@@ -499,7 +499,7 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !LookupResponse {
-        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", null, false);
+        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", "", null, null, false);
     }
 
     pub fn fetchGroupLookupWithMode(
@@ -516,8 +516,10 @@ pub const ApiHttpClient = struct {
         relational_integrity_action: bool,
         relational_integrity_jobs_json: []const u8,
         relational_activation_json: []const u8,
+        relational_index_status_json: []const u8,
         relational_topology_json: []const u8,
         restore_staging_scope: ?[32]u8,
+        restore_staging_plan_id: ?[16]u8,
         include_primary_digest: bool,
     ) !LookupResponse {
         // Group lookups are also used for routed derived-artifact hydration.
@@ -528,7 +530,7 @@ pub const ApiHttpClient = struct {
         // value even when they contain URI delimiters.
         const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(encoded_table_name);
-        const special = relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0;
+        const special = relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
         // Routing uses the actual logical key, including empty first-range
         // boundaries. Only the already-routed HTTP path needs a placeholder.
         const encoded_key = try percentEncodePathComponent(self.alloc, if (special and key.len == 0) "\x00relational_control" else key);
@@ -565,17 +567,23 @@ pub const ApiHttpClient = struct {
         const topology = if (relational_topology_json.len != 0) try percentEncodePathComponent(self.alloc, relational_topology_json) else "";
         defer if (topology.len != 0) self.alloc.free(topology);
         const scope_hex = if (restore_staging_scope) |scope| std.fmt.bytesToHex(scope, .lower) else null;
-        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}", .{
+        if (restore_staging_plan_id != null and restore_staging_scope == null) return error.InvalidArgument;
+        const plan_hex = if (restore_staging_plan_id) |plan| std.fmt.bytesToHex(plan, .lower) else null;
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}{s}", .{
             routes.Routes.internal_groups_prefix,                                            group_id,                                                                      suffix,
             if (relational_integrity_catalog) "&_relational_integrity_catalog=true" else "", if (relational_integrity_action) "&_relational_integrity_action=true" else "", if (jobs.len != 0) "&_relational_integrity_jobs=" else "",
             jobs,                                                                            if (activation.len != 0) "&_relational_activation=" else "",                   activation,
             if (topology.len != 0) "&_relational_topology=" else "",                         topology,                                                                      if (scope_hex != null) "&_restore_staging_scope=" else "",
-            if (scope_hex) |*value| value else "",
+            if (scope_hex) |*value| value else "",                                           if (plan_hex != null) "&_restore_staging_plan_id=" else "",                    if (plan_hex) |*value| value else "",
         });
         defer self.alloc.free(path);
         const observation_path = if (include_primary_digest) try std.fmt.allocPrint(self.alloc, "{s}&_primary_digest=true", .{path}) else null;
         defer if (observation_path) |value| self.alloc.free(value);
-        const uri = try self.joinRoute(base_uri, observation_path orelse path);
+        const index_status = if (relational_index_status_json.len != 0) try percentEncodePathComponent(self.alloc, relational_index_status_json) else "";
+        defer if (index_status.len != 0) self.alloc.free(index_status);
+        const index_path = if (index_status.len != 0) try std.fmt.allocPrint(self.alloc, "{s}&_relational_index_status={s}", .{ observation_path orelse path, index_status }) else null;
+        defer if (index_path) |value| self.alloc.free(value);
+        const uri = try self.joinRoute(base_uri, index_path orelse observation_path orelse path);
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{
@@ -587,6 +595,12 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            404 => {
+                if (std.mem.eql(u8, read_consistency, "read_index") and
+                    std.mem.eql(u8, resp.header(route_metadata_api.catalog_route_fence_ack_header) orelse "", route_metadata_api.catalog_route_fence_ack_value) and
+                    std.mem.eql(u8, resp.header(route_metadata_api.read_index_absence_header) orelse "", route_metadata_api.read_index_absence_value)) return error.AuthoritativeLookupMissing;
+                return error.UnexpectedHttpStatus;
+            },
             408, 504 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
@@ -720,7 +734,8 @@ pub const ApiHttpClient = struct {
         };
     }
 
-    pub fn fetchRestoreOwner(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_owner.zig").Request, context: @import("operation.zig").RequestContext) !@import("restore_owner.zig").Response {
+    pub fn fetchRestoreOwner(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_owner.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("restore_owner.zig").Response {
+        const context = try input_context.platformDeadline();
         try context.ensureActive();
         const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(encoded_name);
@@ -730,6 +745,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(uri);
         const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
         defer self.alloc.free(body);
+        try @import("restore_owner_contract.zig").validateRequestSize(body.len);
         const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
         var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
         var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
@@ -738,6 +754,7 @@ pub const ApiHttpClient = struct {
             200 => {},
             400, 409 => return error.RestoreStagingScopeChanged,
             422 => return error.BackupIntegrityFailure,
+            413 => return error.InvalidBackupRequest,
             408, 504 => return error.Timeout,
             404, 503 => return error.RestoreValidationPending,
             else => return error.UnexpectedHttpStatus,
@@ -1055,6 +1072,7 @@ pub const ApiHttpClient = struct {
             .body = body orelse "",
         });
         defer resp.deinit(self.alloc);
+        if (remoteRelationalRowError(resp.status, resp.body)) |err| return err;
         switch (resp.status) {
             200 => {},
             409 => return remoteGroupConflictError(resp.body),
@@ -1133,6 +1151,7 @@ pub const ApiHttpClient = struct {
             .cancellation = cancellation,
         }, status_writer.writer())) orelse return null;
         if (!handled) return false;
+        if (remoteRelationalRowError(status_writer.status, status_writer.error_body.items)) |err| return err;
         switch (status_writer.status) {
             200 => return true,
             408 => return error.Canceled,
@@ -2514,6 +2533,11 @@ pub const ApiHttpClient = struct {
                 return error.RaftBatchWriteOutcomeUnknown;
             }
             if (resp.status == 409) return remoteGroupConflictError(resp.body);
+            if (resp.status == 429 and std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "RetainedEffectsFull")) {
+                if (forwarding == null or (outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)))
+                    return error.RetainedEffectsFull;
+                return error.RaftBatchWriteOutcomeUnknown;
+            }
             if (resp.status == 404) return if (forwarding != null) error.RaftBatchForwardingUnsupported else error.UnknownGroup;
             if (resp.status == 503) {
                 if (forwarding == null or (outcome != null and
@@ -2977,7 +3001,9 @@ pub const ApiHttpClient = struct {
         // Receiving any response proves that the request crossed the send
         // boundary, even when a custom executor does not update the tracker.
         if (delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
+        if (isRetainedPreDecisionPressure(resp)) return error.RetainedEffectsFull;
         if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
+        if (remoteRelationalRowError(resp.status, resp.body)) |reason| return reason;
         switch (resp.status) {
             200 => return .applied,
             409 => return remoteGroupConflictError(resp.body),
@@ -3068,7 +3094,9 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         if (delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
+        if (isRetainedPreDecisionPressure(resp)) return error.RetainedEffectsFull;
         if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
+        if (remoteRelationalRowError(resp.status, resp.body)) |reason| return reason;
         switch (resp.status) {
             200 => return .applied,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
@@ -3119,6 +3147,33 @@ pub const ApiHttpClient = struct {
         body: []const u8,
     ) !EmptyResponse {
         return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, null, null);
+    }
+
+    pub fn fetchGroupOnlineMergeIo(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("online_merge_io.zig").contract.Request, timeout_ms: u32, cancellation: ?*const http_common.RequestCancellation) !QueryResponse {
+        try request.validate();
+        if (group_id != request.ownerGroup()) return error.OnlineSourceScopeChanged;
+        const table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, table, routes.Routes.online_merge_io_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > @import("online_merge_io.zig").contract.max_request_bytes) return error.InvalidMergePage;
+        var resp = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = timeout_ms, .cancellation = cancellation, .max_response_bytes = @import("online_merge_io.zig").contract.max_response_bytes });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            400 => return error.InvalidMergePage,
+            409 => return if (std.mem.eql(u8, resp.body, "online merge source pin missing")) error.OnlineSourcePinMissing else error.OnlineMergeReceiptMismatch,
+            422 => return error.OnlineMergeUnavailable,
+            408 => return error.Canceled,
+            504 => return error.Timeout,
+            503 => return error.GroupLeaderUnavailable,
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
     pub fn fetchGroupTxnStatus(
@@ -3868,6 +3923,44 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     return error.UnexpectedHttpStatus;
 }
 
+fn remoteRelationalRowError(status: u16, body: []const u8) ?anyerror {
+    const errors = @import("relational_row_errors.zig");
+    const reason = errors.decode(body) orelse return null;
+    return if (errors.status(reason) == status) reason else error.InvalidRemoteResponse;
+}
+
+test "relational row query remote scan preserves readiness and rejects wrong HTTP classes" {
+    try std.testing.expectEqual(error.RelationalIndexNotReady, remoteRelationalRowError(409, "RelationalIndexNotReady").?);
+    try std.testing.expectEqual(error.PreparedGenerationChanged, remoteRelationalRowError(409, "PreparedGenerationChanged").?);
+    try std.testing.expectEqual(error.RelationalRowResultTooLarge, remoteRelationalRowError(413, "RelationalRowResultTooLarge").?);
+    try std.testing.expectEqual(error.InvalidRemoteResponse, remoteRelationalRowError(200, "RelationalIndexNotReady").?);
+    try std.testing.expectEqual(error.RelationalExpressionDivisionByZero, remoteRelationalRowError(400, "RelationalExpressionDivisionByZero").?);
+    try std.testing.expectEqual(error.GeneratedColumnRewriteRequired, remoteRelationalRowError(409, "GeneratedColumnRewriteRequired").?);
+    try std.testing.expectEqual(error.InvalidRemoteResponse, remoteRelationalRowError(500, "RelationalExpressionDivisionByZero").?);
+}
+
+test "relational row query remote transaction prepare preserves scalar validation failures" {
+    const Executor = struct {
+        status: u16,
+        body: []const u8,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = self.status, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    var executor: Executor = .{ .status = 400, .body = "" };
+    var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
+        const reason = @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
+        executor.status = @import("relational_row_errors.zig").status(reason);
+        executor.body = field.name;
+        try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
+    }
+    executor.status = 500;
+    executor.body = "RelationalExpressionOverflow";
+    try std.testing.expectError(error.InvalidRemoteResponse, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
+}
+
 fn remoteGraphEdgesError(body: []const u8) anyerror {
     const message = std.mem.trim(u8, body, " \t\r\n");
     if (std.mem.eql(u8, message, "graph explored edges budget exceeded"))
@@ -3909,6 +4002,7 @@ fn remotePublicBatchError(status: u16, body: []const u8) anyerror {
 }
 
 fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "group leader unavailable")) return error.GroupLeaderUnavailable;
     if (std.mem.eql(u8, body, "GenerationTransitionActive")) return error.GenerationTransitionActive;
     if (std.mem.eql(u8, body, "storage read temporarily unavailable")) {
         return error.StorageReadTemporarilyUnavailable;
@@ -3931,6 +4025,43 @@ fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {
         }
     }
     return false;
+}
+
+test "retained quota client preserves certified rejection and committed pending" {
+    const alloc = std.testing.allocator;
+    const Executor = struct {
+        certified: bool = true,
+        pending: bool = false,
+        fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.pending) return @import("http_route_helpers.zig").textResponseWithHeaders(allocator, 202, "committed_visibility_pending", &.{
+                .{ .name = internal_batch_forwarding.outcome_header, .value = internal_batch_forwarding.outcome_committed_visibility_pending_v1 },
+            });
+            return @import("http_route_helpers.zig").textResponseWithHeaders(allocator, 429, "RetainedEffectsFull", if (self.certified) &.{
+                .{ .name = internal_batch_forwarding.outcome_header, .value = internal_batch_forwarding.outcome_not_proposed_v1 },
+                .{ .name = txn_contract.pre_decision_outcome_header, .value = txn_contract.pre_decision_not_proposed_v1 },
+                .{ .name = "Retry-After", .value = "1" },
+            } else &.{});
+        }
+    };
+    var executor: Executor = .{};
+    var client = ApiHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    const forwarding: internal_batch_forwarding.Context = .{ .remaining_ms = 1000, .forwards_remaining = 1, .campaign_allowed = false };
+    try std.testing.expectError(error.RetainedEffectsFull, client.fetchGroupBatchWithForwarding("http://node:8080", 7, "docs", "{}", 1000, forwarding, null, null));
+    try std.testing.expectError(error.RetainedEffectsFull, client.fetchGroupTxnPrepare("http://node:8080", 7, "docs", "{}"));
+    try std.testing.expectError(error.RetainedEffectsFull, client.fetchGroupTxnBegin("http://node:8080", 7, "docs", "{}"));
+    executor.certified = false;
+    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, client.fetchGroupBatchWithForwarding("http://node:8080", 7, "docs", "{}", 1000, forwarding, null, null));
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupTxnPrepare("http://node:8080", 7, "docs", "{}"));
+    executor.pending = true;
+    try std.testing.expectError(error.EnrichmentRetryInProgress, client.fetchGroupBatchWithForwarding("http://node:8080", 7, "docs", "{}", 1000, forwarding, null, null));
+    try std.testing.expectError(error.CommitVisibilityNotSatisfied, client.fetchGroupTxnResolve("http://node:8080", 7, "docs", "{}"));
+}
+
+fn isRetainedPreDecisionPressure(resp: http_common.HttpResponse) bool {
+    if (resp.status != 429 or !std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "RetainedEffectsFull")) return false;
+    const outcome = resp.header(txn_contract.pre_decision_outcome_header) orelse return false;
+    return std.mem.eql(u8, outcome, txn_contract.pre_decision_not_proposed_v1);
 }
 
 fn isTxnPreDecisionNotProposedResponse(resp: http_common.HttpResponse) bool {
@@ -4059,6 +4190,9 @@ fn consumerTests() type {
             try std.testing.expectError(error.Timeout, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
             executor.status = 409;
             try std.testing.expectError(error.RestoreStagingScopeChanged, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
+            executor.status = 413;
+            try std.testing.expectError(error.InvalidBackupRequest, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
+            try std.testing.expect(@import("restore_source_errors.zig").permanent(error.InvalidBackupRequest));
         }
 
         test "transaction status keeps client-side response reserve" {
@@ -4207,9 +4341,44 @@ fn consumerTests() type {
                 remoteStorageReadUnavailableError("storage read temporarily unavailable"),
             );
             try std.testing.expectEqual(
-                error.UnexpectedHttpStatus,
+                error.GroupLeaderUnavailable,
                 remoteStorageReadUnavailableError("group leader unavailable"),
             );
+            try std.testing.expectEqual(error.UnexpectedHttpStatus, remoteStorageReadUnavailableError("unrecognized failure"));
+            const Stream = struct {
+                status: u16,
+                body: []const u8,
+
+                fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    return error.TestUnexpectedResult;
+                }
+
+                fn executeStream(raw: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest, writer: http_common.StreamWriter) !bool {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try writer.start(alloc, .{ .status = self.status });
+                    try writer.writeAll(self.body);
+                    return true;
+                }
+
+                fn unexpectedStart(_: *anyopaque, _: std.mem.Allocator, _: http_common.StreamingResponse) !void {
+                    return error.TestUnexpectedResult;
+                }
+
+                fn unexpectedWrite(_: *anyopaque, _: []const u8) !void {
+                    return error.TestUnexpectedResult;
+                }
+
+                fn unexpectedFlush(_: *anyopaque) !void {
+                    return error.TestUnexpectedResult;
+                }
+            };
+            var remote = Stream{ .status = 503, .body = "group leader unavailable" };
+            var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &remote, .vtable = &.{ .execute = Stream.execute, .execute_stream = Stream.executeStream } });
+            const sink = http_common.StreamWriter{ .ptr = &remote, .vtable = &.{ .start = Stream.unexpectedStart, .write_all = Stream.unexpectedWrite, .flush = Stream.unexpectedFlush } };
+            try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupScanStream("http://owner", 7, "rows", "{}", null, null, sink));
+            remote.status = 500;
+            remote.body = "internal server error";
+            try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupScanStream("http://owner", 7, "rows", "{}", null, null, sink));
         }
 
         test "api http client preserves remote graph edge budget exhaustion" {
@@ -4868,6 +5037,17 @@ fn consumerTests() type {
 
             var maintenance = try client.fetchGroupGraphMetricMaintenance("http://node:8080", 7, "docs", "{}");
             maintenance.deinit(std.testing.allocator);
+
+            var online = try client.fetchGroupOnlineMergeIo("http://node:8080", 7, "docs", .{
+                .scope = .{
+                    .fence = .{ .transition_id = 1, .attempt = 1, .owner_group_id = 7, .peer_group_id = 8, .role = .merge_source, .namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 }, .catalog_digest = @splat(1) },
+                    .receiver_namespace = .{ .table_id = 1, .shard_id = 8, .range_id = 8 },
+                    .consumer_epoch = 1,
+                    .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+                },
+                .operation = .{ .status = .donor },
+            }, 1000, null);
+            online.deinit(std.testing.allocator);
 
             capture.expected_internal = false;
             var public = try client.executeRequest(.{ .method = .GET, .uri = "http://node:8080/status" });

@@ -34,6 +34,7 @@ pub fn generationSet(catalog: catalog_mod.Catalog) integrity.Digest {
     var state = std.crypto.hash.Blake3.init(.{});
     state.update("antfly active constraint coverage v1");
     state.update(&catalog.incarnation);
+    state.update(&catalog.checks_digest);
     for (catalog.bindings) |binding| if (!binding.retired) {
         state.update(&binding.generation);
         state.update(&binding.definition.fingerprint);
@@ -44,8 +45,23 @@ pub fn generationSet(catalog: catalog_mod.Catalog) integrity.Digest {
 }
 
 pub fn hasActive(catalog: catalog_mod.Catalog) bool {
+    if (hasChecks(catalog)) return true;
     for (catalog.bindings) |binding| if (!binding.retired) return true;
     return false;
+}
+
+pub fn hasChecks(catalog: catalog_mod.Catalog) bool {
+    return !std.mem.allEqual(u8, &catalog.checks_digest, 0);
+}
+
+pub fn firstPhase(catalog: catalog_mod.Catalog) Phase {
+    return if (hasKind(catalog, .unique)) .unique else if (hasKind(catalog, .foreign_key)) .foreign_key else .check;
+}
+
+pub fn nextPhase(catalog: catalog_mod.Catalog, phase: Phase) ?Phase {
+    if (phase == .unique and hasKind(catalog, .foreign_key)) return .foreign_key;
+    if (phase != .check and hasChecks(catalog)) return .check;
+    return null;
 }
 
 pub fn hasKind(catalog: catalog_mod.Catalog, kind: catalog_mod.Kind) bool {
@@ -55,7 +71,7 @@ pub fn hasKind(catalog: catalog_mod.Catalog, kind: catalog_mod.Kind) bool {
 
 pub const State = enum(u8) { validating = 0, enforced = 1, invalid = 2 };
 
-pub const Phase = enum(u8) { unique = 0, foreign_key = 1 };
+pub const Phase = enum(u8) { unique = 0, foreign_key = 1, check = 2 };
 
 pub const Progress = struct {
     generation_set: integrity.Digest,
@@ -70,12 +86,12 @@ pub const Progress = struct {
     failure: []const u8 = "",
 
     pub fn readyForReferences(self: Progress) bool {
-        return self.state == .enforced or self.phase == .foreign_key;
+        return self.state == .enforced or self.phase != .unique;
     }
 
     pub fn retry(self: Progress, catalog: catalog_mod.Catalog) !Progress {
         if (self.state != .invalid) return error.InvalidConstraintActivation;
-        return .{ .generation_set = generationSet(catalog), .owner = self.owner, .schema_version = catalog.schema_version, .phase = if (hasKind(catalog, .unique)) .unique else .foreign_key };
+        return .{ .generation_set = generationSet(catalog), .owner = self.owner, .schema_version = catalog.schema_version, .phase = firstPhase(catalog) };
     }
 
     pub fn encode(self: Progress, alloc: Allocator) ![]u8 {
@@ -100,7 +116,7 @@ pub const Progress = struct {
 
     pub fn decode(bytes: []const u8) !Progress {
         if (bytes.len < header_len + 32 or bytes.len > header_len + max_cursor_bytes + 4096 + 32 or
-            !std.mem.eql(u8, bytes[0..4], "AIA1") or !std.mem.allEqual(u8, bytes[74..76], 0) or bytes[72] > 2 or bytes[73] > 1 or
+            !std.mem.eql(u8, bytes[0..4], "AIA1") or !std.mem.allEqual(u8, bytes[74..76], 0) or bytes[72] > 2 or bytes[73] > 2 or
             !std.mem.eql(u8, bytes[bytes.len - 32 ..], &digest(bytes[0 .. bytes.len - 32]))) return error.InvalidConstraintActivation;
         const cursor_len = std.mem.readInt(u32, bytes[84..88], .little);
         const payload = bytes[header_len .. bytes.len - 32];
@@ -115,7 +131,7 @@ pub const Progress = struct {
                 2 => .invalid,
                 else => unreachable,
             },
-            .phase = if (bytes[73] == 0) .unique else .foreign_key,
+            .phase = @enumFromInt(bytes[73]),
             .rows_scanned = std.mem.readInt(u64, bytes[76..84], .little),
             .cursor = payload[0..cursor_len],
             .failure = payload[cursor_len..],

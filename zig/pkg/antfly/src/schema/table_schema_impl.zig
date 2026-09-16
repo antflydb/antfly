@@ -37,12 +37,16 @@ pub const TableSchema = struct {
     checks: ?std.json.Parsed([]const relational_wire.RelationalCheckConstraint) = null,
     unique_constraints: ?std.json.Parsed([]const relational_wire.RelationalUniqueConstraint) = null,
     foreign_keys: ?std.json.Parsed([]const relational_wire.RelationalForeignKeyConstraint) = null,
+    column_defaults: ?std.json.Parsed(std.json.Value) = null,
+    generated_columns: ?std.json.Parsed(std.json.Value) = null,
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
         if (self.relational_indexes) |*indexes| indexes.deinit();
         if (self.checks) |*checks| checks.deinit();
         if (self.unique_constraints) |*constraints| constraints.deinit();
         if (self.foreign_keys) |*constraints| constraints.deinit();
+        if (self.column_defaults) |*expressions| expressions.deinit();
+        if (self.generated_columns) |*expressions| expressions.deinit();
         alloc.free(self.default_type);
         alloc.free(self.ttl_field);
         for (self.document_schemas) |*document_schema| document_schema.deinit(alloc);
@@ -98,7 +102,9 @@ pub const TableSchema = struct {
         for (declarations.value, definitions) |declaration, *definition| {
             const keys = try alloc.alloc(relational_native.RelationalIndexKey, declaration.keys.len);
             for (declaration.keys, keys) |wire, *key| key.* = .{
-                .column = wire.column,
+                .column = wire.column orelse "",
+                .expression_json = if (wire.expression) |expression| try std.json.Stringify.valueAlloc(alloc, expression, .{ .emit_null_optional_fields = false }) else null,
+                .result_type = if (wire.result_type) |kind| nativeEnum(storage_schema.RelationalColumnType, kind) else null,
                 .collation = wire.collation,
                 .direction = switch (wire.direction orelse .asc) {
                     .asc => .asc,
@@ -110,7 +116,15 @@ pub const TableSchema = struct {
                     .last => .last,
                 },
             };
-            definition.* = .{ .name = declaration.name, .keys = keys, .owner_kind = .table, .owner_name = relational_native.relational_table_index_owner_name, .access_method = .ordered_tuple };
+            const conditions: []const relational_wire.RelationalIndexPredicate = declaration.where orelse &.{};
+            const where = try alloc.alloc(relational_native.UniquePredicate, conditions.len);
+            for (conditions, where) |condition, *target| target.* = .{
+                .field = condition.column,
+                .op = nativeEnum(relational_native.RelationalCheckOp, condition.op),
+                .value_json = if (condition.value) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null,
+                .collation = condition.collation,
+            };
+            definition.* = .{ .name = declaration.name, .keys = keys, .include_columns = declaration.include_columns orelse &.{}, .where = where, .owner_kind = .table, .owner_name = relational_native.relational_table_index_owner_name, .access_method = .ordered_tuple };
         }
         return definitions;
     }
@@ -449,11 +463,17 @@ pub const CompiledValidationPlan = struct {
     properties: std.AutoHashMapUnmanaged(usize, PropertyMap) = .empty,
     patterns: std.StringHashMapUnmanaged(schema_regex.PreparedPattern) = .empty,
     checks: ?*@import("relational_checks.zig").Set = null,
+    expressions: ?*@import("relational_expression.zig").Set = null,
 
     pub fn init(alloc: std.mem.Allocator, schema: TableSchema) !CompiledValidationPlan {
         var plan: CompiledValidationPlan = .{};
         errdefer plan.deinit(alloc);
         for (schema.document_schemas) |document| try plan.addProperty(alloc, makeRootDocumentProperty(document));
+        if (schema.column_defaults != null or schema.generated_columns != null) {
+            const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, schema);
+            errdefer storage_schema.freeSchema(alloc, runtime);
+            plan.expressions = try @import("relational_expression.zig").Set.createOwned(alloc, runtime, if (schema.column_defaults) |expressions| expressions.value else .null, if (schema.generated_columns) |expressions| expressions.value else .null);
+        }
         if (schema.checks) |checks| if (checks.value.len != 0) {
             const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, schema);
             errdefer storage_schema.freeSchema(alloc, runtime);
@@ -464,6 +484,7 @@ pub const CompiledValidationPlan = struct {
 
     pub fn deinit(self: *CompiledValidationPlan, alloc: std.mem.Allocator) void {
         if (self.checks) |checks| checks.deinit();
+        if (self.expressions) |expressions| expressions.deinit();
         var maps = self.properties.valueIterator();
         while (maps.next()) |map| map.deinit(alloc);
         self.properties.deinit(alloc);
@@ -583,6 +604,7 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     try validateParsedStorageModeSchema(schema);
     try validateParsedTtlSchema(schema);
     try validateParsedRelationalSchema(schema);
+    try validateRelationalExpressions(alloc, schema);
     return try stringifyJsonValue(alloc, parsed.value);
 }
 
@@ -605,7 +627,27 @@ pub fn parseSchema(alloc: std.mem.Allocator, schema_json: []const u8) !TableSche
     try validateParsedStorageModeSchema(schema);
     try validateParsedTtlSchema(schema);
     try validateParsedRelationalSchema(schema);
+    try validateRelationalExpressions(alloc, schema);
     return schema;
+}
+
+fn validateRelationalExpressions(alloc: std.mem.Allocator, schema: TableSchema) !void {
+    if (schema.column_defaults == null and schema.generated_columns == null and schema.checks == null) return;
+    const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, schema);
+    errdefer storage_schema.freeSchema(alloc, runtime);
+    if (schema.checks) |definitions| @import("relational_checks.zig").validateDefinitions(alloc, runtime, definitions.value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    if (schema.column_defaults == null and schema.generated_columns == null) {
+        storage_schema.freeSchema(alloc, runtime);
+        return;
+    }
+    const expressions = @import("relational_expression.zig").Set.createOwned(alloc, runtime, if (schema.column_defaults) |value| value.value else .null, if (schema.generated_columns) |value| value.value else .null) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    expressions.deinit();
 }
 
 pub fn validateJsonSchemaJson(
@@ -752,6 +794,13 @@ fn validateDocumentJsonWithPlan(
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
     defer parsed.deinit();
+    if (compiled) |plan| {
+        return prepareDocumentValueWithPlan(parsed.arena.allocator(), alloc, schema, &parsed.value, physical_fields, plan);
+    } else if (schema.column_defaults != null or schema.generated_columns != null) {
+        var plan = try CompiledValidationPlan.init(alloc, schema);
+        defer plan.deinit(alloc);
+        return prepareDocumentValueWithPlan(parsed.arena.allocator(), alloc, schema, &parsed.value, physical_fields, &plan);
+    }
     try validateDocumentValueWithPlan(alloc, schema, &parsed.value, physical_fields, compiled);
 }
 
@@ -857,6 +906,31 @@ pub fn validateDocumentValueWithPlan(
     physical_fields: []const PhysicalFieldValidation,
     compiled: ?*const CompiledValidationPlan,
 ) !void {
+    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true);
+}
+
+/// The only boundary that skips verification owns both expression evaluation
+/// and subsequent validation. Restore callers cannot assert a trusted flag.
+pub fn prepareDocumentValueWithPlan(
+    owned_alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    schema: TableSchema,
+    value: *std.json.Value,
+    physical_fields: []const PhysicalFieldValidation,
+    compiled: *const CompiledValidationPlan,
+) !void {
+    if (compiled.expressions) |expressions| try expressions.applyJson(owned_alloc, value);
+    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false);
+}
+
+fn validateDocumentValueInternal(
+    alloc: std.mem.Allocator,
+    schema: TableSchema,
+    value: *std.json.Value,
+    physical_fields: []const PhysicalFieldValidation,
+    compiled: ?*const CompiledValidationPlan,
+    verify_generated: bool,
+) !void {
     if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
 
     const root = switch (value.*) {
@@ -865,6 +939,13 @@ pub fn validateDocumentValueWithPlan(
     };
 
     const document_schema = try resolveDocumentSchema(schema, root);
+    if (verify_generated) if (compiled) |plan| {
+        if (plan.expressions) |expressions| try expressions.verifyJson(alloc, value.*);
+    } else if (schema.generated_columns != null) {
+        var plan = try CompiledValidationPlan.init(alloc, schema);
+        defer plan.deinit(alloc);
+        if (plan.expressions) |expressions| try expressions.verifyJson(alloc, value.*);
+    };
     var validation_context = RuntimeValidationContext{
         .alloc = alloc,
         .compiled = compiled,
@@ -2272,8 +2353,11 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
         // Null is not a drop command; explicit [] makes destructive intent
         // distinguishable from a omitted field in a schema update.
         if (indexes != .array or indexes.array.items.len > 4096) return error.InvalidSchemaUpdateRequest;
-        parsed.relational_indexes = std.json.parseFromValue([]const relational_wire.RelationalIndexDefinition, alloc, indexes, .{
+        const index_json = try std.json.Stringify.valueAlloc(alloc, indexes, .{});
+        defer alloc.free(index_json);
+        parsed.relational_indexes = std.json.parseFromSlice([]const relational_wire.RelationalIndexDefinition, alloc, index_json, .{
             .allocate = .alloc_always,
+            .parse_numbers = false,
         }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidSchemaUpdateRequest,
@@ -2287,10 +2371,18 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
             var columns = std.StringHashMapUnmanaged(void).empty;
             defer columns.deinit(alloc);
             for (index.keys) |key| {
-                if (key.column.len == 0 or (try columns.getOrPut(alloc, key.column)).found_existing)
-                    return error.InvalidSchemaUpdateRequest;
+                if ((key.column != null) == (key.expression != null)) return error.InvalidSchemaUpdateRequest;
+                if (key.column) |column| {
+                    if (column.len == 0 or key.result_type != null or (try columns.getOrPut(alloc, column)).found_existing)
+                        return error.InvalidSchemaUpdateRequest;
+                } else if (key.result_type == null) return error.InvalidSchemaUpdateRequest;
                 if (key.collation) |collation| if (collation.len == 0) return error.InvalidSchemaUpdateRequest;
             }
+            const includes = index.include_columns orelse &.{};
+            if (includes.len > 256) return error.InvalidSchemaUpdateRequest;
+            for (includes) |column| if (column.len == 0 or (try columns.getOrPut(alloc, column)).found_existing) return error.InvalidSchemaUpdateRequest;
+            const conditions: []const relational_wire.RelationalIndexPredicate = index.where orelse &.{};
+            if (conditions.len > 256) return error.InvalidSchemaUpdateRequest;
         }
     }
     if (root.get("checks")) |checks| {
@@ -2311,8 +2403,14 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
         defer names.deinit(alloc);
         for (parsed.checks.?.value) |check| {
             if (check.name.len == 0 or check.name.len > 256 or !std.unicode.utf8ValidateSlice(check.name) or
-                check.column.len == 0 or (try names.getOrPut(alloc, check.name)).found_existing)
+                (try names.getOrPut(alloc, check.name)).found_existing)
                 return error.InvalidSchemaUpdateRequest;
+            if (check.expression != null) {
+                if (check.column != null or check.op != null or check.value != null or check.collation != null) return error.InvalidSchemaUpdateRequest;
+            } else {
+                const column_name: []const u8 = check.column orelse "";
+                if (check.op == null or column_name.len == 0) return error.InvalidSchemaUpdateRequest;
+            }
         }
     }
     if (root.get("unique_constraints")) |declarations| {
@@ -2320,6 +2418,14 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     }
     if (root.get("foreign_keys")) |declarations| {
         parsed.foreign_keys = try parseRelationalDeclarations(relational_wire.RelationalForeignKeyConstraint, alloc, declarations);
+    }
+    inline for (.{ "column_defaults", "generated_columns" }) |field| {
+        if (root.get(field)) |expressions| {
+            if (expressions != .array or expressions.array.items.len > 256) return error.InvalidSchemaUpdateRequest;
+            const bytes = try std.json.Stringify.valueAlloc(alloc, expressions, .{});
+            defer alloc.free(bytes);
+            @field(parsed, field) = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
+        }
     }
     if (parsed.storage_mode == .relational) {
         if (root.get("enforce_types")) |enforce_types| {
@@ -2445,7 +2551,7 @@ fn propertyContainsRelationalOnlySchemaType(property: DocumentProperty) bool {
 
 fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (schema.storage_mode != .relational) {
-        if (schema.relational_indexes != null or schema.checks != null or schema.unique_constraints != null or schema.foreign_keys != null) return error.InvalidSchemaUpdateRequest;
+        if (schema.relational_indexes != null or schema.checks != null or schema.unique_constraints != null or schema.foreign_keys != null or schema.column_defaults != null or schema.generated_columns != null) return error.InvalidSchemaUpdateRequest;
         return;
     }
     if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;
@@ -2459,17 +2565,26 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     };
     if (schema.foreign_keys) |constraints| for (constraints.value) |constraint| {
         for (constraint.child_columns) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
+        if (constraint.on_update == .cascade or constraint.on_update == .set_null or constraint.on_delete == .set_null) {
+            if (schema.generated_columns) |generated| for (generated.value.array.items) |entry| {
+                if (entry != .object) return error.InvalidSchemaUpdateRequest;
+                const target = entry.object.get("column") orelse return error.InvalidSchemaUpdateRequest;
+                if (target != .string) return error.InvalidSchemaUpdateRequest;
+                for (constraint.child_columns) |column| if (std.mem.eql(u8, target.string, column)) return error.InvalidSchemaUpdateRequest;
+            };
+        }
         if (schema.checks) |checks| for (checks.value) |check| if (std.mem.eql(u8, check.name, constraint.name)) return error.InvalidSchemaUpdateRequest;
         if (schema.unique_constraints) |uniques| for (uniques.value) |unique| if (std.mem.eql(u8, unique.name, constraint.name)) return error.InvalidSchemaUpdateRequest;
     };
     if (schema.checks) |checks| for (checks.value) |check| {
-        if (findDocumentProperty(document_schema.properties, check.column) == null) return error.InvalidSchemaUpdateRequest;
+        if (check.column) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
     };
     if (schema.relational_indexes) |indexes| {
-        for (indexes.value) |index| for (index.keys) |key| {
-            if (findDocumentProperty(document_schema.properties, key.column) == null)
-                return error.InvalidSchemaUpdateRequest;
-        };
+        for (indexes.value) |index| {
+            for (index.keys) |key| if (key.column) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
+            for (index.include_columns orelse &.{}) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
+            for (index.where orelse &.{}) |condition| if (findDocumentProperty(document_schema.properties, condition.column) == null) return error.InvalidSchemaUpdateRequest;
+        }
     }
     if (schema.default_type.len != 0 and !std.mem.eql(u8, schema.default_type, document_schema.name)) {
         return error.InvalidSchemaUpdateRequest;
@@ -2750,6 +2865,30 @@ fn parseDocumentProperties(alloc: std.mem.Allocator, context: SchemaContext, obj
         initialized += 1;
     }
     return properties;
+}
+
+/// Bind a referenced scalar without copying an entire wide schema. The same
+/// property parser and runtime mapper used by the immutable layout remain the
+/// authority, including local references, nullable types and datetime mappings.
+pub fn projectedRelationalColumnType(alloc: std.mem.Allocator, document: std.json.ObjectMap, name: []const u8) !?storage_schema.RelationalColumnType {
+    var object = document;
+    var context: SchemaContext = .{ .document_root = document, .scope_schema = document };
+    for (0..16) |_| {
+        const ref = object.get("$ref") orelse break;
+        if (hasRefSiblings(object)) return null;
+        const path = try parseSchemaRefPath(ref);
+        if (isRootSchemaRef(path)) return null;
+        object = try resolveSchemaRef(context, path);
+        context = context.child(object);
+    } else return error.InvalidSchemaUpdateRequest;
+    const properties = object.get("properties") orelse return null;
+    if (properties != .object) return null;
+    const raw = properties.object.get(name) orelse return null;
+    if (raw != .object) return null;
+    const property = try parseAnonymousProperty(alloc, context, raw.object);
+    defer alloc.destroy(property);
+    defer property.deinit(alloc);
+    return @import("mod.zig").runtimeRelationalColumnType(property.*);
 }
 
 fn parseAnonymousProperty(alloc: std.mem.Allocator, context: SchemaContext, unresolved_object: std.json.ObjectMap) anyerror!*DocumentProperty {

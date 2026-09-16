@@ -14,10 +14,21 @@ from antfly.client_generated.models.relational_index_key_direction import Relati
 from antfly.client_generated.models.relational_index_key_nulls import RelationalIndexKeyNulls
 from antfly.client_generated.models.relational_row import RelationalRow
 from antfly.client_generated.models.relational_row_mutation_request import RelationalRowMutationRequest
+from antfly.client_generated.models.relational_row_query_request import RelationalRowQueryRequest
 from antfly.client_generated.models.relational_unique_constraint import RelationalUniqueConstraint
 from antfly.client_generated.models.table_schema import TableSchema
 from antfly.client_generated.models.table_status import TableStatus
 from antfly.client_generated.models.table_storage_mode import TableStorageMode
+
+
+def test_zero_schema_epoch_is_distinct_from_omitted_query_epoch() -> None:
+    assert "schema_version" not in RelationalRowQueryRequest(fields=["id"]).to_dict()
+    query = RelationalRowQueryRequest(fields=["id"], index="by_id", schema_version=0)
+    assert query.to_dict()["schema_version"] == 0
+    assert RelationalRowQueryRequest.from_dict(query.to_dict()).schema_version == 0
+    mutation = RelationalRowMutationRequest(schema_version=0, mutations=[])
+    assert mutation.to_dict()["schema_version"] == 0
+    assert RelationalRowMutationRequest.from_dict(mutation.to_dict()).schema_version == 0
 
 
 @pytest.mark.parametrize("mode", list(TableStorageMode))

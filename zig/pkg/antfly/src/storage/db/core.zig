@@ -89,6 +89,7 @@ pub const PreparedSchemaMetadata = struct {
     relational_indexes: ?relational_index_catalog_mod.PreparedPublication = null,
     integrity_catalog: ?integrity_catalog_mod.Update = null,
     same_version_layout_matches: bool = false,
+    generated_semantics_match: bool = true,
     combined_writes: []docstore_mod.KVPair,
 
     fn init(
@@ -1342,14 +1343,23 @@ pub const DBCore = struct {
             }
         }
         const next_view = schema_registry_mod.SchemaView{ .epoch = prepared.epoch.? };
+        const expressions = @import("../../schema/relational_expression.zig");
+        const previous_generated = expressions.generatedFingerprint(if (prepared.base_schema_view) |view| if (view.validator()) |validator| validator.execution.expressions else null else null);
+        const next_generated = expressions.generatedFingerprint(if (next_view.validator()) |validator| validator.execution.expressions else null);
+        prepared.generated_semantics_match = std.mem.eql(u8, &previous_generated, &next_generated);
+        // Same-version publication deliberately preserves the registry's
+        // existing immutable epoch. Bind the index plan to that exact epoch,
+        // not the candidate which publication will discard. Owner startup and
+        // idempotent schema retries both exercise this path.
+        const index_view = if (prepared.same_version_layout_matches) prepared.base_schema_view.? else next_view;
         prepared.relational_indexes = declarations: {
             if (next_view.validator()) |validator| {
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena.deinit();
                 if (try validator.schema.relationalIndexDefinitions(arena.allocator())) |definitions|
-                    break :declarations try self.relational_indexes.prepare(next_view, definitions);
+                    break :declarations try self.relational_indexes.prepare(index_view, definitions);
             }
-            break :declarations try self.relational_indexes.prepareSchemaChange(next_view);
+            break :declarations try self.relational_indexes.prepareSchemaChange(index_view);
         };
         prepared.publication = try self.schema_registry.preparePublish(table_schema.version);
         var declaration_arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -1360,16 +1370,26 @@ pub const DBCore = struct {
             &.{};
         const previous_integrity = try self.getStoreValue(self.alloc, integrity_catalog_mod.key);
         defer if (previous_integrity) |bytes| self.alloc.free(bytes);
-        if (definitions.len != 0 or previous_integrity != null) {
+        const checks_digest: [32]u8 = if (next_view.validator()) |validator| checks: {
+            if (validator.execution.checks) |checks| break :checks checks.fingerprint();
+            break :checks @splat(0);
+        } else @splat(0);
+        // Even an unconstrained relational schema has an authoritative empty
+        // catalog. Missing relational integrity metadata is then distinguishable
+        // from a genuinely empty definition set on restore/online source paths.
+        if (definitions.len != 0 or previous_integrity != null or (self.identity_namespace.table_id != 0 and
+            (table_schema.storage_mode == .relational or !std.mem.allEqual(u8, &checks_digest, 0))))
+        {
             var digest: [32]u8 = undefined;
             std.crypto.hash.Blake3.hash(prepared.encoded, &digest, .{});
-            prepared.integrity_catalog = try integrity_catalog_mod.prepare(
+            prepared.integrity_catalog = try integrity_catalog_mod.prepareWithChecks(
                 self.alloc,
                 previous_integrity,
                 try integrity_catalog_mod.incarnationFromTableId(self.identity_namespace.table_id),
                 table_schema.version,
                 digest,
                 definitions,
+                checks_digest,
             );
             if (previous_integrity) |previous| {
                 var prior = try integrity_catalog_mod.decode(self.alloc, previous);
@@ -1398,6 +1418,31 @@ pub const DBCore = struct {
         metadata_deletes: []const []const u8,
         reconciled_row_count: ?u64,
     ) !bool {
+        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false);
+    }
+
+    /// Rehydrate an exact durable schema without inventing a mutation (or an HA
+    /// outbox entry). A false result requires the ordinary authorized write path.
+    pub fn rehydratePreparedSchemaMetadata(
+        self: *DBCore,
+        prepared: *PreparedSchemaMetadata,
+        metadata_writes: []const docstore_mod.KVPair,
+    ) !bool {
+        _ = self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, true) catch |err| switch (err) {
+            error.SchemaMetadataChanged => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    fn commitPreparedSchemaMetadataMode(
+        self: *DBCore,
+        prepared: *PreparedSchemaMetadata,
+        metadata_writes: []const docstore_mod.KVPair,
+        metadata_deletes: []const []const u8,
+        reconciled_row_count: ?u64,
+        rehydrate_only: bool,
+    ) !bool {
         if (prepared.combined_writes.len != metadata_writes.len + 1)
             return error.InvalidSchemaUpdateRequest;
         try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, metadata_deletes);
@@ -1418,6 +1463,12 @@ pub const DBCore = struct {
             if (current.version == table_schema.version and !same_active_epoch)
                 return error.InvalidSchemaUpdateRequest;
         }
+        // Check under the apply fence, not during compilation: writes may
+        // arrive between preparation and publication. The durable presence
+        // bit follows transactional range cardinality without scanning rows.
+        if (!prepared.generated_semantics_match and
+            (self.table_catalog.row_count != 0 or (reconciled_row_count orelse 0) != 0))
+            return error.GeneratedColumnRewriteRequired;
         if (self.schema == null and table_schema.storage_mode == .relational) {
             var manager = try self.initTxnManager();
             defer manager.deinit();
@@ -1445,7 +1496,12 @@ pub const DBCore = struct {
         next_catalog.active_schema_version = table_schema.version;
         if (reconciled_row_count) |row_count| next_catalog.row_count = @intFromBool(row_count != 0);
         next_catalog.reconciled = true;
-        next_catalog.index_state = if (self.indexCount() == 0) .none else .pending;
+        const same_index_catalog = if (prepared.relational_indexes) |indexes|
+            if (indexes.metadata.expected) |expected| expected.eql(indexes.metadata.head) else false
+        else
+            true;
+        if (!same_active_epoch or !same_index_catalog)
+            next_catalog.index_state = if (self.indexCount() == 0) .none else .pending;
         const previous_catalog_data = self.table_catalog.encode();
         const candidate_catalog_data = next_catalog.encode();
         if (!std.mem.eql(u8, &previous_catalog_data, &candidate_catalog_data))
@@ -1459,7 +1515,23 @@ pub const DBCore = struct {
             namespace: doc_identity.Namespace,
 
             pub fn stage(participants: @This(), txn: anytype) !void {
+                // A retained source uses the immutable layouts/validator set
+                // captured at admission. Schema changes must wait for its
+                // terminal receipt; exact rehydration uses stageChanges and
+                // remains possible after restart without reopening DDL.
+                var source_namespace: [24]u8 = undefined;
+                doc_identity.encodeNamespace(&source_namespace, participants.namespace);
+                try @import("../source_pin_state.zig").requireNoPrepared(txn, source_namespace);
+                if (try @import("../retained_effects.zig").load(txn)) |retention| {
+                    if (retention.active() and std.mem.eql(u8, &retention.namespace, &source_namespace))
+                        return error.IntegrityTopologyBusy;
+                }
                 try @import("relational_integrity_topology.zig").requireUnfenced(txn);
+                try @import("online_integrity_shadow.zig").requireCatalogMutable(txn);
+                try participants.stageChanges(txn);
+            }
+
+            pub fn stageChanges(participants: @This(), txn: anytype) !void {
                 if (participants.prepared.relational_indexes) |*indexes| _ = try indexes.metadata.stage(txn);
                 if (participants.prepared.integrity_catalog) |*catalog| {
                     const retirement_mod = @import("relational_integrity_retirement.zig");
@@ -1485,6 +1557,21 @@ pub const DBCore = struct {
                 }
             }
         };
+        const participants = Participants{ .prepared = prepared, .row_count = next_catalog.row_count, .namespace = self.identity_namespace };
+        const unchanged = same_active_epoch and try schema_mod.encodedSchemaMetadataUnchanged(
+            self.store,
+            self.alloc,
+            table_schema.version,
+            prepared.encoded,
+            prepared.combined_writes,
+            metadata_deletes,
+            participants,
+        );
+        if (rehydrate_only and !unchanged) return error.SchemaMetadataChanged;
+        // The current resident epoch and index snapshot were fenced above and
+        // already describe these exact bytes. Keep their identities stable so
+        // reopening/configuring an owner does not invalidate prepared writes.
+        if (unchanged) return false;
         const changed = try schema_mod.saveEncodedSchemaWithMetadataAndStage(
             self.store,
             self.alloc,
@@ -1492,7 +1579,7 @@ pub const DBCore = struct {
             prepared.encoded,
             prepared.combined_writes,
             metadata_deletes,
-            Participants{ .prepared = prepared, .row_count = next_catalog.row_count, .namespace = self.identity_namespace },
+            participants,
         );
         const next_schema = prepared.resident_schema orelse unreachable;
         if (!changed or self.schema == null) {

@@ -49,7 +49,7 @@ pub fn runPage(
     const table = for (tables) |table| {
         if (table.table_id == owner.table_id) break table;
     } else return false;
-    if (owner.restore_backup_id.len != 0 or !try planner.requiresCoordination(alloc, table.schema_json)) return false;
+    if (owner.restore_backup_id.len != 0 or !try planner.requiresActivation(alloc, table.schema_json)) return false;
     const deadline = time.monotonicNs() +| 5 * std.time.ns_per_s;
     const control: RequestContext = .{
         .deadline_ns = deadline,
@@ -112,6 +112,7 @@ fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.Ta
     const phase: planner.BackfillPhase = switch (parsed.value.phase) {
         .unique => .unique,
         .foreign_key => .foreign_key,
+        .check => .check,
     };
     var prepared = planner.prepareBackfillWithCoverageControlled(alloc, reader, tables, ranges, table_name, parsed.value.rows, phase, control) catch |err| {
         if (err == error.TransactionTooLarge and budget.shrink(parsed.value.rows.len)) return .shrink;
@@ -129,6 +130,15 @@ fn runAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: writes.Ta
     } else return error.InvalidConstraintActivation;
     source.relational_activation = parsed.value.command;
     source.relational_schema_version = progress.schema_version;
+    if (prepared.validation_failure) |failure| {
+        // Keep all physical source observations in this same transaction.
+        // Concurrent repair (even with an unchanged timestamp) cannot publish
+        // a stale failed CHECK, and no rejected page advances coverage.
+        var failed = try activation.Progress.decode(parsed.value.command.expected orelse return error.ConstraintActivationChanged);
+        failed.state = .invalid;
+        failed.failure = failure;
+        source.relational_activation.?.next = try failed.encode(prepared.arena.allocator());
+    }
     try control.ensureActive();
     const outcome = writer.commitBatchWithCancellation(alloc, requests, .write, control.cancellation) catch |err| {
         if (err == error.TransactionTooLarge and budget.shrink(parsed.value.rows.len)) return .shrink;
@@ -346,4 +356,159 @@ test "distributed txn activation admission reaches singleton in bounded reductio
     budget = .{};
     try std.testing.expect(budget.shrink(3));
     try std.testing.expectEqual(@as(u32, 1), budget.rows);
+}
+
+test "distributed txn CHECK activation shares durable repair retry and physical source guards" {
+    const db_mod = @import("../storage/db/db.zig");
+    const types = @import("../storage/db/types.zig");
+    const read_gate = @import("../raft/read_gate.zig");
+    const alloc = std.testing.allocator;
+    const initial =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"padding":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    const checked =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"padding":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    try std.testing.expect(try planner.requiresActivation(alloc, checked));
+    try std.testing.expect(!try planner.requiresCoordination(alloc, checked));
+    for ([_]bool{ false, true }) |race_repair| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/check", .{tmp.sub_path});
+        const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 700, .shard_id = 701 }, .primary_backend = .{ .lsm = .{} } };
+        var db = try db_mod.DB.open(alloc, path, options);
+        defer db.close();
+        try db.setSchemaJson(alloc, initial);
+        const padding = try alloc.alloc(u8, 1024 * 1024 + 1);
+        defer alloc.free(padding);
+        @memset(padding, 'x');
+        const row = try std.fmt.allocPrint(alloc, "{{\"id\":-1,\"padding\":\"{s}\"}}", .{padding});
+        defer alloc.free(row);
+        try db.batch(.{ .timestamp_ns = 100, .writes = &.{.{ .key = "a", .value = row }} });
+        try db.setSchemaJson(alloc, checked);
+        const Fixture = struct {
+            db: *db_mod.DB,
+            race_repair: bool,
+            attempts: u8 = 0,
+            fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, consistency: read_gate.ReadConsistency) !?reads.LookupResponse {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                try std.testing.expectEqual(read_gate.ReadConsistency.read_index, consistency);
+                const result = (try self.db.lookup(allocator, key, opts)) orelse return null;
+                return .{ .json = result.json, .version = result.version orelse try self.db.getTimestamp(allocator, key), .expected_content_digest = result.expected_content_digest };
+            }
+            fn commit(ptr: *anyopaque, _: Allocator, requests: []const contract.TableCommitRequest, _: types.SyncLevel, cancellation: CancellationToken) !?contract.CommitOutcome {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                try cancellation.check();
+                try std.testing.expectEqual(@as(usize, 1), requests.len);
+                const request = requests[0];
+                if (request.relational_activation) |command| if (!command.retry and (try activation.Progress.decode(command.next)).state == .invalid) {
+                    try std.testing.expect(request.predicates.len != 0);
+                    try std.testing.expect(request.predicates[0].expected_content_digest != null);
+                    if (self.race_repair) {
+                        self.race_repair = false;
+                        // Same timestamp: only the physical content guard can
+                        // distinguish this repair from the observed bad row.
+                        try self.db.batch(.{ .timestamp_ns = 100, .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} });
+                    }
+                };
+                self.attempts += 1;
+                const stamp = @as(u64, self.attempts) * 1000;
+                const txn = try self.db.beginTransactionWithId(@splat(self.attempts), stamp);
+                self.db.writeTransaction(txn, .{
+                    .relational_schema_version = request.relational_schema_version,
+                    .relational_integrity_generation_set = request.relational_integrity_generation_set,
+                    .relational_repair = request.relational_repair,
+                    .writes = request.writes,
+                    .deletes = request.deletes,
+                    .predicates = request.predicates,
+                    .relational_activation = request.relational_activation,
+                }) catch |err| {
+                    try self.db.abortTransaction(txn, stamp + 1);
+                    return err;
+                };
+                try self.db.commitTransaction(txn, stamp + 1);
+                return .{ .committed = .{ .participant_count = 1 } };
+            }
+        };
+        var fixture: Fixture = .{ .db = &db, .race_repair = race_repair };
+        const reader: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } };
+        const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = undefined, .commit_batch_with_cancellation = Fixture.commit } };
+        const tables = [_]records.TableRecord{.{ .table_id = 700, .name = "rows", .placement_role = "data", .schema_json = checked }};
+        const owners = [_]records.RangeRecord{.{ .group_id = 701, .table_id = 700, .start_key = "" }};
+        if (race_repair) {
+            try std.testing.expectError(error.VersionConflict, runPage(alloc, reader, writer, &tables, &owners, owners[0]));
+        } else {
+            try std.testing.expect(try runPage(alloc, reader, writer, &tables, &owners, owners[0]));
+        }
+        {
+            const raw = (try db.core.getStoreValue(alloc, activation.key)).?;
+            defer alloc.free(raw);
+            const progress = try activation.Progress.decode(raw);
+            try std.testing.expectEqual(if (race_repair) activation.State.validating else activation.State.invalid, progress.state);
+            try std.testing.expectEqual(activation.Phase.check, progress.phase);
+            if (!race_repair) try std.testing.expectEqualStrings("CHECK positive: RelationalCheckViolation", progress.failure);
+        }
+        db.close();
+        db = try db_mod.DB.open(alloc, path, options);
+        if (!race_repair) {
+            try std.testing.expectError(error.RelationalCheckViolation, planner.prepareRepair(alloc, reader, &tables, &owners, .{ .table_name = "rows", .relational_schema_version = 2, .writes = &.{.{ .key = "a", .value = "{\"id\":-1}" }} }, .{}));
+            var repair = try planner.prepareRepair(alloc, reader, &tables, &owners, .{ .table_name = "rows", .relational_schema_version = 2, .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} }, .{});
+            defer repair.deinit();
+            _ = (try writer.commitBatchWithCancellation(alloc, repair.tables, .write, .none)).?;
+            try std.testing.expectError(error.PreparedGenerationChanged, @import("relational_constraint_recovery.zig").retry(alloc, reader, writer, &tables, &owners, .{ .table_name = "rows", .relational_schema_version = 1 }, .{}));
+            try @import("relational_constraint_recovery.zig").retry(alloc, reader, writer, &tables, &owners, .{ .table_name = "rows", .relational_schema_version = 2 }, .{});
+            try @import("relational_constraint_recovery.zig").retry(alloc, reader, writer, &tables, &owners, .{ .table_name = "rows", .relational_schema_version = 2 }, .{});
+        }
+        for (0..8) |_| {
+            if (!try runPage(alloc, reader, writer, &tables, &owners, owners[0])) break;
+        } else return error.ActivationDidNotConverge;
+        const raw = (try db.core.getStoreValue(alloc, activation.key)).?;
+        defer alloc.free(raw);
+        try std.testing.expectEqual(activation.State.enforced, (try activation.Progress.decode(raw)).state);
+        // CHECK changes reset the same durable coverage identity without
+        // routed-claim retirement; removing all CHECKs retires the proof.
+        const changed_version = try std.mem.replaceOwned(u8, alloc, checked, "\"version\":2", "\"version\":3");
+        defer alloc.free(changed_version);
+        const changed = try std.mem.replaceOwned(u8, alloc, changed_version, "\"value\":0", "\"value\":2");
+        defer alloc.free(changed);
+        try db.setSchemaJson(alloc, changed);
+        const changed_tables = [_]records.TableRecord{.{ .table_id = 700, .name = "rows", .placement_role = "data", .schema_json = changed }};
+        for (0..16) |_| {
+            try std.testing.expect(try runPage(alloc, reader, writer, &changed_tables, &owners, owners[0]));
+            const progress_raw = (try db.core.getStoreValue(alloc, activation.key)).?;
+            defer alloc.free(progress_raw);
+            if ((try activation.Progress.decode(progress_raw)).state != .validating) break;
+        } else return error.ActivationDidNotConverge;
+        const changed_raw = (try db.core.getStoreValue(alloc, activation.key)).?;
+        defer alloc.free(changed_raw);
+        try std.testing.expectEqual(activation.State.invalid, (try activation.Progress.decode(changed_raw)).state);
+        const removed = try std.mem.replaceOwned(u8, alloc, initial, "\"version\":1", "\"version\":4");
+        defer alloc.free(removed);
+        try db.setSchemaJson(alloc, removed);
+        try std.testing.expectEqual(@as(?[]u8, null), try db.core.getStoreValue(alloc, activation.key));
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"id\":-1}" }} });
+    }
+}
+
+test "distributed txn CHECK coverage identity is typed order independent and layout independent" {
+    const schema_api = @import("../schema/mod.zig");
+    const alloc = std.testing.allocator;
+    const first =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0},{"name":"bounded","column":"id","op":"lt","value":10}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const equivalent =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","checks":[{"name":"bounded","column":"id","op":"lt","value":"10"},{"name":"positive","column":"id","op":"gt","value":"0"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"extra":{"type":"keyword"},"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var a = try schema_api.CompiledTableValidator.init(alloc, first);
+    defer a.deinit(alloc);
+    var b = try schema_api.CompiledTableValidator.init(alloc, equivalent);
+    defer b.deinit(alloc);
+    const expected = a.execution.checks.?.fingerprint();
+    try std.testing.expectEqualSlices(u8, &expected, &b.execution.checks.?.fingerprint());
+    const changed = try std.mem.replaceOwned(u8, alloc, equivalent, "\"value\":\"10\"", "\"value\":\"11\"");
+    defer alloc.free(changed);
+    var c = try schema_api.CompiledTableValidator.init(alloc, changed);
+    defer c.deinit(alloc);
+    try std.testing.expect(!std.mem.eql(u8, &expected, &c.execution.checks.?.fingerprint()));
 }

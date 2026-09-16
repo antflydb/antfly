@@ -452,7 +452,7 @@ pub fn parseRetireRelationalConstraintsBody(allocator: std.mem.Allocator, body: 
     return std.json.parseFromSlice(types.RelationalConstraintRetirementRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Restart failed UNIQUE/FK validation after administrative repair
+/// Restart failed UNIQUE/FK/CHECK validation after administrative repair
 pub const RetryRelationalConstraintsPathParams = struct {
     table_name: []const u8,
 };
@@ -462,7 +462,7 @@ pub fn parseRetryRelationalConstraintsBody(allocator: std.mem.Allocator, body: [
     return std.json.parseFromSlice(types.RelationalConstraintRetryRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Read distributed unique and foreign-key validation coverage
+/// Read distributed UNIQUE, foreign-key, and CHECK validation coverage
 pub const GetRelationalConstraintStatusPathParams = struct {
     table_name: []const u8,
 };
@@ -583,6 +583,28 @@ pub const ExecuteGraphMetricActionPathParams = struct {
     /// Operational action to apply to the graph metric materialization
     action: []const u8,
 };
+
+/// Repair an index generation
+pub const RepairIndexPathParams = struct {
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
+/// Parse the JSON request body for repairIndex.
+pub fn parseRepairIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexMaintenanceRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retry a failed index build
+pub const RetryIndexPathParams = struct {
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
+/// Parse the JSON request body for retryIndex.
+pub fn parseRetryIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexMaintenanceRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
 
 /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 pub const LinearMergePathParams = struct {
@@ -711,6 +733,11 @@ pub const UpdateSchemaPathParams = struct {
     table_name: []const u8,
 };
 
+pub const UpdateSchemaParams = struct {
+    /// Explicitly enqueue a durable fresh-generation schema rewrite instead of changing the live schema. Requires administrator permission on the entire dependency cohort. Sources remain writable during snapshot and catch-up; final validation and publication are atomic across the cohort. Returns a restore job (202), whose existing status/cancel routes apply. Independent graph/vector artifacts without a retained row-derived source proof are rejected before admission. The default false retains ordinary schema-update behavior. Existing absent values remain absent rather than retroactively receiving defaults. Stored column type changes and destructive column removal are rejected.
+    rewrite: ?[]const u8 = null,
+};
+
 /// Parse the JSON request body for updateSchema.
 pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_schema_openapi.TableSchema) {
     return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
@@ -720,6 +747,11 @@ pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !st
 pub const PatchSchemaPathParams = struct {
     /// Name of the table
     table_name: []const u8,
+};
+
+pub const PatchSchemaParams = struct {
+    /// Explicitly enqueue a durable fresh-generation schema rewrite instead of changing the live schema. Requires administrator permission on the entire dependency cohort. Sources remain writable during snapshot and catch-up; final validation and publication are atomic across the cohort. Returns a restore job (202), whose existing status/cancel routes apply. Independent graph/vector artifacts without a retained row-derived source proof are rejected before admission. The default false retains ordinary schema-update behavior. Existing absent values remain absent rather than retroactively receiving defaults. Stored column type changes and destructive column removal are rejected.
+    rewrite: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for patchSchema.
@@ -895,6 +927,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "dropIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairIndex", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/control-jobs", .operation_id = "startTableRepairControlJob", .request_body = .buffered, .streaming_response = false },
@@ -997,6 +1031,8 @@ pub const routes = [_]Route{
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn repairIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn retryIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn startTableRepairControlJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
@@ -1009,8 +1045,8 @@ pub const routes = [_]Route{
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn mutateRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn queryRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: UpdateSchemaParams) !httpx.Response
+//   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: PatchSchemaParams) !httpx.Response
 //   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response

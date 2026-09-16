@@ -81,10 +81,21 @@ def sync_detailed(
 
     Args:
         table_name (str):
-        body (RelationalRowQueryRequest): Bounded relational scan in primary-key order. Each shard
-            read pins an
-            immutable schema and row snapshot. Resume with the last returned _id
-            as from; a resumed request opens a fresh snapshot, not a retained cursor.
+        body (RelationalRowQueryRequest): Bounded relational scan in primary-key order, or
+            composite index order
+            when index is supplied. Index queries require schema_version and every
+            owning shard must have the selected generation ready. Partial indexes
+            require their WHERE predicates to be implied by the query conditions.
+            The bounded proof combines per-column equality, tighter ranges,
+            exclusions, and NULL-aware predicates using exact typed values and
+            matching collations. Unsupported implications fail closed. Explicit
+            scan bounds alone are not an implication proof. Equal tuples are
+            ordered by primary key. Each shard read pins its own immutable schema
+            and row snapshot; this is not a table-wide consistent snapshot.
+            Resume with the last returned _id as from for primary scans, or its
+            cursor as after for index scans. A resumed request opens a fresh snapshot,
+            not a retained cursor; concurrent mutations may move rows across the
+            continuation boundary. Keep index, bounds and conditions unchanged when paging.
             An empty projection returns row identities and versions only.
 
     Raises:
@@ -117,10 +128,21 @@ def sync(
 
     Args:
         table_name (str):
-        body (RelationalRowQueryRequest): Bounded relational scan in primary-key order. Each shard
-            read pins an
-            immutable schema and row snapshot. Resume with the last returned _id
-            as from; a resumed request opens a fresh snapshot, not a retained cursor.
+        body (RelationalRowQueryRequest): Bounded relational scan in primary-key order, or
+            composite index order
+            when index is supplied. Index queries require schema_version and every
+            owning shard must have the selected generation ready. Partial indexes
+            require their WHERE predicates to be implied by the query conditions.
+            The bounded proof combines per-column equality, tighter ranges,
+            exclusions, and NULL-aware predicates using exact typed values and
+            matching collations. Unsupported implications fail closed. Explicit
+            scan bounds alone are not an implication proof. Equal tuples are
+            ordered by primary key. Each shard read pins its own immutable schema
+            and row snapshot; this is not a table-wide consistent snapshot.
+            Resume with the last returned _id as from for primary scans, or its
+            cursor as after for index scans. A resumed request opens a fresh snapshot,
+            not a retained cursor; concurrent mutations may move rows across the
+            continuation boundary. Keep index, bounds and conditions unchanged when paging.
             An empty projection returns row identities and versions only.
 
     Raises:
@@ -148,10 +170,21 @@ async def asyncio_detailed(
 
     Args:
         table_name (str):
-        body (RelationalRowQueryRequest): Bounded relational scan in primary-key order. Each shard
-            read pins an
-            immutable schema and row snapshot. Resume with the last returned _id
-            as from; a resumed request opens a fresh snapshot, not a retained cursor.
+        body (RelationalRowQueryRequest): Bounded relational scan in primary-key order, or
+            composite index order
+            when index is supplied. Index queries require schema_version and every
+            owning shard must have the selected generation ready. Partial indexes
+            require their WHERE predicates to be implied by the query conditions.
+            The bounded proof combines per-column equality, tighter ranges,
+            exclusions, and NULL-aware predicates using exact typed values and
+            matching collations. Unsupported implications fail closed. Explicit
+            scan bounds alone are not an implication proof. Equal tuples are
+            ordered by primary key. Each shard read pins its own immutable schema
+            and row snapshot; this is not a table-wide consistent snapshot.
+            Resume with the last returned _id as from for primary scans, or its
+            cursor as after for index scans. A resumed request opens a fresh snapshot,
+            not a retained cursor; concurrent mutations may move rows across the
+            continuation boundary. Keep index, bounds and conditions unchanged when paging.
             An empty projection returns row identities and versions only.
 
     Raises:
@@ -182,10 +215,21 @@ async def asyncio(
 
     Args:
         table_name (str):
-        body (RelationalRowQueryRequest): Bounded relational scan in primary-key order. Each shard
-            read pins an
-            immutable schema and row snapshot. Resume with the last returned _id
-            as from; a resumed request opens a fresh snapshot, not a retained cursor.
+        body (RelationalRowQueryRequest): Bounded relational scan in primary-key order, or
+            composite index order
+            when index is supplied. Index queries require schema_version and every
+            owning shard must have the selected generation ready. Partial indexes
+            require their WHERE predicates to be implied by the query conditions.
+            The bounded proof combines per-column equality, tighter ranges,
+            exclusions, and NULL-aware predicates using exact typed values and
+            matching collations. Unsupported implications fail closed. Explicit
+            scan bounds alone are not an implication proof. Equal tuples are
+            ordered by primary key. Each shard read pins its own immutable schema
+            and row snapshot; this is not a table-wide consistent snapshot.
+            Resume with the last returned _id as from for primary scans, or its
+            cursor as after for index scans. A resumed request opens a fresh snapshot,
+            not a retained cursor; concurrent mutations may move rows across the
+            continuation boundary. Keep index, bounds and conditions unchanged when paging.
             An empty projection returns row identities and versions only.
 
     Raises:

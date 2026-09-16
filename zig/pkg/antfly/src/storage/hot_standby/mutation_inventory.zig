@@ -45,6 +45,7 @@ pub const Surface = enum {
     table_catalog,
     table_schema,
     table_index,
+    index_maintenance,
     artifact_enrichment,
     extension_catalog,
     cluster_restore,
@@ -87,6 +88,7 @@ const post_delete = &[_]http_common.Method{ .POST, .DELETE };
 const post_put_delete = &[_]http_common.Method{ .POST, .PUT, .DELETE };
 
 pub const entries = [_]Entry{
+    .{ .surface = .index_maintenance, .disposition = .remote_apply, .path_pattern = "/tables/{table}/indexes/{index}/{retry|repair}", .methods = post, .reason = "generation-fenced desired maintenance tickets enter the synchronous transaction mutation mirror" },
     .{ .surface = .document_batch, .disposition = .remote_apply, .path_pattern = "/tables/{table}/batch", .methods = post, .reason = "logical batch records enter the synchronous HA mutation mirror before local acknowledgement" },
     .{ .surface = .document_merge, .disposition = .remote_apply, .path_pattern = "/tables/{table}/merge", .methods = post, .reason = "merge writes use the same synchronous HA mutation mirror as batch writes" },
     .{ .surface = .auth_user, .disposition = .reject, .path_pattern = "/auth/v1/users/{user}", .methods = post_delete, .reason = "the live user store is not part of continuous replication" },
@@ -205,6 +207,7 @@ pub fn classify(method: http_common.Method, path: []const u8) ?Classification {
     if (routes.Routes.matchTableArtifactEnrichment(path) != null) return rejected(.artifact_enrichment);
     if (routes.Routes.matchTableSchema(path) != null) return rejected(.table_schema);
     if (routes.Routes.matchTableIndex(path) != null) return rejected(.table_index);
+    if (method == .POST and routes.Routes.matchTableIndexMaintenance(path) != null) return classified(.index_maintenance, .remote_apply);
     if (routes.Routes.matchTablePath(path) != null) return rejected(.table_catalog);
     if (std.mem.eql(u8, path, routes.Routes.mcp_v1) or
         std.mem.startsWith(u8, path, routes.Routes.mcp_v1_prefix) or
@@ -272,6 +275,16 @@ test "hot-standby mutation classifier covers acknowledged security catalog and w
         try std.testing.expectEqual(case.surface, actual.surface);
         try std.testing.expectEqual(Disposition.reject, actual.disposition);
     }
+}
+
+test "index maintenance desired tickets require RemoteApply and unsupported verbs fail closed" {
+    for ([_][]const u8{ "/tables/docs/indexes/by_id/retry", "/tables/docs/indexes/by_id/repair" }) |path| {
+        const actual = classify(.POST, path).?;
+        try std.testing.expectEqual(Surface.index_maintenance, actual.surface);
+        try std.testing.expectEqual(Disposition.remote_apply, actual.disposition);
+        try std.testing.expectEqual(Disposition.reject, classify(.DELETE, path).?.disposition);
+    }
+    try std.testing.expectEqual(Disposition.reject, classify(.POST, "/tables/docs/indexes/by_id/retry/extra").?.disposition);
 }
 
 test "hot-standby background producer inventory freezes local state and mirrors logical DB effects" {

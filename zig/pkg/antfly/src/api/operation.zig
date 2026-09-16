@@ -145,6 +145,22 @@ pub const RequestContext = struct {
             if (now_ns >= deadline) return error.DeadlineExceeded;
         }
     }
+
+    /// Preserve remaining time when entering native owners or HTTP timeout
+    /// APIs, whose absolute clock is platform monotonic rather than Io awake.
+    pub fn platformDeadline(self: RequestContext) !RequestContext {
+        try self.ensureActive();
+        const deadline = self.deadline_ns orelse return self;
+        const borrow = self.deadline_io orelse return self;
+        const platform_now = platform_time.monotonicNs();
+        var receiver = try borrow.receive();
+        const source_now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
+        if (source_now >= deadline) return error.DeadlineExceeded;
+        var normalized = self;
+        normalized.deadline_ns = platform_now +| (deadline - source_now);
+        normalized.deadline_io = null;
+        return normalized;
+    }
 };
 
 pub const TableWriteAuthorization = struct {

@@ -76,8 +76,8 @@ pub fn requireMutableScope(alloc: Allocator, txn: anytype, expected: ?Digest) !v
 }
 
 /// Internal PreparedRow import admission, consumed under the DB apply fence.
-pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest };
-pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission, row_count: usize) !void {
+pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0 };
+pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission, row_count: usize, delete_count: usize) !void {
     const raw = (try optional(txn)) orelse return error.RestoreStagingScopeChanged;
     if (!std.mem.eql(u8, &digest(raw), &admission.expected)) return error.RestoreStagingProgressChanged;
     var before = try Progress.decode(alloc, raw);
@@ -89,9 +89,35 @@ pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission,
     defer after.deinit();
     if (before.value.phase != .importing or (after.value.phase != .importing and after.value.phase != .imported) or
         !std.mem.eql(u8, &before.value.scope.digest(), &admission.scope) or !std.mem.eql(u8, &after.value.scope.digest(), &admission.scope) or
-        after.value.rows != std.math.add(u64, before.value.rows, row_count) catch return error.InvalidRestoreStagingCommand)
+        after.value.rows != std.math.add(u64, before.value.rows, row_count +| delete_count) catch return error.InvalidRestoreStagingCommand)
         return error.InvalidRestoreStagingCommand;
-    if (after.value.phase == .importing and std.mem.order(u8, after.value.cursor, before.value.cursor) != .gt) return error.InvalidRestoreStagingCommand;
+    if (admission.rewrite != (before.value.scope.rewrite != null)) return error.InvalidRestoreStagingCommand;
+    if (!admission.rewrite) {
+        if (delete_count != 0 or admission.source_effects != 0 or (after.value.phase == .importing and std.mem.order(u8, after.value.cursor, before.value.cursor) != .gt)) return error.InvalidRestoreStagingCommand;
+        return;
+    }
+    const previous = before.value.rewrite orelse return error.InvalidRestoreStagingCommand;
+    const next = after.value.rewrite orelse return error.InvalidRestoreStagingCommand;
+    if (previous.final_cut != null) return error.InvalidRestoreStagingCommand;
+    if (!previous.snapshot_complete) {
+        if (delete_count != 0 or admission.source_effects != 0 or next.sequence != previous.sequence or next.frame_offset != 0 or next.final_cut != null or
+            (row_count != 0 and std.mem.order(u8, after.value.cursor, before.value.cursor) != .gt) or
+            (!next.snapshot_complete and std.mem.order(u8, after.value.cursor, before.value.cursor) != .gt)) return error.InvalidRestoreStagingCommand;
+    } else {
+        if (!next.snapshot_complete or !std.mem.eql(u8, before.value.cursor, after.value.cursor)) return error.InvalidRestoreStagingCommand;
+        const effects = admission.source_effects;
+        if (effects < row_count +| delete_count or effects > 1024) return error.InvalidRestoreStagingCommand;
+        if (next.final_cut != null) {
+            if (effects != 0 or next.sequence != previous.sequence or previous.frame_offset != 0 or after.value.phase != .imported) return error.InvalidRestoreStagingCommand;
+        } else if (next.sequence == previous.sequence) {
+            if (effects == 0 or next.frame_offset <= previous.frame_offset or next.frame_remaining == 0) return error.InvalidRestoreStagingCommand;
+            if (previous.frame_offset != 0 and (!std.mem.eql(u8, &previous.frame_digest, &next.frame_digest) or
+                previous.frame_remaining != next.frame_remaining +| effects)) return error.InvalidRestoreStagingCommand;
+        } else {
+            if (next.sequence != (std.math.add(u64, previous.sequence, 1) catch return error.InvalidRestoreStagingCommand) or
+                effects == 0 or next.frame_offset != 0 or (previous.frame_offset != 0 and effects != previous.frame_remaining)) return error.InvalidRestoreStagingCommand;
+        }
+    }
 }
 
 pub fn initialCoverage(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catalog) !?[]u8 {
@@ -101,9 +127,7 @@ pub fn initialCoverage(alloc: Allocator, txn: anytype, catalog: catalog_mod.Cata
     progress.cursor = "";
     progress.rows_scanned = 0;
     progress.failure = "";
-    progress.phase = for (catalog.bindings) |binding| {
-        if (!binding.retired and binding.definition.kind == .unique) break .unique;
-    } else .foreign_key;
+    progress.phase = @import("relational_integrity_activation_contract.zig").firstPhase(catalog);
     return try progress.encode(alloc);
 }
 

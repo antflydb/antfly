@@ -158,6 +158,67 @@ describe("CreateIndexDialog", () => {
     });
   });
 
+  it("creates a composite partial relational index through Raw JSON without visual form validation", async () => {
+    render(
+      <CreateIndexDialog
+        open
+        onClose={() => undefined}
+        tableName="rows"
+        onIndexCreated={() => undefined}
+        schema={null}
+        artifactSourcesSupported={false}
+      />
+    );
+    const config = {
+      name: "open_rows",
+      type: "relational",
+      keys: [{ column: "tenant" }, { column: "id", direction: "desc" }],
+      include_columns: ["status"],
+      where: [{ column: "status", op: "eq", value: "open" }],
+    };
+    fireEvent.click(screen.getByRole("switch"));
+    fireEvent.change(screen.getByLabelText("Advanced index JSON"), {
+      target: { value: JSON.stringify(config) },
+    });
+    expect(screen.getByText("Create a new relational index for your table.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(mocks.createIndex).toHaveBeenCalledOnce());
+    const { name, ...request } = config;
+    expect(mocks.createIndex).toHaveBeenCalledWith("rows", name, request);
+  });
+
+  it("rejects malformed relational JSON before submitting an index", () => {
+    for (const extra of [
+      { keys: [] },
+      { where: [{ column: "id", op: "sql", value: "id > 0" }] },
+      { where: [{ column: "id", op: "eq", value: [] }] },
+      { where: [{ column: "id", op: "is_null", value: 1 }] },
+      { include_columns: ["id"] },
+      { source: { artifact: "text" } },
+    ]) {
+      expect(() =>
+        parseAdvancedIndexConfig(
+          JSON.stringify({
+            name: "partial",
+            type: "relational",
+            keys: [{ column: "id" }],
+            ...extra,
+          })
+        )
+      ).toThrow();
+    }
+    expect(
+      parseAdvancedIndexConfig(
+        JSON.stringify({
+          name: "partial",
+          type: "relational",
+          keys: [{ column: "id" }],
+          where: [{ column: "id", op: "gt", value: "9007199254740993" }],
+        })
+      ).type
+    ).toBe("relational");
+  });
+
   it("normalizes direct document-field graph edge types", () => {
     expect(
       buildGraphEdgeTypeConfig({

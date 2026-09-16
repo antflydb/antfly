@@ -140,6 +140,9 @@ pub const TableReadSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    /// Provider guarantees read_index never downgrades to a stale read. Only
+    /// such a successful lookup may certify absence to another replica.
+    strict_read_index_absence: bool = false,
     /// Set only by authenticated group-local ingress. When present, dispatch
     /// must use a routed callback; silently falling back would reintroduce an
     /// admin-snapshot identity race.

@@ -241,6 +241,8 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
 }
 
 pub fn mapError(err: anyerror) ErrorCode {
+    if (@import("../schema/relational_expression_errors.zig").isInvalidInput(err)) return .invalid_argument;
+    if (err == error.GeneratedColumnRewriteRequired) return .intent_conflict;
     return switch (err) {
         error.VersionConflict => .version_conflict,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,

@@ -13,6 +13,8 @@ from antfly import (  # noqa: E402
     AntflyClient,
     AntflyException,
     CreatedEmbeddingsIndex,
+    CreatedRelationalIndex,
+    CreateRelationalIndexRequest,
     CreateEmbeddingsIndexRequest,
     CreateEmbeddingsIndexRequestType,
     IndexMutationTemporarilyUnavailableError,
@@ -403,10 +405,51 @@ class TestAntflyClient:
             },
         )
 
+    @patch("antfly.client.Client")
+    def test_create_relational_index_uses_shared_route(self, mock_client_class: MagicMock) -> None:
+        keys = [{"column": "tenant"}, {"column": "created_at", "direction": "desc", "nulls": "last"}]
+        mock_httpx = MagicMock()
+        configure_response(mock_httpx, 201, {"name": "recent", "type": "relational", "keys": keys})
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+        client = AntflyClient(base_url="http://localhost:8080")
+        request = CreateRelationalIndexRequest.from_dict({"type": "relational", "keys": keys})
+        result = client.indexes.create("orders", "recent", request)
+        assert isinstance(result, CreatedRelationalIndex)
+        assert [key.column for key in result.keys] == ["tenant", "created_at"]
+        assert result.keys[1].direction.value == "desc"
+        mock_httpx.stream.assert_called_once_with("POST", "/db/v1/tables/orders/indexes/recent", json=request.to_dict())
+
     def test_create_index_rejects_duplicate_body_identity(self) -> None:
         client = AntflyClient(base_url="http://localhost:8080")
         with pytest.raises(ValueError, match="owned by the path"):
             client.indexes.create("docs", "search", {"name": "other", "type": "full_text"})
+
+    @patch("antfly.client.Client")
+    def test_expression_index_generated_model_uses_shared_route(self, mock_client_class: MagicMock) -> None:
+        keys = [
+            {"column": "tenant"},
+            {
+                "expression": {
+                    "op": "add",
+                    "args": [
+                        {"op": "column", "column": "id"},
+                        {"op": "literal", "type": "integer", "value": "9007199254740993"},
+                    ],
+                },
+                "result_type": "integer",
+            },
+        ]
+        mock_httpx = MagicMock()
+        configure_response(mock_httpx, 201, {"name": "computed", "type": "relational", "keys": keys})
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+        client = AntflyClient(base_url="http://localhost:8080")
+        request = CreateRelationalIndexRequest.from_dict({"type": "relational", "keys": keys})
+        result = client.indexes.create("orders", "computed", request)
+        assert isinstance(result, CreatedRelationalIndex)
+        assert result.to_dict()["keys"] == keys
+        mock_httpx.stream.assert_called_once_with(
+            "POST", "/db/v1/tables/orders/indexes/computed", json=request.to_dict()
+        )
 
     @patch("antfly.client.Client")
     def test_create_index_rejects_invalid_relationships_before_transport(self, mock_client_class: MagicMock) -> None:

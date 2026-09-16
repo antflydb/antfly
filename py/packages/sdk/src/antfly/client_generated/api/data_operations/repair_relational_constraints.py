@@ -95,7 +95,7 @@ def sync_detailed(
     """Repair version-conditional rows after failed constraint activation
 
      Requires table administrator permission. Each affected target range must
-    have failed UNIQUE/FK activation. Replacement values still satisfy all
+    have failed UNIQUE/FK/CHECK activation. Replacement values still satisfy all
     constraints, and referential actions require write permission on every
     affected table. Existing dependencies remain protected. Repairs do not
     mark historical coverage valid; invoke constraint retry after repairs.
@@ -134,7 +134,7 @@ def sync(
     """Repair version-conditional rows after failed constraint activation
 
      Requires table administrator permission. Each affected target range must
-    have failed UNIQUE/FK activation. Replacement values still satisfy all
+    have failed UNIQUE/FK/CHECK activation. Replacement values still satisfy all
     constraints, and referential actions require write permission on every
     affected table. Existing dependencies remain protected. Repairs do not
     mark historical coverage valid; invoke constraint retry after repairs.
@@ -168,7 +168,7 @@ async def asyncio_detailed(
     """Repair version-conditional rows after failed constraint activation
 
      Requires table administrator permission. Each affected target range must
-    have failed UNIQUE/FK activation. Replacement values still satisfy all
+    have failed UNIQUE/FK/CHECK activation. Replacement values still satisfy all
     constraints, and referential actions require write permission on every
     affected table. Existing dependencies remain protected. Repairs do not
     mark historical coverage valid; invoke constraint retry after repairs.
@@ -205,7 +205,7 @@ async def asyncio(
     """Repair version-conditional rows after failed constraint activation
 
      Requires table administrator permission. Each affected target range must
-    have failed UNIQUE/FK activation. Replacement values still satisfy all
+    have failed UNIQUE/FK/CHECK activation. Replacement values still satisfy all
     constraints, and referential actions require write permission on every
     affected table. Existing dependencies remain protected. Repairs do not
     mark historical coverage valid; invoke constraint retry after repairs.

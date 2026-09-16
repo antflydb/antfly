@@ -13597,6 +13597,7 @@ pub fn isInvalidBackupManifestError(err: anyerror) bool {
         error.ValueTooLong,
         error.BufferUnderrun,
         error.UnsupportedBackupFormat,
+        error.SourceCopyRestoreUnsupported,
         error.InvalidBackupId,
         error.InvalidBackupRequest,
         error.IncompleteClusterBackup,

@@ -50,6 +50,10 @@ pub const ClientGenerator = struct {
                     needs_raw = true;
                 }
                 const op_id = op.operation_id orelse continue;
+                if (!shared.isStreamingOrBinaryResponse(op)) {
+                    const responses = try shared.successSchemas(self.arena, self.resolver, op);
+                    if (responses.len > 1) try self.generateSuccessUnion(op_id, responses);
+                }
                 const params = try shared.collectParameters(self.arena, self.resolver, path_item.parameters, op.parameters);
                 if (params.query.len > 0) {
                     try shared.generateQueryParamsStruct(self.arena, self.w, op_id, params.query);
@@ -140,7 +144,8 @@ pub const ClientGenerator = struct {
         try self.w.line("if (resp.status.code == 204 or resp.status.code == 205) return .{{ .status_code = resp.status.code, .allocator = allocator }};", .{});
         try self.w.line("if (resp.body) |body| {{", .{});
         self.w.indent();
-        try self.w.line("const parsed = std.json.parseFromSlice(T, allocator, body, .{{ .allocate = .alloc_always, .ignore_unknown_fields = true }}) catch |err| {{", .{});
+        try self.w.line("const parse_result = if (comptime @typeInfo(T) == .@\"union\" and @hasDecl(T, \"parseResponse\")) T.parseResponse(allocator, resp.status.code, body) else std.json.parseFromSlice(T, allocator, body, .{{ .allocate = .alloc_always, .ignore_unknown_fields = true }});", .{});
+        try self.w.line("const parsed = parse_result catch |err| {{", .{});
         self.w.indent();
         try self.w.line("return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidApiResponse;", .{});
         self.w.dedent();
@@ -197,7 +202,10 @@ pub const ClientGenerator = struct {
         const is_raw = shared.isStreamingOrBinaryResponse(op);
 
         // Determine response type
-        const response_type = if (is_raw) null else try shared.getSuccessResponseType(self.arena, self.resolver, self.type_gen, op);
+        const response_type = if (is_raw) null else if ((try shared.successSchemas(self.arena, self.resolver, op)).len > 1)
+            try std.fmt.allocPrint(self.arena, "{s}Response", .{try naming.toTypeName(self.arena, op_id)})
+        else
+            try shared.getSuccessResponseType(self.arena, self.resolver, self.type_gen, op);
 
         // Doc comment
         if (op.summary) |summary| try self.w.docComment(summary);
@@ -334,6 +342,42 @@ pub const ClientGenerator = struct {
     }
 
     /// Generate query parameter append code.
+    fn generateSuccessUnion(self: *ClientGenerator, op_id: []const u8, responses: []const shared.SuccessSchema) !void {
+        try self.w.line("/// Success payload selected by HTTP status, never by trial-decoding another status's schema.", .{});
+        try self.w.line("pub const {s}Response = union(enum) {{", .{try naming.toTypeName(self.arena, op_id)});
+        self.w.indent();
+        for (responses) |response| {
+            try self.w.line("status_{s}: {s},", .{ response.code, try shared.successSchemaType(self.arena, self.type_gen, op_id, response) });
+        }
+        try self.w.line("pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {{", .{});
+        self.w.indent();
+        try self.w.line("const arena = try allocator.create(std.heap.ArenaAllocator);", .{});
+        try self.w.line("errdefer allocator.destroy(arena);", .{});
+        try self.w.line("arena.* = std.heap.ArenaAllocator.init(allocator);", .{});
+        try self.w.line("errdefer arena.deinit();", .{});
+        try self.w.line("const value: @This() = switch (status) {{", .{});
+        self.w.indent();
+        var wildcard: ?shared.SuccessSchema = null;
+        for (responses) |response| {
+            if (std.mem.eql(u8, response.code, "2XX")) {
+                wildcard = response;
+                continue;
+            }
+            try self.w.line("{s} => .{{ .status_{s} = try std.json.parseFromSliceLeaky({s}, arena.allocator(), body, .{{ .allocate = .alloc_always, .ignore_unknown_fields = true }}) }},", .{ response.code, response.code, try shared.successSchemaType(self.arena, self.type_gen, op_id, response) });
+        }
+        if (wildcard) |response| {
+            try self.w.line("else => if (status >= 200 and status < 300) .{{ .status_2XX = try std.json.parseFromSliceLeaky({s}, arena.allocator(), body, .{{ .allocate = .alloc_always, .ignore_unknown_fields = true }}) }} else return error.InvalidApiResponse,", .{try shared.successSchemaType(self.arena, self.type_gen, op_id, response)});
+        } else try self.w.line("else => return error.InvalidApiResponse,", .{});
+        self.w.dedent();
+        try self.w.line("}};", .{});
+        try self.w.line("return .{{ .arena = arena, .value = value }};", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}};", .{});
+        try self.w.blank();
+    }
+
     fn generateQueryParamAppend(self: *ClientGenerator, query_params: []const types.Parameter) !void {
         try self.w.line("var query_buf = std.ArrayListUnmanaged(u8).empty;", .{});
         try self.w.line("defer query_buf.deinit(self.allocator);", .{});

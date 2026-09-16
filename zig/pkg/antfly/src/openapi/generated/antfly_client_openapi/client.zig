@@ -22,7 +22,8 @@ pub fn ApiResponse(comptime T: type) type {
             if (resp.ok()) {
                 if (resp.status.code == 204 or resp.status.code == 205) return .{ .status_code = resp.status.code, .allocator = allocator };
                 if (resp.body) |body| {
-                    const parsed = std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+                    const parse_result = if (comptime @typeInfo(T) == .@"union" and @hasDecl(T, "parseResponse")) T.parseResponse(allocator, resp.status.code, body) else std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+                    const parsed = parse_result catch |err| {
                         return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidApiResponse;
                     };
                     return .{ .status_code = resp.status.code, .data = parsed, .allocator = allocator };
@@ -81,6 +82,24 @@ pub const ListTablesParams = struct {
     pattern: ?[]const u8 = null,
 };
 
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const CreateTableResponse = union(enum) {
+    status_200: types.Table,
+    status_202: types.CommittedMutationOutcome,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.Table, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CommittedMutationOutcome, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
 pub const LookupKeyParams = struct {
     /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
     fields: ?[]const u8 = null,
@@ -96,6 +115,52 @@ pub const ListDocumentArtifactManifestsParams = struct {
 pub const GetDocumentArtifactManifestParams = struct {
     /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
     detail: ?[]const u8 = null,
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const UpdateSchemaResponse = union(enum) {
+    status_200: types.Table,
+    status_202: types.OpenApiUpdateSchemaResponse202,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.Table, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.OpenApiUpdateSchemaResponse202, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
+pub const UpdateSchemaParams = struct {
+    /// Explicitly enqueue a durable fresh-generation schema rewrite instead of changing the live schema. Requires administrator permission on the entire dependency cohort. Sources remain writable during snapshot and catch-up; final validation and publication are atomic across the cohort. Returns a restore job (202), whose existing status/cancel routes apply. Independent graph/vector artifacts without a retained row-derived source proof are rejected before admission. The default false retains ordinary schema-update behavior. Existing absent values remain absent rather than retroactively receiving defaults. Stored column type changes and destructive column removal are rejected.
+    rewrite: ?[]const u8 = null,
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const PatchSchemaResponse = union(enum) {
+    status_200: types.Table,
+    status_202: types.OpenApiPatchSchemaResponse202,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.Table, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.OpenApiPatchSchemaResponse202, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
+pub const PatchSchemaParams = struct {
+    /// Explicitly enqueue a durable fresh-generation schema rewrite instead of changing the live schema. Requires administrator permission on the entire dependency cohort. Sources remain writable during snapshot and catch-up; final validation and publication are atomic across the cohort. Returns a restore job (202), whose existing status/cancel routes apply. Independent graph/vector artifacts without a retained row-derived source proof are rejected before admission. The default false retains ordinary schema-update behavior. Existing absent values remain absent rather than retroactively receiving defaults. Stored column type changes and destructive column removal are rejected.
+    rewrite: ?[]const u8 = null,
 };
 
 pub const CleanupTransactionSessionsParams = struct {
@@ -949,7 +1014,7 @@ pub const Client = struct {
 
     /// Create a new table
     /// POST /db/v1/tables/{tableName}
-    pub fn createTable(self: *@This(), table_name: []const u8, body: types.CreateTableRequest) !ApiResponse(types.Table) {
+    pub fn createTable(self: *@This(), table_name: []const u8, body: types.CreateTableRequest) !ApiResponse(CreateTableResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}", .{ self.base_url, encoded_table_name });
@@ -957,7 +1022,7 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
+        return ApiResponse(CreateTableResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Drop a table
@@ -1143,7 +1208,7 @@ pub const Client = struct {
         return ApiResponse(types.RelationalConstraintRetryResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Restart failed UNIQUE/FK validation after administrative repair
+    /// Restart failed UNIQUE/FK/CHECK validation after administrative repair
     /// POST /db/v1/tables/{tableName}/constraints/retry
     pub fn retryRelationalConstraints(self: *@This(), table_name: []const u8, body: types.RelationalConstraintRetryRequest) !ApiResponse(types.RelationalConstraintRetryResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
@@ -1156,7 +1221,7 @@ pub const Client = struct {
         return ApiResponse(types.RelationalConstraintRetryResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Read distributed unique and foreign-key validation coverage
+    /// Read distributed UNIQUE, foreign-key, and CHECK validation coverage
     /// GET /db/v1/tables/{tableName}/constraints/status
     pub fn getRelationalConstraintStatus(self: *@This(), table_name: []const u8) !ApiResponse(types.RelationalConstraintStatus) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
@@ -1376,6 +1441,36 @@ pub const Client = struct {
         return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Repair an index generation
+    /// POST /db/v1/tables/{tableName}/indexes/{indexName}/repair
+    pub fn repairIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: types.IndexMaintenanceRequest) !ApiResponse(types.IndexMaintenanceResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/repair", .{ self.base_url, encoded_table_name, encoded_index_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.IndexMaintenanceResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Retry a failed index build
+    /// POST /db/v1/tables/{tableName}/indexes/{indexName}/retry
+    pub fn retryIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: types.IndexMaintenanceRequest) !ApiResponse(types.IndexMaintenanceResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/retry", .{ self.base_url, encoded_table_name, encoded_index_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.IndexMaintenanceResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
     /// POST /db/v1/tables/{tableName}/merge
     pub fn linearMerge(self: *@This(), table_name: []const u8, body: types.LinearMergeRequest) !ApiResponse(types.LinearMergeResult) {
@@ -1548,36 +1643,70 @@ pub const Client = struct {
 
     /// Replace a table's schema
     /// PUT /db/v1/tables/{tableName}/schema
-    pub fn updateSchema(self: *@This(), table_name: []const u8, body: types.TableSchema, if_match: ?[]const u8) !ApiResponse(types.Table) {
+    pub fn updateSchema(self: *@This(), table_name: []const u8, body: types.TableSchema, idempotency_key: ?[]const u8, if_match: ?[]const u8, params: UpdateSchemaParams) !ApiResponse(UpdateSchemaResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema", .{ self.base_url, encoded_table_name });
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.rewrite) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "rewrite=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
         defer request_headers.deinit(self.allocator);
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (idempotency_key) |value| try request_headers.append(self.allocator, .{ "Idempotency-Key", value });
         if (if_match) |value| try request_headers.append(self.allocator, .{ "If-Match", value });
         var resp = try self.http.put(url, .{ .json = json_body, .headers = request_headers.items });
-        return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
+        return ApiResponse(UpdateSchemaResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Patch a table's schema
     /// PATCH /db/v1/tables/{tableName}/schema
-    pub fn patchSchema(self: *@This(), table_name: []const u8, body: types.TableSchemaPatch, if_match: ?[]const u8) !ApiResponse(types.Table) {
+    pub fn patchSchema(self: *@This(), table_name: []const u8, body: types.TableSchemaPatch, idempotency_key: ?[]const u8, if_match: ?[]const u8, params: PatchSchemaParams) !ApiResponse(PatchSchemaResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema", .{ self.base_url, encoded_table_name });
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.rewrite) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "rewrite=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
         defer request_headers.deinit(self.allocator);
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (idempotency_key) |value| try request_headers.append(self.allocator, .{ "Idempotency-Key", value });
         if (if_match) |value| try request_headers.append(self.allocator, .{ "If-Match", value });
         var resp = try self.http.patch(url, .{ .json = json_body, .headers = request_headers.items });
-        return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
+        return ApiResponse(PatchSchemaResponse).fromResponse(self.allocator, &resp);
     }
 
     /// List transaction sessions

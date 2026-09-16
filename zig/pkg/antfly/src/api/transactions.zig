@@ -47,8 +47,10 @@ pub const TransactionReadItem = struct {
     expected_version: u64,
 
     pub fn clone(self: TransactionReadItem, alloc: std.mem.Allocator) !TransactionReadItem {
+        const table_name = try alloc.dupe(u8, self.table_name);
+        errdefer alloc.free(table_name);
         return .{
-            .table_name = try alloc.dupe(u8, self.table_name),
+            .table_name = table_name,
             .key = try alloc.dupe(u8, self.key),
             .expected_version = self.expected_version,
         };
@@ -127,8 +129,6 @@ pub const OwnedTransactionCommitRequest = struct {
         var out: OwnedTransactionCommitRequest = .{
             .sync_level = self.sync_level,
         };
-        errdefer out.deinit(alloc);
-
         out.read_set = try alloc.alloc(TransactionReadItem, self.read_set.len);
         var read_count: usize = 0;
         errdefer {
@@ -180,6 +180,22 @@ pub const OwnedTransactionCommitRequest = struct {
         return out;
     }
 };
+
+pub const ExecutionPlan = std.json.Parsed([]const distributed_txn.TableCommitRequest);
+
+pub fn parseExecutionPlan(alloc: std.mem.Allocator, bytes: []const u8) !ExecutionPlan {
+    return std.json.parseFromSlice([]const distributed_txn.TableCommitRequest, alloc, bytes, .{ .allocate = .alloc_always });
+}
+
+fn encodeExecutionPlan(alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest) ![]u8 {
+    const Wire = struct {
+        tables: []const distributed_txn.TableCommitRequest,
+        pub fn jsonStringify(self: @This(), stream: anytype) !void {
+            try @import("../storage/db/relational_integrity_json.zig").write(self.tables, stream);
+        }
+    };
+    return std.json.Stringify.valueAlloc(alloc, Wire{ .tables = tables }, .{});
+}
 
 pub const CommitConflict = struct {
     table_name: []const u8,
@@ -361,12 +377,16 @@ pub const PendingSessionRecovery = union(enum) {
         /// must be recovered without re-entering the failed visibility barrier.
         repair_handoff_needs_coordinator: bool = false,
         request: OwnedTransactionCommitRequest,
+        execution_plan: ?[]u8 = null,
     },
     acknowledge: PendingTerminalAcknowledgement,
 
     pub fn deinit(self: *PendingSessionRecovery, alloc: std.mem.Allocator) void {
         switch (self.*) {
-            .commit => |*value| value.request.deinit(alloc),
+            .commit => |*value| {
+                value.request.deinit(alloc);
+                if (value.execution_plan) |bytes| alloc.free(bytes);
+            },
             .acknowledge => |*value| value.deinit(alloc),
         }
         self.* = undefined;
@@ -637,6 +657,9 @@ pub const Session = struct {
     /// invoking 2PC. Once true, background maintenance owns completion even if
     /// the initiating process disappears.
     commit_execution_started: bool = false,
+    /// Exact internally prepared participant input, sealed atomically with
+    /// execution-start. Recovery must never re-plan against later row state.
+    execution_plan: ?[]u8 = null,
     /// Persisted before releasing the retained coordinator's topology fence.
     terminal_commit: ?TerminalCommit = null,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
@@ -654,6 +677,7 @@ pub const Session = struct {
     pub fn deinit(self: *Session, alloc: std.mem.Allocator) void {
         if (self.principal) |principal| alloc.free(principal);
         if (self.staged) |*staged| staged.deinit(alloc);
+        if (self.execution_plan) |bytes| alloc.free(bytes);
         if (self.terminal_commit) |*terminal| terminal.deinit(alloc);
         deinitReadSnapshotMap(alloc, &self.read_snapshots);
         var it = self.savepoints.iterator();
@@ -676,6 +700,7 @@ pub const Session = struct {
         };
         errdefer out.deinit(alloc);
         if (self.staged) |staged| out.staged = try staged.clone(alloc);
+        if (self.execution_plan) |bytes| out.execution_plan = try alloc.dupe(u8, bytes);
         if (self.terminal_commit) |terminal| out.terminal_commit = try terminal.clone(alloc);
         out.read_snapshots = try cloneReadSnapshotMap(alloc, self.read_snapshots);
         try out.savepoints.ensureUnusedCapacity(alloc, self.savepoints.count());
@@ -1460,7 +1485,16 @@ pub const SessionRegistry = struct {
         return loaded.info();
     }
 
+    pub const StageValidator = struct {
+        ptr: *anyopaque,
+        validate: *const fn (*anyopaque, std.mem.Allocator, ?*const OwnedTransactionCommitRequest, *OwnedTransactionCommitRequest, *const OwnedTransactionCommitRequest) anyerror!void,
+    };
+
     pub fn stage(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, req: *const OwnedTransactionCommitRequest) !?SessionInfo {
+        return self.stageValidated(alloc, txn_id, req, null);
+    }
+
+    pub fn stageValidated(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, req: *const OwnedTransactionCommitRequest, validator: ?StageValidator) !?SessionInfo {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
@@ -1468,11 +1502,16 @@ pub const SessionRegistry = struct {
         var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         errdefer candidate.deinit(alloc);
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
+        var previous = if (validator != null and candidate.staged != null) try candidate.staged.?.clone(alloc) else null;
+        defer if (previous) |*value| value.deinit(alloc);
         if (candidate.staged == null) {
             candidate.staged = try req.clone(alloc);
         } else {
             try candidate.staged.?.mergeFrom(alloc, req);
         }
+        // Keep only this session's stripe while doing bounded remote reads;
+        // the registry mutex is free and durable lease CAS still precedes publish.
+        if (validator) |value| try value.validate(value.ptr, alloc, if (previous) |*old| old else null, &candidate.staged.?, req);
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
         try self.persistLocked(candidate);
@@ -1653,6 +1692,55 @@ pub const SessionRegistry = struct {
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
         self.publishCandidateLocked(alloc, publish_target, &candidate);
         return {};
+    }
+
+    pub fn getExecutionPlan(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?ExecutionPlan {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        defer candidate.deinit(alloc);
+        if (candidate.execution_plan) |bytes| return try parseExecutionPlan(alloc, bytes);
+        // Older executing document sessions already chose their participant
+        // request. Preserve it rather than introduce fresh planning on retry.
+        if (!candidate.commit_execution_started) return null;
+        var staged = if (candidate.staged) |*value| value else return error.InvalidTransactionSessionRecord;
+        const tables = try staged.distributedTables(alloc);
+        defer alloc.free(tables);
+        const bytes = try encodeExecutionPlan(alloc, tables);
+        defer alloc.free(bytes);
+        return try parseExecutionPlan(alloc, bytes);
+    }
+
+    /// First successful lease-fenced publisher chooses the immutable plan.
+    /// Every concurrent HTTP retry receives that same owned plan before 2PC.
+    pub fn sealExecutionPlan(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, tables: []const distributed_txn.TableCommitRequest) !?ExecutionPlan {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
+        errdefer candidate.deinit(alloc);
+        if (candidate.commit_body_digest == null or candidate.staged == null) return error.InvalidTransactionSessionRecord;
+        if (candidate.execution_plan) |bytes| {
+            const result = try parseExecutionPlan(alloc, bytes);
+            candidate.deinit(alloc);
+            return result;
+        }
+        // An old executing record cannot be upgraded to a new plan.
+        const selected = if (candidate.commit_execution_started) try candidate.staged.?.distributedTables(alloc) else null;
+        defer if (selected) |value| alloc.free(value);
+        candidate.execution_plan = try encodeExecutionPlan(alloc, selected orelse tables);
+        var result = try parseExecutionPlan(alloc, candidate.execution_plan.?);
+        errdefer result.deinit();
+        candidate.commit_execution_started = true;
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, target, &candidate);
+        return result;
     }
 
     pub fn markCommitExecutionStarted(
@@ -1853,6 +1941,9 @@ pub const SessionRegistry = struct {
                 if (candidate.commit_body_digest == null or !candidate.commit_execution_started)
                     return error.InvalidTransactionSessionRecord;
                 const request = candidate.staged orelse return error.InvalidTransactionSessionRecord;
+                var cloned_request = try request.clone(alloc);
+                errdefer cloned_request.deinit(alloc);
+                const cloned_plan = if (candidate.execution_plan) |bytes| try alloc.dupe(u8, bytes) else null;
                 return .{
                     .commit = .{
                         .txn_id = txn_id,
@@ -1868,7 +1959,8 @@ pub const SessionRegistry = struct {
                         .sync_level = candidate.sync_level,
                         .repair_required = terminal.repair_required,
                         .repair_handoff_needs_coordinator = repair_handoff_needs_coordinator,
-                        .request = try request.clone(alloc),
+                        .request = cloned_request,
+                        .execution_plan = cloned_plan,
                     },
                 };
             }
@@ -1884,13 +1976,17 @@ pub const SessionRegistry = struct {
         }
         if (candidate.commit_body_digest == null or !candidate.commit_execution_started) return null;
         const request = candidate.staged orelse return error.InvalidTransactionSessionRecord;
+        var cloned_request = try request.clone(alloc);
+        errdefer cloned_request.deinit(alloc);
+        const cloned_plan = if (candidate.execution_plan) |bytes| try alloc.dupe(u8, bytes) else null;
         return .{ .commit = .{
             .txn_id = txn_id,
             .begin_timestamp = candidate.begin_timestamp,
             .sync_level = candidate.sync_level,
             .repair_required = false,
             .repair_handoff_needs_coordinator = false,
-            .request = try request.clone(alloc),
+            .request = cloned_request,
+            .execution_plan = cloned_plan,
         } };
     }
 
@@ -2192,11 +2288,22 @@ pub const SessionRegistry = struct {
     }
 
     pub fn remove(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
+        return self.removeMode(alloc, txn_id, false);
+    }
+
+    /// Preflight failure may race another commit retry. Never delete its
+    /// durable decision/recovery handoff based on an earlier missing-plan read.
+    pub fn removeBeforeExecution(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
+        return self.removeMode(alloc, txn_id, true);
+    }
+
+    fn removeMode(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, before_execution_only: bool) bool {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
         var current = (self.loadSessionCloneAssumeStripe(alloc, txn_id) catch return false) orelse return false;
         defer current.deinit(alloc);
+        if (before_execution_only and (current.commit_execution_started or current.terminal_commit != null)) return false;
         self.deletePersistent(txn_id) catch return false;
         self.releaseLease(txn_id, current.owner_node_id) catch {};
         self.mutex.lock();
@@ -3228,7 +3335,6 @@ fn participantPhaseText(phase: distributed_txn.ParticipantPhase) []const u8 {
 
 fn cloneBatchRequest(alloc: std.mem.Allocator, batch: batch_api.OwnedBatchRequest) !batch_api.OwnedBatchRequest {
     var out: batch_api.OwnedBatchRequest = .{};
-    errdefer out.deinit(alloc);
     out.writes = try alloc.alloc(db_mod.types.BatchWrite, batch.writes.len);
     var write_count: usize = 0;
     errdefer {
@@ -3239,8 +3345,10 @@ fn cloneBatchRequest(alloc: std.mem.Allocator, batch: batch_api.OwnedBatchReques
         if (out.writes.len > 0) alloc.free(out.writes);
     }
     for (batch.writes) |write| {
+        const key = try alloc.dupe(u8, write.key);
+        errdefer alloc.free(key);
         out.writes[write_count] = .{
-            .key = try alloc.dupe(u8, write.key),
+            .key = key,
             .value = try alloc.dupe(u8, write.value),
         };
         write_count += 1;
@@ -3270,13 +3378,23 @@ fn cloneBatchRequest(alloc: std.mem.Allocator, batch: batch_api.OwnedBatchReques
     }
     for (batch.transforms) |transform| {
         const ops = try alloc.alloc(db_mod.types.TransformOp, transform.operations.len);
-        errdefer alloc.free(ops);
+        var initialized: usize = 0;
+        errdefer {
+            for (ops[0..initialized]) |op| {
+                alloc.free(op.path);
+                if (op.value_json) |value| alloc.free(value);
+            }
+            alloc.free(ops);
+        }
         for (transform.operations, 0..) |op, i| {
+            const path = try alloc.dupe(u8, op.path);
+            errdefer alloc.free(path);
             ops[i] = .{
                 .op = op.op,
-                .path = try alloc.dupe(u8, op.path),
+                .path = path,
                 .value_json = if (op.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
             };
+            initialized += 1;
         }
         out.transforms[transform_count] = .{
             .key = try alloc.dupe(u8, transform.key),
@@ -3994,6 +4112,8 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     }
     try out.appendSlice(alloc, ",\"commit_execution_started\":");
     try out.appendSlice(alloc, if (session.commit_execution_started) "true" else "false");
+    try out.appendSlice(alloc, ",\"execution_plan\":");
+    if (session.execution_plan) |bytes| try appendJsonString(alloc, &out, bytes) else try out.appendSlice(alloc, "null");
     try out.appendSlice(alloc, ",\"terminal_commit\":");
     if (session.terminal_commit) |terminal| {
         try out.appendSlice(alloc, "{\"status\":");
@@ -4116,6 +4236,16 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         .bool => |started| started,
         else => return error.InvalidTransactionSessionRecord,
     } else false;
+    if (obj.get("execution_plan")) |value| switch (value) {
+        .null => {},
+        .string => |bytes| {
+            if (!session.commit_execution_started or session.commit_body_digest == null) return error.InvalidTransactionSessionRecord;
+            var plan = try parseExecutionPlan(alloc, bytes);
+            defer plan.deinit();
+            session.execution_plan = try alloc.dupe(u8, bytes);
+        },
+        else => return error.InvalidTransactionSessionRecord,
+    };
     if (obj.get("terminal_commit")) |terminal_value| {
         if (terminal_value != .null) {
             const terminal_obj = switch (terminal_value) {
@@ -4471,6 +4601,117 @@ test "durable transaction sessions retain terminal commit coordinator handoff" {
     defer acknowledged.deinit(std.testing.allocator);
     try std.testing.expect(acknowledged.coordinator_acknowledged);
     try std.testing.expectEqual(@as(usize, 1), try reader.cleanupExpired(std.testing.allocator, std.math.maxInt(u64)));
+}
+
+test "distributed txn sessions durably seal exact binary integrity plans before recovery" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    var writer = SessionRegistry.init(&durable);
+    defer writer.deinit(alloc);
+    const session = try writer.begin(alloc, .{ .sync_level = .write }, 9);
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[{"table":"docs","key":"a","version":"7"}],"tables":{"docs":{"inserts":{"a":{"id":1}}}}}
+    );
+    defer request.deinit(alloc);
+    var sealed = (try writer.cloneCommitRequest(alloc, session.txn_id, &request)).?;
+    defer sealed.deinit(alloc);
+    const commands = [_]@import("../storage/db/relational_integrity_contract.zig").Command{.{
+        .address = try @import("../storage/db/relational_integrity_contract.zig").Address.init(@splat(2), "\x00\xfftuple"),
+        .operation = .{ .check_owner = .{ .parent_table = "docs", .parent_key = "\x00\xffa" } },
+    }};
+    const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .relational_schema_version = 3, .relational_integrity_generation_set = @splat(0xff), .predicates = &.{.{ .key = "a", .expected_version = 7 }}, .integrity_commands = &commands }};
+    durable.fail_writes_for_test = true;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, writer.sealExecutionPlan(alloc, session.txn_id, &tables));
+    try std.testing.expect((try writer.getExecutionPlan(alloc, session.txn_id)) == null);
+    durable.fail_writes_for_test = false;
+    var first = (try writer.sealExecutionPlan(alloc, session.txn_id, &tables)).?;
+    defer first.deinit();
+    // A retry that read different metadata cannot redirect the chosen plan.
+    var retry = (try writer.sealExecutionPlan(alloc, session.txn_id, &.{.{ .table_name = "wrong" }})).?;
+    defer retry.deinit();
+    try std.testing.expectEqualStrings("docs", retry.value[0].table_name);
+    // A stale preflight on a concurrent HTTP retry may not erase the plan.
+    try std.testing.expect(!writer.removeBeforeExecution(alloc, session.txn_id));
+    var reopened = SessionRegistry.init(&durable);
+    defer reopened.deinit(alloc);
+    var recovery = (try reopened.claimPendingRecovery(alloc, session.txn_id, 9, nextTxnTimestamp())).?;
+    defer recovery.deinit(alloc);
+    var decoded = try parseExecutionPlan(alloc, recovery.commit.execution_plan.?);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(?u32, 3), decoded.value[0].relational_schema_version);
+    try std.testing.expectEqual(@as(u64, 7), decoded.value[0].predicates[0].expected_version);
+    try std.testing.expectEqualStrings("\x00\xffa", decoded.value[0].integrity_commands[0].operation.check_owner.parent_key);
+    try std.testing.expectEqualSlices(u8, &commands[0].address.routing, &decoded.value[0].integrity_commands[0].address.routing);
+    // Public retry identity and original read dependencies remain separate.
+    try std.testing.expectEqual(@as(u64, 7), recovery.commit.request.read_set[0].expected_version);
+}
+
+test "distributed txn sealed request cloning is allocation failure safe" {
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var reads = [_]TransactionReadItem{.{ .table_name = @constCast("docs"), .key = @constCast("a"), .expected_version = 7 }};
+            const ops = [_]db_mod.types.TransformOp{.{ .op = .set, .path = "title", .value_json = "\"new\"" }};
+            var transforms = [_]db_mod.types.DocumentTransform{.{ .key = "b", .operations = &ops }};
+            var writes = [_]db_mod.types.BatchWrite{.{ .key = "a", .value = "{\"id\":1}" }};
+            var deletes = [_][]const u8{"c"};
+            var tables = [_]TableCommitRequest{.{
+                .table_name = @constCast("docs"),
+                .batch = .{ .writes = &writes, .deletes = &deletes, .transforms = &transforms },
+            }};
+            const input: OwnedTransactionCommitRequest = .{ .read_set = &reads, .tables = &tables };
+            var clone = try input.clone(alloc);
+            defer clone.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "distributed txn public commit JSON cannot supply internal execution authority" {
+    const alloc = std.testing.allocator;
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"execution_plan":"forged","commit_execution_started":true,"tables":{"docs":{"inserts":{"a":{"id":1}},"relational_integrity_generation_set":[255],"integrity_commands":[]}}}
+    );
+    defer request.deinit(alloc);
+    const tables = try request.distributedTables(alloc);
+    defer alloc.free(tables);
+    try std.testing.expect(tables[0].relational_integrity_generation_set == null);
+    try std.testing.expectEqual(@as(usize, 0), tables[0].integrity_commands.len);
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const session = try registry.begin(alloc, .{}, 9);
+    var sealed = (try registry.cloneCommitRequest(alloc, session.txn_id, &request)).?;
+    defer sealed.deinit(alloc);
+    try std.testing.expect((try registry.getExecutionPlan(alloc, session.txn_id)) == null);
+}
+
+test "distributed txn stage validation rejects atomically and preserves prior savepoints" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const session = try registry.begin(alloc, .{}, 9);
+    var request = try parseStageWriteRequest(alloc, "{\"table\":\"docs\",\"key\":\"a\",\"document\":{\"id\":1}}");
+    defer request.deinit(alloc);
+    _ = try registry.stage(alloc, session.txn_id, &request);
+    _ = try registry.createSavepoint(alloc, session.txn_id);
+    var calls: usize = 0;
+    const Validator = struct {
+        fn validate(ptr: *anyopaque, _: std.mem.Allocator, previous: ?*const OwnedTransactionCommitRequest, candidate: *OwnedTransactionCommitRequest, _: *const OwnedTransactionCommitRequest) !void {
+            const count: *usize = @ptrCast(@alignCast(ptr));
+            count.* += 1;
+            try std.testing.expectEqual(@as(usize, 1), previous.?.tables[0].batch.writes.len);
+            try std.testing.expectEqual(@as(usize, 2), candidate.tables[0].batch.writes.len);
+            return error.ForeignKeyParentMissing;
+        }
+    };
+    try std.testing.expectError(error.ForeignKeyParentMissing, registry.stageValidated(alloc, session.txn_id, &request, .{ .ptr = &calls, .validate = Validator.validate }));
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    var committed = (try registry.cloneCommitRequest(alloc, session.txn_id, null)).?;
+    defer committed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), committed.tables[0].batch.writes.len);
 }
 
 test "repair-required transaction sessions replay propagation once then release coordination" {

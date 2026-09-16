@@ -365,6 +365,22 @@ fn requireEmptyOperations(txn: anytype, address: Address, operations: []const Op
     }
 }
 
+fn requireReboundReferences(txn: anytype, address: Address, operations: []const Operation, overlay: *const std.StringHashMapUnmanaged(usize)) !void {
+    const prefix = address.referencePrefix();
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var entry = try cursor.seekAtOrAfter(&prefix);
+    while (entry) |item| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, &prefix)) break;
+        _ = try Reference.decode(item.key, item.value);
+        const position = overlay.get(item.key) orelse return error.ForeignKeyReferenced;
+        // A guard-only attach is not a reference rebind. Only a detached old
+        // relationship, optionally reattached to the final tuple owner, may
+        // survive a handoff. Newly committed unseen children still reject it.
+        if (operations[position].kind == .guard) return error.ForeignKeyReferenced;
+    }
+}
+
 /// Recheck semantic transitions and prefix proofs at participant prepare,
 /// under the SAME apply fence as acquisition of the claim intent. Checking
 /// emptiness only at coordinator planning is unsafe: another child can commit
@@ -398,7 +414,13 @@ pub fn validatePreparedEffects(alloc: Allocator, txn: anytype, operations: []con
                     if (next) |after| {
                         if (!std.mem.eql(u8, after.parent_table, before.parent_table) or !std.mem.eql(u8, after.parent_key, before.parent_key)) {
                             if (before.state != .live or after.state != .live) return error.UniqueConstraintViolation;
-                            try requireEmptyOperations(txn, parsed.address, operations, &overlay);
+                            // Preparation already proves old references empty
+                            // after explicit detaches and before establishes.
+                            // The final overlay can legitimately reattach a
+                            // NO ACTION child to the replacement tuple owner.
+                            // Its live exact-tuple claim and exclusive intent
+                            // preserve existence across the atomic decision.
+                            try requireReboundReferences(txn, parsed.address, operations, &overlay);
                         }
                         if (!std.mem.eql(u8, before.tuple, after.tuple)) return error.IntegrityAddressMismatch;
                         if (before.state == .draining) {
@@ -702,4 +724,51 @@ test "relational integrity shared parent guards and fenced bounded action recove
         try std.testing.expectEqual(@as(usize, 2), unchanged.operations.len);
         for (unchanged.operations) |operation| try std.testing.expectEqual(.guard, operation.kind);
     }
+}
+
+test "distributed txn deferred reference handoff commits atomically and rejects unseen children" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try @import("../lsm_backend.zig").Backend.open(alloc, path, .{});
+    defer backend.close();
+    var store = try @import("../docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try transactions.TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const address = try Address.init(@splat(1), "tuple");
+    const old: Claim = .{ .tuple = "tuple", .parent_table = "p", .parent_key = "old", .schema_version = 1 };
+    var replacement = old;
+    replacement.parent_key = "replacement";
+    const child: Reference = .{ .child_table = "c", .child_key = "child", .constraint_name = "fk", .constraint_generation = @splat(2) };
+    try testCommands(&store, &manager, @splat(1), &.{ .{ .address = address, .operation = .{ .establish = old } }, .{ .address = address, .operation = .{ .attach = child } } }, true);
+    const owner: ClaimOwner = .{ .parent_table = "p", .parent_key = "old" };
+    var read = try CurrentView.init(&store);
+    defer read.deinit();
+    try std.testing.expectError(error.ForeignKeyReferenced, prepare(alloc, &read, &.{ .{ .address = address, .operation = .{ .release = owner } }, .{ .address = address, .operation = .{ .establish = replacement } } }));
+    try std.testing.expectError(error.ForeignKeyParentMissing, prepare(alloc, &read, &.{ .{ .address = address, .operation = .{ .detach = child } }, .{ .address = address, .operation = .{ .release = owner } }, .{ .address = address, .operation = .{ .attach = child } } }));
+    const commands = [_]Command{
+        .{ .address = address, .operation = .{ .attach = child } },
+        .{ .address = address, .operation = .{ .establish = replacement } },
+        .{ .address = address, .operation = .{ .release = owner } },
+        .{ .address = address, .operation = .{ .detach = child } },
+    };
+    var effects = try prepare(alloc, &read, &commands);
+    defer effects.deinit();
+    var unseen = child;
+    unseen.child_key = "concurrent";
+    try testCommands(&store, &manager, @splat(2), &.{.{ .address = address, .operation = .{ .attach = unseen } }}, true);
+    try manager.initTransaction(@splat(3), 1);
+    try std.testing.expectError(error.ForeignKeyReferenced, testPrepareEffects(&store, &manager, @splat(3), effects.operations));
+    try testCommands(&store, &manager, @splat(4), &.{.{ .address = address, .operation = .{ .detach = unseen } }}, true);
+    try testPrepareEffects(&store, &manager, @splat(3), effects.operations);
+    // The durable prepared decision fences new children until resolution.
+    try std.testing.expectError(error.IntentConflict, testCommands(&store, &manager, @splat(5), &.{.{ .address = address, .operation = .{ .attach = unseen } }}, false));
+    try manager.resolveIntents(@splat(3), .committed, 3);
+    var committed = try CurrentView.init(&store);
+    defer committed.deinit();
+    try std.testing.expectEqualStrings("replacement", (try Claim.decode(&address.claimKey(), try committed.get(&address.claimKey()))).parent_key);
+    _ = try Reference.decode(&try child.key(address), try committed.get(&try child.key(address)));
 }

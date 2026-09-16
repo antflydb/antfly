@@ -24,6 +24,10 @@ test {
     _ = @import("api/relational_integrity_wire.zig");
     _ = @import("api/relational_integrity_errors.zig");
     _ = @import("api/relational_integrity_commit.zig");
+    _ = @import("api/relational_session_statement.zig");
+    _ = @import("api/relational_witness_ddl.zig");
+    _ = @import("api/relational_rewrite_admission.zig");
+    _ = @import("api/online_merge_io.zig");
     _ = @import("api/relational_ttl.zig");
     _ = @import("api/relational_activation_worker.zig");
     _ = @import("api/relational_retirement_worker.zig");

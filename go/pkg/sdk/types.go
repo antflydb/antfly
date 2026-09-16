@@ -35,6 +35,11 @@ type (
 	TableSchema                           = oapi.TableSchema
 	TableStorageMode                      = oapi.TableStorageMode
 	RelationalIndexDefinition             = oapi.RelationalIndexDefinition
+	RelationalIndexPredicate              = oapi.RelationalIndexPredicate
+	RelationalScalarExpression            = oapi.RelationalScalarExpression
+	RelationalColumnExpression            = oapi.RelationalColumnExpression
+	RelationalExpressionOp                = oapi.RelationalExpressionOp
+	RelationalExpressionType              = oapi.RelationalExpressionType
 	RelationalCheckConstraint             = oapi.RelationalCheckConstraint
 	RelationalUniqueConstraint            = oapi.RelationalUniqueConstraint
 	RelationalForeignKeyConstraint        = oapi.RelationalForeignKeyConstraint
@@ -60,6 +65,16 @@ type (
 	CreateEmbeddingsIndexRequest          = oapi.CreateEmbeddingsIndexRequest
 	CreateGraphIndexRequest               = oapi.CreateGraphIndexRequest
 	CreateAlgebraicIndexRequest           = oapi.CreateAlgebraicIndexRequest
+	CreateRelationalIndexRequest          = oapi.CreateRelationalIndexRequest
+	CreatedRelationalIndex                = oapi.CreatedRelationalIndex
+	CreatedRelationalIndexType            = oapi.CreatedRelationalIndexType
+	RelationalIndexConfig                 = oapi.RelationalIndexConfig
+	RelationalIndexStats                  = oapi.RelationalIndexStats
+	RelationalIndexStatus                 = oapi.RelationalIndexStatus
+	RelationalIndexRangeStatus            = oapi.RelationalIndexRangeStatus
+	RelationalIndexBuildState             = oapi.RelationalIndexBuildState
+	RelationalIndexBuildFailure           = oapi.RelationalIndexBuildFailure
+	RelationalRowIndexBound               = oapi.RelationalRowIndexBound
 	CreatedFullTextIndex                  = oapi.CreatedFullTextIndex
 	CreatedEmbeddingsIndex                = oapi.CreatedEmbeddingsIndex
 	CreatedGraphIndex                     = oapi.CreatedGraphIndex
@@ -69,6 +84,9 @@ type (
 	CreatedGraphIndexType                 = oapi.CreatedGraphIndexType
 	CreatedAlgebraicIndexType             = oapi.CreatedAlgebraicIndexType
 	IndexStatus                           = oapi.IndexStatus
+	IndexMaintenanceRequest               = oapi.IndexMaintenanceRequest
+	IndexMaintenanceResponse              = oapi.IndexMaintenanceResponse
+	IndexMaintenanceOwnerProof            = oapi.IndexMaintenanceOwnerProof
 	IndexType                             = oapi.IndexType
 	IndexPublicationPolicy                = oapi.IndexPublicationPolicy
 	IndexReadinessState                   = oapi.IndexReadinessState
@@ -483,6 +501,8 @@ func (c CreatedIndex) Value() (any, error) {
 		return c.AsCreatedGraphIndex()
 	case IndexTypeAlgebraic:
 		return c.AsCreatedAlgebraicIndex()
+	case IndexTypeRelational:
+		return c.AsCreatedRelationalIndex()
 	default:
 		return nil, fmt.Errorf("unknown created index discriminator %q", kind)
 	}
@@ -540,6 +560,20 @@ func (c CreatedIndex) AsCreatedAlgebraicIndex() (CreatedAlgebraicIndex, error) {
 	}
 	if value.Name == "" || value.Type != CreatedAlgebraicIndexTypeAlgebraic {
 		return CreatedAlgebraicIndex{}, fmt.Errorf("invalid algebraic create-index response")
+	}
+	return value, nil
+}
+
+func (c CreatedIndex) AsCreatedRelationalIndex() (CreatedRelationalIndex, error) {
+	if err := c.requireKind(IndexTypeRelational); err != nil {
+		return CreatedRelationalIndex{}, err
+	}
+	value, err := c.generated.AsCreatedRelationalIndex()
+	if err != nil {
+		return CreatedRelationalIndex{}, err
+	}
+	if value.Name == "" || value.Type != CreatedRelationalIndexTypeRelational || len(value.Keys) == 0 {
+		return CreatedRelationalIndex{}, fmt.Errorf("invalid relational create-index response")
 	}
 	return value, nil
 }
@@ -670,6 +704,9 @@ const (
 	IndexTypeFullText                          = oapi.IndexTypeFullText
 	IndexTypeGraph                             = oapi.IndexTypeGraph
 	IndexTypeAlgebraic                         = oapi.IndexTypeAlgebraic
+	IndexTypeRelational                        = oapi.IndexTypeRelational
+	CreatedRelationalIndexTypeRelational       = oapi.CreatedRelationalIndexTypeRelational
+	CreateRelationalIndexRequestTypeRelational = oapi.CreateRelationalIndexRequestTypeRelational
 	CreatedFullTextIndexTypeFullText           = oapi.CreatedFullTextIndexTypeFullText
 	CreatedGraphIndexTypeGraph                 = oapi.CreatedGraphIndexTypeGraph
 	CreatedAlgebraicIndexTypeAlgebraic         = oapi.CreatedAlgebraicIndexTypeAlgebraic

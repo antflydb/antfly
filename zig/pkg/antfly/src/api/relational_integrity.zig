@@ -48,6 +48,15 @@ pub const ParentTransition = struct {
     target_tuple: ?[]const u8,
 };
 
+pub const PartialDependency = struct {
+    definition: native.ForeignKey,
+    parent_generation: storage.Generation,
+    reference: storage.Reference,
+    before: ?[]const u8,
+    after: ?[]const u8,
+    repair: bool,
+};
+
 pub const Expansion = struct {
     arena: std.heap.ArenaAllocator,
     commands: []const RoutedCommand,
@@ -55,6 +64,7 @@ pub const Expansion = struct {
     /// coordinator first resolves incoming descriptors and either proves
     /// RESTRICT or schedules a gated, bounded parent-action job.
     parents: []const ParentTransition,
+    partials: []const PartialDependency = &.{},
     pub fn deinit(self: *Expansion) void {
         self.arena.deinit();
         self.* = undefined;
@@ -89,8 +99,9 @@ pub const Plan = struct {
             const def = binding.definition;
             if (std.mem.allEqual(u8, &binding.generation, 0) or std.mem.allEqual(u8, &binding.parent_generation, 0) or
                 def.child_columns.len == 0 or def.child_columns.len != def.parent_columns.len or
-                def.child_period != null or def.parent_period != null or def.match == .partial or def.deferrable or def.timing != .immediate)
+                def.child_period != null or def.parent_period != null or (def.timing == .deferred and !def.deferrable))
                 return error.UnsupportedIntegrityDefinition;
+            if (binding.parent_unique.deferrable or binding.parent_unique.timing != .immediate) return error.ForeignKeyTargetNotUnique;
             if (!sameColumns(def.parent_columns, binding.parent_unique.columns)) return error.ForeignKeyTargetNotUnique;
             var parent_tuple = try bindTuple(owned, binding.parent, def.parent_columns);
             defer parent_tuple.deinit();
@@ -122,14 +133,15 @@ pub const Plan = struct {
         const owned = arena.allocator();
         var commands = std.ArrayList(RoutedCommand).empty;
         var parents = std.ArrayList(ParentTransition).empty;
+        var partials = std.ArrayList(PartialDependency).empty;
         const table_name = try owned.dupe(u8, self.table_name);
         for (mutations) |mutation| {
             const key = try owned.dupe(u8, mutation.key);
             if (mutation.after) |after| if (after.layout != self.view.physicalLayout() or
                 after.table_schema.relational_columns.ptr != self.view.tableSchema().relational_columns.ptr) return error.PreparedGenerationChanged;
             for (self.uniques) |unique| {
-                const before = try encode(owned, unique.tuple, mutation.before, !unique.definition.nulls_not_distinct, false);
-                const after = try encode(owned, unique.tuple, mutation.after, !unique.definition.nulls_not_distinct, false);
+                const before = try encodeUnique(owned, unique.tuple, mutation.before, unique.definition.nulls_not_distinct, key);
+                const after = try encodeUnique(owned, unique.tuple, mutation.after, unique.definition.nulls_not_distinct, key);
                 if (sameTuple(before, after) and !mutation.repair) {
                     if (after) |tuple| try commands.append(owned, .{ .table_name = table_name, .command = .{
                         .address = try storage.Address.init(unique.generation, tuple),
@@ -144,6 +156,19 @@ pub const Plan = struct {
                 } });
             }
             for (self.foreign) |foreign| {
+                if (foreign.definition.match == .partial) {
+                    const encoded = try std.json.Stringify.valueAlloc(owned, foreign.definition, .{});
+                    const definition = try std.json.parseFromSliceLeaky(native.ForeignKey, owned, encoded, .{ .allocate = .alloc_always });
+                    try partials.append(owned, .{
+                        .definition = definition,
+                        .parent_generation = foreign.parent_generation,
+                        .reference = .{ .child_table = table_name, .child_key = key, .constraint_name = definition.name, .constraint_generation = foreign.generation },
+                        .before = if (mutation.before) |row| try row.reconstructValueAlloc(owned) else null,
+                        .after = if (mutation.after) |row| try row.reconstructValueAlloc(owned) else null,
+                        .repair = mutation.repair,
+                    });
+                    continue;
+                }
                 const before = try encode(owned, foreign.tuple, mutation.before, true, foreign.definition.match == .full and !mutation.repair);
                 const after = try encode(owned, foreign.tuple, mutation.after, true, foreign.definition.match == .full);
                 const reference: storage.Reference = .{
@@ -158,7 +183,7 @@ pub const Plan = struct {
             }
             if (commands.items.len + parents.items.len > storage.max_commands) return error.TransactionTooLarge;
         }
-        return .{ .arena = arena, .commands = try commands.toOwnedSlice(owned), .parents = try parents.toOwnedSlice(owned) };
+        return .{ .arena = arena, .commands = try commands.toOwnedSlice(owned), .parents = try parents.toOwnedSlice(owned), .partials = try partials.toOwnedSlice(owned) };
     }
 };
 
@@ -201,6 +226,25 @@ fn encode(alloc: Allocator, current: tuples.TuplePlan, optional_row: ?codec.Ordi
         return null;
     }
     return result.bytes;
+}
+
+/// NULL-distinct keys are still FK witnesses, but are not unique. Append the
+/// exact primary identity only to NULL-containing tuples; their encoded NULL
+/// marker already separates this domain from ordinary non-null unique keys.
+pub fn encodeUnique(alloc: Allocator, current: tuples.TuplePlan, optional_row: ?codec.OrdinalRowView, nulls_not_distinct: bool, row_key: []const u8) !?[]const u8 {
+    const row = optional_row orelse return null;
+    var projected = if (row.layout == current.layout) current else try current.projectSource(alloc, row.table_schema, row.layout);
+    defer if (row.layout != current.layout) projected.deinit();
+    var result = try projected.encodeAlloc(alloc, row);
+    if (!result.has_null or nulls_not_distinct) return result.bytes;
+    defer result.deinit(alloc);
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    errdefer output.deinit();
+    try output.writer.writeAll(result.bytes);
+    try output.writer.writeAll("partial-null-witness-v1");
+    try output.writer.writeInt(u32, std.math.cast(u32, row_key.len) orelse return error.TransactionTooLarge, .big);
+    try output.writer.writeAll(row_key);
+    return try output.toOwnedSlice();
 }
 
 test "distributed txn typed integrity expansion matches composite parent claim without float conversion" {

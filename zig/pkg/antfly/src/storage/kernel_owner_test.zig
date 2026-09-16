@@ -21,6 +21,173 @@ const wal_client = @import("kernel_wal_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
 const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
+test "opaque owner standalone rewrite authority is durable and cannot be selected by a request" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-72/table-db", .{root});
+    defer alloc.free(path);
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    var options: abi.OpenRequest = .{
+        .context = context.handle,
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("rows"),
+        .group_id = 72,
+        .has_identity_namespace = 1,
+        .identity_table_id = 7,
+        .identity_shard_id = 172,
+        .identity_range_id = 272,
+        .online_source_authority = 2,
+        .schema_json = .fromSlice(
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        ),
+    };
+    const wire = @import("db/online_merge_io_contract.zig");
+    const request: wire.Request = .{
+        .scope = .{ .authority = .native, .fence = .{ .role = .rewrite_source, .transition_id = 1, .attempt = 0, .admission_epoch = 0, .owner_group_id = 72, .peer_group_id = 82, .namespace = .{ .table_id = 7, .shard_id = 172, .range_id = 272 }, .catalog_digest = @splat(0) }, .receiver_namespace = .{ .table_id = 8, .shard_id = 82, .range_id = 82 }, .consumer_epoch = 0, .copy_attempt = .{} },
+        .operation = .{ .admission = .donor },
+    };
+    for (0..2) |_| {
+        var owner = try client.Owner.open(options);
+        defer owner.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(encoded);
+        var response = try owner.onlineMergeIoJson(.{ .table_name = .fromSlice("rows"), .request_json = .fromSlice(encoded) });
+        defer response.deinit();
+        const facts = try std.json.parseFromSlice(wire.AdmissionFacts, alloc, response.bytes(), .{});
+        defer facts.deinit();
+        try std.testing.expectEqual(@import("db/online_source_contract.zig").Authority.native, facts.value.authority);
+        try std.testing.expectEqual(@as(u64, 0), facts.value.donor_term);
+        try std.testing.expect(facts.value.eligible);
+        try std.testing.expectEqual(@as(usize, 1), facts.value.source_schemas.len);
+        var forged = request;
+        forged.scope.authority = .raft;
+        const wrong = try std.json.Stringify.valueAlloc(alloc, forged, .{});
+        defer alloc.free(wrong);
+        try std.testing.expectError(error.OnlineSourceScopeChanged, owner.onlineMergeIoJson(.{ .table_name = .fromSlice("rows"), .request_json = .fromSlice(wrong) }));
+    }
+    options.online_source_authority = 1;
+    try std.testing.expectError(error.OnlineSourceScopeChanged, client.Owner.open(options));
+}
+
+test "opaque owner cold reopen preserves frozen document and relational backup cohorts" {
+    const alloc = std.testing.allocator;
+    const topology = @import("db/relational_integrity_topology_contract.zig");
+    const json = @import("db/relational_integrity_handoff_contract.zig");
+    const transition = @import("db/relational_transition_contract.zig");
+    const seal = @import("db/native_backup_seal_contract.zig");
+    const Read = struct {
+        fn call(comptime T: type, handle: ?*anyopaque, request: transition.Request) !std.json.Parsed(T) {
+            const body = try json.encode(std.testing.allocator, request);
+            defer std.testing.allocator.free(body);
+            var response: abi.OwnedBytes = .{};
+            try error_identity.statusToError(abi.antfly_storage_owner_relational_transition_read(handle, &.{ .table_name = .fromSlice("rows"), .request_json = .fromSlice(body) }, &response));
+            defer abi.antfly_storage_owner_buffer_destroy(&response);
+            return std.json.parseFromSlice(T, std.testing.allocator, response.slice(), .{ .allocate = .alloc_always });
+        }
+    };
+    inline for (.{ false, true }) |relational| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+        defer alloc.free(root);
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-7117/table-db", .{root});
+        defer alloc.free(path);
+        const schema = if (relational)
+            \\{"version":0,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"by_id","keys":[{"column":"id"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        else
+            \\{"version":0,"storage_mode":"document","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        ;
+        const indexes = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}";
+        var context = client.Context{};
+        try context.ensure();
+        defer context.deinit();
+        const options: abi.OpenRequest = .{
+            .context = context.handle,
+            .path = .fromSlice(path),
+            .table_name = .fromSlice("rows"),
+            .group_id = 7117,
+            .has_identity_namespace = 1,
+            .identity_table_id = 71,
+            .identity_shard_id = 7117,
+            .identity_range_id = 7117,
+            .has_initial_range = 1,
+            .initial_range_start = .fromSlice("a"),
+            .initial_range_end = .fromSlice("m"),
+            .schema_json = .fromSlice(schema),
+            .indexes_json = .fromSlice(indexes),
+        };
+        var owner = try client.Owner.open(options);
+        var owner_open = true;
+        defer if (owner_open) owner.deinit();
+        var inserted = try owner.batchJson("rows", "{\"inserts\":{\"a\":{\"id\":1}},\"sync_level\":\"write\"}");
+        inserted.deinit();
+        var identity = try Read.call(topology.Identity, owner.handle, .identity);
+        defer identity.deinit();
+        const fence: topology.Fence = .{
+            .admission_epoch = identity.value.next_epoch,
+            .transition_id = 117,
+            .attempt = 1,
+            .peer_group_id = 7117,
+            .owner_group_id = 7117,
+            .role = .backup_snapshot,
+            .namespace = identity.value.namespace,
+            .catalog_digest = identity.value.catalog_digest,
+        };
+        const begin = try json.encode(alloc, .{ ._relational_topology = topology.Command{ .action = .begin, .fence = fence } });
+        defer alloc.free(begin);
+        var frozen = try owner.replicatedBatchAtRaftEntryJson("rows", begin, 1, 1);
+        frozen.deinit();
+        var before = try Read.call(topology.Status, owner.handle, .status);
+        defer before.deinit();
+        try std.testing.expect(before.value.drained and before.value.fence.?.eql(fence));
+        owner.deinit();
+        owner_open = false;
+
+        // Production backup routing may fault in a cold owner between freeze
+        // and pin. Identical metadata rehydration must not become a write.
+        owner = try client.Owner.open(options);
+        owner_open = true;
+        try owner.configure("rows", schema, indexes);
+        var after = try Read.call(topology.Status, owner.handle, .status);
+        defer after.deinit();
+        try std.testing.expect(after.value.drained and after.value.fence.?.eql(fence));
+        try std.testing.expectError(error.IntegrityTopologyBusy, owner.batchJson("rows", "{\"inserts\":{\"b\":{\"id\":2}}}"));
+        const changed_schema = try std.mem.replaceOwned(u8, alloc, schema, "\"version\":0", "\"version\":1");
+        defer alloc.free(changed_schema);
+        try std.testing.expectError(error.IntegrityTopologyBusy, owner.configure("rows", changed_schema, indexes));
+        var wrong = fence;
+        wrong.attempt += 1;
+        const wrong_request = try json.encode(alloc, seal.Request{ .seal = .{ .id = "wrong", .fence = wrong } });
+        defer alloc.free(wrong_request);
+        try std.testing.expectError(error.IntegrityTopologyChanged, owner.backupPinControlJson(.{ .table_name = .fromSlice("rows"), .request_json = .fromSlice(wrong_request) }));
+        const request = try json.encode(alloc, seal.Request{ .seal = .{ .id = "cut", .fence = fence } });
+        defer alloc.free(request);
+        var pinned = try owner.backupPinControlJson(.{ .table_name = .fromSlice("rows"), .request_json = .fromSlice(request) });
+        defer pinned.deinit();
+        var handle = try std.json.parseFromSlice(seal.Handle, alloc, pinned.bytes(), .{});
+        defer handle.deinit();
+        try std.testing.expect(handle.value.fence.eql(fence));
+        var retried = try owner.backupPinControlJson(.{ .table_name = .fromSlice("rows"), .request_json = .fromSlice(request) });
+        defer retried.deinit();
+        try std.testing.expectEqualStrings(pinned.bytes(), retried.bytes());
+        const release = try json.encode(alloc, seal.Request{ .release = handle.value });
+        defer alloc.free(release);
+        var released = try owner.backupPinControlJson(.{ .table_name = .fromSlice("rows"), .request_json = .fromSlice(release) });
+        released.deinit();
+        const cancel = try json.encode(alloc, .{ ._relational_topology = topology.Command{ .action = .cancel, .fence = fence } });
+        defer alloc.free(cancel);
+        var canceled = try owner.replicatedBatchAtRaftEntryJson("rows", cancel, 1, 2);
+        canceled.deinit();
+        var resumed = try owner.batchJson("rows", "{\"inserts\":{\"b\":{\"id\":2}}}");
+        resumed.deinit();
+    }
+}
+
 test "local query identity relay preserves origin and attributes protocol defects to consumer" {
     const failure = error_identity.failureFromError(
         error.InvalidQueryRequest,
@@ -58,6 +225,281 @@ test "local query identity relay preserves origin and attributes protocol defect
         replacement.operation,
     );
     try std.testing.expectEqualStrings("InvalidBoundaryFailureIdentity", replacement.errorName());
+}
+
+test "opaque owner source artifact transfer resumes across replicas without donor inode authority" {
+    const alloc = std.testing.allocator;
+    const transfer = @import("db/source_artifact_transfer.zig");
+    const contract = @import("../api/local_query_contract.zig");
+    const batch = @import("../api/batch.zig");
+    const source = @import("db/online_source_contract.zig");
+    const Call = struct {
+        fn transport(ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, request: transfer.Request, context: @import("../api/operation.zig").RequestContext) ![]u8 {
+            try context.ensureActive();
+            try std.testing.expectEqual(@as(u64, 7201), group);
+            try std.testing.expectEqualStrings("docs", table);
+            const owner: *client.Owner = @ptrCast(@alignCast(ptr));
+            const json = try std.json.Stringify.valueAlloc(allocator, request, .{});
+            defer allocator.free(json);
+            var response = try owner.sourceArtifactJson(.{ .table_name = .fromSlice(table), .request_json = .fromSlice(json) });
+            defer response.deinit();
+            return allocator.dupe(u8, response.bytes());
+        }
+        fn run(comptime T: type, owner: *client.Owner, request: transfer.Request) !std.json.Parsed(T) {
+            const json = try std.json.Stringify.valueAlloc(std.testing.allocator, request, .{});
+            defer std.testing.allocator.free(json);
+            var response = try owner.sourceArtifactJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(json) });
+            defer response.deinit();
+            return std.json.parseFromSlice(T, std.testing.allocator, response.bytes(), .{ .allocate = .alloc_always });
+        }
+        fn apply(owner: *client.Owner, request: @import("db/types.zig").BatchRequest, index: u64) !void {
+            const json = try batch.encodeBatchRequest(std.testing.allocator, request);
+            defer std.testing.allocator.free(json);
+            var response = try owner.replicatedBatchAtRaftEntryJson("docs", json, 1, index);
+            response.deinit();
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const donor_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/donor", .{tmp.sub_path});
+    defer alloc.free(donor_path);
+    const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/target", .{tmp.sub_path});
+    defer alloc.free(target_path);
+    const options: abi.OpenRequest = .{ .path = .fromSlice(donor_path), .table_name = .fromSlice("docs"), .group_id = 7201, .has_identity_namespace = 1, .identity_table_id = 72, .identity_shard_id = 7201, .identity_range_id = 7201, .schema_json = .fromSlice("{}") };
+    var donor = try client.Owner.open(options);
+    defer donor.deinit();
+    var target_options = options;
+    target_options.path = .fromSlice(target_path);
+    var target = try client.Owner.open(target_options);
+    defer target.deinit();
+    // Incompressible printable JSON guarantees several physical transport
+    // chunks without inflating the user-visible row or transport limits.
+    const payload = try alloc.alloc(u8, 3 * 1024 * 1024);
+    defer alloc.free(payload);
+    var random = std.Random.DefaultPrng.init(419);
+    for (payload) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+    const document = try std.fmt.allocPrint(alloc, "{{\"text\":\"{s}\"}}", .{payload});
+    defer alloc.free(document);
+    for ([_]*client.Owner{ &donor, &target }) |owner| try Call.apply(owner, .{ .timestamp_ns = 123, .writes = &.{.{ .key = "row", .value = document }} }, 1);
+    const identity_request = try contract.encodeStorageKernelLookupRequest(alloc, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" });
+    defer alloc.free(identity_request);
+    var identity_response = try donor.lookupJson("docs", identity_request);
+    defer identity_response.deinit();
+    var identity = try std.json.parseFromSlice(@import("db/relational_integrity_topology_contract.zig").Identity, alloc, identity_response.bytes(), .{});
+    defer identity.deinit();
+    const scope: source.Scope = .{ .fence = .{ .admission_epoch = identity.value.next_epoch, .transition_id = 57, .attempt = 1, .owner_group_id = 7201, .peer_group_id = 7202, .role = .merge_source, .namespace = identity.value.namespace, .catalog_digest = identity.value.catalog_digest }, .receiver_namespace = .{ .table_id = 72, .shard_id = 7202, .range_id = 7202 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
+    for ([_]*client.Owner{ &donor, &target }) |owner| try Call.apply(owner, .{ .online_source = .{ .admit = .{ .scope = scope } } }, 2);
+    const pin_json = try std.json.Stringify.valueAlloc(alloc, scope, .{});
+    defer alloc.free(pin_json);
+    var publication = try donor.prepareSourcePinPublicationJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(pin_json) });
+    defer publication.deinit();
+    var certificate = try std.json.parseFromSlice(@import("source_snapshot.zig").Certificate, alloc, publication.bytes(), .{});
+    defer certificate.deinit();
+    for ([_]*client.Owner{ &donor, &target }) |owner| try Call.apply(owner, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate.value } } }, 3);
+    // Simulate native-state transfer containing the durable published ledger
+    // but none of another replica's filesystem pins or local stat receipts.
+    target.deinit();
+    const target_pin = try @import("db/source_pin.zig").pathAlloc(alloc, target_path, scope);
+    defer alloc.free(target_pin);
+    try std.Io.Dir.cwd().deleteTree(std.testing.io, target_pin);
+    target = try client.Owner.open(target_options);
+    try std.testing.expectError(error.OnlineSourcePinMissing, target.prepareSourcePinPublicationJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(pin_json) }));
+    var described = try Call.run(transfer.Descriptor, &donor, .{ .describe = scope });
+    defer described.deinit();
+    const descriptor = described.value;
+    try std.testing.expect(descriptor.total_bytes > transfer.max_chunk_bytes);
+    var wrong = descriptor;
+    wrong.scope.copy_attempt.sequence += 1;
+    try std.testing.expectError(error.OnlineSourceScopeChanged, Call.run(transfer.Status, &target, .{ .status = wrong }));
+    var offset: u64 = 0;
+    while (offset < descriptor.total_bytes) {
+        if (offset != 0) {
+            // Subsequent slices use the production replica-transfer adapter:
+            // distinct endpoints, same donor group, one bounded chunk/call.
+            try std.testing.expect(!try @import("../metadata/online_merge_artifact.zig").step(alloc, .{ .ptr = &donor, .request = Call.transport }, .{ .ptr = &target, .request = Call.transport }, "docs", .{ .scope = scope, .phase = .snapshot, .certificate = certificate.value, .acknowledged = certificate.value.cut.retained_start }, .{}));
+            var observed = try Call.run(transfer.Status, &target, .{ .status = descriptor });
+            defer observed.deinit();
+            try std.testing.expect(observed.value.next_offset > offset);
+            try std.testing.expect(observed.value.next_offset - offset <= transfer.max_chunk_bytes);
+            offset = observed.value.next_offset;
+            continue;
+        }
+        var chunk = try Call.run(transfer.ReadResponse, &donor, .{ .read = .{ .descriptor = descriptor, .offset = offset } });
+        defer chunk.deinit();
+        var request: transfer.Request = .{ .write = .{ .descriptor = descriptor, .offset = offset, .data_base64 = chunk.value.data_base64, .digest = chunk.value.digest } };
+        if (offset == 0) {
+            request.write.digest[0] ^= 1;
+            try std.testing.expectError(error.SourceSnapshotCorrupt, Call.run(transfer.Status, &target, request));
+            request.write.digest = chunk.value.digest;
+            const body = try std.json.Stringify.valueAlloc(alloc, request, .{});
+            defer alloc.free(body);
+            var canceled = std.atomic.Value(bool).init(true);
+            const Cancel = struct {
+                fn check(ptr: ?*anyopaque) callconv(.c) u8 {
+                    const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ptr.?));
+                    return @intFromBool(flag.load(.acquire));
+                }
+            };
+            try std.testing.expectError(error.Canceled, target.sourceArtifactJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(body), .cancellation_ctx = &canceled, .cancellation_fn = Cancel.check }));
+        }
+        var accepted = try Call.run(transfer.Status, &target, request);
+        defer accepted.deinit();
+        try std.testing.expect(!accepted.value.complete);
+        if (offset == 0) {
+            target.deinit();
+            // Power loss can leave file bytes durable before the matching
+            // offset receipt. Preserve that exact disk state without adding
+            // a production failpoint; the next accepted chunk must replace
+            // the unacknowledged tail rather than treating it as progress.
+            const spool_path = try std.fmt.allocPrint(alloc, "{s}/source.receiving", .{target_pin});
+            defer alloc.free(spool_path);
+            {
+                const spool = try std.Io.Dir.cwd().openFile(std.testing.io, spool_path, .{ .mode = .read_write });
+                defer spool.close(std.testing.io);
+                try spool.writePositionalAll(std.testing.io, "unacknowledged physical tail", accepted.value.next_offset);
+                try spool.sync(std.testing.io);
+            }
+            target = try client.Owner.open(target_options);
+            var restarted = try Call.run(transfer.Status, &target, .{ .status = descriptor });
+            defer restarted.deinit();
+            try std.testing.expectEqual(accepted.value.next_offset, restarted.value.next_offset);
+            var duplicate = try Call.run(transfer.Status, &target, request);
+            defer duplicate.deinit();
+            try std.testing.expectEqualDeep(accepted.value, duplicate.value);
+            // Even a self-consistent new transport checksum cannot change an
+            // already acknowledged chunk at the same immutable source offset.
+            const replacement = try alloc.alloc(u8, transfer.max_chunk_bytes);
+            defer alloc.free(replacement);
+            @memset(replacement, 'q');
+            const replacement64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(replacement.len));
+            defer alloc.free(replacement64);
+            const changed_chunk: transfer.Request = .{ .write = .{ .descriptor = descriptor, .offset = 0, .data_base64 = std.base64.standard.Encoder.encode(replacement64, replacement), .digest = transfer.checksum(replacement) } };
+            try std.testing.expectError(error.SourceSnapshotCorrupt, Call.run(transfer.Status, &target, changed_chunk));
+            try std.testing.expectError(error.SourceSnapshotIncomplete, Call.run(transfer.Status, &target, .{ .finish = descriptor }));
+        }
+        offset = accepted.value.next_offset;
+    }
+    // Publication may crash after renaming verified bytes but before writing
+    // its local receipt. An old chunk retry must not create a new empty spool
+    // that hides the complete renamed artifact on recovery.
+    target.deinit();
+    const receiving_path = try std.fmt.allocPrint(alloc, "{s}/source.receiving", .{target_pin});
+    defer alloc.free(receiving_path);
+    const artifact_path = try std.fmt.allocPrint(alloc, "{s}/source.afb2", .{target_pin});
+    defer alloc.free(artifact_path);
+    try std.Io.Dir.rename(.cwd(), receiving_path, .cwd(), artifact_path, std.testing.io);
+    target = try client.Owner.open(target_options);
+    var first_retry = try Call.run(transfer.ReadResponse, &donor, .{ .read = .{ .descriptor = descriptor, .offset = 0 } });
+    defer first_retry.deinit();
+    var retried = try Call.run(transfer.Status, &target, .{ .write = .{ .descriptor = descriptor, .offset = 0, .data_base64 = first_retry.value.data_base64, .digest = first_retry.value.digest } });
+    defer retried.deinit();
+    try std.testing.expectEqual(descriptor.total_bytes, retried.value.next_offset);
+    var verification_complete = false;
+    for (0..1000) |_| {
+        var finished = try Call.run(transfer.Status, &target, .{ .finish = descriptor });
+        defer finished.deinit();
+        if (finished.value.complete) {
+            verification_complete = true;
+            break;
+        }
+        // Every call reopens the owner: no verifier heap/hash/parser state
+        // survives, and the artifact must not be recopied or rescanned.
+        target.deinit();
+        target = try client.Owner.open(target_options);
+    }
+    try std.testing.expect(verification_complete);
+    target.deinit();
+    target = try client.Owner.open(target_options);
+    var recovered = try target.prepareSourcePinPublicationJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(pin_json) });
+    defer recovered.deinit();
+    try std.testing.expectEqualStrings(publication.bytes(), recovered.bytes());
+    // The replacement is a donor too; re-export never requires old inode IDs.
+    var exported = try Call.run(transfer.ReadResponse, &target, .{ .read = .{ .descriptor = descriptor, .offset = 0 } });
+    defer exported.deinit();
+    try std.testing.expect(exported.value.data_base64.len != 0);
+    try Call.apply(&target, .{ .online_source = .{ .release = scope } }, 4);
+    target.deinit();
+    target = try client.Owner.open(target_options);
+    // Durable cancellation/release wins over delayed transfer traffic, even
+    // after owner restart. No stale sender may reopen or reset that scope.
+    try std.testing.expectError(error.OnlineSourceScopeChanged, Call.run(transfer.Descriptor, &target, .{ .describe = scope }));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, Call.run(transfer.Status, &target, .{ .finish = descriptor }));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, Call.run(transfer.Status, &target, .{ .reset = descriptor }));
+    try std.testing.expectError(error.OnlineSourceScopeChanged, Call.run(transfer.Status, &target, .{ .write = .{ .descriptor = descriptor, .offset = 0, .data_base64 = first_retry.value.data_base64, .digest = first_retry.value.digest } }));
+}
+
+test "opaque owner online source controls and status survive compiled boundary restart" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../api/local_query_contract.zig");
+    const batch = @import("../api/batch.zig");
+    const source = @import("db/online_source_contract.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-source-controls", .{tmp.sub_path});
+    defer alloc.free(path);
+    const options: abi.OpenRequest = .{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7101,
+        .has_identity_namespace = 1,
+        .identity_table_id = 71,
+        .identity_shard_id = 7101,
+        .identity_range_id = 7101,
+        .schema_json = .fromSlice("{}"),
+    };
+    var owner = try client.Owner.open(options);
+    defer owner.deinit();
+    const identity_request = try contract.encodeStorageKernelLookupRequest(alloc, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" });
+    defer alloc.free(identity_request);
+    var identity_response = try owner.lookupJson("docs", identity_request);
+    defer identity_response.deinit();
+    var identity = try std.json.parseFromSlice(@import("db/relational_integrity_topology_contract.zig").Identity, alloc, identity_response.bytes(), .{});
+    defer identity.deinit();
+    const scope: source.Scope = .{
+        .fence = .{ .admission_epoch = identity.value.next_epoch, .transition_id = 19, .attempt = 2, .owner_group_id = 7101, .peer_group_id = 7102, .role = .merge_source, .namespace = identity.value.namespace, .catalog_digest = identity.value.catalog_digest },
+        .receiver_namespace = .{ .table_id = 71, .shard_id = 7102, .range_id = 7102 },
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+    };
+    const admission = try batch.encodeBatchRequest(alloc, .{ .online_source = .{ .admit = .{ .scope = scope } } });
+    defer alloc.free(admission);
+    var admitted = try owner.replicatedBatchAtRaftEntryJson("docs", admission, 1, 1);
+    admitted.deinit();
+    // Admission retains changes without freezing normal document writes.
+    var written = try owner.replicatedBatchAtRaftEntryJson("docs", "{\"writes\":{\"r\":{\"n\":1}},\"_timestamp_ns\":\"123\"}", 1, 2);
+    written.deinit();
+    const status_json = try std.json.Stringify.valueAlloc(alloc, .{ .mode = "online_source_status", .scope = scope }, .{});
+    defer alloc.free(status_json);
+    const status_request = try contract.encodeStorageKernelLookupRequest(alloc, "", .{ .relational_topology_json = status_json });
+    defer alloc.free(status_request);
+    const Read = struct {
+        fn check(allocator: std.mem.Allocator, handle: *client.Owner, request: []const u8) !void {
+            var response = try handle.lookupJson("docs", request);
+            defer response.deinit();
+            var progress = try std.json.parseFromSlice(struct { admitted_applied_index: u64, acknowledged: u64 }, allocator, response.bytes(), .{ .ignore_unknown_fields = true });
+            defer progress.deinit();
+            try std.testing.expectEqual(@as(u64, 1), progress.value.admitted_applied_index);
+            try std.testing.expectEqual(@as(u64, 0), progress.value.acknowledged);
+        }
+    };
+    try Read.check(alloc, &owner, status_request);
+    const pin_json = try std.json.Stringify.valueAlloc(alloc, scope, .{});
+    defer alloc.free(pin_json);
+    var publication = try owner.prepareSourcePinPublicationJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(pin_json) });
+    defer publication.deinit();
+    var certificate = try std.json.parseFromSlice(@import("source_snapshot.zig").Certificate, alloc, publication.bytes(), .{});
+    defer certificate.deinit();
+    try std.testing.expectEqual(@as(u64, 1), certificate.value.cut.applied_index);
+    try std.testing.expect(certificate.value.cut.namespace.eql(scope.fence.namespace));
+    owner.deinit();
+    owner = try client.Owner.open(options);
+    try Read.check(alloc, &owner, status_request);
+    var repeated_publication = try owner.prepareSourcePinPublicationJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(pin_json) });
+    defer repeated_publication.deinit();
+    try std.testing.expectEqualStrings(publication.bytes(), repeated_publication.bytes());
+    var retry = try owner.replicatedBatchAtRaftEntryJson("docs", admission, 1, 3);
+    retry.deinit();
+    try Read.check(alloc, &owner, status_request);
 }
 
 test "opaque owner relational handoff preserves binary proofs across the compiled boundary" {
@@ -253,6 +695,274 @@ test "opaque owner exports exact backup seals and reclaims pins without opening 
     }
 }
 
+test "opaque ordinary owner range initialization preserves durable authority and rejects unsafe reconciliation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    var context = client.Context{};
+    try context.ensure();
+    defer context.deinit();
+    const Driver = struct {
+        fn put(owner: *client.Owner, key: []const u8) !void {
+            const request = try std.fmt.allocPrint(std.testing.allocator, "{{\"inserts\":{{\"{s}\":{{\"value\":1}}}},\"sync_level\":\"write\"}}", .{key});
+            defer std.testing.allocator.free(request);
+            var response = try owner.batchJson("docs", request);
+            response.deinit();
+        }
+    };
+    inline for (.{ "fresh", "contained", "outside", "namespace", "deadline", "frozen" }) |scenario| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, scenario });
+        defer alloc.free(path);
+        var options: abi.OpenRequest = .{
+            .context = context.handle,
+            .path = .fromSlice(path),
+            .table_name = .fromSlice("docs"),
+            .group_id = 7191,
+            .has_identity_namespace = 1,
+            .identity_table_id = 71,
+            .identity_shard_id = 7191,
+            .identity_range_id = 7191,
+        };
+        if (comptime !std.mem.eql(u8, scenario, "fresh") and !std.mem.eql(u8, scenario, "deadline")) {
+            var unbounded = try client.Owner.open(options);
+            defer unbounded.deinit();
+            try Driver.put(&unbounded, if (std.mem.eql(u8, scenario, "outside")) "z" else "b");
+            if (comptime std.mem.eql(u8, scenario, "frozen")) {
+                const topology = @import("db/relational_integrity_topology_contract.zig");
+                const handoff = @import("db/relational_integrity_handoff_contract.zig");
+                const identity_request = try handoff.encode(alloc, @as(@import("db/relational_transition_contract.zig").Request, .identity));
+                defer alloc.free(identity_request);
+                var identity_response: abi.OwnedBytes = .{};
+                defer abi.antfly_storage_owner_buffer_destroy(&identity_response);
+                try error_identity.statusToError(abi.antfly_storage_owner_relational_transition_read(unbounded.handle, &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(identity_request) }, &identity_response));
+                var identity = try std.json.parseFromSlice(topology.Identity, alloc, identity_response.slice(), .{});
+                defer identity.deinit();
+                const fence: topology.Fence = .{
+                    .role = .backup_snapshot,
+                    .transition_id = 9191,
+                    .attempt = 1,
+                    .peer_group_id = 7191,
+                    .owner_group_id = 7191,
+                    .admission_epoch = identity.value.next_epoch,
+                    .namespace = identity.value.namespace,
+                    .catalog_digest = identity.value.catalog_digest,
+                };
+                const freeze = try handoff.encode(alloc, .{ ._relational_topology = topology.Command{ .action = .begin, .fence = fence } });
+                defer alloc.free(freeze);
+                var applied = try unbounded.replicatedBatchAtRaftEntryJson("docs", freeze, 1, 1);
+                applied.deinit();
+            }
+        }
+        options.has_initial_range = 1;
+        options.initial_range_start = .fromSlice("a");
+        options.initial_range_end = .fromSlice("m");
+        if (comptime std.mem.eql(u8, scenario, "frozen")) {
+            try std.testing.expectError(error.IntegrityTopologyBusy, client.Owner.open(options));
+            options.has_initial_range = 0;
+            options.initial_range_start = .{};
+            options.initial_range_end = .{};
+            var still_frozen = try client.Owner.open(options);
+            defer still_frozen.deinit();
+            try std.testing.expectError(error.IntegrityTopologyBusy, Driver.put(&still_frozen, "b"));
+            continue;
+        } else if (comptime std.mem.eql(u8, scenario, "outside")) {
+            try std.testing.expectError(error.KeyOutOfRange, client.Owner.open(options));
+            // A failed narrow reconciliation must not install its bounds.
+            options.initial_range_start = .fromSlice("m");
+            options.initial_range_end = .fromSlice("zz");
+        } else if (comptime std.mem.eql(u8, scenario, "namespace")) {
+            options.identity_table_id = 72;
+            options.initial_range_start = .fromSlice("m");
+            options.initial_range_end = .fromSlice("z");
+            try std.testing.expectError(error.IdentityNamespaceMismatch, client.Owner.open(options));
+            options.identity_table_id = 71;
+            options.initial_range_start = .fromSlice("a");
+            options.initial_range_end = .fromSlice("m");
+        } else if (comptime std.mem.eql(u8, scenario, "deadline")) {
+            options.initial_range_control.has_execution_deadline = 1;
+            options.initial_range_control.execution_deadline_ns = 1;
+            try std.testing.expectError(error.DeadlineExceeded, client.Owner.open(options));
+            options.initial_range_control = .{};
+        }
+        {
+            var bounded = try client.Owner.open(options);
+            defer bounded.deinit();
+            try Driver.put(&bounded, if (std.mem.eql(u8, scenario, "outside")) "z" else "b");
+            try std.testing.expectError(error.KeyOutOfRange, Driver.put(&bounded, if (std.mem.eql(u8, scenario, "outside")) "b" else "z"));
+        }
+        // The creation hint is not transition authority. A stale descriptor
+        // cannot change a range that was already committed by its owner.
+        options.initial_range_start = .fromSlice("");
+        options.initial_range_end = .fromSlice("");
+        var reopened = try client.Owner.open(options);
+        defer reopened.deinit();
+        try std.testing.expectError(error.KeyOutOfRange, Driver.put(&reopened, if (std.mem.eql(u8, scenario, "outside")) "b" else "z"));
+    }
+}
+
+test "opaque portable and native restore preserve bounded range through captured replicated pages" {
+    const alloc = std.testing.allocator;
+    const staging = @import("db/restore_staging_contract.zig");
+    const restore = @import("../api/restore_owner_contract.zig");
+    const topology = @import("db/relational_integrity_topology_contract.zig");
+    const handoff = @import("db/relational_integrity_handoff_contract.zig");
+    const transition = @import("db/relational_transition_contract.zig");
+    const seal = @import("db/native_backup_seal_contract.zig");
+    const batch_wire = @import("../api/batch.zig");
+    const Driver = struct {
+        owner: *client.Owner,
+        index: u64 = 0,
+
+        fn call(self: *@This(), input: restore.Request) !restore.Response {
+            const body = try handoff.encode(std.testing.allocator, input);
+            defer std.testing.allocator.free(body);
+            var captured = try self.owner.restoreControlJson(.{ .control = .{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(body) } });
+            defer captured.deinit();
+            var prepared = try std.json.parseFromSlice(@import("../api/restore_owner.zig").Prepared, std.testing.allocator, captured.bytes(), .{ .allocate = .alloc_always });
+            defer prepared.deinit();
+            if (prepared.value.batch_json) |encoded| {
+                var parsed = try batch_wire.parseInternalBatchRequest(std.testing.allocator, encoded);
+                defer parsed.deinit(std.testing.allocator);
+                try std.testing.expectEqual(input.scope.digest(), parsed.req.restore_staging_scope.?);
+                const replay = try batch_wire.encodeBatchRequest(std.testing.allocator, parsed.req);
+                defer std.testing.allocator.free(replay);
+                self.index += 1;
+                var applied = try self.owner.replicatedBatchAtRaftEntryJson("docs", replay, 1, self.index);
+                applied.deinit();
+                return self.call(.{ .scope = input.scope, .action = .status });
+            }
+            return prepared.value.response;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var context = client.Context{};
+    try context.ensure();
+    defer context.deinit();
+    const schema_bytes = try @import("schema.zig").serializeSchema(scratch, .{});
+    const source_namespace: @import("db/doc_identity.zig").Namespace = .{ .table_id = 71, .shard_id = 7101, .range_id = 7101 };
+    const source_path = try std.fmt.allocPrint(scratch, "{s}/source", .{root});
+    var source = try client.Owner.open(.{
+        .context = context.handle,
+        .path = .fromSlice(source_path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7101,
+        .has_identity_namespace = 1,
+        .identity_table_id = 71,
+        .identity_shard_id = 7101,
+        .identity_range_id = 7101,
+        .indexes_json = .fromSlice("{}"),
+        .has_initial_range = 1,
+        .initial_range_start = .fromSlice("a"),
+        .initial_range_end = .fromSlice("m"),
+    });
+    defer source.deinit();
+    var source_driver: Driver = .{ .owner = &source };
+    var written = try source.batchJson("docs", "{\"inserts\":{\"b\":{\"value\":1},\"k\":{\"value\":2}},\"sync_level\":\"write\"}");
+    written.deinit();
+    var identity_response: abi.OwnedBytes = .{};
+    defer abi.antfly_storage_owner_buffer_destroy(&identity_response);
+    try error_identity.statusToError(abi.antfly_storage_owner_relational_transition_read(source.handle, &.{
+        .table_name = .fromSlice("docs"),
+        .request_json = .fromSlice(try handoff.encode(scratch, @as(transition.Request, .identity))),
+    }, &identity_response));
+    const identity = try std.json.parseFromSliceLeaky(topology.Identity, scratch, identity_response.slice(), .{});
+    const fence: topology.Fence = .{
+        .role = .backup_snapshot,
+        .transition_id = 991,
+        .attempt = 1,
+        .peer_group_id = 7101,
+        .owner_group_id = 7101,
+        .admission_epoch = identity.next_epoch,
+        .namespace = identity.namespace,
+        .catalog_digest = identity.catalog_digest,
+    };
+    source_driver.index += 1;
+    var frozen = try source.replicatedBatchAtRaftEntryJson("docs", try handoff.encode(scratch, .{ ._relational_topology = topology.Command{ .action = .begin, .fence = fence } }), 1, source_driver.index);
+    frozen.deinit();
+    var pin = try source.backupPinControlJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(try handoff.encode(scratch, seal.Request{ .seal = .{ .id = "bounded", .fence = fence } })) });
+    defer pin.deinit();
+    const pin_handle = try std.json.parseFromSliceLeaky(seal.Handle, scratch, pin.bytes(), .{});
+    inline for (.{ abi.BackupFormat.portable, abi.BackupFormat.native }) |format| {
+        const backup_id = "bounded-" ++ @tagName(format);
+        var exported = try source.backupWithControl(.{
+            .format = @intFromEnum(format),
+            .table_name = .fromSlice("docs"),
+            .backup_root = .fromSlice(root),
+            .backup_id = .fromSlice(backup_id),
+            .sealed_handle_json = .fromSlice(pin.bytes()),
+        });
+        defer exported.deinit();
+        const shards = try std.json.parseFromSliceLeaky([]@import("../api/backup_contract.zig").ShardSnapshot, scratch, exported.bytes(), .{});
+        try std.testing.expectEqual(@as(usize, 1), shards.len);
+        try std.testing.expectEqualStrings("a", shards[0].start_key);
+        var digest: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&digest, shards[0].artifact_sha256);
+        const artifact: @import("../metadata/restore_staging.zig").SourceArtifact = .{
+            .target_group_id = 7201,
+            .source_namespace = source_namespace,
+            .format = if (format == .portable) .portable else .native,
+            .snapshot_path = shards[0].snapshot_path,
+            .artifact_size_bytes = shards[0].artifact_size_bytes,
+            .artifact_sha256 = digest,
+            .native_manifest_size_bytes = shards[0].native_manifest_size_bytes,
+            .native_manifest_sha256 = shards[0].native_manifest_sha256,
+            .cohort_seal = pin_handle,
+        };
+        const target_scope: staging.Scope = .{
+            .plan_id = @splat(4),
+            .plan_digest = @splat(5),
+            .source_artifact_digest = digest,
+            .source_descriptor_digest = try artifact.digest(scratch),
+            .source_namespace = source_namespace,
+            .target_namespace = .{ .table_id = 72, .shard_id = 7201, .range_id = 7201 },
+            .target_schema_digest = staging.digest(schema_bytes),
+        };
+        const target_bootstrap: staging.OwnerBootstrap = .{
+            .scope = target_scope,
+            .table_name = "docs",
+            .schema_json = "",
+            .indexes_json = "{}",
+            .byte_range = .{ .start = "a", .end = "m" },
+        };
+        var target = try client.Owner.open(.{
+            .context = context.handle,
+            .path = .fromSlice(try std.fmt.allocPrint(scratch, "{s}/target-{s}", .{ root, @tagName(format) })),
+            .table_name = .fromSlice("docs"),
+            .group_id = 7201,
+            .has_identity_namespace = 1,
+            .identity_table_id = 72,
+            .identity_shard_id = 7201,
+            .identity_range_id = 7201,
+            .indexes_json = .fromSlice("{}"),
+            .restore_bootstrap_json = .fromSlice(try handoff.encode(scratch, target_bootstrap)),
+        });
+        defer target.deinit();
+        var target_driver: Driver = .{ .owner = &target };
+        _ = try target_driver.call(.{ .scope = target_scope, .action = .begin });
+        const source_request: restore.Source = .{ .location = try std.fmt.allocPrint(scratch, "file://{s}", .{root}), .artifact = artifact };
+        var final: restore.Response = undefined;
+        for (0..256) |_| {
+            final = try target_driver.call(.{ .scope = target_scope, .action = .import_page, .source = source_request, .max_rows = 1 });
+            if (final.phase == .imported) break;
+        }
+        try std.testing.expectEqual(staging.Phase.imported, final.phase);
+        try std.testing.expectEqual(@as(u64, 2), final.rows);
+        _ = try target_driver.call(.{ .scope = target_scope, .action = .validate });
+        _ = try target_driver.call(.{ .scope = target_scope, .action = .publish });
+        var restored = try target.lookupJson("docs", "{\"key\":\"b\"}");
+        defer restored.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, restored.bytes(), "1") != null);
+    }
+}
+
 test "opaque hidden restore prepares without mutation and reopens exact canceled scope" {
     const alloc = std.testing.allocator;
     const staging = @import("db/restore_staging_contract.zig");
@@ -317,6 +1027,25 @@ test "opaque hidden restore prepares without mutation and reopens exact canceled
     var before = try Control.call(alloc, &owner, .{ .scope = scope, .action = .status });
     defer before.deinit();
     try std.testing.expectEqual(staging.Phase.reserved, before.value.response.phase);
+    {
+        // Exercise the actual archive boundary, not just the HTTP adapter:
+        // valid maximum-length JSON must reach the owner, while one byte over
+        // the shared bound is a stable terminal request error. Whitespace
+        // avoids building millions of test-only JSON nodes.
+        const compact = try std.json.Stringify.valueAlloc(alloc, restore.Request{ .scope = scope, .action = .status }, .{});
+        defer alloc.free(compact);
+        const padded = try alloc.alloc(u8, restore.max_request_bytes + 1);
+        defer alloc.free(padded);
+        @memset(padded, ' ');
+        @memcpy(padded[0..compact.len], compact);
+        var result = try owner.restoreControlJson(.{ .control = .{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(padded[0..restore.max_request_bytes]) } });
+        defer result.deinit();
+        var status = try std.json.parseFromSlice(Prepared, alloc, result.bytes(), .{});
+        defer status.deinit();
+        try std.testing.expectEqual(staging.Phase.reserved, status.value.response.phase);
+        try std.testing.expect(status.value.batch_json == null);
+        try std.testing.expectError(error.InvalidBackupRequest, owner.restoreControlJson(.{ .control = .{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(padded) } }));
+    }
     var applied = try owner.replicatedBatchAtRaftEntryJson("docs", begin.value.batch_json.?, 1, 1);
     applied.deinit();
     var cancel = try Control.call(alloc, &owner, .{ .scope = scope, .action = .cancel });
@@ -789,6 +1518,30 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     capture = .{ .stop_on_row = true };
     try std.testing.expectError(error.ConsumerStoppedAfterRow, owner.scanStream("docs", scan_json, capture.sink()));
     try std.testing.expectEqual(@as(usize, 1), capture.rows);
+    const CancelScan = struct {
+        fn always(_: ?*anyopaque) callconv(.c) u8 {
+            return 1;
+        }
+        fn afterRow(ptr: ?*anyopaque) callconv(.c) u8 {
+            const target: *ScanCapture = @ptrCast(@alignCast(ptr.?));
+            return @intFromBool(target.rows != 0);
+        }
+    };
+    capture = .{};
+    try std.testing.expectError(error.Canceled, owner.scanStreamWithOptions("docs", scan_json, capture.sink(), .{ .cancellation_fn = CancelScan.always }));
+    try std.testing.expectEqual(@as(usize, 0), capture.starts);
+    try std.testing.expectError(error.DeadlineExceeded, owner.scanStreamWithOptions("docs", scan_json, capture.sink(), .{ .execution_deadline_ns = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), capture.starts);
+    try std.testing.expectError(error.Canceled, owner.scanNdjsonWithOptions("docs", scan_json, .{ .cancellation_fn = CancelScan.always }));
+    try std.testing.expectError(error.DeadlineExceeded, owner.scanNdjsonWithOptions("docs", scan_json, .{ .execution_deadline_ns = 0 }));
+    try std.testing.expectError(error.Canceled, owner.scanStreamWithOptions("docs", scan_json, capture.sink(), .{ .cancellation_ctx = &capture, .cancellation_fn = CancelScan.afterRow }));
+    try std.testing.expectEqual(@as(usize, 1), capture.rows);
+    capture = .{};
+    try std.testing.expectError(error.RelationalTableRequired, owner.scanStream("docs",
+        \\{"from_key":"","to_key":"","include_documents":true,"relational_query_json":"{\"fields\":[]}"}
+    , capture.sink()));
+    // Failed typed preparation must never become a successful empty HTTP stream.
+    try std.testing.expectEqual(@as(usize, 0), capture.starts);
     try std.testing.expectError(error.InvalidGraphMetricAction, owner.graphMetricMaintenanceJson("docs", "{\"operation\":\"metric_action_v1\"}"));
 
     // Status reads deliberately avoid waiting under the owner lease for a
@@ -1660,6 +2413,337 @@ test "opaque storage context enforces owner lifetime and shares process storage 
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_destroy(context));
 }
 
+test "opaque rejected Raft entry advances through empty batch without effects across reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/rejected-entry", .{root});
+    defer alloc.free(path);
+    var context = client.Context{};
+    try context.ensure();
+    defer context.deinit();
+    const options: abi.OpenRequest = .{ .context = context.handle, .path = .fromSlice(path), .table_name = .fromSlice("rows"), .group_id = 9191, .has_identity_namespace = 1, .identity_table_id = 91, .identity_shard_id = 9191, .identity_range_id = 9191, .schema_json = .fromSlice("{}") };
+    {
+        var owner = try client.Owner.open(options);
+        defer owner.deinit();
+        var initial = try owner.replicatedBatchAtRaftEntryJson("rows", "{\"inserts\":{\"a\":{\"n\":1}},\"sync_level\":\"write\"}", 3, 1);
+        initial.deinit();
+        // The raw authority has rejected entry two; only its exact native
+        // applied marker advances. The rejected command is never forwarded.
+        var rejected = try owner.replicatedBatchAtRaftEntryJson("rows", "{}", 3, 2);
+        rejected.deinit();
+    }
+    {
+        var owner = try client.Owner.open(options);
+        defer owner.deinit();
+        // A synthetic nonempty replay proves that the empty command persisted
+        // its marker, not merely returned success without a durable effect.
+        var replay = try owner.replicatedBatchAtRaftEntryJson("rows", "{\"inserts\":{\"a\":{\"n\":999}},\"sync_level\":\"write\"}", 3, 2);
+        replay.deinit();
+        var row = try owner.lookupJson("rows", "{\"key\":\"a\"}");
+        defer row.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, row.bytes(), "\"n\":1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, row.bytes(), "999") == null);
+        var next = try owner.replicatedBatchAtRaftEntryJson("rows", "{\"inserts\":{\"a\":{\"n\":2}},\"sync_level\":\"write\"}", 3, 3);
+        next.deinit();
+        var changed = try owner.lookupJson("rows", "{\"key\":\"a\"}");
+        defer changed.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, changed.bytes(), "\"n\":2") != null);
+    }
+}
+
+test "opaque native Raft snapshot captures once and stages native plus logical projection" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const source_path = try std.fmt.allocPrint(alloc, "{s}/native-source", .{root});
+    defer alloc.free(source_path);
+    const target_path = try std.fmt.allocPrint(alloc, "{s}/native-target", .{root});
+    defer alloc.free(target_path);
+    const raw_source_path = try std.fmt.allocPrint(alloc, "{s}/raw-source", .{root});
+    defer alloc.free(raw_source_path);
+    const raw_target_path = try std.fmt.allocPrint(alloc, "{s}/raw-target", .{root});
+    defer alloc.free(raw_target_path);
+    var context = client.Context{};
+    try context.ensure();
+    defer context.deinit();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"body":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const options: abi.OpenRequest = .{ .context = context.handle, .path = .fromSlice(source_path), .table_name = .fromSlice("rows"), .group_id = 8181, .has_identity_namespace = 1, .identity_table_id = 81, .identity_shard_id = 8181, .identity_range_id = 8181, .schema_json = .fromSlice(schema), .indexes_json = .fromSlice("{\"full_text_index_v0\":{\"type\":\"full_text\"}}") };
+    var owner = try client.Owner.open(options);
+    defer owner.deinit();
+    var response = try owner.replicatedBatchAtRaftEntryJson("rows", "{\"inserts\":{\"a\":{\"n\":9007199254740993,\"body\":\"aardvark\"}},\"_timestamp_ns\":\"1234\",\"sync_level\":\"write\"}", 2, 5);
+    response.deinit();
+    var source = try data_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = raw_source_path, .context = context.handle });
+    defer source.deinit();
+    const barrier = "{\"table\":\"rows\",\"protocol_barrier\":10,\"batch\":null}";
+    var log: [25 + barrier.len]u8 = undefined;
+    std.mem.writeInt(u32, log[0..4], 1, .little);
+    std.mem.writeInt(u64, log[4..12], 2, .little);
+    std.mem.writeInt(u64, log[12..20], 7, .little);
+    log[20] = 0;
+    std.mem.writeInt(u32, log[21..25], barrier.len, .little);
+    @memcpy(log[25..], barrier);
+    try source.applyBatch(8181, 7, &log);
+    var prepared = (try source.prepareSnapshot(8181, 7)) orelse return error.TestExpectedEqual;
+    defer prepared.deinit();
+    try std.testing.expect(prepared.requiresNative());
+    var capture = try owner.captureNativeRaftSnapshot(8181, 7);
+    defer capture.deinit();
+    var released: bool = false;
+    const Release = struct {
+        fn call(raw: ?*anyopaque) callconv(.c) void {
+            const flag: *bool = @ptrCast(@alignCast(raw.?));
+            flag.* = true;
+        }
+    };
+    try capture.bindLease(&released, Release.call);
+    try prepared.attachNative(capture.handle.?);
+    capture.handle = null;
+    try std.testing.expect(!released);
+    var later = try owner.replicatedBatchAtRaftEntryJson("rows", "{\"inserts\":{\"later\":{\"n\":2}},\"_timestamp_ns\":\"1235\",\"sync_level\":\"write\"}", 2, 8);
+    later.deinit();
+    var artifact = try prepared.materializeFile(alloc);
+    defer artifact.deinit(alloc);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.path, alloc, .limited(artifact.size + 1));
+    defer alloc.free(bytes);
+    var target = try data_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = raw_target_path, .context = context.handle });
+    defer target.deinit();
+    var target_options = options;
+    target_options.path = .fromSlice(target_path);
+    {
+        var previous = try client.Owner.open(target_options);
+        defer previous.deinit();
+        var old_row = try previous.replicatedBatchAtRaftEntryJson("rows", "{\"inserts\":{\"old\":{\"n\":5,\"body\":\"previous\"}},\"_timestamp_ns\":\"1200\",\"sync_level\":\"write\"}", 1, 5);
+        old_row.deinit();
+    }
+    var request: abi.SnapshotPrepareRequest = .{ .path = .fromSlice(target_path), .table_name = .fromSlice("rows"), .group_id = 8181, .identity_table_id = 81, .identity_shard_id = 8181, .identity_range_id = 8181, .schema_json = .fromSlice(schema), .encoded_snapshot = .fromSlice(bytes), .projection_store = target.handle, .expected_applied_index = 6 };
+    var invalid: ?*anyopaque = null;
+    try std.testing.expect(abi.antfly_storage_snapshot_prepare(&request, &invalid) != .ok);
+    try std.testing.expect(invalid == null);
+    request.expected_applied_index = 7;
+    request.identity_shard_id = 8182;
+    try std.testing.expect(abi.antfly_storage_snapshot_prepare(&request, &invalid) != .ok);
+    try std.testing.expect(invalid == null);
+    try std.testing.expect(try target.latestBatch(8181) == null);
+    request.identity_shard_id = 8181;
+    request.lsm_root_generation = 2;
+    // Simulate losing native publication after raw projection preparation.
+    // Retrying the same Raft snapshot must install the same cut, not recapture
+    // the donor (whose live primary already advanced to index eight).
+    var interrupted = try client.Snapshot.prepare(request);
+    interrupted.deinit();
+    try std.testing.expectEqual(@as(u64, 7), (try target.latestBatch(8181)).?.commit_index);
+    // Crash with the incoming Raft snapshot durable but native publication
+    // incomplete. Reopen through the real shared runtime recovery queue,
+    // whose normal state-machine wrapper must install before marking applied.
+    const raft_engine = @import("raft_engine");
+    const replica_storage = @import("../raft/storage/mod.zig");
+    const state_machine = @import("../raft/state_machine/mod.zig");
+    var layout = try replica_storage.ReplicaPathLayout.initForReplica(alloc, root, 8181, 1);
+    defer layout.deinit(alloc);
+    {
+        var persisted = try replica_storage.PersistentReplicaState.init(alloc, layout);
+        defer persisted.deinit();
+        try persisted.groupStorage().persistReady(8181, .{
+            .hard_state = .{ .current_term = 1, .voted_for = 1, .commit_index = 5 },
+            .snapshot = .{ .metadata = .{ .index = 5, .term = 1, .conf_state = .{ .voters = @constCast(&[_]u64{1}) } }, .data = @constCast("previous completed root") },
+        });
+        try persisted.setAppliedIndex(5);
+        try persisted.groupStorage().persistReady(8181, .{
+            .hard_state = .{ .current_term = 2, .voted_for = 1, .commit_index = 7 },
+            .snapshot = .{ .metadata = .{ .index = 7, .term = 2, .conf_state = .{ .voters = @constCast(&[_]u64{1}) } }, .data = @constCast(bytes) },
+        });
+        try std.testing.expectEqual(@as(u64, 7), persisted.appliedIndex());
+        try std.testing.expectEqual(@as(u64, 5), persisted.completedAppliedIndex());
+    }
+    var recovered = try replica_storage.PersistentReplicaState.init(alloc, layout);
+    defer recovered.deinit();
+    const Recovery = struct {
+        request: abi.SnapshotPrepareRequest,
+        options: abi.OpenRequest,
+        state: *replica_storage.PersistentReplicaState,
+        blocked: bool = true,
+        installs: usize = 0,
+        batches: usize = 0,
+        verified: bool = false,
+
+        fn build(_: *anyopaque, _: std.mem.Allocator, _: u64) ![]u8 {
+            return error.UnexpectedSnapshotBuild;
+        }
+        fn batch(ptr: *anyopaque, value: state_machine.ApplyBatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const entries = try state_machine.decodeCommittedEntries(std.testing.allocator, value.entries_bytes);
+            defer std.testing.allocator.free(entries);
+            var reopened = try client.Owner.open(self.options);
+            defer reopened.deinit();
+            for (entries) |entry| {
+                var result = try reopened.replicatedBatchAtRaftEntryJson("rows", entry.data, entry.term, entry.index);
+                result.deinit();
+            }
+            self.batches += 1;
+        }
+        fn install(ptr: *anyopaque, _: std.mem.Allocator, group: u64, index: u64, encoded: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.blocked) return error.RaftApplyWriterUnavailable;
+            try std.testing.expectEqual(@as(u64, 8181), group);
+            try std.testing.expectEqual(@as(u64, 7), index);
+            var exact = self.request;
+            exact.encoded_snapshot = .fromSlice(encoded);
+            var staged = try client.Snapshot.prepare(exact);
+            defer staged.deinit();
+            try staged.promote();
+            _ = try staged.publishPrepared();
+            try staged.commit();
+            self.installs += 1;
+        }
+        fn verify(ptr: *anyopaque, _: u64, snapshot: ?raft_engine.core.types.Snapshot, entries: []const raft_engine.core.Entry, _: []const raft_engine.core.ReadState) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (snapshot == null and entries.len == 0) return;
+            var reopened = try client.Owner.open(self.options);
+            defer reopened.deinit();
+            var row_at_cut = try reopened.lookupJson("rows", "{\"key\":\"a\"}");
+            defer row_at_cut.deinit();
+            try std.testing.expectError(error.NotFound, reopened.lookupJson("rows", "{\"key\":\"old\"}"));
+            if (self.batches == 0) {
+                try std.testing.expectError(error.NotFound, reopened.lookupJson("rows", "{\"key\":\"later\"}"));
+            } else {
+                var later_row = try reopened.lookupJson("rows", "{\"key\":\"later\"}");
+                later_row.deinit();
+            }
+            self.verified = true;
+        }
+        fn complete(ptr: *anyopaque, _: u64, index: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.verified);
+            try self.state.setAppliedIndex(index);
+        }
+    };
+    var published_options = target_options;
+    published_options.lsm_root_generation = 2;
+    var recovery = Recovery{ .request = request, .options = published_options, .state = &recovered };
+    var apply = state_machine.DataStateMachine{
+        .alloc = alloc,
+        .snapshot_builder = .{ .ptr = &recovery, .vtable = &.{ .build_snapshot = Recovery.build, .install_snapshot = Recovery.install, .apply_batch = Recovery.batch } },
+        .delegate = .{ .ptr = &recovery, .vtable = &.{ .apply_ready = Recovery.verify } },
+        .applied_sink = .{ .ptr = &recovery, .vtable = &.{ .set_applied_index = Recovery.complete } },
+    };
+    var runtime = raft_engine.runtime.MultiRaft.init(alloc, .{}, .{ .state_machine = apply.stateMachine(), .group_storage = recovered.groupStorage() });
+    defer runtime.deinit();
+    var reads = @import("../raft/read_gate.zig").AppliedReadTracker.init(alloc, 999);
+    defer reads.deinit();
+    var read_buffer: [96]u8 = undefined;
+    const read = try reads.register(8181, &read_buffer);
+    reads.observeReadStates(8181, &.{.{ .index = 7, .request_ctx = @constCast(read.request_ctx) }});
+    _ = try runtime.ensureReplica(.{
+        .group = .{ .group_id = 8181, .local_node_id = 1, .raft_config = .{ .id = 1, .group_id = 8181, .peers = &.{1}, .election_tick = 5, .heartbeat_tick = 1, .applied = recovered.completedAppliedIndex() }, .storage = recovered.storage() },
+        .recover_persisted_snapshot = true,
+    });
+    _ = try runtime.processReady(8181);
+    try reads.noteApplied(8181, recovered.completedAppliedIndex());
+    try std.testing.expect(!reads.takeCompleted(read.token));
+    try std.testing.expectEqual(@as(usize, 0), recovery.installs);
+    {
+        var previous = try client.Owner.open(target_options);
+        defer previous.deinit();
+        var old_row = try previous.lookupJson("rows", "{\"key\":\"old\"}");
+        old_row.deinit();
+        try std.testing.expectError(error.NotFound, previous.lookupJson("rows", "{\"key\":\"a\"}"));
+    }
+    recovery.blocked = false;
+    for (0..8) |_| {
+        _ = try runtime.processReady(8181);
+        if (recovered.completedAppliedIndex() == 7) break;
+    } else return error.SnapshotRecoveryDidNotComplete;
+    try std.testing.expectEqual(@as(usize, 1), recovery.installs);
+    try reads.noteApplied(8181, recovered.completedAppliedIndex());
+    try std.testing.expect(reads.takeCompleted(read.token));
+    target_options = published_options;
+    {
+        var restored = try client.Owner.open(target_options);
+        defer restored.deinit();
+        var row = try restored.lookupJson("rows", "{\"key\":\"a\"}");
+        defer row.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, row.bytes(), "9007199254740993") != null);
+        try std.testing.expectError(error.NotFound, restored.lookupJson("rows", "{\"key\":\"old\"}"));
+        var search = try restored.queryJson("rows", "{\"full_text_search\":{\"match\":\"aardvark\",\"field\":\"body\"},\"indexes\":[\"full_text_index_v0\"],\"limit\":10}");
+        defer search.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, search.bytes(), "aardvark") != null);
+    }
+    var range = try target.currentRange(alloc, 8181);
+    defer range.deinit(alloc);
+    var page = try target.groupStatePageInRange(alloc, 8181, .{ .start = range.start, .end = range.end }, null, 10, 1024 * 1024);
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), page.entries.len);
+    try std.testing.expectEqualStrings("a", page.entries[0].key);
+    try std.testing.expect(std.mem.indexOf(u8, page.entries[0].value, "9007199254740993") != null);
+    try std.testing.expectEqual(@as(u64, 7), (try target.latestBatch(8181)).?.commit_index);
+
+    // Legacy (or batched-watermark) recovery can find native data ahead of
+    // its completed cursor. Reinstalling the retained snapshot must replay
+    // the durable suffix before satisfying an already-observed current read.
+    const suffix = "{\"inserts\":{\"later\":{\"n\":2}},\"_timestamp_ns\":\"1235\",\"sync_level\":\"write\"}";
+    {
+        var ahead = try client.Owner.open(target_options);
+        defer ahead.deinit();
+        var result = try ahead.replicatedBatchAtRaftEntryJson("rows", suffix, 2, 8);
+        result.deinit();
+    }
+    const legacy_root = try std.fmt.allocPrint(alloc, "{s}/legacy-provider", .{root});
+    defer alloc.free(legacy_root);
+    var legacy_layout = try replica_storage.ReplicaPathLayout.initForReplica(alloc, legacy_root, 8181, 1);
+    defer legacy_layout.deinit(alloc);
+    {
+        var persisted = try replica_storage.PersistentReplicaState.init(alloc, legacy_layout);
+        defer persisted.deinit();
+        try persisted.groupStorage().persistReady(8181, .{
+            .hard_state = .{ .current_term = 2, .voted_for = 1, .commit_index = 8 },
+            .snapshot = .{ .metadata = .{ .index = 7, .term = 2, .conf_state = .{ .voters = @constCast(&[_]u64{1}) } }, .data = @constCast(bytes) },
+            .entries = &.{.{ .term = 2, .index = 8, .data = @constCast(suffix) }},
+        });
+        try std.testing.expectEqual(@as(u64, 0), persisted.completedAppliedIndex());
+    }
+    var legacy = try replica_storage.PersistentReplicaState.init(alloc, legacy_layout);
+    defer legacy.deinit();
+    var legacy_request = request;
+    legacy_request.lsm_root_generation = 3;
+    var legacy_options = target_options;
+    legacy_options.lsm_root_generation = 3;
+    var legacy_recovery = Recovery{ .request = legacy_request, .options = legacy_options, .state = &legacy };
+    var legacy_apply = state_machine.DataStateMachine{
+        .alloc = alloc,
+        .snapshot_builder = .{ .ptr = &legacy_recovery, .vtable = &.{ .build_snapshot = Recovery.build, .install_snapshot = Recovery.install, .apply_batch = Recovery.batch } },
+        .delegate = .{ .ptr = &legacy_recovery, .vtable = &.{ .apply_ready = Recovery.verify } },
+        .applied_sink = .{ .ptr = &legacy_recovery, .vtable = &.{ .set_applied_index = Recovery.complete } },
+    };
+    var legacy_runtime = raft_engine.runtime.MultiRaft.init(alloc, .{}, .{ .state_machine = legacy_apply.stateMachine(), .group_storage = legacy.groupStorage() });
+    defer legacy_runtime.deinit();
+    const latest_read = try reads.register(8181, &read_buffer);
+    reads.observeReadStates(8181, &.{.{ .index = 8, .request_ctx = @constCast(latest_read.request_ctx) }});
+    _ = try legacy_runtime.ensureReplica(.{
+        .group = .{ .group_id = 8181, .local_node_id = 1, .raft_config = .{ .id = 1, .group_id = 8181, .peers = &.{1}, .election_tick = 5, .heartbeat_tick = 1, .applied = legacy.completedAppliedIndex() }, .storage = legacy.storage() },
+        .recover_persisted_snapshot = true,
+    });
+    _ = try legacy_runtime.processReady(8181);
+    try std.testing.expectEqual(@as(u64, 0), legacy.completedAppliedIndex());
+    try std.testing.expect(!reads.takeCompleted(latest_read.token));
+    legacy_recovery.blocked = false;
+    for (0..8) |_| {
+        _ = try legacy_runtime.processReady(8181);
+        try reads.noteApplied(8181, legacy.completedAppliedIndex());
+        if (legacy.completedAppliedIndex() == 8) break;
+        try std.testing.expect(!reads.takeCompleted(latest_read.token));
+    } else return error.LegacySnapshotRecoveryDidNotComplete;
+    try std.testing.expectEqual(@as(usize, 1), legacy_recovery.installs);
+    try std.testing.expectEqual(@as(usize, 1), legacy_recovery.batches);
+    try std.testing.expect(reads.takeCompleted(latest_read.token));
+}
+
 test "opaque data raft apply owner preserves batch snapshot and placement lifecycle" {
     const source_root = "/tmp/antfly-storage-kernel-data-apply-source";
     const restored_root = "/tmp/antfly-storage-kernel-data-apply-restored";
@@ -1749,6 +2833,31 @@ test "opaque data raft apply owner preserves batch snapshot and placement lifecy
     );
     defer projection_page.deinit(std.testing.allocator);
     try std.testing.expect(projection_page.entries.len > 0);
+    var key_page = try source.groupStateKeysPageInRange(
+        std.testing.allocator,
+        81,
+        .{ .start = projection_range.start, .end = projection_range.end },
+        null,
+        1,
+        1024,
+    );
+    defer key_page.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), key_page.entries.len);
+    try std.testing.expectEqualStrings(projection_page.entries[0].key, key_page.entries[0].key);
+    try std.testing.expectEqualStrings("", key_page.entries[0].value);
+    try std.testing.expect(projection_page.entries[0].value.len != 0);
+    try std.testing.expect(!key_page.exhausted);
+    var following_keys = try source.groupStateKeysPageInRange(
+        std.testing.allocator,
+        81,
+        .{ .start = projection_range.start, .end = projection_range.end },
+        key_page.entries[0].key,
+        8,
+        1024,
+    );
+    defer following_keys.deinit(std.testing.allocator);
+    try std.testing.expectEqual(projection_page.entries.len - 1, following_keys.entries.len);
+    for (following_keys.entries) |entry| try std.testing.expectEqualStrings("", entry.value);
     var invalid_projection: abi.OwnedBytes = .{};
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_data_apply_store_projection(
         source.handle,
@@ -1923,6 +3032,136 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
     try source.flushHAOutbox();
     try std.testing.expectEqual(prior_lsn, primary.lastLsn());
     _ = try source.exportHACheckpoint(std.testing.io, root ++ "/checkpoint");
+}
+
+test "opaque metadata staging authority and binary receipts survive compiled projection and snapshot" {
+    const alloc = std.testing.allocator;
+    const staging = @import("../metadata/restore_staging.zig");
+    const Helper = struct {
+        fn apply(store: *metadata_apply_client.RaftApplyStore, group: u64, command: staging.Command) !void {
+            const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, command, .{});
+            defer std.testing.allocator.free(encoded);
+            try store.applyStandaloneCommand(group, .{ .apply_restore_staging = encoded });
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const source_path = try std.fmt.allocPrint(alloc, "{s}/source", .{root});
+    defer alloc.free(source_path);
+    const restored_path = try std.fmt.allocPrint(alloc, "{s}/restored", .{root});
+    defer alloc.free(restored_path);
+    var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = source_path, .no_sync = true });
+    defer store.deinit();
+    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    const target: staging.Target = .{ .source_table_id = 1, .table = .{ .table_id = 11, .name = "private", .schema_json = "{}" }, .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }} };
+    const plan: staging.Plan = .{ .id = @splat(255), .cohort_digest = @splat(9), .targets = &.{target} };
+    try Helper.apply(&store, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group, plan.id, 7, null));
+    try store.applyStandaloneCommand(group, .{ .register_node = .{ .node_id = 7, .role = "data", .lifecycle = @import("../metadata/table_manager.zig").node_lifecycle_active } });
+    try store.applyStandaloneCommand(group, .{ .upsert_replica_intent = .{
+        .expected_metadata_version = null,
+        .expected_version_fence = 0,
+        .expected_target_drain_requested = false,
+        .replacement = .{ .record = .{ .group_id = 701, .replica_id = 1, .local_node_id = 7 }, .store_id = 0, .peer_node_ids = &.{7} },
+    } });
+    try std.testing.expect(try store.restoreStagingAuthorityAllowed(alloc, group, plan.id, 7, null));
+    try std.testing.expect(try store.restoreStagingAuthorityAllowed(alloc, group, plan.id, 7, 701));
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group, plan.id, 8, 701));
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group, @splat(254), 7, 701));
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group, plan.id, 7, 0));
+    try std.testing.expect((try store.loadRestoreStagingReceipt(alloc, group, plan.id, .importing, 701)) == null);
+
+    var binary_digest: staging.Digest = @splat(255);
+    binary_digest[0] = 0;
+    const utf8_digest: staging.Digest = ([_]u8{ 0xc3, 0xa9, 0, 127 } ** 8);
+    const plan_digest = try plan.digest(alloc);
+    try Helper.apply(&store, group, .{ .id = plan.id, .action = .imported, .expected_revision = 1, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = plan_digest, .completion_digest = binary_digest } });
+    const imported = (try store.loadRestoreStagingProgress(alloc, group, plan.id)).?;
+    try std.testing.expectEqual(staging.State.validating, imported.state);
+    try Helper.apply(&store, group, .{ .id = plan.id, .action = .begin_cancel, .expected_revision = imported.revision });
+    const canceling = (try store.loadRestoreStagingProgress(alloc, group, plan.id)).?;
+    try std.testing.expectEqual(staging.State.canceling, canceling.state);
+    try Helper.apply(&store, group, .{ .id = plan.id, .action = .canceled, .expected_revision = canceling.revision, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = plan_digest, .completion_digest = utf8_digest } });
+    const canceled_owner = (try store.loadRestoreStagingProgress(alloc, group, plan.id)).?;
+    try std.testing.expectEqual(@as(u32, 1), canceled_owner.completed_owners);
+    try Helper.apply(&store, group, .{ .id = plan.id, .action = .finish_cancel, .expected_revision = canceled_owner.revision });
+    try store.applyStandaloneCommand(group, .{ .remove_replica_intent = .{ .group_id = 701, .local_node_id = 7, .expected_metadata_version = 1 } });
+    const snapshot = try store.snapshotBuilder().buildSnapshot(alloc, group);
+    defer alloc.free(snapshot);
+    var restored = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = restored_path, .no_sync = true });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(alloc, group, 1, snapshot));
+    for ([_]*metadata_apply_client.RaftApplyStore{ &store, &restored }) |owner| {
+        try std.testing.expect(try owner.restoreStagingAuthorityAllowed(alloc, group, plan.id, 7, 701));
+        try std.testing.expectEqual(staging.State.canceled, (try owner.loadRestoreStagingProgress(alloc, group, plan.id)).?.state);
+        var job = (try owner.loadRestoreStaging(alloc, group, plan.id)).?;
+        defer job.deinit();
+        try std.testing.expectEqual(plan.id, job.value.plan.id);
+        const binary = (try owner.loadRestoreStagingReceipt(alloc, group, plan.id, .importing, 701)).?;
+        defer alloc.free(binary);
+        try std.testing.expectEqualSlices(u8, &binary_digest, binary);
+        const utf8 = (try owner.loadRestoreStagingReceipt(alloc, group, plan.id, .canceling, 701)).?;
+        defer alloc.free(utf8);
+        try std.testing.expectEqualSlices(u8, &utf8_digest, utf8);
+    }
+}
+
+test "opaque metadata compound rewrite admission preserves job and source reservation across native snapshot" {
+    const alloc = std.testing.allocator;
+    const stages = @import("../metadata/restore_staging.zig");
+    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var source = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = try std.fmt.allocPrint(a, "{s}/source", .{root}), .no_sync = true });
+    defer source.deinit();
+    const original: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 9, .name = "rows", .schema_json = "{\"version\":1,\"storage_mode\":\"document\"}" };
+    const range: @import("../metadata/table_manager.zig").RangeRecord = .{ .table_id = 9, .group_id = 301, .range_id = 301, .start_key = "" };
+    try source.applyStandaloneCommand(group, .{ .upsert_table = original });
+    try source.applyStandaloneCommand(group, .{ .upsert_range = range });
+    const scope: @import("db/online_source_contract.zig").Scope = .{
+        .fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 401, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) },
+        .receiver_namespace = .{ .table_id = 10, .shard_id = 401, .range_id = 401 },
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+    };
+    const plan: stages.Plan = .{
+        .id = try stages.idForAttempt(7, 1),
+        .cohort_digest = @splat(7),
+        .preparing_sources = true,
+        .targets = &.{.{
+            .source_table_id = 9,
+            .table = .{ .table_id = 10, .name = "rows", .schema_json = original.schema_json },
+            .ranges = &.{.{ .table_id = 10, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" }},
+            .replace = .{ .table = original, .ranges = &.{range}, .fences = &.{scope.fence} },
+            .rewrite_sources = &.{scope},
+            .rewrite = .{ .preserve_document = true, .source_schemas = &.{original.schema_json}, .target_schema = original.schema_json, .program_digest = @splat(6) },
+        }},
+    };
+    const plan_json = try std.json.Stringify.valueAlloc(a, plan, .{});
+    const key = "\x00\x00__api_restore_jobs__:0000000000000007";
+    const value = "{\"job_id\":7,\"attempt_id\":1,\"staging_attempt_id\":1,\"source_kind\":\"schema_rewrite\",\"phase\":\"queued\"}";
+    try source.applyStandaloneCommand(group, .{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } });
+    const encoded = try source.snapshotBuilder().buildSnapshot(alloc, group);
+    defer alloc.free(encoded);
+    var replacement = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = try std.fmt.allocPrint(a, "{s}/replacement", .{root}), .no_sync = true });
+    defer replacement.deinit();
+    try std.testing.expect(try replacement.snapshotBuilder().installSnapshot(alloc, group, 1, encoded));
+    for ([_]*metadata_apply_client.RaftApplyStore{ &source, &replacement }) |owner| {
+        const stored = (try owner.getRestoreJobValue(alloc, group, key)).?;
+        defer alloc.free(stored);
+        try std.testing.expectEqualStrings(value, stored);
+        var admitted = (try owner.loadRestoreStaging(alloc, group, plan.id)).?;
+        defer admitted.deinit();
+        try std.testing.expectEqual(stages.State.preparing_sources, admitted.value.state);
+        try std.testing.expectEqualSlices(u8, &try plan.digest(alloc), &admitted.value.plan_digest);
+        try std.testing.expectEqual(stages.State.preparing_sources, (try owner.loadRestoreStagingProgress(alloc, group, plan.id)).?.state);
+    }
 }
 
 test "opaque metadata apply owner preserves semantic error identity" {
@@ -2369,7 +3608,7 @@ test "opaque owner lookup and typed scans preserve metadata scope digest and row
     cleanup(path);
     defer cleanup(path);
     const schema =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"string"},"count":{"type":"integer"}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"count_id","keys":[{"column":"count","direction":"desc"},{"column":"id"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"string"},"count":{"type":"integer"}},"additionalProperties":false}}}}
     ;
     var owner = try client.Owner.open(.{ .path = .fromSlice(path), .table_name = .fromSlice("rows"), .group_id = 7301, .has_identity_namespace = 1, .identity_table_id = 73, .identity_shard_id = 7301, .identity_range_id = 7301, .schema_json = .fromSlice(schema) });
     defer owner.deinit();
@@ -2410,6 +3649,38 @@ test "opaque owner lookup and typed scans preserve metadata scope digest and row
     try std.testing.expectEqualStrings(expected_version, decoded.value.object.get("version").?.string);
     try std.testing.expectEqualStrings("9007199254740993", decoded.value.object.get("row").?.object.get("count").?.number_string);
     try std.testing.expect(decoded.value.object.get("row").?.object.get("id") == null);
+    var second = try owner.batchJson("rows", "{\"inserts\":{\"s\":{\"id\":\"b\",\"count\":9007199254740992}},\"sync_level\":\"write\"}");
+    second.deinit();
+    const indexed_request = try contract.encodeStorageKernelScanRequest(alloc, "", "", .{
+        .relational_query_json = "{\"schema_version\":1,\"index\":\"count_id\",\"fields\":[]}",
+        .include_documents = true,
+        .limit = 1,
+    });
+    defer alloc.free(indexed_request);
+    const deadline = @import("antfly_platform").time.monotonicNs() + 15 * std.time.ns_per_s;
+    var indexed = while (true) {
+        break owner.scanNdjsonWithOptions("rows", indexed_request, .{ .execution_deadline_ns = deadline }) catch |err| switch (err) {
+            error.RelationalIndexNotReady => {
+                if (@import("antfly_platform").time.monotonicNs() >= deadline) return err;
+                try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    };
+    defer indexed.deinit();
+    var index_row = try std.json.parseFromSlice(std.json.Value, alloc, std.mem.trim(u8, indexed.bytes(), "\n"), .{});
+    defer index_row.deinit();
+    try std.testing.expectEqualStrings("r", index_row.value.object.get("_id").?.string);
+    try std.testing.expectEqual(@as(usize, 0), index_row.value.object.get("row").?.object.count());
+    const after = index_row.value.object.get("cursor").?.string;
+    const resumed_query = try std.fmt.allocPrint(alloc, "{{\"schema_version\":1,\"index\":\"count_id\",\"fields\":[],\"after\":\"{s}\"}}", .{after});
+    defer alloc.free(resumed_query);
+    const resumed_request = try contract.encodeStorageKernelScanRequest(alloc, "", "", .{ .relational_query_json = resumed_query, .include_documents = true, .limit = 1 });
+    defer alloc.free(resumed_request);
+    var resumed = try owner.scanNdjson("rows", resumed_request);
+    defer resumed.deinit();
+    try std.testing.expect(std.mem.startsWith(u8, resumed.bytes(), "{\"_id\":\"s\""));
 }
 
 test "opaque WAL rejects custom simulation hooks even without a context pointer" {

@@ -1,5 +1,16 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Stable error transport for independently generated runtime archives.
 //!
@@ -479,6 +490,85 @@ pub const Detail = enum(c_int) {
     metadata_ha_sequence_gap,
     invalid_metadata_ha_effect_chunk,
     ha_primary_not_configured,
+    relational_index_not_ready,
+    invalid_relational_index_bound,
+    relational_index_column_not_found,
+    unsupported_relational_index_column,
+    relational_rows_output_budget_exceeded,
+    relational_row_result_too_large,
+    relational_index_column_type_mismatch,
+    relational_table_required,
+    invalid_relational_index_forward_key,
+    // Online source, immutable artifact, and receiver control callbacks cross
+    // independent runtime units. Append stable identities; never expose
+    // compilation-local Zig error integers or silently erase recovery signals.
+    invalid_online_source_command,
+    online_source_corrupt,
+    online_source_pin_missing,
+    online_source_pin_pending,
+    online_source_scope_changed,
+    invalid_source_snapshot,
+    source_snapshot_corrupt,
+    source_snapshot_cut_mismatch,
+    source_snapshot_incomplete,
+    source_snapshot_too_large,
+    source_copy_restore_unsupported,
+    invalid_merge_page,
+    merge_copy_fenced,
+    merge_page_chunk_required,
+    merge_page_incomplete,
+    merge_page_sequence_gap,
+    retained_effects_consumer_limit,
+    retained_effects_corrupt,
+    retained_effects_cursor_mismatch,
+    retained_effects_full,
+    retained_effects_identity_required,
+    retained_effects_namespace_mismatch,
+    backend_runtime_io_unavailable,
+    corrupt_raft_applied_entry,
+    unknown_schema_version,
+    invalid_retained_effects_admission,
+    retained_effects_fence_mismatch,
+    retained_effects_mixed_control,
+    retained_effects_transaction_failed,
+    transition_operation_busy,
+    unknown_split_runtime,
+    unknown_merge_runtime,
+    missing_split_runtime,
+    missing_merge_runtime,
+    metadata_snapshot_unavailable,
+    split_source_projection_not_ready,
+    split_source_projection_advanced,
+    durable_root_incarnation_unavailable,
+    auto_bulk_ingest_busy,
+    apply_store_group_retired,
+    apply_store_shutting_down,
+    group_leader_unavailable,
+    catalog_routing_unavailable,
+    transition_operations_retired,
+    merge_transition_not_ready,
+    merge_receiver_projection_not_ready,
+    merge_source_projection_not_ready,
+    merge_source_projection_advanced,
+    storage_busy,
+    restore_job_commit_not_applied,
+    coordinated_standalone_ha_metadata_required,
+    relational_rewrite_type_change,
+    relational_rewrite_column_drop,
+    relational_rewrite_requires_relational,
+    relational_rewrite_budget_exceeded,
+    relational_expression_overflow,
+    relational_expression_division_by_zero,
+    relational_expression_budget_exceeded,
+    invalid_relational_expression_input,
+    invalid_relational_generated_value,
+    generated_column_rewrite_required,
+    read_index_timeout,
+    catalog_routing_snapshot_timeout,
+    intent_conflict,
+    version_conflict,
+    merge_page_required,
+    invalid_response,
 };
 
 pub const Status = extern struct {
@@ -496,6 +586,72 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.RelationalRewriteTypeChange => status(.invalid_argument, .relational_rewrite_type_change),
+        error.RelationalRewriteColumnDrop => status(.invalid_argument, .relational_rewrite_column_drop),
+        error.RelationalRewriteRequiresRelational => status(.invalid_argument, .relational_rewrite_requires_relational),
+        error.RelationalRewriteBudgetExceeded => status(.invalid_argument, .relational_rewrite_budget_exceeded),
+        error.RelationalExpressionOverflow => status(.invalid_argument, .relational_expression_overflow),
+        error.RelationalExpressionDivisionByZero => status(.invalid_argument, .relational_expression_division_by_zero),
+        error.RelationalExpressionBudgetExceeded => status(.invalid_argument, .relational_expression_budget_exceeded),
+        error.InvalidRelationalExpressionInput => status(.invalid_argument, .invalid_relational_expression_input),
+        error.InvalidRelationalGeneratedValue => status(.invalid_argument, .invalid_relational_generated_value),
+        error.GeneratedColumnRewriteRequired => status(.conflict, .generated_column_rewrite_required),
+        error.RestoreJobCommitNotApplied => status(.retryable, .restore_job_commit_not_applied),
+        error.CoordinatedStandaloneHAMetadataRequired => status(.unsupported, .coordinated_standalone_ha_metadata_required),
+        error.StorageBusy => status(.retryable, .storage_busy),
+        error.MergeTransitionNotReady => status(.retryable, .merge_transition_not_ready),
+        error.MergeReceiverProjectionNotReady => status(.retryable, .merge_receiver_projection_not_ready),
+        error.MergeSourceProjectionNotReady => status(.retryable, .merge_source_projection_not_ready),
+        error.MergeSourceProjectionAdvanced => status(.retryable, .merge_source_projection_advanced),
+        error.GroupLeaderUnavailable => status(.retryable, .group_leader_unavailable),
+        error.CatalogRoutingUnavailable => status(.retryable, .catalog_routing_unavailable),
+        error.CatalogRoutingSnapshotTimeout => status(.timeout, .catalog_routing_snapshot_timeout),
+        error.IntentConflict => status(.conflict, .intent_conflict),
+        error.VersionConflict => status(.conflict, .version_conflict),
+        error.MergePageRequired => status(.conflict, .merge_page_required),
+        error.InvalidResponse => status(.internal, .invalid_response),
+        error.TransitionOperationsRetired => status(.retryable, .transition_operations_retired),
+        error.TransitionOperationBusy => status(.retryable, .transition_operation_busy),
+        error.UnknownSplitRuntime => status(.not_found, .unknown_split_runtime),
+        error.UnknownMergeRuntime => status(.not_found, .unknown_merge_runtime),
+        error.MissingSplitRuntime => status(.not_found, .missing_split_runtime),
+        error.MissingMergeRuntime => status(.not_found, .missing_merge_runtime),
+        error.MetadataSnapshotUnavailable => status(.retryable, .metadata_snapshot_unavailable),
+        error.SplitSourceProjectionNotReady => status(.retryable, .split_source_projection_not_ready),
+        error.SplitSourceProjectionAdvanced => status(.retryable, .split_source_projection_advanced),
+        error.DurableRootIncarnationUnavailable => status(.retryable, .durable_root_incarnation_unavailable),
+        error.AutoBulkIngestBusy => status(.retryable, .auto_bulk_ingest_busy),
+        error.ApplyStoreGroupRetired => status(.retryable, .apply_store_group_retired),
+        error.ApplyStoreShuttingDown => status(.retryable, .apply_store_shutting_down),
+        error.InvalidRetainedEffectsAdmission => status(.invalid_argument, .invalid_retained_effects_admission),
+        error.RetainedEffectsFenceMismatch => status(.conflict, .retained_effects_fence_mismatch),
+        error.RetainedEffectsMixedControl => status(.invalid_argument, .retained_effects_mixed_control),
+        error.RetainedEffectsTransactionFailed => status(.conflict, .retained_effects_transaction_failed),
+        error.InvalidOnlineSourceCommand => status(.invalid_argument, .invalid_online_source_command),
+        error.OnlineSourceCorrupt => status(.corrupt, .online_source_corrupt),
+        error.OnlineSourcePinMissing => status(.not_found, .online_source_pin_missing),
+        error.OnlineSourcePinPending => status(.retryable, .online_source_pin_pending),
+        error.OnlineSourceScopeChanged => status(.conflict, .online_source_scope_changed),
+        error.InvalidSourceSnapshot => status(.invalid_argument, .invalid_source_snapshot),
+        error.SourceSnapshotCorrupt => status(.corrupt, .source_snapshot_corrupt),
+        error.SourceSnapshotCutMismatch => status(.conflict, .source_snapshot_cut_mismatch),
+        error.SourceSnapshotIncomplete => status(.retryable, .source_snapshot_incomplete),
+        error.SourceSnapshotTooLarge => status(.invalid_argument, .source_snapshot_too_large),
+        error.SourceCopyRestoreUnsupported => status(.unsupported, .source_copy_restore_unsupported),
+        error.InvalidMergePage => status(.invalid_argument, .invalid_merge_page),
+        error.MergeCopyFenced => status(.conflict, .merge_copy_fenced),
+        error.MergePageChunkRequired => status(.invalid_argument, .merge_page_chunk_required),
+        error.MergePageIncomplete => status(.retryable, .merge_page_incomplete),
+        error.MergePageSequenceGap => status(.conflict, .merge_page_sequence_gap),
+        error.RetainedEffectsConsumerLimit => status(.retryable, .retained_effects_consumer_limit),
+        error.RetainedEffectsCorrupt => status(.corrupt, .retained_effects_corrupt),
+        error.RetainedEffectsCursorMismatch => status(.conflict, .retained_effects_cursor_mismatch),
+        error.RetainedEffectsFull => status(.retryable, .retained_effects_full),
+        error.RetainedEffectsIdentityRequired => status(.conflict, .retained_effects_identity_required),
+        error.RetainedEffectsNamespaceMismatch => status(.conflict, .retained_effects_namespace_mismatch),
+        error.BackendRuntimeIoUnavailable => status(.unavailable, .backend_runtime_io_unavailable),
+        error.CorruptRaftAppliedEntry => status(.corrupt, .corrupt_raft_applied_entry),
+        error.UnknownSchemaVersion => status(.conflict, .unknown_schema_version),
         error.MetadataHABindingBusy => status(.retryable, .metadata_ha_binding_busy),
         error.MetadataHAOutboxPending => status(.retryable, .metadata_ha_outbox_pending),
         error.MetadataHACheckpointTargetNotEmpty => status(.conflict, .metadata_ha_checkpoint_target_not_empty),
@@ -506,6 +662,15 @@ pub fn statusFromError(err: anyerror) Status {
         error.MetadataHASequenceGap => status(.conflict, .metadata_ha_sequence_gap),
         error.InvalidMetadataHAEffectChunk => status(.conflict, .invalid_metadata_ha_effect_chunk),
         error.HAPrimaryNotConfigured => status(.unavailable, .ha_primary_not_configured),
+        error.RelationalIndexNotReady => status(.conflict, .relational_index_not_ready),
+        error.InvalidRelationalIndexBound => status(.invalid_argument, .invalid_relational_index_bound),
+        error.RelationalIndexColumnNotFound => status(.invalid_argument, .relational_index_column_not_found),
+        error.UnsupportedRelationalIndexColumn => status(.unsupported, .unsupported_relational_index_column),
+        error.RelationalRowsOutputBudgetExceeded => status(.invalid_argument, .relational_rows_output_budget_exceeded),
+        error.RelationalRowResultTooLarge => status(.invalid_argument, .relational_row_result_too_large),
+        error.RelationalIndexColumnTypeMismatch => status(.conflict, .relational_index_column_type_mismatch),
+        error.RelationalTableRequired => status(.invalid_argument, .relational_table_required),
+        error.InvalidRelationalIndexForwardKey => status(.corrupt, .invalid_relational_index_forward_key),
         error.IntegrityTopologyCutoverRequired => status(.conflict, .integrity_topology_cutover_required),
         error.InvalidRestoreTerminal => status(.conflict, .invalid_restore_terminal),
         error.InvalidStandaloneMetadataCheckpoint => status(.conflict, .invalid_standalone_metadata_checkpoint),
@@ -709,6 +874,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedVersion => status(.unsupported, .unsupported_version),
         error.UnsupportedPlatform => status(.unsupported, .unsupported_platform),
         error.Timeout => status(.timeout, .timeout),
+        error.ReadIndexTimeout => status(.timeout, .read_index_timeout),
         error.DeadlineExceeded => status(.timeout, .deadline_exceeded),
         error.PreDecisionDeadlineExceeded => status(.timeout, .pre_decision_deadline_exceeded),
         error.ConnectionTimeout => status(.timeout, .connection_timeout),
@@ -961,6 +1127,7 @@ fn status(code: Code, detail: Detail) Status {
 }
 
 pub fn errorFromStatus(value: Status) anyerror {
+    @setEvalBranchQuota(10_000);
     const code = std.enums.fromInt(Code, value.code) orelse return error.RuntimeBoundaryFailure;
     if (code == .ok) return error.RuntimeBoundaryFailure;
     const detail = std.enums.fromInt(Detail, value.detail) orelse return error.RuntimeBoundaryFailure;
@@ -977,6 +1144,72 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .restore_job_commit_not_applied => "RestoreJobCommitNotApplied",
+        .coordinated_standalone_ha_metadata_required => "CoordinatedStandaloneHAMetadataRequired",
+        .relational_rewrite_type_change => "RelationalRewriteTypeChange",
+        .relational_rewrite_column_drop => "RelationalRewriteColumnDrop",
+        .relational_rewrite_requires_relational => "RelationalRewriteRequiresRelational",
+        .relational_rewrite_budget_exceeded => "RelationalRewriteBudgetExceeded",
+        .relational_expression_overflow => "RelationalExpressionOverflow",
+        .relational_expression_division_by_zero => "RelationalExpressionDivisionByZero",
+        .relational_expression_budget_exceeded => "RelationalExpressionBudgetExceeded",
+        .invalid_relational_expression_input => "InvalidRelationalExpressionInput",
+        .invalid_relational_generated_value => "InvalidRelationalGeneratedValue",
+        .generated_column_rewrite_required => "GeneratedColumnRewriteRequired",
+        .invalid_retained_effects_admission => "InvalidRetainedEffectsAdmission",
+        .retained_effects_fence_mismatch => "RetainedEffectsFenceMismatch",
+        .retained_effects_mixed_control => "RetainedEffectsMixedControl",
+        .retained_effects_transaction_failed => "RetainedEffectsTransactionFailed",
+        .transition_operation_busy => "TransitionOperationBusy",
+        .unknown_split_runtime => "UnknownSplitRuntime",
+        .unknown_merge_runtime => "UnknownMergeRuntime",
+        .missing_split_runtime => "MissingSplitRuntime",
+        .missing_merge_runtime => "MissingMergeRuntime",
+        .metadata_snapshot_unavailable => "MetadataSnapshotUnavailable",
+        .split_source_projection_not_ready => "SplitSourceProjectionNotReady",
+        .split_source_projection_advanced => "SplitSourceProjectionAdvanced",
+        .durable_root_incarnation_unavailable => "DurableRootIncarnationUnavailable",
+        .auto_bulk_ingest_busy => "AutoBulkIngestBusy",
+        .apply_store_group_retired => "ApplyStoreGroupRetired",
+        .apply_store_shutting_down => "ApplyStoreShuttingDown",
+        .group_leader_unavailable => "GroupLeaderUnavailable",
+        .catalog_routing_unavailable => "CatalogRoutingUnavailable",
+        .catalog_routing_snapshot_timeout => "CatalogRoutingSnapshotTimeout",
+        .intent_conflict => "IntentConflict",
+        .version_conflict => "VersionConflict",
+        .merge_page_required => "MergePageRequired",
+        .invalid_response => "InvalidResponse",
+        .transition_operations_retired => "TransitionOperationsRetired",
+        .merge_transition_not_ready => "MergeTransitionNotReady",
+        .merge_receiver_projection_not_ready => "MergeReceiverProjectionNotReady",
+        .merge_source_projection_not_ready => "MergeSourceProjectionNotReady",
+        .merge_source_projection_advanced => "MergeSourceProjectionAdvanced",
+        .storage_busy => "StorageBusy",
+        .invalid_online_source_command => "InvalidOnlineSourceCommand",
+        .online_source_corrupt => "OnlineSourceCorrupt",
+        .online_source_pin_missing => "OnlineSourcePinMissing",
+        .online_source_pin_pending => "OnlineSourcePinPending",
+        .online_source_scope_changed => "OnlineSourceScopeChanged",
+        .invalid_source_snapshot => "InvalidSourceSnapshot",
+        .source_snapshot_corrupt => "SourceSnapshotCorrupt",
+        .source_snapshot_cut_mismatch => "SourceSnapshotCutMismatch",
+        .source_snapshot_incomplete => "SourceSnapshotIncomplete",
+        .source_snapshot_too_large => "SourceSnapshotTooLarge",
+        .source_copy_restore_unsupported => "SourceCopyRestoreUnsupported",
+        .invalid_merge_page => "InvalidMergePage",
+        .merge_copy_fenced => "MergeCopyFenced",
+        .merge_page_chunk_required => "MergePageChunkRequired",
+        .merge_page_incomplete => "MergePageIncomplete",
+        .merge_page_sequence_gap => "MergePageSequenceGap",
+        .retained_effects_consumer_limit => "RetainedEffectsConsumerLimit",
+        .retained_effects_corrupt => "RetainedEffectsCorrupt",
+        .retained_effects_cursor_mismatch => "RetainedEffectsCursorMismatch",
+        .retained_effects_full => "RetainedEffectsFull",
+        .retained_effects_identity_required => "RetainedEffectsIdentityRequired",
+        .retained_effects_namespace_mismatch => "RetainedEffectsNamespaceMismatch",
+        .backend_runtime_io_unavailable => "BackendRuntimeIoUnavailable",
+        .corrupt_raft_applied_entry => "CorruptRaftAppliedEntry",
+        .unknown_schema_version => "UnknownSchemaVersion",
         .metadata_ha_binding_busy => "MetadataHABindingBusy",
         .metadata_ha_outbox_pending => "MetadataHAOutboxPending",
         .metadata_ha_checkpoint_target_not_empty => "MetadataHACheckpointTargetNotEmpty",
@@ -987,6 +1220,15 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .metadata_ha_sequence_gap => "MetadataHASequenceGap",
         .invalid_metadata_ha_effect_chunk => "InvalidMetadataHAEffectChunk",
         .ha_primary_not_configured => "HAPrimaryNotConfigured",
+        .relational_index_not_ready => "RelationalIndexNotReady",
+        .invalid_relational_index_bound => "InvalidRelationalIndexBound",
+        .relational_index_column_not_found => "RelationalIndexColumnNotFound",
+        .unsupported_relational_index_column => "UnsupportedRelationalIndexColumn",
+        .relational_rows_output_budget_exceeded => "RelationalRowsOutputBudgetExceeded",
+        .relational_row_result_too_large => "RelationalRowResultTooLarge",
+        .relational_index_column_type_mismatch => "RelationalIndexColumnTypeMismatch",
+        .relational_table_required => "RelationalTableRequired",
+        .invalid_relational_index_forward_key => "InvalidRelationalIndexForwardKey",
         .integrity_topology_cutover_required => "IntegrityTopologyCutoverRequired",
         .invalid_restore_terminal => "InvalidRestoreTerminal",
         .invalid_standalone_metadata_checkpoint => "InvalidStandaloneMetadataCheckpoint",
@@ -1177,6 +1419,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_exact_sort => "UnsupportedExactSort",
         .unsupported_version => "UnsupportedVersion",
         .timeout => "Timeout",
+        .read_index_timeout => "ReadIndexTimeout",
         .connection_timeout => "ConnectionTimeout",
         .connection_timed_out => "ConnectionTimedOut",
         .cancelled => "Cancelled",
@@ -1426,6 +1669,19 @@ test "transaction capacity rejection retains a permanent public status" {
     try std.testing.expectEqual(error.TransactionTooLarge, errorFromStatus(value));
 }
 
+test "stable status preserves deterministic raft rejection and malformed response identity" {
+    inline for (.{ error.IntentConflict, error.VersionConflict, error.MergePageRequired }) |err| {
+        const value = statusFromError(err);
+        try std.testing.expectEqual(@intFromEnum(Code.conflict), value.code);
+        try std.testing.expectEqual(err, errorFromStatus(value));
+    }
+    // A malformed response is not proof that a mutation failed to commit.
+    // Preserve its identity without granting automatic retry authority.
+    const malformed = statusFromError(error.InvalidResponse);
+    try std.testing.expectEqual(@intFromEnum(Code.internal), malformed.code);
+    try std.testing.expectEqual(error.InvalidResponse, errorFromStatus(malformed));
+}
+
 test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.GenerationTransitionActive, errorFromStatus(statusFromError(error.GenerationTransitionActive)));
     try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.GenerationTransitionActive).code);
@@ -1434,6 +1690,8 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expect(Status.ok.isOk());
     try std.testing.expectEqual(error.TableNotFound, errorFromStatus(statusFromError(error.TableNotFound)));
     try std.testing.expectEqual(error.TableVisibilityTimeout, errorFromStatus(statusFromError(error.TableVisibilityTimeout)));
+    try std.testing.expectEqual(error.ReadIndexTimeout, errorFromStatus(statusFromError(error.ReadIndexTimeout)));
+    try std.testing.expectEqual(error.CatalogRoutingSnapshotTimeout, errorFromStatus(statusFromError(error.CatalogRoutingSnapshotTimeout)));
     try std.testing.expectEqual(error.ExtensionOwnedObject, errorFromStatus(statusFromError(error.ExtensionOwnedObject)));
     try std.testing.expectEqual(error.ResourceRequestTooLarge, errorFromStatus(statusFromError(error.ResourceRequestTooLarge)));
     try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, errorFromStatus(statusFromError(error.ResourceTemporarilyUnavailable)));

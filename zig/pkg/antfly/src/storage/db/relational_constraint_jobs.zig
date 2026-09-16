@@ -184,9 +184,9 @@ pub const Page = struct {
                 }
                 const row = try codec.ordinalRowView(kv.value, source.?.tableSchema().*, source.?.physicalLayout());
                 progress.rows_scanned = try std.math.add(u64, progress.rows_scanned, 1);
-                if (try checks.firstViolationRow(alloc, row)) |which| {
+                if (try checks.firstFailureRow(alloc, row)) |failure| {
                     progress.state = .invalid;
-                    progress.failed_check = @intCast(which);
+                    progress.failed_check = @intCast(failure.index);
                     failed_hash = digest(kv.value);
                     break;
                 }

@@ -127,7 +127,74 @@ pub const TableTopologyMutation = union(enum) {
 };
 
 const RestoreJobWrite = struct { key: []const u8, value: []const u8 };
+pub const RestoreJobWithStaging = struct { key: []const u8, value: []const u8, plan_json: []const u8 };
 pub const BackupCohortWrite = struct { job_id: u64, expected_revision: u64, value: []const u8, seal: ?@import("../backup_cohort.zig").SealReceipt = null };
+
+pub const OnlineMergeCutoverBounds = struct {
+    receiver_base_digest: [32]u8,
+    merged_digest: [32]u8,
+    pub fn fromRanges(receiver_base: @import("../../storage/byte_range.zig").ByteRange, merged: @import("../../storage/byte_range.zig").ByteRange) @This() {
+        return .{ .receiver_base_digest = hashRange(0, receiver_base), .merged_digest = hashRange(1, merged) };
+    }
+    fn hashRange(role: u8, range: @import("../../storage/byte_range.zig").ByteRange) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-online-merge-cutover-bounds-v1");
+        hash.update(&.{role});
+        for ([_][]const u8{ range.start, range.end }) |bound| {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, bound.len, .little);
+            hash.update(&length);
+            hash.update(bound);
+        }
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+};
+
+pub const OnlineMergeUpdate = struct {
+    expected: @import("../online_merge.zig").State,
+    next: @import("../online_merge.zig").State,
+    expected_cancel: bool,
+    lease: metadata.ReconcileLeaseRecord,
+    publish_cutover: bool = false,
+    cutover_bounds: ?OnlineMergeCutoverBounds = null,
+    pub fn jsonStringify(self: @This(), stream: anytype) !void {
+        try @import("../../storage/db/relational_integrity_json.zig").write(self, stream);
+    }
+};
+
+/// Converts only the exact untouched queued record observed by the lease
+/// holder. Native source/receiver preflight remains mandatory before proposing
+/// this command; metadata cannot certify the absence of an in-flight RPC.
+pub const OnlineMergeAdmission = struct {
+    expected_record_digest: [32]u8,
+    next: @import("../online_merge.zig").State,
+    lease: metadata.ReconcileLeaseRecord,
+
+    pub fn recordDigest(alloc: std.mem.Allocator, record: metadata.MergeTransitionRecord) ![32]u8 {
+        const encoded = try encodeMergeTransitionRecord(alloc, record);
+        defer alloc.free(encoded);
+        return digestEncoded(encoded);
+    }
+
+    fn digestEncoded(encoded: []const u8) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-online-merge-admission-v1");
+        hash.update(encoded);
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+
+    pub fn jsonStringify(self: @This(), stream: anytype) !void {
+        try @import("../../storage/db/relational_integrity_json.zig").write(self, stream);
+    }
+};
+
+pub fn onlineMergeAdmissionDigest(alloc: std.mem.Allocator, record: metadata.MergeTransitionRecord) ![32]u8 {
+    return OnlineMergeAdmission.recordDigest(alloc, record);
+}
 
 pub const TransitionCommand = union(enum) {
     apply_restore_staging: []const u8,
@@ -204,6 +271,8 @@ pub const TransitionCommand = union(enum) {
         transition_id: u64,
     },
     upsert_merge_transition: metadata.MergeTransitionRecord,
+    compare_and_set_online_merge: OnlineMergeUpdate,
+    admit_online_merge: OnlineMergeAdmission,
     remove_merge_transition: struct {
         transition_id: u64,
     },
@@ -215,6 +284,7 @@ pub const TransitionCommand = union(enum) {
     },
     upsert_restore_job: RestoreJobWrite,
     create_restore_job: RestoreJobWrite,
+    create_restore_job_with_staging: RestoreJobWithStaging,
     compare_and_set_backup_cohort: BackupCohortWrite,
     remove_restore_job_if_matches: struct { key: []const u8, value_hash: []const u8 },
     remove_restore_job: struct {
@@ -346,6 +416,11 @@ pub const TransitionCommand = union(enum) {
             .upsert_restore_job, .create_restore_job => |record| {
                 alloc.free(record.key);
                 alloc.free(record.value);
+            },
+            .create_restore_job_with_staging => |record| {
+                alloc.free(record.key);
+                alloc.free(record.value);
+                alloc.free(record.plan_json);
             },
             .compare_and_set_backup_cohort => |record| alloc.free(record.value),
             .remove_restore_job => |record| alloc.free(record.key),
@@ -543,6 +618,18 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             try group_ids.requireDataGroupId(record.source_group_id);
             try group_ids.requireDataGroupId(record.destination_group_id);
         },
+        .compare_and_set_online_merge => |update| {
+            try update.expected.validate();
+            try update.next.validate();
+            if (!@import("../online_merge.zig").updateAllowed(update.expected, update.next) or update.lease.owner_node_id == 0 or update.lease.expires_at_ms == 0 or
+                update.publish_cutover != (update.expected.phase == .cutover and update.next.phase == .release) or update.publish_cutover != (update.cutover_bounds != null)) return error.InvalidOnlineMergeState;
+        },
+        .admit_online_merge => |admission| {
+            try admission.next.validate();
+            if (admission.next.phase != .admit or admission.next.revision != 1 or admission.next.certificate != null or
+                admission.next.acknowledged != 0 or admission.next.final_applied_index != 0 or admission.lease.owner_node_id == 0 or
+                admission.lease.expires_at_ms == 0) return error.InvalidOnlineMergeState;
+        },
         .upsert_merge_transition => |record| {
             try group_ids.requireDataGroupId(record.donor_group_id);
             try group_ids.requireDataGroupId(record.receiver_group_id);
@@ -551,6 +638,10 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         .upsert_restore_job, .create_restore_job => |record| {
             try validateRestoreJobLogicalKey(record.key);
             if (record.value.len == 0 or record.value.len > max_restore_job_value_bytes) return error.InvalidRestoreJobRecord;
+        },
+        .create_restore_job_with_staging => |record| {
+            try validateRestoreJobLogicalKey(record.key);
+            if (record.value.len == 0 or record.value.len > max_restore_job_value_bytes or record.plan_json.len == 0 or record.plan_json.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreJobRecord;
         },
         .compare_and_set_backup_cohort => |record| {
             if (record.job_id == 0 or record.value.len == 0 or record.value.len > @import("../backup_cohort.zig").Job.max_encoded_bytes)
@@ -759,6 +850,62 @@ test "table topology mutation decoder rejects frames above the legal command cei
 
 test "relational integrity metadata FK target validates ordered uniqueness types and self references" {
     try @import("../../schema/relational_foreign_key_target.zig").testTargetContract();
+}
+
+test "distributed txn owned witness cleanup metadata CAS fences both child admission race orders" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/witness-cleanup", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const group_id = 22;
+    const parent_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const supported = (try @import("../../schema/relational_witness_indexes.zig").ensureCoverage(alloc, parent_schema, &.{"id"})).?;
+    defer alloc.free(supported);
+    const parent: metadata.TableRecord = .{ .table_id = 7, .name = "parents", .schema_json = supported };
+    const cleaned_schema = try std.mem.replaceOwned(u8, alloc, parent_schema, "\"version\":1", "\"version\":2");
+    defer alloc.free(cleaned_schema);
+    var cleaned = parent;
+    cleaned.schema_json = cleaned_schema;
+    const child: metadata.TableRecord = .{ .table_id = 8, .name = "children", .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parents","parent_columns":["id"],"match":"partial"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    };
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    try store.applyTableUpsertTxn(&txn, group_id, parent);
+    try store.applyTableUpsertTxn(&txn, group_id, child);
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, parent, cleaned);
+    var key_buf: [160]u8 = undefined;
+    const parent_key = try tableKeyForGroup(&key_buf, group_id, parent.table_id);
+    const retained = try decodeTableRecord(alloc, try txn.get(parent_key));
+    defer metadata_table_manager.freeTable(alloc, retained);
+    try std.testing.expectEqualStrings(parent.schema_json, retained.schema_json);
+    var child_key_buf: [160]u8 = undefined;
+    const child_key = try tableKeyForGroup(&child_key_buf, group_id, child.table_id);
+    // Retained read-schema references remain admission dependencies too.
+    var historical = child;
+    historical.schema_json = "{}";
+    historical.read_schema_json = child.schema_json;
+    const historical_bytes = try encodeTableRecord(alloc, historical);
+    defer alloc.free(historical_bytes);
+    try txn.put(child_key, historical_bytes);
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, parent, cleaned);
+    const retained_read = try decodeTableRecord(alloc, try txn.get(parent_key));
+    defer metadata_table_manager.freeTable(alloc, retained_read);
+    try std.testing.expectEqualStrings(parent.schema_json, retained_read.schema_json);
+    // Model terminal child retirement, then let cleanup win first.
+    try txn.delete(child_key);
+    try store.deleteTableNameIndexTxn(&txn, group_id, child.name);
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, parent, cleaned);
+    const removed = try decodeTableRecord(alloc, try txn.get(parent_key));
+    defer metadata_table_manager.freeTable(alloc, removed);
+    try std.testing.expectEqualStrings(cleaned.schema_json, removed.schema_json);
+    try store.applyTableUpsertTxn(&txn, group_id, child);
+    try std.testing.expectError(error.NotFound, txn.get(child_key));
 }
 
 test "distributed txn retirement metadata persists identity barriers and rejects phase skipping" {
@@ -1667,6 +1814,269 @@ fn applyRestoreStagingForTest(store: *RaftApplyStore, txn: *docstore.DocStore.Tx
     var decoded = (try decodeTransitionCommand(std.testing.allocator, wire)).?;
     defer decoded.deinit(std.testing.allocator);
     try store.applyTransitionCommandTxn(txn, group_id, decoded);
+}
+
+test "relational integrity restore staging rewrite draft survives restart and freezes only exact pre-pin intent" {
+    try testRewriteDraft(false, false);
+}
+
+test "relational integrity restore staging rewrite pre-pin cancellation requires only source tombstones and fences delayed freeze" {
+    try testRewriteDraft(true, false);
+}
+
+test "metadata raft apply store compound rewrite admission atomically reserves exact sources and preserves first job" {
+    try testRewriteDraft(false, true);
+}
+
+fn testRewriteDraft(cancel: bool, compound: bool) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rewrite-draft", .{tmp.sub_path});
+    defer alloc.free(root);
+    const group = group_ids.main_metadata_group_id;
+    const id = try restore_staging.idForAttempt(7, 1);
+    const schema_json = "{\"version\":1,\"storage_mode\":\"document\"}";
+    const source: @import("../../storage/db/online_source_contract.zig").Scope = .{
+        .fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 401, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) },
+        .receiver_namespace = .{ .table_id = 10, .shard_id = 401, .range_id = 401 },
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+    };
+    const original: metadata.TableRecord = .{ .table_id = 9, .name = "rows", .schema_json = schema_json };
+    const original_range: metadata.RangeRecord = .{ .table_id = 9, .group_id = 301, .range_id = 301, .start_key = "" };
+    var targets = [_]restore_staging.Target{.{
+        .source_table_id = 9,
+        .table = .{ .table_id = 10, .name = "rows", .schema_json = schema_json },
+        .ranges = &.{.{ .table_id = 10, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" }},
+        .replace = .{ .table = original, .ranges = &.{original_range}, .fences = &.{source.fence} },
+        .rewrite_sources = &.{source},
+        .rewrite = .{ .preserve_document = true, .source_schemas = &.{schema_json}, .target_schema = schema_json, .program_digest = @splat(6) },
+    }};
+    var draft: restore_staging.Plan = .{ .id = id, .cohort_digest = @splat(7), .targets = &targets, .preparing_sources = true };
+    try draft.validate(alloc);
+    const draft_digest = try draft.digest(alloc);
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .upsert_table = original });
+        try store.applyStandaloneCommand(group, .{ .upsert_range = original_range });
+        const user_key = restore_job_logical_prefix ++ "0000000000000007";
+        const user_value = "{\"job_id\":7,\"attempt_id\":1,\"staging_attempt_id\":1,\"source_kind\":\"schema_rewrite\",\"phase\":\"queued\"}";
+        if (compound) {
+            const plan_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
+            defer alloc.free(plan_json);
+            const command: TransitionCommand = .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = plan_json } };
+            const wire = try encodeTransitionCommand(alloc, command);
+            defer alloc.free(wire);
+            try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTransitionCommand(alloc, wire[0 .. wire.len - 1]));
+            const trailing = try std.mem.concat(alloc, u8, &.{ wire, "x" });
+            defer alloc.free(trailing);
+            try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTransitionCommand(alloc, trailing));
+            var decoded = (try decodeTransitionCommand(alloc, wire)).?;
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqualDeep(command, decoded);
+            {
+                var cancelled_txn = try store.store.beginWriteTxn();
+                defer cancelled_txn.abort();
+                var key_buf: [256]u8 = undefined;
+                const key = try restoreJobKeyForGroup(&key_buf, group, user_key);
+                try cancelled_txn.put(key, "already canceled");
+                try store.applyTransitionCommandTxn(&cancelled_txn, group, decoded);
+                var plan_key_buf: [256]u8 = undefined;
+                try std.testing.expectError(error.NotFound, cancelled_txn.get(try restore_staging.jobKey(&plan_key_buf, group, id)));
+                try std.testing.expectEqualStrings("already canceled", try cancelled_txn.get(key));
+            }
+            {
+                var failed_txn = try store.store.beginWriteTxn();
+                defer failed_txn.abort();
+                targets[0].replace.?.table.description = "stale expected definition";
+                const stale_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
+                defer alloc.free(stale_json);
+                try store.applyTransitionCommandTxn(&failed_txn, group, .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = stale_json } });
+                targets[0].replace.?.table.description = "";
+                var key_buf: [256]u8 = undefined;
+                try std.testing.expectError(error.NotFound, failed_txn.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
+                try std.testing.expectError(error.NotFound, failed_txn.get(try restore_staging.jobKey(&key_buf, group, id)));
+                // A rejected/cancelled reservation cannot leave a user-visible
+                // accepted job with no recoverable source plan.
+                try applyRestoreStagingForTest(&store, &failed_txn, group, .{ .id = id, .action = .cancel_reservation });
+                try store.applyTransitionCommandTxn(&failed_txn, group, decoded);
+                try std.testing.expectError(error.NotFound, failed_txn.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
+            }
+            // Aborting a fully successful mutation rolls both sides back.
+            {
+                var rolled_back = try store.store.beginWriteTxn();
+                defer rolled_back.abort();
+                try store.applyTransitionCommandTxn(&rolled_back, group, decoded);
+                var key_buf: [256]u8 = undefined;
+                _ = try rolled_back.get(try restoreJobKeyForGroup(&key_buf, group, user_key));
+                _ = try rolled_back.get(try restore_staging.jobKey(&key_buf, group, id));
+            }
+        }
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        if (compound) {
+            const plan_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
+            defer alloc.free(plan_json);
+            const command: TransitionCommand = .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = plan_json } };
+            try store.applyTransitionCommandTxn(&txn, group, command);
+            var replay = command;
+            replay.create_restore_job_with_staging.value = "rejected late replacement";
+            try store.applyTransitionCommandTxn(&txn, group, replay);
+            var key_buf: [256]u8 = undefined;
+            try std.testing.expectEqualStrings(user_value, try txn.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
+        } else try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .reserve, .plan = draft });
+        try std.testing.expect(try restoreStagingLocksTableTxn(&txn, group, original.table_id));
+        try txn.commit();
+        var projection = try store.captureProvisioningCatalog(alloc, group);
+        defer projection.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), projection.tables.len);
+        try std.testing.expectEqual(@as(usize, 0), projection.jobs_json.len);
+    }
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    if (compound) {
+        const row = (try store.getRestoreJobValue(alloc, group, restore_job_logical_prefix ++ "0000000000000007")).?;
+        defer alloc.free(row);
+        try std.testing.expect(std.mem.indexOf(u8, row, "schema_rewrite") != null);
+    }
+    try std.testing.expectEqual(.preparing_sources, (try store.loadRestoreStagingProgress(alloc, group, id)).?.state);
+    const artifacts = [_]restore_staging.SourceArtifact{.{ .target_group_id = 401, .source_namespace = source.fence.namespace, .format = .portable, .snapshot_path = "cut/source.afb2", .artifact_size_bytes = 100, .artifact_sha256 = @splat(7), .rewrite = .{ .program_digest = @splat(6), .retained_pin = source.pin(), .snapshot_certificate = @splat(7), .retained_epoch = 1, .retained_start = 8, .source_applied_index = 20, .source_scope = source } }};
+    targets[0].source_artifacts = &artifacts;
+    draft.preparing_sources = false;
+    draft.cohort_digest = @splat(8);
+    try draft.validate(alloc);
+    try std.testing.expectError(error.InvalidRestoreStaging, (restore_staging.Command{ .id = id, .action = .reserve, .plan = draft }).validate(alloc));
+    if (cancel) {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .begin_cancel, .expected_revision = 1 });
+        // No target generation was ever provisioned. Its invented receipt
+        // cannot satisfy cancellation of an actual admitted source pin.
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .canceled, .expected_revision = 2, .receipt = .{ .group_id = 401, .range_id = 401, .plan_digest = draft_digest, .completion_digest = @splat(1) } });
+        var buf: [256]u8 = undefined;
+        const pending = try std.json.parseFromSlice(restore_staging.Progress, alloc, try txn.get(try restore_staging.progressKey(&buf, group, id)), .{});
+        defer pending.deinit();
+        try std.testing.expectEqual(@as(u32, 0), pending.value.completed_owners);
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .canceled, .expected_revision = 2, .receipt = .{ .group_id = 301, .range_id = 301, .plan_digest = draft_digest, .completion_digest = @splat(2) } });
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .finish_cancel, .expected_revision = 2 });
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .freeze_rewrite, .expected_revision = 1, .plan = draft });
+        try std.testing.expect(!try restoreStagingLocksTableTxn(&txn, group, original.table_id));
+        _ = try txn.get(try tableKeyForGroup(&buf, group, original.table_id));
+        try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&buf, group, targets[0].table.table_id)));
+        try txn.commit();
+        try std.testing.expectEqual(.canceled, (try store.loadRestoreStagingProgress(alloc, group, id)).?.state);
+        return;
+    }
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        // A fabricated frozen plan is not enough: every published source cut
+        // has its own durable bounded receipt before metadata freezes it.
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .freeze_rewrite, .expected_revision = 1, .plan = draft });
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .rewrite_source_ready, .expected_revision = 1, .source_artifact = artifacts[0] });
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .rewrite_source_ready, .expected_revision = 1, .source_artifact = artifacts[0] });
+        try txn.commit();
+    }
+    store.deinit();
+    store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    {
+        var pending = (try store.loadRestoreStaging(alloc, group, id)).?;
+        defer pending.deinit();
+        try std.testing.expectEqual(.preparing_sources, pending.value.state);
+        try std.testing.expectEqual(@as(u64, 2), pending.value.revision);
+        try std.testing.expectEqual(@as(u32, 1), pending.value.completed_owners);
+        try std.testing.expectEqualDeep(artifacts[0], pending.value.plan.targets[0].source_artifacts[0]);
+    }
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        // A valid plan with altered immutable target configuration is not a
+        // continuation of the reserved rewrite, even under the same ID.
+        targets[0].table.description = "changed after pin";
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .freeze_rewrite, .expected_revision = 2, .plan = draft });
+        targets[0].table.description = "";
+        var buf: [256]u8 = undefined;
+        const progress = try std.json.parseFromSlice(restore_staging.Progress, alloc, try txn.get(try restore_staging.progressKey(&buf, group, id)), .{});
+        defer progress.deinit();
+        try std.testing.expectEqual(.preparing_sources, progress.value.state);
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .freeze_rewrite, .expected_revision = 2, .plan = draft });
+        try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .freeze_rewrite, .expected_revision = 2, .plan = draft });
+        try txn.commit();
+    }
+    const progress = (try store.loadRestoreStagingProgress(alloc, group, id)).?;
+    try std.testing.expectEqual(.importing, progress.state);
+    try std.testing.expectEqual(@as(u64, 3), progress.revision);
+    var recovered = (try store.loadRestoreStaging(alloc, group, id)).?;
+    defer recovered.deinit();
+    try std.testing.expectEqualDeep(artifacts[0], recovered.value.plan.targets[0].source_artifacts[0]);
+    try std.testing.expectEqualSlices(u8, &try draft.digest(alloc), &recovered.value.plan_digest);
+}
+
+test "relational integrity restore staging authority survives retirement and snapshot with point reads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/authority", .{tmp.sub_path});
+    defer alloc.free(root);
+    const restored_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/authority-restored", .{tmp.sub_path});
+    defer alloc.free(restored_root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const group_id = group_ids.main_metadata_group_id;
+    const target: restore_staging.Target = .{ .source_table_id = 1, .table = .{ .table_id = 11, .name = "private", .schema_json = "{}" }, .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }} };
+    const plan: restore_staging.Plan = .{ .id = @splat(8), .cohort_digest = @splat(9), .targets = &.{target} };
+    const reserve = try std.json.Stringify.valueAlloc(alloc, restore_staging.Command{ .id = plan.id, .action = .reserve, .plan = plan }, .{});
+    defer alloc.free(reserve);
+    try store.applyStandaloneCommand(group_id, .{ .apply_restore_staging = reserve });
+    try store.applyStandaloneCommand(group_id, .{ .register_node = .{ .node_id = 7, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active } });
+    // Prime cached snapshot projections before placement adds its authority
+    // row: the placement command must dirty the staging projection as well.
+    const before_placement_snapshot = try store.snapshotBuilder().buildSnapshot(alloc, group_id);
+    defer alloc.free(before_placement_snapshot);
+    const placement: TransitionCommand = .{ .upsert_replica_intent = .{
+        .expected_metadata_version = null,
+        .expected_version_fence = 0,
+        .expected_target_drain_requested = false,
+        .replacement = .{ .record = .{ .group_id = 701, .replica_id = 1, .local_node_id = 7 }, .store_id = 0, .peer_node_ids = &.{7} },
+    } };
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group_id, plan.id, 7, null));
+    try store.applyStandaloneCommand(group_id, placement);
+    try std.testing.expect(try store.restoreStagingAuthorityAllowed(alloc, group_id, plan.id, 7, null));
+    try std.testing.expect(try store.restoreStagingAuthorityAllowed(alloc, group_id, plan.id, 7, 701));
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group_id, plan.id, 8, null));
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group_id, @splat(7), 7, null));
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group_id + 1, plan.id, 7, null));
+    try std.testing.expect(!try store.restoreStagingAuthorityAllowed(alloc, group_id, plan.id, 7, 702));
+    try store.applyStandaloneCommand(group_id, .{ .remove_replica_intent = .{ .group_id = 701, .local_node_id = 7, .expected_metadata_version = 1 } });
+    const placements = try store.listPlacementIntents(alloc, group_id);
+    defer store.freePlacementIntents(alloc, placements);
+    try std.testing.expectEqual(@as(usize, 0), placements.len);
+    try std.testing.expect(try store.restoreStagingAuthorityAllowed(alloc, group_id, plan.id, 7, 701));
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = plan.id, .action = .begin_cancel, .expected_revision = 1 });
+        try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = plan.id, .action = .canceled, .expected_revision = 2, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = try plan.digest(alloc), .completion_digest = @splat(3) } });
+        try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = plan.id, .action = .finish_cancel, .expected_revision = 2 });
+        try txn.commit();
+    }
+    try std.testing.expectEqual(restore_staging.State.canceled, (try store.loadRestoreStagingProgress(alloc, group_id, plan.id)).?.state);
+    const snapshot = try store.snapshotBuilder().buildSnapshot(alloc, group_id);
+    defer alloc.free(snapshot);
+    var restored = try RaftApplyStore.init(alloc, .{ .root_dir = restored_root });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(alloc, group_id, 1, snapshot));
+    try std.testing.expect(try restored.restoreStagingAuthorityAllowed(alloc, group_id, plan.id, 7, 701));
+    // Corrupting the large immutable job cannot affect this compact authority
+    // check: it performs only fixed-key reads and never parses the plan.
+    var key_buf: [256]u8 = undefined;
+    try restored.store.put(try restore_staging.jobKey(&key_buf, group_id, plan.id), "not a JSON plan");
+    var no_alloc = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    for (0..128) |_| try std.testing.expect(try restored.restoreStagingAuthorityAllowed(no_alloc.allocator(), group_id, plan.id, 7, 701));
+    try restored.store.put(try restore_staging.identityKey(&key_buf, group_id, .group, 701), &@as([16]u8, @splat(5)));
+    try std.testing.expect(!try restored.restoreStagingAuthorityAllowed(alloc, group_id, plan.id, 7, 701));
 }
 
 test "relational integrity restore staging cancellation tombstone defeats delayed reserve" {
@@ -4140,6 +4550,17 @@ pub const RaftApplyStore = struct {
         return out;
     }
 
+    pub fn getMergeTransition(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, transition_id: u64) !?metadata.MergeTransitionRecord {
+        var key_buf: [160]u8 = undefined;
+        const key = try mergeTransitionKeyForGroup(&key_buf, group_id, transition_id);
+        const encoded = self.store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(encoded);
+        return try decodeMergeTransitionRecord(alloc, encoded);
+    }
+
     pub fn listTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
@@ -5787,7 +6208,9 @@ pub const RaftApplyStore = struct {
             .upsert_node, .register_node, .remove_node => metadataSnapshotProjectionBit(.node),
             .request_node_shutdown, .cancel_node_shutdown, .finalize_node_shutdown => metadataSnapshotProjectionBit(.node) | metadataSnapshotProjectionBit(.store),
             .upsert_store, .register_store, .remove_store => metadataSnapshotProjectionBit(.store),
-            .upsert_replica_intent, .remove_replica_intent => metadataSnapshotProjectionBit(.placement) |
+            .upsert_replica_intent => metadataSnapshotProjectionBit(.placement) |
+                metadataSnapshotProjectionBit(.placement_version) | metadataSnapshotProjectionBit(.restore_staging),
+            .remove_replica_intent => metadataSnapshotProjectionBit(.placement) |
                 metadataSnapshotProjectionBit(.placement_version),
             .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.catalog_revision),
@@ -5808,11 +6231,14 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_split_transition, .remove_split_transition => metadataSnapshotProjectionBit(.split_transition) |
                 metadataSnapshotProjectionBit(.table_transition_fence),
+            .compare_and_set_online_merge => metadataSnapshotProjectionBit(.merge_transition) | metadataSnapshotProjectionBit(.range) | metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
+            .admit_online_merge => metadataSnapshotProjectionBit(.merge_transition) | metadataSnapshotProjectionBit(.table_transition_fence),
             .upsert_merge_transition, .remove_merge_transition => metadataSnapshotProjectionBit(.merge_transition) |
                 metadataSnapshotProjectionBit(.table_transition_fence),
             .upsert_reconcile_lease, .remove_reconcile_lease => metadataSnapshotProjectionBit(.reconcile_lease),
             .upsert_shuffle_join_lease, .remove_shuffle_join_lease => metadataSnapshotProjectionBit(.shuffle_join_lease),
             .upsert_restore_job, .create_restore_job, .remove_restore_job, .remove_restore_jobs, .remove_restore_job_if_matches => metadataSnapshotProjectionBit(.restore_job),
+            .create_restore_job_with_staging => metadataSnapshotProjectionBit(.restore_job) | metadataSnapshotProjectionBit(.restore_staging),
             .compare_and_set_backup_cohort => metadataSnapshotProjectionBit(.backup_cohort) | metadataSnapshotProjectionBit(.backup_cohort_progress) | metadataSnapshotProjectionBit(.backup_cohort_lock),
             .upsert_reallocation_request, .remove_reallocation_request => metadataSnapshotProjectionBit(.reallocation_request) |
                 metadataSnapshotProjectionBit(.reallocation_request_pending),
@@ -6667,6 +7093,8 @@ pub const RaftApplyStore = struct {
             .upsert_merge_transition => |record| {
                 try self.applyMergeTransitionUpsertTxn(txn, group_id, record);
             },
+            .compare_and_set_online_merge => |update| try self.applyOnlineMergeUpdateTxn(txn, group_id, update),
+            .admit_online_merge => |admission| try self.applyOnlineMergeAdmissionTxn(txn, group_id, admission),
             .remove_merge_transition => |record| {
                 try self.applyMergeTransitionRemovalTxn(txn, group_id, record.transition_id);
             },
@@ -6740,6 +7168,7 @@ pub const RaftApplyStore = struct {
                     .metadata_group_id = group_id,
                 });
             },
+            .create_restore_job_with_staging => |record| try self.applyRestoreJobWithStagingTxn(txn, group_id, record),
             .remove_restore_job_if_matches => |record| {
                 var key_buf: [256]u8 = undefined;
                 const key = try restoreJobKeyForGroup(&key_buf, group_id, record.key);
@@ -7151,9 +7580,12 @@ pub const RaftApplyStore = struct {
             var job = try std.json.parseFromSlice(restore_staging.Job, alloc, job_bytes, .{});
             defer job.deinit();
             try overlayRestoreStagingProgressTxn(&txn, alloc, group_id, id, &job.value);
+            // Drafts reserve identities and live source definitions, but may
+            // not create target owners until immutable source cuts are bound.
+            if (job.value.plan.preparing_sources) continue;
             switch (job.value.state) {
                 .importing, .validating, .cutover, .canceling => {},
-                .published, .canceled => return error.InvalidRestoreStaging,
+                .published, .canceled, .preparing_sources => return error.InvalidRestoreStaging,
             }
             // The plan remains immutable. Only this snapshot's small progress
             // view changes, so a restarted owner can distinguish ordinary
@@ -7210,6 +7642,20 @@ pub const RaftApplyStore = struct {
         var job = try std.json.parseFromSlice(restore_staging.Job, alloc, bytes, .{ .allocate = .alloc_always });
         errdefer job.deinit();
         try overlayRestoreStagingProgressTxn(&txn, alloc, group_id, id, &job.value);
+        if (job.value.plan.preparing_sources) {
+            const arena = job.arena.allocator();
+            const targets = try arena.dupe(restore_staging.Target, job.value.plan.targets);
+            for (targets) |*target| {
+                var artifacts: std.ArrayList(restore_staging.SourceArtifact) = .empty;
+                for (target.ranges) |range| {
+                    const raw = (try stagingGet(&txn, try restore_staging.sourceArtifactKey(&key_buf, group_id, id, range.group_id))) orelse continue;
+                    const artifact = try std.json.parseFromSliceLeaky(restore_staging.SourceArtifact, arena, raw, .{ .allocate = .alloc_always });
+                    try artifacts.append(arena, artifact);
+                }
+                target.source_artifacts = try artifacts.toOwnedSlice(arena);
+            }
+            job.value.plan.targets = targets;
+        }
         return job;
     }
 
@@ -7236,6 +7682,44 @@ pub const RaftApplyStore = struct {
         var parsed = try std.json.parseFromSlice(restore_staging.Progress, alloc, bytes, .{});
         defer parsed.deinit();
         return parsed.value;
+    }
+
+    /// Read-only authorization remains valid after replica placement removal.
+    /// The immutable restore group reservation and existing placement-version
+    /// tombstone jointly bind plan, group, and node; no whole-plan decode or
+    /// retained-history scan is needed for each owner progress poll.
+    /// Replacement old owners deliberately receive no grant: the metadata
+    /// driver reads their receipts locally and fences them through the normal
+    /// topology batch route. Only new staged owners consume this capability.
+    pub fn restoreStagingAuthorityAllowed(self: *RaftApplyStore, alloc: std.mem.Allocator, metadata_group_id: u64, id: restore_staging.Id, node_id: u64, owner_group: ?u64) !bool {
+        _ = alloc;
+        if (node_id == 0) return false;
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [256]u8 = undefined;
+        const witness = (try stagingGet(&txn, try restore_staging.authorityNodeKey(&key_buf, metadata_group_id, id, node_id))) orelse return false;
+        if (witness.len != 8) return error.InvalidRestoreStaging;
+        const witness_group = std.mem.readInt(u64, witness[0..8], .little);
+        const reservation = (try stagingGet(&txn, try restore_staging.identityKey(&key_buf, metadata_group_id, .group, witness_group))) orelse return false;
+        if (!std.mem.eql(u8, reservation, &id) or try self.loadPlacementVersionFenceTxn(&txn, metadata_group_id, witness_group, node_id) == 0) return false;
+        if (owner_group) |requested_group| {
+            const requested = (try stagingGet(&txn, try restore_staging.identityKey(&key_buf, metadata_group_id, .group, requested_group))) orelse return false;
+            if (!std.mem.eql(u8, requested, &id) or try self.loadPlacementVersionFenceTxn(&txn, metadata_group_id, requested_group, node_id) == 0) return false;
+        }
+        return true;
+    }
+
+    fn stageRestorePlacementAuthorityTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, metadata_group_id: u64, owner_group: u64, node_id: u64) !void {
+        _ = self;
+        var key_buf: [256]u8 = undefined;
+        const reservation = (try stagingGet(txn, try restore_staging.identityKey(&key_buf, metadata_group_id, .group, owner_group))) orelse return;
+        if (reservation.len != 16) return error.InvalidRestoreStaging;
+        const plan_id: restore_staging.Id = reservation[0..16].*;
+        const authority_key = try restore_staging.authorityNodeKey(&key_buf, metadata_group_id, plan_id, node_id);
+        if (try stagingGet(txn, authority_key) != null) return;
+        var witness: [8]u8 = undefined;
+        std.mem.writeInt(u64, &witness, owner_group, .little);
+        try txn.put(authority_key, &witness);
     }
 
     pub fn loadRestoreStagingReceipt(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: restore_staging.Id, state: restore_staging.State, owner_group_id: u64) !?[]u8 {
@@ -7267,6 +7751,51 @@ pub const RaftApplyStore = struct {
             try membership.add(range.group_id);
         }
         return membership.finish(old.table.table_id).eql(fence.membership(old.table.table_id));
+    }
+
+    fn applyRestoreJobWithStagingTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, record: RestoreJobWithStaging) !void {
+        var logical_key_buf: [256]u8 = undefined;
+        const logical_key = try restoreJobKeyForGroup(&logical_key_buf, group_id, record.key);
+        // Replays, cancellation and prior admission win before any reservation
+        // is inspected or created. The caller receives the durable first row.
+        if (try stagingGet(txn, logical_key) != null) return;
+        const Header = struct { job_id: u64, attempt_id: u64, staging_attempt_id: u64, source_kind: []const u8, phase: []const u8, cancel_requested: bool = false };
+        var header = std.json.parseFromSlice(Header, self.alloc, record.value, .{ .ignore_unknown_fields = true }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return;
+        };
+        defer header.deinit();
+        if (header.value.job_id == 0 or header.value.attempt_id != 1 or header.value.staging_attempt_id != 1 or header.value.cancel_requested or
+            !std.mem.eql(u8, header.value.source_kind, "schema_rewrite") or !std.mem.eql(u8, header.value.phase, "queued")) return;
+        var expected_key_buf: [128]u8 = undefined;
+        const expected_key = try std.fmt.bufPrint(&expected_key_buf, "{s}{x:0>16}", .{ restore_job_logical_prefix, header.value.job_id });
+        if (!std.mem.eql(u8, record.key, expected_key)) return;
+        var plan = std.json.parseFromSlice(restore_staging.Plan, self.alloc, record.plan_json, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return;
+        };
+        defer plan.deinit();
+        const expected_id = try restore_staging.idForAttempt(header.value.job_id, 1);
+        if (!std.mem.eql(u8, &plan.value.id, &expected_id) or !plan.value.preparing_sources) return;
+        const reserve: restore_staging.Command = .{ .id = expected_id, .action = .reserve, .plan = plan.value };
+        reserve.validate(self.alloc) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return;
+        };
+        var plan_key_buf: [256]u8 = undefined;
+        const plan_key = try restore_staging.jobKey(&plan_key_buf, group_id, expected_id);
+        var progress_key_buf: [256]u8 = undefined;
+        const progress_key = try restore_staging.progressKey(&progress_key_buf, group_id, expected_id);
+        if (try stagingGet(txn, plan_key) != null or try stagingGet(txn, progress_key) != null) return;
+        const bytes = try std.json.Stringify.valueAlloc(self.alloc, reserve, .{});
+        defer self.alloc.free(bytes);
+        // The shared reservation validates exact source definitions, ranges,
+        // incoming dependency closure and every identity collision first.
+        try self.applyRestoreStagingTxn(txn, group_id, bytes);
+        if (try stagingGet(txn, plan_key) == null) return;
+        try txn.put(logical_key, record.value);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = logical_key });
+        self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
     }
 
     fn restoreIncomingDependenciesClosedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, plan: restore_staging.Plan) !bool {
@@ -7349,7 +7878,8 @@ pub const RaftApplyStore = struct {
                 }
             }
             if (!try self.restoreIncomingDependenciesClosedTxn(txn, group_id, plan)) return;
-            const job: restore_staging.Job = .{ .plan = plan, .plan_digest = try plan.digest(self.alloc) };
+            const initial_state: restore_staging.State = if (plan.preparing_sources) .preparing_sources else .importing;
+            const job: restore_staging.Job = .{ .plan = plan, .plan_digest = try plan.digest(self.alloc), .state = initial_state };
             const value = try std.json.Stringify.valueAlloc(self.alloc, job, .{});
             defer self.alloc.free(value);
             try txn.put(job_key, value);
@@ -7362,7 +7892,7 @@ pub const RaftApplyStore = struct {
                 if (target.replace) |old| try txn.put(try restore_staging.identityKey(&key_buf, group_id, .old_table, old.table.table_id), &command.id);
                 for (target.ranges) |range| try txn.put(try restore_staging.identityKey(&key_buf, group_id, .group, range.group_id), &command.id);
             }
-            const initial = try std.json.Stringify.valueAlloc(self.alloc, restore_staging.Progress{}, .{});
+            const initial = try std.json.Stringify.valueAlloc(self.alloc, restore_staging.Progress{ .state = initial_state }, .{});
             defer self.alloc.free(initial);
             try txn.put(progress_key, initial);
         } else {
@@ -7382,6 +7912,47 @@ pub const RaftApplyStore = struct {
             }
             switch (command.action) {
                 .reserve, .cancel_reservation => unreachable,
+                .rewrite_source_ready => {
+                    if (next.state != .preparing_sources or !job.value.plan.preparing_sources) return;
+                    const artifact = command.source_artifact.?;
+                    const binding = artifact.rewrite.?;
+                    const matches = outer: for (job.value.plan.targets) |target| {
+                        if (!std.mem.eql(u8, &target.rewrite.?.program_digest, &binding.program_digest)) continue;
+                        for (target.rewrite_sources) |scope| if (std.meta.eql(scope, binding.source_scope.?)) break :outer true;
+                    } else false;
+                    if (!matches) return;
+                    var source_key_buf: [256]u8 = undefined;
+                    const source_key = try restore_staging.sourceArtifactKey(&source_key_buf, group_id, command.id, artifact.target_group_id);
+                    if (try stagingGet(txn, source_key) != null) return;
+                    const value = try std.json.Stringify.valueAlloc(self.alloc, artifact, .{});
+                    defer self.alloc.free(value);
+                    try txn.put(source_key, value);
+                    next.completed_owners += 1;
+                    next.revision += 1;
+                },
+                .freeze_rewrite => {
+                    if (next.state != .preparing_sources or !job.value.plan.preparing_sources or next.completed_owners != total) return;
+                    const frozen = command.plan.?;
+                    const previous_digest = try job.value.plan.rewriteIntentDigest(self.alloc);
+                    const frozen_digest = try frozen.rewriteIntentDigest(self.alloc);
+                    if (!std.mem.eql(u8, &previous_digest, &frozen_digest)) return;
+                    for (frozen.targets) |target| for (target.source_artifacts) |artifact| {
+                        var source_key_buf: [256]u8 = undefined;
+                        const raw = (try stagingGet(txn, try restore_staging.sourceArtifactKey(&source_key_buf, group_id, command.id, artifact.target_group_id))) orelse return;
+                        var expected = try std.json.parseFromSlice(restore_staging.SourceArtifact, self.alloc, raw, .{});
+                        defer expected.deinit();
+                        if (!std.mem.eql(u8, &try expected.value.digest(self.alloc), &try artifact.digest(self.alloc))) return;
+                    };
+                    // The full cohort geometry remains reserved. No target
+                    // scopes exist before this atomic immutable-plan freeze.
+                    for (frozen.targets) |target| if (!try self.restoreReplacementMatchesTxn(txn, group_id, target)) return;
+                    const value = try std.json.Stringify.valueAlloc(self.alloc, restore_staging.Job{ .plan = frozen, .plan_digest = try frozen.digest(self.alloc) }, .{});
+                    defer self.alloc.free(value);
+                    try txn.put(job_key, value);
+                    next.state = .importing;
+                    next.completed_owners = 0;
+                    next.revision += 1;
+                },
                 .imported, .validated, .old_fenced, .canceled => {
                     const expected_state: restore_staging.State = switch (command.action) {
                         .imported => .importing,
@@ -7394,7 +7965,7 @@ pub const RaftApplyStore = struct {
                     const receipt = command.receipt.?;
                     if (!std.mem.eql(u8, &receipt.plan_digest, &job.value.plan_digest)) return;
                     const owner_matches = outer: for (job.value.plan.targets) |target| {
-                        if (command.action != .old_fenced) for (target.ranges) |range| {
+                        if (command.action != .old_fenced and !job.value.plan.preparing_sources) for (target.ranges) |range| {
                             if (range.group_id == receipt.group_id and range.range_id == receipt.range_id) break :outer true;
                         };
                         if (command.action == .old_fenced or command.action == .canceled) if (target.replace) |old| {
@@ -7426,7 +7997,7 @@ pub const RaftApplyStore = struct {
                     next.revision += 1;
                 },
                 .publish, .finish_cancel => {
-                    const required = if (command.action == .finish_cancel) total + old_total else if (old_total != 0) old_total else total;
+                    const required = if (command.action == .finish_cancel) (if (job.value.plan.preparing_sources) old_total else total + old_total) else if (old_total != 0) old_total else total;
                     if (next.completed_owners != required or
                         (command.action == .publish and next.state != (if (old_total != 0) restore_staging.State.cutover else .validating)) or
                         (command.action == .finish_cancel and next.state != .canceling)) return;
@@ -8100,6 +8671,10 @@ pub const RaftApplyStore = struct {
     }
 
     fn relationalParentsExistForCreateTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord, explicit_create: bool) !bool {
+        @import("../../schema/relational_index_namespace.zig").validate(self.alloc, table.schema_json, table.indexes_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false,
+        };
         if (try backupCohortLocksTableTxn(txn, group_id, table.table_id) or try restoreStagingLocksTableTxn(txn, group_id, table.table_id)) return false;
         var staging_buf: [640]u8 = undefined;
         if (try stagingGet(txn, try restore_staging.nameKey(&staging_buf, group_id, table.name)) != null) return false;
@@ -8371,6 +8946,91 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         record: metadata.MergeTransitionRecord,
     ) !void {
+        return self.applyMergeTransitionUpsertAuthorizedTxn(txn, group_id, record, false);
+    }
+
+    fn applyOnlineMergeAdmissionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, admission: OnlineMergeAdmission) !void {
+        var key_buf: [160]u8 = undefined;
+        const key = try mergeTransitionKeyForGroup(&key_buf, group_id, admission.next.scope.fence.transition_id);
+        const bytes = (try stagingGet(txn, key)) orelse return;
+        if (!std.mem.eql(u8, &OnlineMergeAdmission.digestEncoded(bytes), &admission.expected_record_digest)) return;
+        const current = try decodeMergeTransitionRecord(self.alloc, bytes);
+        defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, current);
+        if (current.online != null or current.phase != .prepare or current.rollback_reason != null) return;
+        // The catalog flag authorizes rebuilding source identities in the
+        // receiver namespace. Online row preparation performs that rebuild;
+        // it does not run the legacy receiver identity-reassignment command.
+        current.table_contract.validateForMerge(current.allow_doc_identity_reassignment) catch return;
+        var replacement = current;
+        replacement.online = admission.next;
+        admission.next.validateRecord(replacement) catch return;
+        var lease_buf: [160]u8 = undefined;
+        const lease_bytes = (try stagingGet(txn, try reconcileLeaseKeyForGroup(&lease_buf, group_id))) orelse return;
+        var lease_pos: usize = 0;
+        const lease = try readReconcileLeaseRecord(lease_bytes, &lease_pos);
+        if (lease_pos != lease_bytes.len) return error.InvalidMetadataTransitionEncoding;
+        if (!std.meta.eql(lease, admission.lease)) return;
+        if (!try self.mergeTransitionAdmissionMatchesTxn(txn, group_id, replacement) or
+            try backupCohortLocksTableTxn(txn, group_id, current.table_contract.table_id) or
+            try restoreStagingLocksTableTxn(txn, group_id, current.table_contract.table_id)) return;
+        // No transition-count change: the ordinary queued record already owns
+        // this table's active-transition fence. Publish identity and notify the
+        // scheduler in the same transaction, without reopening ordinary upsert.
+        const encoded = try encodeMergeTransitionRecord(self.alloc, replacement);
+        defer self.alloc.free(encoded);
+        try txn.put(key, encoded);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{ .kind = .merge_transition, .metadata_group_id = group_id, .group_id = replacement.receiver_group_id });
+        self.notifyCommittedTransition(.{ .upsert_merge = replacement });
+    }
+
+    fn applyOnlineMergeUpdateTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, update: OnlineMergeUpdate) anyerror!void {
+        var key_buf: [160]u8 = undefined;
+        const key = try mergeTransitionKeyForGroup(&key_buf, group_id, update.expected.scope.fence.transition_id);
+        const bytes = (try stagingGet(txn, key)) orelse return;
+        const current = try decodeMergeTransitionRecord(self.alloc, bytes);
+        defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, current);
+        const online = current.online orelse return;
+        if (!online.eql(update.expected) or (current.rollback_reason != null) != update.expected_cancel) return;
+        var lease_buf: [160]u8 = undefined;
+        const lease_bytes = (try stagingGet(txn, try reconcileLeaseKeyForGroup(&lease_buf, group_id))) orelse return;
+        var lease_pos: usize = 0;
+        const lease = try readReconcileLeaseRecord(lease_bytes, &lease_pos);
+        if (lease_pos != lease_bytes.len) return error.InvalidMetadataTransitionEncoding;
+        if (!std.meta.eql(lease, update.lease)) return;
+        if (!try self.tableMatchesTransitionContractTxn(txn, group_id, current.table_contract)) return;
+        var replacement = current;
+        replacement.online = update.next;
+        if (update.next.phase == .complete) replacement.phase = .finalized;
+        if (update.next.phase == .cancelled) replacement.phase = .rolled_back;
+        if (!mergeTransitionUpdateAllowed(current, replacement)) return;
+        if (update.publish_cutover) {
+            if (try backupCohortLocksTableTxn(txn, group_id, current.table_contract.table_id) or try restoreStagingLocksTableTxn(txn, group_id, current.table_contract.table_id)) return;
+            var donor_buf: [160]u8 = undefined;
+            var receiver_buf: [160]u8 = undefined;
+            const donor_bytes = (try stagingGet(txn, try rangeKeyForGroup(&donor_buf, group_id, current.donor_group_id))) orelse return;
+            const receiver_bytes = (try stagingGet(txn, try rangeKeyForGroup(&receiver_buf, group_id, current.receiver_group_id))) orelse return;
+            const donor = try decodeRangeRecord(self.alloc, donor_bytes);
+            defer metadata_table_manager.freeRange(self.alloc, donor);
+            const receiver = try decodeRangeRecord(self.alloc, receiver_bytes);
+            defer metadata_table_manager.freeRange(self.alloc, receiver);
+            if (donor.table_id != current.table_contract.table_id or receiver.table_id != current.table_contract.table_id or !rangesAreAdjacent(donor, receiver) or
+                !rangeMatchesTransitionIdentity(donor, current.table_contract.source_identity) or !rangeMatchesTransitionIdentity(receiver, current.table_contract.target_identity)) return;
+            var merged = receiver;
+            if (std.mem.order(u8, donor.start_key, receiver.start_key) == .lt) merged.start_key = donor.start_key else merged.end_key = donor.end_key;
+            const bounds = update.cutover_bounds.?;
+            const actual = OnlineMergeCutoverBounds.fromRanges(.{ .start = receiver.start_key, .end = receiver.end_key orelse "" }, .{ .start = merged.start_key, .end = merged.end_key orelse "" });
+            if (!std.meta.eql(bounds, actual)) return;
+            // Both existing range handlers maintain table/range indexes and
+            // generation fences in this SAME transaction as the online CAS.
+            try self.applyTransitionCommandTxn(txn, group_id, .{ .upsert_range = merged });
+            try self.applyTransitionCommandTxn(txn, group_id, .{ .remove_range = .{ .group_id = donor.group_id } });
+        }
+        try self.applyMergeTransitionUpsertAuthorizedTxn(txn, group_id, replacement, true);
+    }
+
+    fn applyMergeTransitionUpsertAuthorizedTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.MergeTransitionRecord, allow_online_change: bool) !void {
+        if (record.online) |online| try online.validateRecord(record);
         var key_buf: [160]u8 = undefined;
         const key = try mergeTransitionKeyForGroup(&key_buf, group_id, record.transition_id);
         const encoded_existing = txn.get(key) catch |err| switch (err) {
@@ -8378,9 +9038,11 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         var existing_active = false;
+        if (!allow_online_change and encoded_existing == null and record.online != null) return;
         if (encoded_existing) |encoded| {
             const existing = try decodeMergeTransitionRecord(self.alloc, encoded);
             defer metadata_table_manager.freeMergeTransitionRecord(self.alloc, existing);
+            if (!allow_online_change) if (existing.online) |previous| if (record.online == null or !previous.eql(record.online.?)) return;
             if (!mergeTransitionUpdateAllowed(existing, record)) return;
             existing_active = !transitionPhaseTerminal(existing.phase);
         } else if (!try self.mergeTransitionAdmissionMatchesTxn(
@@ -8622,6 +9284,10 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         record: metadata.MergeTransitionRecord,
     ) !bool {
+        if (record.online) |online| {
+            online.validateRecord(record) catch return false;
+            if (online.phase != .admit or online.revision != 1 or online.certificate != null) return false;
+        }
         if (record.phase != .prepare or
             record.donor_group_id == record.receiver_group_id)
             return false;
@@ -9210,6 +9876,7 @@ pub const RaftApplyStore = struct {
         );
         var applied = replacement;
         applied.record.metadata_version = next_version;
+        try self.stageRestorePlacementAuthorityTxn(txn, metadata_group_id, applied.record.group_id, applied.record.local_node_id);
         const value = try encodePlacementIntent(self.alloc, applied);
         defer self.alloc.free(value);
         try txn.put(key, value);
@@ -9741,6 +10408,9 @@ const TransitionTag = enum(u8) {
     create_restore_job = 52,
     remove_restore_job_if_matches = 53,
     compare_and_set_backup_cohort = 54,
+    compare_and_set_online_merge = 56,
+    admit_online_merge = 57,
+    create_restore_job_with_staging = 58,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -9943,6 +10613,18 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_merge_transition));
             try appendMergeTransitionRecord(alloc, &out, record);
         },
+        .compare_and_set_online_merge => |update| {
+            try out.append(alloc, @intFromEnum(TransitionTag.compare_and_set_online_merge));
+            const json = try std.json.Stringify.valueAlloc(alloc, update, .{});
+            defer alloc.free(json);
+            try out.appendSlice(alloc, json);
+        },
+        .admit_online_merge => |admission| {
+            try out.append(alloc, @intFromEnum(TransitionTag.admit_online_merge));
+            const json = try std.json.Stringify.valueAlloc(alloc, admission, .{});
+            defer alloc.free(json);
+            try out.appendSlice(alloc, json);
+        },
         .remove_merge_transition => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_merge_transition));
             try appendInt(alloc, &out, u64, record.transition_id);
@@ -10029,6 +10711,12 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(if (command == .create_restore_job) TransitionTag.create_restore_job else TransitionTag.upsert_restore_job));
             try appendRequiredString(alloc, &out, record.key);
             try appendRequiredString(alloc, &out, record.value);
+        },
+        .create_restore_job_with_staging => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.create_restore_job_with_staging));
+            try appendRequiredString(alloc, &out, record.key);
+            try appendRequiredString(alloc, &out, record.value);
+            try appendRequiredString(alloc, &out, record.plan_json);
         },
         .remove_restore_job_if_matches => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_job_if_matches));
@@ -10303,7 +10991,25 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
             .remove_split_transition = .{ .transition_id = try readInt(encoded, &pos, u64) },
         },
         .upsert_merge_transition => .{
-            .upsert_merge_transition = try readMergeTransitionRecord(alloc, encoded, &pos),
+            .upsert_merge_transition = try decodeMergeTransitionRecord(alloc, encoded[pos..]),
+        },
+        .compare_and_set_online_merge => blk: {
+            if (encoded.len - pos > 16 * 1024) return error.InvalidMetadataTransitionEncoding;
+            var parsed = std.json.parseFromSlice(OnlineMergeUpdate, alloc, encoded[pos..], .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataTransitionEncoding,
+            };
+            defer parsed.deinit();
+            break :blk .{ .compare_and_set_online_merge = parsed.value };
+        },
+        .admit_online_merge => blk: {
+            if (encoded.len - pos > 16 * 1024) return error.InvalidMetadataTransitionEncoding;
+            var parsed = std.json.parseFromSlice(OnlineMergeAdmission, alloc, encoded[pos..], .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidMetadataTransitionEncoding,
+            };
+            defer parsed.deinit();
+            break :blk .{ .admit_online_merge = parsed.value };
         },
         .remove_merge_transition => .{
             .remove_merge_transition = .{ .transition_id = try readInt(encoded, &pos, u64) },
@@ -10395,6 +11101,17 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 .key = try readRequiredString(alloc, encoded, &pos),
                 .value = try readRequiredString(alloc, encoded, &pos),
             },
+        },
+        .create_restore_job_with_staging => blk: {
+            const key = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(key);
+            const value = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(value);
+            const plan = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(plan);
+            if (pos != encoded.len or value.len == 0 or value.len > max_restore_job_value_bytes or plan.len == 0 or plan.len > restore_staging.max_encoded_bytes) return error.InvalidMetadataTransitionEncoding;
+            try validateRestoreJobLogicalKey(key);
+            break :blk .{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan } };
         },
         .upsert_restore_job => .{
             .upsert_restore_job = .{
@@ -10533,7 +11250,10 @@ fn decodeSplitTransitionRecord(alloc: std.mem.Allocator, encoded: []const u8) !m
 
 fn decodeMergeTransitionRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.MergeTransitionRecord {
     var pos: usize = 0;
-    return try readMergeTransitionRecord(alloc, encoded, &pos);
+    const record = try readMergeTransitionRecord(alloc, encoded, &pos);
+    errdefer metadata_table_manager.freeMergeTransitionRecord(alloc, record);
+    if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+    return record;
 }
 
 fn decodeTableRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.TableRecord {
@@ -12161,6 +12881,16 @@ fn appendMergeTransitionRecord(
         record.allow_doc_identity_reassignment,
     );
     try appendTransitionTableContract(alloc, out, record.table_contract);
+    // Fixed owned fields only. Length-framed extension also works inside a
+    // multi-command metadata batch; never consume another command's bytes.
+    if (record.online) |online| {
+        try online.validateRecord(record);
+        const bytes = try std.json.Stringify.valueAlloc(alloc, online, .{});
+        defer alloc.free(bytes);
+        try out.appendSlice(alloc, "afom1");
+        try appendInt(alloc, out, u32, @intCast(bytes.len));
+        try out.appendSlice(alloc, bytes);
+    }
 }
 
 fn appendTransitionTableContract(
@@ -13081,7 +13811,7 @@ fn readMergeTransitionRecord(
     var table_contract = try readTransitionTableContract(alloc, encoded, pos);
     errdefer table_contract.deinitOwned(alloc);
     try table_contract.validateForMerge(allow_doc_identity_reassignment);
-    return .{
+    var record: metadata.MergeTransitionRecord = .{
         .transition_id = transition_id,
         .donor_group_id = donor_group_id,
         .receiver_group_id = receiver_group_id,
@@ -13090,6 +13820,19 @@ fn readMergeTransitionRecord(
         .allow_doc_identity_reassignment = allow_doc_identity_reassignment,
         .table_contract = table_contract,
     };
+    if (std.mem.startsWith(u8, encoded[pos.*..], "afom1")) {
+        pos.* += 5;
+        const length = try readInt(encoded, pos, u32);
+        if (length == 0 or length > 16 * 1024 or length > encoded.len - pos.*) return error.InvalidMetadataTransitionEncoding;
+        if (length != 0) {
+            const parsed = try std.json.parseFromSlice(@import("../online_merge.zig").State, alloc, encoded[pos.*..][0..length], .{});
+            defer parsed.deinit();
+            record.online = parsed.value;
+            try record.online.?.validateRecord(record);
+        }
+        pos.* += length;
+    }
+    return record;
 }
 
 fn readTransitionTableContract(
@@ -13806,12 +14549,17 @@ fn splitTransitionUpdateAllowed(existing: metadata.SplitTransitionRecord, incomi
 }
 
 fn mergeTransitionUpdateAllowed(existing: metadata.MergeTransitionRecord, incoming: metadata.MergeTransitionRecord) bool {
+    if ((existing.online == null) != (incoming.online == null)) return false;
+    if (existing.online) |previous| {
+        incoming.online.?.validateRecord(incoming) catch return false;
+        if (!@import("../online_merge.zig").updateAllowed(previous, incoming.online.?)) return false;
+    }
     return existing.transition_id == incoming.transition_id and
         existing.donor_group_id == incoming.donor_group_id and
         existing.receiver_group_id == incoming.receiver_group_id and
         existing.table_contract.eql(incoming.table_contract) and
         existing.allow_doc_identity_reassignment == incoming.allow_doc_identity_reassignment and
-        transitionPhaseCanAdvance(existing.phase, incoming.phase) and
+        (existing.online != null or transitionPhaseCanAdvance(existing.phase, incoming.phase)) and
         !(existing.rollback_reason != null and incoming.rollback_reason == null);
 }
 
@@ -13824,6 +14572,261 @@ fn keyStrictlyInsideRange(key: []const u8, start_key: []const u8, end_key: ?[]co
     if (std.mem.order(u8, key, start_key) != .gt) return false;
     if (end_key) |end| return std.mem.order(u8, key, end) == .lt;
     return true;
+}
+
+test "metadata raft apply store online admission rejects ordinary progress cancellation and contract races" {
+    const alloc = std.testing.allocator;
+    for (0..4) |race| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-admission", .{tmp.sub_path});
+        defer alloc.free(root);
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        var contract = test_merge_transition_table_contract;
+        contract.source_identity.shard_id = 31;
+        contract.target_identity.shard_id = 30;
+        const queued: metadata.MergeTransitionRecord = .{ .transition_id = 601, .donor_group_id = 31, .receiver_group_id = 30, .table_contract = contract, .allow_doc_identity_reassignment = true };
+        const next: @import("../online_merge.zig").State = .{ .scope = .{
+            .fence = .{ .transition_id = 601, .attempt = 1, .peer_group_id = 30, .owner_group_id = 31, .role = .merge_source, .namespace = .{ .table_id = 7, .shard_id = 31, .range_id = 700 }, .catalog_digest = @splat(8) },
+            .receiver_namespace = .{ .table_id = 7, .shard_id = 30, .range_id = 701 },
+            .consumer_epoch = 4,
+            .copy_attempt = .{ .donor_term = 5, .sequence = 6 },
+        } };
+        const lease: metadata.ReconcileLeaseRecord = .{ .owner_node_id = 1, .expires_at_ms = 5000 };
+        try store.applyStandaloneCommand(21, .{ .upsert_table = testTransitionTableRecord() });
+        try store.applyStandaloneCommand(21, .{ .upsert_range = testTransitionRangeRecord(31, contract.source_identity, "doc:m", "doc:z") });
+        try store.applyStandaloneCommand(21, .{ .upsert_range = testTransitionRangeRecord(30, contract.target_identity, "doc:a", "doc:m") });
+        try store.applyStandaloneCommand(21, .{ .upsert_merge_transition = queued });
+        try store.applyStandaloneCommand(21, .{ .upsert_reconcile_lease = lease });
+        var admission: OnlineMergeAdmission = .{ .expected_record_digest = try onlineMergeAdmissionDigest(alloc, queued), .next = next, .lease = lease };
+        switch (race) {
+            0 => {
+                var progressed = queued;
+                progressed.phase = .bootstrap_peer;
+                try store.applyStandaloneCommand(21, .{ .upsert_merge_transition = progressed });
+                // Even a fresh digest cannot convert an already started merge.
+                admission.expected_record_digest = try onlineMergeAdmissionDigest(alloc, progressed);
+            },
+            1 => {
+                var canceled = queued;
+                canceled.rollback_reason = "canceled before automatic admission";
+                try store.applyStandaloneCommand(21, .{ .upsert_merge_transition = canceled });
+                admission.expected_record_digest = try onlineMergeAdmissionDigest(alloc, canceled);
+            },
+            2 => admission.next.scope.receiver_namespace.range_id += 1,
+            3 => {
+                var replaced_lease = lease;
+                replaced_lease.owner_node_id += 1;
+                try store.applyStandaloneCommand(21, .{ .upsert_reconcile_lease = replaced_lease });
+            },
+            else => unreachable,
+        }
+        try store.applyStandaloneCommand(21, .{ .admit_online_merge = admission });
+        const actual = (try store.getMergeTransition(alloc, 21, queued.transition_id)).?;
+        defer metadata_table_manager.freeMergeTransitionRecord(alloc, actual);
+        try std.testing.expect(actual.online == null);
+    }
+}
+
+test "metadata raft apply store online merge phases persist exact attempt and reject stale CAS after reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-merge", .{tmp.sub_path});
+    defer alloc.free(root);
+    var contract = test_merge_transition_table_contract;
+    contract.source_identity.shard_id = 31;
+    contract.target_identity.shard_id = 30;
+    var record: metadata.MergeTransitionRecord = .{
+        .transition_id = 601,
+        .donor_group_id = 31,
+        .receiver_group_id = 30,
+        .allow_doc_identity_reassignment = true,
+        .table_contract = contract,
+        .online = .{ .scope = .{
+            .fence = .{ .transition_id = 601, .attempt = 1, .peer_group_id = 30, .owner_group_id = 31, .role = .merge_source, .namespace = .{ .table_id = 7, .shard_id = 31, .range_id = 700 }, .catalog_digest = @splat(8) },
+            .receiver_namespace = .{ .table_id = 7, .shard_id = 30, .range_id = 701 },
+            .consumer_epoch = 4,
+            .copy_attempt = .{ .donor_term = 5, .sequence = 6 },
+        } },
+    };
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        try store.applyStandaloneCommand(21, .{ .upsert_table = testTransitionTableRecord() });
+        try store.applyStandaloneCommand(21, .{ .upsert_range = testTransitionRangeRecord(31, contract.source_identity, "doc:m", "doc:z") });
+        try store.applyStandaloneCommand(21, .{ .upsert_range = testTransitionRangeRecord(30, contract.target_identity, "doc:a", "doc:m") });
+        const lease: metadata.ReconcileLeaseRecord = .{ .owner_node_id = 1, .expires_at_ms = 5000 };
+        try store.applyStandaloneCommand(21, .{ .upsert_reconcile_lease = lease });
+        // Caller-chosen online records cannot bypass queued-record admission.
+        try store.applyStandaloneCommand(21, .{ .upsert_merge_transition = record });
+        try std.testing.expect((try store.getMergeTransition(alloc, 21, record.transition_id)) == null);
+        var queued = record;
+        queued.online = null;
+        try store.applyStandaloneCommand(21, .{ .upsert_merge_transition = queued });
+        const admission: OnlineMergeAdmission = .{ .expected_record_digest = try onlineMergeAdmissionDigest(alloc, queued), .next = record.online.?, .lease = lease };
+        const admission_wire = try encodeTransitionCommand(alloc, .{ .admit_online_merge = admission });
+        defer alloc.free(admission_wire);
+        var decoded_admission = (try decodeTransitionCommand(alloc, admission_wire)).?;
+        defer decoded_admission.deinit(alloc);
+        try std.testing.expectEqualDeep(admission, decoded_admission.admit_online_merge);
+        var stale_admission = admission;
+        stale_admission.lease.expires_at_ms += 1;
+        try store.applyStandaloneCommand(21, .{ .admit_online_merge = stale_admission });
+        const not_admitted = (try store.getMergeTransition(alloc, 21, record.transition_id)).?;
+        defer metadata_table_manager.freeMergeTransitionRecord(alloc, not_admitted);
+        try std.testing.expect(not_admitted.online == null);
+        try store.applyStandaloneCommand(21, .{ .admit_online_merge = admission });
+        try store.applyStandaloneCommand(21, .{ .admit_online_merge = admission });
+        const initial = try store.listMergeTransitions(alloc, 21);
+        defer store.freeMergeTransitions(alloc, initial);
+        try std.testing.expectEqual(@as(usize, 1), initial.len);
+        try std.testing.expect(initial[0].online.?.eql(record.online.?));
+        const previous = record.online.?;
+        record.online.?.phase = .publish;
+        record.online.?.revision = 2;
+        try store.applyStandaloneCommand(21, .{ .upsert_reconcile_lease = lease });
+        // Unconditional legacy updates may request cancellation, but cannot
+        // advance an online phase or bypass its scoped lease/CAS admission.
+        try store.applyStandaloneCommand(21, .{ .upsert_merge_transition = record });
+        const before = (try store.getMergeTransition(alloc, 21, record.transition_id)).?;
+        defer metadata_table_manager.freeMergeTransitionRecord(alloc, before);
+        try std.testing.expect(before.online.?.eql(previous));
+        const update: OnlineMergeUpdate = .{ .expected = previous, .next = record.online.?, .expected_cancel = false, .lease = lease };
+        const update_bytes = try encodeTransitionCommand(alloc, .{ .compare_and_set_online_merge = update });
+        defer alloc.free(update_bytes);
+        var decoded_update = (try decodeTransitionCommand(alloc, update_bytes)).?;
+        defer decoded_update.deinit(alloc);
+        try std.testing.expectEqualDeep(update, decoded_update.compare_and_set_online_merge);
+        var wrong_lease = update;
+        wrong_lease.lease.expires_at_ms += 1;
+        try store.applyStandaloneCommand(21, .{ .compare_and_set_online_merge = wrong_lease });
+        const denied = (try store.getMergeTransition(alloc, 21, record.transition_id)).?;
+        defer metadata_table_manager.freeMergeTransitionRecord(alloc, denied);
+        try std.testing.expect(denied.online.?.eql(previous));
+        try store.applyStandaloneCommand(21, .{ .compare_and_set_online_merge = update });
+        try store.applyStandaloneCommand(21, .{ .compare_and_set_online_merge = update });
+    }
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        const recovered = try store.listMergeTransitions(alloc, 21);
+        defer store.freeMergeTransitions(alloc, recovered);
+        try std.testing.expectEqual(@as(usize, 1), recovered.len);
+        try std.testing.expect(recovered[0].online.?.eql(record.online.?));
+        var manager = metadata_table_manager.TableManager.init(alloc);
+        defer manager.deinit();
+        try manager.syncProjectedMergeTransitions(recovered);
+        const projected = try manager.listDesiredMergeTransitions(alloc);
+        defer manager.freeMergeTransitions(alloc, projected);
+        try std.testing.expectEqual(@as(usize, 1), projected.len);
+        try std.testing.expect(projected[0].online.?.eql(record.online.?));
+        var stale = record;
+        stale.online.?.phase = .admit;
+        stale.online.?.revision = 1;
+        try store.applyStandaloneCommand(21, .{ .upsert_merge_transition = stale });
+        var wrong_attempt = record;
+        wrong_attempt.online.?.scope.copy_attempt.sequence += 1;
+        wrong_attempt.online.?.revision += 1;
+        try store.applyStandaloneCommand(21, .{ .upsert_merge_transition = wrong_attempt });
+        var ordinary = record;
+        ordinary.online = null;
+        try store.applyStandaloneCommand(21, .{ .upsert_merge_transition = ordinary });
+        const unchanged = try store.listMergeTransitions(alloc, 21);
+        defer store.freeMergeTransitions(alloc, unchanged);
+        try std.testing.expect(unchanged[0].online.?.eql(record.online.?));
+        // Actual immutable record clone + native codec retain every fixed field.
+        const bytes = try encodeTransitionCommand(alloc, .{ .upsert_merge_transition = record });
+        defer alloc.free(bytes);
+        var parsed = (try decodeTransitionCommand(alloc, bytes)).?;
+        defer parsed.deinit(alloc);
+        try std.testing.expect(parsed.upsert_merge_transition.online.?.eql(record.online.?));
+        const stored_bytes = try encodeMergeTransitionRecord(alloc, record);
+        defer alloc.free(stored_bytes);
+        const marker = std.mem.indexOf(u8, stored_bytes, "afom1").?;
+        var ordinary_record = record;
+        ordinary_record.online = null;
+        const ordinary_bytes = try encodeMergeTransitionRecord(alloc, ordinary_record);
+        defer alloc.free(ordinary_bytes);
+        // Ordinary records retain the exact pre-extension representation.
+        try std.testing.expectEqualSlices(u8, ordinary_bytes, stored_bytes[0..marker]);
+        for ([_]usize{ marker + 1, marker + 5, marker + 8, stored_bytes.len - 1 }) |length|
+            try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeMergeTransitionRecord(alloc, stored_bytes[0..length]));
+        const corrupted = try alloc.dupe(u8, stored_bytes);
+        defer alloc.free(corrupted);
+        corrupted[marker] ^= 1;
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeMergeTransitionRecord(alloc, corrupted));
+        const snapshot_bytes = try store.snapshotBuilder().buildSnapshot(alloc, 21);
+        defer alloc.free(snapshot_bytes);
+        const target_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-merge-copy", .{tmp.sub_path});
+        defer alloc.free(target_root);
+        var restored = try RaftApplyStore.init(alloc, .{ .root_dir = target_root });
+        defer restored.deinit();
+        try std.testing.expect(try restored.snapshotBuilder().installSnapshot(alloc, 21, 20, snapshot_bytes));
+        const transplanted = try restored.listMergeTransitions(alloc, 21);
+        defer restored.freeMergeTransitions(alloc, transplanted);
+        try std.testing.expect(transplanted[0].online.?.eql(record.online.?));
+        const online_mod = @import("../online_merge.zig");
+        const lease: metadata.ReconcileLeaseRecord = .{ .owner_node_id = 1, .expires_at_ms = 5000 };
+        var state = record.online.?;
+        for ([_]online_mod.Phase{ .snapshot, .tail, .freeze, .final_tail, .cutover }) |phase| {
+            var next = state;
+            next.phase = phase;
+            next.revision += 1;
+            if (phase == .snapshot) {
+                next.certificate = .{ .cut = .{ .namespace = state.scope.fence.namespace, .applied_index = 10, .retained_start = 4 }, .objects = 3, .content_bytes = 100, .schema_manifest_digest = @splat(1), .ordered_content_digest = @splat(2) };
+                next.acknowledged = 4;
+            }
+            if (phase == .final_tail) {
+                next.final_sequence = 4;
+                next.final_applied_index = 20;
+                next.final_cut_digest = @splat(3);
+            }
+            try store.applyStandaloneCommand(21, .{ .compare_and_set_online_merge = .{ .expected = state, .next = next, .expected_cancel = false, .lease = lease } });
+            state = next;
+        }
+        var released = state;
+        released.phase = .release;
+        released.revision += 1;
+        var cutover: OnlineMergeUpdate = .{ .expected = state, .next = released, .expected_cancel = true, .lease = lease, .publish_cutover = true, .cutover_bounds = OnlineMergeCutoverBounds.fromRanges(.{ .start = "doc:a", .end = "doc:m" }, .{ .start = "doc:a", .end = "doc:z" }) };
+        const cutover_wire = try encodeTransitionCommand(alloc, .{ .compare_and_set_online_merge = cutover });
+        defer alloc.free(cutover_wire);
+        var decoded_cutover = (try decodeTransitionCommand(alloc, cutover_wire)).?;
+        defer decoded_cutover.deinit(alloc);
+        try std.testing.expectEqualDeep(cutover, decoded_cutover.compare_and_set_online_merge);
+        try store.applyStandaloneCommand(21, .{ .compare_and_set_online_merge = cutover });
+        const still_donor = (try store.getRange(alloc, 21, 31)).?;
+        defer metadata_table_manager.freeRange(alloc, still_donor);
+        const still_state = (try store.getMergeTransition(alloc, 21, record.transition_id)).?;
+        defer metadata_table_manager.freeMergeTransitionRecord(alloc, still_state);
+        try std.testing.expect(still_state.online.?.eql(state));
+        cutover.expected_cancel = false;
+        var wrong_bounds = cutover;
+        wrong_bounds.cutover_bounds.?.merged_digest[0] ^= 1;
+        try store.applyStandaloneCommand(21, .{ .compare_and_set_online_merge = wrong_bounds });
+        const range_denied = (try store.getMergeTransition(alloc, 21, record.transition_id)).?;
+        defer metadata_table_manager.freeMergeTransitionRecord(alloc, range_denied);
+        try std.testing.expect(range_denied.online.?.eql(state));
+        try store.applyStandaloneCommand(21, .{ .compare_and_set_online_merge = cutover });
+        try store.applyStandaloneCommand(21, .{ .compare_and_set_online_merge = cutover });
+        try std.testing.expect((try store.getRange(alloc, 21, 31)) == null);
+        const merged = (try store.getRange(alloc, 21, 30)).?;
+        defer metadata_table_manager.freeRange(alloc, merged);
+        try std.testing.expectEqualStrings("doc:a", merged.start_key);
+        try std.testing.expectEqualStrings("doc:z", merged.end_key.?);
+        const after_cutover = (try store.getMergeTransition(alloc, 21, record.transition_id)).?;
+        defer metadata_table_manager.freeMergeTransitionRecord(alloc, after_cutover);
+        try std.testing.expect(after_cutover.online.?.eql(released));
+        var complete = released;
+        complete.phase = .complete;
+        complete.revision += 1;
+        try store.applyStandaloneCommand(21, .{ .compare_and_set_online_merge = .{ .expected = released, .next = complete, .expected_cancel = false, .lease = lease } });
+        const terminal = (try store.getMergeTransition(alloc, 21, record.transition_id)).?;
+        defer metadata_table_manager.freeMergeTransitionRecord(alloc, terminal);
+        try std.testing.expectEqual(metadata.TransitionPhase.finalized, terminal.phase);
+        try std.testing.expect(terminal.online.?.eql(complete));
+    }
 }
 
 test "metadata raft apply store persists batches across reopen" {

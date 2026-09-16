@@ -366,6 +366,27 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("exposes durable schema rewrite admission without discarding its job", async () => {
+      const job = { job_id: "rewrite-1", phase: "queued", scope: "table" };
+      mockPatch.mockResolvedValueOnce({ data: job, error: undefined });
+      await expect(
+        client.tables.patchSchema(
+          "products",
+          { generated_columns: [] },
+          {
+            expectedVersion: 5,
+            rewrite: true,
+            idempotencyKey: "rewrite-products-v6",
+          }
+        )
+      ).resolves.toEqual(job);
+      expect(mockPatch).toHaveBeenCalledWith("/db/v1/tables/{tableName}/schema", {
+        params: { path: { tableName: "products" }, query: { rewrite: true } },
+        body: { generated_columns: [] },
+        headers: { "If-Match": '"schema-5"', "Idempotency-Key": "rewrite-products-v6" },
+      });
+    });
+
     it("should query a specific table", async () => {
       const mockResponse = {
         responses: [

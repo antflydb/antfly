@@ -62,6 +62,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
     const public_api_parity_default_filters = [_][]const u8{
+        "api http server authenticates bounded online merge owner routes",
+        "online merge private port fences owners cancellation and deadlines before dispatch",
+        "online merge private port preserves source recovery errors through foreign runtime dispatch",
         "public openapi contract module is generated and wired",
         "admin openapi contract module is generated and wired",
         "internal openapi contract module is generated and wired",
@@ -96,6 +99,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server serves retrieval agent response envelope",
         "api http server serves table batch writes",
         "api http server routes table batches through the batch commit hook",
+        "api http server coordinated batch outcomes retain prepared names and conflict keys",
+        "api http server rewrite job authorization follows the complete cohort",
         "auto bulk max-window request waits for idle finish",
         "auto bulk group writes release leases so idle finish can publish",
         "auto bulk background finish skips entries with active foreground leases",
@@ -228,6 +233,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx shared registrar keeps root probes and rejects removed data aliases",
         "httpx storage maintenance routes call typed operations directly",
         "httpx antfly routes require auth and enforce admin middleware",
+        "httpx relational row query mutation endpoints enforce exact versions and schema epochs",
+        "httpx antfly schema update returns full table status after projection",
+        "httpx antfly schema update owns self partial support and rejects public index forgery",
+        "httpx schema patch merges at the authority and accepts version zero ETag",
+        "schema ETags are strong and preserve version zero",
         "request context observes cancellation before deadline",
         "admission reservation releases exactly once",
         "probe operations distinguish health from readiness",
@@ -600,6 +610,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, api_session_maintenance_test_mod, true, true);
     api_session_maintenance_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const retained_quota_tests = b.addTest(.{
+        .root_module = api_session_maintenance_test_mod,
+        .filters = &.{ "retained quota", "api http server routes table batches through the batch commit hook" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-retained-quota-test", "Run retained-effects pressure outcome and retry contracts").dependOn(&addFilteredTestRunArtifact(b, retained_quota_tests).step);
     const lib_api_session_maintenance_tests = b.addTest(.{
         .root_module = api_session_maintenance_test_mod,
         .filters = &.{
@@ -1243,6 +1259,26 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "Run retryable distributed-query transport classification regressions",
     );
     lib_api_distributed_query_availability_test_step.dependOn(&run_lib_api_distributed_query_availability_tests.step);
+    const api_internal_read_availability_tests = @import("linked_tests.zig").add(b, .{
+        .name = "api-internal-read-availability-tests",
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &.{
+            "typed internal group reads preserve retryable resident storage failures",
+            "api http client preserves remote storage read contention",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    b.step("antfly-api-internal-read-availability-test", "Run internal scan leadership availability and wire classification regressions").dependOn(&api_internal_read_availability_tests.run(b).step);
+    const api_internal_routed_batch_tests = @import("linked_tests.zig").add(b, .{
+        .name = "api-internal-routed-batch-tests",
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &.{"typed routed batch preserves forwarding cancellation and identity conflicts"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-internal-routed-batch-test", "Run exact private batch routing and rollback authority regressions").dependOn(&api_internal_routed_batch_tests.run(b).step);
     const api_derived_coverage_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_derived_coverage_test_root.zig"),
         .target = target,
@@ -1458,7 +1494,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_api_table_reads_docid_tests = @import("linked_tests.zig").runPair(b, api_table_reads_linked_tests, write_implementation_tests);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
-        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls" },
+        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
@@ -1469,6 +1505,30 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-rows-test", "Run generated relational row and schema boundary contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_row_contract_tests).step);
+    const restore_lookup_authority_tests = b.addTest(.{
+        .root_module = api_public_table_http_docid_test_mod,
+        .filters = &.{ "private restore lookup plan identity", "compiled lookup wire preserves binary scope" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-restore-lookup-authority-test", "Run private restore lookup authority parsing and compiled wire regressions").dependOn(&addFilteredTestRunArtifact(b, restore_lookup_authority_tests).step);
+    const api_index_maintenance_tests = b.addTest(.{
+        .root_module = api_public_table_http_docid_test_mod,
+        .filters = &.{ "index maintenance", "hot-standby mutation" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-index-maintenance-test", "Run generation-fenced index maintenance admission and recovery contracts").dependOn(&addFilteredTestRunArtifact(b, api_index_maintenance_tests).step);
+    const api_storage_capability_tests = b.addTest(.{
+        .root_module = api_public_table_http_docid_test_mod,
+        .filters = &.{"serverless capabilities"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-storage-capabilities-test", "Run backend relational capability admission contracts").dependOn(&addFilteredTestRunArtifact(b, api_storage_capability_tests).step);
+    const api_relational_index_status_tests = b.addTest(.{
+        .root_module = api_public_table_http_docid_test_mod,
+        .filters = &.{"relational index status"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-relational-index-status-test", "Run unified relational index readiness and owner coverage contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_index_status_tests).step);
     const api_relational_topology_contract_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{ "internal batch topology control", "relational backup cohort" },
@@ -1715,6 +1775,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-restore-provisioning-test", "Run private hidden owner reservation and writer-cache admission").dependOn(&restore_provisioning_tests.run(b).step);
+    const hosted_batch_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-hosted-batch-tests",
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{"hosted remote batch prefers routed Raft protocol with safe legacy fallback"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    }, write_implementation_tests);
+    b.step("antfly-api-hosted-batch-test", "Run hosted batch forwarding authority and canonical wire regressions").dependOn(&hosted_batch_tests.run(b).step);
     const run_api_table_writes_production_regression_unit_tests = api_table_writes_production_regression_tests.run(b);
     // These stateful suites each open several DB/index runtimes. Keep their
     // aggregate-gate runs on one lane so bounded CI hosts do not convert
@@ -1862,6 +1929,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "staged restore published metadata wins cancellation only after every owner opens",
             "staged restore worker publishes a dependency complete mixed native cohort",
             "staged restore worker rebuilds a dependency complete mixed portable cohort",
+            "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners",
             "restore admission unknown response preserves recovery",
             "restore worker authority is fenced across leadership reacquisition",
             "restore ownership backoff is interruptible without polling",
@@ -1874,10 +1942,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_api_standalone_backup_restore_tests = addFilteredTestRunArtifact(b, lib_api_standalone_backup_restore_tests);
     const staged_restore_driver_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
-        .filters = &.{ "staged restore published metadata wins cancellation only after every owner opens", "staged restore worker publishes a dependency complete mixed native cohort", "staged restore worker rebuilds a dependency complete mixed portable cohort", "staged restore worker recovers lost acknowledgements across owner restart matrix", "staged table restore worker uses shared dependency complete cohort", "staged restore worker preserves migration mappings and indexes after restart", "staged restore worker measures bounded LSM native and portable work" },
+        .filters = &.{ "staged restore published metadata wins cancellation only after every owner opens", "staged restore worker publishes a dependency complete mixed native cohort", "staged restore worker rebuilds a dependency complete mixed portable cohort", "staged restore worker recovers lost acknowledgements across owner restart matrix", "staged restore worker preserves generated mixed cohorts across HTTP owner faults", "staged table restore worker uses shared dependency complete cohort", "staged restore worker preserves migration mappings and indexes after restart", "staged restore worker measures bounded LSM native and portable work" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-staged-restore-driver-test", "Run bounded staged restore publication and cancellation driver regressions").dependOn(&addFilteredTestRunArtifact(b, staged_restore_driver_tests).step);
+    const rewrite_driver_tests = b.addTest(.{
+        .root_module = api_backup_restore_test_mod,
+        .filters = &.{ "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners", "restore immutable rewrite failures are terminal" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-rewrite-driver-test", "Run real retained-source rewrite, hidden owner recovery and failed-tail cancellation").dependOn(&addFilteredTestRunArtifact(b, rewrite_driver_tests).step);
+    const generated_restore_tests = b.addTest(.{
+        .root_module = api_backup_restore_test_mod,
+        .filters = &.{"staged restore worker preserves generated mixed cohorts across HTTP owner faults"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-generated-restore-test", "Run generated mixed-table restore through HTTP owner faults").dependOn(&addFilteredTestRunArtifact(b, generated_restore_tests).step);
     const lib_api_standalone_backup_restore_test_step = b.step("antfly-api-standalone-backup-restore-test", "Run the focused standalone-like backup/restore e2e test");
     lib_api_standalone_backup_restore_test_step.dependOn(&run_lib_api_standalone_backup_restore_tests.step);
 
@@ -1899,7 +1979,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_transactions_docid_tests = run_api_transactions_docid_tests,
         .run_api_table_writes_docid_tests = run_api_table_writes_docid_tests,
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_table_writes_production_regression_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

@@ -113,6 +113,7 @@ pub const Page = struct {
             break :blk try @import("relational_rows.zig").Reader.open(alloc, core.store, view, null, .{ .fields = fields, .include_primary_digest = true }, 0);
         };
         defer reader.deinit();
+        try @import("online_integrity_shadow.zig").requireCatalogMutable(&reader.read);
         const previous = (try optional(&reader.read, key)) orelse return null;
         // Projection selection and its phase must refer to this exact cut;
         // another worker may have crossed a barrier before snapshot opening.

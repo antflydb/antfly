@@ -37,6 +37,7 @@ pub const Routes = struct {
     pub const internal_linearizable_head = "/internal/v1/catalog/linearizable-head";
     pub const internal_linearizable_snapshot = "/internal/v1/catalog/linearizable-snapshot";
     pub const internal_provisioning_snapshot = "/internal/v1/catalog/provisioning";
+    pub const internal_restore_staging_authority = "/internal/v1/catalog/restore-staging-authority";
     pub const internal_linearizable_routing_snapshot = "/internal/v1/catalog/linearizable-routing-snapshot";
     pub const internal_table_routing_snapshot = "/internal/v2/catalog/table-routing-snapshot";
     pub const internal_linearizable_table_routing_snapshot = "/internal/v2/catalog/linearizable-table-routing-snapshot";

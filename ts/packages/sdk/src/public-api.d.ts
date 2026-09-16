@@ -954,7 +954,7 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** Read distributed unique and foreign-key validation coverage */
+        /** Read distributed UNIQUE, foreign-key, and CHECK validation coverage */
         get: operations["getRelationalConstraintStatus"];
         put?: never;
         post?: never;
@@ -978,7 +978,7 @@ export interface paths {
         /**
          * Repair version-conditional rows after failed constraint activation
          * @description Requires table administrator permission. Each affected target range must
-         *     have failed UNIQUE/FK activation. Replacement values still satisfy all
+         *     have failed UNIQUE/FK/CHECK activation. Replacement values still satisfy all
          *     constraints, and referential actions require write permission on every
          *     affected table. Existing dependencies remain protected. Repairs do not
          *     mark historical coverage valid; invoke constraint retry after repairs.
@@ -1002,7 +1002,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Restart failed UNIQUE/FK validation after administrative repair
+         * Restart failed UNIQUE/FK/CHECK validation after administrative repair
          * @description Requires table administrator permission. Resets each failed owner using
          *     an exact checkpoint precondition. Owners already validating or enforced
          *     are unchanged. Retrying after partial progress is safe. Inspect the
@@ -1214,8 +1214,25 @@ export interface paths {
     };
     "/db/v1/tables/{tableName}/schema": {
         parameters: {
-            query?: never;
-            header?: never;
+            query?: {
+                /**
+                 * @description Explicitly enqueue a durable fresh-generation schema rewrite instead
+                 *     of changing the live schema. Requires administrator permission on the
+                 *     entire dependency cohort. Sources remain writable during snapshot and
+                 *     catch-up; final validation and publication are atomic across the cohort.
+                 *     Returns a restore job (202), whose existing status/cancel routes apply.
+                 *     Independent graph/vector artifacts without a retained row-derived
+                 *     source proof are rejected before admission. The default false retains
+                 *     ordinary schema-update behavior. Existing absent values remain absent
+                 *     rather than retroactively receiving defaults. Stored column type
+                 *     changes and destructive column removal are rejected.
+                 */
+                rewrite?: boolean;
+            };
+            header?: {
+                /** @description Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409. */
+                "Idempotency-Key"?: string;
+            };
             path: {
                 /** @description Name of the table */
                 tableName: string;
@@ -1784,6 +1801,52 @@ export interface paths {
         get: operations["listIndexes"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry a failed index build
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["retryIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair an index generation
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["repairIndex"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5899,12 +5962,29 @@ export interface components {
             collation?: string;
         };
         /**
-         * @description Bounded relational scan in primary-key order. Each shard read pins an
-         *     immutable schema and row snapshot. Resume with the last returned _id
-         *     as from; a resumed request opens a fresh snapshot, not a retained cursor.
+         * @description Bounded relational scan in primary-key order, or composite index order
+         *     when index is supplied. Index queries require schema_version and every
+         *     owning shard must have the selected generation ready. Partial indexes
+         *     require their WHERE predicates to be implied by the query conditions.
+         *     The bounded proof combines per-column equality, tighter ranges,
+         *     exclusions, and NULL-aware predicates using exact typed values and
+         *     matching collations. Unsupported implications fail closed. Explicit
+         *     scan bounds alone are not an implication proof. Equal tuples are
+         *     ordered by primary key. Each shard read pins its own immutable schema
+         *     and row snapshot; this is not a table-wide consistent snapshot.
+         *     Resume with the last returned _id as from for primary scans, or its
+         *     cursor as after for index scans. A resumed request opens a fresh snapshot,
+         *     not a retained cursor; concurrent mutations may move rows across the
+         *     continuation boundary. Keep index, bounds and conditions unchanged when paging.
          *     An empty projection returns row identities and versions only.
          */
         RelationalRowQueryRequest: {
+            /** @description Ready composite secondary index. Requires schema_version; cannot be combined with from/to. */
+            index?: string;
+            /** @description Opaque exclusive index-order cursor from the last returned row. Binds the immutable schema version, logical index name, and comparison semantics, independent of owner-local physical generations. Each owner must still prove its current local index is ready. */
+            after?: string;
+            lower?: components["schemas"]["RelationalRowIndexBound"];
+            upper?: components["schemas"]["RelationalRowIndexBound"];
             fields: string[];
             conditions?: components["schemas"]["RelationalRowCondition"][];
             /** @description Exclusive lower primary-key bound, including pagination continuation. */
@@ -5918,11 +5998,19 @@ export interface components {
             limit?: number;
             /**
              * Format: uint32
-             * @description Reject the read if an owning shard has a different active schema epoch.
+             * @description Reject the read if an owning shard has a different active schema epoch. Zero is a valid epoch and is distinct from omission.
              */
             schema_version?: number;
         };
+        /** @description Typed left-prefix bound in declared index order, including descending components. Inclusive bounds include the entire matching prefix. Integer components accept exact decimal strings; null is an indexed null. */
+        RelationalRowIndexBound: {
+            values: unknown[];
+            /** @default true */
+            inclusive?: boolean;
+        };
         RelationalRow: {
+            /** @description Opaque index-order continuation; present only for secondary-index queries. */
+            cursor?: string;
             _id: string;
             row: {
                 [key: string]: unknown;
@@ -6254,7 +6342,7 @@ export interface components {
          */
         RelationalConstraintConflictReason: "unique_constraint_violation" | "foreign_key_parent_missing" | "foreign_key_referenced";
         /** @enum {string} */
-        RelationalConstraintActivationPhase: "unique" | "foreign_key";
+        RelationalConstraintActivationPhase: "unique" | "foreign_key" | "check";
         RelationalConstraintRangeStatus: {
             /** @description Exact owner group identifier as decimal text. */
             group_id: string;
@@ -6309,10 +6397,10 @@ export interface components {
             /** Format: uint32 */
             schema_version: number;
             /**
-             * @description This endpoint reports distributed unique/FK coverage, not local scalar CHECK validation.
+             * @description Distributed UNIQUE, foreign-key, and scalar CHECK coverage across every current table owner. Native local validation is not a substitute for this coordinated proof.
              * @enum {string}
              */
-            coverage_kind: "unique_and_foreign_key";
+            coverage_kind: "unique_foreign_key_and_check";
             state: components["schemas"]["RelationalConstraintValidationState"];
             ranges: components["schemas"]["RelationalConstraintRangeStatus"][];
             retirement?: components["schemas"]["RelationalConstraintRetirementStatus"];
@@ -10752,11 +10840,96 @@ export interface components {
             /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
             derive_from_schema?: boolean;
         };
+        /** @enum {string} */
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not";
+        /** @enum {string} */
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number";
+        /**
+         * @description Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+         *     A literal requires type; omitted value means typed null. A column
+         *     requires column; other
+         *     operations require args. Unknown or irrelevant fields are rejected.
+         *     Arithmetic operands have the same integer or number type. Integer
+         *     division truncates toward zero. Overflow and division by zero reject
+         *     the write. Arithmetic and string operations propagate null. ASCII case
+         *     operations leave non-ASCII bytes unchanged. No volatile functions are
+         *     accepted. Allocated results are bounded to 1 MiB each. Allocations
+         *     and byte-comparison operand work share a 4 MiB evaluation budget per
+         *     row and expression set. An integer literal may use a decimal string
+         *     for exact int64 transport; blob uses base64 and datetime uses the
+         *     normal relational datetime representation.
+         *     Comparisons require operands of the same type and return boolean or
+         *     SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
+         *     boolean. Unary is_null and is_not_null test presence/null. AND and OR
+         *     evaluate left to right with SQL three-valued short-circuit semantics;
+         *     NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+         */
+        RelationalScalarExpression: {
+            op: components["schemas"]["RelationalExpressionOp"];
+            type?: components["schemas"]["RelationalExpressionType"];
+            /** @description Typed literal value, including null. */
+            value?: unknown;
+            column?: string;
+            /** @description Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes. */
+            collation?: string;
+            args?: components["schemas"]["RelationalScalarExpression"][];
+        };
+        /**
+         * @description Direction of one ordered index key component. Omission selects asc.
+         * @enum {string}
+         */
+        RelationalIndexKeyDirection: "asc" | "desc";
+        /**
+         * @description Null placement for one ordered index key component. The default is
+         *     last for ascending keys and first for descending keys. Omission selects default.
+         * @enum {string}
+         */
+        RelationalIndexKeyNulls: "default" | "first" | "last";
+        /**
+         * @description Ordered component of a relational ordered-tuple index key. Supply
+         *     either a declared column or a deterministic typed scalar expression
+         *     with its result_type. Composite keys may mix both forms. Bounds use
+         *     the expression result type, not its input columns.
+         */
+        RelationalIndexKey: {
+            /** @description Declared relational column used by this key component. */
+            column?: string;
+            expression?: components["schemas"]["RelationalScalarExpression"];
+            result_type?: components["schemas"]["RelationalExpressionType"];
+            /**
+             * @description String-key collation. Omission selects binary ordering. Supported
+             *     binary aliases are C, POSIX, and binary. The aliases ci,
+             *     case_insensitive, and antfly.case_insensitive select ASCII-only
+             *     case folding, not locale-aware or Unicode case folding.
+             */
+            collation?: string;
+            direction?: components["schemas"]["RelationalIndexKeyDirection"];
+            nulls?: components["schemas"]["RelationalIndexKeyNulls"];
+        };
+        /** @enum {string} */
+        RelationalComparisonOp: "is_null" | "is_not_null" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_distinct" | "is_not_distinct";
+        /** @description A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded. */
+        RelationalIndexPredicate: {
+            column: string;
+            op: components["schemas"]["RelationalComparisonOp"];
+            /** @description Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL. */
+            value?: unknown;
+            /** @description String comparison collation with the same semantics as ordered keys. */
+            collation?: string;
+        };
+        /** @description Schema-bound composite ordered index on a relational table. Keys use stable typed comparison semantics and independent direction, null placement, and string collation. Existing rows build asynchronously; indexed queries require complete owner coverage. The table schema is the single durable authority for these definitions. */
+        RelationalIndexConfig: {
+            keys: components["schemas"]["RelationalIndexKey"][];
+            /** @description Non-key columns stored for index-only projection; distinct from keys. */
+            include_columns?: string[];
+            /** @description Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts. */
+            where?: components["schemas"]["RelationalIndexPredicate"][];
+        };
         /**
          * @description The type of the index.
          * @enum {string}
          */
-        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
+        IndexType: "full_text" | "embeddings" | "graph" | "algebraic" | "relational";
         /** @description Configuration for an index */
         IndexConfig: {
             /** @description Name of the index */
@@ -10789,7 +10962,7 @@ export interface components {
              *     ]
              */
             enrichments?: components["schemas"]["EnrichmentConfig"][];
-        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"] | components["schemas"]["RelationalIndexConfig"]);
         /** @description Fields shared by every create-index variant. The index name is owned by the request path. */
         CreateIndexCommon: {
             /** @description Optional description of the index and its purpose */
@@ -10846,8 +11019,26 @@ export interface components {
              */
             type: "algebraic";
         };
+        /** @description Create a composite ordered index through the shared index resource. */
+        CreateRelationalIndexRequest: components["schemas"]["RelationalIndexConfig"] & {
+            /** @description Optional description of the index and its purpose. */
+            description?: string;
+            /**
+             * @description Index implementation version. Only zero is supported; the schema epoch is managed by the server.
+             * @default 0
+             */
+            version?: number;
+            /** @enum {string} */
+            type: "relational";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "relational";
+        };
         /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
-        CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"];
+        CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"] | components["schemas"]["CreateRelationalIndexRequest"];
         /**
          * @description Storage representation for the table. Omission selects "document".
          *     "relational" stores schema-bound typed rows and requires exactly one
@@ -10858,27 +11049,33 @@ export interface components {
          * @enum {string}
          */
         TableStorageMode: "document" | "relational";
-        /** @enum {string} */
-        RelationalComparisonOp: "is_null" | "is_not_null" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_distinct" | "is_not_distinct";
+        RelationalColumnExpression: {
+            column: string;
+            expression: components["schemas"]["RelationalScalarExpression"];
+        };
         /**
-         * @description A typed scalar CHECK. New writes are checked from schema publication;
+         * @description A typed CHECK. Supply either expression or column and op (with optional
+         *     value and collation), never both forms. Expressions must return boolean
+         *     and use the shared bounded immutable scalar expression vocabulary.
+         *     New writes are checked from schema publication;
          *     existing rows are validated separately. SQL UNKNOWN satisfies CHECK.
          *     Comparison values must match the column type. Integer values may also
          *     use exact decimal strings to avoid client-side floating-point rounding.
          */
         RelationalCheckConstraint: {
             name: string;
-            column: string;
-            op: components["schemas"]["RelationalComparisonOp"];
+            column?: string;
+            op?: components["schemas"]["RelationalComparisonOp"];
             /** @description Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand. */
             value?: unknown;
             /** @description String comparison collation; uses the same rules as ordered indexes. */
             collation?: string;
+            expression?: components["schemas"]["RelationalScalarExpression"];
         };
         /**
          * @description A named, ordered composite unique key. Validation status is maintained
-         *     by the server. TTL expiry cannot be combined with unique or foreign-key
-         *     declarations until expiry uses the distributed integrity coordinator.
+         *     by the server. TTL expiry uses the distributed integrity coordinator.
+         *     Referenced unique keys are nondeferrable.
          */
         RelationalUniqueConstraint: {
             name: string;
@@ -10892,12 +11089,20 @@ export interface components {
          */
         ForeignKeyAction: "restrict" | "set_null" | "cascade" | "no_action";
         /**
-         * @description Whether foreign-key enforcement occurs immediately or at transaction commit.
+         * @description Enforcement timing for atomic mutations and transaction sessions. Deferred
+         *     requires deferrable=true and validates the final transaction state.
+         *     NO ACTION permits a valid final-state parent replacement; RESTRICT
+         *     still rejects referenced parent removal. Existing multi-request
+         *     transaction sessions retain deferred checks until commit; immediate
+         *     checks apply to each staged statement. SET CONSTRAINTS is not provided.
          * @enum {string}
          */
         ForeignKeyTiming: "immediate" | "deferred";
         /**
-         * @description Null matching semantics of a composite foreign key.
+         * @description Null matching semantics of a composite foreign key. Partial requires
+         *     at least one parent matching every non-null child component; all-null
+         *     children are exempt. Compatible parent witnesses are guarded through
+         *     commit, including concurrent deletion of alternative witnesses.
          * @enum {string}
          */
         ForeignKeyMatch: "simple" | "full" | "partial";
@@ -10906,7 +11111,9 @@ export interface components {
          *     and must have the same physical comparison types. The parent columns
          *     must identify a unique key. Existing-row validation is independent of
          *     new-write enforcement and is never client-writable.
-         *     Deferred timing, MATCH PARTIAL, and TTL expiry are not supported.
+         *     Enforcement and referential actions share the bounded distributed
+         *     transaction path, including TTL expiry. Partial matching uses ordered
+         *     support indexes on the parent; activation waits until these are ready.
          *     SET NULL requires every child column to accept explicit NULL.
          */
         RelationalForeignKeyConstraint: {
@@ -10921,40 +11128,23 @@ export interface components {
             deferrable?: boolean;
         };
         /**
-         * @description Direction of one ordered index key component. Omission selects asc.
-         * @enum {string}
-         */
-        RelationalIndexKeyDirection: "asc" | "desc";
-        /**
-         * @description Null placement for one ordered index key component. The default is
-         *     last for ascending keys and first for descending keys. Omission selects default.
-         * @enum {string}
-         */
-        RelationalIndexKeyNulls: "default" | "first" | "last";
-        /** @description Ordered component of a relational ordered-tuple index key. */
-        RelationalIndexKey: {
-            /** @description Declared relational column used by this key component. */
-            column: string;
-            /**
-             * @description String-key collation. Omission selects binary ordering. Supported
-             *     binary aliases are C, POSIX, and binary. The aliases ci,
-             *     case_insensitive, and antfly.case_insensitive select ASCII-only
-             *     case folding, not locale-aware or Unicode case folding.
-             */
-            collation?: string;
-            direction?: components["schemas"]["RelationalIndexKeyDirection"];
-            nulls?: components["schemas"]["RelationalIndexKeyNulls"];
-        };
-        /**
          * @description Declarative table-owned ordered index. Keys are compared lexicographically
          *     in the declared order, with independent direction, null placement, and
          *     string collation. Creation builds existing rows asynchronously; queries
-         *     must wait for range-local coverage. Unique constraints, expressions,
-         *     partial predicates, and covering payloads are not implied by this object.
+         *     must wait for range-local coverage. Unique constraints and expression
+         *     keys are not implied by this object. Optional WHERE conjuncts select
+         *     only matching rows. INCLUDE columns
+         *     store typed values alongside keys for index-only projected reads.
          */
         RelationalIndexDefinition: {
+            /** @description Optional human-readable description, also exposed by the shared indexes API. */
+            description?: string;
             name: string;
             keys: components["schemas"]["RelationalIndexKey"][];
+            /** @description Non-key columns stored in the index; must be distinct from key columns. */
+            include_columns?: string[];
+            /** @description Conjunction of typed predicates. Indexed queries must explicitly contain every conjunct with equivalent typed comparison semantics. */
+            where?: components["schemas"]["RelationalIndexPredicate"][];
         };
         /**
          * @description Field types accepted by detailed `x-antfly-field` and dynamic-template
@@ -11139,6 +11329,32 @@ export interface components {
              */
             readonly version?: number;
             storage_mode?: components["schemas"]["TableStorageMode"];
+            /**
+             * @description Immutable typed expressions applied only to absent columns on new
+             *     writes, never explicit null. Defaults cannot reference columns.
+             *     A column cannot have both a default and a generated expression.
+             *     Omission or [] declares none. Relational tables only.
+             */
+            column_defaults?: components["schemas"]["RelationalColumnExpression"][];
+            /**
+             * @description Stored immutable generated columns, evaluated in dependency order
+             *     on writes before validation and indexing. Cycles are rejected.
+             *     Generated columns are output-only; submitted values are replaced
+             *     by the computed value. Omission or [] declares none. Defaults
+             *     and generated declarations together are limited to 256 columns,
+             *     4096 expression nodes, and 4 MiB of literal data. Evaluation has
+             *     a shared 4 MiB allocation budget across all column expressions.
+             *     Restore verifies stored results instead of silently recomputing
+             *     them. Changing, adding, or removing generated semantics through
+             *     an existing table's schema update requires explicit rewrite=true
+             *     on the PUT or PATCH schema route. This returns a durable restore
+             *     job and replaces the complete authorized dependency cohort only
+             *     after distributed transformation and validation. Ordinary schema
+             *     updates reject these changes, even when a table appears empty.
+             *     Declaration reordering and default-only changes remain allowed.
+             *     Relational tables only.
+             */
+            generated_columns?: components["schemas"]["RelationalColumnExpression"][];
             /**
              * @description Named scalar CHECK constraints for a relational schema. This is
              *     part of the complete schema: omission or [] declares no checks.
@@ -11378,8 +11594,19 @@ export interface components {
              */
             type: "algebraic";
         };
+        /** @description Effective schema-bound composite index configuration. */
+        CreatedRelationalIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["RelationalIndexConfig"] & {
+            /** @enum {string} */
+            type: "relational";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "relational";
+        };
         /** @description Discriminated normalized configuration returned after an index is created. */
-        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"];
+        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"] | components["schemas"]["CreatedRelationalIndex"];
         /**
          * @description Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
          * @enum {string}
@@ -12487,8 +12714,49 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @enum {string} */
+        RelationalIndexBuildState: "building" | "ready" | "failed";
+        /** @enum {string} */
+        RelationalIndexBuildFailure: "incompatible_schema" | "invalid_row";
+        RelationalIndexRangeStatus: {
+            group_id: string;
+            /** @description Exact uint64 generation encoded as decimal, never a floating-point number. */
+            generation: string;
+            /** Format: uint32 */
+            slot: number;
+            /** @description Namespace and owned-range fingerprint. */
+            owner: string;
+            /** @description Executable tuple comparison fingerprint. */
+            comparison: string;
+            /** @description Exact durable progress observation for generation-fenced maintenance. */
+            progress_digest: string;
+            /** @description Replicated desired maintenance ticket, separate from replica-local progress. */
+            maintenance_epoch: string;
+            /** @description Most recently accepted maintenance command proof for exact retry acknowledgement. */
+            last_maintenance_request?: string;
+            state: components["schemas"]["RelationalIndexBuildState"];
+            rows_scanned: string;
+            failure?: components["schemas"]["RelationalIndexBuildFailure"];
+        };
+        RelationalIndexStatus: {
+            table_id: string;
+            /** Format: uint32 */
+            schema_version: number;
+            index_name: string;
+            state: components["schemas"]["RelationalIndexBuildState"];
+            ranges: components["schemas"]["RelationalIndexRangeStatus"][];
+        };
+        RelationalIndexStats: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            index_type: "relational";
+            milestones: components["schemas"]["IndexMilestones"];
+            relational_index: components["schemas"]["RelationalIndexStatus"];
+        };
         /** @description Statistics for an index */
-        IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
+        IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"] | components["schemas"]["RelationalIndexStats"];
         GraphMetricEdgeFilterStatus: {
             /** @enum {string} */
             mode: "all" | "types";
@@ -14723,6 +14991,26 @@ export interface components {
             context?: Record<string, never>[];
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
+        };
+        IndexMaintenanceOwnerProof: {
+            group_id: string;
+            generation: string;
+            /** Format: uint32 */
+            slot: number;
+            owner: string;
+            comparison: string;
+            progress_digest: string;
+            maintenance_epoch: string;
+        };
+        /** @description Exact observations from index status. Each selected owner is admitted atomically through the replicated transaction journal; the selection is not one global transaction. Cancellation, conflicts, or a lost acknowledgement may leave some owners admitted. Resubmit the identical request to resume safely; do not replace its observations with newer progress unless starting a new maintenance attempt. */
+        IndexMaintenanceRequest: {
+            table_id: string;
+            /** Format: uint32 */
+            schema_version: number;
+            owners: components["schemas"]["IndexMaintenanceOwnerProof"][];
+        };
+        IndexMaintenanceResponse: {
+            acknowledged_groups: string[];
         };
         InferenceError: {
             /** @description Stable machine-readable error code */
@@ -18715,8 +19003,24 @@ export interface operations {
     };
     updateSchema: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Explicitly enqueue a durable fresh-generation schema rewrite instead
+                 *     of changing the live schema. Requires administrator permission on the
+                 *     entire dependency cohort. Sources remain writable during snapshot and
+                 *     catch-up; final validation and publication are atomic across the cohort.
+                 *     Returns a restore job (202), whose existing status/cancel routes apply.
+                 *     Independent graph/vector artifacts without a retained row-derived
+                 *     source proof are rejected before admission. The default false retains
+                 *     ordinary schema-update behavior. Existing absent values remain absent
+                 *     rather than retroactively receiving defaults. Stored column type
+                 *     changes and destructive column removal are rejected.
+                 */
+                rewrite?: boolean;
+            };
             header?: {
+                /** @description Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409. */
+                "Idempotency-Key"?: string;
                 /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
                 "If-Match"?: string;
             };
@@ -18743,7 +19047,17 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
-            202: components["responses"]["CommittedMutationAccepted"];
+            /** @description Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility */
+            202: {
+                headers: {
+                    /** @description Restore job status URL when rewrite=true. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"] | components["schemas"]["CommittedMutationOutcome"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -18752,8 +19066,24 @@ export interface operations {
     };
     patchSchema: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Explicitly enqueue a durable fresh-generation schema rewrite instead
+                 *     of changing the live schema. Requires administrator permission on the
+                 *     entire dependency cohort. Sources remain writable during snapshot and
+                 *     catch-up; final validation and publication are atomic across the cohort.
+                 *     Returns a restore job (202), whose existing status/cancel routes apply.
+                 *     Independent graph/vector artifacts without a retained row-derived
+                 *     source proof are rejected before admission. The default false retains
+                 *     ordinary schema-update behavior. Existing absent values remain absent
+                 *     rather than retroactively receiving defaults. Stored column type
+                 *     changes and destructive column removal are rejected.
+                 */
+                rewrite?: boolean;
+            };
             header?: {
+                /** @description Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409. */
+                "Idempotency-Key"?: string;
                 /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
                 "If-Match"?: string;
             };
@@ -18781,7 +19111,17 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
-            202: components["responses"]["CommittedMutationAccepted"];
+            /** @description Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility */
+            202: {
+                headers: {
+                    /** @description Restore job status URL when rewrite=true. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"] | components["schemas"]["CommittedMutationOutcome"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -19512,6 +19852,72 @@ export interface operations {
             };
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    retryIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
+        };
+    };
+    repairIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     getIndex: {

@@ -16,6 +16,18 @@
 const std = @import("std");
 const native = @import("../db/restore_staging_contract.zig");
 const records = @import("../../common/topology_records.zig");
+
+/// Resolve private restore authority from a configured node-local root. Never
+/// infer a deployment layout by walking ancestors: custom replica roots may
+/// be siblings, and their parents are not owned by this node.
+pub fn metadataRootAlloc(alloc: std.mem.Allocator, replica_root: []const u8, explicit_metadata_root: ?[]const u8) ![]u8 {
+    if (explicit_metadata_root) |root| {
+        if (root.len == 0) return error.InvalidHASeedSnapshotRoot;
+        return alloc.dupe(u8, root);
+    }
+    if (replica_root.len == 0) return error.InvalidHASeedSnapshotRoot;
+    return std.fs.path.join(alloc, &.{ replica_root, ".restore-owner-metadata" });
+}
 pub const Owner = native.OwnerBootstrap;
 pub const terminal_artifact_name = "restore-terminals.bin";
 pub const max_owners = 65_536;

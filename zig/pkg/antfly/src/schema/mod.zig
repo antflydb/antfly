@@ -117,11 +117,16 @@ pub const CompiledTableValidator = struct {
         try impl.validateDocumentValueWithPlan(alloc, self.schema, value, self.physical_fields, &self.execution);
     }
 
+    pub fn prepareValue(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value) !void {
+        try impl.prepareDocumentValueWithPlan(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution);
+    }
+
     /// The caller must first validate canonical bytes/hash against the runtime
     /// layout. Its binding to this public schema must be verified before any
     /// validated rows are published (archive finish checks staged restores).
     pub fn validateRelationalRestoreFields(self: *const CompiledTableValidator, alloc: std.mem.Allocator, row: anytype) !void {
         std.debug.assert(!self.restore.full_root);
+        if (self.execution.expressions) |expressions| try expressions.verifyRow(alloc, row);
         if (self.execution.checks) |checks| if (try checks.firstViolationRow(alloc, row) != null) return error.RelationalCheckViolation;
         for (self.restore.properties) |index| {
             const property = self.schema.document_schemas[0].properties[index];
@@ -466,6 +471,13 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
                 else => return error.InvalidSchemaUpdateRequest,
             };
             tuple.deinit();
+            if (definition.where.len != 0) {
+                var condition = @import("../storage/db/relational_index_predicate.zig").Plan.init(alloc, index_schema, &layout, definition.where) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidSchemaUpdateRequest,
+                };
+                condition.deinit();
+            }
         }
     }
 
@@ -562,7 +574,7 @@ fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) 
     return false;
 }
 
-fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_schema.RelationalColumnType {
+pub fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_schema.RelationalColumnType {
     if (documentPropertyUsesJsonEncoding(property)) return .json;
     if (property.field_type) |field_type| {
         if (std.mem.eql(u8, field_type, "embedding")) return .dense_vector;

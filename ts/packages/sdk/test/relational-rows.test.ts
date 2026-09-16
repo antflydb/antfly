@@ -4,6 +4,31 @@ import { AntflyClient } from "../src/client.js";
 afterEach(() => vi.restoreAllMocks());
 
 describe("typed relational rows", () => {
+  it("preserves explicit zero epochs and distinguishes omitted query epochs", async () => {
+    const fetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response("", { status: 200 }))
+      .mockResolvedValueOnce(new Response("", { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response('{"status":"committed","inserted":1,"deleted":0}', { status: 200 })
+      );
+    const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+    await client.tables.rows.queryRaw("t", { fields: ["id"] });
+    await client.tables.rows.queryRaw("t", {
+      fields: ["id"],
+      index: "by_id",
+      schema_version: 0,
+    });
+    await client.tables.rows.mutate("t", {
+      schema_version: 0,
+      mutations: [{ key: "a", expected_version: "0", row: { id: 1 } }],
+    });
+    const bodies = fetch.mock.calls.map((call) => JSON.parse(call[1]?.body as string));
+    expect(bodies[0]).not.toHaveProperty("schema_version");
+    expect(bodies[1]).toHaveProperty("schema_version", 0);
+    expect(bodies[2]).toHaveProperty("schema_version", 0);
+  });
+
   it("reports retirement acceptance without implying table deletion", async () => {
     const fetch = vi
       .spyOn(globalThis, "fetch")

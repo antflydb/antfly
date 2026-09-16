@@ -13,7 +13,8 @@
 // limitations.
 
 //! Physical ordered-index records and transactional mutation staging.
-//! Forward: [private namespace][12-byte ID][raw tuple][encoded document][u32 length].
+//! Forward: [private namespace][12-byte ID][raw tuple][encoded document][u32 length]
+//! -> empty for key-only indexes, or a schema-bound covering payload + key-bound CRC.
 //! Reverse: [document prefix][reverse kind][12-byte ID] -> [v1][tuple][CRC32C].
 //! Reverse records participate in document-range ownership. Range transfer must
 //! derive their forward companions and exclude unselected global forward keys.
@@ -58,7 +59,7 @@ const ReverseKey = struct {
     document_component: []const u8,
 };
 
-fn parseReverseKey(key: []const u8) !ReverseKey {
+pub fn parseReverseKey(key: []const u8) !ReverseKey {
     if (!internal.isRelationalIndexReverseKey(key)) return error.InvalidRelationalIndexReverseKey;
     const term = internal.findComponentTerminator(key, 1).?;
     return .{ .id = try Id.decode(key[term + 3 ..]), .document_component = key[1 .. term + 2] };
@@ -144,6 +145,16 @@ pub fn parseForward(key: []const u8, index: plans.BoundIndex) !Forward {
     return owner;
 }
 
+/// Forward payloads are bound to their physical key, preventing a valid row
+/// projection copied onto another tuple/document from passing integrity checks.
+pub fn forwardPayload(key: []const u8, value: []const u8) ![]const u8 {
+    if (value.len == 0) return "";
+    if (value.len < 4) return error.InvalidRelationalIndexForwardValue;
+    const body = value[0 .. value.len - 4];
+    if (std.mem.readInt(u32, value[value.len - 4 ..][0..4], .little) != checksum(key, body)) return error.InvalidRelationalIndexForwardValue;
+    return body;
+}
+
 /// Explicitly distinguish backfill/new rows from already indexed rows. Missing
 /// reverse state for an indexed row is not silently treated as a new insertion.
 pub const Presence = enum { new_or_building, indexed, ready_generation };
@@ -159,6 +170,7 @@ pub const Writer = struct {
     reverse_value: std.ArrayList(u8) = .empty,
     old_forward: std.ArrayList(u8) = .empty,
     new_forward: std.ArrayList(u8) = .empty,
+    forward_value: std.ArrayList(u8) = .empty,
 
     pub fn init(alloc: Allocator) Writer {
         return .{ .alloc = alloc };
@@ -169,6 +181,7 @@ pub const Writer = struct {
         self.reverse_value.deinit(self.alloc);
         self.old_forward.deinit(self.alloc);
         self.new_forward.deinit(self.alloc);
+        self.forward_value.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -182,11 +195,24 @@ pub const Writer = struct {
         try self.new_forward.ensureTotalCapacity(self.alloc, forward_len);
     }
 
+    pub fn reservePayload(self: *Writer, bytes: usize) !void {
+        if (bytes != 0) try self.forward_value.ensureTotalCapacity(self.alloc, try std.math.add(usize, bytes, 4));
+    }
+
     fn reset(self: *Writer) void {
         self.reverse_key.clearRetainingCapacity();
         self.reverse_value.clearRetainingCapacity();
         self.old_forward.clearRetainingCapacity();
         self.new_forward.clearRetainingCapacity();
+        self.forward_value.clearRetainingCapacity();
+    }
+
+    fn encodeForwardValue(self: *Writer, payload: []const u8) !void {
+        if (payload.len == 0) return;
+        try self.forward_value.appendSlice(self.alloc, payload);
+        var crc: [4]u8 = undefined;
+        std.mem.writeInt(u32, &crc, checksum(self.new_forward.items, payload), .little);
+        try self.forward_value.appendSlice(self.alloc, &crc);
     }
 
     pub fn upsert(
@@ -197,7 +223,12 @@ pub const Writer = struct {
         tuple: []const u8,
         presence: Presence,
     ) !Effect {
+        return self.upsertCovered(txn, index, document, tuple, "", presence);
+    }
+
+    pub fn upsertCovered(self: *Writer, txn: anytype, index: plans.BoundIndex, document: []const u8, tuple: []const u8, payload: []const u8, presence: Presence) !Effect {
         self.reset();
+        if ((index.cover != null) != (payload.len != 0)) return error.InvalidRelationalIndexForwardValue;
         if (try index.tuple.prefixLen(tuple) != tuple.len) return error.InvalidRelationalIndexTuple;
         try appendReverseKey(self.alloc, &self.reverse_key, index.id(), document);
         const old = txn.get(self.reverse_key.items) catch |err| switch (err) {
@@ -210,7 +241,7 @@ pub const Writer = struct {
             // The reverse record is authoritative under the atomic pair
             // invariant. Integrity scrubs verify forward existence separately.
             // An unchanged tuple must not create index WAL/LSM churn.
-            if (std.mem.eql(u8, old_tuple, tuple)) return .unchanged;
+            if (std.mem.eql(u8, old_tuple, tuple) and payload.len == 0) return .unchanged;
             try appendForwardFromReverse(self.alloc, &self.old_forward, self.reverse_key.items, value);
         } else if (presence == .indexed) return error.MissingRelationalIndexReverse else if (presence == .ready_generation) {
             // Only a missing reverse entry needs the primary existence probe.
@@ -227,9 +258,22 @@ pub const Writer = struct {
         const owner = try parseReverseKey(self.reverse_key.items);
         try appendForwardEncoded(self.alloc, &self.new_forward, index.id(), tuple, owner.document_component);
         try appendReverseValue(self.alloc, &self.reverse_value, self.reverse_key.items, tuple);
+        try self.encodeForwardValue(payload);
+        // Included values and full-row visibility metadata can change while
+        // comparison keys stay identical. Only rewrite the forward payload;
+        // the document-owned reverse record remains a tuple-only record.
+        if (old != null and std.mem.eql(u8, self.old_forward.items, self.new_forward.items)) {
+            const existing = txn.get(self.new_forward.items) catch |err| switch (err) {
+                error.NotFound => return error.MissingRelationalIndexForward,
+                else => return err,
+            };
+            if (std.mem.eql(u8, existing, self.forward_value.items)) return .unchanged;
+            try txn.put(self.new_forward.items, self.forward_value.items);
+            return .updated;
+        }
         // All scratch allocation and validation precedes the first mutation.
         if (old != null) try deleteIfPresent(txn, self.old_forward.items);
-        try txn.put(self.new_forward.items, "");
+        try txn.put(self.new_forward.items, self.forward_value.items);
         try txn.put(self.reverse_key.items, self.reverse_value.items);
         return if (old != null) .updated else .inserted;
     }
@@ -251,8 +295,66 @@ pub const Writer = struct {
     /// fence. The caller chooses presence from row/generation lifecycle facts.
     pub fn upsertPrepared(self: *Writer, txn: anytype, current: plans.View, batch: *const plans.Batch, row: usize, document: []const u8, presence: Presence) !void {
         if (!batch.isForPlan(current)) return error.PreparedGenerationChanged;
-        for (current.boundIndexes(), 0..) |index, i|
-            _ = try self.upsert(txn, index, document, (try batch.key(row, i)).bytes, presence);
+        for (current.boundIndexes(), 0..) |index, i| {
+            const key = try batch.key(row, i);
+            if (key.member) {
+                _ = try self.upsertCovered(txn, index, document, key.bytes, key.payload, presence);
+            } else _ = try self.delete(txn, index.id(), document, presence);
+        }
+    }
+
+    /// A verified nonmember must own no pair. Corrupt reverse bytes are not
+    /// trusted for routing; the following forward scrub removes their orphans.
+    pub fn removeForRepair(self: *Writer, txn: anytype, index: plans.BoundIndex, document: []const u8) !void {
+        self.reset();
+        try appendReverseKey(self.alloc, &self.reverse_key, index.id(), document);
+        const old = txn.get(self.reverse_key.items) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        appendForwardFromReverse(self.alloc, &self.old_forward, self.reverse_key.items, old) catch |err| switch (err) {
+            error.InvalidRelationalIndexReverseValue, error.RelationalIndexReverseChecksumMismatch => {},
+            else => return err,
+        };
+        if (self.old_forward.items.len != 0) try deleteIfPresent(txn, self.old_forward.items);
+        try txn.delete(self.reverse_key.items);
+    }
+
+    /// A repair caller has already pinned and rechecked the authoritative
+    /// primary row. Do not trust a reverse record as proof of forward presence,
+    /// and never require a corrupt derived record to decode before replacing it.
+    /// The job's forward sweep removes any old tuple whose reverse was damaged.
+    pub fn repair(self: *Writer, txn: anytype, index: plans.BoundIndex, document: []const u8, tuple: []const u8) !usize {
+        return self.repairCovered(txn, index, document, tuple, "");
+    }
+
+    pub fn repairCovered(self: *Writer, txn: anytype, index: plans.BoundIndex, document: []const u8, tuple: []const u8, payload: []const u8) !usize {
+        self.reset();
+        if ((index.cover != null) != (payload.len != 0)) return error.InvalidRelationalIndexForwardValue;
+        if (try index.tuple.prefixLen(tuple) != tuple.len) return error.InvalidRelationalIndexTuple;
+        try appendReverseKey(self.alloc, &self.reverse_key, index.id(), document);
+        const owner = try parseReverseKey(self.reverse_key.items);
+        try appendForwardEncoded(self.alloc, &self.new_forward, index.id(), tuple, owner.document_component);
+        try appendReverseValue(self.alloc, &self.reverse_value, self.reverse_key.items, tuple);
+        try self.encodeForwardValue(payload);
+        var changed: usize = 0;
+        const forward = txn.get(self.new_forward.items) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (forward == null or !std.mem.eql(u8, forward.?, self.forward_value.items)) {
+            try txn.put(self.new_forward.items, self.forward_value.items);
+            changed += 1;
+        }
+        const reverse = txn.get(self.reverse_key.items) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (reverse == null or !std.mem.eql(u8, reverse.?, self.reverse_value.items)) {
+            try txn.put(self.reverse_key.items, self.reverse_value.items);
+            changed += 1;
+        }
+        return changed;
     }
 };
 
@@ -328,8 +430,13 @@ pub const RangeRepair = struct {
                     else => return err,
                 };
                 if (existing) |value| {
-                    if (value.len != 0) return error.InvalidRelationalIndexForwardValue;
-                } else try writes.append(alloc, .{ .key = forward.items, .value = "" });
+                    _ = try forwardPayload(forward.items, value);
+                } else {
+                    // Ownership publication invalidates the ready proof. A
+                    // missing covering payload is rebuilt from primary rows by
+                    // bounded maintenance before the new range becomes ready.
+                    try writes.append(alloc, .{ .key = forward.items, .value = "" });
+                }
                 bytes +|= kv.value.len;
             }
             if (scanned >= 256 or bytes >= 1024 * 1024) {
@@ -416,11 +523,24 @@ pub const Staged = struct {
     }
 
     pub fn upsertPreparedWithReadiness(self: *Staged, writer: *Writer, current: plans.View, batch: *const plans.Batch, row: usize, document: []const u8, ready: []const bool) !void {
+        return self.upsertPreparedWithMembership(writer, current, batch, row, document, ready, &.{});
+    }
+
+    pub fn upsertPreparedWithMembership(self: *Staged, writer: *Writer, current: plans.View, batch: *const plans.Batch, row: usize, document: []const u8, ready: []const bool, prior_members: []const bool) !void {
         try self.requireOpen();
         errdefer self.state = .failed;
         if (!batch.isForPlan(current) or ready.len != current.boundIndexes().len) return error.PreparedGenerationChanged;
-        for (current.boundIndexes(), ready, 0..) |index, is_ready, i|
-            _ = try writer.upsert(self, index, document, (try batch.key(row, i)).bytes, if (is_ready) .ready_generation else .new_or_building);
+        if (prior_members.len != 0 and prior_members.len != ready.len) return error.InvalidRelationalIndexPosition;
+        for (current.boundIndexes(), ready, 0..) |index, is_ready, i| {
+            const key = try batch.key(row, i);
+            const presence: Presence = if (index.predicate != null) blk: {
+                if (prior_members.len == 0) return error.MissingRelationalIndexMembership;
+                break :blk if (is_ready and prior_members[i]) .indexed else .new_or_building;
+            } else if (is_ready) .ready_generation else .new_or_building;
+            if (key.member) {
+                _ = try writer.upsertCovered(self, index, document, key.bytes, key.payload, presence);
+            } else _ = try writer.delete(self, index.id(), document, presence);
+        }
     }
 
     pub fn deleteIndex(self: *Staged, writer: *Writer, id: Id, document: []const u8, presence: Presence) !Effect {
@@ -860,6 +980,34 @@ fn testStagedMutations(comptime Backend: type) !void {
     try failed.upsertPrepared(&writer, plan, &batch, 0, document, .indexed);
     try std.testing.expectError(error.MissingRelationalIndexReverse, failed.deleteIndex(&writer, .{ .generation = 100, .slot = 0 }, document, .indexed));
     try std.testing.expectError(error.RelationalIndexStageClosed, failed.seal());
+}
+
+test "relational index records primary repair writes only damaged companions" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+    var store = try docstore.DocStore.openRuntime(alloc, &runtime);
+    defer store.close();
+    var plan = try testPlan(alloc);
+    defer plan.release();
+    var row = try testRow(alloc, plan, "doc", "{\"id\":7,\"tenant\":1,\"label\":\"Alpha\"}");
+    defer row.deinit(alloc);
+    var batch = plans.Batch.init(alloc, plan);
+    defer batch.deinit();
+    _ = try batch.appendPrepared(&row);
+    const tuple = try batch.key(0, 0);
+    var writer = Writer.init(alloc);
+    defer writer.deinit();
+    var txn = try store.beginWriteTxn();
+    defer txn.abort();
+    try std.testing.expectEqual(@as(usize, 2), try writer.repair(&txn, plan.boundIndexes()[0], "doc", tuple.bytes));
+    try std.testing.expectEqual(@as(usize, 0), try writer.repair(&txn, plan.boundIndexes()[0], "doc", tuple.bytes));
+    try txn.delete(writer.new_forward.items);
+    try txn.put(writer.reverse_key.items, "damaged");
+    try std.testing.expectEqual(@as(usize, 2), try writer.repair(&txn, plan.boundIndexes()[0], "doc", tuple.bytes));
+    try std.testing.expectEqual(@as(usize, 0), try writer.repair(&txn, plan.boundIndexes()[0], "doc", tuple.bytes));
 }
 
 test "relational index records stage coalesced effects for one primary and outbox batch" {

@@ -87,7 +87,7 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: RelationalConstraintRetryRequest,
 ) -> Response[Any | Error | RelationalConstraintRetryResponse]:
-    """Restart failed UNIQUE/FK validation after administrative repair
+    """Restart failed UNIQUE/FK/CHECK validation after administrative repair
 
      Requires table administrator permission. Resets each failed owner using
     an exact checkpoint precondition. Owners already validating or enforced
@@ -127,7 +127,7 @@ def sync(
     client: AuthenticatedClient,
     body: RelationalConstraintRetryRequest,
 ) -> Any | Error | RelationalConstraintRetryResponse | None:
-    """Restart failed UNIQUE/FK validation after administrative repair
+    """Restart failed UNIQUE/FK/CHECK validation after administrative repair
 
      Requires table administrator permission. Resets each failed owner using
     an exact checkpoint precondition. Owners already validating or enforced
@@ -162,7 +162,7 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: RelationalConstraintRetryRequest,
 ) -> Response[Any | Error | RelationalConstraintRetryResponse]:
-    """Restart failed UNIQUE/FK validation after administrative repair
+    """Restart failed UNIQUE/FK/CHECK validation after administrative repair
 
      Requires table administrator permission. Resets each failed owner using
     an exact checkpoint precondition. Owners already validating or enforced
@@ -200,7 +200,7 @@ async def asyncio(
     client: AuthenticatedClient,
     body: RelationalConstraintRetryRequest,
 ) -> Any | Error | RelationalConstraintRetryResponse | None:
-    """Restart failed UNIQUE/FK validation after administrative repair
+    """Restart failed UNIQUE/FK/CHECK validation after administrative repair
 
      Requires table administrator permission. Resets each failed owner using
     an exact checkpoint precondition. Owners already validating or enforced

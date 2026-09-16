@@ -12,6 +12,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.dynamic_template import DynamicTemplate
     from ..models.relational_check_constraint import RelationalCheckConstraint
+    from ..models.relational_column_expression import RelationalColumnExpression
     from ..models.relational_foreign_key_constraint import RelationalForeignKeyConstraint
     from ..models.relational_index_definition import RelationalIndexDefinition
     from ..models.relational_unique_constraint import RelationalUniqueConstraint
@@ -35,6 +36,28 @@ class TableSchema:
             enforce_types; explicitly setting enforce_types to false is invalid.
             Existing JSON document write and read APIs remain available. This
             setting alone does not declare primary keys or unique constraints.
+        column_defaults (list[RelationalColumnExpression] | Unset): Immutable typed expressions applied only to absent
+            columns on new
+            writes, never explicit null. Defaults cannot reference columns.
+            A column cannot have both a default and a generated expression.
+            Omission or [] declares none. Relational tables only.
+        generated_columns (list[RelationalColumnExpression] | Unset): Stored immutable generated columns, evaluated in
+            dependency order
+            on writes before validation and indexing. Cycles are rejected.
+            Generated columns are output-only; submitted values are replaced
+            by the computed value. Omission or [] declares none. Defaults
+            and generated declarations together are limited to 256 columns,
+            4096 expression nodes, and 4 MiB of literal data. Evaluation has
+            a shared 4 MiB allocation budget across all column expressions.
+            Restore verifies stored results instead of silently recomputing
+            them. Changing, adding, or removing generated semantics through
+            an existing table's schema update requires explicit rewrite=true
+            on the PUT or PATCH schema route. This returns a durable restore
+            job and replaces the complete authorized dependency cohort only
+            after distributed transformation and validation. Ordinary schema
+            updates reject these changes, even when a table appears empty.
+            Declaration reordering and default-only changes remain allowed.
+            Relational tables only.
         checks (list[RelationalCheckConstraint] | Unset): Named scalar CHECK constraints for a relational schema. This
             is
             part of the complete schema: omission or [] declares no checks.
@@ -66,6 +89,8 @@ class TableSchema:
 
     version: int | Unset = UNSET
     storage_mode: TableStorageMode | Unset = UNSET
+    column_defaults: list[RelationalColumnExpression] | Unset = UNSET
+    generated_columns: list[RelationalColumnExpression] | Unset = UNSET
     checks: list[RelationalCheckConstraint] | Unset = UNSET
     unique_constraints: list[RelationalUniqueConstraint] | Unset = UNSET
     foreign_keys: list[RelationalForeignKeyConstraint] | Unset = UNSET
@@ -87,6 +112,20 @@ class TableSchema:
         storage_mode: str | Unset = UNSET
         if not isinstance(self.storage_mode, Unset):
             storage_mode = self.storage_mode.value
+
+        column_defaults: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.column_defaults, Unset):
+            column_defaults = []
+            for column_defaults_item_data in self.column_defaults:
+                column_defaults_item = column_defaults_item_data.to_dict()
+                column_defaults.append(column_defaults_item)
+
+        generated_columns: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.generated_columns, Unset):
+            generated_columns = []
+            for generated_columns_item_data in self.generated_columns:
+                generated_columns_item = generated_columns_item_data.to_dict()
+                generated_columns.append(generated_columns_item)
 
         checks: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.checks, Unset):
@@ -150,6 +189,10 @@ class TableSchema:
             field_dict["version"] = version
         if storage_mode is not UNSET:
             field_dict["storage_mode"] = storage_mode
+        if column_defaults is not UNSET:
+            field_dict["column_defaults"] = column_defaults
+        if generated_columns is not UNSET:
+            field_dict["generated_columns"] = generated_columns
         if checks is not UNSET:
             field_dict["checks"] = checks
         if unique_constraints is not UNSET:
@@ -179,6 +222,7 @@ class TableSchema:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.dynamic_template import DynamicTemplate
         from ..models.relational_check_constraint import RelationalCheckConstraint
+        from ..models.relational_column_expression import RelationalColumnExpression
         from ..models.relational_foreign_key_constraint import RelationalForeignKeyConstraint
         from ..models.relational_index_definition import RelationalIndexDefinition
         from ..models.relational_unique_constraint import RelationalUniqueConstraint
@@ -194,6 +238,24 @@ class TableSchema:
             storage_mode = UNSET
         else:
             storage_mode = TableStorageMode(_storage_mode)
+
+        _column_defaults = d.pop("column_defaults", UNSET)
+        column_defaults: list[RelationalColumnExpression] | Unset = UNSET
+        if _column_defaults is not UNSET:
+            column_defaults = []
+            for column_defaults_item_data in _column_defaults:
+                column_defaults_item = RelationalColumnExpression.from_dict(column_defaults_item_data)
+
+                column_defaults.append(column_defaults_item)
+
+        _generated_columns = d.pop("generated_columns", UNSET)
+        generated_columns: list[RelationalColumnExpression] | Unset = UNSET
+        if _generated_columns is not UNSET:
+            generated_columns = []
+            for generated_columns_item_data in _generated_columns:
+                generated_columns_item = RelationalColumnExpression.from_dict(generated_columns_item_data)
+
+                generated_columns.append(generated_columns_item)
 
         _checks = d.pop("checks", UNSET)
         checks: list[RelationalCheckConstraint] | Unset = UNSET
@@ -275,6 +337,8 @@ class TableSchema:
         table_schema = cls(
             version=version,
             storage_mode=storage_mode,
+            column_defaults=column_defaults,
+            generated_columns=generated_columns,
             checks=checks,
             unique_constraints=unique_constraints,
             foreign_keys=foreign_keys,

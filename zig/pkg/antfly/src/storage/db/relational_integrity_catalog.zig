@@ -44,6 +44,9 @@ pub const Catalog = struct {
     incarnation: integrity.Generation,
     schema_version: u32,
     schema_digest: integrity.Digest,
+    /// CHECKs have no routed claims/references or retirement records. Their
+    /// logical identity still participates in the shared activation fence.
+    checks_digest: integrity.Digest = @splat(0),
     next_generation: u64,
     bindings: []const Binding,
     pub fn deinit(self: *Catalog) void {
@@ -93,11 +96,11 @@ fn generation(incarnation: integrity.Generation, allocation: u64) integrity.Gene
     return result[0..16].*;
 }
 
-const header_len = 68;
+const header_len = 100;
 const entry_header_len = 64;
 
 pub fn decode(alloc: Allocator, bytes: []const u8) !Catalog {
-    if (bytes.len < header_len + 32 or bytes.len > max_catalog_bytes or !std.mem.eql(u8, bytes[0..4], "AIC1") or
+    if (bytes.len < header_len + 32 or bytes.len > max_catalog_bytes or !std.mem.eql(u8, bytes[0..4], "AIC2") or
         !std.mem.eql(u8, bytes[bytes.len - 32 ..], &digest(bytes[0 .. bytes.len - 32]))) return error.InvalidIntegrityCatalog;
     const count = std.mem.readInt(u32, bytes[64..68], .little);
     const next_generation = std.mem.readInt(u64, bytes[56..64], .little);
@@ -134,7 +137,7 @@ pub fn decode(alloc: Allocator, bytes: []const u8) !Catalog {
         offset += name_len + payload_len;
     }
     if (offset != end) return error.InvalidIntegrityCatalog;
-    return .{ .arena = arena, .incarnation = incarnation, .schema_version = std.mem.readInt(u32, bytes[20..24], .little), .schema_digest = bytes[24..56].*, .next_generation = next_generation, .bindings = bindings };
+    return .{ .arena = arena, .incarnation = incarnation, .schema_version = std.mem.readInt(u32, bytes[20..24], .little), .schema_digest = bytes[24..56].*, .checks_digest = bytes[68..100].*, .next_generation = next_generation, .bindings = bindings };
 }
 
 fn lessThan(_: void, left: Binding, right: Binding) bool {
@@ -153,12 +156,13 @@ fn encode(alloc: Allocator, catalog: Catalog) ![]u8 {
     for (catalog.bindings) |binding| length = std.math.add(usize, length, entry_header_len + binding.definition.name.len + binding.definition.payload.len) catch return error.IntegrityCatalogTooLarge;
     if (length > max_catalog_bytes) return error.IntegrityCatalogTooLarge;
     const bytes = try alloc.alloc(u8, length);
-    @memcpy(bytes[0..4], "AIC1");
+    @memcpy(bytes[0..4], "AIC2");
     @memcpy(bytes[4..20], &catalog.incarnation);
     std.mem.writeInt(u32, bytes[20..24], catalog.schema_version, .little);
     @memcpy(bytes[24..56], &catalog.schema_digest);
     std.mem.writeInt(u64, bytes[56..64], catalog.next_generation, .little);
     std.mem.writeInt(u32, bytes[64..68], @intCast(catalog.bindings.len), .little);
+    @memcpy(bytes[68..100], &catalog.checks_digest);
     var offset: usize = header_len;
     for (catalog.bindings) |binding| {
         bytes[offset] = @intFromEnum(binding.definition.kind);
@@ -200,6 +204,10 @@ pub const Update = struct {
 };
 
 pub fn prepare(alloc: Allocator, previous: ?[]const u8, incarnation: integrity.Generation, schema_version: u32, schema_digest: integrity.Digest, definitions: []const Definition) !Update {
+    return prepareWithChecks(alloc, previous, incarnation, schema_version, schema_digest, definitions, @splat(0));
+}
+
+pub fn prepareWithChecks(alloc: Allocator, previous: ?[]const u8, incarnation: integrity.Generation, schema_version: u32, schema_digest: integrity.Digest, definitions: []const Definition, checks_digest: integrity.Digest) !Update {
     if (definitions.len > max_definitions or std.mem.allEqual(u8, &incarnation, 0)) return error.InvalidIntegrityCatalog;
     var prior: ?Catalog = if (previous) |bytes| try decode(alloc, bytes) else null;
     defer if (prior) |*catalog| catalog.deinit();
@@ -232,7 +240,7 @@ pub fn prepare(alloc: Allocator, previous: ?[]const u8, incarnation: integrity.G
     };
     std.mem.sort(Binding, bindings.items, {}, lessThan);
     const binding_items = try bindings.toOwnedSlice(owned);
-    var catalog: Catalog = .{ .arena = undefined, .incarnation = incarnation, .schema_version = schema_version, .schema_digest = schema_digest, .next_generation = next, .bindings = binding_items };
+    var catalog: Catalog = .{ .arena = undefined, .incarnation = incarnation, .schema_version = schema_version, .schema_digest = schema_digest, .checks_digest = checks_digest, .next_generation = next, .bindings = binding_items };
     const value = try encode(owned, catalog);
     const expected = if (previous) |bytes| try owned.dupe(u8, bytes) else null;
     catalog.arena = arena;

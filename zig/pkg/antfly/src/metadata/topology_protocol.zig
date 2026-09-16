@@ -27,9 +27,18 @@ const std = @import("std");
 /// Version 7 adds relational integrity topology capability/floor and the
 /// immutable active/read schema contract on distributed split/merge records,
 /// shared backup/restore lifecycle commands, and retirement table extensions.
-pub const current_version: u16 = 7;
-pub const relational_integrity_topology_version: u16 = 7;
-pub const coordinated_lifecycle_version: u16 = 7;
+/// Version 8 binds integrity-bearing immutable sources and staged rewrite
+/// intents/final cuts. Every metadata voter/learner must decode these before
+/// admission, independently of data-owner Raft protocol 11.
+/// Version 9 carries explicit Scope-v2 source authority in online transitions
+/// and rewrite plans. Registration, admission, and final append share this
+/// capability; a v8 metadata follower cannot interpret the new cut identity.
+pub const current_version: u16 = 9;
+// Registration/topology admission and the final append must acquire the same
+// decoder proof. A v8 preflight cannot satisfy the v9 coordinated append gate.
+pub const relational_integrity_topology_version: u16 = coordinated_lifecycle_version;
+pub const coordinated_lifecycle_version: u16 = source_scope_version;
+pub const source_scope_version: u16 = 9;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;
 /// Minimum decoder capability required by the atomic create/drop wire format.

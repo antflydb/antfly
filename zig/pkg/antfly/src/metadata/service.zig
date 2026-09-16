@@ -1778,6 +1778,332 @@ pub const MetadataServiceConfig = struct {
     reallocation_protocol_peers: []const ReallocationProtocolPeer = &.{},
 };
 
+/// Native point projections keep online recovery independent of resident
+/// transition queues and avoid reloading every table/job on each page.
+pub fn currentOnlineMerge(service: anytype, expected: @import("online_merge.zig").State) !@import("online_merge.zig").Driver.Current {
+    var arena = std.heap.ArenaAllocator.init(service.alloc);
+    defer arena.deinit();
+    const request: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s };
+    try service.ensureLinearizableReadWithContext(request);
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    const record = (try store.getMergeTransition(arena.allocator(), service.metadata_group_id, expected.scope.fence.transition_id)) orelse return error.OnlineMergeRevisionChanged;
+    const current = record.online orelse return error.OnlineMergeRevisionChanged;
+    try current.validateRecord(record);
+    if (!std.meta.eql(current.scope, expected.scope)) return error.OnlineMergeRevisionChanged;
+    return .{ .state = current, .cancel = record.rollback_reason != null };
+}
+
+pub fn onlineMergeContext(service: anytype, alloc: std.mem.Allocator, expected: @import("online_merge.zig").State, request: api_operation.RequestContext) !@import("online_merge_driver.zig").Context {
+    try request.ensureActive();
+    if (service.internal_service_secret == null) return error.OnlineMergeUnavailable;
+    try service.ensureLinearizableReadWithContext(request);
+    if (!try service.ensureReconcileLease()) return error.NotLeader;
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    const lease = (try service.getProjectedReconcileLease()) orelse return error.NotLeader;
+    if (lease.owner_node_id != service.reconcile_lease.local_node_id or lease.expires_at_ms <= service.reconcile_lease.nowMs()) return error.NotLeader;
+    const record = (try store.getMergeTransition(alloc, service.metadata_group_id, expected.scope.fence.transition_id)) orelse return error.OnlineMergeRevisionChanged;
+    const current = record.online orelse return error.OnlineMergeRevisionChanged;
+    try current.validateRecord(record);
+    if (!current.eql(expected)) return error.OnlineMergeRevisionChanged;
+    const donor = try store.getRange(alloc, service.metadata_group_id, expected.scope.fence.owner_group_id);
+    const receiver = (try store.getRange(alloc, service.metadata_group_id, expected.scope.fence.peer_group_id)) orelse return error.OnlineMergeReceiptMismatch;
+    if (receiver.table_id != expected.scope.receiver_namespace.table_id or
+        metadata_table_manager.rangeDocIdentityShardId(receiver) != expected.scope.receiver_namespace.shard_id or metadata_table_manager.rangeDocIdentityRangeId(receiver) != expected.scope.receiver_namespace.range_id) return error.OnlineMergeReceiptMismatch;
+    if (donor) |range| {
+        if (range.table_id != expected.scope.fence.namespace.table_id or metadata_table_manager.rangeDocIdentityShardId(range) != expected.scope.fence.namespace.shard_id or metadata_table_manager.rangeDocIdentityRangeId(range) != expected.scope.fence.namespace.range_id) return error.OnlineMergeReceiptMismatch;
+    } else if (expected.phase != .release and expected.phase != .complete) return error.OnlineMergeReceiptMismatch;
+    return .{ .record = record, .donor = donor, .receiver = receiver, .lease = lease };
+}
+
+pub const OnlineMergeRoutes = struct {
+    donor_uri: []const u8,
+    receiver_uri: []const u8,
+    donor_replica_uris: []const []const u8,
+
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.donor_uri);
+        alloc.free(self.receiver_uri);
+        for (self.donor_replica_uris) |uri| alloc.free(uri);
+        alloc.free(self.donor_replica_uris);
+    }
+};
+
+/// Capture both routes and artifact-recovery peers from one non-observational
+/// projection. The transition driver holds its own mutex: administrative
+/// snapshots would recursively invoke transition observation under that mutex.
+pub fn onlineMergeRoutes(service: anytype, alloc: std.mem.Allocator, donor: u64, receiver: u64, request: api_operation.RequestContext) !OnlineMergeRoutes {
+    try request.ensureActive();
+    service.lockRuntime();
+    defer service.unlockRuntime();
+    try request.ensureActive();
+    if (comptime @hasDecl(@TypeOf(service.*), "projectedCoreSnapshotLocked")) {
+        const core = try service.projectedCoreSnapshotLocked();
+        return selectOnlineMergeRoutes(alloc, core.stores, core.placement_intents, donor, receiver);
+    } else {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const store = service.projectedStore() orelse return error.MissingMetadataStore;
+        const stores = try store.listStores(scratch.allocator(), service.metadata_group_id);
+        const placements = try store.listPlacementIntents(scratch.allocator(), service.metadata_group_id);
+        return selectOnlineMergeRoutes(alloc, stores, placements, donor, receiver);
+    }
+}
+
+fn onlineRoutePlacement(placements: []const raft_reconciler.PlacementIntent, store: metadata_table_manager.StoreRecord, group: u64) ?raft_reconciler.PlacementIntent {
+    var found: ?raft_reconciler.PlacementIntent = null;
+    for (placements) |intent| {
+        if (intent.record.group_id != group or intent.record.local_node_id != store.node_id) continue;
+        if (found != null) return null;
+        found = intent;
+    }
+    const intent = found orelse return null;
+    if ((intent.store_id != 0 and intent.store_id != store.store_id) or !raft_reconciler.placementReadableWithPeers(placements, intent)) return null;
+    return intent;
+}
+
+fn onlineRouteStoreUsable(store: metadata_table_manager.StoreRecord) bool {
+    return store.live and std.mem.eql(u8, store.health_class, "healthy") and store.api_url.len != 0;
+}
+
+fn onlineRouteLeader(stores: []const metadata_table_manager.StoreRecord, placements: []const raft_reconciler.PlacementIntent, group: u64) ![]const u8 {
+    var evidence: metadata_table_manager.GroupLeaderEvidence = .{};
+    for (stores) |store| {
+        if (!onlineRouteStoreUsable(store)) continue;
+        const placement = onlineRoutePlacement(placements, store, group) orelse continue;
+        for (store.group_statuses) |report| {
+            if (report.group_id == group and report.relocation_generation == placement.relocation_generation) evidence.observe(store.store_id, report);
+        }
+    }
+    const leader = evidence.resolve() orelse return error.GroupLeaderUnavailable;
+    for (stores) |store| if (store.store_id == leader.store_id) return store.api_url;
+    return error.GroupLeaderUnavailable;
+}
+
+fn selectOnlineMergeRoutes(alloc: std.mem.Allocator, stores: []const metadata_table_manager.StoreRecord, placements: []const raft_reconciler.PlacementIntent, donor: u64, receiver: u64) !OnlineMergeRoutes {
+    const donor_uri = try alloc.dupe(u8, try onlineRouteLeader(stores, placements, donor));
+    errdefer alloc.free(donor_uri);
+    const receiver_uri = try alloc.dupe(u8, try onlineRouteLeader(stores, placements, receiver));
+    errdefer alloc.free(receiver_uri);
+    var replicas: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (replicas.items) |uri| alloc.free(uri);
+        replicas.deinit(alloc);
+    }
+    for (stores) |store| {
+        if (!onlineRouteStoreUsable(store) or onlineRoutePlacement(placements, store, donor) == null) continue;
+        const uri = try alloc.dupe(u8, store.api_url);
+        errdefer alloc.free(uri);
+        try replicas.append(alloc, uri);
+    }
+    return .{ .donor_uri = donor_uri, .receiver_uri = receiver_uri, .donor_replica_uris = try replicas.toOwnedSlice(alloc) };
+}
+
+test "metadata transition driver online routes capture one projection without administrative recursion" {
+    const Fake = struct {
+        core: ProjectedCoreSnapshot,
+        locked: bool = false,
+        captures: usize = 0,
+        admin_calls: usize = 0,
+        fn lockRuntime(self: *@This()) void {
+            std.debug.assert(!self.locked);
+            self.locked = true;
+        }
+        fn unlockRuntime(self: *@This()) void {
+            std.debug.assert(self.locked);
+            self.locked = false;
+        }
+        fn projectedCoreSnapshotLocked(self: *@This()) !*const ProjectedCoreSnapshot {
+            std.debug.assert(self.locked);
+            self.captures += 1;
+            return &self.core;
+        }
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            self.admin_calls += 1;
+            return error.UnexpectedAdministrativeRouting;
+        }
+    };
+    var donor_old = [_]metadata_table_manager.GroupStatusReport{.{ .group_id = 77, .relocation_generation = 9, .raft_term = 5, .raft_membership_index = 10, .local_leader = true }};
+    var donor_current = [_]metadata_table_manager.GroupStatusReport{.{ .group_id = 77, .relocation_generation = 4, .raft_term = 6, .raft_membership_index = 11, .local_leader = true }};
+    var receiver = [_]metadata_table_manager.GroupStatusReport{.{ .group_id = 88, .relocation_generation = 2, .raft_term = 3, .local_leader = true }};
+    var stores = [_]metadata_table_manager.StoreRecord{
+        .{ .store_id = 11, .node_id = 1, .api_url = "http://old", .group_statuses = &donor_old },
+        .{ .store_id = 22, .node_id = 2, .api_url = "http://current", .group_statuses = &donor_current },
+        .{ .store_id = 33, .node_id = 3, .api_url = "http://receiver", .group_statuses = &receiver },
+    };
+    var placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 }, .store_id = 11, .relocation_generation = 9, .serving_state = .serving },
+        .{ .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 }, .store_id = 22, .relocation_generation = 4, .serving_state = .serving },
+        .{ .record = .{ .group_id = 88, .replica_id = 3, .local_node_id = 3 }, .store_id = 33, .relocation_generation = 2, .serving_state = .serving },
+    };
+    // No range/catalog rows are needed: retiring donor placements remain
+    // routable after metadata cutover removes its public range.
+    var fake: Fake = .{ .core = .{ .stores = &stores, .placement_intents = &placements } };
+    {
+        const routes = try onlineMergeRoutes(&fake, std.testing.allocator, 77, 88, .{});
+        defer routes.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("http://current", routes.donor_uri);
+        try std.testing.expectEqualStrings("http://receiver", routes.receiver_uri);
+        try std.testing.expectEqual(@as(usize, 2), routes.donor_replica_uris.len);
+        try std.testing.expectEqual(@as(usize, 1), fake.captures);
+        try std.testing.expectEqual(@as(usize, 0), fake.admin_calls);
+        try std.testing.expect(!fake.locked);
+    }
+    donor_current[0].relocation_generation = 3;
+    {
+        const routes = try onlineMergeRoutes(&fake, std.testing.allocator, 77, 88, .{});
+        defer routes.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("http://old", routes.donor_uri);
+    }
+    donor_current[0].relocation_generation = 4;
+    donor_current[0].local_leader = false;
+    try std.testing.expectError(error.GroupLeaderUnavailable, onlineMergeRoutes(&fake, std.testing.allocator, 77, 88, .{}));
+    donor_current[0].local_leader = true;
+    placements[2].serving_state = .retiring;
+    try std.testing.expectError(error.GroupLeaderUnavailable, onlineMergeRoutes(&fake, std.testing.allocator, 77, 88, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.admin_calls);
+    try std.testing.expect(!fake.locked);
+}
+
+pub fn onlineMergeAdmissionContext(service: anytype, alloc: std.mem.Allocator, expected: transition_state.MergeTransitionRecord, request: api_operation.RequestContext) !@import("online_merge_driver.zig").Context {
+    try request.ensureActive();
+    try service.ensureLinearizableReadWithContext(request);
+    if (!try service.ensureReconcileLease()) return error.NotLeader;
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    const lease = (try service.getProjectedReconcileLease()) orelse return error.NotLeader;
+    if (lease.owner_node_id != service.reconcile_lease.local_node_id or lease.expires_at_ms <= service.reconcile_lease.nowMs()) return error.NotLeader;
+    const record = (try store.getMergeTransition(alloc, service.metadata_group_id, expected.transition_id)) orelse return error.OnlineMergeRevisionChanged;
+    if (record.online == null and !std.mem.eql(u8, &try metadata_storage.raft_apply_store.onlineMergeAdmissionDigest(alloc, record), &try metadata_storage.raft_apply_store.onlineMergeAdmissionDigest(alloc, expected))) return error.OnlineMergeRevisionChanged;
+    const donor = try store.getRange(alloc, service.metadata_group_id, record.donor_group_id);
+    const receiver = (try store.getRange(alloc, service.metadata_group_id, record.receiver_group_id)) orelse return error.OnlineMergeReceiptMismatch;
+    return .{ .record = record, .donor = donor, .receiver = receiver, .lease = lease };
+}
+
+pub fn admitOnlineMerge(service: anytype, context: @import("online_merge_driver.zig").Context, next: @import("online_merge.zig").State, request: api_operation.RequestContext) !void {
+    try request.ensureActive();
+    var arena = std.heap.ArenaAllocator.init(service.alloc);
+    defer arena.deinit();
+    const proposal = try service.proposeTransitionCommandWithReceipt(.{ .admit_online_merge = .{
+        .expected_record_digest = try metadata_storage.raft_apply_store.onlineMergeAdmissionDigest(arena.allocator(), context.record),
+        .next = next,
+        .lease = context.lease,
+    } });
+    try service.waitForTransitionAppliedWithContext(proposal, request);
+    const actual = try currentOnlineMerge(service, next);
+    if (!actual.state.eql(next) or actual.cancel) return error.OnlineMergeRevisionChanged;
+}
+
+pub fn compareAndSetOnlineMerge(service: anytype, previous: @import("online_merge.zig").State, next: @import("online_merge.zig").State, expected_cancel: bool, cutover_bounds: ?metadata_storage.raft_apply_store.OnlineMergeCutoverBounds) !bool {
+    if (!@import("online_merge.zig").updateAllowed(previous, next)) return error.InvalidOnlineMergeState;
+    const durable = try currentOnlineMerge(service, previous);
+    if (durable.state.eql(next)) return true;
+    if (!durable.state.eql(previous) or durable.cancel != expected_cancel) return false;
+    var arena = std.heap.ArenaAllocator.init(service.alloc);
+    defer arena.deinit();
+    const request: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s };
+    const context = try onlineMergeContext(service, arena.allocator(), previous, request);
+    const proposal = try service.proposeTransitionCommandWithReceipt(.{ .compare_and_set_online_merge = .{
+        .expected = previous,
+        .next = next,
+        .expected_cancel = expected_cancel,
+        .lease = context.lease,
+        .publish_cutover = previous.phase == .cutover and next.phase == .release,
+        .cutover_bounds = cutover_bounds,
+    } });
+    try service.waitForTransitionAppliedWithContext(proposal, request);
+    return (try currentOnlineMerge(service, previous)).state.eql(next);
+}
+
+/// Called after the service has its final address and shared HTTP executor.
+/// The default capability set is false; installing an incomplete bundle fails
+/// closed and ordinary merges continue through their existing driver.
+pub fn installOnlineMergeDriver(service: anytype, executor: @import("../common/http/http_common.zig").RequestExecutor, capabilities: @import("online_merge.zig").Capabilities) !void {
+    return installOnlineMergeDriverWithAdmission(service, executor, capabilities, true);
+}
+
+/// Disabling new online work must not abandon durable in-flight transitions or
+/// their source fences. Recovery retains the same complete driver; only the
+/// optional ordinary-to-online admission callback is removed.
+pub fn installOnlineMergeDriverWithAdmission(service: anytype, executor: @import("../common/http/http_common.zig").RequestExecutor, capabilities: @import("online_merge.zig").Capabilities, allow_new_admissions: bool) !void {
+    var runtime = try @import("online_merge_driver.zig").create(service, executor, capabilities);
+    errdefer runtime.deinit();
+    if (!allow_new_admissions) runtime.driver.admit = null;
+    service.transition_mutex.lockUncancelable(std.Options.debug_io);
+    defer service.transition_mutex.unlock(std.Options.debug_io);
+    if (service.online_merge_runtime) |*old| old.deinit();
+    service.online_merge_runtime = runtime;
+    // A fresh metadata process has not yet observed any data runtimes, so its
+    // transition service is intentionally absent. Retain the owned adapter;
+    // stepTransitions attaches it whenever that service is created/replaced.
+    if (service.raft.transition_svc) |*transitions| transitions.online_driver = runtime.driver;
+}
+
+test "metadata transition driver online installs before registration and reattaches replacement" {
+    const http = @import("../common/http/http_common.zig");
+    const shard = @import("../raft/shard_ops.zig");
+    const Stub = struct {
+        fn build(_: *anyopaque, _: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            return error.UnexpectedReplicaConstruction;
+        }
+        fn free(_: *anyopaque, _: std.mem.Allocator, _: *raft_engine.runtime.ReplicaDescriptor) void {}
+        fn request(_: *anyopaque, _: std.mem.Allocator, _: http.HttpRequest) !http.HttpResponse {
+            return error.UnexpectedNetworkRequest;
+        }
+        const operations: shard.ShardOperationAdapter.VTable = blk: {
+            var value: shard.ShardOperationAdapter.VTable = undefined;
+            for (std.meta.fields(@TypeOf(value))) |field| {
+                if (@typeInfo(field.type) == .optional) {
+                    @field(value, field.name) = null;
+                    continue;
+                }
+                @field(value, field.name) = struct {
+                    fn call(_: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field.type).pointer.child).@"fn".params[2].type.?) @typeInfo(@typeInfo(field.type).pointer.child).@"fn".return_type.? {
+                        return error.UnexpectedTransitionEffect;
+                    }
+                }.call;
+            }
+            break :blk value;
+        };
+    };
+    const alloc = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-install", .{temp.sub_path});
+    defer alloc.free(root);
+    const catalog = try std.fmt.allocPrint(alloc, "{s}/catalog", .{root});
+    defer alloc.free(catalog);
+    var token: u8 = 0;
+    var svc = try MetadataService.init(alloc, .{ .host = .{ .local_node_id = 1, .metadata_group_id = 4096, .replica_root_dir = root, .replica_catalog_path = catalog } }, .{ .host = .{ .host = .{ .descriptor_factory = .{ .ptr = &token, .vtable = &.{ .build_descriptor = Stub.build, .free_descriptor = Stub.free } } } } }, .{ .internal_service_secret = "online-install-test-secret" });
+    defer svc.deinit();
+    svc.raft.disableTransitionOps();
+    var capabilities: @import("online_merge.zig").Capabilities = .{};
+    inline for (std.meta.fields(@TypeOf(capabilities))) |field| @field(capabilities, field.name) = true;
+    try installOnlineMergeDriver(&svc, .{ .ptr = &token, .vtable = &.{ .execute = Stub.request } }, capabilities);
+    try std.testing.expect(svc.raft.transition_svc == null);
+    const driver_ptr = svc.online_merge_runtime.?.driver.ptr;
+    for (0..2) |_| {
+        var registration = try svc.raft.replaceTransitionOps(.{ .ptr = &token, .vtable = &Stub.operations });
+        defer registration.deinit();
+        try std.testing.expect(svc.raft.transition_svc.?.online_driver == null);
+        try svc.stepTransitions();
+        try std.testing.expect(svc.raft.transition_svc.?.online_driver.?.ptr == driver_ptr);
+    }
+    try installOnlineMergeDriverWithAdmission(&svc, .{ .ptr = &token, .vtable = &.{ .execute = Stub.request } }, capabilities, false);
+    const recovery_driver = svc.online_merge_runtime.?.driver;
+    try std.testing.expect(recovery_driver.admit == null);
+    try std.testing.expect(recovery_driver.current_state != null);
+    try recovery_driver.capabilities.require();
+    for (0..2) |_| {
+        var registration = try svc.raft.replaceTransitionOps(.{ .ptr = &token, .vtable = &Stub.operations });
+        defer registration.deinit();
+        try svc.stepTransitions();
+        const attached = svc.raft.transition_svc.?.online_driver.?;
+        try std.testing.expect(attached.ptr == recovery_driver.ptr);
+        try std.testing.expect(attached.admit == null);
+        try std.testing.expect(attached.execute == recovery_driver.execute);
+        try std.testing.expect(attached.compare_and_set == recovery_driver.compare_and_set);
+    }
+}
+
 pub const ReallocationProtocolPeer = struct {
     node_id: u64,
     orchestration_url: ?[]const u8 = null,
@@ -2462,7 +2788,7 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.TransitionCommand) bool {
     return switch (command) {
-        .apply_restore_staging, .compare_and_set_backup_cohort => true,
+        .apply_restore_staging, .create_restore_job_with_staging, .compare_and_set_backup_cohort, .compare_and_set_online_merge => true,
         .upsert_table => |table| table.relational_retirement_json.len != 0,
         .compare_and_replace_table => |cas| cas.expected.relational_retirement_json.len != 0 or cas.replacement.relational_retirement_json.len != 0,
         .apply_table_topology => |mutation| switch (mutation) {
@@ -2476,7 +2802,8 @@ pub fn transitionRequiresCoordinatedDecoder(command: metadata_storage.Transition
         .register_store, .upsert_store => |record| record.relational_topology_protocol_version != 0,
         .admit_split_transition => |admission| admission.record.table_contract.integrity_protocol != .none or admission.record.table_contract.read_schema_json.len != 0,
         .upsert_split_transition => |record| record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0,
-        .upsert_merge_transition => |record| record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0,
+        .admit_online_merge => true,
+        .upsert_merge_transition => |record| record.online != null or record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0,
         else => false,
     };
 }
@@ -3963,6 +4290,7 @@ fn reconcileLeaseCacheNextRefreshAtMs(
 }
 
 pub const MetadataService = struct {
+    online_merge_runtime: ?@import("online_merge_driver.zig").Runtime = null,
     alloc: std.mem.Allocator,
     metadata_group_id: u64,
     replica_root_dir: ?[]const u8,
@@ -4090,6 +4418,8 @@ pub const MetadataService = struct {
     }
 
     pub fn deinit(self: *MetadataService) void {
+        if (self.online_merge_runtime) |*runtime| runtime.deinit();
+        self.online_merge_runtime = null;
         shutdownCdcRuntimeJobs(self);
         self.closeLifecycleListener();
         // Hosted lifecycle owners borrow the catalog, Raft router, and backend
@@ -4142,6 +4472,9 @@ pub const MetadataService = struct {
     fn stepTransitions(self: *MetadataService) !void {
         self.lockTransitions();
         defer self.unlockTransitions();
+        if (self.online_merge_runtime) |runtime| if (self.raft.transition_svc) |*transitions| {
+            transitions.online_driver = runtime.driver;
+        };
         _ = try self.raft.stepTransitions();
     }
 
@@ -5277,6 +5610,9 @@ pub const MetadataService = struct {
     }
 
     pub fn upsertMergeTransition(self: *MetadataService, record: transition_state.MergeTransitionRecord) !void {
+        // Internal ledger support does not advertise an end-to-end native
+        // snapshot capability. Do not admit a stranded live-source transition.
+        if (record.online != null) return error.OnlineMergeUnavailable;
         if (record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0) _ = try self.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relational_integrity_topology_version);
         if (record.phase == .prepare) {
             var contract = record.table_contract;
@@ -6560,6 +6896,7 @@ pub const MetadataService = struct {
 };
 
 pub const MetadataHttpService = struct {
+    online_merge_runtime: ?@import("online_merge_driver.zig").Runtime = null,
     alloc: std.mem.Allocator,
     metadata_group_id: u64,
     replica_root_dir: ?[]const u8,
@@ -6726,6 +7063,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn deinit(self: *MetadataHttpService) void {
+        if (self.online_merge_runtime) |*runtime| runtime.deinit();
+        self.online_merge_runtime = null;
         shutdownRuntimeStatusProtocolProbe(self);
         shutdownCdcRuntimeJobs(self);
         // Stop new Raft HTTP ingress before closing retained apply callbacks.
@@ -8008,6 +8347,7 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn upsertMergeTransition(self: *MetadataHttpService, record: transition_state.MergeTransitionRecord) !void {
+        if (record.online != null) return error.OnlineMergeUnavailable;
         if (record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0) _ = try self.ensureTableTopologyProtocolReadyMode(.{}, metadata_topology_protocol.relational_integrity_topology_version, true);
         if (record.phase == .prepare) {
             var contract = record.table_contract;
@@ -8828,6 +9168,9 @@ pub const MetadataHttpService = struct {
     fn stepTransitions(self: *MetadataHttpService) !raft_transition_service.TransitionStepResult {
         self.transition_mutex.lockUncancelable(std.Options.debug_io);
         defer self.transition_mutex.unlock(std.Options.debug_io);
+        if (self.online_merge_runtime) |runtime| if (self.raft.transition_svc) |*transitions| {
+            transitions.online_driver = runtime.driver;
+        };
         defer self.publishTransitionMetricsLocked();
         return try self.raft.stepTransitions();
     }
@@ -10809,6 +11152,7 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     const legacy: metadata_storage.TransitionCommand = .{ .upsert_table = plain };
     const commands = [_]metadata_storage.TransitionCommand{
         .{ .apply_restore_staging = "{}" },
+        .{ .create_restore_job_with_staging = .{ .key = "\x00\x00__api_restore_jobs__:0000000000000001", .value = "{}", .plan_json = "{}" } },
         .{ .compare_and_set_backup_cohort = .{ .job_id = 9, .expected_revision = 0, .value = "{}" } },
         .{ .upsert_table = retiring },
         .{ .compare_and_replace_table = .{ .expected = retiring, .replacement = plain } },
@@ -10816,7 +11160,8 @@ test "relational topology admission rejects lifecycle proposals before encoding 
         .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{retiring} } },
     };
     for (commands) |command| {
-        var service: Fake = .{ .member_versions = &.{ 7, 7, 6 } }; // Includes a lower-version learner.
+        const required = metadata_topology_protocol.coordinated_lifecycle_version;
+        var service: Fake = .{ .member_versions = &.{ required, required, required - 1 } }; // Includes a lower-version learner.
         try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&service, command, .{}));
         try std.testing.expectEqual(@as(usize, 1), service.probes);
         try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, service.propose(&.{ legacy, command }));
@@ -10824,7 +11169,7 @@ test "relational topology admission rejects lifecycle proposals before encoding 
         try std.testing.expectEqual(@as(usize, 1), service.probes); // Final guard does no network probe.
         try service.propose(&.{legacy});
         try std.testing.expectEqual(@as(usize, 1), service.appended);
-        service.member_versions = &.{ 7, 7, 7 };
+        service.member_versions = &.{ required, required, required };
         try ensureCoordinatedDecoderWithContext(&service, command, .{});
         try std.testing.expect((try prepareCoordinatedDecoderAdmission(&service, &.{command})) != null);
         service.cache.cached.?.readiness.term += 1;
@@ -10837,10 +11182,15 @@ test "relational topology admission rejects lifecycle proposals before encoding 
 }
 
 test "relational topology admission requires metadata decoder capability beyond framed status" {
+    try std.testing.expectEqual(@as(u16, 9), metadata_topology_protocol.source_scope_version);
+    try std.testing.expectEqual(metadata_topology_protocol.current_version, metadata_topology_protocol.coordinated_lifecycle_version);
+    try std.testing.expectEqual(metadata_topology_protocol.current_version, metadata_topology_protocol.relational_integrity_topology_version);
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var status: MetadataStatus = .{ .metadata_group_id = 42, .metadata_incarnation = incarnation, .metadata_raft_local_node_id = 7, .metrics = .{}, .table_topology_protocol_version = 6, .runtime_status_record_version = metadata_runtime_status_protocol.current_record_version };
     try std.testing.expect(runtimeStatusProtocolCompatible(status, 42, 7, incarnation, metadata_runtime_status_protocol.current_record_version));
     try std.testing.expect(!tableTopologyProtocolCompatible(status, 42, 7, incarnation, metadata_topology_protocol.relational_integrity_topology_version));
+    status.table_topology_protocol_version = 8;
+    try std.testing.expect(!tableTopologyProtocolCompatible(status, 42, 7, incarnation, metadata_topology_protocol.source_scope_version));
     status.table_topology_protocol_version = metadata_topology_protocol.relational_integrity_topology_version;
     try std.testing.expect(tableTopologyProtocolCompatible(status, 42, 7, incarnation, metadata_topology_protocol.relational_integrity_topology_version));
     const readiness = try tableTopologyProtocolReadiness(1, metadata_topology_protocol.relational_integrity_topology_version, incarnation, &.{7});
@@ -11561,6 +11911,62 @@ test "metadata service defers reporter fence transitions while activation is unk
     try std.testing.expectEqual(@as(u64, 0), service.last_reporter_incarnation);
     try std.testing.expectEqual(@as(u64, 0x1234), projected[0].reporter_incarnation);
     try std.testing.expectEqual(@as(u64, 0), projected[1].reporter_incarnation);
+}
+
+test "relational integrity metadata topology heartbeat selects current profile and preserves group reports" {
+    const alloc = std.testing.allocator;
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        ready: bool = false,
+        current_profile_probes: usize = 0,
+        upserts: usize = 0,
+        groups: usize = 0,
+        topology: u16 = 0,
+
+        fn runtimeStatusProtocolReady(self: *@This(), required: u16) bool {
+            if (required == metadata_runtime_status_protocol.current_record_version) {
+                self.current_profile_probes += 1;
+                return self.ready;
+            }
+            return false;
+        }
+
+        fn upsertStore(self: *@This(), record: metadata_table_manager.StoreRecord) !void {
+            self.upserts += 1;
+            self.groups = record.group_statuses.len;
+            self.topology = record.relational_topology_protocol_version;
+        }
+    };
+    // Both a newly advertised capability and an already committed capability
+    // constrain subsequent heartbeats, including ones without relational rows.
+    for ([_]bool{ false, true }) |committed| {
+        var projected = [_]metadata_table_manager.StoreRecord{try metadata_table_manager.cloneStore(alloc, .{
+            .store_id = 7,
+            .node_id = 9,
+            .reporter_incarnation = if (committed) 0 else 0x1234,
+            .status_generation = if (committed) 0 else 1,
+            .relational_topology_protocol_version = if (committed) metadata_table_manager.relational_topology_protocol_version else 0,
+        })};
+        defer metadata_table_manager.freeStore(alloc, projected[0]);
+        var groups = [_]metadata_table_manager.GroupStatusReport{.{ .group_id = 21, .local_leader = true, .local_voter = true, .voter_count = 3 }};
+        const reports = [_]metadata_table_manager.StoreStatusReport{.{
+            .store_id = 7,
+            .reporter_incarnation = if (committed) 0 else 0x1234,
+            .status_generation = if (committed) 0 else 2,
+            .relational_topology_protocol_version = if (committed) 0 else metadata_table_manager.relational_topology_protocol_version,
+            .group_statuses = &groups,
+        }};
+        var service: FakeService = .{ .alloc = alloc };
+        try std.testing.expectError(error.RuntimeStatusProtocolUnavailable, reportStoreStatusesWithProjected(&service, &projected, &reports));
+        try std.testing.expectEqual(@as(usize, 0), service.upserts);
+        try std.testing.expectEqual(@as(usize, 0), projected[0].group_statuses.len);
+        service.ready = true;
+        try std.testing.expectEqual(@as(usize, 1), try reportStoreStatusesWithProjected(&service, &projected, &reports));
+        try std.testing.expectEqual(@as(usize, 1), service.upserts);
+        try std.testing.expectEqual(@as(usize, 1), service.groups);
+        try std.testing.expectEqual(metadata_table_manager.relational_topology_protocol_version, service.topology);
+        try std.testing.expectEqual(@as(usize, 2), service.current_profile_probes);
+    }
 }
 
 test "metadata service defers vector projection readiness transitions while activation is unknown" {
@@ -12589,6 +12995,11 @@ fn reportStoreStatusesWithProjected(
         storesHaveDenseVectorProjectionPending(projected);
     const native_storage_transition_possible = reportsHaveDenseNativeStorageStatus(reports) or
         storesHaveDenseNativeStorageStatus(projected);
+    const relational_topology_transition_possible = blk: {
+        for (reports) |report| if (report.relational_topology_protocol_version != 0) break :blk true;
+        for (projected) |record| if (record.relational_topology_protocol_version != 0) break :blk true;
+        break :blk false;
+    };
     const artifact_source_transition_possible = reportsHaveRuntimeArtifactSourceStatus(reports) or
         storesHaveRuntimeArtifactSourceStatus(projected);
     const reporter_fence_transition_possible = reportsHaveRuntimeReporterFence(reports) or
@@ -12603,12 +13014,17 @@ fn reportStoreStatusesWithProjected(
         metadata_runtime_status_protocol.positional_record_version
     else
         metadata_runtime_status_protocol.v0_2_0_record_version;
-    const native_required_version = if (vector_projection_transition_possible or native_storage_transition_possible)
+    // Relational topology is a framed V17 admission fact too. Asking only
+    // for V15 here can silently discard every ordinary group heartbeat at
+    // the mandatory-profile fence below, even when all voters support V17.
+    const current_profile_required = vector_projection_transition_possible or
+        native_storage_transition_possible or relational_topology_transition_possible;
+    const native_required_version = if (current_profile_required)
         metadata_runtime_status_protocol.current_record_version
     else
         required_version;
     const supported_version = highestSupportedRuntimeStatusVersion(service, native_required_version);
-    if ((vector_projection_transition_possible or native_storage_transition_possible) and
+    if (current_profile_required and
         supported_version != metadata_runtime_status_protocol.current_record_version)
     {
         return error.RuntimeStatusProtocolUnavailable;

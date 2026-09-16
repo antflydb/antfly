@@ -62,6 +62,7 @@ pub fn validate(alloc: std.mem.Allocator, child_json: []const u8, parent_name: [
             if (sameColumns(fk.parent_columns, unique.columns)) break true;
         } else false;
         if (!unique_found) return error.ForeignKeyTargetNotUnique;
+        if (fk.match == .partial) try @import("relational_witness_indexes.zig").requireCoverage(parent, fk.parent_columns);
         if (fk.child_columns.len == 0 or fk.child_columns.len != fk.parent_columns.len)
             return error.ForeignKeyTypeMismatch;
         for (fk.child_columns, fk.parent_columns) |child_column, parent_column| {
@@ -89,6 +90,23 @@ fn columnType(layout: native.TableSchema, name: []const u8) !native.RelationalCo
 
 test "relational integrity FK target validates ordered uniqueness types and self references" {
     try testTargetContract();
+}
+
+test "distributed txn MATCH PARTIAL DDL pins selectable parent support for every non-null mask" {
+    const alloc = std.testing.allocator;
+    const child =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["a","b"],"parent_table":"parents","parent_columns":["a","b"],"match":"partial"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer","nullable":true},"b":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const parent =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["a","b"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer","nullable":true},"b":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    try std.testing.expectError(error.ForeignKeyPartialSupportIndexRequired, validate(alloc, child, "parents", parent));
+    const supported = (try @import("relational_witness_indexes.zig").ensureCoverage(alloc, parent, &.{ "a", "b" })).?;
+    defer alloc.free(supported);
+    try validate(alloc, child, "parents", supported);
+    // The identical validator runs on incoming dependencies under the parent
+    // metadata CAS, so removing the support definitions cannot race admission.
+    try std.testing.expectError(error.ForeignKeyPartialSupportIndexRequired, validate(alloc, child, "parents", parent));
 }
 
 pub fn testTargetContract() !void {

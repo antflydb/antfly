@@ -15,7 +15,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 50;
+pub const abi_version: u32 = 53;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -543,6 +543,52 @@ pub const Status = enum(u32) {
     ha_fenced_primary = 584,
     ha_promoted_standby_requires_primary_open = 585,
     ha_primary_not_configured = 586,
+    relational_index_not_ready = 587,
+    invalid_relational_index_bound = 588,
+    relational_index_column_not_found = 589,
+    unsupported_relational_index_column = 590,
+    relational_rows_output_budget_exceeded = 591,
+    relational_row_result_too_large = 592,
+    relational_index_column_type_mismatch = 593,
+    relational_table_required = 594,
+    invalid_relational_index_forward_key = 595,
+    relational_expression_overflow = 596,
+    relational_expression_division_by_zero = 597,
+    relational_expression_budget_exceeded = 598,
+    invalid_relational_expression_input = 599,
+    invalid_relational_generated_value = 600,
+    generated_column_rewrite_required = 601,
+    invalid_online_source_command = 602,
+    online_source_corrupt = 603,
+    online_source_scope_changed = 604,
+    invalid_retained_effects_admission = 605,
+    retained_effects_consumer_limit = 606,
+    retained_effects_corrupt = 607,
+    retained_effects_cursor_mismatch = 608,
+    retained_effects_fence_mismatch = 609,
+    retained_effects_full = 610,
+    retained_effects_identity_required = 611,
+    retained_effects_mixed_control = 612,
+    retained_effects_namespace_mismatch = 613,
+    retained_effects_transaction_failed = 614,
+    invalid_source_snapshot = 615,
+    source_snapshot_corrupt = 616,
+    source_snapshot_incomplete = 617,
+    source_snapshot_too_large = 618,
+    source_snapshot_cut_mismatch = 619,
+    invalid_merge_page = 620,
+    merge_page_incomplete = 621,
+    merge_page_required = 622,
+    merge_page_sequence_gap = 623,
+    merge_page_source_missing = 624,
+    missing_online_source_applied_index = 625,
+    online_source_pin_pending = 626,
+    online_source_pin_missing = 627,
+    source_copy_restore_unsupported = 628,
+    merge_page_chunk_required = 629,
+    foreign_key_partial_support_index_required = 630,
+    foreign_key_partial_support_index_conflict = 631,
+    reserved_foreign_key_support_index = 632,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

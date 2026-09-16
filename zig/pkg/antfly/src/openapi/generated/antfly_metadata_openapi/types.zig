@@ -8094,11 +8094,13 @@ pub const RawQuery = @import("antfly-json").RawValue;
 pub const RelationalConstraintActivationPhase = enum {
     unique,
     foreign_key,
+    check,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .unique => "unique",
             .foreign_key => "foreign_key",
+            .check => "check",
         };
         try jw.write(s);
     }
@@ -8111,6 +8113,7 @@ pub const RelationalConstraintActivationPhase = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "unique", .unique },
             .{ "foreign_key", .foreign_key },
+            .{ "check", .check },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -8289,7 +8292,7 @@ pub const RelationalConstraintRetryResponse = struct {
 
 pub const RelationalConstraintStatus = struct {
     schema_version: i64,
-    /// This endpoint reports distributed unique/FK coverage, not local scalar CHECK validation.
+    /// Distributed UNIQUE, foreign-key, and scalar CHECK coverage across every current table owner. Native local validation is not a substitute for this coordinated proof.
     coverage_kind: []const u8,
     state: antfly_schema_openapi.RelationalConstraintValidationState,
     ranges: []const RelationalConstraintRangeStatus,
@@ -8331,12 +8334,48 @@ pub const RelationalConstraintStatus = struct {
 };
 
 pub const RelationalRow = struct {
+    /// Opaque index-order continuation; present only for secondary-index queries.
+    cursor: ?[]const u8 = null,
     _id: []const u8,
     row: std.json.ArrayHashMap(std.json.Value),
     /// Exact row version for mutation preconditions, encoded as decimal text.
     version: []const u8,
     /// Active pinned schema epoch, not the historical physical row layout.
     schema_version: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "cursor", "cursor", true },
+        .{ "_id", "_id", false },
+        .{ "row", "row", false },
+        .{ "version", "version", false },
+        .{ "schema_version", "schema_version", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        try jw.objectField("_id");
+        try jw.write(self._id);
+        try jw.objectField("row");
+        try jw.write(self.row);
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.endObject();
+    }
 };
 
 pub const RelationalRowCondition = struct {
@@ -8374,6 +8413,37 @@ pub const RelationalRowCondition = struct {
         }
         if (self.collation) |value| {
             try jw.objectField("collation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Typed left-prefix bound in declared index order, including descending components. Inclusive bounds include the entire matching prefix. Integer components accept exact decimal strings; null is an indexed null.
+pub const RelationalRowIndexBound = struct {
+    values: []const std.json.Value,
+    inclusive: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "values", "values", false },
+        .{ "inclusive", "inclusive", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("values");
+        try jw.write(self.values);
+        if (self.inclusive) |value| {
+            try jw.objectField("inclusive");
             try jw.write(value);
         }
         try jw.endObject();
@@ -8452,8 +8522,14 @@ pub const RelationalRowMutationRequest = struct {
     }
 };
 
-/// Bounded relational scan in primary-key order. Each shard read pins an immutable schema and row snapshot. Resume with the last returned _id as from; a resumed request opens a fresh snapshot, not a retained cursor. An empty projection returns row identities and versions only.
+/// Bounded relational scan in primary-key order, or composite index order when index is supplied. Index queries require schema_version and every owning shard must have the selected generation ready. Partial indexes require their WHERE predicates to be implied by the query conditions. The bounded proof combines per-column equality, tighter ranges, exclusions, and NULL-aware predicates using exact typed values and matching collations. Unsupported implications fail closed. Explicit scan bounds alone are not an implication proof. Equal tuples are ordered by primary key. Each shard read pins its own immutable schema and row snapshot; this is not a table-wide consistent snapshot. Resume with the last returned _id as from for primary scans, or its cursor as after for index scans. A resumed request opens a fresh snapshot, not a retained cursor; concurrent mutations may move rows across the continuation boundary. Keep index, bounds and conditions unchanged when paging. An empty projection returns row identities and versions only.
 pub const RelationalRowQueryRequest = struct {
+    /// Ready composite secondary index. Requires schema_version; cannot be combined with from/to.
+    index: ?[]const u8 = null,
+    /// Opaque exclusive index-order cursor from the last returned row. Binds the immutable schema version, logical index name, and comparison semantics, independent of owner-local physical generations. Each owner must still prove its current local index is ready.
+    after: ?[]const u8 = null,
+    lower: ?RelationalRowIndexBound = null,
+    upper: ?RelationalRowIndexBound = null,
     fields: []const []const u8,
     conditions: ?[]const RelationalRowCondition = null,
     /// Exclusive lower primary-key bound, including pagination continuation.
@@ -8461,11 +8537,15 @@ pub const RelationalRowQueryRequest = struct {
     /// Exclusive upper primary-key bound.
     to: ?[]const u8 = null,
     limit: ?i64 = null,
-    /// Reject the read if an owning shard has a different active schema epoch.
+    /// Reject the read if an owning shard has a different active schema epoch. Zero is a valid epoch and is distinct from omission.
     schema_version: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "index", "index", true },
+        .{ "after", "after", true },
+        .{ "lower", "lower", true },
+        .{ "upper", "upper", true },
         .{ "fields", "fields", false },
         .{ "conditions", "conditions", true },
         .{ "from", "from", true },
@@ -8484,6 +8564,22 @@ pub const RelationalRowQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.index) |value| {
+            try jw.objectField("index");
+            try jw.write(value);
+        }
+        if (self.after) |value| {
+            try jw.objectField("after");
+            try jw.write(value);
+        }
+        if (self.lower) |value| {
+            try jw.objectField("lower");
+            try jw.write(value);
+        }
+        if (self.upper) |value| {
+            try jw.objectField("upper");
+            try jw.write(value);
+        }
         try jw.objectField("fields");
         try jw.write(self.fields);
         if (self.conditions) |value| {
@@ -14129,6 +14225,134 @@ pub const WebSearchConnection = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+pub const OpenApiUpdateSchemaResponse202 = union(enum) {
+    restore_job: *RestoreJob,
+    committed_mutation_outcome: *CommittedMutationOutcome,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "job_id",
+            "attempt_id",
+            "scope",
+            "table_name",
+            "backup_id",
+            "phase",
+            "cancel_requested",
+            "durability_pending_table_count",
+            "published_table_count",
+            "completed_table_count",
+            "total_table_count",
+            "result",
+            "error",
+            "created_at_ms",
+            "updated_at_ms",
+            "expires_at_ms",
+        })) {
+            if (try parseStructuralVariant(RestoreJob, allocator, source, options)) |parsed| return .{ .restore_job = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+        })) {
+            if (try parseStructuralVariant(CommittedMutationOutcome, allocator, source, options)) |parsed| return .{ .committed_mutation_outcome = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .restore_job => |v| try jw.write(v.*),
+            .committed_mutation_outcome => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const OpenApiPatchSchemaResponse202 = union(enum) {
+    restore_job: *RestoreJob,
+    committed_mutation_outcome: *CommittedMutationOutcome,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "job_id",
+            "attempt_id",
+            "scope",
+            "table_name",
+            "backup_id",
+            "phase",
+            "cancel_requested",
+            "durability_pending_table_count",
+            "published_table_count",
+            "completed_table_count",
+            "total_table_count",
+            "result",
+            "error",
+            "created_at_ms",
+            "updated_at_ms",
+            "expires_at_ms",
+        })) {
+            if (try parseStructuralVariant(RestoreJob, allocator, source, options)) |parsed| return .{ .restore_job = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+        })) {
+            if (try parseStructuralVariant(CommittedMutationOutcome, allocator, source, options)) |parsed| return .{ .committed_mutation_outcome = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .restore_job => |v| try jw.write(v.*),
+            .committed_mutation_outcome => |v| try jw.write(v.*),
+        }
     }
 };
 

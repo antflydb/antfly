@@ -19,7 +19,9 @@ class RelationalForeignKeyConstraint:
     and must have the same physical comparison types. The parent columns
     must identify a unique key. Existing-row validation is independent of
     new-write enforcement and is never client-writable.
-    Deferred timing, MATCH PARTIAL, and TTL expiry are not supported.
+    Enforcement and referential actions share the bounded distributed
+    transaction path, including TTL expiry. Partial matching uses ordered
+    support indexes on the parent; activation waits until these are ready.
     SET NULL requires every child column to accept explicit NULL.
 
         Attributes:
@@ -29,8 +31,16 @@ class RelationalForeignKeyConstraint:
             parent_columns (list[str]):
             on_delete (ForeignKeyAction | Unset): Action on referencing rows when a referenced row is changed or removed.
             on_update (ForeignKeyAction | Unset): Action on referencing rows when a referenced row is changed or removed.
-            timing (ForeignKeyTiming | Unset): Whether foreign-key enforcement occurs immediately or at transaction commit.
-            match (ForeignKeyMatch | Unset): Null matching semantics of a composite foreign key.
+            timing (ForeignKeyTiming | Unset): Enforcement timing for atomic mutations and transaction sessions. Deferred
+                requires deferrable=true and validates the final transaction state.
+                NO ACTION permits a valid final-state parent replacement; RESTRICT
+                still rejects referenced parent removal. Existing multi-request
+                transaction sessions retain deferred checks until commit; immediate
+                checks apply to each staged statement. SET CONSTRAINTS is not provided.
+            match (ForeignKeyMatch | Unset): Null matching semantics of a composite foreign key. Partial requires
+                at least one parent matching every non-null child component; all-null
+                children are exempt. Compatible parent witnesses are guarded through
+                commit, including concurrent deletion of alternative witnesses.
             deferrable (bool | Unset):
     """
 

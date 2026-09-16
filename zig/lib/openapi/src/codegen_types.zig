@@ -51,8 +51,7 @@ pub const TypeGenerator = struct {
 
     /// Generate all component schemas in stable lexical order.
     pub fn generateAll(self: *TypeGenerator, doc: *const types.OpenApiDoc) !void {
-        const components = doc.components orelse return;
-        const schemas = components.schemas;
+        const schemas = if (doc.components) |components| components.schemas else std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
 
         try self.initializeTypeNames(schemas.keys());
         const optional_nullable_type_name = try self.allocateAuxiliaryTypeName(
@@ -79,6 +78,29 @@ pub const TypeGenerator = struct {
                     try self.w.line("pub const {s} = {s};", .{ type_name, target_name });
                     try self.w.blank();
                 },
+            }
+        }
+        // Multi-status clients need real named inline schemas, not an opaque
+        // Value or the first response's type. Emit these before parser helpers.
+        const shared = @import("codegen_shared.zig");
+        for (try sortedStringKeys(self.arena, doc.paths.keys())) |path| {
+            for (shared.methodOps(doc.paths.get(path).?)) |method| {
+                const op = method.op orelse continue;
+                const op_id = op.operation_id orelse continue;
+                if (shared.isStreamingOrBinaryResponse(op)) continue;
+                const responses = try shared.successSchemas(self.arena, self.resolver, op);
+                if (responses.len < 2) continue;
+                for (responses) |response| switch (response.schema) {
+                    .ref => {},
+                    .schema => |schema| {
+                        const name = try shared.inlineResponseTypeName(self.arena, op_id, response.code);
+                        if (self.reserved_type_names.contains(name)) return error.InvalidOpenApiSchema;
+                        try self.reserved_type_names.put(self.arena, name, {});
+                        try self.generateNamedType(name, schema);
+                        try self.extra_type_reexports.append(self.arena, name);
+                        try self.w.blank();
+                    },
+                };
             }
         }
         if (self.uses_optional_nullable) {

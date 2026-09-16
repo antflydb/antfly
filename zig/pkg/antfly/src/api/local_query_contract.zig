@@ -3440,10 +3440,12 @@ pub const StorageKernelLookupWireRequest = struct {
     include_all_fields: bool = true,
     include_primary_digest: bool = false,
     restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
     relational_integrity_catalog: bool = false,
     relational_integrity_action: bool = false,
     relational_integrity_jobs_json: []const u8 = "",
     relational_activation_json: []const u8 = "",
+    relational_index_status_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
 
     pub fn options(self: StorageKernelLookupWireRequest) db_mod.types.LookupOptions {
@@ -3452,10 +3454,12 @@ pub const StorageKernelLookupWireRequest = struct {
             .include_all_fields = self.include_all_fields,
             .include_primary_digest = self.include_primary_digest,
             .restore_staging_scope = self.restore_staging_scope,
+            .restore_staging_plan_id = self.restore_staging_plan_id,
             .relational_integrity_catalog = self.relational_integrity_catalog,
             .relational_integrity_action = self.relational_integrity_action,
             .relational_integrity_jobs_json = self.relational_integrity_jobs_json,
             .relational_activation_json = self.relational_activation_json,
+            .relational_index_status_json = self.relational_index_status_json,
             .relational_topology_json = self.relational_topology_json,
         };
     }
@@ -3464,7 +3468,7 @@ pub const StorageKernelLookupWireRequest = struct {
         try stream.beginObject();
         inline for (@typeInfo(StorageKernelLookupWireRequest).@"struct".fields) |field| {
             try stream.objectField(field.name);
-            if (comptime std.mem.eql(u8, field.name, "key") or std.mem.eql(u8, field.name, "restore_staging_scope")) {
+            if (comptime std.mem.eql(u8, field.name, "key") or std.mem.eql(u8, field.name, "restore_staging_scope") or std.mem.eql(u8, field.name, "restore_staging_plan_id")) {
                 try @import("../storage/db/relational_integrity_json.zig").write(@field(self, field.name), stream);
             } else try stream.write(@field(self, field.name));
         }
@@ -3473,7 +3477,7 @@ pub const StorageKernelLookupWireRequest = struct {
 };
 
 pub fn integrityLookupMode(opts: db_mod.types.LookupOptions) bool {
-    return opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
+    return opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
 }
 
 test "compiled lookup wire preserves binary scope and every integrity control" {
@@ -3484,10 +3488,12 @@ test "compiled lookup wire preserves binary scope and every integrity control" {
         .include_all_fields = false,
         .include_primary_digest = true,
         .restore_staging_scope = scope,
+        .restore_staging_plan_id = @splat(0xfe),
         .relational_integrity_catalog = true,
         .relational_integrity_action = true,
         .relational_integrity_jobs_json = "{\"kind\":\"references\"}",
         .relational_activation_json = "{\"mode\":\"status\"}",
+        .relational_index_status_json = "{\"name\":\"by_id\",\"schema_version\":2}",
         .relational_topology_json = "{\"mode\":\"identity\"}",
         .execution_deadline_ns = 1234,
     };
@@ -3498,10 +3504,12 @@ test "compiled lookup wire preserves binary scope and every integrity control" {
     try std.testing.expectEqualStrings("\xff\x00\x80", decoded.value.key);
     const actual = decoded.value.options();
     try std.testing.expectEqualSlices(u8, &scope, &actual.restore_staging_scope.?);
+    try std.testing.expectEqual(options.restore_staging_plan_id, actual.restore_staging_plan_id);
     try std.testing.expect(actual.include_primary_digest and !actual.include_all_fields);
     try std.testing.expect(actual.relational_integrity_catalog and actual.relational_integrity_action);
     try std.testing.expectEqualStrings(options.relational_integrity_jobs_json, actual.relational_integrity_jobs_json);
     try std.testing.expectEqualStrings(options.relational_activation_json, actual.relational_activation_json);
+    try std.testing.expectEqualStrings(options.relational_index_status_json, actual.relational_index_status_json);
     try std.testing.expectEqualStrings(options.relational_topology_json, actual.relational_topology_json);
     try std.testing.expectEqualStrings("id", actual.fields[0]);
     try std.testing.expect(actual.execution_deadline_ns == null and actual.execution_io == null and actual.cancellation == null);
@@ -3518,10 +3526,12 @@ pub fn encodeStorageKernelLookupRequest(
         .include_all_fields = opts.include_all_fields,
         .include_primary_digest = opts.include_primary_digest,
         .restore_staging_scope = opts.restore_staging_scope,
+        .restore_staging_plan_id = opts.restore_staging_plan_id,
         .relational_integrity_catalog = opts.relational_integrity_catalog,
         .relational_integrity_action = opts.relational_integrity_action,
         .relational_integrity_jobs_json = opts.relational_integrity_jobs_json,
         .relational_activation_json = opts.relational_activation_json,
+        .relational_index_status_json = opts.relational_index_status_json,
         .relational_topology_json = opts.relational_topology_json,
     }, .{});
 }
@@ -3639,7 +3649,7 @@ pub fn encodeStorageKernelScanNdjson(
     for (result.hashes, 0..) |entry, i| {
         const json = if (include_documents) result.documents[i].json else null;
         if (entry.relational_schema_version) |version| {
-            try appendRelationalScanLine(alloc, &out, .{ .id = entry.id, .hash = entry.hash, .document_json = json, .content_hash = entry.content_hash, .relational_schema_version = version }, version);
+            try appendRelationalScanLine(alloc, &out, .{ .id = entry.id, .hash = entry.hash, .document_json = json, .content_hash = entry.content_hash, .relational_schema_version = version, .relational_cursor = entry.relational_cursor }, version);
         } else try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
     }
     return try out.toOwnedSlice(alloc);
@@ -5676,8 +5686,14 @@ pub fn appendRelationalScanLine(alloc: std.mem.Allocator, out: *std.ArrayListUnm
     if (out.items.len +| projected.len +| entry.id.len > 16 * 1024 * 1024) return error.RelationalRowsOutputBudgetExceeded;
     const header = try std.fmt.allocPrint(alloc, "{{\"_id\":{f},\"version\":\"{d}\",\"schema_version\":{d},\"row\":", .{ std.json.fmt(entry.id, .{}), entry.hash, schema_version });
     defer alloc.free(header);
+    const cursor_bytes = if (entry.relational_cursor) |cursor| cursor.len +| 12 else @as(usize, 0);
+    if (header.len +| projected.len +| cursor_bytes +| 2 > (16 * 1024 * 1024) -| out.items.len) return error.RelationalRowsOutputBudgetExceeded;
     try out.appendSlice(alloc, header);
     try out.appendSlice(alloc, projected);
+    if (entry.relational_cursor) |cursor| {
+        try out.appendSlice(alloc, ",\"cursor\":");
+        try appendJsonString(alloc, out, cursor);
+    }
     try out.appendSlice(alloc, "}\n");
 }
 

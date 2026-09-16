@@ -27,6 +27,7 @@ const catalog_api = @import("table_catalog.zig");
 const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
 const identity = @import("../storage/db/doc_identity.zig");
 const seal = @import("../storage/db/native_backup_seal.zig");
+var diagnostic_gate: @import("bounded_diagnostic_gate.zig").Gate = .{};
 
 pub fn idForAttempt(attempt: []const u8) u64 {
     var hash = std.crypto.hash.Blake3.init(.{});
@@ -119,6 +120,7 @@ pub fn Session(comptime Source: type) type {
         }
 
         fn checkpoint(self: *Self, phase: cohort.Phase, cursor: usize, receipt: ?cohort.SealReceipt, digest: ?[32]u8) !void {
+            errdefer |err| self.logFailure("checkpoint", err);
             try self.request.ensureActive();
             var replacement: cohort.Progress = .{ .revision = self.parsed.value.revision + 1, .phase = phase, .cursor = cursor, .owner_count = @intCast(self.parsed.value.state.owners.len), .plan_digest = self.plan_digest, .manifest_sha256 = self.parsed.value.manifest_sha256 };
             if (digest) |value| replacement.manifest_sha256 = value;
@@ -139,16 +141,28 @@ pub fn Session(comptime Source: type) type {
         }
 
         fn control(self: *Self, owner: cohort.Owner, action: @FieldType(topology.Command, "action")) !void {
+            errdefer |err| self.logFailure(@tagName(action), err);
             try self.request.ensureActive();
             _ = (try self.write.batch(self.alloc, owner.table_name, .{ .relational_topology = .{ .fence = owner.fence, .action = action } })) orelse return error.TableNotFound;
         }
 
         fn pin(self: *Self, owner: cohort.Owner, command: seal.Request) ![]u8 {
+            errdefer |err| self.logFailure("pin", err);
             try self.request.ensureActive();
             return (try self.write.backupPinControl(self.alloc, owner.table_name, owner.fence.owner_group_id, command, .{ .deadline_ns = self.request.deadline_ns orelse return error.InvalidArgument, .cancellation = self.request.cancellation, .capture_node_id = owner.capture_node_id })) orelse return error.BackupPinSourceUnavailable;
         }
 
         pub const Preparation = enum { advanced, waiting, ready };
+
+        // Recovery may retry failed actions frequently. Keep diagnostics
+        // process-bounded, and never log row data or repository credentials.
+        fn logFailure(self: *const Self, action: []const u8, err: anyerror) void {
+            if (!diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs())) return;
+            const state = self.parsed.value.state;
+            std.log.warn("backup cohort action failed action={s} phase={s} owner_ordinal={d} group_id={d} revision={d} class={s}", .{
+                action, @tagName(state.phase), state.cursor, state.owners[state.cursor].fence.owner_group_id, self.parsed.value.revision, @errorName(err),
+            });
+        }
 
         /// One owner action per slice; callers delay only while waiting. No table-size
         /// work occurs before this reaches exporting.
@@ -162,7 +176,10 @@ pub fn Session(comptime Source: type) type {
                     try self.next(.draining, null);
                 },
                 .draining => {
-                    var response = (try self.read.topologyStatus(self.alloc, owner.table_name, owner.range_start, "{\"mode\":\"status\"}")) orelse return error.TableNotFound;
+                    var response = (self.read.topologyStatus(self.alloc, owner.table_name, owner.range_start, "{\"mode\":\"status\"}") catch |err| {
+                        self.logFailure("drain_status", err);
+                        return err;
+                    }) orelse return error.TableNotFound;
                     defer response.deinit(self.alloc);
                     const status = try std.json.parseFromSlice(cohort.Observation, self.alloc, response.json, .{});
                     defer status.deinit();

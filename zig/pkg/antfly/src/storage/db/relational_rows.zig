@@ -30,6 +30,7 @@ const codec = @import("algebraic/relational_row_codec.zig");
 const range_state = @import("range_state.zig");
 const ttl = @import("../ttl.zig");
 const predicates = @import("relational_predicate.zig");
+const row_cursor_codec = @import("relational_row_cursor.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Value = tuples.Value;
@@ -46,9 +47,13 @@ pub const RowFilter = struct {
 };
 pub const Request = struct {
     include_primary_digest: bool = false,
+    /// Stateful internal readers already retain a cursor; public stateless
+    /// pages opt in to owned external continuation tokens.
+    include_cursor: bool = false,
     /// Null selects primary-key order. Named indexes must have a durable
     /// ready proof for this exact generation and owned range.
     index: ?[]const u8 = null,
+    after: ?[]const u8 = null,
     lower: ?Bound = null,
     upper: ?Bound = null,
     primary_lower: ?PrimaryBound = null,
@@ -81,6 +86,7 @@ pub const Row = struct {
     schema_version: u32,
     semantic_hash: [32]u8,
     expected_content_digest: ?[32]u8 = null,
+    cursor: ?[]const u8 = null,
 };
 
 pub const Page = struct {
@@ -89,6 +95,9 @@ pub const Page = struct {
     more: bool,
     records_examined: usize,
     output_bytes: usize,
+    /// Work counters distinguish covering scans from primary-row fallbacks.
+    primary_lookups: usize = 0,
+    index_only_rows: usize = 0,
 
     pub fn deinit(self: *Page) void {
         self.arena.deinit();
@@ -111,10 +120,19 @@ pub const Reader = struct {
     now_ns: u64,
     authenticated: bool,
     include_primary_digest: bool,
+    include_cursor: bool,
+    cursor_identity: ?[row_cursor_codec.identity_len]u8,
     row_filter: ?RowFilter,
+    index_only: bool = false,
+    covering_projection: ?codec.OrdinalProjectionPlan = null,
+    covering_conditions: []predicates.Source = &.{},
     source: ?registry.SchemaView = null,
     selected: ?codec.OrdinalProjectionPlan = null,
     conditions: []predicates.Plan,
+    /// Exact conjuncts discharged by the pinned READY partial-index proof.
+    /// These are skipped only on the index-only path; primary reads still
+    /// evaluate the complete query against the authoritative row.
+    implied_conditions: []const bool,
     source_conditions: []predicates.Source = &.{},
     after: std.ArrayList(u8) = .empty,
     done: bool = false,
@@ -128,6 +146,7 @@ pub const Reader = struct {
         if (request.fields.len > 256 or request.conditions.len > 256 or (request.index == null and (request.lower != null or request.upper != null)))
             return error.InvalidRelationalRowsRequest;
         if (request.index != null and (request.primary_lower != null or request.primary_upper != null)) return error.InvalidRelationalRowsRequest;
+        if (request.after != null and request.index == null) return error.InvalidRelationalRowsRequest;
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const owned = arena.allocator();
@@ -150,6 +169,7 @@ pub const Reader = struct {
         var lower: []const u8 = owned_lower;
         var upper: []const u8 = owned_upper;
         var selected_index: ?plans.BoundIndex = null;
+        var cursor_identity: ?[row_cursor_codec.identity_len]u8 = null;
         if (request.primary_lower) |bound| {
             const prefix = try internal.documentExactPrefixAlloc(owned, bound.key);
             const requested = if (bound.inclusive) prefix else (try internal.nextPrefixAlloc(owned, prefix)) orelse return error.InvalidRelationalRowsRequest;
@@ -169,12 +189,21 @@ pub const Reader = struct {
                 if (std.mem.eql(u8, index.name, name)) break index;
             } else return error.IndexNotFound;
             if ((try jobs.status(&read, selected_index.?)).state != .ready) return error.RelationalIndexNotReady;
+            if (request.include_cursor or request.after != null) cursor_identity = row_cursor_codec.identity(active_view.version(), selected_index.?.name, selected_index.?.tuple.fingerprint);
             const prefix = try records.forwardPrefix(selected_index.?.id());
             lower = try owned.dupe(u8, &prefix);
             upper = (try internal.nextPrefixAlloc(owned, &prefix)).?;
             if (request.lower) |bound| lower = try boundKey(owned, selected_index.?, bound, false);
             if (request.upper) |bound| upper = try boundKey(owned, selected_index.?, bound, true);
             if (std.mem.order(u8, lower, upper) == .gt) return error.InvalidRelationalRowsRequest;
+            if (request.after) |encoded| {
+                const index = selected_index.?;
+                const suffix = try row_cursor_codec.decode(owned, encoded, cursor_identity.?);
+                const key = try std.mem.concat(owned, u8, &.{ &prefix, suffix });
+                _ = records.parseForward(key, index) catch return error.InvalidRelationalRowsRequest;
+                const requested = (try internal.nextPrefixAlloc(owned, key)) orelse return error.InvalidRelationalRowsRequest;
+                if (std.mem.order(u8, requested, lower) == .gt) lower = requested;
+            }
         }
         const conditions = try alloc.alloc(predicates.Plan, request.conditions.len);
         var initialized: usize = 0;
@@ -185,6 +214,22 @@ pub const Reader = struct {
         for (conditions, request.conditions) |*plan, condition| {
             plan.* = try predicates.Plan.init(alloc, active_view.tableSchema().*, active_view.physicalLayout(), condition);
             initialized += 1;
+        }
+        const implied_conditions = try owned.alloc(bool, conditions.len);
+        @memset(implied_conditions, false);
+        if (selected_index) |index| if (index.predicate) |condition| {
+            if (!condition.impliedByAndMark(conditions, implied_conditions)) return error.PartialIndexPredicateNotImplied;
+        };
+        var index_only = selected_index != null and request.row_filter == null and !request.include_primary_digest;
+        if (selected_index) |index| {
+            if (index.cover) |cover| {
+                for (fields) |field| if (!cover.contains(field)) {
+                    index_only = false;
+                };
+                for (request.conditions, implied_conditions) |condition, implied| if (!implied and !cover.contains(condition.column)) {
+                    index_only = false;
+                };
+            } else index_only = false;
         }
         return .{
             .alloc = alloc,
@@ -201,8 +246,12 @@ pub const Reader = struct {
             .now_ns = now_ns,
             .authenticated = store.valuesAreAuthenticated(),
             .include_primary_digest = request.include_primary_digest,
+            .include_cursor = request.include_cursor,
+            .cursor_identity = cursor_identity,
             .row_filter = request.row_filter,
+            .index_only = index_only,
             .conditions = conditions,
+            .implied_conditions = implied_conditions,
             .done = std.mem.order(u8, lower, upper) != .lt,
         };
     }
@@ -217,6 +266,9 @@ pub const Reader = struct {
     }
 
     pub fn deinit(self: *Reader) void {
+        if (self.covering_projection) |*plan| plan.deinit();
+        for (self.covering_conditions) |*condition| condition.deinit();
+        self.alloc.free(self.covering_conditions);
         for (self.source_conditions) |*condition| condition.deinit();
         self.alloc.free(self.source_conditions);
         for (self.conditions) |*condition| condition.deinit();
@@ -229,6 +281,37 @@ pub const Reader = struct {
         self.after.deinit(self.alloc);
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    fn coveringView(self: *Reader, key: []const u8, value: []const u8) !codec.OrdinalRowView {
+        const cover = &self.index.?.cover.?;
+        const payload = try records.forwardPayload(key, value);
+        const row = try cover.decode(payload);
+        if (self.covering_projection == null) {
+            const selected = try codec.OrdinalProjectionPlan.init(self.alloc, cover.table(), &cover.layout, self.fields);
+            errdefer {
+                var cleanup = selected;
+                cleanup.deinit();
+            }
+            var residual_count: usize = 0;
+            for (self.implied_conditions) |implied| if (!implied) {
+                residual_count += 1;
+            };
+            const conditions = try self.alloc.alloc(predicates.Source, residual_count);
+            var initialized: usize = 0;
+            errdefer {
+                for (conditions[0..initialized]) |*condition| condition.deinit();
+                self.alloc.free(conditions);
+            }
+            for (self.conditions, self.implied_conditions) |*plan, implied| {
+                if (implied) continue;
+                conditions[initialized] = try plan.projectSource(self.alloc, cover.table(), &cover.layout);
+                initialized += 1;
+            }
+            self.covering_conditions = conditions;
+            self.covering_projection = selected;
+        }
+        return row;
     }
 
     fn rowView(self: *Reader, raw: []const u8) !codec.OrdinalRowView {
@@ -325,17 +408,18 @@ pub const Reader = struct {
                 break :blk key.items;
             } else if (internal.isRelationalRowKey(kv.key)) kv.key else null;
             if (primary) |key| {
-                const raw = if (self.index != null) self.read.get(key) catch |err| switch (err) {
+                if (self.index != null and !self.index_only) result.primary_lookups += 1;
+                const raw = if (self.index_only) kv.value else if (self.index != null) self.read.get(key) catch |err| switch (err) {
                     error.NotFound => return error.InvalidRelationalIndexForwardKey,
                     else => return err,
                 } else kv.value;
-                const row = try self.rowView(raw);
+                const row = if (self.index_only) try self.coveringView(kv.key, raw) else try self.rowView(raw);
                 const expired = self.active.visibilityTtlDurationNs() != 0 and row.writeTimestampNs() != 0 and
                     ttl.isExpired(row.writeTimestampNs(), self.active.visibilityTtlDurationNs(), self.now_ns);
                 var decoded_key: ?[]const u8 = null;
                 const matches = check: {
                     if (expired) break :check false;
-                    for (self.source_conditions) |condition| {
+                    for (if (self.index_only) self.covering_conditions else self.source_conditions) |condition| {
                         if (io) |runtime_io| try runtime_io.checkCancel();
                         if (!(try condition.evaluate(alloc, &predicate_scratch, row)).matches()) break :check false;
                     }
@@ -346,9 +430,13 @@ pub const Reader = struct {
                     break :check true;
                 };
                 if (matches) {
-                    const json = try row.projectAlloc(temporary, self.selected.?);
+                    const json = try row.projectAlloc(temporary, if (self.index_only) self.covering_projection.? else self.selected.?);
                     const document = decoded_key orelse (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;
-                    const size = json.len + document.len;
+                    const row_cursor = if (self.include_cursor) blk: {
+                        const identity = self.cursor_identity orelse break :blk null;
+                        break :blk try row_cursor_codec.encode(temporary, identity, kv.key[records.forward_prefix_len..]);
+                    } else null;
+                    const size = json.len + document.len + if (row_cursor) |encoded| encoded.len else @as(usize, 0);
                     if (size > budget.output_bytes) return error.RelationalRowResultTooLarge;
                     if (size > budget.output_bytes - result.output_bytes) {
                         exhausted = false;
@@ -358,8 +446,9 @@ pub const Reader = struct {
                         .key = try page.dupe(u8, document),
                         .json = try page.dupe(u8, json),
                         .version = row.writeTimestampNs(),
-                        .schema_version = row.table_schema.version,
+                        .schema_version = if (self.index_only) try @import("relational_index_cover.zig").Plan.sourceVersion(try records.forwardPayload(kv.key, raw)) else row.table_schema.version,
                         .semantic_hash = row.semanticHash(),
+                        .cursor = if (row_cursor) |encoded| try page.dupe(u8, encoded) else null,
                         .expected_content_digest = if (self.include_primary_digest) blk: {
                             var digest: [32]u8 = undefined;
                             std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
@@ -367,6 +456,7 @@ pub const Reader = struct {
                         } else null,
                     });
                     result.output_bytes += size;
+                    if (self.index_only) result.index_only_rows += 1;
                 }
             }
             continuation.clearRetainingCapacity();

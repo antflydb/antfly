@@ -355,9 +355,10 @@ pub fn applyReplicatedTransactionMutationInternal(
     raft_entry: ?db_mod.RaftAppliedEntryIdentity,
 ) !void {
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
+    if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
         .begin => |begin| {
-            const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
+            const local_participant = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
             defer alloc.free(local_participant);
             if (begin.participants.len == 0) return error.InvalidBatchRequest;
             var seen = std.StringHashMapUnmanaged(void).empty;
@@ -408,9 +409,11 @@ pub fn applyReplicatedTransactionMutationInternal(
                 .integrity_commands = req.integrity_commands,
                 .relational_activation = req.relational_activation,
                 .relational_retirement = req.relational_retirement,
+                .relational_index_maintenance = req.relational_index_maintenance,
                 .relational_schema_version = req.relational_schema_version,
                 .relational_integrity_generation_set = req.relational_integrity_generation_set,
                 .restore_staging_scope = req.restore_staging_scope,
+                .restore_staging_plan_id = req.restore_staging_plan_id,
                 .relational_repair = req.relational_repair,
             };
             if (raft_entry) |entry|
@@ -419,7 +422,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                 try db.writeTransaction(prepare.txn_id, intents);
         },
         .resolve => |resolve| {
-            const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
+            const local_participant = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
             defer alloc.free(local_participant);
             if (raft_entry) |entry| {
                 // Retained coordinators keep their own acknowledgement pending
@@ -1668,7 +1671,10 @@ pub fn applyLocalTableSchemaJson(
     const effective_schema_json = if (schema_json.len == 0) tables_api.default_schema_json else schema_json;
     // Install the public and runtime forms together so storage-boundary writes
     // immediately use the same authoritative validator as API writes.
-    try db.setSchemaJson(alloc, effective_schema_json);
+    // A cold owner may reopen while its durable backup fence is held. Opening
+    // an exact descriptor is a read, not a schema mutation or a new HA event.
+    if (!try db.rehydrateSchemaJson(effective_schema_json))
+        try db.setSchemaJson(alloc, effective_schema_json);
     // Propagate schema-derived changes to live algebraic indexes so dynamic
     // template updates take effect without a reopen.
     try db.reloadAlgebraicSchemaConfigs(effective_schema_json);

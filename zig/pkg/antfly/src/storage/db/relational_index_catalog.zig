@@ -27,7 +27,7 @@ const Digest = [std.crypto.hash.Blake3.digest_length]u8;
 
 pub const head_key = "\x00\x00__metadata__:relational_index_head";
 pub const blob_prefix = "\x00\x00__metadata__:relational_index_definitions:";
-pub const format_version: u32 = 1;
+pub const format_version: u32 = 2;
 pub const max_payload_bytes: usize = 4 * 1024 * 1024;
 pub const max_index_count: usize = 4096;
 const blob_header_len = 48;
@@ -80,6 +80,9 @@ pub const Head = struct {
 pub const Entry = struct {
     generation: u64,
     slot: u32,
+    /// Comparison dependencies, not the entire schema epoch. Ordinal moves
+    /// and unrelated columns must not force an LSM-wide index rewrite.
+    comparison: ?Digest = null,
     definition: native.RelationalIndexDefinition,
 
     pub fn id(self: Entry) native.RelationalIndexId {
@@ -194,8 +197,8 @@ pub const Prepared = struct {
     /// Index names are sorted once. An unchanged definition retains its physical
     /// generation; changed/new/reintroduced definitions use the new catalog
     /// revision, so dropping an index never permits its generation to be reused.
-    /// A schema change conservatively creates new generations until access-
-    /// method-specific dependency validation can prove a generation reusable.
+    /// Ordered tuples retain generations across schema changes when both their
+    /// full declaration and resolved physical comparison dependencies agree.
     pub fn init(
         alloc: Allocator,
         view: registry.SchemaView,
@@ -211,10 +214,11 @@ pub const Prepared = struct {
         const items = try alloc.alloc(Entry, definitions.len);
         defer alloc.free(items);
         for (definitions, items) |definition, *item| {
-            item.* = .{ .generation = revision, .slot = 0, .definition = definition };
+            item.* = .{ .generation = revision, .slot = 0, .definition = definition, .comparison = try comparisonFingerprint(alloc, view, definition) };
             if (previous) |p| {
-                if (std.mem.eql(u8, &p.schema_digest, &schema_hash)) {
-                    if (p.find(definition.name)) |old| {
+                if (p.find(definition.name)) |old| {
+                    const dependencies_match = if (old.comparison) |prior| if (item.comparison) |next| std.mem.eql(u8, &prior, &next) else false else std.mem.eql(u8, &p.schema_digest, &schema_hash);
+                    if (dependencies_match) {
                         const a = try std.json.Stringify.valueAlloc(alloc, definition, .{});
                         defer alloc.free(a);
                         const b = try std.json.Stringify.valueAlloc(alloc, old.definition, .{});
@@ -311,6 +315,7 @@ pub const Prepared = struct {
         try txn.put(head_key, &encoded_head);
         // The transaction that stops selecting an ID also queues its cleanup.
         const gc = @import("relational_index_gc.zig");
+        try gc.admitRetirements(txn, self.retired.len);
         for (self.retired) |id| try txn.put(&gc.key(id), &gc.initial(id));
         // Loaded views own their definitions and MVCC retains old roots.
         if (self.expected) |old| if (!std.mem.eql(u8, &old.blob_digest, &self.head.blob_digest))
@@ -346,9 +351,33 @@ pub fn load(alloc: Allocator, txn: anytype) !?Loaded {
 const plans = @import("relational_index_plan.zig");
 const docstore = @import("../docstore.zig");
 
+fn comparisonFingerprint(alloc: Allocator, view: registry.SchemaView, definition: native.RelationalIndexDefinition) !?Digest {
+    if (definition.access_method != .ordered_tuple or definition.unique or definition.expressions.len != 0 or
+        definition.where_expressions.len != 0 or
+        definition.method_config_json != null) return null;
+    var tuple = try @import("relational_index_keys.zig").TuplePlan.init(alloc, view.tableSchema().*, view.physicalLayout(), definition.keys);
+    defer tuple.deinit();
+    if (definition.include_columns.len != 0) {
+        var cover = try @import("relational_index_cover.zig").Plan.init(alloc, view.tableSchema().*, view.physicalLayout(), definition.keys, definition.include_columns);
+        defer cover.deinit();
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update(&tuple.fingerprint);
+        hash.update(&cover.fingerprint);
+        hash.final(&tuple.fingerprint);
+    }
+    if (definition.where.len != 0) {
+        var condition = try @import("relational_index_predicate.zig").Plan.init(alloc, view.tableSchema().*, view.physicalLayout(), definition.where);
+        defer condition.deinit();
+        condition.bindFingerprint(&tuple.fingerprint);
+    }
+    return tuple.fingerprint;
+}
+
 /// Executable ordered-key compilation. The durable vocabulary is intentionally
-/// broader than the currently implemented executor. Do not lower a partial,
-/// covering, expression, or constraint index to an unconditional plain key.
+/// broader than the currently implemented executor. Unsupported legacy AST or
+/// constraint-index declarations must not become unconditional plain keys.
+/// Typed expression keys, covering and partial declarations compile immutable
+/// layouts and dependency identities.
 pub fn bindWritePlan(alloc: Allocator, view: registry.SchemaView, loaded: *const Loaded) !plans.View {
     const schema_bytes = try schema.serializeSchema(alloc, view.tableSchema().*);
     defer alloc.free(schema_bytes);
@@ -361,16 +390,18 @@ pub fn bindWritePlan(alloc: Allocator, view: registry.SchemaView, loaded: *const
         if (source.access_method != .ordered_tuple or source.unique or
             source.owner_kind != .table or !std.mem.eql(u8, source.owner_name, native.relational_table_index_owner_name) or
             source.method_config_json != null or source.expressions.len != 0 or
-            source.include_columns.len != 0 or source.where.len != 0 or source.where_expressions.len != 0)
+            source.where_expressions.len != 0)
             return error.UnsupportedRelationalIndexExecution;
         if (source.keys.len == 0) return error.InvalidRelationalIndexDefinition;
+        const comparison = (try comparisonFingerprint(alloc, view, source)) orelse return error.UnsupportedRelationalIndexExecution;
+        if (entry.comparison == null or !std.mem.eql(u8, &entry.comparison.?, &comparison)) return error.RelationalIndexCatalogSchemaMismatch;
         // Redundant column summaries must agree with the executable key order.
         if (source.columns.len != 0) {
             if (source.columns.len != source.keys.len) return error.InvalidRelationalIndexDefinition;
             for (source.columns, source.keys) |column, key|
                 if (!std.mem.eql(u8, column, key.column)) return error.InvalidRelationalIndexDefinition;
         }
-        target.* = .{ .name = source.name, .generation = entry.generation, .slot = entry.slot, .keys = source.keys };
+        target.* = .{ .name = source.name, .generation = entry.generation, .slot = entry.slot, .keys = source.keys, .include_columns = source.include_columns, .where = source.where };
     }
     return try plans.View.init(alloc, view, definitions);
 }
@@ -526,6 +557,7 @@ pub const Controller = struct {
         return std.mem.eql(u8, key, head_key) or std.mem.startsWith(u8, key, blob_prefix) or
             std.mem.eql(u8, key, @import("relational_constraint_jobs.zig").progress_key) or
             std.mem.startsWith(u8, key, @import("relational_index_jobs.zig").progress_prefix) or
+            std.mem.startsWith(u8, key, @import("relational_index_maintenance_contract.zig").control_prefix) or
             std.mem.startsWith(u8, key, @import("relational_index_gc.zig").prefix);
     }
 
@@ -805,6 +837,9 @@ fn testCatalogTransaction(comptime Backend: type) !void {
         const FailingTxn = struct {
             txn: *DocStore.Txn,
             puts: usize = 0,
+            pub fn openCursor(self: *@This()) !DocStore.Txn.CursorAdapter {
+                return self.txn.openCursor();
+            }
             pub fn delete(self: *@This(), item: []const u8) !void {
                 try self.txn.delete(item);
             }
@@ -942,6 +977,48 @@ test "relational index catalog physical identities survive name ordering and rej
     aliases[1].slot = aliases[0].slot;
     try std.testing.expectError(error.DuplicateRelationalIndexId, validateEntries(alloc, &aliases, original.head.revision));
     try std.testing.expectError(error.InvalidRelationalIndexId, native.RelationalIndexId.decode(&([_]u8{0} ** 12)));
+}
+
+test "relational index catalog reuses only unchanged comparison dependencies across schema epochs" {
+    const alloc = std.testing.allocator;
+    var schemas = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    defer schemas.deinit();
+    var view = schemas.acquire().?;
+    defer view.release();
+    var first = try Prepared.init(alloc, view, null, test_definitions[0..1]);
+    defer first.deinit();
+    var original = try decode(alloc, first.head, first.blob);
+    defer original.deinit();
+    const moved = [_]schema.RelationalColumn{ test_columns[1], test_columns[0], .{ .name = "extra", .path = "extra", .column_type = .string, .allows_null = true } };
+    var next_schema = test_schema;
+    next_schema.version += 1;
+    next_schema.relational_columns = &moved;
+    var next_registry = try registry.Registry.initCloned(alloc, std.testing.io, next_schema);
+    defer next_registry.deinit();
+    var next_view = next_registry.acquire().?;
+    defer next_view.release();
+    var next = try Prepared.init(alloc, next_view, &original, test_definitions[0..1]);
+    defer next.deinit();
+    var reused = try decode(alloc, next.head, next.blob);
+    defer reused.deinit();
+    try std.testing.expectEqual(original.entries()[0].id(), reused.entries()[0].id());
+    try std.testing.expectEqual(@as(usize, 0), next.retired.len);
+    var plan = try bindWritePlan(alloc, next_view, &reused);
+    defer plan.release();
+    var changed_columns = moved;
+    changed_columns[1].column_type = .number;
+    next_schema.version += 1;
+    next_schema.relational_columns = &changed_columns;
+    var changed_registry = try registry.Registry.initCloned(alloc, std.testing.io, next_schema);
+    defer changed_registry.deinit();
+    var changed_view = changed_registry.acquire().?;
+    defer changed_view.release();
+    var changed = try Prepared.init(alloc, changed_view, &reused, test_definitions[0..1]);
+    defer changed.deinit();
+    var replacement = try decode(alloc, changed.head, changed.blob);
+    defer replacement.deinit();
+    try std.testing.expect(replacement.entries()[0].generation > reused.entries()[0].generation);
+    try std.testing.expectEqual(@as(usize, 1), changed.retired.len);
 }
 
 fn testPublication(comptime Backend: type) !void {

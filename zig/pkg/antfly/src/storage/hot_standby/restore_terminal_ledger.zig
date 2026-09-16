@@ -273,6 +273,43 @@ pub const Ledger = struct {
     }
 };
 
+test "storage.hot_standby terminal ledgers isolate custom replica roots and explicit seed metadata" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const paths = @import("restore_owner_contract.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const left_replica = try std.fs.path.join(alloc, &.{ root, "data-4-replicas" });
+    defer alloc.free(left_replica);
+    const right_replica = try std.fs.path.join(alloc, &.{ root, "data-5-replicas" });
+    defer alloc.free(right_replica);
+    const left_root = try paths.metadataRootAlloc(alloc, left_replica, null);
+    defer alloc.free(left_root);
+    const right_root = try paths.metadataRootAlloc(alloc, right_replica, null);
+    defer alloc.free(right_root);
+    try std.testing.expect(!std.mem.eql(u8, left_root, right_root));
+    try std.testing.expect(std.mem.startsWith(u8, left_root, left_replica));
+    try std.testing.expect(std.mem.startsWith(u8, right_root, right_replica));
+    var left = try Ledger.open(alloc, io, left_root);
+    defer left.deinit();
+    var right = try Ledger.open(alloc, io, right_root);
+    defer right.deinit();
+    const terminal: Terminal = .{ .group_id = 71, .table_id = 7, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .scope = @splat(1), .payload = @splat(2) };
+    try left.record(terminal);
+    var left_view = try left.snapshot();
+    defer left_view.deinit();
+    var right_view = try right.snapshot();
+    defer right_view.deinit();
+    try std.testing.expect(try left_view.get(71) != null);
+    try std.testing.expect(try right_view.get(71) == null);
+    const explicit = try paths.metadataRootAlloc(alloc, right_replica, "/volume/activated/metadata");
+    defer alloc.free(explicit);
+    try std.testing.expectEqualStrings("/volume/activated/metadata", explicit);
+    try std.testing.expectError(error.InvalidHASeedSnapshotRoot, paths.metadataRootAlloc(alloc, right_replica, ""));
+}
+
 test "HA terminal ledger streams history beyond active owner cap with fixed buffers" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;

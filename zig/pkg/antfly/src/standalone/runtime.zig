@@ -1081,7 +1081,7 @@ const LocalStandaloneMetadata = struct {
 
     const RestorePersistence = antfly.public_api.restore_jobs.ReplicatedPersistence;
     fn restorePersistence(self: *LocalStandaloneMetadata) RestorePersistence {
-        return RestorePersistence.fromLocal(self, .{ .load = restoreJobsLoad, .get = restoreJobsGet, .put = restoreJobsPut, .create = restoreJobsCreate, .delete = restoreJobsDelete, .delete_many = restoreJobsDeleteMany, .delete_matching = restoreJobsDeleteMatching });
+        return RestorePersistence.fromLocal(self, .{ .load = restoreJobsLoad, .get = restoreJobsGet, .put = restoreJobsPut, .create = restoreJobsCreate, .create_with_staging = restoreJobsCreateWithStaging, .delete = restoreJobsDelete, .delete_many = restoreJobsDeleteMany, .delete_matching = restoreJobsDeleteMatching });
     }
     fn migrateRestoreJobs(self: *LocalStandaloneMetadata, legacy: *antfly.storage_backend_erased.Store) !void {
         const store = self.lifecycle_store orelse return;
@@ -1163,6 +1163,15 @@ const LocalStandaloneMetadata = struct {
         defer locked.deinit();
         try self.requireRestoreJobTermLocked(term);
         try self.applyJobCommandLocked(.{ .create_restore_job = .{ .key = key, .value = value } });
+        return (try self.lifecycle_store.?.getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+    }
+    fn restoreJobsCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, term: u64) ![]u8 {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        var locked = try self.lockMutation();
+        defer locked.deinit();
+        if (!self.coordinated_lifecycle_allowed) return error.CoordinatedStandaloneHAMetadataRequired;
+        try self.requireRestoreJobTermLocked(term);
+        try self.applyJobCommandLocked(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } });
         return (try self.lifecycle_store.?.getRestoreJobValue(alloc, group_ids.main_metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
     }
     fn restoreJobsDelete(ptr: *anyopaque, key: []const u8, term: u64) !void {
@@ -3156,6 +3165,7 @@ pub fn runFromIterator(
             .session_savepoint_limit = if (loaded_config) |*cfg| cfg.transaction_sessions.max_savepoints else standalone_session_savepoint_limit,
         },
         .ha = if (ha_primary != null or ha_standby != null or ha_fence_store != null or ha_former_primary_log != null) .{
+            .restore_owner_metadata_root = std.fs.path.dirname(resolved.local_metadata_catalog_path) orelse return error.InvalidHASeedSnapshotRoot,
             .admin_context = .{
                 .primary = if (ha_primary) |*primary| primary else null,
                 .primary_node_id = cli.ha_primary_node_id,
@@ -3175,7 +3185,7 @@ pub fn runFromIterator(
             .primary_retention_policy = ha_retention_policy,
             .primary_sync_policy = ha_sync_policy.policy,
             .standby_replication = try haStandbyReplicationConfigFromCliWithBearerToken(cli, admin_bearer_token),
-        } else .{},
+        } else .{ .restore_owner_metadata_root = std.fs.path.dirname(resolved.local_metadata_catalog_path) orelse return error.InvalidHASeedSnapshotRoot },
         .backend_runtime = node_backend_runtime.ptr(),
     }, local_metadata.catalogSource(), local_metadata.statusSource());
     // A non-HA standalone process is the complete set of readers and writers
@@ -9178,6 +9188,13 @@ test "standalone shared catalog resumes private restore and publishes atomically
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, catalog_path, runtime.ptr(), null, .local);
     var metadata_open = true;
     defer if (metadata_open) metadata.deinit();
+    const rejected_rewrite_key = "\x00\x00__api_restore_jobs__:0000000000000007";
+    try std.testing.expectError(error.NotLeader, metadata.restorePersistence().createWithStaging(alloc, rejected_rewrite_key, "{}", "{}", 2));
+    try std.testing.expectError(error.RestoreJobCommitNotApplied, metadata.restorePersistence().createWithStaging(alloc, rejected_rewrite_key, "{}", "{}", 1));
+    try std.testing.expect((try metadata.restorePersistence().get(alloc, rejected_rewrite_key)) == null);
+    metadata.coordinated_lifecycle_allowed = false;
+    try std.testing.expectError(error.CoordinatedStandaloneHAMetadataRequired, metadata.restorePersistence().createWithStaging(alloc, rejected_rewrite_key, "{}", "{}", 1));
+    metadata.coordinated_lifecycle_allowed = true;
     try LocalStandaloneMetadata.createTable(&metadata, alloc, "existing", .{});
     const stages = @import("../metadata/restore_staging.zig");
     const targets = [_]stages.Target{

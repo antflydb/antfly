@@ -1572,6 +1572,7 @@ const RoutePinnedCatalog = struct {
 
     const vtable: table_catalog.CatalogSource.VTable = .{
         .restore_scope_for_group = restoreScopeForGroup,
+        .restore_plan_for_group = restorePlanForGroup,
         .admin_snapshot = adminSnapshot,
         .free_admin_snapshot = freeAdminSnapshot,
         .routing_snapshot = routingSnapshot,
@@ -1592,6 +1593,10 @@ const RoutePinnedCatalog = struct {
 
     fn restoreScopeForGroup(ptr: *anyopaque, table_name: []const u8, group_id: u64) !?[32]u8 {
         return cast(ptr).base.restoreScopeForGroup(table_name, group_id);
+    }
+
+    fn restorePlanForGroup(ptr: *anyopaque, table_name: []const u8, group_id: u64) !?[16]u8 {
+        return cast(ptr).base.restorePlanForGroup(table_name, group_id);
     }
 
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -3268,6 +3273,7 @@ pub const ProvisionedTableReadSource = struct {
     pub fn source(self: *ProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
+            .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else false,
             .vtable = &.{
                 .lookup = lookup,
                 .scan = scan,
@@ -3418,10 +3424,12 @@ pub const ProvisionedTableReadSource = struct {
         // that is waiting on it. Multi-range barriers remain bounded-parallel
         // so removing that cycle does not serialize distributed reads.
         if (consistency == .stale or group_ids.len == 0) return;
+        const allow_stale_fallback = !(consistency == .read_index and request == .lookup and
+            (if (self.local_read_source) |local| local.strict_read_index_absence else false));
         const plan = planFanout(.query, self.io_impl, group_ids.len);
         if (!plan.parallel) {
             for (group_ids) |group_id| {
-                try prepareProvisionedGroupConsistency(self.read_safety_barrier, group_id, request, consistency, true);
+                try prepareProvisionedGroupConsistency(self.read_safety_barrier, group_id, request, consistency, allow_stale_fallback);
             }
             return;
         }
@@ -3436,8 +3444,9 @@ pub const ProvisionedTableReadSource = struct {
                 group_id: u64,
                 request_inner: *const ProvisionedConsistencyRequest,
                 consistency_inner: raft_mod.ReadConsistency,
+                allow_stale: bool,
             ) void {
-                prepareProvisionedGroupConsistency(read_safety_barrier, group_id, request_inner.*, consistency_inner, true) catch |err| {
+                prepareProvisionedGroupConsistency(read_safety_barrier, group_id, request_inner.*, consistency_inner, allow_stale) catch |err| {
                     slot.* = err;
                 };
             }
@@ -3448,7 +3457,7 @@ pub const ProvisionedTableReadSource = struct {
             const end = @min(start + plan.width, group_ids.len);
             var group: std.Io.Group = .init;
             for (group_ids[start..end], start..end) |group_id, i| {
-                group.async(self.io_impl.?.io(), Fiber.run, .{ self.read_safety_barrier, &errors[i], group_id, &request, consistency });
+                group.async(self.io_impl.?.io(), Fiber.run, .{ self.read_safety_barrier, &errors[i], group_id, &request, consistency, allow_stale_fallback });
             }
             try group.await(self.io_impl.?.io());
             for (errors[start..end]) |maybe_err| if (maybe_err) |err| return err;
@@ -3513,6 +3522,13 @@ pub const ProvisionedTableReadSource = struct {
     ) !bool {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        if (try ordered_rows.isIndexQuery(alloc, opts.relational_query_json)) {
+            var result = (try scan(ptr, alloc, table_name, from_key, to_key, opts, consistency)) orelse return false;
+            defer result.deinit(alloc);
+            try sink.start();
+            try sink.write(result.ndjson);
+            return true;
+        }
         var attempt: usize = 0;
         retry: while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var prepared = try self.prepareRoutedSpanRead(alloc, table_name, from_key, to_key, .{ .scan = .{ .from_key = from_key, .to_key = to_key, .opts = opts } }, consistency, .general);
@@ -3774,6 +3790,7 @@ pub const ProvisionedTableReadSource = struct {
             const fence = routed.fence() orelse return null;
             var scoped = opts;
             scoped.restore_staging_scope = (try self.catalog.restoreScopeForGroup(table_name, fence.route.group_id)) orelse return error.RestoreStagingScopeChanged;
+            scoped.restore_staging_plan_id = try self.catalog.restorePlanForGroup(table_name, fence.route.group_id);
             return self.lookupRestoreStaging(alloc, fence.route.group_id, table_name, key, scoped, fence);
         }
         if (self.distributed_router != null) {
@@ -3912,6 +3929,7 @@ pub const ProvisionedTableReadSource = struct {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.scan(&hosted, alloc, table_name, from_key, to_key, opts, consistency);
         }
+        const index_order = try ordered_rows.isIndexQuery(alloc, opts.relational_query_json);
         var attempt: usize = 0;
         retry: while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var prepared = try self.prepareRoutedSpanRead(alloc, table_name, from_key, to_key, .{ .scan = .{ .from_key = from_key, .to_key = to_key, .opts = opts } }, consistency, .general);
@@ -3921,11 +3939,13 @@ pub const ProvisionedTableReadSource = struct {
             try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
             var out = std.ArrayListUnmanaged(u8).empty;
             defer out.deinit(alloc);
+            var ordered = if (index_order) try ordered_rows.Merger.init(alloc, if (opts.limit == 0) 128 else opts.limit) else null;
+            defer if (ordered) |*merge| merge.deinit();
 
             var emitted: u32 = 0;
             for (group_ids, prepared.routes, 0..) |group_id, group_route, route_index| {
                 var group_opts = opts;
-                if (opts.limit > 0) {
+                if (opts.limit > 0 and !index_order) {
                     if (emitted >= opts.limit) break;
                     group_opts.limit = opts.limit - emitted;
                 }
@@ -3944,11 +3964,19 @@ pub const ProvisionedTableReadSource = struct {
                         return error.StorageReadTemporarilyUnavailable;
                     },
                     else => return err,
-                }) orelse continue;
+                }) orelse {
+                    if (index_order) return error.TopologyChanged;
+                    continue;
+                };
                 defer result.deinit(alloc);
-                try out.appendSlice(alloc, result.ndjson);
+                if (ordered) |*merge| {
+                    merge.beginGroup();
+                    try merge.write(result.ndjson);
+                    try merge.endGroup();
+                } else try out.appendSlice(alloc, result.ndjson);
                 emitted += @intCast(std.mem.count(u8, result.ndjson, "\n"));
             }
+            if (ordered) |*merge| return .{ .ndjson = try merge.finishAlloc() };
             return .{ .ndjson = try out.toOwnedSlice(alloc) };
         }
         unreachable;
@@ -5858,6 +5886,7 @@ pub const HostedProvisionedTableReadSource = struct {
     pub fn source(self: *HostedProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
+            .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else false,
             .vtable = &.{
                 .lookup = lookup,
                 .scan = scan,
@@ -5945,7 +5974,20 @@ pub const HostedProvisionedTableReadSource = struct {
 
         var scoped_opts = opts;
         if (try self.catalog.restoreScopeForGroup(table_name, group_id)) |scope| scoped_opts.restore_staging_scope = scope;
-        if (try lookupViaRoute(self, alloc, route, group_id, table_name, key, scoped_opts, consistency)) |result| return result;
+        if (try self.catalog.restorePlanForGroup(table_name, group_id)) |plan| scoped_opts.restore_staging_plan_id = plan;
+        const initial = lookupViaRoute(self, alloc, route, group_id, table_name, key, scoped_opts, consistency) catch |err| switch (err) {
+            error.AuthoritativeLookupMissing => return null,
+            else => return err,
+        };
+        if (initial) |result| return result;
+        // A successful native read-index lookup has already proved absence
+        // under the pinned route and applied read barrier. Consulting other
+        // replicas cannot strengthen that result and makes each insert's
+        // preflight miss fetch the entire placement catalog. Physical legacy
+        // sources may downgrade NotLeader to stale; remote HTTP misses remain
+        // ambiguous, so neither takes this shortcut.
+        if (route == .local and consistency == .read_index and
+            (if (self.local_read_source) |local| local.strict_read_index_absence else false)) return null;
         return try lookupAcrossActivePlacements(self, alloc, group_id, table_name, key, scoped_opts, consistency, route);
     }
 
@@ -6085,6 +6127,7 @@ pub const HostedProvisionedTableReadSource = struct {
             if (lookupRemote(self.internalExecutor(), alloc, base_uri, group_id, table_name, key, opts, consistency)) |result| {
                 return result;
             } else |err| switch (err) {
+                error.AuthoritativeLookupMissing => return null,
                 error.UnexpectedHttpStatus => continue,
                 else => return err,
             }
@@ -6157,21 +6200,27 @@ pub const HostedProvisionedTableReadSource = struct {
         sink: ScanStreamSink,
     ) !bool {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .{ .span = .{ .from_key = from_key, .to_key = to_key } }, null);
+        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .{ .span = .{ .from_key = from_key, .to_key = to_key } }, opts.execution_deadline_ns);
         defer routing_session.deinit();
         var routed_source = hosted.*;
         routed_source.catalog = routing_session.catalog();
         const self = &routed_source;
-        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, null);
+        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, opts.execution_deadline_ns);
         defer route_snapshot.deinit(alloc);
         const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return false;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
 
+        const index_order = try ordered_rows.isIndexQuery(alloc, opts.relational_query_json);
+        var ordered = if (index_order) try ordered_rows.Merger.init(alloc, if (opts.limit == 0) 128 else opts.limit) else null;
+        defer if (ordered) |*merge| merge.deinit();
         var stream = ScanStartOnce{ .downstream = sink };
         for (group_ids) |group_id| {
+            if (ordered) |*merge| merge.beginGroup();
+            _ = try scanRemainingTimeoutMs(opts);
+            const group_sink = if (ordered) |*merge| orderedRowSink(merge) else stream.sink();
             var group_opts = opts;
-            if (opts.limit > 0) {
+            if (opts.limit > 0 and !index_order) {
                 if (stream.lines >= opts.limit) break;
                 group_opts.limit = opts.limit - stream.lines;
             }
@@ -6180,7 +6229,7 @@ pub const HostedProvisionedTableReadSource = struct {
             switch (route) {
                 .local => {
                     const local_source = try self.groupLocalSourceForGroup(alloc, group_id, table_name, null, null);
-                    if (!(try local_source.scanGroupLocalStream(alloc, group_id, table_name, from_key, to_key, group_opts, consistency, stream.sink()))) return false;
+                    if (!(try local_source.scanGroupLocalStream(alloc, group_id, table_name, from_key, to_key, group_opts, consistency, group_sink))) return false;
                 },
                 .remote => |remote| {
                     if (!(try scanRemoteToSink(
@@ -6192,10 +6241,20 @@ pub const HostedProvisionedTableReadSource = struct {
                         from_key,
                         to_key,
                         group_opts,
-                        stream.sink(),
+                        group_sink,
                     ))) return false;
                 },
             }
+            if (ordered) |*merge| try merge.endGroup();
+        }
+        if (ordered) |*merge| {
+            try table_catalog.validatePinnedTopologyEpochUntil(alloc, hosted.catalog, table_name, route_snapshot.topology_epoch, opts.execution_deadline_ns);
+            const result = try merge.finishAlloc();
+            defer alloc.free(result);
+            _ = try scanRemainingTimeoutMs(opts);
+            try sink.start();
+            try sink.write(result);
+            return true;
         }
         try stream.sink().start();
         return true;
@@ -14404,8 +14463,10 @@ fn lookupRemote(
         opts.relational_integrity_action,
         opts.relational_integrity_jobs_json,
         opts.relational_activation_json,
+        opts.relational_index_status_json,
         opts.relational_topology_json,
         opts.restore_staging_scope,
+        opts.restore_staging_plan_id,
         opts.include_primary_digest,
     );
     defer result.deinit(alloc);
@@ -14876,6 +14937,18 @@ pub const encodeStorageKernelQueryRequest = local_query_contract.encodeStorageKe
 pub const StorageKernelLookupWireRequest = local_query_contract.StorageKernelLookupWireRequest;
 const integrityLookupMode = local_query_contract.integrityLookupMode;
 const appendRelationalScanLine = local_query_contract.appendRelationalScanLine;
+const ordered_rows = @import("relational_row_merge.zig");
+
+fn orderedRowSink(merge: *ordered_rows.Merger) ScanStreamSink {
+    const Adapter = struct {
+        fn start(_: ?*anyopaque) anyerror!void {}
+        fn write(raw: ?*anyopaque, bytes: []const u8) anyerror!void {
+            const target: *ordered_rows.Merger = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+            try target.write(bytes);
+        }
+    };
+    return .{ .context = merge, .start_fn = Adapter.start, .write_fn = Adapter.write };
+}
 
 pub const encodeStorageKernelLookupRequest = local_query_contract.encodeStorageKernelLookupRequest;
 
@@ -15172,6 +15245,15 @@ fn scanNdjsonWithConsistencyToSink(
     consistency: raft_mod.ReadConsistency,
     sink: ScanStreamSink,
 ) !void {
+    if (opts.relational_query_json.len != 0) {
+        const ndjson = try scanNdjsonWithConsistencyAlloc(alloc, reads, db, from_key, to_key, opts, consistency);
+        defer alloc.free(ndjson);
+        if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+        _ = try scanRemainingTimeoutMs(opts);
+        try sink.start();
+        try sink.write(ndjson);
+        return;
+    }
     const NdjsonVisitor = struct {
         alloc: std.mem.Allocator,
         sink: ScanStreamSink,
@@ -15419,6 +15501,121 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(builtin.is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "distributed txn native read-index absence avoids placement refresh and replica reads" {
+            const Fixture = struct {
+                reads: usize = 0,
+                failure: ?anyerror = null,
+                remote: bool = false,
+                acknowledge: bool = true,
+                absence: []const u8 = "1",
+                status: u16 = 404,
+                fn localNodeId(_: *anyopaque) u64 {
+                    return 1;
+                }
+                fn leader(ptr: *anyopaque, _: u64) ?u64 {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    return if (self.remote) 2 else 1;
+                }
+                fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+                    return .active;
+                }
+                fn nodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64) !?[]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (!self.remote) return error.UnexpectedReplicaRead;
+                    return try alloc.dupe(u8, "http://worker");
+                }
+                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedPlacementRefresh;
+                }
+                fn notLeader(_: *anyopaque, _: u64, _: []const u8) !void {
+                    return error.NotLeader;
+                }
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+                    unreachable;
+                }
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (!self.remote) return error.UnexpectedReplicaRead;
+                    self.reads += 1;
+                    const headers = try alloc.alloc(http_common.Header, 2);
+                    headers[0] = .{ .name = try alloc.dupe(u8, metadata_api.catalog_route_fence_ack_header), .value = try alloc.dupe(u8, if (self.acknowledge) "1" else "") };
+                    headers[1] = .{ .name = try alloc.dupe(u8, metadata_api.read_index_absence_header), .value = try alloc.dupe(u8, self.absence) };
+                    return .{ .status = self.status, .headers = headers, .body = try alloc.dupe(u8, "not found") };
+                }
+                fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                    const groups = try alloc.alloc(table_catalog.CatalogGroupRoute, 1);
+                    groups[0] = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } };
+                    return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .groups = groups } };
+                }
+                fn lookup(ptr: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group: u64, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?LookupResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(@as(u64, 7), group);
+                    try std.testing.expectEqual(group, fence.route.group_id);
+                    self.reads += 1;
+                    if (self.failure) |err| return err;
+                    return null;
+                }
+            };
+            var fixture: Fixture = .{};
+            const catalog: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.adminSnapshot, .free_admin_snapshot = Fixture.freeAdminSnapshot, .resolve_route = Fixture.resolve } };
+            const router: table_router.HostedGroupRouter = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.localNodeId, .local_status = Fixture.localStatus, .group_leader_node_id = Fixture.leader, .node_base_uri = Fixture.nodeBaseUri } };
+            var hosted = HostedProvisionedTableReadSource.init("unused", catalog, raft_mod.read_gate.alreadyReadSafeBarrier(), router, .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } });
+            _ = hosted.withLocalReadSource(.{ .ptr = &fixture, .strict_read_index_absence = true, .vtable = &.{ .lookup = unsupportedPhysicalTopLevelLookup, .scan = unsupportedPhysicalTopLevelScan, .query = unsupportedPhysicalTopLevelQuery, .lookup_group_local_routed = Fixture.lookup } });
+            for (0..36) |_| try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
+            try std.testing.expectEqual(@as(usize, 36), fixture.reads);
+            // No absence is inferred from failed barriers; stale reads retain
+            // the existing fallback behavior instead of claiming authority.
+            fixture.failure = error.ReadIndexTimeout;
+            try std.testing.expectError(error.ReadIndexTimeout, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+            fixture.failure = null;
+            try std.testing.expectError(error.UnexpectedPlacementRefresh, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .stale));
+            hosted.local_read_source.?.strict_read_index_absence = false;
+            try std.testing.expectError(error.UnexpectedPlacementRefresh, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+
+            // Authenticated routed HTTP requires explicit successful-absence
+            // proof, not an arbitrary 404 or routing acknowledgement alone.
+            fixture.remote = true;
+            fixture.reads = 0;
+            for (0..36) |_| try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
+            try std.testing.expectEqual(@as(usize, 36), fixture.reads);
+            inline for (.{ "", "2" }) |marker| {
+                fixture.absence = marker;
+                try std.testing.expectError(error.UnexpectedPlacementRefresh, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+            }
+            fixture.absence = "1";
+            fixture.status = 500;
+            try std.testing.expectError(error.UnexpectedPlacementRefresh, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+
+            // A raw client must not accept even valid headers for a stale
+            // request, or an absence marker without its route ACK.
+            fixture.status = 404;
+            const executor: http_common.RequestExecutor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } };
+            try std.testing.expectError(error.UnexpectedHttpStatus, lookupRemote(executor, std.testing.allocator, "http://worker", 7, "rows", "absent", .{}, .stale));
+            fixture.acknowledge = false;
+            try std.testing.expectError(error.UnexpectedHttpStatus, lookupRemote(executor, std.testing.allocator, "http://worker", 7, "rows", "absent", .{}, .read_index));
+
+            const operations_module = @import("internal_group_operations.zig");
+            hosted.local_read_source.?.strict_read_index_absence = true;
+            var operations: operations_module.Operations = .{ .reads = hosted.local_read_source, .shard_db_adapter = null };
+            const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .route = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } } };
+            const fence_json = try std.json.Stringify.valueAlloc(std.testing.allocator, fence, .{});
+            defer std.testing.allocator.free(fence_json);
+            const context: @import("operation.zig").RequestContext = .{ .catalog_route_fence_json = fence_json };
+            const input: operations_module.LookupInput = .{ .group_id = 7, .table_name = "rows", .key = "absent" };
+            try std.testing.expectError(error.AuthoritativeLookupMissing, operations.lookup(std.testing.allocator, context, input));
+            operations.reads.?.strict_read_index_absence = false;
+            try std.testing.expectError(error.NotFound, operations.lookup(std.testing.allocator, context, input));
+            operations.reads.?.strict_read_index_absence = true;
+            var stale_input = input;
+            stale_input.consistency = .stale;
+            try std.testing.expectError(error.NotFound, operations.lookup(std.testing.allocator, context, stale_input));
+            var provisioned = ProvisionedTableReadSource.init("unused", catalog, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.notLeader } });
+            _ = provisioned.withLocalReadSource(hosted.local_read_source.?);
+            try std.testing.expect(provisioned.source().strict_read_index_absence);
+            try std.testing.expect(hosted.source().strict_read_index_absence);
+            try std.testing.expectError(error.NotLeader, provisioned.prepareGroupsForReadAdmission(std.testing.allocator, &.{7}, .{ .lookup = .{ .key = "absent", .opts = .{} } }, .read_index));
+        }
+
         test "relational row query primary digest transport preserves snapshot proof and rejects missing or invalid headers" {
             const alloc = std.testing.allocator;
             const Capture = struct {

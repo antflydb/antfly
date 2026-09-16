@@ -197,6 +197,65 @@ fn commit(alloc: Allocator, writer: writes.TableWriteSource, requests: []const c
     }
 }
 
+const DrainBudget = struct {
+    rows: u32 = 128,
+
+    fn shrink(self: *DrainBudget, observed: usize) bool {
+        // Native pages can stop early for their byte/CPU budget. Halving the
+        // requested cap alone would repeatedly prepare the same actual page.
+        if (observed <= 1 or self.rows <= 1) return false;
+        self.rows = @intCast(@max(@as(usize, 1), @min(self.rows / 2, observed / 2)));
+        return true;
+    }
+};
+
+fn drainPage(alloc: Allocator, reader: reads.TableReadSource, writer: writes.TableWriteSource, tables: []const records.TableRecord, table: records.TableRecord, owner_start: []const u8, expected: []const u8, control: Control) !void {
+    var budget: DrainBudget = .{};
+    for (0..8) |_| {
+        try control.ensureActive();
+        // Each failed admission releases its projections, parsed rows, and
+        // derived intents before another attempt, bounding peak memory to one
+        // page instead of retaining up to eight independent prepared arenas.
+        var attempt = std.heap.ArenaAllocator.init(alloc);
+        defer attempt.deinit();
+        const owned = attempt.allocator();
+        const request = try std.fmt.allocPrint(owned, "{{\"kind\":\"retirement\",\"mode\":\"page\",\"max_rows\":{d}}}", .{budget.rows});
+        var response = (try reader.lookup(owned, table.name, owner_start, .{
+            .relational_integrity_jobs_json = request,
+            .execution_deadline_ns = control.deadline_ns,
+            .execution_io = control.deadline_io,
+            .cancellation = control.cancellation,
+        }, .read_index)) orelse return error.ConstraintRetirementChanged;
+        defer response.deinit(owned);
+        var page = try std.json.parseFromSlice(struct { rows: []const planner.BackfillRow, command: native.Command, phase: native.Phase }, owned, response.json, .{ .allocate = .alloc_always });
+        defer page.deinit();
+        if (!std.mem.eql(u8, page.value.command.expected orelse return error.ConstraintRetirementChanged, expected) or
+            !std.mem.eql(u8, page.value.command.routing_key, owner_start)) return error.ConstraintRetirementChanged;
+        const progress = try native.Progress.decode(expected);
+        if (page.value.phase != progress.phase) return error.ConstraintRetirementChanged;
+        var prepared = planner.prepareRetirementPage(owned, reader, tables, table.name, page.value.rows, progress, control) catch |err| {
+            if (err == error.TransactionTooLarge and budget.shrink(page.value.rows.len)) continue;
+            return err;
+        };
+        defer prepared.deinit();
+        const requests = try owned.dupe(contract.TableCommitRequest, prepared.tables);
+        const source = for (requests) |*request_table| {
+            if (std.mem.eql(u8, request_table.table_name, table.name)) break request_table;
+        } else return error.InvalidConstraintRetirement;
+        source.relational_retirement = page.value.command;
+        commit(owned, writer, requests, control) catch |err| {
+            // Participant fanout and encoded intent overhead are only known
+            // at distributed admission. Treat this pre-decision rejection
+            // just like planner pressure; never retry ambiguous outcomes or
+            // advance the owner checkpoint independently of its detachments.
+            if (err == error.TransactionTooLarge and budget.shrink(page.value.rows.len)) continue;
+            return err;
+        };
+        return;
+    }
+    return error.TransactionTooLarge;
+}
+
 /// At most one 128-row native page or one metadata phase transition per call.
 /// A returned replacement must be durably CAS-published before later work.
 pub fn retry(alloc: Allocator, table: records.TableRecord) !Replacement {
@@ -233,7 +292,13 @@ fn runPageAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: write
         arena.deinit();
         return null;
     }
-    const control: Control = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s };
+    const deadline = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
+    const control: Control = .{ .deadline_ns = deadline, .cancellation = .{ .ptr = &deadline, .is_cancelled_fn = struct {
+        fn expired(ptr: *const anyopaque) bool {
+            const value: *const u64 = @ptrCast(@alignCast(ptr));
+            return @import("antfly_platform").time.monotonicNs() >= value.*;
+        }
+    }.expired } };
     const state = try readStatus(owned, reader, table.name, owner_start, control, true);
     const catalog = try catalog_mod.decode(owned, state.value.catalog);
     if (!std.mem.eql(u8, &job.generation_set, &activation.generationSet(catalog))) return error.ConstraintRetirementChanged;
@@ -256,32 +321,16 @@ fn runPageAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: write
         return null;
     }
     if (progress.phase == expected_phase and expected_phase != .fenced) {
-        var max_rows: u32 = 128;
-        for (0..8) |_| {
-            const request = try std.fmt.allocPrint(owned, "{{\"kind\":\"retirement\",\"mode\":\"page\",\"max_rows\":{d}}}", .{max_rows});
-            const response = (try reader.lookup(owned, table.name, owner_start, .{ .relational_integrity_jobs_json = request, .execution_deadline_ns = control.deadline_ns }, .read_index)) orelse return error.ConstraintRetirementChanged;
-            const page = try std.json.parseFromSlice(struct { rows: []const planner.BackfillRow, command: native.Command, phase: native.Phase }, owned, response.json, .{ .allocate = .alloc_always });
-            const prepared = planner.prepareRetirementPage(owned, reader, tables, table.name, page.value.rows, try native.Progress.decode(page.value.command.expected.?), control) catch |err| {
-                if (err == error.TransactionTooLarge and max_rows > 1) {
-                    max_rows /= 2;
-                    continue;
-                }
-                return err;
-            };
-            const requests = try owned.dupe(contract.TableCommitRequest, prepared.tables);
-            const source = for (requests) |*request_table| {
-                if (std.mem.eql(u8, request_table.table_name, table.name)) break request_table;
-            } else return error.InvalidConstraintRetirement;
-            source.relational_retirement = page.value.command;
-            try commit(owned, writer, requests, control);
-            arena.deinit();
-            return null;
-        }
-        return error.TransactionTooLarge;
+        try drainPage(alloc, reader, writer, tables, table, owner_start, state.value.progress orelse return error.ConstraintRetirementChanged, control);
+        arena.deinit();
+        return null;
     }
-    // Every phase boundary is an all-owner linearizable proof. Positive
-    // evidence lives in metadata; no volatile across-request readiness cache.
-    for (job.owners) |owner| {
+    // Verify at most one owner per tick. The topology/job is frozen and native
+    // progress is monotonic, making this durable prefix valid across process
+    // restarts and leadership changes. Rescanning all owners under a fresh
+    // deadline would never finish for sufficiently large tables.
+    {
+        const owner = job.owners[job.verified_owners];
         const peer = try readStatus(owned, reader, table.name, owner.start, control, false);
         if (!std.mem.eql(u8, peer.value.range_start, owner.start) or !std.mem.eql(u8, peer.value.range_end, owner.end)) return error.TopologyChanged;
         const proof = try native.Progress.decode(peer.value.progress orelse {
@@ -298,18 +347,131 @@ fn runPageAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: write
             return null;
         }
     }
-    job.phase = switch (job.phase) {
-        .fencing => .foreign_keys,
-        .foreign_keys => .unique,
-        .unique => .ready,
-        .ready, .published => unreachable,
-    };
+    job.verified_owners += 1;
+    if (job.verified_owners == job.owners.len) {
+        job.phase = switch (job.phase) {
+            .fencing => .foreign_keys,
+            .foreign_keys => .unique,
+            .unique => .ready,
+            .ready, .published => unreachable,
+        };
+        job.verified_owners = 0;
+    }
     var replacement = table;
     replacement.relational_retirement_json = try std.json.Stringify.valueAlloc(owned, job, .{});
     return .{ .arena = arena, .table = replacement };
 }
 
 test "distributed txn retirement drains self foreign keys before unique claims with durable checkpoints" {
+    try testRetirementDrain(.none);
+}
+
+test "distributed txn retirement adapts commit headroom without advancing rejected checkpoints" {
+    try testRetirementDrain(.page);
+}
+
+test "distributed txn retirement retains singleton failure and resumes the same proof after explicit retry" {
+    try testRetirementDrain(.singleton);
+}
+
+test "distributed txn retirement budget uses observed page size" {
+    var budget: DrainBudget = .{};
+    try std.testing.expect(budget.shrink(3));
+    try std.testing.expectEqual(@as(u32, 1), budget.rows);
+    try std.testing.expect(!budget.shrink(1));
+}
+
+const RetirementPressure = enum { none, page, singleton };
+
+test "distributed txn retirement verifies large owner barriers in bounded restartable slices" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var update = try catalog_mod.prepare(alloc, null, try catalog_mod.incarnationFromTableId(501), 1, @splat(1), &.{.{ .kind = .unique, .name = "pk", .fingerprint = @splat(2) }});
+    defer update.deinit();
+    const owners = try owned.alloc(metadata.Job.Owner, 129);
+    for (owners, 0..) |*owner, i| owner.* = .{
+        .group_id = i + 1,
+        .range_id = i + 1,
+        .start = if (i == 0) "" else try std.fmt.allocPrint(owned, "{d:0>4}", .{i}),
+        .end = if (i + 1 == owners.len) "" else try std.fmt.allocPrint(owned, "{d:0>4}", .{i + 1}),
+    };
+    const job: metadata.Job = .{
+        .id = @splat(3),
+        .source_schema_digest = metadata.digest("{}"),
+        .target_schema_digest = @splat(4),
+        .generation_set = activation.generationSet(update.catalog),
+        .generations = &.{update.catalog.bindings[0].generation},
+        .target_schema_json = "{\"version\":2}",
+        .owners = owners,
+    };
+    const Fixture = struct {
+        job: metadata.Job,
+        catalog: []const u8,
+        reads_this_tick: usize = 0,
+        expected_owner: usize = 0,
+        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, options: @import("../storage/db/types.zig").LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (options.cancellation) |cancellation| try cancellation.check();
+            self.reads_this_tick += 1;
+            try std.testing.expect(self.reads_this_tick <= 2);
+            const owner = if (self.reads_this_tick == 1) self.job.owners[0] else self.job.owners[self.expected_owner];
+            try std.testing.expectEqualStrings(owner.start, key);
+            const proof: native.Progress = .{
+                .job_id = self.job.id,
+                .generation_set = self.job.generation_set,
+                .owner = metadata.digest(owner.start),
+                .target_schema_digest = self.job.target_schema_digest,
+                .schema_version = 1,
+                .phase = .ready,
+                .generations = self.job.generations,
+            };
+            const progress = try proof.encode(allocator);
+            defer allocator.free(progress);
+            // Binary owner/range/checkpoint fields retain the same codec as
+            // the native endpoint; no live native state is cached by worker.
+            var output: std.Io.Writer.Allocating = .init(allocator);
+            defer output.deinit();
+            var json: std.json.Stringify = .{ .writer = &output.writer };
+            try @import("../storage/db/relational_integrity_json.zig").write(Status{ .catalog = self.catalog, .progress = progress, .owner = proof.owner, .range_start = owner.start, .range_end = owner.end }, &json);
+            return .{ .json = try allocator.dupe(u8, output.written()), .version = 0 };
+        }
+        fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: @import("../storage/db/types.zig").ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.ScanResponse {
+            return error.UnexpectedCall;
+        }
+        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: @import("../storage/db/types.zig").SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
+            return error.UnexpectedCall;
+        }
+        fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: @import("../storage/db/types.zig").BatchRequest) !?void {
+            return error.UnexpectedCall;
+        }
+    };
+    var fixture: Fixture = .{ .job = job, .catalog = update.value };
+    const reader: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = Fixture.scan, .query = Fixture.query } };
+    const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch } };
+    var table: records.TableRecord = .{ .table_id = 501, .name = "rows", .schema_json = "{}", .relational_retirement_json = try std.json.Stringify.valueAlloc(alloc, job, .{}) };
+    defer alloc.free(table.relational_retirement_json);
+    for (0..owners.len * 3) |tick| {
+        fixture.reads_this_tick = 0;
+        fixture.expected_owner = tick % owners.len;
+        var replacement = (try runPage(alloc, reader, writer, &.{table}, table, "")) orelse return error.MissingBarrierContinuation;
+        defer replacement.deinit();
+        try std.testing.expectEqual(@as(usize, 2), fixture.reads_this_tick);
+        try std.testing.expect(try metadata.transitionAllowed(alloc, table, replacement.table));
+        // Retain only a serialized metadata checkpoint between ticks, just as
+        // a replacement supervisor does after process restart or failover.
+        const persisted = try alloc.dupe(u8, replacement.table.relational_retirement_json);
+        alloc.free(table.relational_retirement_json);
+        table.relational_retirement_json = persisted;
+    }
+    var result = try metadata.parse(alloc, table.relational_retirement_json);
+    defer result.deinit();
+    try std.testing.expectEqual(metadata.Phase.ready, result.value.phase);
+    try std.testing.expectEqual(@as(u32, 0), result.value.verified_owners);
+}
+
+fn testRetirementDrain(pressure: RetirementPressure) !void {
     const db_mod = @import("../storage/db/db.zig");
     const types = @import("../storage/db/types.zig");
     const read_gate = @import("../raft/read_gate.zig");
@@ -330,6 +492,8 @@ test "distributed txn retirement drains self foreign keys before unique claims w
     const Fixture = struct {
         db: *db_mod.DB,
         attempts: u8 = 0,
+        pressure: RetirementPressure,
+        rejections: usize = 0,
         fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, options: types.LookupOptions, _: read_gate.ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const result = (try self.db.lookup(allocator, key, options)) orelse return null;
@@ -344,10 +508,22 @@ test "distributed txn retirement drains self foreign keys before unique claims w
         fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: types.BatchRequest) !?void {
             return error.UnexpectedCall;
         }
-        fn commitBatch(ptr: *anyopaque, _: Allocator, requests: []const contract.TableCommitRequest, _: types.SyncLevel, _: @import("../common/cancellation.zig").CancellationToken) !?contract.CommitOutcome {
+        fn commitBatch(ptr: *anyopaque, allocator: Allocator, requests: []const contract.TableCommitRequest, _: types.SyncLevel, cancellation: @import("../common/cancellation.zig").CancellationToken) !?contract.CommitOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try cancellation.check();
             try std.testing.expectEqual(@as(usize, 1), requests.len);
             const request = requests[0];
+            if (request.relational_retirement) |command| {
+                if (request.predicates.len != 0 and (self.pressure == .singleton or (self.pressure == .page and request.predicates.len > 1))) {
+                    // Distributed wire/participant headroom may reject an
+                    // otherwise valid prepared page before the decision.
+                    const durable = (try self.db.core.getStoreValue(allocator, native.key)).?;
+                    defer allocator.free(durable);
+                    try std.testing.expectEqualStrings(command.expected.?, durable);
+                    self.rejections += 1;
+                    return error.TransactionTooLarge;
+                }
+            }
             self.attempts += 1;
             const timestamp = @as(u64, self.attempts) * 100;
             const transaction = try self.db.beginTransactionWithId(@splat(self.attempts), timestamp);
@@ -367,7 +543,7 @@ test "distributed txn retirement drains self foreign keys before unique claims w
             return .{ .committed = .{ .participant_count = 1 } };
         }
     };
-    var fixture: Fixture = .{ .db = &db };
+    var fixture: Fixture = .{ .db = &db, .pressure = pressure };
     const reader: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = Fixture.scan, .query = Fixture.query } };
     const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .commit_batch_with_cancellation = Fixture.commitBatch } };
     var tables = [_]records.TableRecord{.{ .table_id = 400, .name = "rows", .schema_json = declaration }};
@@ -385,9 +561,30 @@ test "distributed txn retirement drains self foreign keys before unique claims w
         for (owned_updates.items) |*update| update.deinit();
         owned_updates.deinit(alloc);
     }
-    for (0..24) |_| {
+    var failure_retried = false;
+    for (0..32) |_| {
         var state = try metadata.parse(alloc, tables[0].relational_retirement_json);
         defer state.deinit();
+        if (state.value.failure.len != 0) {
+            try std.testing.expectEqual(RetirementPressure.singleton, pressure);
+            try std.testing.expect(!failure_retried);
+            try std.testing.expectEqualStrings("TransactionTooLarge", state.value.failure);
+            const before = (try db.core.getStoreValue(alloc, native.key)).?;
+            defer alloc.free(before);
+            // A paused job does no storage work. Administrative retry only
+            // clears the diagnostic, retaining its exact owner continuation.
+            try std.testing.expect(try runPage(alloc, reader, writer, &tables, tables[0], "") == null);
+            const update = try retry(alloc, tables[0]);
+            try std.testing.expect(try metadata.transitionAllowed(alloc, tables[0], update.table));
+            tables[0] = update.table;
+            try owned_updates.append(alloc, update);
+            const after = (try db.core.getStoreValue(alloc, native.key)).?;
+            defer alloc.free(after);
+            try std.testing.expectEqualStrings(before, after);
+            fixture.pressure = .none;
+            failure_retried = true;
+            continue;
+        }
         if (state.value.phase == .ready) break;
         if (try runPage(alloc, reader, writer, &tables, tables[0], "")) |update| {
             try std.testing.expect(try metadata.transitionAllowed(alloc, tables[0], update.table));
@@ -395,6 +592,8 @@ test "distributed txn retirement drains self foreign keys before unique claims w
             try owned_updates.append(alloc, update);
         }
     } else return error.RetirementDidNotConverge;
+    if (pressure != .none) try std.testing.expect(fixture.rejections > 0);
+    try std.testing.expectEqual(pressure == .singleton, failure_retried);
     const raw_claim = try db.core.getStoreValue(alloc, &address.claimKey());
     defer if (raw_claim) |bytes| alloc.free(bytes);
     try std.testing.expect(raw_claim == null);

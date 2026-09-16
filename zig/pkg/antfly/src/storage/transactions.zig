@@ -34,6 +34,7 @@ const build_options = @import("build_options");
 const tracing = @import("../tracing/antfly_trace_writer.zig");
 const stderr_writer = @import("../tracing/stderr_writer.zig");
 const ttl = @import("ttl.zig");
+const retained_effects = @import("retained_effects.zig");
 
 // ============================================================================
 // Key prefixes
@@ -52,7 +53,20 @@ const intent_locks_prefix = "\x00\x00__txn_intent_locks__:";
 const intent_keys_prefix = "\x00\x00__txn_intent_keys__:";
 const intent_members_prefix = "\x00\x00__txn_intent_members__:";
 const intent_admission_prefix = "\x00\x00__txn_intent_admission__:";
-const IntentAdmission = struct { count: u64 = 0, bytes: u64 = 0 };
+const IntentAdmission = struct {
+    count: u64 = 0,
+    bytes: u64 = 0,
+    retained_bytes: u64 = 0,
+    retained_keys: u64 = 0,
+    retention_tracked: bool = true,
+
+    fn reservation(self: @This()) u64 {
+        if (!self.retention_tracked or self.retained_keys == 0) return 0;
+        if (self.retained_keys > retained_effects.max_keys) return @max(self.retained_bytes +| 48, retained_effects.max_frame_bytes + 1);
+        return self.retained_bytes +| 48;
+    }
+};
+const IntentCost = struct { bytes: u64, retained: u64 };
 // Read dependencies that are not also writes need durable shared guards.
 // A predicate check alone is not a prepare vote: another transaction could
 // delete its parent row after the check but before the coordinator commits.
@@ -122,6 +136,48 @@ pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
     const bytes = std.math.mul(u64, payload, 64) catch return error.TransactionTooLarge;
     const keys = std.math.mul(u64, intent.key.len, 16) catch return error.TransactionTooLarge;
     return std.math.add(u64, bytes, std.math.add(u64, keys, 4096) catch return error.TransactionTooLarge) catch error.TransactionTooLarge;
+}
+
+/// REF3 contains final primary effects/timestamps and integrity records, not
+/// derived index/vector writes. AROW metadata replacement preserves length.
+/// Document numbers retain their exact source spelling. Only special-field
+/// stripping serializes JSON; count its exact output with a bounded writer.
+fn isRawMetadataIntentKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_activation") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or
+        @import("db/relational_index_maintenance_contract.zig").isControlKey(key);
+}
+
+fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
+    if (@import("db/relational_integrity_contract.zig").isKey(intent.key)) {
+        _ = try @import("db/relational_integrity_contract.zig").parseKey(intent.key);
+        return std.math.add(u64, 16 + intent.key.len, if (intent.value) |value| value.len else 0) catch error.TransactionTooLarge;
+    }
+    if (isRawMetadataIntentKey(intent.key)) return 0;
+    var payload: u64 = if (intent.prepared_row) |row| row.len else if (intent.value) |value| value.len else 0;
+    if (intent.prepared_row == null) if (intent.value) |value| {
+        // No escaped property name and no special spelling means the mapper
+        // borrows original bytes; do not parse or allocate on that common path.
+        if (std.mem.indexOf(u8, value, "_edges") != null or std.mem.indexOf(u8, value, "_embeddings") != null or std.mem.indexOfScalar(u8, value, '\\') != null) {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{ .parse_numbers = false }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidTxnRecord,
+            };
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                var buffer: [1024]u8 = undefined;
+                var counter = std.Io.Writer.Discarding.init(&buffer);
+                try std.json.Stringify.value(parsed.value, .{}, &counter.writer);
+                // Native DB removes special/vector fields, while the generic
+                // transaction manager can preserve raw document bytes. Cover
+                // both authorities; removing fields never grows this encoding.
+                payload = @max(payload, counter.fullCount());
+            }
+        }
+    };
+    return std.math.add(u64, 16 + 2 + internal_keys.encodedComponentLen(intent.key), payload) catch error.TransactionTooLarge;
 }
 
 fn appendOwnedBytes(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), bytes: []u8) !void {
@@ -621,7 +677,7 @@ pub const TxnManager = struct {
 
         const previous_admission = try self.loadIntentAdmission(self.alloc, txn_id);
         var admission = previous_admission orelse IntentAdmission{};
-        var pending_costs = std.StringHashMapUnmanaged(u64).empty;
+        var pending_costs = std.StringHashMapUnmanaged(IntentCost).empty;
         defer pending_costs.deinit(self.alloc);
         var last_intents = std.StringHashMapUnmanaged(usize).empty;
         defer last_intents.deinit(self.alloc);
@@ -643,26 +699,32 @@ pub const TxnManager = struct {
         // Only transactions from released document-storage versions need this
         // one-time conversion. New prepares never reread their prior payloads
         // or rewrite a growing list of keys.
-        if (previous_admission == null and record.intent_revision != 0) {
+        if ((previous_admission == null or !previous_admission.?.retention_tracked) and record.intent_revision != 0) {
+            admission = .{};
             var previous = try self.collectIntentBatch(self.alloc, txn_id);
             defer previous.deinit(self.alloc);
             for (previous.owned_entries.?) |entry| {
                 const key = entry.key[intents_prefix.len + 17 ..];
                 const decoded = try IntentValue.decode(entry.value);
-                const cost = try intentAdmissionBytes(.{ .key = key, .value = decoded.value, .prepared_row = decoded.prepared_row });
+                const previous_intent: WriteIntent = .{ .key = key, .value = decoded.value, .prepared_row = decoded.prepared_row };
+                const cost = try intentAdmissionBytes(previous_intent);
+                const retained = try retainedIntentBytes(self.alloc, previous_intent);
                 admission.count += 1;
                 admission.bytes = std.math.add(u64, admission.bytes, cost) catch return error.TransactionTooLarge;
-                try pending_costs.put(self.alloc, key, cost);
+                admission.retained_bytes = std.math.add(u64, admission.retained_bytes, retained) catch return error.TransactionTooLarge;
+                admission.retained_keys += @intFromBool(retained != 0);
+                try pending_costs.put(self.alloc, key, .{ .bytes = cost, .retained = retained });
                 const member_key = try makeIntentMemberKey(self.alloc, txn_id, key);
                 try appendOwnedBytes(self.alloc, &write_keys, member_key);
-                const member_value = try self.alloc.alloc(u8, 8);
+                const member_value = try self.alloc.alloc(u8, 16);
                 try appendOwnedBytes(self.alloc, &write_vals, member_value);
                 std.mem.writeInt(u64, member_value[0..8], cost, .little);
+                std.mem.writeInt(u64, member_value[8..16], retained, .little);
                 try writes.append(self.alloc, .{ .key = member_key, .value = member_value });
             }
             // Hash-map keys must outlive the snapshot.
             pending_costs.clearRetainingCapacity();
-            for (writes.items) |write| try pending_costs.put(self.alloc, write.key[intent_members_prefix.len + 17 ..], std.mem.readInt(u64, write.value[0..8], .little));
+            for (writes.items) |write| try pending_costs.put(self.alloc, write.key[intent_members_prefix.len + 17 ..], .{ .bytes = std.mem.readInt(u64, write.value[0..8], .little), .retained = std.mem.readInt(u64, write.value[8..16], .little) });
         }
 
         // Compute the final replacement-aware ledger before allocating any
@@ -676,17 +738,22 @@ pub const TxnManager = struct {
                     else => return err,
                 };
                 defer self.alloc.free(raw);
-                if (raw.len != 8) return error.InvalidTxnRecord;
-                break :blk std.mem.readInt(u64, raw[0..8], .little);
+                if (raw.len != 16) return error.InvalidTxnRecord;
+                break :blk IntentCost{ .bytes = std.mem.readInt(u64, raw[0..8], .little), .retained = std.mem.readInt(u64, raw[8..16], .little) };
             };
             const cost = try intentAdmissionBytes(intent);
+            const retained = try retainedIntentBytes(self.alloc, intent);
             if (prior) |old| {
-                admission.bytes = std.math.sub(u64, admission.bytes, old) catch return error.InvalidTxnRecord;
+                admission.bytes = std.math.sub(u64, admission.bytes, old.bytes) catch return error.InvalidTxnRecord;
+                admission.retained_bytes = std.math.sub(u64, admission.retained_bytes, old.retained) catch return error.InvalidTxnRecord;
+                admission.retained_keys = std.math.sub(u64, admission.retained_keys, @intFromBool(old.retained != 0)) catch return error.InvalidTxnRecord;
             } else {
                 admission.count = std.math.add(u64, admission.count, 1) catch return error.TransactionTooLarge;
             }
             admission.bytes = std.math.add(u64, admission.bytes, cost) catch return error.TransactionTooLarge;
-            try pending_costs.put(self.alloc, intent.key, cost);
+            admission.retained_bytes = std.math.add(u64, admission.retained_bytes, retained) catch return error.TransactionTooLarge;
+            admission.retained_keys += @intFromBool(retained != 0);
+            try pending_costs.put(self.alloc, intent.key, .{ .bytes = cost, .retained = retained });
             try last_intents.put(self.alloc, intent.key, index);
         }
         const read_admission = try self.stageReadGuards(txn_id, predicates, &last_intents, &write_keys, &write_vals, &writes);
@@ -700,8 +767,9 @@ pub const TxnManager = struct {
             if (last_intents.get(intent.key).? != index) continue;
             const member_key = try makeIntentMemberKey(self.alloc, txn_id, intent.key);
             try appendOwnedBytes(self.alloc, &write_keys, member_key);
-            const member_value = try self.alloc.alloc(u8, 8);
-            std.mem.writeInt(u64, member_value[0..8], pending_costs.get(intent.key).?, .little);
+            const member_value = try self.alloc.alloc(u8, 16);
+            std.mem.writeInt(u64, member_value[0..8], pending_costs.get(intent.key).?.bytes, .little);
+            std.mem.writeInt(u64, member_value[8..16], pending_costs.get(intent.key).?.retained, .little);
             try appendOwnedBytes(self.alloc, &write_vals, member_value);
             try writes.append(self.alloc, .{ .key = member_key, .value = member_value });
             const intent_key = try self.makeIntentKey(txn_id, intent.key);
@@ -747,9 +815,11 @@ pub const TxnManager = struct {
         try writes.append(self.alloc, .{ .key = &record_key, .value = record_value });
 
         const intent_keys_key = makeSidecarKey(intent_admission_prefix, txn_id);
-        const intent_keys_value = try self.alloc.alloc(u8, 16);
+        const intent_keys_value = try self.alloc.alloc(u8, 32);
         std.mem.writeInt(u64, intent_keys_value[0..8], admission.count, .little);
         std.mem.writeInt(u64, intent_keys_value[8..16], admission.bytes, .little);
+        std.mem.writeInt(u64, intent_keys_value[16..24], admission.retained_bytes, .little);
+        std.mem.writeInt(u64, intent_keys_value[24..32], admission.retained_keys, .little);
         try appendOwnedBytes(self.alloc, &write_vals, intent_keys_value);
         try writes.append(self.alloc, .{ .key = &intent_keys_key, .value = intent_keys_value });
         if (extra_batch.schema_binding != null)
@@ -757,7 +827,7 @@ pub const TxnManager = struct {
 
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
-        try self.applyBatch(writes.items, extra_batch.deletes, null);
+        try self.applyBatchWithReservation(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() });
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
     }
@@ -896,7 +966,8 @@ pub const TxnManager = struct {
             try completion_deletes.append(self.alloc, &stale_admission_key);
             try completion_deletes.append(self.alloc, &schema_lease_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
-            try self.applyBatch(completion_writes.items, completion_deletes.items, null);
+            const admission = try self.loadIntentAdmission(self.alloc, txn_id);
+            try self.applyBatchWithReservation(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -973,7 +1044,7 @@ pub const TxnManager = struct {
                 // Integrity participants store private physical records, not
                 // primary JSON rows. Recovery without a DB materialization
                 // hook must preserve exactly the same physical namespace.
-                if (std.mem.startsWith(u8, user_key, "\x00\x00__metadata__:relational_integrity:") or std.mem.eql(u8, user_key, "\x00\x00__metadata__:relational_integrity_activation")) {
+                if (isRawMetadataIntentKey(user_key)) {
                     if (intent.value) |value| {
                         try writes.append(self.alloc, .{ .key = user_key, .value = value });
                     } else try deletes.append(self.alloc, user_key);
@@ -1021,7 +1092,8 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
 
-        try self.applyBatch(writes.items, deletes.items, extra_batch.replay);
+        const admission = try self.loadIntentAdmission(self.alloc, txn_id);
+        try self.applyBatchWithReservation(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -1568,7 +1640,8 @@ pub const TxnManager = struct {
                 const stale_manifest_key = makeSidecarKey(intent_keys_prefix, txn_id);
                 const stale_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
                 const stale_admission_key = makeSidecarKey(intent_admission_prefix, txn_id);
-                try self.applyBatch(&.{.{ .key = &upgraded_key, .value = upgraded_value }}, &.{ &stale_manifest_key, &stale_lease_key, &stale_admission_key }, null);
+                const admission = try self.loadIntentAdmission(self.alloc, txn_id);
+                try self.applyBatchWithReservation(&.{.{ .key = &upgraded_key, .value = upgraded_value }}, &.{ &stale_manifest_key, &stale_lease_key, &stale_admission_key }, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
             }
 
             const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
@@ -1656,7 +1729,7 @@ pub const TxnManager = struct {
                     }
                 },
                 .exact_value => {
-                    if (!std.mem.startsWith(u8, pred.key, "\x00\x00__metadata__:relational_integrity:") and !std.mem.eql(u8, pred.key, "\x00\x00__metadata__:relational_integrity_activation") and !std.mem.eql(u8, pred.key, "\x00\x00__metadata__:relational_integrity_retirement") and !std.mem.eql(u8, pred.key, "\x00\x00__metadata__:restore_staging_owner")) return error.InvalidArgument;
+                    if (!isRawMetadataIntentKey(pred.key)) return error.InvalidArgument;
                     const current = self.getAlloc(self.alloc, pred.key) catch |err| switch (err) {
                         error.NotFound => null,
                         else => return err,
@@ -2024,8 +2097,8 @@ pub const TxnManager = struct {
             else => return err,
         };
         defer alloc.free(raw);
-        if (raw.len != 16) return error.InvalidTxnRecord;
-        return .{ .count = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u64, raw[8..16], .little) };
+        if (raw.len != 16 and raw.len != 32) return error.InvalidTxnRecord;
+        return .{ .count = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u64, raw[8..16], .little), .retained_bytes = if (raw.len == 32) std.mem.readInt(u64, raw[16..24], .little) else 0, .retained_keys = if (raw.len == 32) std.mem.readInt(u64, raw[24..32], .little) else 0, .retention_tracked = raw.len == 32 };
     }
 
     fn makeIntentMemberKey(alloc: Allocator, txn_id: TxnId, key: []const u8) ![]u8 {
@@ -2222,8 +2295,14 @@ pub const TxnManager = struct {
     }
 
     fn applyBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {
+        return self.applyBatchWithReservation(writes, deletes, replay, null);
+    }
+
+    const ReservationChange = struct { previous: u64, next: u64 };
+    fn applyBatchWithReservation(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange) !void {
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
+        if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
         for (deletes) |key| {
             batch.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
@@ -2696,6 +2775,167 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
 // Tests
 // ============================================================================
 
+test "retained transaction reservations survive LSM reopen and guarantee committed resolution at quota" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-retained-reserved");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(73);
+    const ns: retained_effects.Namespace = @splat(1);
+    // A near-frame-limit transaction remains admissible: reserving a blanket
+    // six-times JSON allowance would wrongly reject this before preparation.
+    const payload = try alloc.alloc(u8, retained_effects.max_frame_bytes - 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+    const physical = try internal_keys.documentKeyAlloc(alloc, "reserved");
+    defer alloc.free(physical);
+    const filler_key = try internal_keys.documentKeyAlloc(alloc, "filler");
+    defer alloc.free(filler_key);
+    const integrity = @import("db/relational_integrity_contract.zig");
+    const address = try integrity.Address.init(@splat(3), "parent");
+    const claim_key = address.claimKey();
+    const claim_value = try (integrity.Claim{ .tuple = "parent", .parent_table = "parents", .parent_key = "reserved", .schema_version = 1 }).encode(alloc, address);
+    defer alloc.free(claim_value);
+    const claim_intent: WriteIntent = .{ .key = &claim_key, .value = claim_value };
+    var expected_reserved: u64 = 0;
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.put(&internal_keys.identity_namespace_key, &ns);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try retained_effects.admit(&txn, ns, 1, @splat(1), retained_effects.max_frame_bytes);
+            try txn.commit();
+        }
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.initTransaction(id, 1);
+        const intent: WriteIntent = .{ .key = "reserved", .value = payload };
+        try manager.writeIntents(id, &.{ intent, claim_intent }, &.{});
+        expected_reserved = (try manager.loadIntentAdmission(alloc, id)).?.reservation();
+        try std.testing.expectEqual(@as(u64, payload.len + physical.len + 16 + 48 + claim_key.len + claim_value.len + 16), expected_reserved);
+        // Repeated/duplicate-key prepares replace their credits, not add them.
+        try manager.writeIntents(id, &.{ intent, claim_intent, .{ .key = "reserved", .value = "smaller" }, intent }, &.{});
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(expected_reserved, (try retained_effects.loadReservations(&read)).?.bytes);
+        }
+        const filler = try alloc.alloc(u8, @intCast(retained_effects.max_frame_bytes - expected_reserved - 48 - 16 - filler_key.len));
+        defer alloc.free(filler);
+        @memset(filler, 'f');
+        try store.put(filler_key, filler);
+        try std.testing.expectError(error.RetainedEffectsFull, store.put(filler_key, "cannot steal committed credits"));
+        const rejected: TxnId = @splat(74);
+        try manager.initTransaction(rejected, 2);
+        try std.testing.expectError(error.RetainedEffectsFull, manager.writeIntents(rejected, &.{.{ .key = "another", .value = "x" }}, &.{}));
+        try manager.checkOrdinaryWriteConflict("another");
+        try std.testing.expect(!(try manager.loadTransactionRecord(rejected)).prepared);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.resolveIntents(id, .committed, 1234);
+        try manager.resolveIntents(id, .committed, 1234);
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualSlices(u8, payload, try read.get(physical));
+        try std.testing.expectEqualSlices(u8, claim_value, try read.get(&claim_key));
+        try std.testing.expectEqual(@as(u64, 0), (try retained_effects.loadReservations(&read)).?.bytes);
+        const state = (try retained_effects.load(&read)).?;
+        try std.testing.expectEqual(@as(u64, 2), state.latest);
+        try std.testing.expectEqual(@as(u64, retained_effects.max_frame_bytes), state.retained_bytes);
+        var reader = (try retained_effects.read(&read, ns, 1, @splat(1), 1)).?;
+        const claim_effect = (try reader.next()).?;
+        try std.testing.expect(claim_effect.isIntegrity());
+        try std.testing.expectEqualSlices(u8, claim_value, claim_effect.value.?);
+        try std.testing.expectEqual(@as(u64, 0), claim_effect.timestamp);
+        const effect = (try reader.next()).?;
+        try std.testing.expectEqual(@as(u64, 1234), effect.timestamp);
+        try std.testing.expect(try reader.next() == null);
+    }
+}
+
+test "retained transaction reservations admit existing prepares release abort and fence untracked roots" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const ns: retained_effects.Namespace = @splat(2);
+    try store.put(&internal_keys.identity_namespace_key, &ns);
+    const id: TxnId = @splat(5);
+    try manager.initTransaction(id, 1);
+    try manager.writeIntents(id, &.{.{ .key = "existing", .value = "before admission" }}, &.{});
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try retained_effects.admit(&txn, ns, 1, @splat(1), retained_effects.default_limit);
+        try txn.commit();
+    }
+    try manager.resolveIntents(id, .aborted, 2);
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(u64, 0), (try retained_effects.loadReservations(&txn)).?.bytes);
+        try std.testing.expectEqual(@as(u64, 0), (try retained_effects.load(&txn)).?.latest);
+    }
+    // Simulate a released pre-accounting prepared root. One prefix probe must
+    // deny source admission, never scan or silently evict the prepared vote.
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try retained_effects.release(&txn, ns, 1, @splat(1));
+        try txn.delete(retained_effects.reservation_key);
+        try txn.put(intents_prefix ++ "old", "untracked");
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.RetainedEffectsFull, retained_effects.admit(&txn, ns, 2, @splat(2), retained_effects.default_limit));
+    }
+    try store.delete(intents_prefix ++ "old");
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try retained_effects.admit(&txn, ns, 2, @splat(2), retained_effects.default_limit);
+        try txn.commit();
+    }
+}
+
+test "retained transaction byte bounds count exact physical rows without parsing ordinary values" {
+    var tiny: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&tiny);
+    const raw: WriteIntent = .{ .key = "binary\x00key", .value = "{\"number\":9007199254740993}" };
+    try std.testing.expectEqual(@as(u64, raw.value.?.len + 16 + 2 + internal_keys.encodedComponentLen(raw.key)), try retainedIntentBytes(fixed.allocator(), raw));
+    const typed: WriteIntent = .{ .key = "row", .value = "sidecar", .prepared_row = "already encoded defaults and generated values" };
+    try std.testing.expectEqual(@as(u64, typed.prepared_row.?.len + 23), try retainedIntentBytes(fixed.allocator(), typed));
+    const address = try @import("db/relational_integrity_contract.zig").Address.init(@splat(1), "parent");
+    const claim_key = address.claimKey();
+    // Physical integrity keys are already encoded; neither JSON parsing nor
+    // primary-key escaping belongs in their exact prepared reservation.
+    const claim: WriteIntent = .{ .key = &claim_key, .value = "binary\x00\\_edges" };
+    try std.testing.expectEqual(@as(u64, 16 + claim_key.len + claim.value.?.len), try retainedIntentBytes(fixed.allocator(), claim));
+    try std.testing.expectEqual(@as(u64, 16 + claim_key.len), try retainedIntentBytes(fixed.allocator(), .{ .key = &claim_key, .value = null }));
+    const special: WriteIntent = .{ .key = "row", .value = "{\"_edges\":[],\"literal\":\"\\u000b\\u2028\\\\\"}" };
+    try std.testing.expect((try retainedIntentBytes(std.testing.allocator, special)) >= special.value.?.len + 23);
+    for ([_][]const u8{
+        "\x00\x00__metadata__:relational_integrity_activation",
+        "\x00\x00__metadata__:relational_integrity_retirement",
+        "\x00\x00__metadata__:restore_staging_owner",
+    }) |key| try std.testing.expectEqual(@as(u64, 0), try retainedIntentBytes(fixed.allocator(), .{ .key = key, .value = "binary\x00\\_edges" }));
+}
+
 test "transaction cumulative admission is atomic and membership metadata is incremental" {
     const alloc = std.testing.allocator;
     const path = try tempTestPath(alloc, "txn-admission");
@@ -2731,7 +2971,7 @@ test "transaction cumulative admission is atomic and membership metadata is incr
     const header_key = makeSidecarKey(intent_admission_prefix, txn);
     const header = try mgr.getAlloc(alloc, &header_key);
     defer alloc.free(header);
-    try std.testing.expectEqual(@as(usize, 16), header.len);
+    try std.testing.expectEqual(@as(usize, 32), header.len);
     try mgr.resolveIntents(txn, .aborted, 200);
     try std.testing.expectEqual(@as(?IntentAdmission, null), try mgr.loadIntentAdmission(alloc, txn));
     const member_key = try TxnManager.makeIntentMemberKey(alloc, txn, "a");

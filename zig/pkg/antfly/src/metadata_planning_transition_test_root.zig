@@ -24,6 +24,8 @@ test {
     _ = transition_actions;
     _ = transition_controller;
     _ = transition_driver;
+    _ = @import("metadata/online_merge.zig");
+    _ = @import("metadata/online_merge_driver.zig");
 }
 
 /// Implementation source choices for this compilation root.

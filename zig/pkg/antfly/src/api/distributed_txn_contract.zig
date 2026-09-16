@@ -32,9 +32,18 @@ pub const status_server_response_reserve_ms: u32 = 50;
 /// never serialized directly across the wire.
 pub const PreDecisionContext = struct {
     restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
     deadline_ns: ?u64 = null,
     deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
     cancellation: db_types.CancellationToken = .none,
+};
+
+/// Authenticated private recovery observation. A locator is never authority by
+/// itself: hidden owner handlers validate the exact plan and scope together.
+pub const TxnStatusRequest = struct {
+    txn_id: db_types.TxnId,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
 };
 
 pub const TableCommitRequest = struct {
@@ -42,6 +51,7 @@ pub const TableCommitRequest = struct {
     relational_schema_version: ?u32 = null,
     relational_integrity_generation_set: ?[32]u8 = null,
     restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
     relational_repair: bool = false,
     writes: []const db_types.TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
@@ -51,6 +61,7 @@ pub const TableCommitRequest = struct {
     integrity_commands: []const @import("../storage/db/relational_integrity_contract.zig").Command = &.{},
     relational_activation: ?@import("../storage/db/relational_integrity_activation_contract.zig").Command = null,
     relational_retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Command = null,
+    relational_index_maintenance: ?@import("../storage/db/relational_index_maintenance_contract.zig").Command = null,
 };
 
 pub const CommitConflict = struct {

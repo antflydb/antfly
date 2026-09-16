@@ -93,7 +93,9 @@ pub const RelationalIndexKeyNulls = enum(u8) {
 };
 
 pub const RelationalIndexKey = struct {
-    column: []const u8,
+    column: []const u8 = "",
+    expression_json: ?[]const u8 = null,
+    result_type: ?@import("schema.zig").RelationalColumnType = null,
     collation: ?[]const u8 = null,
     direction: RelationalIndexKeyDirection = .asc,
     nulls: RelationalIndexKeyNulls = .default,
@@ -822,17 +824,13 @@ pub const UniqueExpression = struct {
     expression: ?RelationalRowsExpression = null,
 };
 
-pub const UniquePredicateOp = enum(u8) {
-    is_null = 0,
-    is_not_null = 1,
-    eq = 2,
-    ne = 3,
-};
+pub const UniquePredicateOp = RelationalCheckOp;
 
 pub const UniquePredicate = struct {
     field: []const u8,
     op: UniquePredicateOp,
     value_json: ?[]const u8 = null,
+    collation: ?[]const u8 = null,
 };
 
 pub const RelationalPeriod = struct {

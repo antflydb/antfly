@@ -27,7 +27,8 @@ pub fn parseMutation(alloc: std.mem.Allocator, body: []const u8) !batch.OwnedBat
     defer parsed.deinit();
     const req = parsed.value;
     const schema_version = std.math.cast(u32, req.schema_version) orelse return error.InvalidBatchRequest;
-    if (req.mutations.len == 0 or req.mutations.len > 4096 or schema_version == 0) return error.InvalidBatchRequest;
+    // Zero is the initial active schema epoch, not an absent precondition.
+    if (req.mutations.len == 0 or req.mutations.len > 4096) return error.InvalidBatchRequest;
     var result: batch.OwnedBatchRequest = .{};
     errdefer result.deinit(alloc);
     var writes: std.ArrayList(types.BatchWrite) = .empty;
@@ -90,4 +91,19 @@ test "relational mutation boundary preserves exact row and version integers" {
     try std.testing.expectError(error.InvalidBatchRequest, parseMutation(alloc,
         \\{"schema_version":4,"mutations":[{"key":"a","expected_version":"0"},{"key":"a","expected_version":"0"}]}
     ));
+}
+
+test "relational mutation boundary preserves required initial zero schema epoch" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseMutation(alloc,
+        \\{"schema_version":0,"mutations":[{"key":"a","expected_version":"0","row":{"id":1}}]}
+    );
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(?u32, 0), parsed.req.relational_schema_version);
+    for ([_][]const u8{
+        "{\"mutations\":[{\"key\":\"a\",\"expected_version\":\"0\"}]}",
+        "{\"schema_version\":null,\"mutations\":[{\"key\":\"a\",\"expected_version\":\"0\"}]}",
+        "{\"schema_version\":-1,\"mutations\":[{\"key\":\"a\",\"expected_version\":\"0\"}]}",
+        "{\"schema_version\":4294967296,\"mutations\":[{\"key\":\"a\",\"expected_version\":\"0\"}]}",
+    }) |invalid| try std.testing.expectError(error.InvalidBatchRequest, parseMutation(alloc, invalid));
 }

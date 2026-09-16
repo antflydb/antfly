@@ -18,8 +18,15 @@ export function parseAdvancedIndexConfig(source: string): IndexConfig {
   if (typeof config.name !== "string" || !config.name.trim()) {
     throw new Error("Index configuration requires a non-empty name.");
   }
-  if (config.type !== "embeddings" && config.type !== "full_text" && config.type !== "graph") {
-    throw new Error('Index configuration type must be "embeddings", "full_text", or "graph".');
+  if (
+    config.type !== "embeddings" &&
+    config.type !== "full_text" &&
+    config.type !== "graph" &&
+    config.type !== "relational"
+  ) {
+    throw new Error(
+      'Index configuration type must be "embeddings", "full_text", "graph", or "relational".'
+    );
   }
   if (config.sources !== undefined) {
     if (!Array.isArray(config.sources)) {

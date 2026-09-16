@@ -35,13 +35,14 @@ const RollbackMerge = std.meta.fieldInfo(metadata_actions.TransitionAction, .rol
 pub const TopologyReadRequest = struct {
     transition_id: u64,
     attempt_epoch: u64,
-    mode: enum { identity, status, completed, handoff_progress, handoff_manifest, prune_progress },
+    mode: enum { identity, status, completed, handoff_progress, handoff_manifest, prune_progress, merge_copy_receipt },
 };
 
 pub const ShardOperationAdapter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     context_id: u64 = 0,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         topology_read: ?*const fn (ptr: *anyopaque, context_id: u64, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("../common/cancellation.zig").CancellationToken) anyerror![]u8 = null,
@@ -59,32 +60,34 @@ pub const ShardOperationAdapter = struct {
         rollback_merge: *const fn (ptr: *anyopaque, context_id: u64, op: RollbackMerge) anyerror!void,
     };
 
+    const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+
     pub fn topologyRead(self: ShardOperationAdapter, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("../common/cancellation.zig").CancellationToken) ![]u8 {
         const callback = self.vtable.topology_read orelse return error.UnsupportedOperation;
-        return callback(self.ptr, self.context_id, alloc, group_id, table_name, request, cancellation);
+        return BoundaryAbi.call("topology_read", self.boundary_dispatch, callback, .{ self.ptr, self.context_id, alloc, group_id, table_name, request, cancellation });
     }
 
     pub fn observeSplit(self: ShardOperationAdapter, record: metadata_state.SplitTransitionRecord) !metadata_state.SplitObservation {
-        return try self.vtable.observe_split(self.ptr, self.context_id, record);
+        return BoundaryAbi.call("observe_split", self.boundary_dispatch, self.vtable.observe_split, .{ self.ptr, self.context_id, record });
     }
 
     pub fn observeMerge(self: ShardOperationAdapter, record: metadata_state.MergeTransitionRecord) !metadata_state.MergeObservation {
-        return try self.vtable.observe_merge(self.ptr, self.context_id, record);
+        return BoundaryAbi.call("observe_merge", self.boundary_dispatch, self.vtable.observe_merge, .{ self.ptr, self.context_id, record });
     }
 
     pub fn execute(self: ShardOperationAdapter, action: metadata_actions.TransitionAction) !void {
         switch (action) {
             .none => {},
-            .prepare_split_source => |op| try self.vtable.prepare_split_source(self.ptr, self.context_id, op),
-            .start_split_source => |op| try self.vtable.start_split_source(self.ptr, self.context_id, op),
-            .bootstrap_split_destination => |op| try self.vtable.bootstrap_split_destination(self.ptr, self.context_id, op),
-            .catch_up_split_destination => |op| try self.vtable.catch_up_split_destination(self.ptr, self.context_id, op),
-            .finalize_split_source => |op| try self.vtable.finalize_split_source(self.ptr, self.context_id, op),
-            .rollback_split => |op| try self.vtable.rollback_split(self.ptr, self.context_id, op),
-            .accept_merge_receiver => |op| try self.vtable.accept_merge_receiver(self.ptr, self.context_id, op),
-            .catch_up_merge_receiver => |op| try self.vtable.catch_up_merge_receiver(self.ptr, self.context_id, op),
-            .finalize_merge => |op| try self.vtable.finalize_merge(self.ptr, self.context_id, op),
-            .rollback_merge => |op| try self.vtable.rollback_merge(self.ptr, self.context_id, op),
+            .prepare_split_source => |op| try BoundaryAbi.call("prepare_split_source", self.boundary_dispatch, self.vtable.prepare_split_source, .{ self.ptr, self.context_id, op }),
+            .start_split_source => |op| try BoundaryAbi.call("start_split_source", self.boundary_dispatch, self.vtable.start_split_source, .{ self.ptr, self.context_id, op }),
+            .bootstrap_split_destination => |op| try BoundaryAbi.call("bootstrap_split_destination", self.boundary_dispatch, self.vtable.bootstrap_split_destination, .{ self.ptr, self.context_id, op }),
+            .catch_up_split_destination => |op| try BoundaryAbi.call("catch_up_split_destination", self.boundary_dispatch, self.vtable.catch_up_split_destination, .{ self.ptr, self.context_id, op }),
+            .finalize_split_source => |op| try BoundaryAbi.call("finalize_split_source", self.boundary_dispatch, self.vtable.finalize_split_source, .{ self.ptr, self.context_id, op }),
+            .rollback_split => |op| try BoundaryAbi.call("rollback_split", self.boundary_dispatch, self.vtable.rollback_split, .{ self.ptr, self.context_id, op }),
+            .accept_merge_receiver => |op| try BoundaryAbi.call("accept_merge_receiver", self.boundary_dispatch, self.vtable.accept_merge_receiver, .{ self.ptr, self.context_id, op }),
+            .catch_up_merge_receiver => |op| try BoundaryAbi.call("catch_up_merge_receiver", self.boundary_dispatch, self.vtable.catch_up_merge_receiver, .{ self.ptr, self.context_id, op }),
+            .finalize_merge => |op| try BoundaryAbi.call("finalize_merge", self.boundary_dispatch, self.vtable.finalize_merge, .{ self.ptr, self.context_id, op }),
+            .rollback_merge => |op| try BoundaryAbi.call("rollback_merge", self.boundary_dispatch, self.vtable.rollback_merge, .{ self.ptr, self.context_id, op }),
         }
     }
 
@@ -396,81 +399,83 @@ pub const OwnedShardOperationAdapter = struct {
         var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
         const downstream = lease.state.downstream;
-        try downstream.vtable.prepare_split_source(downstream.ptr, downstream.context_id, op);
+        try downstream.execute(.{ .prepare_split_source = op });
     }
 
     fn startSplitSource(ptr: *anyopaque, context_id: u64, op: StartSplitSource) !void {
         var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
         const downstream = lease.state.downstream;
-        try downstream.vtable.start_split_source(downstream.ptr, downstream.context_id, op);
+        try downstream.execute(.{ .start_split_source = op });
     }
 
     fn bootstrapSplitDestination(ptr: *anyopaque, context_id: u64, op: BootstrapSplitDestination) !void {
         var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
         const downstream = lease.state.downstream;
-        try downstream.vtable.bootstrap_split_destination(downstream.ptr, downstream.context_id, op);
+        try downstream.execute(.{ .bootstrap_split_destination = op });
     }
 
     fn catchUpSplitDestination(ptr: *anyopaque, context_id: u64, op: CatchUpSplitDestination) !void {
         var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
         const downstream = lease.state.downstream;
-        try downstream.vtable.catch_up_split_destination(downstream.ptr, downstream.context_id, op);
+        try downstream.execute(.{ .catch_up_split_destination = op });
     }
 
     fn finalizeSplitSource(ptr: *anyopaque, context_id: u64, op: FinalizeSplitSource) !void {
         var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
         const downstream = lease.state.downstream;
-        try downstream.vtable.finalize_split_source(downstream.ptr, downstream.context_id, op);
+        try downstream.execute(.{ .finalize_split_source = op });
     }
 
     fn rollbackSplit(ptr: *anyopaque, context_id: u64, op: RollbackSplit) !void {
         var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
         const downstream = lease.state.downstream;
-        try downstream.vtable.rollback_split(downstream.ptr, downstream.context_id, op);
+        try downstream.execute(.{ .rollback_split = op });
     }
 
     fn acceptMergeReceiver(ptr: *anyopaque, context_id: u64, op: AcceptMergeReceiver) !void {
         var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
         const downstream = lease.state.downstream;
-        try downstream.vtable.accept_merge_receiver(downstream.ptr, downstream.context_id, op);
+        try downstream.execute(.{ .accept_merge_receiver = op });
     }
 
     fn catchUpMergeReceiver(ptr: *anyopaque, context_id: u64, op: CatchUpMergeReceiver) !void {
         var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
         const downstream = lease.state.downstream;
-        try downstream.vtable.catch_up_merge_receiver(downstream.ptr, downstream.context_id, op);
+        try downstream.execute(.{ .catch_up_merge_receiver = op });
     }
 
     fn finalizeMerge(ptr: *anyopaque, context_id: u64, op: FinalizeMerge) !void {
         var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
         const downstream = lease.state.downstream;
-        try downstream.vtable.finalize_merge(downstream.ptr, downstream.context_id, op);
+        try downstream.execute(.{ .finalize_merge = op });
     }
 
     fn rollbackMerge(ptr: *anyopaque, context_id: u64, op: RollbackMerge) !void {
         var lease = try acquireRegistered(ptr, context_id);
         defer lease.deinit();
         const downstream = lease.state.downstream;
-        try downstream.vtable.rollback_merge(downstream.ptr, downstream.context_id, op);
+        try downstream.execute(.{ .rollback_merge = op });
     }
 };
 
 test "shard operation adapter metadata runtime dispatches actions" {
     const Fake = struct {
         split_prepared: bool = false,
+        failing: bool = false,
 
         fn adapter(self: *@This()) ShardOperationAdapter {
             return .{
                 .ptr = self,
                 .vtable = &.{
+                    .topology_read = topologyRead,
                     .observe_split = observeSplit,
                     .observe_merge = observeMerge,
                     .prepare_split_source = prepareSplitSource,
@@ -487,7 +492,13 @@ test "shard operation adapter metadata runtime dispatches actions" {
             };
         }
 
-        fn observeSplit(_: *anyopaque, _: u64, _: metadata_state.SplitTransitionRecord) !metadata_state.SplitObservation {
+        fn topologyRead(_: *anyopaque, _: u64, _: std.mem.Allocator, _: u64, _: []const u8, _: TopologyReadRequest, _: @import("../common/cancellation.zig").CancellationToken) ![]u8 {
+            return error.GroupLeaderUnavailable;
+        }
+
+        fn observeSplit(ptr: *anyopaque, _: u64, _: metadata_state.SplitTransitionRecord) !metadata_state.SplitObservation {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.failing) return error.TopologyChanged;
             return .{
                 .status = .{
                     .phase = .prepare,
@@ -522,6 +533,7 @@ test "shard operation adapter metadata runtime dispatches actions" {
 
         fn prepareSplitSource(ptr: *anyopaque, _: u64, _: PrepareSplitSource) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.failing) return error.TransitionOperationBusy;
             self.split_prepared = true;
         }
 
@@ -556,6 +568,24 @@ test "shard operation adapter metadata runtime dispatches actions" {
         },
     });
     try std.testing.expect(fake.split_prepared);
+
+    // Force the same checked transport used when provider and consumer are
+    // separately compiled; same-unit direct callbacks remain supported.
+    const Foreign = struct {
+        fn dispatch(contract: *const @import("../runtime_native_abi.zig").CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("../runtime_error_abi.zig").Status {
+            return ShardOperationAdapter.BoundaryAbi.local_dispatch(contract, callback, args, output);
+        }
+    };
+    var foreign = fake.adapter();
+    foreign.boundary_dispatch = Foreign.dispatch;
+    fake.failing = true;
+    try std.testing.expectError(error.TransitionOperationBusy, foreign.execute(.{ .prepare_split_source = .{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = 10, .destination_group_id = 11, .split_key = "m" } }));
+    try std.testing.expectError(error.TopologyChanged, foreign.observeSplit(.{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = 10, .destination_group_id = 11 }));
+    try std.testing.expectError(error.GroupLeaderUnavailable, foreign.topologyRead(std.testing.allocator, 10, "rows", .{ .transition_id = 1, .attempt_epoch = 1, .mode = .merge_copy_receipt }, .none));
+    var foreign_owned = try OwnedShardOperationAdapter.init(std.testing.allocator, foreign);
+    defer foreign_owned.deinit();
+    try std.testing.expectError(error.TransitionOperationBusy, foreign_owned.adapter().execute(.{ .prepare_split_source = .{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = 10, .destination_group_id = 11, .split_key = "m" } }));
+    fake.failing = false;
 
     var owned = try OwnedShardOperationAdapter.init(std.testing.allocator, fake.adapter());
     defer owned.deinit();

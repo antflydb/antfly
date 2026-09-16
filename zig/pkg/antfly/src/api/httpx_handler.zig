@@ -25,6 +25,11 @@ const runtime_http_bridge = @import("../runtime_http_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
+var relational_read_diagnostic_gate: http_route_helpers.RelationalReadDiagnosticGate = .{};
+var backup_pin_diagnostic_gate: http_route_helpers.RelationalReadDiagnosticGate = .{};
+var restore_owner_diagnostic_gate: http_route_helpers.RelationalReadDiagnosticGate = .{};
+var online_merge_diagnostic_gate: http_route_helpers.RelationalReadDiagnosticGate = .{};
+var txn_prepare_diagnostic_gate: http_route_helpers.RelationalReadDiagnosticGate = .{};
 const http_server_mod = @import("http_server.zig");
 const operation_contract = @import("operation.zig");
 const probe_operations = @import("probe_operations.zig");
@@ -338,17 +343,37 @@ fn storedDestinationAllowed(identity: ?AuthenticatedIdentity, table_name: []cons
     return http_server_mod.permissionsAllow(authenticated.permissions, .table, table_name, .write);
 }
 
-fn foreignKeyParentsAllowed(alloc: std.mem.Allocator, identity: ?AuthenticatedIdentity, schema_json: []const u8) !bool {
-    _ = identity orelse return true;
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, schema_json);
-    defer parsed.deinit(alloc);
-    if (parsed.foreign_keys) |foreign_keys| for (foreign_keys.value) |foreign_key| {
-        // Defining a cross-table dependency can expose existence and block
-        // parent writes. Require REFERENCES-like authority, conservatively
-        // represented by table admin until a dedicated privilege exists.
-        if (!(try http_server_mod.tablePermissionCurrentlyAllowed(identity, foreign_key.parent_table, .admin))) return false;
+fn witnessDDLError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    const jsonErrorResponse = AntflyApiHandler.jsonErrorResponse;
+    return switch (err) {
+        error.ReservedForeignKeySupportIndex => jsonErrorResponse(ctx, 400, "__fk_partial_ indexes are server-owned foreign-key support; edit or retire the foreign key instead"),
+        error.ForeignKeyPartialSupportIndexConflict => jsonErrorResponse(ctx, 409, "foreign-key support index name conflicts with an existing definition"),
+        error.ForeignKeyPartialSupportIndexRequired, error.RelationalIndexNotReady => jsonErrorResponse(ctx, 409, "foreign-key support changed or is still building; refresh the schema and retry"),
+        error.ForeignKeyTargetNotUnique, error.ForeignKeyTypeMismatch, error.ForeignKeyParentTableNotFound => jsonErrorResponse(ctx, 400, "foreign key requires an existing parent with a matching ordered unique key and compatible scalar column types"),
+        error.TableGenerationChanged, error.SchemaVersionChanged, error.TableTransitionActive, error.ConstraintRetirementInProgress => jsonErrorResponse(ctx, 409, "parent schema changed or has active maintenance; refresh and retry"),
+        error.MetadataUnavailable, error.NotLeader, error.ProposalDropped => jsonErrorResponse(ctx, 503, "foreign-key support metadata is unavailable; retry"),
+        error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => jsonErrorResponse(ctx, 400, "invalid relational schema definition"),
+        error.UnsupportedRestoreSource => jsonErrorResponse(ctx, 409, "online schema rewrite requires row-derived indexes and completed source maintenance; independently authored artifacts are unsupported"),
+        error.UnknownSchemaVersion, error.RestoreStagingScopeChanged => jsonErrorResponse(ctx, 409, "schema rewrite source definitions are incomplete or changed; verify source schema history and refresh before retrying"),
+        error.InvalidOnlineSourceCommand => jsonErrorResponse(ctx, 409, "schema rewrite source ownership authority is not ready for this deployment; no rewrite was admitted"),
+        error.OnlineSourceScopeChanged => jsonErrorResponse(ctx, 409, "schema rewrite source ownership changed or uses a different authority mode; refresh before retrying"),
+        error.StorageKernelOwnerUnavailable, error.RestoreValidationPending, error.GroupLeaderUnavailable, error.UnknownGroup => jsonErrorResponse(ctx, 503, "schema rewrite source owner is unavailable; retry after owner recovery"),
+        error.RelationalRewriteTypeChange => jsonErrorResponse(ctx, 400, "schema rewrite cannot change a stored column's scalar type"),
+        error.RelationalRewriteColumnDrop => jsonErrorResponse(ctx, 400, "schema rewrite cannot silently drop stored columns"),
+        error.RelationalRewriteRequiresRelational => jsonErrorResponse(ctx, 400, "schema rewrite cannot change the table storage mode"),
+        error.RelationalRewriteBudgetExceeded => jsonErrorResponse(ctx, 413, "schema rewrite program exceeds its bounded schema or expression limit"),
+        error.AsyncRestoreUnavailable => jsonErrorResponse(ctx, 503, "durable schema rewrite service is unavailable"),
+        error.TransactionTooLarge => jsonErrorResponse(ctx, 413, "schema rewrite dependency cohort exceeds the bounded transaction limit"),
+        error.InvalidIdempotencyKey => jsonErrorResponse(ctx, 400, "invalid Idempotency-Key"),
+        error.IdempotencyConflict => jsonErrorResponse(ctx, 409, "Idempotency-Key was already used for a different rewrite"),
+        error.StoredDestinationAuthorizationRevoked => jsonErrorResponse(ctx, 403, "schema rewrite administrator authorization is no longer valid"),
+        error.MetadataMutationOutcomeUnknown => AntflyApiHandler.metadataMutationOutcomeUnknownResponse(ctx),
+        else => err,
     };
-    return true;
+}
+
+fn foreignKeyParentsAllowed(alloc: std.mem.Allocator, identity: ?AuthenticatedIdentity, schema_json: []const u8) !bool {
+    return http_server_mod.foreignKeyParentsAllowed(alloc, identity, schema_json);
 }
 
 test "relational foreign key DDL requires referenced parent admin for create replace and patch" {
@@ -1104,6 +1129,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.batch_suffix, httpx.Handler.bind(self, internalGroupBatch));
         try server.post(table_prefix ++ routes.backup_shard_suffix, httpx.Handler.bind(self, internalGroupBackupShard));
         try server.post(table_prefix ++ routes.restore_owner_suffix, httpx.Handler.bind(self, internalGroupRestoreOwner));
+        try server.post(table_prefix ++ routes.online_merge_io_suffix, httpx.Handler.bind(self, internalGroupOnlineMergeIo));
         try server.postResponseStreaming(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
         try server.post(table_prefix ++ routes.query_suffix, httpx.Handler.bind(self, internalGroupQuery));
         try server.post(table_prefix ++ routes.query_preflight_suffix, httpx.Handler.bind(self, internalGroupQueryPreflight));
@@ -1967,7 +1993,16 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    fn internalLookupErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.AuthoritativeLookupMissing) {
+            try ctx.setHeader(metadata_api.read_index_absence_header, metadata_api.read_index_absence_value);
+            return textResponse(ctx, 404, "not found");
+        }
+        return internalGroupErrorResponse(ctx, err);
+    }
+
     fn internalGroupErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (@import("relational_row_errors.zig").classify(err)) |reason| return textResponse(ctx, @import("relational_row_errors.zig").status(reason), @errorName(reason));
         if (err == error.RestoreStagingInProgress) return textResponse(ctx, 503, "RestoreStagingInProgress");
         if (@import("relational_integrity_errors.zig").classify(err)) |reason| return textResponse(ctx, 409, @errorName(reason));
         if (sharedInternalHttpErrorSpec(err)) |spec|
@@ -2025,15 +2060,46 @@ pub const AntflyApiHandler = struct {
         return ctx.json(progress);
     }
 
+    fn internalGroupOnlineMergeIo(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "online merge request required");
+        if (body.len > @import("online_merge_io.zig").contract.max_request_bytes) return textResponse(ctx, 413, "online merge request too large");
+        var parsed = std.json.parseFromSlice(@import("online_merge_io.zig").contract.Request, ctx.allocator, body, .{ .allocate = .alloc_always }) catch return textResponse(ctx, 400, "invalid online merge request");
+        defer parsed.deinit();
+        parsed.value.validate() catch return textResponse(ctx, 400, "invalid online merge scope or receipt");
+        if (parsed.value.ownerGroup() != params.group_id) return textResponse(ctx, 409, "online merge owner changed");
+        const port = self.api_server.cfg.online_merge_io orelse return textResponse(ctx, 503, "online merge unavailable");
+        const result = port.execute(ctx.allocator, params.group_id, params.table_name, parsed.value, operationContext(ctx, null)) catch |err| return switch (err) {
+            error.OnlineSourcePinMissing, error.FileNotFound => textResponse(ctx, 409, "online merge source pin missing"),
+            error.InvalidMergePage, error.InvalidSourceSnapshot, error.InvalidOnlineSourceCommand => textResponse(ctx, 400, "invalid online merge request"),
+            error.OnlineSourceScopeChanged, error.SourceSnapshotCutMismatch, error.MergeCopyFenced, error.MergePageSequenceGap => textResponse(ctx, 409, "online merge scope or receipt changed"),
+            error.TableTopologyProtocolUpgradeRequired => textResponse(ctx, 422, "online merge requires native host-path storage and row-derived indexes without coordinated constraints; graph, vector and algebraic artifact tails are not supported"),
+            error.SourceSnapshotCorrupt, error.RetainedEffectsCorrupt => textResponse(ctx, 422, "online merge source integrity validation failed"),
+            error.Canceled, error.Cancelled => textResponse(ctx, 408, "online merge canceled"),
+            error.Timeout, error.DeadlineExceeded => textResponse(ctx, 504, "online merge deadline exceeded"),
+            else => blk: {
+                if (online_merge_diagnostic_gate.admit(platform_time.monotonicNs()))
+                    std.log.warn("online merge owner unavailable group_id={} operation={s} class={s}", .{ params.group_id, @tagName(parsed.value.operation), @errorName(err) });
+                break :blk textResponse(ctx, 503, "online merge owner unavailable");
+            },
+        };
+        defer ctx.allocator.free(result);
+        if (result.len > @import("online_merge_io.zig").contract.max_response_bytes) return textResponse(ctx, 413, "online merge response too large");
+        return jsonResponse(ctx, 200, result);
+    }
+
     fn internalGroupRestoreOwner(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "restore owner request required");
-        if (body.len > 16 * 1024) return textResponse(ctx, 413, "restore owner request too large");
+        @import("restore_owner_contract.zig").validateRequestSize(body.len) catch return textResponse(ctx, 413, "restore owner request too large");
         var parsed = std.json.parseFromSlice(@import("restore_owner.zig").Request, ctx.allocator, body, .{ .allocate = .alloc_always }) catch return textResponse(ctx, 400, "invalid restore owner request");
         defer parsed.deinit();
         const port = self.api_server.cfg.restore_owner orelse return textResponse(ctx, 503, "restore owner unavailable");
         const result = port.execute(ctx.allocator, params.table_name, params.group_id, parsed.value, operationContext(ctx, null)) catch |err| {
+            if (restore_owner_diagnostic_gate.admit(platform_time.monotonicNs()))
+                std.log.warn("restore owner failed action={s} group_id={d} class={s}", .{ @tagName(parsed.value.action), params.group_id, @errorName(err) });
             if (@import("restore_source_errors.zig").permanent(err)) return textResponse(ctx, 422, "restore source integrity validation failed");
             return switch (err) {
                 error.InvalidRestoreStagingCommand, error.RestoreSourceProofMissing, error.InvalidBackupArtifactPath => textResponse(ctx, 400, "invalid restore source proof"),
@@ -2058,10 +2124,14 @@ pub const AntflyApiHandler = struct {
             defer parsed.deinit();
             const source = self.api_server.table_writes orelse return textResponse(ctx, 503, "backup owner unavailable");
             const request = self.api_server.boundedBackupRequest(operationContext(ctx, null));
-            const response = source.backupPinControl(ctx.allocator, params.table_name, params.group_id, parsed.value, .{ .deadline_ns = request.deadline_ns.?, .cancellation = request.cancellation, .owner_local_only = true }) catch |err| return switch (err) {
-                error.InvalidBackupFence => textResponse(ctx, 400, "invalid backup pin owner"),
-                error.IntegrityTopologyChanged, error.IntegrityTopologyMissing, error.IntegrityCatalogChanged, error.CatalogChanged => textResponse(ctx, 409, "backup pin authority changed"),
-                else => textResponse(ctx, 503, "backup pin operation must be retried"),
+            const response = source.backupPinControl(ctx.allocator, params.table_name, params.group_id, parsed.value, .{ .deadline_ns = request.deadline_ns.?, .cancellation = request.cancellation, .owner_local_only = true }) catch |err| {
+                if (backup_pin_diagnostic_gate.admit(platform_time.monotonicNs()))
+                    std.log.warn("backup pin failed phase=owner_dispatch action={s} group_id={d} class={s}", .{ @tagName(parsed.value), params.group_id, @errorName(err) });
+                return switch (err) {
+                    error.InvalidBackupFence => textResponse(ctx, 400, "invalid backup pin owner"),
+                    error.IntegrityTopologyChanged, error.IntegrityTopologyMissing, error.IntegrityCatalogChanged, error.CatalogChanged => textResponse(ctx, 409, "backup pin authority changed"),
+                    else => textResponse(ctx, 503, "backup pin operation must be retried"),
+                };
             };
             defer if (response) |value| ctx.allocator.free(value);
             return if (response) |value| jsonResponse(ctx, 200, value) else textResponse(ctx, 404, "backup owner not found");
@@ -2151,7 +2221,7 @@ pub const AntflyApiHandler = struct {
             ctx.request.uri.query orelse "",
         ) catch return textResponse(ctx, 400, "invalid lookup options");
         defer lookup_options.deinit(ctx.allocator);
-        const control_lookup = lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0;
+        const control_lookup = lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_index_status_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0;
         const logical_key = if (control_lookup and std.mem.eql(u8, key, "\x00relational_control")) "" else key;
         const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch
             return textResponse(ctx, 400, "invalid read consistency");
@@ -2165,7 +2235,7 @@ pub const AntflyApiHandler = struct {
                 .options = lookup_options.opts,
                 .consistency = consistency,
             },
-        ) catch |err| return internalGroupErrorResponse(ctx, err);
+        ) catch |err| return internalLookupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
         var version_buf: [20]u8 = undefined;
         const version = try std.fmt.bufPrint(&version_buf, "{d}", .{result.version});
@@ -2662,6 +2732,7 @@ pub const AntflyApiHandler = struct {
             params.table_name,
             input.req,
         ) catch |err| return switch (err) {
+            error.RetainedEffectsFull => retainedPressureResponse(ctx, true),
             error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
             error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
             error.EnrichmentWaitCanceled,
@@ -2695,6 +2766,12 @@ pub const AntflyApiHandler = struct {
             .deleted = result.deleted,
             .transformed = result.transformed,
         });
+    }
+
+    fn retainedPressureResponse(ctx: *httpx.Context, batch: bool) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        if (batch) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
+        return textResponse(ctx, 429, "RetainedEffectsFull");
     }
 
     fn internalCapabilities(_: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -3019,6 +3096,7 @@ pub const AntflyApiHandler = struct {
             input.req,
             forwarding_context,
         ) catch |err| return switch (err) {
+            error.RetainedEffectsFull => retainedPressureResponse(ctx, true),
             error.InvalidArgument => textResponse(ctx, 400, "invalid batch request"),
             error.TopologyChanged => blk: {
                 try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
@@ -3074,6 +3152,8 @@ pub const AntflyApiHandler = struct {
         err: internal_group_operations.Error,
         phase: InternalTxnPhase,
     ) !httpx.Response {
+        if (@import("relational_row_errors.zig").classify(err)) |reason|
+            return textResponse(ctx, @import("relational_row_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_integrity_errors.zig").classify(err)) |relational_error|
             return textResponse(ctx, 409, @errorName(relational_error));
         if (txnErrorProvesNotProposed(err, phase))
@@ -3091,6 +3171,7 @@ pub const AntflyApiHandler = struct {
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
             error.PreDecisionDeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
             error.TransactionPreDecisionOutcomeUnknown => textResponse(ctx, 504, "transaction outcome unknown"),
+            error.RetainedEffectsFull => retainedPressureResponse(ctx, false),
             error.EnrichmentWaitCanceled,
             error.EnrichmentWaitTimeout,
             error.EnrichmentRetryInProgress,
@@ -3105,6 +3186,7 @@ pub const AntflyApiHandler = struct {
     fn txnErrorProvesNotProposed(err: internal_group_operations.Error, phase: InternalTxnPhase) bool {
         if (!phase.isPreDecision()) return false;
         return err == error.GroupLeaderUnavailable or
+            err == error.RetainedEffectsFull or
             err == error.PreDecisionDeadlineExceeded or
             err == error.NotFound;
     }
@@ -3124,10 +3206,17 @@ pub const AntflyApiHandler = struct {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
-        var input = distributed_txn.parseTxnPrepareRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        var input = distributed_txn.parseTxnPrepareRequest(ctx.allocator, body) catch |err| {
+            if (txn_prepare_diagnostic_gate.admit(platform_time.monotonicNs()))
+                std.log.warn("transaction prepare rejected phase=parse group_id={d} class={s}", .{ params.group_id, @errorName(err) });
+            return textResponse(ctx, 400, "invalid transaction request");
+        };
         defer distributed_txn.freeTxnPrepareRequest(ctx.allocator, &input);
-        self.internalGroupOperations().txnPrepare(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+        self.internalGroupOperations().txnPrepare(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err| {
+            if (err == error.InvalidArgument and txn_prepare_diagnostic_gate.admit(platform_time.monotonicNs()))
+                std.log.warn("transaction prepare rejected phase=owner group_id={d} scoped={} class={s}", .{ params.group_id, input.req.restore_staging_scope != null, @errorName(err) });
             return internalTxnErrorResponse(ctx, err, .prepare);
+        };
         return ctx.json(struct {}{});
     }
 
@@ -3145,8 +3234,8 @@ pub const AntflyApiHandler = struct {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
-        const txn_id = distributed_txn.parseTxnStatusRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
-        const status = self.internalGroupOperations().txnStatus(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, txn_id) catch |err|
+        const input = distributed_txn.parseTxnStatusRequestWithScope(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        const status = self.internalGroupOperations().txnStatusWithRequest(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .status);
         return ctx.json(distributed_txn.TxnStatusResponse{ .status = status });
     }
@@ -3601,10 +3690,13 @@ pub const AntflyApiHandler = struct {
             return ctx.openApiJson(response);
         }
 
-        const commit_request = operationContext(ctx, authenticated_identity);
+        const commit_request = tableMutationContext(ctx, &authenticated_identity);
+        var prepared = self.api_server.preparePublicCommitWithIntegrity(alloc, distributed_tables, commit_request) catch |err|
+            return self.transactionPreparationError(ctx, err);
+        defer prepared.deinit();
         const outcome = ((switch (response_mode) {
-            .transaction => source.commitTransactionWithCancellation(alloc, distributed_tables, commit_req.sync_level, commit_request.cancellation),
-            .multi_batch => source.commitBatchWithCancellation(alloc, distributed_tables, commit_req.sync_level, commit_request.cancellation),
+            .transaction => source.commitTransactionWithCancellation(alloc, prepared.tables, commit_req.sync_level, commit_request.cancellation),
+            .multi_batch => source.commitBatchWithCancellation(alloc, prepared.tables, commit_req.sync_level, commit_request.cancellation),
         }) catch |err| switch (err) {
             error.TransactionTooLarge => return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions"),
             error.InvalidBatchRequest,
@@ -3911,7 +4003,8 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(403);
             return ctx.text("forbidden");
         }
-        const session = (self.api_server.txn_sessions.stage(alloc, txn_id, &stage_req) catch |err| switch (err) {
+        var validator: SessionStatementValidator = .{ .server = self.api_server, .context = tableMutationContext(ctx, &authenticated_identity) };
+        const session = (self.api_server.txn_sessions.stageValidated(alloc, txn_id, &stage_req, validator.port()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -3920,7 +4013,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
             },
-            else => return err,
+            error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.UniqueConstraintViolation, error.RelationalCheckViolation => return jsonErrorResponse(ctx, 409, @errorName(err)),
+            error.Forbidden => return jsonErrorResponse(ctx, 403, "forbidden"),
+            error.TransactionTooLarge => return jsonErrorResponse(ctx, 413, "transaction statement exceeds preparation capacity"),
+            else => return self.transactionPreparationError(ctx, err),
         }) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -4045,6 +4141,18 @@ pub const AntflyApiHandler = struct {
 
     const SessionMutationKind = enum { write, delete };
 
+    const SessionStatementValidator = struct {
+        server: *ApiHttpServer,
+        context: operation_contract.RequestContext,
+        fn port(self: *@This()) transactions_api.SessionRegistry.StageValidator {
+            return .{ .ptr = self, .validate = validate };
+        }
+        fn validate(ptr: *anyopaque, alloc: std.mem.Allocator, previous: ?*const transactions_api.OwnedTransactionCommitRequest, candidate: *transactions_api.OwnedTransactionCommitRequest, statement: *const transactions_api.OwnedTransactionCommitRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try @import("relational_session_statement.zig").validate(self.server, alloc, previous, candidate, statement, self.context);
+        }
+    };
+
     fn stageSessionMutation(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8, kind: SessionMutationKind) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -4075,7 +4183,8 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(403);
             return ctx.text("forbidden");
         }
-        const session = (self.api_server.txn_sessions.stage(alloc, txn_id, &stage_req) catch |err| switch (err) {
+        var validator: SessionStatementValidator = .{ .server = self.api_server, .context = tableMutationContext(ctx, &authenticated_identity) };
+        const session = (self.api_server.txn_sessions.stageValidated(alloc, txn_id, &stage_req, validator.port()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -4084,7 +4193,10 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit is sealed");
             },
-            else => return err,
+            error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.UniqueConstraintViolation, error.RelationalCheckViolation => return jsonErrorResponse(ctx, 409, @errorName(err)),
+            error.Forbidden => return jsonErrorResponse(ctx, 403, "forbidden"),
+            error.TransactionTooLarge => return jsonErrorResponse(ctx, 413, "transaction statement exceeds preparation capacity"),
+            else => return self.transactionPreparationError(ctx, err),
         }) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -4169,6 +4281,53 @@ pub const AntflyApiHandler = struct {
         defer arena_impl.deinit();
         const response = try transactions_api.buildRollbackResponse(arena_impl.allocator(), info);
         return ctx.openApiJson(response);
+    }
+
+    // These failures happen before any participant decision. Keep this mapping
+    // separate from post-decision visibility/unknown-outcome handling below.
+    fn transactionPreparationError(_: *AntflyApiHandler, ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.DeadlineExceeded, error.PreDecisionDeadlineExceeded => textResponse(ctx, 504, "transaction preparation deadline exceeded before commit"),
+            error.Forbidden => textResponse(ctx, 403, "forbidden"),
+            error.TransactionTooLarge, error.SessionRecordTooLarge => textResponse(ctx, 413, "transaction exceeds preparation capacity"),
+            error.ForeignKeyParentMissing,
+            error.ForeignKeyReferenced,
+            error.UniqueConstraintViolation,
+            error.ForeignKeyMatchFullViolation,
+            error.ForeignKeyActionInProgress,
+            error.PreparedReadSetChanged,
+            error.VersionConflict,
+            error.PreparedGenerationChanged,
+            error.IntegrityCatalogChanged,
+            error.SessionLeaseLost,
+            error.TransactionCommitSealed,
+            => textResponse(ctx, 409, @errorName(err)),
+            error.TableNotFound => textResponse(ctx, 404, "not found"),
+            error.InvalidBatchRequest,
+            error.InvalidArgument,
+            error.UnsupportedOperation,
+            error.RelationalCheckViolation,
+            error.UnsupportedTransformOperation,
+            => textResponse(ctx, 400, @errorName(err)),
+            error.IntegrityCatalogUnavailable,
+            error.ConstraintActivationInProgress,
+            error.ConstraintActivationOwnerChanged,
+            error.ConstraintActivationPending,
+            error.Timeout,
+            error.GroupLeaderUnavailable,
+            error.DistributedQueryUnavailable,
+            error.ReadIndexTimeout,
+            error.CatalogRoutingSnapshotTimeout,
+            error.ReadIndexUnavailable,
+            error.StorageReadTemporarilyUnavailable,
+            error.NotLeader,
+            error.LeaderUnavailable,
+            => blk: {
+                try ctx.setHeader("Retry-After", "1");
+                break :blk textResponse(ctx, 503, "transaction preparation temporarily unavailable");
+            },
+            else => return err,
+        };
     }
 
     pub fn commitTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
@@ -4279,58 +4438,60 @@ pub const AntflyApiHandler = struct {
             return ctx.openApiJson(response);
         }
 
+        var execution_plan = try self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id);
+        defer if (execution_plan) |*plan| plan.deinit();
         const distributed_tables = try commit_req.distributedTables(alloc);
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
-        self.api_server.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
-            error.InvalidBatchRequest,
-            error.InvalidArgument,
-            error.InvalidGraphEdges,
-            error.UnsupportedTransformOperation,
-            => {
-                _ = ctx.status(400);
-                return ctx.text("invalid transaction commit request");
-            },
-            else => return err,
-        };
-        if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
-            _ = self.api_server.txn_sessions.remove(alloc, txn_id);
-            var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-            defer arena_impl.deinit();
-            const response = try transactions_api.buildSessionCommitResponse(
-                arena_impl.allocator(),
-                txn_id,
-                "aborted",
-                conflict,
-                null,
-            );
-            _ = ctx.status(409);
-            return ctx.openApiJson(response);
+        // Once execution starts, even a lost-response retry must replay the
+        // exact durable plan, not reject a prior commit on its own new versions.
+        if (execution_plan == null) {
+            self.api_server.validateCommitTablesAgainstSchema(distributed_tables) catch |err| switch (err) {
+                error.InvalidBatchRequest,
+                error.InvalidArgument,
+                error.InvalidGraphEdges,
+                error.UnsupportedTransformOperation,
+                => {
+                    _ = ctx.status(400);
+                    return ctx.text("invalid transaction commit request");
+                },
+                else => return err,
+            };
+            if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
+                if (!self.api_server.txn_sessions.removeBeforeExecution(alloc, txn_id)) {
+                    execution_plan = (try self.api_server.txn_sessions.getExecutionPlan(alloc, txn_id)) orelse
+                        return textResponse(ctx, 503, "transaction preflight changed; retry this transaction id");
+                } else {
+                    var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+                    defer arena_impl.deinit();
+                    const response = try transactions_api.buildSessionCommitResponse(
+                        arena_impl.allocator(),
+                        txn_id,
+                        "aborted",
+                        conflict,
+                        null,
+                    );
+                    _ = ctx.status(409);
+                    return ctx.openApiJson(response);
+                }
+            }
         }
 
         if (try self.acquirePublicOperation(ctx, "commitTransactionSession")) |response| return response;
         defer self.releasePublicOperation("commitTransactionSession");
 
-        // Persist the exact sealed request as recoverable work before 2PC can
-        // choose a durable decision. This closes the response/crash window:
-        // maintenance can replay the same transaction ID without duplicating
-        // non-idempotent transforms.
-        _ = (self.api_server.txn_sessions.markCommitExecutionStarted(alloc, txn_id) catch |err| switch (err) {
-            error.SessionLeaseLost => {
-                _ = ctx.status(409);
-                return ctx.text("session lease lost");
-            },
-            else => return err,
-        }) orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        };
-
-        const commit_request = operationContext(ctx, null);
+        const commit_request = tableMutationContext(ctx, &authenticated_identity);
+        if (execution_plan == null) {
+            var prepared = self.api_server.preparePublicCommitWithIntegrity(alloc, distributed_tables, commit_request) catch |err|
+                return self.transactionPreparationError(ctx, err);
+            defer prepared.deinit();
+            execution_plan = (self.api_server.txn_sessions.sealExecutionPlan(alloc, txn_id, prepared.tables) catch |err|
+                return self.transactionPreparationError(ctx, err)) orelse return textResponse(ctx, 404, "not found");
+        }
         const outcome = (source.commitTransactionWithIdAndCancellation(
             alloc,
             txn_id,
             session.begin_timestamp,
-            distributed_tables,
+            execution_plan.?.value,
             session.sync_level,
             commit_request.cancellation,
         ) catch |err| switch (err) {
@@ -5283,12 +5444,17 @@ pub const AntflyApiHandler = struct {
         );
         if (create_req.indexes_json) |old| alloc.free(old);
         create_req.indexes_json = sealed_indexes_json;
+        @import("relational_witness_ddl.zig").validateArtifactNames(alloc, sealed_indexes_json) catch |err| return witnessDDLError(ctx, err);
+        const supported_schema = self.api_server.preparePartialWitnessSchema(alloc, decoded_table_name, tables_api.effectiveSchemaJson(create_req.schema_json), "", operationContext(ctx, authenticated_identity)) catch |err| return witnessDDLError(ctx, err);
+        if (create_req.schema_json) |old| alloc.free(old);
+        create_req.schema_json = supported_schema;
         std.log.info("public create table begin table={s}", .{decoded_table_name});
         const metadata_create_start_ns = platform_time.monotonicNs();
         var metadata_create_attempts: usize = 0;
         while (true) {
             metadata_create_attempts += 1;
             self.api_server.source.createTable(alloc, decoded_table_name, create_req) catch |err| switch (err) {
+                error.ForeignKeyPartialSupportIndexRequired, error.ForeignKeyPartialSupportIndexConflict => return witnessDDLError(ctx, err),
                 error.TableAlreadyExists => {
                     _ = ctx.status(409);
                     return ctx.text("table already exists");
@@ -5729,11 +5895,11 @@ pub const AntflyApiHandler = struct {
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
-    pub fn updateSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+    pub fn updateSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, _: metadata_openapi.server.UpdateSchemaParams) !httpx.Response {
         return self.mutateSchema(ctx, table_name, .replace);
     }
 
-    pub fn patchSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+    pub fn patchSchema(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, _: metadata_openapi.server.PatchSchemaParams) !httpx.Response {
         return self.mutateSchema(ctx, table_name, .merge_patch);
     }
 
@@ -5754,6 +5920,9 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid schema update request");
         };
         var expected_version: ?u32 = null;
+        // Validate the raw query as well as the generated parameter shape:
+        // duplicate rewrite flags must not be silently collapsed by routing.
+        const rewrite_requested = @import("relational_rewrite_admission.zig").requested(ctx.request.uri.query orelse "") catch return jsonErrorResponse(ctx, 400, "schema query accepts only rewrite=true or rewrite=false");
         if (ctx.header("if-match")) |raw_etag| {
             expected_version = parseSchemaEtag(raw_etag) catch {
                 _ = ctx.status(400);
@@ -5761,7 +5930,9 @@ pub const AntflyApiHandler = struct {
             };
         }
         var invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(error.InvalidSchemaUpdateRequest, body_data);
-        if (authenticated_identity != null) {
+        var supported_schema: ?[]u8 = null;
+        defer if (supported_schema) |json| alloc.free(json);
+        {
             // For PATCH, authorize the complete proposed schema and bind the
             // later mutation to the same epoch so concurrent DDL cannot add
             // an unexamined parent dependency between admission and commit.
@@ -5775,14 +5946,22 @@ pub const AntflyApiHandler = struct {
             defer alloc.free(proposed);
             if (!(foreignKeyParentsAllowed(alloc, authenticated_identity, proposed) catch return jsonErrorResponse(ctx, 400, "invalid schema update request")))
                 return jsonErrorResponse(ctx, 403, "foreign key declarations require admin permission on every referenced parent table");
-            if (mode == .merge_patch and expected_version == null) {
-                var current_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, current.schema_json);
-                defer current_schema.deinit(alloc);
-                expected_version = current_schema.version;
+            const version = try tables_api.schemaVersion(current.schema_json);
+            if (expected_version) |expected| if (version != expected) return jsonErrorResponse(ctx, 409, "schema version changed; refresh and retry");
+            expected_version = version;
+            if (rewrite_requested) {
+                var response = self.api_server.handlePublicSchemaRewrite(current.*, proposed, ctx.header("idempotency-key"), authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| return witnessDDLError(ctx, err);
+                return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
             }
+            supported_schema = self.api_server.preparePartialWitnessSchema(alloc, decoded_table_name, proposed, current.schema_json, operationContext(ctx, authenticated_identity)) catch |err| return witnessDDLError(ctx, err);
         }
         var local_schema_applied = false;
-        var mutation = self.api_server.source.mutateSchema(alloc, decoded_table_name, mode, body_data, expected_version) catch |err| switch (err) {
+        var mutation = self.api_server.source.mutateSchema(alloc, decoded_table_name, .replace, supported_schema.?, expected_version) catch |err| switch (err) {
+            error.ForeignKeyPartialSupportIndexRequired, error.ForeignKeyPartialSupportIndexConflict => return witnessDDLError(ctx, err),
+            error.GeneratedColumnRewriteRequired => {
+                _ = ctx.status(409);
+                return ctx.text(@import("../schema/relational_expression_errors.zig").rewrite_required_message);
+            },
             error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest, error.SchemaVersionManagedByBackend => {
                 invalid_schema_message = table_contract.schemaUpdateRequestErrorMessage(err, body_data);
                 _ = ctx.status(400);
@@ -5827,6 +6006,10 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("method not allowed");
                 };
                 _ = table_writes_source.updateSchema(alloc, decoded_table_name, schema_json) catch |write_err| switch (write_err) {
+                    error.GeneratedColumnRewriteRequired => {
+                        _ = ctx.status(409);
+                        return ctx.text(@import("../schema/relational_expression_errors.zig").rewrite_required_message);
+                    },
                     error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => {
                         _ = ctx.status(400);
                         return ctx.text(invalid_schema_message);
@@ -5970,7 +6153,11 @@ pub const AntflyApiHandler = struct {
                     error.TopologyChanged, error.IdentityReadGenerationChanged, error.DocIdentityNamespaceMismatch => jsonErrorResponse(ctx, 409, "read topology changed"),
                     error.Canceled, error.Cancelled => error.Canceled,
                     error.Timeout, error.DeadlineExceeded => jsonErrorResponse(ctx, 504, "request deadline exceeded"),
-                    else => jsonErrorResponse(ctx, 503, "relational read unavailable"),
+                    else => blk: {
+                        if (relational_read_diagnostic_gate.admit(platform_time.monotonicNs()))
+                            std.log.warn("relational read unavailable phase=distributed_scan class={s}", .{@errorName(err)});
+                        break :blk jsonErrorResponse(ctx, 503, "relational read unavailable");
+                    },
                 };
             }) orelse {
                 return jsonErrorResponse(ctx, 404, "not found");
@@ -6436,6 +6623,7 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
+        if (@import("relational_witness_ddl.zig").reserved(decoded_index_name)) return witnessDDLError(ctx, error.ReservedForeignKeySupportIndex);
         const body_data = (try ctx.body()) orelse "";
         const destinations_allowed = graphResolverDestinationsAllowed(
             ctx.allocator,
@@ -6461,8 +6649,30 @@ pub const AntflyApiHandler = struct {
         defer ctx.allocator.free(decoded_table_name);
         const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_index_name);
+        if (@import("relational_witness_ddl.zig").reserved(decoded_index_name)) return witnessDDLError(ctx, error.ReservedForeignKeySupportIndex);
         var resp = try public_table_http.handleTableDeleteIndex(ctx.allocator, decoded_table_name, decoded_index_name, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn retryIndex(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response {
+        return self.maintainIndex(ctx, table_name, index_name, .retry);
+    }
+
+    pub fn repairIndex(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response {
+        return self.maintainIndex(ctx, table_name, index_name, .repair);
+    }
+
+    fn maintainIndex(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, action: @import("../storage/db/relational_index_maintenance_contract.zig").Action) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_table_name);
+        const decoded_index_name = (try decodePathParamOrBadRequest(ctx, index_name)) orelse return ctx.text("invalid path parameter");
+        defer ctx.allocator.free(decoded_index_name);
+        const body = (try ctx.body()) orelse "";
+        var response = try public_table_http.handleTableIndexMaintenance(ctx.allocator, decoded_table_name, decoded_index_name, action, body, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
+        return respondOwnedApiResponse(ctx, &response);
     }
 
     pub fn executeGraphMetricAction(
@@ -7424,7 +7634,8 @@ const SchemaUpdateStatusSource = struct {
     projection_wait_calls: std.atomic.Value(u32) = .init(0),
     schema_json: ?[]const u8 = null,
     owns_schema_json: bool = false,
-    table_buf: [1]metadata_table_manager.TableRecord = undefined,
+    dependency: ?metadata_table_manager.TableRecord = null,
+    table_buf: [2]metadata_table_manager.TableRecord = undefined,
     range_buf: [1]metadata_table_manager.RangeRecord = undefined,
 
     fn iface(self: *@This()) http_server_mod.StatusSource {
@@ -7474,9 +7685,10 @@ const SchemaUpdateStatusSource = struct {
             .start_key = "",
             .end_key = null,
         };
+        if (self.dependency) |table| self.table_buf[1] = table;
         return .{
             .status = .{ .metadata_group_id = 1, .metrics = .{} },
-            .tables = &self.table_buf,
+            .tables = self.table_buf[0..if (self.dependency != null) @as(usize, 2) else 1],
             .ranges = &self.range_buf,
             .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
             .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
@@ -7746,6 +7958,26 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
             distributed_txn_contract.pre_decision_not_proposed_v1,
             response.headers.get(distributed_txn_contract.pre_decision_outcome_header).?,
         );
+    }
+}
+
+test "internal read-index absence response requires typed native proof" {
+    inline for (.{ error.NotFound, error.AuthoritativeLookupMissing, error.GroupLeaderUnavailable }) |failure| {
+        var request = try httpx.Request.init(std.testing.allocator, .GET, "http://node/internal/v1/groups/7/tables/rows/lookup/missing");
+        defer request.deinit();
+        // Reflected request headers must not manufacture a successful read.
+        try request.setHeader(metadata_api.read_index_absence_header, metadata_api.read_index_absence_value);
+        try request.setHeader(metadata_api.catalog_route_fence_ack_header, metadata_api.catalog_route_fence_ack_value);
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try AntflyApiHandler.internalLookupErrorResponse(&ctx, failure);
+        defer response.deinit();
+        if (failure == error.AuthoritativeLookupMissing) {
+            try std.testing.expectEqual(@as(u16, 404), response.status.code);
+            try std.testing.expectEqualStrings(metadata_api.read_index_absence_value, response.headers.get(metadata_api.read_index_absence_header).?);
+        } else {
+            try std.testing.expect(response.headers.get(metadata_api.read_index_absence_header) == null);
+        }
     }
 }
 
@@ -9841,7 +10073,7 @@ test "httpx relational row query mutation endpoints enforce exact versions and s
     try db.setSchemaJson(alloc, schema_json);
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"id\":9007199254740993,\"name\":\"first\"}" }}, .timestamp_ns = 9007199254740994 });
     var reads = table_reads.BoundTableReadSource.init("docs", 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
-    var writes = table_writes.BoundTableWriteSource.init("docs", &db);
+    var writes = @import("table_writes.zig").BoundTableWriteSource.init("docs", &db);
     // Admission and participants must agree on the authoritative schema.
     // The generic lookup fixture advertises a document table at epoch zero,
     // which should be rejected for this schema-fenced relational mutation.
@@ -10176,6 +10408,341 @@ test "httpx antfly schema update returns full table status after projection" {
     try std.testing.expectEqual(@as(u32, 0), source.projection_wait_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), writes.reconcile_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 0), writes.synchronous_update_calls.load(.monotonic));
+}
+
+test "httpx antfly schema update owns self partial support and rejects public index forgery" {
+    const alloc = std.testing.allocator;
+    var source = SchemaUpdateStatusSource{};
+    defer source.deinit(alloc);
+    const initial =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    try source.replaceSchemaJson(alloc, initial);
+    var writes = SchemaReconcileWriteSource{};
+    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/schema", .{base_url});
+    defer alloc.free(url);
+    const body =
+        \\{"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"docs","parent_columns":["id"],"match":"partial"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    for (0..2) |_| {
+        var response = try requestWithRetry(&client, client_io.io(), .PUT, url, body, &headers, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, source.schema_json.?);
+        defer parsed.deinit(alloc);
+        try @import("../schema/relational_witness_indexes.zig").requireCoverage(parsed, &.{"id"});
+        try std.testing.expectEqual(@as(u32, 2), parsed.version);
+    }
+    const forged = try std.mem.replaceOwned(u8, alloc, body, "\"foreign_keys\":", "\"relational_indexes\":[{\"name\":\"__fk_partial_forged\",\"keys\":[{\"column\":\"id\"}]}],\"foreign_keys\":");
+    defer alloc.free(forged);
+    var rejected = try requestWithRetry(&client, client_io.io(), .PUT, url, forged, &headers, 20);
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 400), rejected.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.body.?, "server-owned") != null);
+    const index_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/indexes/{s}", .{ base_url, @import("../schema/relational_witness_indexes.zig").supportName("id") });
+    defer alloc.free(index_url);
+    var dropped = try requestWithRetry(&client, client_io.io(), .DELETE, index_url, null, &headers, 20);
+    defer dropped.deinit();
+    try std.testing.expectEqual(@as(u16, 400), dropped.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, dropped.body.?, "server-owned") != null);
+}
+
+test "httpx restore owner accepts bounded rewrite source chunks above legacy control limit" {
+    const alloc = std.testing.allocator;
+    const contract = @import("restore_owner_contract.zig");
+    const rewrite = @import("../storage/db/relational_rewrite_contract.zig");
+    const transfer = @import("../storage/db/source_artifact_transfer.zig");
+    const source_scope: @import("../storage/db/online_source_contract.zig").Scope = .{
+        .fence = .{ .role = .rewrite_source, .transition_id = 1, .attempt = 1, .owner_group_id = 11, .peer_group_id = 22, .namespace = .{ .table_id = 1, .shard_id = 11, .range_id = 11 }, .admission_epoch = 1, .catalog_digest = @splat(1) },
+        .receiver_namespace = .{ .table_id = 2, .shard_id = 22, .range_id = 22 },
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+    };
+    const certificate: @import("../storage/source_snapshot.zig").Certificate = .{
+        .cut = .{ .namespace = source_scope.fence.namespace, .applied_index = 1, .retained_start = 0 },
+        .objects = 1,
+        .content_bytes = 1,
+        .schema_manifest_digest = @splat(2),
+        .ordered_content_digest = @splat(3),
+    };
+    const certificate_digest = try certificate.digest();
+    const binding: rewrite.Binding = .{ .program_digest = @splat(4), .retained_pin = source_scope.pin(), .snapshot_certificate = certificate_digest, .retained_epoch = 1, .retained_start = 0, .source_applied_index = 1, .source_scope = source_scope };
+    const data = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(transfer.max_chunk_bytes));
+    defer alloc.free(data);
+    @memset(data, 'z');
+    var request: contract.Request = .{
+        .action = .import_page,
+        .scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = certificate_digest, .source_namespace = source_scope.fence.namespace, .target_namespace = source_scope.receiver_namespace, .target_schema_digest = @splat(4), .rewrite = binding },
+        .rewrite = .{ .source_schemas = &.{"{}"}, .target_schema = "{}", .program_digest = binding.program_digest },
+        .source = .{ .location = "", .artifact = .{ .target_group_id = 22, .source_namespace = source_scope.fence.namespace, .format = .portable, .snapshot_path = "source.afb2", .artifact_size_bytes = transfer.max_chunk_bytes, .artifact_sha256 = certificate_digest, .rewrite = binding }, .peer_descriptor = .{ .scope = source_scope, .certificate = certificate, .total_bytes = transfer.max_chunk_bytes } },
+        .source_chunk = .{ .offset = 0, .data_base64 = data[0 .. 32 * 1024], .digest = @splat(5) },
+    };
+    try request.validate(22);
+    const Fixture = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, group: u64, input: contract.Request, context: @import("operation.zig").RequestContext) !contract.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            try input.validate(group);
+            try std.testing.expectEqualStrings("docs", table);
+            try std.testing.expectEqual(@as(usize, 32 * 1024), input.source_chunk.?.data_base64.len);
+            try std.testing.expectEqual(@as(u8, 'z'), input.source_chunk.?.data_base64[0]);
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return .{ .phase = .importing, .rows = 0, .receipt = @splat(0), .source_next_offset = 24576 };
+        }
+    };
+    var fixture: Fixture = .{};
+    var source = AuthStatusSource{};
+    const secret = "restore-owner-chunk-test-secret";
+    var api_server = ApiHttpServer.init(alloc, .{ .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.execute }, .internal_service_secret = secret, .internal_service_issuer = "httpx-test" }, source.iface(), null, null);
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(alloc, &api_server);
+    defer server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/22/tables/docs/restore-owner", .{base});
+    defer alloc.free(url);
+    const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    const body = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(body);
+    try std.testing.expect(body.len > 16 * 1024);
+    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token } };
+    var response = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqual(@as(u32, 1), fixture.calls.load(.monotonic));
+    const parsed = try std.json.parseFromSlice(contract.Response, alloc, response.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 24576), parsed.value.source_next_offset);
+
+    // Count the actual wire format at both independent maximum payload sizes,
+    // without allocating or parsing a corpus-sized JSON tree. 0xff exercises
+    // the worst-case four-byte numeric encoding of every schema byte.
+    const maximum_schema = try alloc.alloc(u8, rewrite.max_schema_bytes - 2);
+    defer alloc.free(maximum_schema);
+    @memset(maximum_schema, 255);
+    request.rewrite.?.target_schema = maximum_schema;
+    request.source_chunk.?.data_base64 = data;
+    try request.rewrite.?.validate();
+    var buffer: [4096]u8 = undefined;
+    var count = std.Io.Writer.Discarding.init(&buffer);
+    try std.json.Stringify.value(request, .{}, &count.writer);
+    try std.testing.expect(count.fullCount() > 21 * 1024 * 1024);
+    try contract.validateRequestSize(count.fullCount());
+    try contract.validateRequestSize(contract.max_request_bytes);
+    try std.testing.expectError(error.InvalidBackupRequest, contract.validateRequestSize(contract.max_request_bytes + 1));
+    try std.testing.expect(@import("restore_source_errors.zig").permanent(error.InvalidBackupRequest));
+}
+
+test "httpx schema rewrite accepted job atomically stores draft and preserves idempotent live schema" {
+    const alloc = std.testing.allocator;
+    const source_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"add","args":[{"op":"column","column":"x"},{"op":"literal","type":"integer","value":1}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"x":{"type":"integer"},"g":{"type":"integer"}},"required":["x","g"],"additionalProperties":false}}}}
+    ;
+    const patch =
+        \\{"generated_columns":[{"column":"g","expression":{"op":"multiply","args":[{"op":"column","column":"x"},{"op":"literal","type":"integer","value":3}]}}]}
+    ;
+    const Fixture = struct {
+        alloc: std.mem.Allocator,
+        schema: []const u8,
+        key: ?[]u8 = null,
+        row: ?[]u8 = null,
+        plan: ?[]u8 = null,
+        admissions: std.atomic.Value(u32) = .init(0),
+        creates: std.atomic.Value(u32) = .init(0),
+
+        fn deinit(self: *@This()) void {
+            if (self.key) |value| self.alloc.free(value);
+            if (self.row) |value| self.alloc.free(value);
+            if (self.plan) |value| self.alloc.free(value);
+        }
+        fn readFacts(ptr: *anyopaque, a: std.mem.Allocator, group: u64, table: []const u8, request: @import("online_merge_io.zig").contract.Request, context: @import("operation.zig").RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            try request.validate();
+            try std.testing.expectEqualStrings("docs", table);
+            try std.testing.expectEqual(@as(u64, 7001), group);
+            try std.testing.expect(request.operation == .admission and request.operation.admission == .donor);
+            try std.testing.expectEqual(@import("../storage/db/relational_integrity_topology_contract.zig").Role.rewrite_source, request.scope.fence.role);
+            _ = self.admissions.fetchAdd(1, .monotonic);
+            return std.json.Stringify.valueAlloc(a, @import("online_merge_io.zig").contract.AdmissionFacts{
+                .namespace = request.scope.fence.namespace,
+                .eligible = true,
+                .catalog_digest = @splat(7),
+                .next_topology_epoch = 1,
+                .next_consumer_epoch = 1,
+                .donor_term = 1,
+                .next_copy_sequence = 1,
+                .source_schemas = &.{self.schema},
+            }, .{});
+        }
+        fn create(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8, value: []const u8, plan: []const u8, _: u64) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.row == null and self.plan == null);
+            const job = try std.json.parseFromSlice(restore_jobs.JobState, a, value, .{});
+            defer job.deinit();
+            const stages = @import("../metadata/restore_staging.zig");
+            const draft = try std.json.parseFromSlice(stages.Plan, a, plan, .{});
+            defer draft.deinit();
+            try draft.value.validate(a);
+            try std.testing.expect(draft.value.preparing_sources);
+            try std.testing.expectEqual(@as(usize, 1), draft.value.targets.len);
+            try std.testing.expectEqualSlices(u8, &try stages.idForAttempt(job.value.job_id, 1), &draft.value.id);
+            try std.testing.expectEqual(restore_jobs.SourceKind.schema_rewrite, job.value.source_kind);
+            try std.testing.expectEqual(restore_jobs.Phase.queued, job.value.phase);
+            try std.testing.expectEqual(@as(u64, 1), job.value.attempt_id);
+            try std.testing.expectEqual(@as(u64, 1), job.value.staging_attempt_id);
+            try std.testing.expect(value.len < 64 * 1024);
+            try std.testing.expect(std.mem.indexOf(u8, value, "generated_columns") == null);
+            const target = draft.value.targets[0];
+            try std.testing.expectEqualStrings(self.schema, target.replace.?.table.schema_json);
+            try std.testing.expectEqualStrings(self.schema, target.rewrite.?.source_schemas[0]);
+            try std.testing.expect(!std.mem.eql(u8, self.schema, target.table.schema_json));
+            try std.testing.expectEqual(@as(usize, 0), target.source_artifacts.len);
+            try std.testing.expectEqual(@as(usize, 1), target.rewrite_sources.len);
+            const owned_key = try self.alloc.dupe(u8, key);
+            errdefer self.alloc.free(owned_key);
+            const owned_row = try self.alloc.dupe(u8, value);
+            errdefer self.alloc.free(owned_row);
+            const owned_plan = try self.alloc.dupe(u8, plan);
+            self.key = owned_key;
+            self.row = owned_row;
+            self.plan = owned_plan;
+            _ = self.creates.fetchAdd(1, .monotonic);
+            return a.dupe(u8, value);
+        }
+        fn load(_: *anyopaque, a: std.mem.Allocator) ![]restore_jobs.ReplicatedPersistence.OwnedRow {
+            return a.alloc(restore_jobs.ReplicatedPersistence.OwnedRow, 0);
+        }
+        fn get(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.key) |stored| if (std.mem.eql(u8, stored, key)) return try a.dupe(u8, self.row.?);
+            return null;
+        }
+        fn put(_: *anyopaque, _: []const u8, _: []const u8, _: u64) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn delete(_: *anyopaque, _: []const u8, _: u64) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn deleteMany(_: *anyopaque, _: []const []const u8, _: u64) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var fixture: Fixture = .{ .alloc = alloc, .schema = source_schema };
+    defer fixture.deinit();
+    var source = SchemaUpdateStatusSource{ .schema_json = source_schema };
+    defer source.deinit(alloc);
+    var writes = SchemaReconcileWriteSource{};
+    var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.readFacts } }, source.iface(), null, writes.iface());
+    defer api_server.deinit();
+    api_server.restore_job_store.deinit();
+    api_server.restore_job_store = restore_jobs.Store.initWithIo(alloc, std.testing.io);
+    try api_server.restore_job_store.attachReplicated(restore_jobs.ReplicatedPersistence.fromLocal(&fixture, .{
+        .create_with_staging = Fixture.create,
+        .load = Fixture.load,
+        .get = Fixture.get,
+        .put = Fixture.put,
+        .delete = Fixture.delete,
+        .delete_many = Fixture.deleteMany,
+    }));
+    api_server.restore_dispatch_paused.store(true, .release);
+    var server: HttpxE2eServer = undefined;
+    try server.init(alloc, &api_server);
+    defer server.deinit();
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/schema?rewrite=true", .{base});
+    defer alloc.free(url);
+    const headers = [_][2][]const u8{ .{ "content-type", "application/merge-patch+json" }, .{ "if-match", "\"schema-1\"" }, .{ "idempotency-key", "rewrite-accepted" } };
+    var accepted = try requestWithRetry(&client, io.io(), .PATCH, url, patch, &headers, 20);
+    defer accepted.deinit();
+    try std.testing.expectEqual(@as(u16, 202), accepted.status.code);
+    try std.testing.expect(std.mem.startsWith(u8, accepted.headers.get("location").?, "/db/v1/restore/jobs/"));
+    try std.testing.expectEqualStrings("rewrite-accepted", accepted.headers.get("idempotency-key").?);
+    var repeated = try requestWithRetry(&client, io.io(), .PATCH, url, patch, &headers, 20);
+    defer repeated.deinit();
+    try std.testing.expectEqual(@as(u16, 202), repeated.status.code);
+    try std.testing.expectEqualStrings(accepted.headers.get("location").?, repeated.headers.get("location").?);
+    try std.testing.expectEqualStrings(accepted.body.?, repeated.body.?);
+    var conflict = try requestWithRetry(&client, io.io(), .PATCH, url, "{\"description\":\"different rewrite\"}", &headers, 20);
+    defer conflict.deinit();
+    try std.testing.expectEqual(@as(u16, 409), conflict.status.code);
+    try std.testing.expectEqual(@as(u32, 1), fixture.creates.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), fixture.admissions.load(.monotonic));
+    try std.testing.expectEqualStrings(source_schema, source.schema_json.?);
+    try std.testing.expectEqual(@as(u32, 0), writes.reconcile_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), writes.synchronous_update_calls.load(.monotonic));
+}
+
+test "httpx schema rewrite authorizes incoming dependencies before source admission" {
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var permission = try usermgr.Permission.initOwned(alloc, .table, "docs", .admin);
+    defer permission.deinit(alloc);
+    var user = try auth.manager.createUser("rewriter", "secret", &.{permission});
+    defer user.deinit(alloc);
+    const authorization = try encodeBasicAuthorization(alloc, "rewriter", "secret");
+    defer alloc.free(authorization);
+    const parent =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const child =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"docs","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var source = SchemaUpdateStatusSource{ .schema_json = parent, .dependency = .{ .table_id = 8, .name = "dependent", .schema_json = child, .indexes_json = "{}", .placement_role = "data" } };
+    defer source.deinit(alloc);
+    var writes = SchemaReconcileWriteSource{};
+    var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, writes.iface());
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(alloc, &api_server);
+    defer server.deinit();
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/schema?rewrite=true", .{base});
+    defer alloc.free(url);
+    const headers = [_][2][]const u8{ .{ "content-type", "application/merge-patch+json" }, .{ "authorization", authorization }, .{ "if-match", "\"schema-1\"" }, .{ "idempotency-key", "rewrite-auth" } };
+    var response = try requestWithRetry(&client, io.io(), .PATCH, url, "{\"description\":\"rewrite\"}", &headers, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 403), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "every dependency-cohort table") != null);
+    try std.testing.expectEqualStrings(parent, source.schema_json.?);
+    try std.testing.expectEqual(@as(u32, 0), writes.reconcile_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), writes.synchronous_update_calls.load(.monotonic));
+    try api_server.requireSchemaRewriteAuthority("basic:rewriter", &.{"docs"});
+    try std.testing.expectError(error.StoredDestinationAuthorizationRevoked, api_server.requireSchemaRewriteAuthority("basic:rewriter", &.{ "docs", "dependent" }));
+    try auth.manager.deleteUser("rewriter");
+    try std.testing.expectError(error.StoredDestinationAuthorizationRevoked, api_server.requireSchemaRewriteAuthority("basic:rewriter", &.{"docs"}));
 }
 
 test "httpx schema patch merges at the authority and accepts version zero ETag" {

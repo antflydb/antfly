@@ -109,6 +109,7 @@ pub const Routes = struct {
     pub const txn_prepare_suffix = "/txn-prepare";
     pub const txn_resolve_suffix = "/txn-resolve";
     pub const txn_status_suffix = "/txn-status";
+    pub const online_merge_io_suffix = "/online-merge-io";
     pub const txn_acknowledge_suffix = "/txn-acknowledge";
     pub const corrupt_embedding_artifact_suffix = "/corrupt-embedding-artifact";
     pub const group_db_median_key_suffix = "/db/median-key";
@@ -661,6 +662,13 @@ pub const Routes = struct {
             .table_name = table_name,
             .index_name = index_name,
         };
+    }
+
+    pub fn matchTableIndexMaintenance(path: []const u8) ?TableIndex {
+        const suffix: []const u8 = if (std.mem.endsWith(u8, path, "/retry")) "/retry" else if (std.mem.endsWith(u8, path, "/repair")) "/repair" else return null;
+        const index = matchTableIndex(path[0 .. path.len - suffix.len]) orelse return null;
+        if (std.mem.indexOfScalar(u8, index.table_name, '/') != null) return null;
+        return index;
     }
 
     pub fn matchTableGraphMetricAction(path: []const u8) ?TableGraphMetricAction {

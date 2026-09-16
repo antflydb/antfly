@@ -1331,6 +1331,7 @@ pub const SplitIntent = struct {
 };
 
 pub const MergeIntent = struct {
+    projected_online: ?@import("online_merge.zig").State = null,
     transition_id: u64,
     table_id: u64,
     donor_group_id: u64,
@@ -1664,6 +1665,7 @@ pub const TableManager = struct {
                 return error.InvalidProjectedMergeTransition;
 
             const owned = try cloneMergeIntent(self.alloc, .{
+                .projected_online = record.online,
                 .transition_id = record.transition_id,
                 .table_id = record.table_contract.table_id,
                 .donor_group_id = record.donor_group_id,
@@ -1960,6 +1962,7 @@ pub const TableManager = struct {
                 break :blk transitionTableContract(table, donor, receiver);
             };
             const owned = try cloneMergeTransitionRecord(alloc, .{
+                .online = intent.projected_online,
                 .transition_id = intent.transition_id,
                 .donor_group_id = intent.donor_group_id,
                 .receiver_group_id = intent.receiver_group_id,
@@ -2793,6 +2796,7 @@ fn cloneMergeIntent(alloc: std.mem.Allocator, intent: MergeIntent) !MergeIntent 
     else
         null;
     return .{
+        .projected_online = intent.projected_online,
         .transition_id = intent.transition_id,
         .table_id = intent.table_id,
         .donor_group_id = intent.donor_group_id,
@@ -2855,6 +2859,7 @@ pub fn cloneMergeTransitionRecord(alloc: std.mem.Allocator, record: transition_s
         owned_contract.deinitOwned(alloc);
     }
     return .{
+        .online = record.online,
         .transition_id = record.transition_id,
         .donor_group_id = record.donor_group_id,
         .receiver_group_id = record.receiver_group_id,

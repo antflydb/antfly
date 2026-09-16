@@ -65,6 +65,7 @@ pub const contextual_operations = @import("contextual_operations.zig");
 pub const internal_join_operations = @import("internal_join_operations.zig");
 pub const internal_repair_operations = @import("internal_repair_operations.zig");
 pub const restore_jobs = @import("restore_jobs.zig");
+pub const relational_rewrite_driver = @import("relational_rewrite_driver.zig");
 pub const internal_query_operations = @import("internal_query_operations.zig");
 pub const internal_transition_wire = @import("internal_transition_wire.zig");
 pub const http_server = @import("http_server.zig");
@@ -104,6 +105,7 @@ pub const ApiHttpClient = http_client.ApiHttpClient;
 
 test "api restore jobs module compiles" {
     _ = restore_jobs;
+    _ = relational_rewrite_driver;
 }
 
 test "api query contract preserves filter-only query string filters" {

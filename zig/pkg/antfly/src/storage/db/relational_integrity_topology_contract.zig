@@ -33,7 +33,7 @@ pub const receipt_key = "\x00\x00__metadata__:relational_integrity_topology_rece
 
 pub const abort_prefix = "\x00\x00__metadata__:relational_integrity_topology_aborted:";
 
-pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5 };
+pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6 };
 
 pub const Fence = struct {
     admission_epoch: u64 = 1,

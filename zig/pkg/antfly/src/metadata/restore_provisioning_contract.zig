@@ -17,6 +17,7 @@ pub const SourceArtifact = struct {
     native_manifest_size_bytes: u64 = 0,
     native_manifest_sha256: []const u8 = "",
     cohort_seal: ?@import("../storage/db/native_backup_seal_contract.zig").Handle = null,
+    rewrite: ?@import("../storage/db/relational_rewrite_contract.zig").Binding = null,
 
     pub fn digest(self: SourceArtifact, alloc: std.mem.Allocator) ![32]u8 {
         const encoded = try std.json.Stringify.valueAlloc(alloc, self, .{});

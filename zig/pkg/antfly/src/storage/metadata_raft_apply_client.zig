@@ -281,6 +281,10 @@ pub const RaftApplyStore = struct {
     pub fn loadRestoreStagingProgress(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: restore_staging.Id) !?restore_staging.Progress {
         return self.projectionWithAllocator(?restore_staging.Progress, alloc, .{ .kind = .restore_staging_progress, .group_id = group_id, .key = .fromSlice(&id) });
     }
+    pub fn restoreStagingAuthorityAllowed(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: restore_staging.Id, node_id: u64, owner_group: ?u64) !bool {
+        if (owner_group == 0) return false;
+        return self.projectionWithAllocator(bool, alloc, .{ .kind = .restore_staging_authority_allowed, .group_id = group_id, .key = .fromSlice(&id), .arg0 = node_id, .arg1 = owner_group orelse 0 });
+    }
     pub fn loadRestoreStagingReceipt(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: restore_staging.Id, state: restore_staging.State, owner_group: u64) !?[]u8 {
         return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_staging_receipt, .group_id = group_id, .key = .fromSlice(&id), .arg0 = @intFromEnum(state), .arg1 = owner_group });
     }
@@ -411,6 +415,10 @@ pub const RaftApplyStore = struct {
 
     pub fn listMergeTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.MergeTransitionRecord {
         return try self.projectionWithAllocator([]metadata.MergeTransitionRecord, alloc, .{ .kind = .merge_transitions, .group_id = group_id });
+    }
+
+    pub fn getMergeTransition(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, transition_id: u64) !?metadata.MergeTransitionRecord {
+        return self.projectionWithAllocator(?metadata.MergeTransitionRecord, alloc, .{ .kind = .merge_transition, .group_id = group_id, .arg0 = transition_id });
     }
 
     pub fn listTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {

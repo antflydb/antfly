@@ -30,14 +30,15 @@ pub fn collect(alloc: std.mem.Allocator, source: anytype, reader: reads.TableRea
     var snapshot = (try source.adminSnapshot()) orelse return error.ConstraintActivationPending;
     defer source.freeAdminSnapshot(&snapshot);
     const table = tables.findTableByName(&snapshot, name) orelse return error.TableNotFound;
-    var parsed = try schema.parseValidatedTableSchema(alloc, table.schema_json);
-    defer parsed.deinit(alloc);
+    var validator = try schema.CompiledTableValidator.init(alloc, table.schema_json);
+    defer validator.deinit(alloc);
+    const parsed = validator.schema;
     if (parsed.storage_mode != .relational) return error.RelationalTableRequired;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const temporary = arena.allocator();
-    const has_constraints = (if (parsed.unique_constraints) |list| list.value.len else 0) != 0 or (if (parsed.foreign_keys) |list| list.value.len else 0) != 0;
-    var result = wire.RelationalConstraintStatus{ .schema_version = parsed.version, .coverage_kind = "unique_and_foreign_key", .state = .enforced, .ranges = &.{} };
+    const has_constraints = (if (parsed.unique_constraints) |list| list.value.len else 0) != 0 or (if (parsed.foreign_keys) |list| list.value.len else 0) != 0 or (if (parsed.checks) |list| list.value.len else 0) != 0;
+    var result = wire.RelationalConstraintStatus{ .schema_version = parsed.version, .coverage_kind = "unique_foreign_key_and_check", .state = .enforced, .ranges = &.{} };
     if (table.relational_retirement_json.len != 0) {
         var job = try @import("../metadata/relational_retirement.zig").parse(temporary, table.relational_retirement_json);
         defer job.deinit();
@@ -68,8 +69,17 @@ pub fn collect(alloc: std.mem.Allocator, source: anytype, reader: reads.TableRea
     try std.base64.standard.Decoder.decode(raw, encoded);
     var catalog = try catalog_mod.decode(temporary, raw);
     defer catalog.deinit();
+    const checks_digest: [32]u8 = if (validator.execution.checks) |checks| checks.fingerprint() else @splat(0);
+    if (catalog.schema_version != parsed.version or !std.mem.eql(u8, &catalog.incarnation, &(try catalog_mod.incarnationFromTableId(table.table_id))) or
+        !std.mem.eql(u8, &catalog.checks_digest, &checks_digest)) return error.PreparedGenerationChanged;
     var owners: std.ArrayList(*const metadata.RangeRecord) = .empty;
-    for (snapshot.ranges) |*owner| if (owner.table_id == table.table_id) try owners.append(temporary, owner);
+    var owner_by_group: std.AutoHashMapUnmanaged(u64, *const metadata.RangeRecord) = .empty;
+    for (snapshot.ranges) |*owner| if (owner.table_id == table.table_id) {
+        const entry = try owner_by_group.getOrPut(temporary, owner.group_id);
+        if (entry.found_existing) return error.TopologyChanged;
+        entry.value_ptr.* = owner;
+        try owners.append(temporary, owner);
+    };
     if (owners.items.len == 0 or owners.items.len > 4096) return error.ConstraintActivationPending;
     std.mem.sort(*const metadata.RangeRecord, owners.items, {}, struct {
         fn less(_: void, left: *const metadata.RangeRecord, right: *const metadata.RangeRecord) bool {
@@ -115,6 +125,7 @@ pub fn collect(alloc: std.mem.Allocator, source: anytype, reader: reads.TableRea
             .phase = switch (value.phase) {
                 .unique => .unique,
                 .foreign_key => .foreign_key,
+                .check => .check,
             },
             .rows_scanned = try std.fmt.allocPrint(temporary, "{d}", .{value.rows_scanned}),
             .owner = try temporary.dupe(u8, &owner_hex),
@@ -132,10 +143,8 @@ pub fn collect(alloc: std.mem.Allocator, source: anytype, reader: reads.TableRea
     var found: usize = 0;
     for (current.ranges) |owner| if (owner.table_id == table.table_id) {
         found += 1;
-        const matches = for (owners.items) |prior| {
-            if (metadata.rangeRecordsEqual(prior.*, owner)) break true;
-        } else false;
-        if (!matches) return error.TopologyChanged;
+        const prior = owner_by_group.fetchRemove(owner.group_id) orelse return error.TopologyChanged;
+        if (!metadata.rangeRecordsEqual(prior.value.*, owner)) return error.TopologyChanged;
     };
     if (found != owners.items.len) return error.TopologyChanged;
     result.ranges = ranges;
@@ -149,15 +158,19 @@ test "relational declarations status requires complete matching owner coverage" 
         stale: bool = false,
         calls: usize = 0,
         changed_identity: bool = false,
+        check_only: bool = false,
         snapshots: usize = 0,
         const schema_json =
             \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        ;
+        const checked_schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
         ;
         pub fn adminSnapshot(self: *@This()) !?@import("../metadata/api.zig").AdminSnapshot {
             self.snapshots += 1;
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast(&[_]metadata.TableRecord{.{ .table_id = 7, .name = "rows", .schema_json = schema_json }}),
+                .tables = if (self.check_only) @constCast(&[_]metadata.TableRecord{.{ .table_id = 7, .name = "rows", .schema_json = checked_schema_json }}) else @constCast(&[_]metadata.TableRecord{.{ .table_id = 7, .name = "rows", .schema_json = schema_json }}),
                 .ranges = if (self.changed_identity and self.snapshots > 1) @constCast(&[_]metadata.RangeRecord{
                     .{ .table_id = 7, .group_id = 11, .range_id = 999, .start_key = "", .end_key = "\x00" },
                     .{ .table_id = 7, .group_id = 12, .start_key = "\x00", .end_key = null },
@@ -194,7 +207,7 @@ test "relational declarations status requires complete matching owner coverage" 
                 .range_end = if (first) "\x00" else "",
                 .unique_covered = true,
                 .state = "enforced",
-                .phase = "foreign_key",
+                .phase = if (self.check_only) "check" else "foreign_key",
                 .rows_scanned = @as(u64, 9007199254740993),
                 .failure = "",
             }, .{}) };
@@ -217,4 +230,19 @@ test "relational declarations status requires complete matching owner coverage" 
     fixture.changed_identity = true;
     fixture.snapshots = 0;
     try std.testing.expectError(error.TopologyChanged, collect(alloc, &fixture, reader, "rows", .{}));
+    var checked_validator = try schema.CompiledTableValidator.init(alloc, Fixture.checked_schema_json);
+    defer checked_validator.deinit(alloc);
+    var checked_update = try catalog_mod.prepareWithChecks(alloc, null, try catalog_mod.incarnationFromTableId(7), 1, @splat(9), &.{}, checked_validator.execution.checks.?.fingerprint());
+    defer checked_update.deinit();
+    fixture = .{ .update = &checked_update, .check_only = true };
+    const checked_body = try collect(alloc, &fixture, reader, "rows", .{});
+    defer alloc.free(checked_body);
+    var checked_result = try std.json.parseFromSlice(wire.RelationalConstraintStatus, alloc, checked_body, .{});
+    defer checked_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), checked_result.value.ranges.len);
+    try std.testing.expectEqual(wire.RelationalConstraintActivationPhase.check, checked_result.value.ranges[0].phase);
+    try std.testing.expectEqualStrings("unique_foreign_key_and_check", checked_result.value.coverage_kind);
+    // Matching schema versions do not disguise a different CHECK definition.
+    fixture.update = &update;
+    try std.testing.expectError(error.PreparedGenerationChanged, collect(alloc, &fixture, reader, "rows", .{}));
 }

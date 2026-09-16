@@ -30,7 +30,7 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
         if (!std.mem.eql(u8, &parsed.value.plan_digest, &(try parsed.value.plan.digest(alloc)))) return error.InvalidRestoreStaging;
         switch (parsed.value.state) {
             .importing, .validating, .cutover, .canceling => {},
-            .published, .canceled => return error.InvalidRestoreStaging,
+            .published, .canceled, .preparing_sources => return error.InvalidRestoreStaging,
         }
         if (parsed.value.revision == 0) return error.InvalidRestoreStaging;
         var new_owners: usize = 0;

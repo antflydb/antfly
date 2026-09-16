@@ -73,7 +73,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[Any | Error | RelationalConstraintStatus]:
-    """Read distributed unique and foreign-key validation coverage
+    """Read distributed UNIQUE, foreign-key, and CHECK validation coverage
 
     Args:
         table_name (str):
@@ -102,7 +102,7 @@ def sync(
     *,
     client: AuthenticatedClient,
 ) -> Any | Error | RelationalConstraintStatus | None:
-    """Read distributed unique and foreign-key validation coverage
+    """Read distributed UNIQUE, foreign-key, and CHECK validation coverage
 
     Args:
         table_name (str):
@@ -126,7 +126,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[Any | Error | RelationalConstraintStatus]:
-    """Read distributed unique and foreign-key validation coverage
+    """Read distributed UNIQUE, foreign-key, and CHECK validation coverage
 
     Args:
         table_name (str):
@@ -153,7 +153,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
 ) -> Any | Error | RelationalConstraintStatus | None:
-    """Read distributed unique and foreign-key validation coverage
+    """Read distributed UNIQUE, foreign-key, and CHECK validation coverage
 
     Args:
         table_name (str):

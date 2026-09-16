@@ -35,7 +35,7 @@ pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSche
     errdefer for (definitions[0..initialized]) |definition| alloc.free(definition.payload);
     for (uniques, definitions[0..uniques.len]) |unique, *definition| {
         definition.* = try definitionAlloc(alloc, .unique, unique.name, .{
-            .domain = "antfly unique declaration v1",
+            .domain = "antfly unique declaration v2 null witnesses",
             .name = unique.name,
             .columns = unique.columns,
             .column_types = try columnTypes(arena, runtime, unique.columns),
@@ -44,7 +44,7 @@ pub fn definitionFingerprints(alloc: std.mem.Allocator, public: schema.TableSche
         initialized += 1;
     }
     for (foreign_keys, definitions[uniques.len..]) |foreign_key, *definition| {
-        if (foreign_key.timing == .deferred or foreign_key.deferrable or foreign_key.match == .partial) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.timing == .deferred and !foreign_key.deferrable) return error.InvalidSchemaUpdateRequest;
         if (foreign_key.on_delete == .set_null or foreign_key.on_update == .set_null) {
             for (foreign_key.child_columns) |name| {
                 const column = for (runtime.relational_columns) |column| {

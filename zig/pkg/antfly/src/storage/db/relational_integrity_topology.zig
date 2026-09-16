@@ -100,12 +100,28 @@ pub fn stageBegin(txn: anytype, fence: Fence) !void {
         if (previous.admission_epoch >= fence.admission_epoch)
             return error.IntegrityTopologyCompleted;
     }
-    const raw_catalog = (try optional(txn, catalog.key)) orelse if (fence.role == .backup_snapshot) "" else return error.IntegrityCatalogChanged;
+    const raw_catalog = try catalogForFence(txn, fence);
     var digest: integrity.Digest = undefined;
     std.crypto.hash.Blake3.hash(raw_catalog, &digest, .{});
     if (!std.mem.eql(u8, &digest, &fence.catalog_digest)) return error.IntegrityCatalogChanged;
     const bytes = try fence.encode();
     try txn.put(fence_key, &bytes);
+}
+
+/// Ordinary document owners need the same source fence for online transfer,
+/// but legitimately have no relational integrity catalog. The durable storage
+/// mode, not catalog absence alone, authorizes this case. A relational owner
+/// with missing integrity metadata remains corruption, never an empty catalog.
+pub fn catalogForFence(txn: anytype, fence: Fence) ![]const u8 {
+    if (try optional(txn, catalog.key)) |bytes| return bytes;
+    if (fence.role == .backup_snapshot) return "";
+    if (fence.role == .merge_source or fence.role == .rewrite_source) {
+        const table = @import("table_catalog.zig");
+        const raw = try optional(txn, table.key) orelse return error.IntegrityCatalogChanged;
+        const facts = try table.Catalog.decode(raw);
+        if (facts.mode_initialized and facts.storage_mode == .document) return "";
+    }
+    return error.IntegrityCatalogChanged;
 }
 
 fn abortedKey(fence: Fence) [abort_prefix.len + 9]u8 {
@@ -123,7 +139,7 @@ fn abortedKey(fence: Fence) [abort_prefix.len + 9]u8 {
 /// horizon before collection; elapsed wall time is not a correctness proof.
 pub fn stageAbortTransition(txn: anytype, expected: Fence) !void {
     _ = try expected.encode();
-    if (expected.role != .split_source and expected.role != .split_destination and expected.role != .merge_source and expected.role != .merge_destination) return error.InvalidIntegrityTopologyFence;
+    if (expected.role != .split_source and expected.role != .split_destination and expected.role != .merge_source and expected.role != .merge_destination and expected.role != .rewrite_source) return error.InvalidIntegrityTopologyFence;
     const key = abortedKey(expected);
     const previous = if (try optional(txn, &key)) |bytes| blk: {
         if (bytes.len != 8) return error.InvalidIntegrityTopologyFence;
@@ -155,7 +171,7 @@ pub fn requireUnfenced(txn: anytype) !void {
 /// Runtime reconciliation of an already-published identical producer catalog
 /// is harmless while frozen; delayed *changes* may not create new callbacks.
 pub fn requireUnfencedOrUnchanged(txn: anytype, key: []const u8, candidate: []const u8) !void {
-    if (try current(txn) == null) return;
+    if (try current(txn) == null and try @import("online_integrity_shadow.zig").rawRange(txn) == null) return;
     const existing = (try optional(txn, key)) orelse return error.IntegrityTopologyBusy;
     if (!std.mem.eql(u8, existing, candidate)) return error.IntegrityTopologyBusy;
 }

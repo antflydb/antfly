@@ -77,6 +77,14 @@ pub const TableWriteSource = struct {
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
+        txn_status_group_local_with_request: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: distributed_txn.TxnStatusRequest,
+            context: @import("operation.zig").RequestContext,
+        ) anyerror!?db_mod.types.TxnStatus = null,
         /// Committed replication has distinct transaction and entry-identity
         /// semantics from an ordinary request batch. Prepared application may
         /// only borrow an already configured owner, never consult the catalog.
@@ -1078,6 +1086,20 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group_local orelse return null;
         return try BoundaryAbi.call("txn_status_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
+    }
+
+    pub fn txnStatusGroupLocalWithRequest(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_txn.TxnStatusRequest,
+        context: @import("operation.zig").RequestContext,
+    ) !?db_mod.types.TxnStatus {
+        try context.ensureActive();
+        if (req.restore_staging_scope == null or req.restore_staging_plan_id == null) return error.InvalidTxnRequest;
+        const callback = self.vtable.txn_status_group_local_with_request orelse return error.DeadlineAwareTxnStatusUnsupported;
+        return try BoundaryAbi.call("txn_status_group_local_with_request", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, req, context });
     }
 
     pub fn txnStatusGroupLinearizable(

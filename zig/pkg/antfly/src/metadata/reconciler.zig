@@ -4039,6 +4039,7 @@ fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTran
         owned_contract.deinitOwned(alloc);
     }
     return .{
+        .online = record.online,
         .transition_id = record.transition_id,
         .donor_group_id = record.donor_group_id,
         .receiver_group_id = record.receiver_group_id,
@@ -4062,7 +4063,7 @@ fn splitRecordsEqual(a: transition_state.SplitTransitionRecord, b: transition_st
 }
 
 fn mergeRecordsEqual(a: transition_state.MergeTransitionRecord, b: transition_state.MergeTransitionRecord) bool {
-    return a.transition_id == b.transition_id and
+    return std.meta.eql(a.online, b.online) and a.transition_id == b.transition_id and
         a.donor_group_id == b.donor_group_id and
         a.receiver_group_id == b.receiver_group_id and
         a.phase == b.phase and

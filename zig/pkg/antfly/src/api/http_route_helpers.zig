@@ -119,12 +119,14 @@ pub const OwnedLookupOptions = struct {
     fields: [][]const u8 = &.{},
     relational_integrity_jobs_json: []const u8 = "",
     relational_activation_json: []const u8 = "",
+    relational_index_status_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
     opts: @import("../storage/db/types.zig").LookupOptions = .{},
 
     pub fn deinit(self: *OwnedLookupOptions, alloc: std.mem.Allocator) void {
         if (self.relational_integrity_jobs_json.len != 0) alloc.free(self.relational_integrity_jobs_json);
         if (self.relational_activation_json.len != 0) alloc.free(self.relational_activation_json);
+        if (self.relational_index_status_json.len != 0) alloc.free(self.relational_index_status_json);
         if (self.relational_topology_json.len != 0) alloc.free(self.relational_topology_json);
         for (self.fields) |field| alloc.free(field);
         if (self.fields.len > 0) alloc.free(self.fields);
@@ -209,6 +211,12 @@ pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !
             result.relational_integrity_jobs_json = try decodePercentEncodedPathComponentAlloc(alloc, part["_relational_integrity_jobs=".len..]);
             if (result.relational_integrity_jobs_json.len == 0 or result.relational_integrity_jobs_json.len > 4096) return error.InvalidQueryRequest;
             result.opts.relational_integrity_jobs_json = result.relational_integrity_jobs_json;
+        } else if (std.mem.startsWith(u8, part, "_relational_index_status=")) {
+            if (seen) return error.InvalidQueryRequest;
+            seen = true;
+            result.relational_index_status_json = try decodePercentEncodedPathComponentAlloc(alloc, part["_relational_index_status=".len..]);
+            if (result.relational_index_status_json.len == 0 or result.relational_index_status_json.len > 4096) return error.InvalidQueryRequest;
+            result.opts.relational_index_status_json = result.relational_index_status_json;
         } else if (std.mem.startsWith(u8, part, "_relational_activation=")) {
             if (seen) return error.InvalidQueryRequest;
             seen = true;
@@ -228,8 +236,17 @@ pub fn parseInternalLookupOptions(alloc: std.mem.Allocator, query: []const u8) !
             var scope: [32]u8 = undefined;
             _ = std.fmt.hexToBytes(&scope, hex) catch return error.InvalidQueryRequest;
             result.opts.restore_staging_scope = scope;
+        } else if (std.mem.startsWith(u8, part, "_restore_staging_plan_id=")) {
+            if (result.opts.restore_staging_plan_id != null) return error.InvalidQueryRequest;
+            const hex = part["_restore_staging_plan_id=".len..];
+            if (hex.len != 32) return error.InvalidQueryRequest;
+            var plan: [16]u8 = undefined;
+            _ = std.fmt.hexToBytes(&plan, hex) catch return error.InvalidQueryRequest;
+            if (std.mem.allEqual(u8, &plan, 0)) return error.InvalidQueryRequest;
+            result.opts.restore_staging_plan_id = plan;
         }
     }
+    if (result.opts.restore_staging_plan_id != null and result.opts.restore_staging_scope == null) return error.InvalidQueryRequest;
     return result;
 }
 
@@ -249,6 +266,13 @@ test "relational row query control modes require authenticated internal parsing"
     var public = try parseLookupOptions(alloc, query);
     defer public.deinit(alloc);
     try std.testing.expectEqualStrings("", public.opts.relational_activation_json);
+    const index_query = "_relational_index_status=%7B%22name%22%3A%22by_id%22%2C%22schema_version%22%3A2%7D";
+    var index_internal = try parseInternalLookupOptions(alloc, index_query);
+    defer index_internal.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"name\":\"by_id\",\"schema_version\":2}", index_internal.opts.relational_index_status_json);
+    var index_public = try parseLookupOptions(alloc, index_query);
+    defer index_public.deinit(alloc);
+    try std.testing.expectEqualStrings("", index_public.opts.relational_index_status_json);
     try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, "_relational_integrity_catalog=true&_relational_integrity_action=true"));
     const topology_query = "_relational_topology=%7B%22mode%22%3A%22identity%22%7D";
     var topology_internal = try parseInternalLookupOptions(alloc, topology_query);
@@ -258,6 +282,22 @@ test "relational row query control modes require authenticated internal parsing"
     defer topology_public.deinit(alloc);
     try std.testing.expectEqualStrings("", topology_public.opts.relational_topology_json);
     try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, topology_query ++ "&_relational_integrity_catalog=true"));
+}
+
+test "private restore lookup plan identity never leaks into public admission" {
+    const alloc = std.testing.allocator;
+    const plan = "_restore_staging_plan_id=ffffffffffffffffffffffffffffffff";
+    const scope = "_restore_staging_scope=" ++ "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    var parsed = try parseInternalLookupOptions(alloc, plan ++ "&" ++ scope);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as([16]u8, @splat(0xff)), parsed.opts.restore_staging_plan_id.?);
+    try std.testing.expectEqual(@as([32]u8, @splat(0xee)), parsed.opts.restore_staging_scope.?);
+    var public = try parseLookupOptions(alloc, plan ++ "&" ++ scope);
+    defer public.deinit(alloc);
+    try std.testing.expect(public.opts.restore_staging_plan_id == null and public.opts.restore_staging_scope == null);
+    try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, plan));
+    try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, plan ++ "&" ++ scope ++ "&" ++ plan));
+    try std.testing.expectError(error.InvalidQueryRequest, parseInternalLookupOptions(alloc, scope ++ "&_restore_staging_plan_id=00000000000000000000000000000000"));
 }
 
 test "relational mutation endpoints are not aliased to serverless ingestion" {
@@ -321,7 +361,16 @@ pub fn parseRelationalRowQueryRequest(alloc: std.mem.Allocator, body: []const u8
     defer parsed.deinit();
     const req = parsed.value;
     const limit = std.math.cast(u32, req.limit orelse 128) orelse return error.InvalidQueryRequest;
-    if (req.schema_version) |version| if (std.math.cast(u32, version) == null or version == 0) return error.InvalidQueryRequest;
+    if (req.index) |name| {
+        if (name.len == 0 or req.schema_version == null or req.from != null or req.to != null) return error.InvalidQueryRequest;
+    } else if (req.after != null or req.lower != null or req.upper != null) return error.InvalidQueryRequest;
+    if (req.after) |cursor| @import("../storage/db/relational_row_cursor.zig").validate(cursor) catch return error.InvalidQueryRequest;
+    inline for (.{ "lower", "upper" }) |field| if (@field(req, field)) |bound| {
+        if (bound.values.len == 0 or bound.values.len > 256) return error.InvalidQueryRequest;
+    };
+    // Newly created tables use epoch zero. Presence provides the fence;
+    // rejecting zero makes those tables impossible to query by index.
+    if (req.schema_version) |version| if (std.math.cast(u32, version) == null) return error.InvalidQueryRequest;
     const conditions: []const metadata_openapi.types.RelationalRowCondition = req.conditions orelse &.{};
     if (req.fields.len > 256 or conditions.len > 256 or limit == 0 or limit > 4096) return error.InvalidQueryRequest;
     for (req.fields, 0..) |field, i| {
@@ -357,6 +406,41 @@ test "relational row query preserves exact operands and empty projection" {
     try std.testing.expect(std.mem.indexOf(u8, req.opts.relational_query_json, "9007199254740993") != null);
     try std.testing.expectError(error.InvalidQueryRequest, parseRelationalRowQueryRequest(alloc, "{\"fields\":[],\"limit\":-1}"));
     try std.testing.expectError(error.InvalidQueryRequest, parseRelationalRowQueryRequest(alloc, "{\"fields\":[\"x\",\"x\"]}"));
+}
+
+test "relational row query index selection requires schema fencing and exclusive cursor vocabulary" {
+    const alloc = std.testing.allocator;
+    var request = try parseRelationalRowQueryRequest(alloc,
+        \\{"schema_version":7,"index":"tenant_id","fields":[],"lower":{"values":["9007199254740993"],"inclusive":false},"limit":4}
+    );
+    defer request.deinit(alloc);
+    try std.testing.expectEqualStrings("", request.from);
+    try std.testing.expectEqualStrings("", request.to);
+    try std.testing.expectEqual(@as(u32, 4), request.opts.limit);
+    for ([_][]const u8{
+        "{\"index\":\"tenant_id\",\"fields\":[]}",
+        "{\"schema_version\":7,\"index\":\"tenant_id\",\"from\":\"a\",\"fields\":[]}",
+        "{\"fields\":[],\"lower\":{\"values\":[1]}}",
+        "{\"schema_version\":7,\"index\":\"tenant_id\",\"fields\":[],\"lower\":{\"values\":[]}}",
+        "{\"schema_version\":7,\"index\":\"tenant_id\",\"fields\":[],\"after\":\"invalid\"}",
+    }) |invalid| try std.testing.expectError(error.InvalidQueryRequest, parseRelationalRowQueryRequest(alloc, invalid));
+    try std.testing.expectEqual(@as(u16, 409), scanRequestError(error.RelationalIndexNotReady).?.status);
+    try std.testing.expectEqual(@as(u16, 404), scanRequestError(error.IndexNotFound).?.status);
+}
+
+test "relational row query accepts the initial zero epoch without weakening index fencing" {
+    const alloc = std.testing.allocator;
+    var request = try parseRelationalRowQueryRequest(alloc,
+        \\{"schema_version":0,"index":"active_price","fields":["id","price"],"conditions":[{"column":"active","op":"eq","value":true}],"lower":{"values":[1]},"upper":{"values":[1]},"limit":4096}
+    );
+    defer request.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, request.relational_query_json, "\"schema_version\":0") != null);
+    for ([_][]const u8{
+        "{\"index\":\"active_price\",\"fields\":[]}",
+        "{\"schema_version\":null,\"index\":\"active_price\",\"fields\":[]}",
+        "{\"schema_version\":-1,\"index\":\"active_price\",\"fields\":[]}",
+        "{\"schema_version\":4294967296,\"index\":\"active_price\",\"fields\":[]}",
+    }) |invalid| try std.testing.expectError(error.InvalidQueryRequest, parseRelationalRowQueryRequest(alloc, invalid));
 }
 
 fn parseScanKeysRequestImpl(alloc: std.mem.Allocator, body: []const u8, allow_internal_options: bool) !OwnedScanKeysRequest {
@@ -435,6 +519,18 @@ pub const ScanRequestError = struct {
     message: []const u8,
 };
 
+/// Public responses deliberately hide internal read failures. Preserve the
+/// cause operationally without allowing a failing read loop to flood logs.
+pub const RelationalReadDiagnosticGate = @import("bounded_diagnostic_gate.zig").Gate;
+
+test "relational row query diagnostics bound repeated unavailable responses" {
+    var gate: RelationalReadDiagnosticGate = .{};
+    try std.testing.expect(gate.admit(1));
+    for (0..1000) |_| try std.testing.expect(!gate.admit(2));
+    try std.testing.expect(gate.admit(1 + 30 * std.time.ns_per_s));
+    try std.testing.expect(!gate.admit(1 + 30 * std.time.ns_per_s));
+}
+
 pub fn scanRequestError(err: anyerror) ?ScanRequestError {
     return switch (err) {
         error.InvalidQueryRequest,
@@ -442,13 +538,17 @@ pub fn scanRequestError(err: anyerror) ?ScanRequestError {
         error.RelationalTableRequired,
         error.RelationalIndexColumnNotFound,
         error.UnsupportedRelationalIndexColumn,
+        error.InvalidRelationalIndexBound,
         error.InvalidBatchRequest,
         => .{ .status = 400, .message = "invalid scan request" },
         error.PreparedSchemaChanged,
         error.PreparedGenerationChanged,
         error.SchemaVersionChanged,
+        error.RelationalIndexColumnTypeMismatch,
         => .{ .status = 409, .message = "relational schema epoch changed" },
-        error.RelationalRowsOutputBudgetExceeded => .{ .status = 413, .message = "projected row exceeds output budget" },
+        error.RelationalIndexNotReady => .{ .status = 409, .message = "relational index is not ready on every owning shard" },
+        error.IndexNotFound => .{ .status = 404, .message = "relational index not found" },
+        error.RelationalRowsOutputBudgetExceeded, error.RelationalRowResultTooLarge => .{ .status = 413, .message = "projected row exceeds output budget" },
         // scanKeys declares BadRequest, not an operation-specific 422, in the
         // public OpenAPI contract. Keep every server and generated SDK aligned.
         error.UnsupportedQueryRequest => .{ .status = 400, .message = "unsupported scan filter query" },

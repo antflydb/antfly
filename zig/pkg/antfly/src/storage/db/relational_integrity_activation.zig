@@ -49,7 +49,7 @@ pub fn ownership(txn: anytype) !integrity.Digest {
     state.update("antfly constraint coverage owner v1");
     const namespace = try optional(txn, &@import("../internal_keys.zig").identity_namespace_key) orelse return error.CoordinatedConstraintsRequireTableIdentity;
     state.update(namespace);
-    state.update((try optional(txn, ranges.range_key)) orelse &full_range);
+    state.update((try @import("online_integrity_shadow.zig").rawRange(txn)) orelse (try optional(txn, ranges.range_key)) orelse &full_range);
     var result: integrity.Digest = undefined;
     state.final(&result);
     return result;
@@ -64,6 +64,8 @@ pub fn routingKey(alloc: Allocator, txn: anytype) ![]const u8 {
 pub const State = @import("relational_integrity_activation_contract.zig").State;
 pub const Phase = @import("relational_integrity_activation_contract.zig").Phase;
 pub const Progress = @import("relational_integrity_activation_contract.zig").Progress;
+const firstPhase = @import("relational_integrity_activation_contract.zig").firstPhase;
+const nextPhase = @import("relational_integrity_activation_contract.zig").nextPhase;
 
 pub fn status(txn: anytype, catalog: catalog_mod.Catalog) !Progress {
     const owner = try ownership(txn);
@@ -74,7 +76,7 @@ pub fn status(txn: anytype, catalog: catalog_mod.Catalog) !Progress {
             return progress;
         }
     }
-    return .{ .generation_set = generationSet(catalog), .owner = owner, .schema_version = catalog.schema_version, .phase = if (hasKind(catalog, .unique)) .unique else .foreign_key };
+    return .{ .generation_set = generationSet(catalog), .owner = owner, .schema_version = catalog.schema_version, .phase = firstPhase(catalog) };
 }
 
 /// Must stage in the schema/catalog/outbox commit using the durable table
@@ -130,14 +132,14 @@ pub fn prepareCommand(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catal
     const after = Progress.decode(command.next) catch return error.InvalidConstraintActivationCommand;
     if (!after.matches(catalog, before.owner) or after.schema_version != catalog.schema_version) return error.ConstraintActivationChanged;
     if (command.retry) {
-        const initial_phase: Phase = if (hasKind(catalog, .unique)) .unique else .foreign_key;
+        const initial_phase = firstPhase(catalog);
         if (before.state != .invalid or after.state != .validating or after.phase != initial_phase or after.cursor.len != 0 or after.rows_scanned != 0) return error.InvalidConstraintActivationCommand;
     } else {
         if (before.state != .validating or after.rows_scanned < before.rows_scanned) return error.InvalidConstraintActivationCommand;
         if (after.phase != before.phase) {
-            if (before.phase != .unique or after.phase != .foreign_key or after.state != .validating or after.cursor.len != 0 or !hasKind(catalog, .foreign_key)) return error.InvalidConstraintActivationCommand;
+            if (after.phase != (nextPhase(catalog, before.phase) orelse return error.InvalidConstraintActivationCommand) or after.state != .validating or after.cursor.len != 0) return error.InvalidConstraintActivationCommand;
         } else if (after.state == .validating and std.mem.order(u8, after.cursor, before.cursor) != .gt) return error.InvalidConstraintActivationCommand;
-        if (after.state == .enforced and before.phase == .unique and hasKind(catalog, .foreign_key)) return error.InvalidConstraintActivationCommand;
+        if (after.state == .enforced and nextPhase(catalog, before.phase) != null) return error.InvalidConstraintActivationCommand;
     }
     return .{ .intent = .{ .key = key, .value = command.next }, .predicate = .{ .key = key, .comparison = .exact_value, .expected_value = command.expected } };
 }
@@ -168,7 +170,7 @@ pub const Page = struct {
     /// Opens one immutable source snapshot and releases the apply fence before
     /// projection. The coordinator enlists every returned row's version guard
     /// with its generated integrity commands AND this page's CAS command.
-    pub fn prepare(alloc: Allocator, io: ?std.Io, core: anytype, fields: []const []const u8, budget: rows.Budget) !?Page {
+    pub fn prepare(alloc: Allocator, io: ?std.Io, core: anytype, budget: rows.Budget) !?Page {
         var reader = blk: {
             core.lockApplyShared();
             defer core.unlockApplyShared();
@@ -176,9 +178,10 @@ pub const Page = struct {
             defer view.release();
             // Validate all physically retained rows, including TTL candidates;
             // only coordinated expiration may retire constrained parents.
-            break :blk try rows.Reader.open(alloc, core.store, view, null, .{ .fields = fields, .include_primary_digest = true }, 0);
+            break :blk try rows.Reader.open(alloc, core.store, view, null, .{ .include_primary_digest = true }, 0);
         };
         defer reader.deinit();
+        try @import("online_integrity_shadow.zig").requireCatalogMutable(&reader.read);
         const catalog_raw = try optional(&reader.read, catalog_mod.key) orelse return error.ConstraintNotFound;
         var catalog = try catalog_mod.decode(alloc, catalog_raw);
         defer catalog.deinit();
@@ -187,6 +190,31 @@ pub const Page = struct {
         var progress = try status(&reader.read, catalog);
         const phase = progress.phase;
         if (progress.state != .validating) return null;
+        // Bind the cold projection to the checkpoint in this SAME source
+        // snapshot. A large CHECK column must not inflate UNIQUE/FK pages.
+        const public = (reader.active.validator() orelse return error.ConstraintNotFound).schema;
+        var selected_fields: std.ArrayList([]const u8) = .empty;
+        defer selected_fields.deinit(alloc);
+        var selected: std.StringHashMapUnmanaged(void) = .empty;
+        defer selected.deinit(alloc);
+        switch (phase) {
+            .unique => if (public.unique_constraints) |constraints| {
+                for (constraints.value) |constraint| for (constraint.columns) |column| {
+                    if (!(try selected.getOrPut(alloc, column)).found_existing) try selected_fields.append(alloc, column);
+                };
+            },
+            .foreign_key => if (public.foreign_keys) |constraints| {
+                for (constraints.value) |constraint| for (constraint.child_columns) |column| {
+                    if (!(try selected.getOrPut(alloc, column)).found_existing) try selected_fields.append(alloc, column);
+                };
+            },
+            .check => if (reader.active.validator().?.execution.checks) |checks| {
+                for (checks.dependency_fields) |column| {
+                    if (!(try selected.getOrPut(alloc, column)).found_existing) try selected_fields.append(alloc, column);
+                }
+            },
+        }
+        reader.fields = selected_fields.items;
         if (progress.cursor.len != 0 and (std.mem.order(u8, progress.cursor, reader.lower) == .lt or std.mem.order(u8, progress.cursor, reader.upper) != .lt)) return error.InvalidConstraintActivation;
         try reader.after.appendSlice(alloc, progress.cursor);
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -195,13 +223,13 @@ pub const Page = struct {
         const expected = if (try optional(&reader.read, key)) |bytes| try owned.dupe(u8, bytes) else null;
         const routing = try routingKey(owned, &reader.read);
         var page_rows = reader.nextPage(alloc, io, budget) catch |err| {
-            if (err != error.RelationalRowResultTooLarge) return err;
+            if (err != error.RelationalRowResultTooLarge and err != error.RelationalIndexColumnTypeMismatch) return err;
             // A single unprojectable row must not leave an owner retrying
             // forever. Publish a conservative failure CAS with NO source
             // coverage or cursor advancement; ordinary mutations remain
             // fenced until explicit repair/retry resolves the diagnostic.
             progress.state = .invalid;
-            progress.failure = "RelationalRowResultTooLarge";
+            progress.failure = @errorName(err);
             progress.cursor = try owned.dupe(u8, progress.cursor);
             const next = try progress.encode(owned);
             return .{
@@ -216,7 +244,7 @@ pub const Page = struct {
         progress.rows_scanned = std.math.add(u64, progress.rows_scanned, page_rows.rows.len) catch return error.InvalidConstraintActivation;
         progress.cursor = if (page_rows.more) try owned.dupe(u8, reader.after.items) else "";
         if (!page_rows.more) {
-            if (phase == .unique and hasKind(catalog, .foreign_key)) progress.phase = .foreign_key else progress.state = .enforced;
+            if (nextPhase(catalog, phase)) |next_phase| progress.phase = next_phase else progress.state = .enforced;
         }
         const next = try progress.encode(owned);
         return .{ .arena = arena, .rows = page_rows, .progress = progress, .phase = phase, .command = .{ .routing_key = routing, .expected = expected, .next = next } };

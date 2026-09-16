@@ -26,16 +26,20 @@ const native = @import("../relational_index.zig");
 const tuples = @import("relational_index_keys.zig");
 const mapper = @import("document_mapper.zig");
 const rows = @import("algebraic/relational_row_codec.zig");
+const covering = @import("relational_index_cover.zig");
+const partial = @import("relational_index_predicate.zig");
 const Allocator = std.mem.Allocator;
 
-/// Already selected by the catalog for key preparation. Constraint/predicate
-/// evaluation and covering payloads are separate consumers of the same typed
+/// Already selected by the catalog for key and covering-value preparation.
+/// Constraint/predicate evaluation is a separate consumer of the same typed
 /// row; callers must not discard those requirements when selecting definitions.
 pub const Definition = struct {
     name: []const u8,
     generation: u64,
     slot: u32 = 0,
     keys: []const native.RelationalIndexKey,
+    include_columns: []const []const u8 = &.{},
+    where: []const native.UniquePredicate = &.{},
 };
 
 pub const BoundIndex = struct {
@@ -43,6 +47,8 @@ pub const BoundIndex = struct {
     generation: u64,
     slot: u32,
     tuple: tuples.TuplePlan,
+    cover: ?covering.Plan = null,
+    predicate: ?partial.Plan = null,
 
     pub fn id(self: BoundIndex) native.RelationalIndexId {
         return .{ .generation = self.generation, .slot = self.slot };
@@ -63,6 +69,8 @@ const Snapshot = struct {
         for (self.indexes) |*index| {
             self.alloc.free(index.name);
             index.tuple.deinit();
+            if (index.cover) |*cover| cover.deinit();
+            if (index.predicate) |*condition| condition.deinit();
         }
         self.alloc.free(self.indexes);
         self.schema_view.release();
@@ -85,6 +93,8 @@ pub const View = struct {
             for (indexes[0..initialized]) |*index| {
                 alloc.free(index.name);
                 index.tuple.deinit();
+                if (index.cover) |*cover| cover.deinit();
+                if (index.predicate) |*condition| condition.deinit();
             }
             alloc.free(indexes);
         }
@@ -93,8 +103,19 @@ pub const View = struct {
                 return error.InvalidRelationalIndexDefinition;
             const name = try alloc.dupe(u8, definition.name);
             errdefer alloc.free(name);
-            const tuple = try tuples.TuplePlan.init(alloc, retained.tableSchema().*, retained.physicalLayout(), definition.keys);
-            index.* = .{ .name = name, .generation = definition.generation, .slot = definition.slot, .tuple = tuple };
+            var tuple = try tuples.TuplePlan.init(alloc, retained.tableSchema().*, retained.physicalLayout(), definition.keys);
+            errdefer tuple.deinit();
+            var cover = if (definition.include_columns.len != 0) try covering.Plan.init(alloc, retained.tableSchema().*, retained.physicalLayout(), definition.keys, definition.include_columns) else null;
+            errdefer if (cover) |*value| value.deinit();
+            if (cover) |value| {
+                var hash = std.crypto.hash.Blake3.init(.{});
+                hash.update(&tuple.fingerprint);
+                hash.update(&value.fingerprint);
+                hash.final(&tuple.fingerprint);
+            }
+            const condition = if (definition.where.len != 0) try partial.Plan.init(alloc, retained.tableSchema().*, retained.physicalLayout(), definition.where) else null;
+            if (condition) |value| value.bindFingerprint(&tuple.fingerprint);
+            index.* = .{ .name = name, .generation = definition.generation, .slot = definition.slot, .tuple = tuple, .cover = cover, .predicate = condition };
             initialized += 1;
         }
         // Stable slot order is independent of a request/map's iteration order.
@@ -162,12 +183,16 @@ pub const View = struct {
 const Entry = struct {
     start: usize,
     end: usize,
+    payload_end: usize,
     has_null: bool,
+    member: bool = true,
 };
 
 pub const Key = struct {
     bytes: []const u8,
+    payload: []const u8 = "",
     has_null: bool,
+    member: bool = true,
 };
 
 /// Single-worker builder; share immutable Views, not this mutable buffer.
@@ -179,6 +204,7 @@ pub const Batch = struct {
     bytes: std.ArrayList(u8) = .empty,
     entries: std.ArrayList(Entry) = .empty,
     row_count: usize = 0,
+    predicate_scratch: std.ArrayList(u8) = .empty,
 
     pub fn init(alloc: Allocator, view: View) Batch {
         return .{ .alloc = alloc, .view = view.clone() };
@@ -187,6 +213,7 @@ pub const Batch = struct {
     pub fn deinit(self: *Batch) void {
         self.bytes.deinit(self.alloc);
         self.entries.deinit(self.alloc);
+        self.predicate_scratch.deinit(self.alloc);
         self.view.release();
         self.* = undefined;
     }
@@ -234,8 +261,16 @@ pub const Batch = struct {
         try self.entries.ensureUnusedCapacity(self.alloc, self.view.boundIndexes().len);
         for (self.view.boundIndexes()) |index| {
             const start = self.bytes.items.len;
+            if (index.predicate) |condition| if (!try condition.active.matches(self.alloc, &self.predicate_scratch, row)) {
+                self.entries.appendAssumeCapacity(.{ .start = start, .end = start, .payload_end = start, .has_null = false, .member = false });
+                continue;
+            };
             const has_null = try index.tuple.append(self.alloc, &self.bytes, row);
-            self.entries.appendAssumeCapacity(.{ .start = start, .end = self.bytes.items.len, .has_null = has_null });
+            const end = self.bytes.items.len;
+            if (index.cover) |cover| {
+                try cover.append(self.alloc, &self.bytes, row);
+            }
+            self.entries.appendAssumeCapacity(.{ .start = start, .end = end, .payload_end = self.bytes.items.len, .has_null = has_null });
         }
         const result = self.row_count;
         self.row_count = next_count;
@@ -245,7 +280,7 @@ pub const Batch = struct {
     pub fn key(self: *const Batch, row: usize, index: usize) !Key {
         if (row >= self.row_count or index >= self.view.boundIndexes().len) return error.InvalidRelationalIndexPosition;
         const entry = self.entries.items[row * self.view.boundIndexes().len + index];
-        return .{ .bytes = self.bytes.items[entry.start..entry.end], .has_null = entry.has_null };
+        return .{ .bytes = self.bytes.items[entry.start..entry.end], .payload = self.bytes.items[entry.end..entry.payload_end], .has_null = entry.has_null, .member = entry.member };
     }
 };
 

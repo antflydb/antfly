@@ -79,6 +79,7 @@ pub const Catalog = struct {
             .linearizable_routing_snapshot = routingSnapshot,
             .free_routing_snapshot = freeRoutingSnapshot,
             .restore_scope_for_group = restoreScopeForGroup,
+            .restore_plan_for_group = restorePlanForGroup,
             .requires_linearizable_publication_fence = true,
             .validate_publication = validatePublication,
             .validate_table_publication = validateTablePublication,
@@ -112,6 +113,11 @@ pub const Catalog = struct {
     fn freeRoutingSnapshot(_: *anyopaque, snapshot: *metadata.CatalogRoutingSnapshot) void {
         snapshot.* = undefined;
     }
+    fn restorePlanForGroup(ptr: *anyopaque, name: []const u8, group_id: u64) !?[16]u8 {
+        _ = try restoreScopeForGroup(ptr, name, group_id);
+        return cast(ptr).plan_id;
+    }
+
     fn restoreScopeForGroup(ptr: *anyopaque, name: []const u8, group_id: u64) !?[32]u8 {
         const self = cast(ptr);
         try self.verify();
@@ -328,11 +334,14 @@ pub fn validateSlice(alloc: std.mem.Allocator, catalog: *Catalog, reader: reads.
     const table = for (catalog.snapshot.tables) |table| {
         if (table.table_id == owner.table_id) break table;
     } else return error.RestoreStagingScopeChanged;
-    var status = (try reader.integrityActivation(alloc, table.name, owner.start_key, "{\"mode\":\"status\"}")) orelse {
-        if (try @import("relational_integrity_commit.zig").requiresCoordination(alloc, table.schema_json)) return error.IntegrityCatalogUnavailable;
+    // Unconstrained document and typed tables have no distributed activation
+    // work. Their physical/index readiness still belongs to the per-owner
+    // validation barrier; do not require an unrelated routed read-index here.
+    if (!try @import("relational_integrity_commit.zig").requiresActivation(alloc, table.schema_json)) {
         cursor.owner_index += 1;
         return false;
-    };
+    }
+    var status = (try reader.integrityActivation(alloc, table.name, owner.start_key, "{\"mode\":\"status\"}")) orelse return error.IntegrityCatalogUnavailable;
     defer status.deinit(alloc);
     const State = @import("../storage/db/relational_integrity_activation_contract.zig").State;
     var parsed = try std.json.parseFromSlice(struct { state: State, unique_covered: bool }, alloc, status.json, .{ .ignore_unknown_fields = true });
@@ -361,7 +370,7 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
     const parent_schema =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0}],"unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
     const child_schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"parent_fk","child_columns":["id"],"parent_table":"parent","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
@@ -439,6 +448,7 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 try std.testing.expectEqual(read_gate.ReadConsistency.read_index, consistency);
                 const i = try self.index(name);
+                if (i == 2) return error.UnexpectedUnconstrainedActivationRead;
                 var scoped = opts;
                 scoped.restore_staging_scope = try self.catalog.source().restoreScopeForGroup(name, 200 + i);
                 const row = (try self.dbs[i].lookup(allocator, key, scoped)) orelse return null;
@@ -455,7 +465,7 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
             }
             fn begin(ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, name: []const u8, req: distributed.TxnBeginRequest) !void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
-                const participant = try distributed.participantIdForGroup(allocator, name, group);
+                const participant = try distributed.participantIdForGroupScoped(allocator, name, group, req.restore_staging_scope, req.restore_staging_plan_id);
                 defer allocator.free(participant);
                 _ = try self.dbs[try self.index(name)].beginTransactionScoped(req.txn_id, req.begin_timestamp, req.begin_timestamp, req.participants, std.mem.eql(u8, participant, req.participants[0]), false, req.restore_staging_scope);
             }
@@ -500,6 +510,14 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
             for (dbs, scopes) |db, owner| _ = try db.finishRestoreStaging(alloc, owner.scope.digest(), .canceled);
             for (dbs) |db| try std.testing.expectError(error.RestoreStagingCanceled, db.lookup(alloc, "row", .{}));
         } else {
+            // The existing per-owner restore preparation owns local physical
+            // CHECK/index readiness; the distributed barrier above is not a
+            // replacement for each replica's verified physical projection.
+            for (dbs, scopes) |db, owner| {
+                for (0..128) |_| {
+                    if (try db.prepareRestoreStagingIndexesStep(alloc, owner.scope.digest())) break;
+                } else return error.RestorePreparationDidNotConverge;
+            }
             for (dbs, scopes) |db, owner| _ = try db.finishRestoreStaging(alloc, owner.scope.digest(), .validated);
             try std.testing.expectError(error.RestoreStagingScopeChanged, dbs[0].beginTransactionScoped(@splat(99), 999, 999, &.{}, true, false, scopes[0].scope.digest()));
             for (dbs, scopes) |db, owner| _ = try db.finishRestoreStaging(alloc, owner.scope.digest(), .published);

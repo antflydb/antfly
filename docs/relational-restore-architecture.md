@@ -5,6 +5,151 @@ targets new, isolated generations for a dependency-complete set of tables. It
 must not modify live generations in place or publish independently restored
 children and parents.
 
+### Stored-generated rewrites: shared lifecycle, distinct row contract
+
+An explicit stored-generated rewrite extends this lifecycle without weakening
+ordinary ALTER or creating another scheduler. It is not an ordinary overwrite
+restore: overwrite deliberately replaces a live table with a historical cut,
+whereas a rewrite must retain every acknowledged mutation through cutover.
+The explicit schema route (`?rewrite=true`) uses these shared contracts:
+
+1. Bind the versioned rewrite intent to the existing durable job admission.
+   The shared staging plan has an explicit target rewrite intent, preallocated
+   source scopes, and durable `preparing_sources` reservation. Drafts lock the
+   source definitions but do not provision target owners. `freeze_rewrite`
+   accepts certified source artifacts only under the unchanged draft identity;
+   cancellation requires source tombstones, not nonexistent target receipts.
+   A single metadata transaction admits the compact restore job and complete
+   draft before the worker sends any source admission. Source artifact receipts
+   are compact point records, not repeated whole-plan writes.
+   Authenticate the original cohort/source definitions unchanged, and separately
+   bind the target public schema, immutable physical layout, scalar-program
+   semantics version, and complete dependent table set into the plan digest.
+   Ordinary `cohortSource`/`buildPlan` intentionally derive the target definition
+   directly from the authenticated source manifest; substituting a target
+   schema there would discard a required proof. Rewrite admission uses a separate
+   immutable source/target plan while sharing the same staging lifecycle.
+2. Extend the shared owner page operation with an explicit row operation:
+   ordinary restore preserves the source row's historical logical values;
+   rewrite reads those values under their source epoch, evaluates the pinned
+   target expression/default plan, then prepares checks, indexes, typed bytes,
+   and semantic hash once. Target row effects, source cursor, progress digest,
+   and hot-standby outbox must commit atomically. Retries replay prepared effects
+   under that exact target digest, never reevaluate a newly active schema.
+   A schema-version number alone is insufficient when source and target layouts
+   differ: both registries and their identities must remain independently bound.
+3. Capture an immutable source cut through the existing cohort pin protocol,
+   but also durably retain committed logical effects after that cut for each
+   selected source owner. Register retention before releasing the capture
+   fence. Rewrite tail pages must transform the retained mutations using the
+   same target plan and checkpoint a contiguous source sequence. The existing
+   backup pin retains a cut, not the subsequent mutation stream; the overwrite
+   fence/drain step alone cannot recover intervening acknowledged writes.
+4. Reuse hidden target placement, replica-local index/CHECK readiness, and
+   distributed UNIQUE/FK activation against the transformed dependency set.
+   After tail convergence, briefly fence and drain the old owners, prove exact
+   final source watermarks, and use the existing all-table generation-CAS
+   publication transaction. Cancellation and lost replies use the existing
+   staging incarnation, owner tombstones, and post-publication completion rule.
+5. Gate the new intent/page semantics through the existing metadata and owner
+   capability admission before reservation. Resume requires the same source
+   cut, target program, dependent generations, and authorization; it must never
+   silently recapture current rows or downgrade to historical overwrite.
+
+The executable row-transform substrate now lives in
+`storage/db/relational_row_transform.zig`. A program owns independent immutable
+source and target schema views and binds their exact-number canonical public
+definitions, physical layouts, expression semantics version, and explicit
+defaults/drop policy into its identity. It first verifies the historical row's
+physical checksum, logical hash, generated values, and constraints. Then it maps
+same-name/same-type cells, computes the target generated DAG, validates the target
+row, and returns owned canonical bytes and both source/target integrity values.
+Defaults are either deliberately applied to absent fields or left absent; an
+explicit NULL is never defaulted. Dropping fields requires explicit permission;
+implicit type conversion is rejected. Unrelated wide scalar/vector/blob cells
+remain typed borrowed inputs, while root-sensitive schemas retain full-root
+validation. Limits are 4 MiB per schema, 4,096 columns, 16 MiB per row (with a
+conservative pre-allocation output bound), and the shared scalar work budget.
+The source timestamp is preserved. This contract performs no writes and grants
+no publication authority: the shared worker supplies the snapshot/tail and atomic
+receiver/cutover integration above. A program must be pinned for each historical
+source schema identity, not selected solely by a numeric version.
+
+`storage/db/relational_rewrite_staging.zig` connects that transformer to the
+shared hidden-owner import transaction. A program set binds every historical
+source schema and shares one compiled target epoch across them.
+Admission unions the bounded native schema histories from every selected owner,
+including epochs no longer named by the active/read pair. Before publishing a
+certified source decoder, it checks every artifact epoch's public definition and
+physical layout against that admitted program set once; numeric-version equality
+alone cannot substitute a different source definition. Snapshot pages
+and retained REF3 after-images use the same program; source claim/ref effects
+advance the source cursor but are not copied into target constraint generations.
+The target commits prepared rows/deletes, original timestamps, partial-frame
+continuation, progress digest, Raft marker and standby obligation through the
+existing staging batch. A partial frame cannot be acknowledged as complete,
+and snapshot completion alone cannot produce a validation receipt: the exact
+drained final source cut is required. Ordinary restore rejects rewrite scopes.
+
+Unchanged document dependents use an explicit preservation program: snapshot
+and tail JSON bytes and timestamps survive without applying defaults or generated
+expressions. They use the same hidden-owner progress and final-cut requirement.
+
+The `rewrite_source` role reuses source admission, immutable pin, publication
+certificate, retained journal and cleanup while binding a different hidden
+target table identity. Shared private donor reads have an explicit role
+allowlist; merge receiver/checkpoint operations remain forbidden. REF3 frames
+transfer in bounded 64 KiB chunks from a cached checksum-verified frame and are
+assembled in a disposable durable spool under the existing restore source
+generation. The shared owner importer validates the immutable program and uses
+the same replicated staging CAS for snapshot and transformed tail pages.
+The shared restore worker now drives source publication, bounded authenticated
+peer-artifact push, snapshot transformation, retained catchup, all-source
+fence/drain, exact final tails, shared validation and atomic cohort publication.
+ACK and bounded retained-journal reclamation are separate replicated steps.
+Old source retention is released while its final topology write fence remains
+in place, before the old metadata route disappears. Cancellation tombstones
+all planned sources even if their admission acknowledgement was lost.
+
+Unflagged generated ALTER remains guarded. Explicit rewrite returns the existing
+asynchronous restore-job resource; it does not modify the live schema in place.
+The complete selected cohort requires administrator authority, checked again
+before each mutable scheduling slice. The initial public policy preserves
+absent fields and rejects implicit column drops or type conversion. Sources with
+independently authored graph/vector/enrichment artifacts remain unsupported;
+they are rejected before source admission, not silently omitted.
+The source transport uses explicit owner authority: data-Raft owners use their
+committed log, while non-Raft standalone rewrite owners use a durable native
+source clock. The native clock advances atomically with source controls and
+retained row mutations and is carried through hot-standby replay. Owner opens
+persist the authority mode and reject incompatible reopen or request modes;
+standalone admission also pins the hot-standby generation. Native authority
+never invents a Raft term or applied index and does not enable ordinary online
+split/merge. Full worker regressions exercise both authority modes, including
+historical schemas, namespace aliases, post-pin writes, cancellation and reopen.
+
+Real native worker regressions exercise mixed typed/document owners, immutable
+source publication, peer transfer, acknowledged post-pin update/insert/delete,
+original timestamps, generated recomputation, lost target replies and reopen,
+and atomic metadata publication. A target expression overflow during tail
+replay cancels the hidden cohort while retaining the old definitions and
+acknowledged rows and restoring ordinary source writes. Shared restore
+regressions separately exercise generated
+parent/child and document cohorts through the production HTTP client and actual
+HTTP listener/owner route, native and portable artifacts, lost acknowledgements
+after durable owner effects, owner reopen, partial covering-index readiness, and
+invalid-FK cleanup. The transport fault adapter drops an already successful
+response; it does not simulate multi-node elections or arbitrary network
+partitions. Neither fixture substitutes for a full distributed election and
+network-partition matrix of the new rewrite action.
+
+Private restore import admission selects preserved-value preparation in both
+the parallel worker and serialized fallback. A newly added default cannot fill
+an absent historical column, and a forged stored-generated value is rejected
+rather than repaired. Canonical values still undergo target type, CHECK, and
+generated-value validation; an incompatible required target column fails.
+Ordinary mutations continue to evaluate defaults and generated expressions.
+
 Jobs, manifests, artifact storage, admission, staging, placement, checkpoints,
 cancellation, publication, progress, and recovery are shared machinery. Storage
 mode selects row decoding and index reconstruction; relational constraints add
@@ -174,6 +319,18 @@ does not prove that a recovering follower has rebuilt its CHECK coverage or
 physical indexes. Followers and hot standbys advance bounded reconstruction
 slices before accepting that receipt. Catch-up defers apply without advancing
 the applied index, rejecting a valid command, or poisoning the replica.
+The same gate includes relational index build jobs, not only ordinary derived
+indexes. Each restore preparation advances at most one relational build page;
+validated/published receipts are rechecked after owner reopen and lost replies.
+Even an already-applied exact Raft entry or hot-standby LSN must restore local
+coverage when its completion scope and phase are still current. This repair
+does not replay logical effects or advance receipts; older entries, replaced
+scopes, and canceled attempts remain no-ops. Hot-standby duplicate inspection
+projects only the fixed-size finish proof, without materializing row payloads.
+Cancellation never waits for projection readiness. An explicitly failed target
+projection terminates the immutable restore attempt and enters shared cleanup;
+resource pressure and generic decoder corruption remain distinct retryable
+failures rather than being mislabeled as a successful readiness receipt.
 
 ## Hot standby ownership and canceled generations
 
@@ -260,6 +417,35 @@ global constraint validation, native index readiness, and atomic publication.
 Administrative constraint repair, validation retry, and retirement have separate
 public APIs. They do not grant public access to staging or private receipts.
 
+Distributed owners read staging authority through the existing authenticated
+internal metadata transport. Metadata workers dispatch to remote owners through
+the same data-bearing router and owned HTTP executor as ordinary table reads
+and writes; no separate restore transport is created. Compact progress and receipt requests use point
+lookups, not repeated whole-plan decoding, and have a 4 KiB response ceiling;
+the immutable plan is fetched separately when needed. A durable plan/node
+placement witness and permanent group reservations keep cleanup reads authorized
+after live placement removal. These are scoped cluster-service claims, not
+cryptographic per-node identities. Old replacement owners use the ordinary
+topology fence path; they do not gain access to staged-owner authority.
+
+Each distributed data node keeps its private restore-owner ledger beneath its
+own configured replica root. Standalone explicitly selects the metadata root
+included in its seed and activation layout. Replica retirement drains compiled
+owner leases before changing physical paths; nameless recovery journals still
+target one exact positive group ID. Cold opening an already frozen owner can
+rehydrate an exactly matching schema without a metadata write, but changed
+catalog, participant, or outbox effects must still pass the normal write fence.
+
+Ordinary compiled owners initialize a missing durable key range from their
+authenticated catalog descriptor before admitting writes. Existing durable
+split/merge ranges take precedence over historical descriptor hints. Older
+missing-range roots receive a one-time, cancellation-aware containment check
+over primary rows before binding; namespace mismatches and out-of-range rows
+fail without changing the range. Portable archives continue to exclude local
+routing metadata. Only their unpublished decoder reconstructs the range from
+the restore plan, before publication, so native and portable import share the
+same strict source/target range checks.
+
 The shared-worker regression drives real metadata Raft/apply persistence,
 sealed LSM artifacts, hidden document/parent/child targets, distributed UNIQUE/FK
 activation, and every publication acknowledgement. Its negative case verifies
@@ -270,6 +456,15 @@ Native seal restart/export and metadata overwrite tests cover their additional
 boundaries. Standalone regressions exercise mixed document/relational restore
 without data Raft, canceled-owner recovery after restart, and hot standby-policy-enabled
 restore with native owner effects and replayed metadata/user-job publication.
+
+The real six-process regression (three metadata nodes and three data nodes)
+passes for both native and portable backups. It restores three-shard document
+and relational tables, exercises schema-epoch-zero query/mutation admission and
+a composite expression/partial/covering index, kills the metadata coordinator
+after durable job admission, and verifies indexed values and versions after a
+data-owner restart following publication. This is a specific failover scenario,
+not an exhaustive network-fault or mid-import owner-crash matrix.
+
 A full multi-node backup-to-restore fault matrix
 remains a release-verification requirement; component tests are not a claim that
 all distributed failure combinations have been exercised. The shared worker
@@ -292,3 +487,35 @@ These are restart-safe driver validation baselines, not optimized throughput
 results or a comparative speedup claim. Import pages also have a 5 ms preparation
 budget, so calls can contain fewer than the 128-row ceiling, particularly in
 debug builds. Benchmark timing includes source materialization and publication.
+
+### Recovery and activation boundaries
+
+Replica persistence distinguishes a received Raft snapshot from completed native
+application. Only the state-machine completion sink advances the durable
+completed-applied cursor. Startup places any persisted but incomplete snapshot
+in the ordinary bounded apply queue ahead of log replay and read barriers;
+snapshot installation retries therefore cannot expose an older native root as
+current. Legacy completion records are replayed conservatively, not inferred
+from the Raft log cursor. Provider persistence, queue ordering/admission cleanup,
+and actual native-root recovery have dedicated regression coverage.
+
+UNIQUE/FK activation consumes cold-scan projections through a distinct typed
+projection boundary, not the full-row mutation validator. Selected required
+columns, types and NULL rules remain checked; omitted unrelated required columns
+are not fabricated or treated as missing user input. Activation retains the
+full primary-row digest/version predicate and never writes a projected primary
+row. Ordinary writes retain full required-column validation.
+
+Schema-rewrite job status, listing and cancellation use the same immutable
+dependency cohort as admission: the caller must currently have administrative
+permission on every member. Losing any member's permission removes job access;
+unrelated cluster-wide administration is not required. Ordinary cluster restore
+jobs retain their cluster-admin requirement. Resumed staged cluster jobs use the
+same bounded terminal summary as first-attempt jobs, including committed-table
+counts, while single-table jobs preserve their existing response shape.
+
+The dependency-cohort schema-rewrite network regression passes both metadata
+coordinator failure and lost accepted publication-reply cases. It writes after
+the retained cut, verifies recomputed generated values through all data frontends,
+checks the terminal committed-table count, rejects post-publication orphan and
+duplicate writes, and executes a new cascading delete against rebuilt references.

@@ -7,6 +7,10 @@ import createClient, { type Client } from "openapi-fetch";
 import { validateGraphQueryIdentifiers } from "./graph-identifiers.js";
 import { validateGraphQueryResponses } from "./graph-results.js";
 import { validateCreateIndexRequestRelationships } from "./index-config.js";
+import {
+  validateIndexMaintenanceRequest,
+  validateIndexMaintenanceResponse,
+} from "./index-maintenance.js";
 import { InferenceCapacityError, isTransientCapacityError } from "./inference-client.js";
 import type { paths } from "./public-api.js";
 import { parseSSEFrames } from "./sse.js";
@@ -37,6 +41,8 @@ import type {
   DocumentArtifactTableReprocessResponse,
   EnrichmentConfig,
   GlobalQueryRequest,
+  IndexMaintenanceRequest,
+  IndexMaintenanceResponse,
   IndexStatus,
   LinearMergeRequest,
   LinearMergeResult,
@@ -48,10 +54,10 @@ import type {
   QueryRequest,
   QueryResponses,
   QueryResult,
-  RelationalConstraintStatus,
-  RelationalConstraintRetryRequest,
   RelationalConstraintRetirementRequest,
+  RelationalConstraintRetryRequest,
   RelationalConstraintRetryResponse,
+  RelationalConstraintStatus,
   RelationalRowMutationRequest,
   RelationalRowQueryRequest,
   ResourceType,
@@ -72,6 +78,34 @@ import type {
 export interface RestoreOptions {
   /** Stable key used to safely retry creation of the same restore job. */
   idempotencyKey?: string;
+}
+
+export interface SchemaMutationOptions {
+  expectedVersion?: number;
+  /** Build and atomically publish a fresh generation through a durable restore job. */
+  rewrite?: boolean;
+  /** Reuse this key when retrying the same rewrite admission after a lost response. */
+  idempotencyKey?: string;
+}
+
+function schemaMutationParams(tableName: string, options?: SchemaMutationOptions) {
+  return {
+    params: {
+      path: { tableName },
+      ...(options?.rewrite === undefined ? {} : { query: { rewrite: options.rewrite } }),
+    },
+    headers:
+      options?.expectedVersion === undefined && options?.idempotencyKey === undefined
+        ? undefined
+        : {
+            ...(options.expectedVersion === undefined
+              ? {}
+              : { "If-Match": `"schema-${options.expectedVersion}"` }),
+            ...(options.idempotencyKey === undefined
+              ? {}
+              : { "Idempotency-Key": options.idempotencyKey }),
+          },
+  };
 }
 
 export interface QueryExecutionOptions {
@@ -112,6 +146,20 @@ export interface IndexOperations {
   get(tableName: string, indexName: string): Promise<IndexStatus>;
   create(tableName: string, indexName: string, config: CreateIndexRequest): Promise<CreatedIndex>;
   drop(tableName: string, indexName: string): Promise<true>;
+  /** Resume the identical proof request after a partial/lost acknowledgement; proofs are never refreshed automatically. */
+  retry(
+    tableName: string,
+    indexName: string,
+    request: IndexMaintenanceRequest,
+    options?: QueryExecutionOptions
+  ): Promise<IndexMaintenanceResponse>;
+  /** Primary-authoritative repair; selected owner admissions are not one global transaction. */
+  repair(
+    tableName: string,
+    indexName: string,
+    request: IndexMaintenanceRequest,
+    options?: QueryExecutionOptions
+  ): Promise<IndexMaintenanceResponse>;
 }
 
 export const QUERY_TEMPORARILY_UNAVAILABLE_CODES = [
@@ -516,7 +564,7 @@ export class AntflyClient {
     errorPrefix: string,
     marshalErrorPrefix: string,
     relational = false
-  ): Promise<{ data?: T; text: string }> {
+  ): Promise<{ data?: T; text: string; status: number }> {
     const opts = normalizedWriteOptions(options);
     let encodedBody: string;
     try {
@@ -551,9 +599,9 @@ export class AntflyClient {
       throw new Error(`${errorPrefix} response exceeded ${opts.maxResponseBytes} bytes`);
     }
     if (!text.trim()) {
-      return { text };
+      return { text, status: response.status };
     }
-    return { data: parseJSON<T>(text), text };
+    return { data: parseJSON<T>(text), text, status: response.status };
   }
 
   /**
@@ -1163,15 +1211,11 @@ export class AntflyClient {
     replaceSchema: async (
       tableName: string,
       config: TableSchema,
-      options?: { expectedVersion?: number }
-    ): Promise<Table | CommittedMutationOutcome> => {
+      options?: SchemaMutationOptions
+    ): Promise<Table | CommittedMutationOutcome | RestoreJob> => {
       const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
-        params: { path: { tableName } },
+        ...schemaMutationParams(tableName, options),
         body: config,
-        headers:
-          options?.expectedVersion === undefined
-            ? undefined
-            : { "If-Match": `"schema-${options.expectedVersion}"` },
       });
       if (error) throw new Error(`Failed to replace table schema: ${error.error}`);
       if (!data) throw new Error("Failed to replace table schema: unexpected empty response");
@@ -1182,15 +1226,11 @@ export class AntflyClient {
     patchSchema: async (
       tableName: string,
       patch: Record<string, unknown>,
-      options?: { expectedVersion?: number }
-    ): Promise<Table | CommittedMutationOutcome> => {
+      options?: SchemaMutationOptions
+    ): Promise<Table | CommittedMutationOutcome | RestoreJob> => {
       const { data, error } = await this.client.PATCH("/db/v1/tables/{tableName}/schema", {
-        params: { path: { tableName } },
+        ...schemaMutationParams(tableName, options),
         body: patch,
-        headers:
-          options?.expectedVersion === undefined
-            ? undefined
-            : { "If-Match": `"schema-${options.expectedVersion}"` },
       });
       if (error) throw new Error(`Failed to patch table schema: ${error.error}`);
       if (!data) throw new Error("Failed to patch table schema: unexpected empty response");
@@ -1201,15 +1241,11 @@ export class AntflyClient {
     updateSchema: async (
       tableName: string,
       config: TableSchema,
-      options?: { expectedVersion?: number }
-    ): Promise<Table | CommittedMutationOutcome> => {
+      options?: SchemaMutationOptions
+    ): Promise<Table | CommittedMutationOutcome | RestoreJob> => {
       const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
-        params: { path: { tableName } },
+        ...schemaMutationParams(tableName, options),
         body: config,
-        headers:
-          options?.expectedVersion === undefined
-            ? undefined
-            : { "If-Match": `"schema-${options.expectedVersion}"` },
       });
       if (error) throw new Error(`Failed to replace table schema: ${error.error}`);
       if (!data) throw new Error("Failed to replace table schema: unexpected empty response");
@@ -1823,7 +1859,36 @@ export class AntflyClient {
   /**
    * Index operations
    */
+  private async maintainIndex(
+    action: "retry" | "repair",
+    tableName: string,
+    indexName: string,
+    request: IndexMaintenanceRequest,
+    options?: QueryExecutionOptions
+  ): Promise<IndexMaintenanceResponse> {
+    const groups = validateIndexMaintenanceRequest(request);
+    // Keep the submitted proof and its acknowledgement expectation stable even
+    // when the caller reuses/mutates their request while awaiting this operation.
+    const body = { ...request, owners: request.owners.map((owner) => ({ ...owner })) };
+    const { data, status } = await this.postBoundedJSON<IndexMaintenanceResponse>(
+      `/db/v1/tables/${encodeURIComponent(tableName)}/indexes/${encodeURIComponent(indexName)}/${action}`,
+      body,
+      { signal: options?.signal, maxRequestBytes: 128 * 1024, maxResponseBytes: 32 * 1024 },
+      `Failed to ${action} index; resubmit identical proofs after an ambiguous acknowledgement`,
+      "Encoding index maintenance"
+    );
+    if (status !== 200)
+      throw new Error(
+        "Invalid index maintenance acknowledgement status; resubmit identical proofs"
+      );
+    return validateIndexMaintenanceResponse(data, groups);
+  }
+
   indexes: IndexOperations = {
+    retry: (tableName, indexName, request, options) =>
+      this.maintainIndex("retry", tableName, indexName, request, options),
+    repair: (tableName, indexName, request, options) =>
+      this.maintainIndex("repair", tableName, indexName, request, options),
     /**
      * List all indexes for a table
      */

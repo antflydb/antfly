@@ -149,6 +149,24 @@ pub const AntflyClient = struct {
         return resp;
     }
 
+    pub fn retryIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8, body: openapi.types.IndexMaintenanceRequest) !openapi.ApiResponse(openapi.types.IndexMaintenanceResponse) {
+        var resp = try self.inner.retryIndex(table_name, index_name, body);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
+    }
+
+    pub fn repairIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8, body: openapi.types.IndexMaintenanceRequest) !openapi.ApiResponse(openapi.types.IndexMaintenanceResponse) {
+        var resp = try self.inner.repairIndex(table_name, index_name, body);
+        if (resp.status_code >= 300) {
+            defer resp.deinit();
+            return self.apiErrorFromResponse(&resp);
+        }
+        return resp;
+    }
+
     /// Returns the typed HTTP response without converting non-2xx statuses to
     /// `error.ApiError`. Long-running readiness commands use this to classify
     /// retryable status codes without weakening normal one-shot API behavior.

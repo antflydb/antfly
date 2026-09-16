@@ -50,6 +50,54 @@ func TestRelationalRowQueryPreservesExactInteger(t *testing.T) {
 	}
 }
 
+func TestRelationalRowQueryPreservesExplicitZeroEpoch(t *testing.T) {
+	zero := uint32(0)
+	for _, epoch := range []*uint32{nil, &zero} {
+		client, err := NewAntflyClientWithOptions("http://example.invalid", oapi.WithHTTPClient(relationalHTTPDoer(func(req *http.Request) (*http.Response, error) {
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			value, present := body["schema_version"]
+			if present != (epoch != nil) || (present && string(value) != "0") {
+				t.Fatalf("schema epoch lost: %s (present=%v, explicit=%v)", value, present, epoch != nil)
+			}
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(""))}, nil
+		})))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := RelationalRowQueryRequest{Fields: []string{"id"}, SchemaVersion: epoch}
+		if epoch != nil {
+			request.Index = "by_id"
+		}
+		if _, err := client.QueryRelationalRows(context.Background(), "rows", request); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestRelationalRowMutationPreservesZeroEpoch(t *testing.T) {
+	client, err := NewAntflyClientWithOptions("http://example.invalid", oapi.WithHTTPClient(relationalHTTPDoer(func(req *http.Request) (*http.Response, error) {
+		var body map[string]json.RawMessage
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if string(body["schema_version"]) != "0" {
+			t.Fatalf("required zero epoch omitted: %#v", body)
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"status":"committed","inserted":1,"deleted":0}`))}, nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.MutateRelationalRows(context.Background(), "rows", RelationalRowMutationRequest{
+		SchemaVersion: 0, Mutations: []RelationalRowMutation{{Key: "a", ExpectedVersion: "0"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRelationalMutationPreservesPendingOutcomeWithoutRetry(t *testing.T) {
 	calls := 0
 	client, err := NewAntflyClientWithOptions("http://example.invalid", oapi.WithHTTPClient(relationalHTTPDoer(func(req *http.Request) (*http.Response, error) {

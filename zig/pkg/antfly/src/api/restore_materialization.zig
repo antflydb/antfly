@@ -78,9 +78,9 @@ pub fn step(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocat
 
 /// Portable uses the identical durable SHA prefix as native objects, followed
 /// by an atomic logical-object/row cursor inside a disposable LSM decoder.
-pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, root: []const u8, cancellation: @import("../common/cancellation.zig").CancellationToken, byte_budget: usize) !bool {
+pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, cancellation: @import("../common/cancellation.zig").CancellationToken, byte_budget: usize) !bool {
     if (byte_budget == 0 or byte_budget > chunk_bytes or source.format != .portable or !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;
-    const seal = source.cohort_seal orelse return error.RestoreSourceProofMissing;
+    if ((source.cohort_seal == null) == (source.rewrite == null)) return error.RestoreSourceProofMissing;
     try cancellation.check();
     try fs.createDirPathPortable(io, root);
     const state_path = try std.fmt.allocPrint(alloc, "{s}/progress", .{root});
@@ -127,16 +127,56 @@ pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *b
     var finished_digest: [32]u8 = undefined;
     finished_hash.final(&finished_digest);
     if (!std.mem.eql(u8, &finished_digest, &source.artifact_sha256)) return error.InvalidRestoreSourceCheckpoint;
+    return stepPortableDecoder(alloc, io, artifact, source, scope, owner_range, root, cancellation);
+}
+
+/// Shared bounded logical import after either repository checksum verification
+/// or the peer transport's exact immutable certificate verification.
+pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.Io.File, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, cancellation: @import("../common/cancellation.zig").CancellationToken) !bool {
+    try cancellation.check();
+    if (source.format != .portable or (source.cohort_seal == null) == (source.rewrite == null) or
+        !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;
     const files = try std.fmt.allocPrint(alloc, "{s}/files", .{root});
     defer alloc.free(files);
     var backend = try @import("../storage/lsm_backend.zig").Backend.open(alloc, files, .{ .read_runtime = @import("../storage/lsm_backend/storage_io.zig").ReadRuntime.init(io) });
     defer backend.close();
     var store = try @import("../storage/docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "docs" }));
     defer store.close();
-    const complete = try @import("../storage/portable_backup.zig").importCohortFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .seal = seal, .namespace = scope.source_namespace }, scope.digest(), 128, cancellation);
+    const portable = @import("../storage/portable_backup.zig");
+    const complete = if (source.rewrite) |rewrite| try portable.importSourceCopyFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .scope = rewrite.source_scope orelse return error.RestoreSourceProofMissing, .applied_index = rewrite.source_applied_index, .retained_start = rewrite.retained_start }, scope.digest(), 128, cancellation) else try portable.importCohortFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .seal = source.cohort_seal.?, .namespace = scope.source_namespace }, scope.digest(), 128, cancellation);
+    if (complete) try bindPortableDecoderRange(alloc, &store, owner_range);
     try fs.syncDirPortable(io, files);
     try fs.syncDirPortable(io, root);
     return complete;
+}
+
+/// Portable archives intentionally omit routing metadata. Only a private,
+/// disposable decoder reconstructs it from the target owner's authenticated
+/// immutable plan/bootstrap. Persist before decoder publication; a replay may
+/// confirm the same range but must never replace a different bound range.
+pub fn bindPortableDecoderRange(alloc: std.mem.Allocator, store: *@import("../storage/docstore.zig").DocStore, owner_range: @import("../storage/docstore.zig").ByteRange) !void {
+    const range_state = @import("../storage/db/range_state.zig");
+    if (owner_range.end.len != 0 and std.mem.order(u8, owner_range.start, owner_range.end) != .lt) return error.RestoreStagingScopeChanged;
+    const encoded = try range_state.encodeRangeAlloc(alloc, owner_range);
+    defer alloc.free(encoded);
+    var txn = try store.beginWriteTxn();
+    var txn_open = true;
+    defer if (txn_open) txn.abort();
+    const existing = txn.get(range_state.range_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (existing) |bytes| {
+        if (!std.mem.eql(u8, bytes, encoded)) return error.RestoreStagingScopeChanged;
+        txn.abort();
+        txn_open = false;
+        try store.sync(true);
+        return;
+    }
+    try txn.put(range_state.range_key, encoded);
+    try txn.commit();
+    txn_open = false;
+    try store.sync(true);
 }
 
 pub fn stepWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, root: []const u8, cancellation: @import("../common/cancellation.zig").CancellationToken, byte_budget: usize) !?native.LoadedManifest {

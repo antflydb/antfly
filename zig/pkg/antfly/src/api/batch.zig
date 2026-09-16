@@ -17,6 +17,8 @@ const db_mod = @import("../storage/db/selected_root.zig").db;
 const ant_json = @import("antfly-json");
 const document_mapper = @import("../storage/db/document_mapper.zig");
 const public_limits = @import("public_limits.zig");
+const merge_pages = @import("../storage/db/merge_page_contract.zig");
+const MergePageEffects = struct { writes: []db_mod.types.BatchWrite, deletes: [][]const u8 };
 
 pub const BatchFailure = struct {
     code: []const u8,
@@ -36,6 +38,263 @@ pub const BatchResult = struct {
     failure: ?BatchFailure = null,
 };
 
+test "index maintenance internal batch codec owns binary proof and rejects public bypass" {
+    const alloc = std.testing.allocator;
+    const command = @import("../storage/db/relational_index_maintenance_contract.zig").Command{
+        .action = .retry,
+        .table_id = 7,
+        .owner_group_id = 11,
+        .schema_version = 2,
+        .index_name = "by_id",
+        .generation = 8,
+        .slot = 1,
+        .owner = @splat(0xff),
+        .comparison = @splat(0x80),
+        .expected_progress_digest = @splat(0xfe),
+        .expected_maintenance_epoch = 3,
+        .routing_key = "\x00\xff",
+    };
+    const request = db_mod.types.BatchRequest{
+        .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 9 } },
+        .relational_schema_version = 2,
+        .relational_index_maintenance = command,
+    };
+    const bytes = try encodeBatchRequest(alloc, request);
+    defer alloc.free(bytes);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, bytes));
+    var decoded = try parseInternalBatchRequest(alloc, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualDeep(command, decoded.req.relational_index_maintenance.?);
+    var zero = request;
+    zero.relational_schema_version = 0;
+    zero.relational_index_maintenance.?.schema_version = 0;
+    const zero_bytes = try encodeBatchRequest(alloc, zero);
+    defer alloc.free(zero_bytes);
+    var zero_parsed = try parseInternalBatchRequest(alloc, zero_bytes);
+    defer zero_parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(?u32, 0), zero_parsed.req.relational_schema_version);
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_relational_schema_version\":4294967296}"));
+    var invalid = request;
+    invalid.transaction = null;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, invalid));
+    invalid = request;
+    invalid.writes = &.{.{ .key = "row", .value = "{}" }};
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, invalid));
+}
+
+test "merge page internal codec preserves certified bytes and requires fail closed discriminants" {
+    const alloc = std.testing.allocator;
+    const namespace: db_mod.DocIdentityNamespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
+    const source: merge_pages.Source = .{ .namespace = namespace, .pin_digest = @splat(255), .applied_index = 10 };
+    var request: db_mod.types.BatchRequest = .{
+        .writes = &.{.{ .key = "\x00\xff", .value = "{ \"x\" : 9007199254740993 }" }},
+        .merge_replication = .{
+            .transition_id = 1,
+            .donor_group_id = 8,
+            .receiver_group_id = 9,
+            .identity_namespace = namespace,
+            .copy_attempt = .{ .donor_term = 2, .sequence = 3 },
+        },
+        .merge_page = .{
+            .source = source,
+            .sequence = 2,
+            .phase = .rows,
+            .next = "\x00\xff",
+            .timestamps = &.{123},
+            .exhausted = true,
+            .digest = @splat(0),
+        },
+    };
+    request.merge_page.?.digest = merge_pages.commandDigest(request);
+    const bytes = try encodeBatchRequest(alloc, request);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"kind\":\"page_v1\"") != null);
+    try std.testing.expect(std.meta.stringToEnum(db_mod.types.MergeReplicationCheckpoint.Kind, "page_v1") == null);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, bytes));
+    var decoded = try parseInternalBatchRequest(alloc, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualDeep(request.merge_page.?, decoded.req.merge_page.?);
+    try std.testing.expectEqualDeep(request.writes, decoded.req.writes);
+    try std.testing.expect(decoded.req.merge_checkpoint == null);
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_merge_checkpoint\":{\"kind\":\"page_v1\"}}"));
+    // Blob-like logical JSON must not become millions of numeric JSON nodes.
+    // Bound wire growth as well as retaining exact original row bytes.
+    const large_value = try alloc.alloc(u8, 4 * 1024 * 1024);
+    defer alloc.free(large_value);
+    @memset(large_value, 'A');
+    @memcpy(large_value[0..9], "{\"blob\":\"");
+    @memcpy(large_value[large_value.len - 2 ..], "\"}");
+    var large_request = request;
+    large_request.writes = &.{.{ .key = request.writes[0].key, .value = large_value }};
+    large_request.merge_page.?.digest = merge_pages.commandDigest(large_request);
+    const large_encoded = try encodeBatchRequest(alloc, large_request);
+    defer alloc.free(large_encoded);
+    try std.testing.expect(large_encoded.len < large_value.len + 4096);
+    var large_decoded = try parseInternalBatchRequest(alloc, large_encoded);
+    defer large_decoded.deinit(alloc);
+    try std.testing.expectEqualStrings(large_value, large_decoded.req.writes[0].value);
+
+    const chunker = try merge_pages.RowChunks(db_mod.types.BatchRequest).init(large_request);
+    const chunk_request = try chunker.requestAt(0);
+    const chunk_encoded = try encodeBatchRequest(alloc, chunk_request);
+    defer alloc.free(chunk_encoded);
+    try std.testing.expect(chunk_encoded.len < merge_pages.max_chunk_bytes * 3 / 2);
+    try std.testing.expect(std.mem.indexOf(u8, chunk_encoded, "data_base64") != null);
+    const chunk_marker = std.mem.indexOf(u8, chunk_encoded, "page_v3") orelse return error.TestUnexpectedResult;
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, chunk_encoded));
+    var chunk_decoded = try parseInternalBatchRequest(alloc, chunk_encoded);
+    defer chunk_decoded.deinit(alloc);
+    try std.testing.expectEqualDeep(chunk_request.merge_page.?, chunk_decoded.req.merge_page.?);
+    try std.testing.expectEqual(@as(usize, 0), chunk_decoded.req.writes.len);
+    chunk_encoded[chunk_marker + "page_v".len] = '2';
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, chunk_encoded));
+    chunk_encoded[chunk_marker + "page_v".len] = '3';
+    const payload_marker = std.mem.indexOf(u8, chunk_encoded, "\"data_base64\":\"").?;
+    chunk_encoded[payload_marker + "\"data_base64\":\"".len] = '!';
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, chunk_encoded));
+
+    const checkpoint: db_mod.types.BatchRequest = .{ .merge_checkpoint = .{
+        .kind = .begin_copy,
+        .transition_id = 1,
+        .donor_group_id = 8,
+        .receiver_group_id = 9,
+        .receiver_base_start = "a",
+        .receiver_base_end = "m",
+        .merged_start = "a",
+        .merged_end = "z",
+        .copy_attempt = .{ .donor_term = 2, .sequence = 3 },
+        .page_source = source,
+        .page_receiver_namespace = namespace,
+    } };
+    const checkpoint_bytes = try encodeBatchRequest(alloc, checkpoint);
+    defer alloc.free(checkpoint_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint_bytes, "page_v1_begin_copy") != null);
+    var parsed = try parseInternalBatchRequest(alloc, checkpoint_bytes);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(checkpoint.merge_checkpoint.?, parsed.req.merge_checkpoint.?);
+    var invalid = checkpoint;
+    invalid.merge_checkpoint.?.page_receiver_namespace = null;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, invalid));
+}
+
+test "online source internal codec rejects public controls and preserves exact scope" {
+    const alloc = std.testing.allocator;
+    const scope: @import("../storage/db/online_source_contract.zig").Scope = .{
+        .fence = .{
+            .transition_id = 9,
+            .attempt = 2,
+            .owner_group_id = 8,
+            .peer_group_id = 10,
+            .role = .merge_source,
+            .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 },
+            .catalog_digest = @splat(255),
+        },
+        .receiver_namespace = .{ .table_id = 7, .shard_id = 10, .range_id = 11 },
+        .consumer_epoch = 9007199254740993,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+    };
+    const command = @import("../storage/db/online_source_contract.zig").Command{ .admit = .{ .scope = scope } };
+    const bytes = try encodeBatchRequest(alloc, .{ .online_source = command });
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "online_source_v4") != null);
+    try std.testing.expect(std.meta.stringToEnum(db_mod.types.MergeReplicationCheckpoint.Kind, "online_source_v4") == null);
+    const legacy_bytes = try alloc.dupe(u8, bytes);
+    defer alloc.free(legacy_bytes);
+    const source_marker = std.mem.indexOf(u8, legacy_bytes, "online_source_v4").?;
+    for ([_]u8{ '1', '2', '3' }) |version| {
+        legacy_bytes[source_marker + "online_source_v".len] = version;
+        try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, legacy_bytes));
+    }
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, bytes));
+    var decoded = try parseInternalBatchRequest(alloc, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualDeep(command, decoded.req.online_source.?);
+    try std.testing.expect(decoded.req.merge_checkpoint == null);
+    const restore = try encodeBatchRequest(alloc, .{ .restore_staging = .{ .finish = .{ .scope = @splat(3), .phase = .validated } } });
+    defer alloc.free(restore);
+    var restore_parsed = try parseInternalBatchRequest(alloc, restore);
+    defer restore_parsed.deinit(alloc);
+    try std.testing.expectEqual(.validated, restore_parsed.req.restore_staging.?.finish.phase);
+    const restore_marker = std.mem.indexOf(u8, restore, "restore_v3").?;
+    for ([_]u8{ '1', '2' }) |version| {
+        restore[restore_marker + "restore_v".len] = version;
+        try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, restore));
+    }
+    try std.testing.expectError(error.InvalidOnlineSourceCommand, encodeBatchRequest(alloc, .{
+        .online_source = command,
+        .writes = &.{.{ .key = "row", .value = "{}" }},
+    }));
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_merge_checkpoint\":{\"kind\":\"online_source_v1\"}}"));
+}
+
+test "merge page tail binding cannot be downgraded to snapshot only wire" {
+    const alloc = std.testing.allocator;
+    var request: db_mod.types.BatchRequest = .{
+        .merge_replication = .{
+            .transition_id = 1,
+            .donor_group_id = 8,
+            .receiver_group_id = 10,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 10, .range_id = 11 },
+            .copy_attempt = .{ .donor_term = 2, .sequence = 3 },
+        },
+        .merge_page = .{
+            .source = .{ .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 }, .pin_digest = @splat(255), .applied_index = 10, .retention = .{ .epoch = 1, .after_sequence = 5 } },
+            .sequence = 1,
+            .phase = .cleanup,
+            .exhausted = true,
+            .digest = @splat(0),
+        },
+    };
+    request.merge_page.?.digest = merge_pages.commandDigest(request);
+    const bytes = try encodeBatchRequest(alloc, request);
+    defer alloc.free(bytes);
+    const marker = std.mem.indexOf(u8, bytes, "page_v6") orelse return error.TestUnexpectedResult;
+    var decoded = try parseInternalBatchRequest(alloc, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualDeep(request.merge_page.?, decoded.req.merge_page.?);
+    bytes[marker + 6] = '1';
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, bytes));
+    const checkpoint: db_mod.types.BatchRequest = .{ .merge_checkpoint = .{
+        .kind = .begin_copy,
+        .transition_id = 1,
+        .donor_group_id = 8,
+        .receiver_group_id = 10,
+        .receiver_base_start = "a",
+        .receiver_base_end = "m",
+        .merged_start = "a",
+        .merged_end = "z",
+        .copy_attempt = .{ .donor_term = 2, .sequence = 3 },
+        .page_source = request.merge_page.?.source,
+        .page_receiver_namespace = request.merge_replication.?.identity_namespace,
+    } };
+    const bootstrap = try encodeBatchRequest(alloc, checkpoint);
+    defer alloc.free(bootstrap);
+    const bootstrap_marker = std.mem.indexOf(u8, bootstrap, "page_v4_begin_copy") orelse return error.TestUnexpectedResult;
+    var parsed_bootstrap = try parseInternalBatchRequest(alloc, bootstrap);
+    defer parsed_bootstrap.deinit(alloc);
+    try std.testing.expectEqualDeep(checkpoint.merge_checkpoint, parsed_bootstrap.req.merge_checkpoint);
+    for ([_]u8{ '1', '2', '3' }) |version| {
+        bootstrap[bootstrap_marker + 6] = version;
+        try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, bootstrap));
+    }
+    // A durable archive locator changes receiver progress semantics. Older
+    // private parsers must reject it rather than silently drop that cursor.
+    request.merge_page.?.phase = .rows;
+    request.merge_page.?.next_snapshot_position = .{ .object = 9, .offset = 9007199254740993, .remaining = 7 };
+    request.merge_page.?.digest = merge_pages.commandDigest(request);
+    const located = try encodeBatchRequest(alloc, request);
+    defer alloc.free(located);
+    const locator_marker = std.mem.indexOf(u8, located, "page_v6") orelse return error.TestUnexpectedResult;
+    var parsed_locator = try parseInternalBatchRequest(alloc, located);
+    defer parsed_locator.deinit(alloc);
+    try std.testing.expectEqualDeep(request.merge_page, parsed_locator.req.merge_page);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, located));
+    for ([_]u8{ '1', '2', '3', '4', '5' }) |version| {
+        located[locator_marker + 6] = version;
+        try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, located));
+    }
+}
+
 pub const OwnedBatchRequest = struct {
     writes: []db_mod.types.BatchWrite = &.{},
     deletes: [][]const u8 = &.{},
@@ -47,8 +306,10 @@ pub const OwnedBatchRequest = struct {
     integrity_commands: ?std.json.Parsed([]const @import("../storage/db/relational_integrity_contract.zig").Command) = null,
     relational_activation: ?std.json.Parsed(@import("../storage/db/relational_integrity_activation_contract.zig").Command) = null,
     relational_retirement: ?std.json.Parsed(@import("../storage/db/relational_integrity_retirement_contract.zig").Command) = null,
+    relational_index_maintenance: ?std.json.Parsed(@import("../storage/db/relational_index_maintenance_contract.zig").Command) = null,
     relational_topology: ?std.json.Parsed(@import("../storage/db/relational_integrity_topology_contract.zig").Command) = null,
     restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
+    online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
     transaction_participants: [][]const u8 = &.{},
     split_checkpoint_range_start: ?[]u8 = null,
     split_checkpoint_range_end: ?[]u8 = null,
@@ -58,6 +319,8 @@ pub const OwnedBatchRequest = struct {
     merge_range_start: ?[]u8 = null,
     merge_range_end: ?[]u8 = null,
     merge_artifacts: ?std.json.Parsed([]const db_mod.types.BatchWrite) = null,
+    merge_page: ?std.json.Parsed(merge_pages.Command) = null,
+    merge_page_effects: ?std.json.Parsed(MergePageEffects) = null,
     req: db_mod.types.BatchRequest = .{},
 
     pub fn deinit(self: *OwnedBatchRequest, alloc: std.mem.Allocator) void {
@@ -65,15 +328,21 @@ pub const OwnedBatchRequest = struct {
         if (self.integrity_commands) |*commands| commands.deinit();
         if (self.relational_activation) |*activation| activation.deinit();
         if (self.relational_retirement) |*retirement| retirement.deinit();
+        if (self.relational_index_maintenance) |*retirement| retirement.deinit();
         if (self.relational_topology) |*topology| topology.deinit();
         if (self.restore_staging) |*control| control.deinit();
-        for (self.writes) |write| {
-            alloc.free(@constCast(write.key));
-            alloc.free(@constCast(write.value));
+        if (self.online_source) |*control| control.deinit();
+        if (self.merge_page_effects) |*effects| {
+            effects.deinit();
+        } else {
+            for (self.writes) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            if (self.writes.len > 0) alloc.free(self.writes);
+            for (self.deletes) |key| alloc.free(key);
+            if (self.deletes.len > 0) alloc.free(self.deletes);
         }
-        if (self.writes.len > 0) alloc.free(self.writes);
-        for (self.deletes) |key| alloc.free(key);
-        if (self.deletes.len > 0) alloc.free(self.deletes);
         for (self.transforms) |transform| {
             alloc.free(@constCast(transform.key));
             for (transform.operations) |op| {
@@ -97,6 +366,7 @@ pub const OwnedBatchRequest = struct {
         if (self.merge_range_start) |value| alloc.free(value);
         if (self.merge_range_end) |value| alloc.free(value);
         if (self.merge_artifacts) |*value| value.deinit();
+        if (self.merge_page) |*value| value.deinit();
         self.* = undefined;
     }
 
@@ -151,7 +421,17 @@ fn parseBatchRequestWithOptions(
     if (parsed.value != .object) return error.InvalidBatchRequest;
     const root = parsed.value.object;
 
+    var page_effects: ?std.json.Parsed(MergePageEffects) = null;
+    errdefer if (page_effects) |*effects| effects.deinit();
+    if (root.get("_merge_page_effects")) |value| {
+        if (!allow_internal or root.get("_merge_page") == null) return error.InvalidBatchRequest;
+        if (root.get("inserts")) |inserts| if (inserts != .object or inserts.object.count() != 0) return error.InvalidBatchRequest;
+        if (root.get("deletes")) |deletes| if (deletes != .array or deletes.array.items.len != 0) return error.InvalidBatchRequest;
+        page_effects = try std.json.parseFromValue(MergePageEffects, alloc, value, .{ .allocate = .alloc_always });
+    } else if (root.get("_merge_page") != null) return error.InvalidBatchRequest;
+
     const writes: []db_mod.types.BatchWrite = writes: {
+        if (page_effects) |effects| break :writes effects.value.writes;
         if (root.get("inserts")) |inserts| {
             if (inserts == .null) break :writes &.{};
             const parsed_writes = try parseInserts(alloc, inserts, !allow_internal);
@@ -160,9 +440,10 @@ fn parseBatchRequestWithOptions(
         }
         break :writes &.{};
     };
-    errdefer freeWrites(alloc, writes);
+    errdefer if (page_effects == null) freeWrites(alloc, writes);
 
     const deletes: [][]const u8 = deletes: {
+        if (page_effects) |effects| break :deletes effects.value.deletes;
         if (root.get("deletes")) |deletes_value| {
             if (deletes_value == .null) break :deletes &.{};
             const parsed_deletes = try parseDeletes(alloc, deletes_value);
@@ -171,7 +452,7 @@ fn parseBatchRequestWithOptions(
         }
         break :deletes &.{};
     };
-    errdefer freeDeletes(alloc, deletes);
+    errdefer if (page_effects == null) freeDeletes(alloc, deletes);
 
     const transforms: []db_mod.types.DocumentTransform = transforms: {
         if (root.get("transforms")) |transforms_value| {
@@ -205,6 +486,11 @@ fn parseBatchRequestWithOptions(
         break :retirement @as(?std.json.Parsed(@import("../storage/db/relational_integrity_retirement_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_integrity_retirement_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (relational_retirement) |*retirement| retirement.deinit();
+    var relational_index_maintenance = if (root.get("_relational_index_maintenance")) |value| retirement: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        break :retirement @as(?std.json.Parsed(@import("../storage/db/relational_index_maintenance_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_index_maintenance_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
+    } else null;
+    errdefer if (relational_index_maintenance) |*retirement| retirement.deinit();
     var relational_topology = if (root.get("_relational_topology")) |value| topology: {
         if (!allow_internal) return error.InvalidBatchRequest;
         break :topology @as(?std.json.Parsed(@import("../storage/db/relational_integrity_topology_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_integrity_topology_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
@@ -212,9 +498,22 @@ fn parseBatchRequestWithOptions(
     errdefer if (relational_topology) |*topology| topology.deinit();
     var restore_staging = if (root.get("_restore_staging")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "restore_v3")) return error.InvalidBatchRequest;
         break :control @as(?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control), try std.json.parseFromValue(@import("../storage/db/restore_staging_contract.zig").Control, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (restore_staging) |*control| control.deinit();
+    var online_source = if (root.get("_online_source")) |value| control: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "online_source_v4")) return error.InvalidBatchRequest;
+        break :control @as(?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/online_source_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
+    } else null;
+    errdefer if (online_source) |*control| control.deinit();
     const relational_schema_version: ?u32 = if (root.get("_relational_schema_version")) |value| blk: {
         if (!allow_internal) return error.InvalidBatchRequest;
         break :blk std.math.cast(u32, try parseInternalU64(value)) orelse return error.InvalidBatchRequest;
@@ -230,6 +529,13 @@ fn parseBatchRequestWithOptions(
     const restore_staging_scope: ?[32]u8 = if (root.get("_restore_staging_scope")) |value| blk: {
         if (!allow_internal) return error.InvalidBatchRequest;
         break :blk try @import("relational_integrity_wire.zig").parseGenerationSet(value);
+    } else null;
+    const restore_staging_plan_id: ?[16]u8 = if (root.get("_restore_staging_plan_id")) |value| blk: {
+        if (!allow_internal or restore_staging_scope == null or value != .string or value.string.len != 32) return error.InvalidBatchRequest;
+        var id: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&id, value.string) catch return error.InvalidBatchRequest;
+        if (std.mem.allEqual(u8, &id, 0)) return error.InvalidBatchRequest;
+        break :blk id;
     } else null;
     const graph_writes: []db_mod.types.GraphEdgeWrite = graph_writes: {
         const value = root.get("_graph_writes") orelse break :graph_writes &.{};
@@ -437,6 +743,24 @@ fn parseBatchRequestWithOptions(
         };
     };
 
+    var merge_page: ?std.json.Parsed(merge_pages.Command) = null;
+    errdefer if (merge_page) |*value| value.deinit();
+    if (root.get("_merge_page")) |value| {
+        if (!allow_internal or merge_replication == null) return error.InvalidBatchRequest;
+        merge_page = @import("../storage/db/merge_page_wire.zig").parseFromValue(alloc, value) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBatchRequest,
+        };
+        if (merge_page.?.value.chunk != null and writes.len != 0) return error.InvalidBatchRequest;
+        // A discriminant understood by the old checkpoint parser prevents an
+        // older node from silently discarding progress and applying bare rows.
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        const expected_marker = if (merge_page.?.value.source.retention != null) "page_v6" else if (merge_page.?.value.source.integrity != null) "page_v5" else if (merge_page.?.value.next_snapshot_position != null) "page_v4" else if (merge_page.?.value.chunk != null) "page_v3" else "page_v1";
+        if (kind != .string or !std.mem.eql(u8, kind.string, expected_marker)) return error.InvalidBatchRequest;
+    }
+
     var merge_artifacts: ?std.json.Parsed([]const db_mod.types.BatchWrite) = null;
     errdefer if (merge_artifacts) |*value| value.deinit();
     if (root.get("_merge_artifacts")) |value| {
@@ -518,10 +842,43 @@ fn parseBatchRequestWithOptions(
         const object = value.object;
         const kind_value = object.get("kind") orelse return error.InvalidBatchRequest;
         if (kind_value != .string) return error.InvalidBatchRequest;
+        if (std.mem.eql(u8, kind_value.string, "restore_v3")) {
+            if (restore_staging == null or object.count() != 1) return error.InvalidBatchRequest;
+            break :merge null;
+        }
+        if (std.mem.eql(u8, kind_value.string, "online_source_v4")) {
+            if (online_source == null or object.count() != 1) return error.InvalidBatchRequest;
+            break :merge null;
+        }
+        if (std.mem.eql(u8, kind_value.string, "page_v1") or std.mem.eql(u8, kind_value.string, "page_v2") or std.mem.eql(u8, kind_value.string, "page_v3") or std.mem.eql(u8, kind_value.string, "page_v4") or std.mem.eql(u8, kind_value.string, "page_v5") or std.mem.eql(u8, kind_value.string, "page_v6")) {
+            if (merge_page == null) return error.InvalidBatchRequest;
+            break :merge null;
+        }
+        const integrity_protocol = std.mem.startsWith(u8, kind_value.string, "page_v3_");
+        const scope_protocol = std.mem.startsWith(u8, kind_value.string, "page_v4_");
+        const tail_protocol = scope_protocol or integrity_protocol or std.mem.startsWith(u8, kind_value.string, "page_v2_");
+        const page_protocol = tail_protocol or std.mem.startsWith(u8, kind_value.string, "page_v1_");
         const kind = std.meta.stringToEnum(
             db_mod.types.MergeReplicationCheckpoint.Kind,
-            kind_value.string,
+            if (page_protocol) kind_value.string["page_v1_".len..] else kind_value.string,
         ) orelse return error.InvalidBatchRequest;
+        if (page_protocol != (object.get("page_source") != null) or page_protocol != (object.get("page_receiver_namespace") != null))
+            return error.InvalidBatchRequest;
+        const page_source: ?merge_pages.Source = if (object.get("page_source")) |source_value| blk: {
+            var owned = try std.json.parseFromValue(merge_pages.Source, alloc, source_value, .{});
+            defer owned.deinit();
+            try owned.value.validate();
+            if (tail_protocol != (owned.value.retention != null)) return error.InvalidBatchRequest;
+            if (scope_protocol != (owned.value.retention != null)) return error.InvalidBatchRequest;
+            if (!scope_protocol and integrity_protocol != (owned.value.integrity != null)) return error.InvalidBatchRequest;
+            break :blk owned.value;
+        } else null;
+        const page_receiver: ?db_mod.DocIdentityNamespace = if (object.get("page_receiver_namespace")) |receiver_value| blk: {
+            var owned = try std.json.parseFromValue(db_mod.DocIdentityNamespace, alloc, receiver_value, .{});
+            defer owned.deinit();
+            if (owned.value.table_id == 0 or owned.value.shard_id == 0 or owned.value.range_id == 0) return error.InvalidBatchRequest;
+            break :blk owned.value;
+        } else null;
         const transition_id = try parseInternalU64(object.get("transition_id") orelse return error.InvalidBatchRequest);
         const donor_group_id = try parseInternalU64(object.get("donor_group_id") orelse return error.InvalidBatchRequest);
         const receiver_group_id = try parseInternalU64(object.get("receiver_group_id") orelse return error.InvalidBatchRequest);
@@ -571,6 +928,8 @@ fn parseBatchRequestWithOptions(
                 else => return error.InvalidBatchRequest,
             } else false,
             .receiver_identity_reassignment_namespace = namespace,
+            .page_source = page_source,
+            .page_receiver_namespace = page_receiver,
         };
     };
 
@@ -663,7 +1022,11 @@ fn parseBatchRequestWithOptions(
     if (integrity_commands != null and (transaction == null or transaction.? != .prepare or integrity.len != 0)) return error.InvalidBatchRequest;
     if (relational_activation != null and (transaction == null or transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (relational_retirement != null and (transaction == null or transaction.? != .prepare)) return error.InvalidBatchRequest;
-    if (relational_topology != null and (transaction != null or writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0 or integrity.len != 0 or integrity_commands != null or relational_activation != null or relational_retirement != null or split_checkpoint != null or split_replication != null or split_transition != null or merge_checkpoint != null or merge_replication != null or merge_source_transition != null)) return error.InvalidBatchRequest;
+    if (relational_index_maintenance) |command| {
+        try command.value.validate();
+        if (transaction == null or transaction.? != .prepare or writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0 or integrity.len != 0 or integrity_commands != null or relational_activation != null or relational_retirement != null or relational_repair or restore_staging_scope != null) return error.InvalidBatchRequest;
+    }
+    if (relational_topology != null and (transaction != null or writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0 or integrity.len != 0 or integrity_commands != null or relational_activation != null or relational_retirement != null or relational_index_maintenance != null or split_checkpoint != null or split_replication != null or split_transition != null or merge_checkpoint != null or merge_replication != null or merge_source_transition != null)) return error.InvalidBatchRequest;
     if (relational_topology != null and (relational_schema_version != null or relational_integrity_generation_set != null or relational_repair)) return error.InvalidBatchRequest;
     if (transaction) |mutation| switch (mutation) {
         .begin, .resolve, .acknowledge, .cleanup => if (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0)
@@ -700,7 +1063,7 @@ fn parseBatchRequestWithOptions(
             return error.InvalidBatchRequest;
     };
 
-    return .{
+    const result_value: OwnedBatchRequest = .{
         .writes = writes,
         .deletes = deletes,
         .transforms = transforms,
@@ -711,8 +1074,10 @@ fn parseBatchRequestWithOptions(
         .integrity_commands = integrity_commands,
         .relational_activation = relational_activation,
         .relational_retirement = relational_retirement,
+        .relational_index_maintenance = relational_index_maintenance,
         .relational_topology = relational_topology,
         .restore_staging = restore_staging,
+        .online_source = online_source,
         .transaction_participants = transaction_participants,
         .split_checkpoint_range_start = checkpoint_start,
         .split_checkpoint_range_end = checkpoint_end,
@@ -722,16 +1087,21 @@ fn parseBatchRequestWithOptions(
         .merge_range_start = merge_range_start,
         .merge_range_end = merge_range_end,
         .merge_artifacts = merge_artifacts,
+        .merge_page = merge_page,
+        .merge_page_effects = page_effects,
         .req = .{
             .integrity = integrity,
             .integrity_commands = if (integrity_commands) |commands| commands.value else &.{},
             .relational_activation = if (relational_activation) |activation| activation.value else null,
             .relational_retirement = if (relational_retirement) |retirement| retirement.value else null,
+            .relational_index_maintenance = if (relational_index_maintenance) |maintenance| maintenance.value else null,
             .relational_topology = if (relational_topology) |topology| topology.value else null,
             .restore_staging = if (restore_staging) |control| control.value else null,
+            .online_source = if (online_source) |control| control.value else null,
             .relational_schema_version = relational_schema_version,
             .relational_integrity_generation_set = relational_integrity_generation_set,
             .restore_staging_scope = restore_staging_scope,
+            .restore_staging_plan_id = restore_staging_plan_id,
             .relational_repair = relational_repair,
             .writes = writes,
             .deletes = deletes,
@@ -745,6 +1115,7 @@ fn parseBatchRequestWithOptions(
             .split_checkpoint = split_checkpoint,
             .split_replication = split_replication,
             .merge_replication = merge_replication,
+            .merge_page = if (merge_page) |value| value.value else null,
             .merge_artifacts = if (merge_artifacts) |value| value.value else &.{},
             .split_transition = split_transition,
             .merge_source_transition = merge_source_transition,
@@ -752,6 +1123,9 @@ fn parseBatchRequestWithOptions(
             .transaction = transaction,
         },
     };
+    try merge_pages.validateRequest(result_value.req);
+    try @import("../storage/db/online_source_contract.zig").validateRequest(result_value.req);
+    return result_value;
 }
 
 pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 {
@@ -759,12 +1133,22 @@ pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    if (req.relational_topology != null and (req.transaction != null or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null)) return error.InvalidBatchRequest;
+    try @import("../storage/db/online_source_contract.zig").validateRequest(req);
+    try merge_pages.validateRequest(req);
+    if (req.merge_checkpoint) |checkpoint| {
+        if ((checkpoint.page_source != null) != (checkpoint.page_receiver_namespace != null)) return error.InvalidBatchRequest;
+        if (checkpoint.page_source) |source| try source.validate();
+    }
+    if (req.relational_topology != null and (req.transaction != null or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null)) return error.InvalidBatchRequest;
     if (req.relational_topology != null and (req.relational_schema_version != null or req.relational_integrity_generation_set != null or req.relational_repair)) return error.InvalidBatchRequest;
     if (req.integrity.len != 0 and (req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (req.integrity_commands.len != 0 and (req.transaction == null or req.transaction.? != .prepare or req.integrity.len != 0)) return error.InvalidBatchRequest;
     if (req.relational_activation != null and (req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (req.relational_retirement != null and (req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
+    if (req.relational_index_maintenance) |command| {
+        try command.validate();
+        if (req.transaction == null or req.transaction.? != .prepare or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_repair or req.restore_staging_scope != null) return error.InvalidBatchRequest;
+    }
     try db_mod.types.validateMergeArtifacts(req);
     if (req.predicates.len > 0 and req.transaction == null) {
         return error.UnsupportedBatchRequestEncoding;
@@ -814,17 +1198,35 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
     const writer = &out.writer;
 
     try writer.writeAll("{\"inserts\":{");
-    for (req.writes, 0..) |write, i| {
+    for (if (req.merge_page != null) &.{} else req.writes, 0..) |write, i| {
         if (i != 0) try writer.writeByte(',');
         try writer.print("{f}:", .{std.json.fmt(write.key, .{})});
         try writer.writeAll(write.value);
     }
     try writer.writeAll("},\"deletes\":[");
-    for (req.deletes, 0..) |key, i| {
+    for (if (req.merge_page != null) &.{} else req.deletes, 0..) |key, i| {
         if (i != 0) try writer.writeByte(',');
         try writer.print("{f}", .{std.json.fmt(key, .{})});
     }
     try writer.writeAll("]");
+    if (req.merge_page != null) {
+        // Preserve exact JSON bytes and arbitrary binary row keys; reparsing
+        // ordinary inserts would change whitespace/numeric spellings under
+        // the already-certified page digest.
+        // Row values are logical JSON, not opaque physical envelopes. Encode
+        // them as JSON strings: decoding preserves their exact bytes without
+        // expanding every byte into a numeric JSON node. Only binary keys need
+        // arrays. Large typed/blob rows avoid numeric-array transport overhead.
+        try writer.writeAll(",\"_merge_page_effects\":{\"writes\":[");
+        for (req.writes, 0..) |write, index| {
+            if (index != 0) try writer.writeByte(',');
+            try writer.print("{{\"key\":{f},\"value\":{f}}}", .{
+                std.json.fmt(write.key, .{ .emit_strings_as_arrays = true }),
+                std.json.fmt(write.value, .{}),
+            });
+        }
+        try writer.print("],\"deletes\":{f}}}", .{std.json.fmt(req.deletes, .{ .emit_strings_as_arrays = true })});
+    }
     if (req.merge_artifacts.len > 0) {
         // Byte arrays preserve binary keys and opaque payloads exactly.
         try writer.print(",\"_merge_artifacts\":{f}", .{std.json.fmt(req.merge_artifacts, .{ .emit_strings_as_arrays = true })});
@@ -860,6 +1262,10 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
     }
+    if (req.restore_staging_plan_id) |id| {
+        if (req.restore_staging_scope == null or std.mem.allEqual(u8, &id, 0)) return error.InvalidBatchRequest;
+        try writer.print(",\"_restore_staging_plan_id\":\"{s}\"", .{std.fmt.bytesToHex(id, .lower)});
+    }
     if (req.relational_integrity_generation_set) |generation_set| {
         try writer.writeAll(",\"_relational_integrity_generation_set\":");
         const encoded = try @import("relational_integrity_wire.zig").encodeGenerationSet(alloc, generation_set);
@@ -878,6 +1284,12 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
     }
+    if (req.relational_index_maintenance) |retirement| {
+        try writer.writeAll(",\"_relational_index_maintenance\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, retirement, .{});
+        defer alloc.free(encoded);
+        try writer.writeAll(encoded);
+    }
     if (req.relational_topology) |topology| {
         try writer.writeAll(",\"_relational_topology\":");
         const encoded = try std.json.Stringify.valueAlloc(alloc, topology, .{});
@@ -885,7 +1297,16 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         try writer.writeAll(encoded);
     }
     if (req.restore_staging) |control| {
-        try writer.writeAll(",\"_restore_staging\":");
+        if (req.online_source != null or req.merge_checkpoint != null or req.merge_page != null) return error.InvalidBatchRequest;
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"restore_v3\"},\"_restore_staging\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
+        defer alloc.free(encoded);
+        try writer.writeAll(encoded);
+    }
+    if (req.online_source) |control| {
+        // Existing parsers reject this mandatory checkpoint discriminator
+        // rather than silently dropping a new source authority command.
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"online_source_v4\"},\"_online_source\":");
         const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
@@ -1013,8 +1434,13 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         });
     }
     if (req.merge_checkpoint) |checkpoint| {
+        const kind = if (checkpoint.page_source) |source|
+            try std.fmt.allocPrint(alloc, "{s}_{s}", .{ if (source.retention != null) "page_v4" else if (source.integrity != null) "page_v3" else "page_v1", @tagName(checkpoint.kind) })
+        else
+            try alloc.dupe(u8, @tagName(checkpoint.kind));
+        defer alloc.free(kind);
         try writer.print(",\"_merge_checkpoint\":{{\"kind\":{f},\"transition_id\":\"{d}\",\"donor_group_id\":\"{d}\",\"receiver_group_id\":\"{d}\",\"receiver_base_start\":{f},\"receiver_base_end\":{f},\"merged_start\":{f},\"merged_end\":{f},\"bootstrap_applied_index\":\"{d}\",\"allow_doc_identity_reassignment\":{},\"copy_donor_term\":\"{d}\",\"copy_sequence\":\"{d}\"", .{
-            std.json.fmt(@tagName(checkpoint.kind), .{}),
+            std.json.fmt(kind, .{}),
             checkpoint.transition_id,
             checkpoint.donor_group_id,
             checkpoint.receiver_group_id,
@@ -1034,7 +1460,19 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
                 namespace.range_id,
             });
         }
+        if (checkpoint.page_source) |source| {
+            try writer.print(",\"page_source\":{f},\"page_receiver_namespace\":{f}", .{
+                std.json.fmt(source, .{}), std.json.fmt(checkpoint.page_receiver_namespace.?, .{}),
+            });
+        }
         try writer.writeByte('}');
+    }
+    if (req.merge_page) |page| {
+        if (page.chunk != null and req.writes.len != 0) return error.InvalidBatchRequest;
+        try writer.print(",\"_merge_checkpoint\":{{\"kind\":\"{s}\"}},\"_merge_page\":", .{if (page.source.retention != null) "page_v6" else if (page.source.integrity != null) "page_v5" else if (page.next_snapshot_position != null) "page_v4" else if (page.chunk != null) "page_v3" else "page_v1"});
+        const encoded = try @import("../storage/db/merge_page_wire.zig").encodeAlloc(alloc, page);
+        defer alloc.free(encoded);
+        try writer.writeAll(encoded);
     }
     if (req.transaction) |mutation| {
         try writer.writeAll(",\"_transaction\":{");
@@ -1484,6 +1922,11 @@ fn consumerTests() type {
             try std.testing.expectEqualSlices(u8, &.{ 0, 255, 128, 1 }, page.next);
             try std.testing.expectEqualSlices(u8, &.{ 0, 255, 127 }, page.timestamps[0].key);
             try std.testing.expectEqual(@as(u64, 9_007_199_254_740_993), page.timestamps[0].timestamp);
+            const marker = std.mem.indexOf(u8, encoded, "restore_v3").?;
+            for ([_]u8{ '1', '2' }) |version| {
+                encoded[marker + "restore_v".len] = version;
+                try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, encoded));
+            }
         }
 
         test "distributed txn internal batch codec round trips replicated transaction phases" {

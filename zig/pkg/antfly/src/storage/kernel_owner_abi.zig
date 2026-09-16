@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 54;
+pub const abi_version: u32 = 61;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -416,7 +416,8 @@ pub const DataApplyOpenRequest = extern struct {
     version: u32 = abi_version,
     no_sync: u8 = 0,
     read_only: u8 = 0,
-    _reserved0: u16 = 0,
+    native_source_delegate: u8 = 0,
+    _reserved0: u8 = 0,
     context: ?*anyopaque = null,
     root_dir: BorrowedBytes = .{},
 };
@@ -525,6 +526,8 @@ pub const MetadataProjectionKind = enum(u32) {
     export_ha_checkpoint = 57,
     import_ha_checkpoint = 58,
     migrate_standalone_restore_jobs = 59,
+    restore_staging_authority_allowed = 60,
+    merge_transition = 61,
 };
 
 pub const MetadataHABindRequest = extern struct {
@@ -695,6 +698,8 @@ pub const DataApplyProjectionKind = enum(u32) {
     capture_verified_handoff_metadata = 4,
     current_merge_source = 5,
     current_merge_receiver = 6,
+    group_state_keys_page = 7,
+    topology_rejection = 8,
 };
 
 /// One bounded projection read. Fields unused by `kind` must remain zero.
@@ -1015,10 +1020,17 @@ pub const OpenRequest = extern struct {
     restore_bootstrap_json: BorrowedBytes = .{},
     restore_cancel_recovery: u8 = 0,
     restore_ha_replay: u8 = 0,
-    _restore_reserved: [6]u8 = @splat(0),
+    /// Immutable native ownership domain; not inferred from the first row or
+    /// from a caller-supplied source control request. 1 = Raft, 2 = native.
+    online_source_authority: u8 = 1,
+    _restore_reserved: [5]u8 = @splat(0),
     target_observer: TargetObserver = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},
     runtime_hooks: RuntimeHooksConfig = .{},
+    has_initial_range: u8 = 0,
+    initial_range_start: BorrowedBytes = .{},
+    initial_range_end: BorrowedBytes = .{},
+    initial_range_control: ControlledJsonOperationRequest = .{},
 };
 
 pub const JsonOperationRequest = extern struct {
@@ -1346,6 +1358,8 @@ pub const SnapshotPrepareRequest = extern struct {
     schema_json: BorrowedBytes = .{},
     indexes_json: BorrowedBytes = .{},
     encoded_snapshot: BorrowedBytes = .{},
+    projection_store: ?*anyopaque = null,
+    expected_applied_index: u64 = 0,
 };
 
 /// Coarse local backup-restore request. The manifest is a complete JSON value
@@ -1637,6 +1651,9 @@ pub extern fn antfly_data_apply_store_prepare_snapshot(
     out_prepared: *?*anyopaque,
 ) callconv(.c) Status;
 
+pub extern fn antfly_data_apply_prepared_snapshot_requires_native(prepared: ?*anyopaque) callconv(.c) bool;
+pub extern fn antfly_data_apply_prepared_snapshot_attach_native(prepared: ?*anyopaque, capture: ?*anyopaque) callconv(.c) Status;
+
 pub extern fn antfly_data_apply_prepared_snapshot_materialize(
     prepared: ?*anyopaque,
     out_result: *DataApplyPreparedSnapshotResult,
@@ -1823,6 +1840,24 @@ pub extern fn antfly_storage_owner_backup_pin_control_json(
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
+pub extern fn antfly_storage_owner_source_artifact_json(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out: *OwnedBytes,
+) Status;
+
+pub extern fn antfly_storage_owner_online_merge_io_json(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_source_pin_publication_json(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_backup_pin_reclaim_json(
     context: ?*anyopaque,
     request: *const BackupPinReclaimRequest,
@@ -1833,6 +1868,10 @@ pub extern fn antfly_storage_snapshot_prepare(
     request: *const SnapshotPrepareRequest,
     out_snapshot: *?*anyopaque,
 ) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_snapshot_capture(owner: ?*anyopaque, group_id: u64, through_index: u64, out_capture: *?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_storage_snapshot_capture_destroy(capture: ?*anyopaque) callconv(.c) void;
+pub extern fn antfly_storage_snapshot_capture_bind_lease(capture: ?*anyopaque, ctx: ?*anyopaque, release: ?*const fn (?*anyopaque) callconv(.c) void) callconv(.c) Status;
 
 pub extern fn antfly_storage_restore_prepare(
     request: *const RestorePrepareRequest,
@@ -1888,15 +1927,16 @@ pub const ScanSink = extern struct {
 
 pub extern fn antfly_storage_owner_scan_stream(
     owner: ?*anyopaque,
-    request: *const JsonOperationRequest,
+    request: *const ControlledJsonOperationRequest,
     sink: *const ScanSink,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_scan_ndjson(
     owner: ?*anyopaque,
-    request: *const JsonOperationRequest,
+    request: *const ControlledJsonOperationRequest,
     out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_graph_metric_maintenance_json(

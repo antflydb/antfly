@@ -79,11 +79,22 @@ pub const Phase = enum { reserved, importing, imported, validated, published, ca
 
 pub const Timestamp = struct { key: []const u8, timestamp: u64 };
 
-pub const ImportPage = struct { expected: Digest, next: []const u8, scope: Digest, timestamps: []const Timestamp };
+pub const ImportPage = struct {
+    expected: Digest,
+    next: []const u8,
+    scope: Digest,
+    timestamps: []const Timestamp,
+    /// Rewrite tails consume source integrity effects without copying their
+    /// generations. Target claims are rebuilt by shared cohort activation.
+    source_effects: u32 = 0,
+};
 
 pub const Control = union(enum) {
     begin: Scope,
     import_page: ImportPage,
+    /// Explicit tag prevents old readers from treating transformed/tail effects
+    /// as a preservation-only restore page.
+    rewrite_page: ImportPage,
     finish: struct { scope: Digest, phase: Phase },
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("relational_integrity_json.zig").write(self, jw);
@@ -98,14 +109,24 @@ pub const Scope = struct {
     source_namespace: identity.Namespace,
     target_namespace: identity.Namespace,
     target_schema_digest: Digest,
+    rewrite: ?@import("relational_rewrite_contract.zig").Binding = null,
 
     pub fn validateReservation(self: Scope) !void {
+        if (self.rewrite) |rewrite| {
+            try rewrite.validate();
+            if (rewrite.source_scope) |source| if (!source.receiver_namespace.eql(self.target_namespace) or
+                (self.source_namespace.table_id != 0 and !source.fence.namespace.eql(self.source_namespace))) return error.InvalidRestoreStagingCommand;
+        }
         if (std.mem.allEqual(u8, &self.plan_id, 0) or std.mem.allEqual(u8, &self.plan_digest, 0) or
             self.target_namespace.table_id == 0 or self.target_namespace.shard_id == 0 or self.target_namespace.range_id == 0)
             return error.InvalidRestoreStagingCommand;
     }
 
     pub fn validate(self: Scope) !void {
+        if (self.rewrite) |rewrite| {
+            try rewrite.validate();
+            if (rewrite.source_scope) |source| if (!source.fence.namespace.eql(self.source_namespace) or !source.receiver_namespace.eql(self.target_namespace)) return error.InvalidRestoreStagingCommand;
+        }
         if (std.mem.allEqual(u8, &self.plan_id, 0) or std.mem.allEqual(u8, &self.plan_digest, 0) or
             std.mem.allEqual(u8, &self.source_artifact_digest, 0) or self.target_namespace.table_id == 0 or
             self.target_namespace.shard_id == 0 or self.target_namespace.range_id == 0 or
@@ -127,6 +148,17 @@ pub const Scope = struct {
             }
         }
         hash.update(&self.target_schema_digest);
+        if (self.rewrite) |rewrite| {
+            hash.update("relational-rewrite-v1");
+            hash.update(&rewrite.program_digest);
+            hash.update(&rewrite.retained_pin);
+            hash.update(&rewrite.snapshot_certificate);
+            inline for (.{ rewrite.retained_epoch, rewrite.retained_start, rewrite.source_applied_index }) |value| {
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &bytes, value, .little);
+                hash.update(&bytes);
+            }
+        }
         var result: Digest = undefined;
         hash.final(&result);
         return result;
@@ -139,10 +171,12 @@ pub const Progress = struct {
     rows: u64 = 0,
     cursor: []const u8 = "",
     logical_digest: Digest = @splat(0),
+    rewrite: ?@import("relational_rewrite_contract.zig").Progress = null,
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("relational_integrity_json.zig").write(self, jw);
     }
     pub fn encode(self: Progress, alloc: Allocator) ![]u8 {
+        try self.validateRewrite();
         if (self.phase == .reserved or (self.phase == .canceled and self.scope.source_namespace.table_id == 0 and self.rows == 0 and self.cursor.len == 0)) try self.scope.validateReservation() else try self.scope.validate();
         if (self.cursor.len > 1024 * 1024) return error.InvalidRestoreStagingCommand;
         const body = try std.json.Stringify.valueAlloc(alloc, self, .{});
@@ -162,7 +196,17 @@ pub const Progress = struct {
             parsed.value.scope.validateReservation() catch return error.InvalidRestoreStagingRecord;
         } else parsed.value.scope.validate() catch return error.InvalidRestoreStagingRecord;
         if (parsed.value.cursor.len > 1024 * 1024) return error.InvalidRestoreStagingRecord;
+        parsed.value.validateRewrite() catch return error.InvalidRestoreStagingRecord;
         return parsed;
+    }
+    fn validateRewrite(self: Progress) !void {
+        if (self.scope.rewrite) |binding| {
+            // Reservations and terminal cancellation may precede initialization.
+            if (self.phase == .reserved or (self.phase == .canceled and self.rewrite == null)) return;
+            const progress = self.rewrite orelse return error.InvalidRestoreStagingCommand;
+            try progress.validate(binding);
+            if ((self.phase == .imported or self.phase == .validated or self.phase == .published) and progress.final_cut == null) return error.InvalidRestoreStagingCommand;
+        } else if (self.rewrite != null) return error.InvalidRestoreStagingCommand;
     }
     pub fn receipt(self: Progress) Digest {
         var hash = std.crypto.hash.Blake3.init(.{});
@@ -170,6 +214,16 @@ pub const Progress = struct {
         hash.update(&self.scope.digest());
         hash.update(@tagName(self.phase));
         hash.update(&self.logical_digest);
+        if (self.rewrite) |rewrite| {
+            var sequence: [8]u8 = undefined;
+            std.mem.writeInt(u64, &sequence, rewrite.sequence, .little);
+            hash.update(&sequence);
+            if (rewrite.final_cut) |cut| {
+                std.mem.writeInt(u64, &sequence, cut.applied_index, .little);
+                hash.update(&sequence);
+                hash.update(&cut.digest);
+            }
+        }
         var count: [8]u8 = undefined;
         std.mem.writeInt(u64, &count, self.rows, .little);
         hash.update(&count);

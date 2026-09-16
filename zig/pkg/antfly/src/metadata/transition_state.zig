@@ -148,6 +148,7 @@ pub const SplitTransitionRecord = struct {
 };
 
 pub const MergeTransitionRecord = struct {
+    online: ?@import("online_merge.zig").State = null,
     transition_id: u64,
     donor_group_id: u64,
     receiver_group_id: u64,

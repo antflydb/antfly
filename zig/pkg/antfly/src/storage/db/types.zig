@@ -258,6 +258,10 @@ pub const MergeReplicationCheckpoint = struct {
     copy_attempt: MergeCopyAttempt = .{},
     allow_doc_identity_reassignment: bool = false,
     receiver_identity_reassignment_namespace: ?doc_identity_mod.Namespace = null,
+    /// Opt-in immutable source binding for atomic, resumable receiver pages.
+    /// Only begin_copy may install it; ordinary checkpoint payloads stay empty.
+    page_source: ?@import("merge_page_contract.zig").Source = null,
+    page_receiver_namespace: ?doc_identity_mod.Namespace = null,
 };
 
 /// Private data-Raft command used by the distributed transaction protocol.
@@ -301,9 +305,13 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    /// Private, replicated source-retention lifecycle. Never accepted by public JSON.
+    online_source: ?@import("online_source_contract.zig").Command = null,
     /// Private replicated hidden-owner lifecycle; public JSON cannot set it.
     restore_staging: ?@import("restore_staging_contract.zig").Control = null,
     restore_staging_scope: ?[32]u8 = null,
+    /// Private metadata lookup identity, authenticated together with the scope.
+    restore_staging_plan_id: ?[16]u8 = null,
     /// Authenticated owner lifecycle control; never populated by public JSON.
     relational_topology: ?@import("relational_integrity_topology_contract.zig").Command = null,
     relational_schema_version: ?u32 = null,
@@ -322,6 +330,7 @@ pub const BatchRequest = struct {
     integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
     relational_activation: ?@import("relational_integrity_activation_contract.zig").Command = null,
     relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
+    relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion
@@ -343,6 +352,8 @@ pub const BatchRequest = struct {
     /// Internal identity context for receiver-side merge copy and rollback
     /// batches. Public batch parsing never sets it.
     merge_replication: ?MergeReplicationContext = null,
+    /// Separate effect-bearing command; never combined with a checkpoint.
+    merge_page: ?@import("merge_page_contract.zig").Command = null,
     /// Authoritative document-scoped store rows, not original write inputs.
     /// Ordered after primary copy and before the receiver completion checkpoint.
     merge_artifacts: []const BatchWrite = &.{},
@@ -353,12 +364,16 @@ pub const BatchRequest = struct {
         try jw.beginObject();
         inline for (std.meta.fields(@This())) |field| {
             try jw.objectField(field.name);
-            if (comptime std.mem.eql(u8, field.name, "relational_integrity_generation_set") or std.mem.eql(u8, field.name, "restore_staging_scope")) {
+            if (comptime std.mem.eql(u8, field.name, "relational_integrity_generation_set") or std.mem.eql(u8, field.name, "restore_staging_scope") or std.mem.eql(u8, field.name, "restore_staging_plan_id")) {
                 if (@field(self, field.name)) |digest| {
                     try jw.beginArray();
                     for (digest) |byte| try jw.write(byte);
                     try jw.endArray();
                 } else try jw.write(null);
+            } else if (comptime std.mem.eql(u8, field.name, "merge_page")) {
+                // The same bounded chunk encoding crosses HTTP, native replay
+                // and projection storage; never expand payload bytes to nodes.
+                try jw.write(self.merge_page);
             } else if (comptime std.mem.eql(u8, field.name, "split_checkpoint") or
                 std.mem.eql(u8, field.name, "split_transition") or
                 std.mem.eql(u8, field.name, "merge_checkpoint") or
@@ -1258,11 +1273,13 @@ pub const LookupOptions = struct {
     /// exact primary bytes from one snapshot, regardless of JSON projection.
     include_primary_digest: bool = false,
     restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
     /// Authenticated group-local control read; never accepted by public lookup parsing.
     relational_integrity_catalog: bool = false,
     relational_integrity_action: bool = false,
     relational_integrity_jobs_json: []const u8 = "",
     relational_activation_json: []const u8 = "",
+    relational_index_status_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
@@ -1378,9 +1395,11 @@ pub const ScanHash = struct {
     hash: u64,
     content_hash: ?DocumentContentHash = null,
     relational_schema_version: ?u32 = null,
+    relational_cursor: ?[]u8 = null,
 
     pub fn deinit(self: *ScanHash, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.relational_cursor) |cursor| alloc.free(cursor);
         self.* = undefined;
     }
 };
@@ -1392,6 +1411,7 @@ pub const ScanVisitEntry = struct {
     hash: u64,
     content_hash: ?DocumentContentHash = null,
     relational_schema_version: ?u32 = null,
+    relational_cursor: ?[]const u8 = null,
     document_json: ?[]const u8 = null,
 };
 
@@ -1504,7 +1524,9 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
     restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
     relational_activation: ?@import("relational_integrity_activation_contract.zig").Command = null,
     relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
     relational_schema_version: ?u32 = null,

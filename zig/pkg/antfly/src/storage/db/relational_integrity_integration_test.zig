@@ -624,7 +624,7 @@ fn activateOnePage(db: *db_mod.DB, txn_byte: u8) !bool {
     const activation = @import("relational_integrity_activation.zig");
     const types = @import("types.zig");
     const alloc = std.testing.allocator;
-    var page = (try activation.Page.prepare(alloc, null, db.core, &.{"id"}, .{ .rows = 1, .records = 64 })) orelse return true;
+    var page = (try activation.Page.prepare(alloc, null, db.core, .{ .rows = 1, .records = 64 })) orelse return true;
     defer page.deinit();
     const id = try binding(db, .unique, "id_unique");
     var view = db.core.acquireSchemaView().?;
@@ -1104,7 +1104,7 @@ test "relational integrity DB activation backfills atomically gates writers and 
             \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"id_unique","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
         );
         {
-            var oversized = (try activation.Page.prepare(alloc, null, db.core, &.{"id"}, .{ .output_bytes = 1 })).?;
+            var oversized = (try activation.Page.prepare(alloc, null, db.core, .{ .output_bytes = 1 })).?;
             defer oversized.deinit();
             try std.testing.expectEqual(.invalid, oversized.progress.state);
             try std.testing.expectEqualStrings("RelationalRowResultTooLarge", oversized.progress.failure);

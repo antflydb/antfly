@@ -58,8 +58,9 @@ fn snapshotRecord(source: Source) backups.ShardSnapshot {
 /// Build a source decoder once per scope, using the existing generation
 /// staging/publish protocol. Replays open the same immutable decoder; they do
 /// not download or hash the corpus for each 128-row import page.
-fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, context: operation.RequestContext) !bool {
+fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owner_range: db.types.ByteRange, context: operation.RequestContext, source_next_offset: *u64) !bool {
     const source = input.source.?;
+    source_next_offset.* = if (source.peer_descriptor) |descriptor| descriptor.total_bytes else 0;
     const marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{env.cache_path});
     defer alloc.free(marker);
     var transition = try generation.beginProcessExclusiveWithRuntimeAndIo(env.cache_path, env.runtime, env.io);
@@ -100,16 +101,33 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, cont
     var options = env.location_options;
     options.connection = if (source.connection.len == 0) null else source.connection;
     options.required_capability = "restore.read";
-    var location = try backups.openBackupLocationWithOptions(alloc, source.location, options);
-    defer location.deinit(alloc);
-    if (source.artifact.format == .portable and source.artifact.cohort_seal != null) {
+    var optional_location = if (source.peer_descriptor == null) try backups.openBackupLocationWithOptions(alloc, source.location, options) else null;
+    defer if (optional_location) |*location| location.deinit(alloc);
+    if (source.artifact.format == .portable and (source.artifact.cohort_seal != null or source.artifact.rewrite != null)) {
         const work_path = try std.fmt.allocPrint(alloc, "{s}.materializing", .{env.cache_path});
         defer alloc.free(work_path);
-        if (!try materialization.stepPortableWithBudget(alloc, env.io, &location, source.artifact, input.scope, work_path, context.cancellation, env.source_byte_budget)) return false;
+        const complete = if (source.peer_descriptor != null) peer: {
+            const result = try @import("../api/restore_peer_materialization.zig").step(alloc, env.io, source, input.scope, owner_range, work_path, input.source_chunk, context.cancellation, env.source_byte_budget);
+            source_next_offset.* = result.next_offset;
+            break :peer result.complete;
+        } else try materialization.stepPortableWithBudget(alloc, env.io, &optional_location.?, source.artifact, input.scope, owner_range, work_path, context.cancellation, env.source_byte_budget);
+        if (!complete) return false;
         const files = try std.fmt.allocPrint(alloc, "{s}/files", .{work_path});
         defer alloc.free(files);
         var decoder = try db.DB.open(alloc, files, .{ .backend_runtime = env.runtime, .identity_namespace = input.scope.source_namespace, .prefer_existing_identity_namespace = false, .primary_backend = .{ .lsm = .{} }, .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
-        decoder.close();
+        {
+            defer decoder.close();
+            if (input.rewrite) |intent| {
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                var program = try @import("db/relational_rewrite_program.zig").ProgramSet.initIntent(alloc, intent);
+                defer program.deinit();
+                var read = try decoder.core.store.beginReadTxn();
+                defer read.abort();
+                const manifest = try @import("db/relational_rewrite_manifest.zig").read(scratch.allocator(), &read, context.cancellation);
+                try program.requireSourceManifest(alloc, manifest, try read.get("\x00\x00__metadata__:schema_json"));
+            }
+        }
         const portable_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{files});
         defer alloc.free(portable_marker);
         _ = try native_backup.writeFileDurable(env.io, portable_marker, &input.scope.digest());
@@ -125,10 +143,11 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, cont
         if (try candidate.publish() != .durable) return error.RestoreSourceDurabilityUncertain;
         return true;
     }
+    const location = &optional_location.?;
     if (source.artifact.format == .native and source.artifact.native_manifest_size_bytes != 0) {
         const work_path = try std.fmt.allocPrint(alloc, "{s}.materializing", .{env.cache_path});
         defer alloc.free(work_path);
-        var manifest = (try materialization.stepWithBudget(alloc, env.io, &location, source.artifact, input.scope, work_path, context.cancellation, env.source_byte_budget)) orelse return false;
+        var manifest = (try materialization.stepWithBudget(alloc, env.io, location, source.artifact, input.scope, work_path, context.cancellation, env.source_byte_budget)) orelse return false;
         defer manifest.deinit();
         const files = try std.fmt.allocPrint(alloc, "{s}/files", .{work_path});
         defer alloc.free(files);
@@ -164,8 +183,8 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, cont
     const source_path = portable_path orelse artifact.path();
     const digest_hex = std.fmt.bytesToHex(source.artifact.artifact_sha256, .lower);
     switch (source.artifact.format) {
-        .native => try backups.copyDirectoryFromLocationUsingIoWithCancellation(alloc, env.io, &location, source.artifact.snapshot_path, artifact.path(), context.cancellation),
-        .portable => try backups.copyFileFromLocationVerifiedUsingIo(alloc, env.io, &location, source.artifact.snapshot_path, source_path, source.artifact.artifact_size_bytes, &digest_hex, context.cancellation),
+        .native => try backups.copyDirectoryFromLocationUsingIoWithCancellation(alloc, env.io, location, source.artifact.snapshot_path, artifact.path(), context.cancellation),
+        .portable => try backups.copyFileFromLocationVerifiedUsingIo(alloc, env.io, location, source.artifact.snapshot_path, source_path, source.artifact.artifact_size_bytes, &digest_hex, context.cancellation),
     }
     var shard = snapshotRecord(source);
     shard.artifact_sha256 = &digest_hex;
@@ -199,6 +218,7 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, cont
             if (source.artifact.cohort_seal) |seal| {
                 try decoder.importCohortPortableFileIntoUnpublishedEmpty(alloc, env.io, file, stat.size, .{ .seal = seal, .namespace = input.scope.source_namespace }, context.cancellation);
             } else try decoder.importPortableFileIntoUnpublishedEmpty(alloc, env.io, file, stat.size, input.scope.source_namespace);
+            try materialization.bindPortableDecoderRange(alloc, decoder.core.store, owner_range);
         },
     }
     const candidate_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{candidate.path()});
@@ -258,7 +278,23 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     var before = (try target.restoreStagingStatus(alloc)) orelse return error.RestoreStagingScopeChanged;
     defer before.deinit();
     if (!std.mem.eql(u8, &before.value.scope.digest(), &input.scope.digest())) return error.RestoreStagingScopeChanged;
-    if (input.action == .status) return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt() };
+    // Metadata/owner receipts survive restart; physical index coverage belongs
+    // to this replica. Recheck it before acknowledging recovered readiness.
+    // Cancellation must remain available even when a projection is broken.
+    if ((input.action == .status or input.action == .validate or input.action == .publish) and
+        (before.value.phase == .validated or before.value.phase == .published))
+    {
+        if (!try target.prepareRestoreStagingIndexesStep(alloc, input.scope.digest())) return error.RestoreValidationPending;
+    }
+    if (input.action == .status) {
+        const resume_offset = if (before.value.rewrite) |progress| blk: {
+            if (!progress.snapshot_complete or progress.final_cut != null) break :blk 0;
+            var transition = try generation.beginProcessExclusiveWithRuntimeAndIo(env.cache_path, env.runtime, env.io);
+            defer transition.deinit();
+            break :blk try @import("rewrite_tail_spool.zig").resumeOffset(alloc, env.io, env.cache_path, input.scope, progress.sequence);
+        } else 0;
+        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite, .tail_next = resume_offset };
+    }
     const desired: ?staging.Phase = switch (input.action) {
         .validate => .validated,
         .publish => .published,
@@ -270,13 +306,44 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         return .{ .phase = phase, .rows = before.value.rows, .receipt = before.value.receipt() };
     };
     if (before.value.phase == .canceled or before.value.phase == .published) return error.RestoreStagingScopeChanged;
+    var tail_next: u32 = 0;
+    var source_next_offset: u64 = 0;
     switch (input.action) {
         .begin => try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .begin = input.scope } }, context),
-        .import_page => {
-            if (!try ensureSource(alloc, env, input, context)) return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt() };
+        .import_page => import: {
+            if (input.rewrite_finish) |receipt| {
+                try receipt.validate(input.scope.rewrite.?);
+                var page = try @import("db/relational_rewrite_staging.zig").prepareFinish(target, alloc, input.scope, receipt.cut);
+                defer page.deinit();
+                if (page.batch) |batch| try env.proposer.propose(env.proposer.ptr, batch, context);
+                break :import;
+            }
+            if (input.rewrite_tail) |chunk| {
+                const progress = before.value.rewrite orelse return error.InvalidRestoreStagingCommand;
+                if (!progress.snapshot_complete or progress.final_cut != null) return error.RestoreStagingInProgress;
+                if (chunk.sequence <= progress.sequence) break :import;
+                // Reuse the same source-generation lock/terminal GC root.
+                // No target apply lock is held during bounded chunk fsync.
+                var transition = try generation.beginProcessExclusiveWithRuntimeAndIo(env.cache_path, env.runtime, env.io);
+                defer transition.deinit();
+                const assembled = try @import("rewrite_tail_spool.zig").receive(alloc, env.io, env.cache_path, input.scope, progress.sequence, chunk);
+                defer assembled.deinit(alloc);
+                tail_next = assembled.next;
+                if (assembled.frame) |frame| {
+                    var program = try @import("db/relational_rewrite_staging.zig").ProgramSet.initIntent(alloc, input.rewrite.?);
+                    defer program.deinit();
+                    var page = try @import("db/relational_rewrite_staging.zig").prepareTailFrame(target, alloc, input.scope, frame, chunk.frame_digest, &program, input.max_rows, context.cancellation);
+                    defer page.deinit();
+                    if (page.batch) |batch| try env.proposer.propose(env.proposer.ptr, batch, context);
+                }
+                break :import;
+            }
+            if (!try ensureSource(alloc, env, input, target.core.byteRange(), context, &source_next_offset)) return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite, .source_next_offset = source_next_offset };
             var decoder = try db.DB.open(alloc, env.cache_path, .{ .backend_runtime = env.runtime, .identity_namespace = input.scope.source_namespace, .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
             defer decoder.close();
-            var page = try target.prepareRestoreStagingPage(alloc, input.scope, &decoder, input.max_rows, context.cancellation);
+            var program = if (input.rewrite) |intent| try @import("db/relational_rewrite_staging.zig").ProgramSet.initIntent(alloc, intent) else null;
+            defer if (program) |*compiled| compiled.deinit();
+            var page = if (program) |*compiled| try target.prepareRewriteStagingPage(alloc, input.scope, &decoder, input.max_rows, context.cancellation, compiled) else try target.prepareRestoreStagingPage(alloc, input.scope, &decoder, input.max_rows, context.cancellation);
             defer page.deinit();
             if (page.batch) |batch| try env.proposer.propose(env.proposer.ptr, batch, context);
         },
@@ -292,7 +359,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     var after = (try target.restoreStagingStatus(alloc)) orelse return error.RestoreStagingScopeChanged;
     defer after.deinit();
     if (after.value.phase == .published or after.value.phase == .canceled) try releaseSource(alloc, env, input.scope);
-    return .{ .phase = after.value.phase, .rows = after.value.rows, .receipt = after.value.receipt() };
+    return .{ .phase = after.value.phase, .rows = after.value.rows, .receipt = after.value.receipt(), .rewrite = after.value.rewrite, .tail_next = tail_next, .source_next_offset = source_next_offset };
 }
 
 test "restore owner verified decoder is reused across pages and terminal cleanup revokes import" {
@@ -301,6 +368,179 @@ test "restore owner verified decoder is reused across pages and terminal cleanup
 
 test "restore owner verified decoder portable resumes and preserves vector projections" {
     try testVerifiedDecoder(true);
+}
+
+test "restore owner verified decoder portable range binding is immutable and durable" {
+    const alloc = std.testing.allocator;
+    const range_state = @import("db/range_state.zig");
+    const materialization = @import("../api/restore_materialization.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const options: @import("lsm_backend.zig").Options = .{ .read_runtime = @import("lsm_backend/storage_io.zig").ReadRuntime.init(std.testing.io) };
+    const expected: db.types.ByteRange = .{ .start = &.{ 0, 127, 255 }, .end = &.{ 1, 0, 128 } };
+    {
+        var backend = try @import("lsm_backend.zig").Backend.open(alloc, root, options);
+        defer backend.close();
+        var store = try @import("docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "docs" }));
+        defer store.close();
+        try materialization.bindPortableDecoderRange(alloc, &store, expected);
+        try materialization.bindPortableDecoderRange(alloc, &store, expected);
+        try std.testing.expectError(error.RestoreStagingScopeChanged, materialization.bindPortableDecoderRange(alloc, &store, .{ .start = "", .end = "" }));
+        try std.testing.expectError(error.RestoreStagingScopeChanged, materialization.bindPortableDecoderRange(alloc, &store, .{ .start = "z", .end = "a" }));
+    }
+    var reopened = try @import("lsm_backend.zig").Backend.open(alloc, root, options);
+    defer reopened.close();
+    var store = try @import("docstore.zig").DocStore.openRuntime(alloc, try reopened.runtimeStore(alloc, .{ .name = "docs" }));
+    defer store.close();
+    const range = try range_state.loadRange(alloc, &store);
+    defer range_state.freeRange(alloc, range);
+    try std.testing.expectEqualSlices(u8, expected.start, range.start);
+    try std.testing.expectEqualSlices(u8, expected.end, range.end);
+}
+
+test "restore owner verified decoder peer rewrite certificate chunks survive reopen corruption cancellation and publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const source_path = try std.fmt.allocPrint(a, "{s}/source", .{root});
+    const target_path = try std.fmt.allocPrint(a, "{s}/target", .{root});
+    const cache_path = try std.fmt.allocPrint(a, "{s}/decoder", .{root});
+    var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = std.testing.io });
+    defer runtime.deinit();
+    const source_ns: @import("db/doc_identity_namespace.zig").Namespace = .{ .table_id = 11, .shard_id = 12, .range_id = 12 };
+    const target_ns: @import("db/doc_identity_namespace.zig").Namespace = .{ .table_id = 21, .shard_id = 22, .range_id = 22 };
+    const source_options: db.OpenOptions = .{ .backend_runtime = &runtime, .identity_namespace = source_ns, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+    const target_options: db.OpenOptions = .{ .backend_runtime = &runtime, .identity_namespace = target_ns, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
+    var source = try db.DB.open(alloc, source_path, source_options);
+    defer source.close();
+    const schema_json = "{\"version\":1,\"storage_mode\":\"document\"}";
+    try source.setSchemaJson(alloc, schema_json);
+    const padding = try a.alloc(u8, 3 * 1024 * 1024);
+    var random = std.Random.DefaultPrng.init(71942);
+    for (padding) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+    const document = try std.fmt.allocPrint(a, "{{\"padding\":\"{s}\"}}", .{padding});
+    try source.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "a", .value = document }}, .timestamp_ns = 123 }, .{ .term = 1, .index = 1 });
+    const identity = try source.relationalTopologyIdentity();
+    const source_scope: @import("db/online_source_contract.zig").Scope = .{
+        .fence = .{ .role = .rewrite_source, .transition_id = 1, .attempt = 1, .owner_group_id = 12, .peer_group_id = 22, .namespace = source_ns, .admission_epoch = identity.next_epoch, .catalog_digest = identity.catalog_digest },
+        .receiver_namespace = target_ns,
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+    };
+    try source.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = source_scope, .limit = @import("retained_effects.zig").default_limit } } }, .{ .term = 1, .index = 2 });
+    const certificate = try source.prepareOnlineSourcePublication(source_scope, .none);
+    try source.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = source_scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
+    const transfer = @import("db/source_artifact_transfer.zig");
+    const descriptor = try transfer.describe(&source, source_scope, .none);
+    try std.testing.expect(descriptor.total_bytes > transfer.max_chunk_bytes);
+    var program = try @import("db/relational_rewrite_staging.zig").ProgramSet.initDocumentPreservation(alloc, schema_json);
+    defer program.deinit();
+    const binding: @import("db/relational_rewrite_contract.zig").Binding = .{ .program_digest = program.identity, .retained_pin = source_scope.pin(), .snapshot_certificate = try certificate.digest(), .retained_epoch = 1, .retained_start = certificate.cut.retained_start, .source_applied_index = certificate.cut.applied_index, .source_scope = source_scope };
+    const artifact: metadata_staging.SourceArtifact = .{ .target_group_id = 22, .source_namespace = source_ns, .format = .portable, .snapshot_path = "source.afb2", .artifact_size_bytes = descriptor.total_bytes, .artifact_sha256 = try certificate.digest(), .rewrite = binding };
+    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = artifact.artifact_sha256, .source_descriptor_digest = try artifact.digest(alloc), .source_namespace = source_ns, .target_namespace = target_ns, .target_schema_digest = program.target_runtime_digest, .rewrite = binding };
+    var target = try db.DB.open(alloc, target_path, target_options);
+    var target_open = true;
+    defer if (target_open) target.close();
+    try target.setSchemaJson(alloc, schema_json);
+    try target.reserveRestoreStagingScoped(alloc, scope);
+    const Apply = struct {
+        target: *db.DB,
+        scope_digest: [32]u8,
+        index: u64 = 0,
+        fn propose(ptr: *anyopaque, value: db.types.BatchRequest, context: operation.RequestContext) !void {
+            try context.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var batch = value;
+            batch.restore_staging_scope = self.scope_digest;
+            self.index += 1;
+            try self.target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = self.index });
+        }
+    };
+    var apply: Apply = .{ .target = &target, .scope_digest = scope.digest() };
+    const env: Environment = .{ .io = std.testing.io, .runtime = &runtime, .location_options = .{}, .cache_path = cache_path, .source_byte_budget = transfer.max_chunk_bytes, .proposer = .{ .ptr = &apply, .propose = Apply.propose } };
+    _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .begin }, .{});
+    var request: Request = .{ .scope = scope, .action = .import_page, .source = .{ .location = "", .artifact = artifact, .peer_descriptor = descriptor }, .rewrite = .{ .preserve_document = true, .source_schemas = &.{schema_json}, .target_schema = schema_json, .program_digest = program.identity } };
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, executeResident(alloc, &target, env, request, .{ .cancellation = .fromAtomic(&canceled) }));
+    var wrong = request;
+    wrong.source.?.peer_descriptor.?.certificate.cut.applied_index += 1;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, wrong, .{}));
+    var response = try executeResident(alloc, &target, env, request, .{});
+    try std.testing.expectEqual(@as(u64, 0), response.source_next_offset);
+    var chunk_count: usize = 0;
+    while (response.source_next_offset < descriptor.total_bytes) {
+        var bytes = try transfer.read(&source, alloc, descriptor, response.source_next_offset, .none);
+        defer bytes.deinit(alloc);
+        const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.data.len));
+        defer alloc.free(encoded);
+        request.source_chunk = .{ .offset = bytes.offset, .data_base64 = std.base64.standard.Encoder.encode(encoded, bytes.data), .digest = bytes.digest };
+        const status_read = request.statusRead();
+        try status_read.validate(22);
+        try std.testing.expect(status_read.source == null and status_read.source_chunk == null and status_read.rewrite == null and status_read.rewrite_tail == null and status_read.rewrite_finish == null);
+        if (chunk_count == 0) {
+            request.source_chunk.?.digest[0] ^= 1;
+            try std.testing.expectError(error.SourceSnapshotCorrupt, executeResident(alloc, &target, env, request, .{}));
+            request.source_chunk.?.digest[0] ^= 1;
+        }
+        const wire = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(wire);
+        var decoded = try std.json.parseFromSlice(Request, alloc, wire, .{});
+        defer decoded.deinit();
+        response = try executeResident(alloc, &target, env, decoded.value, .{});
+        try std.testing.expectEqual(bytes.offset + bytes.data.len, response.source_next_offset);
+        const replay = try executeResident(alloc, &target, env, decoded.value, .{});
+        try std.testing.expectEqual(response.source_next_offset, replay.source_next_offset);
+        try std.testing.expectEqual(@as(u64, 0), response.rows);
+        if (chunk_count == 0) {
+            target.close();
+            target_open = false;
+            target = try db.DB.open(alloc, target_path, target_options);
+            target_open = true;
+            request.source_chunk = null;
+            const peer_receipt_path = try std.fmt.allocPrint(a, "{s}.materializing/peer.progress", .{cache_path});
+            const peer_receipt = try native_backup.readFileAlloc(alloc, std.testing.io, peer_receipt_path, 121);
+            defer alloc.free(peer_receipt);
+            peer_receipt[peer_receipt.len - 1] ^= 1;
+            _ = try native_backup.writeFileDurable(std.testing.io, peer_receipt_path, peer_receipt);
+            try std.testing.expectError(error.InvalidRestoreSourceCheckpoint, executeResident(alloc, &target, env, request, .{}));
+            peer_receipt[peer_receipt.len - 1] ^= 1;
+            _ = try native_backup.writeFileDurable(std.testing.io, peer_receipt_path, peer_receipt);
+            var empty_storage: [0]u8 = .{};
+            var failing = std.heap.FixedBufferAllocator.init(&empty_storage);
+            try std.testing.expectError(error.OutOfMemory, executeResident(failing.allocator(), &target, env, request, .{}));
+            response = try executeResident(alloc, &target, env, request, .{});
+            try std.testing.expectEqual(bytes.offset + bytes.data.len, response.source_next_offset);
+        }
+        chunk_count += 1;
+    }
+    request.source_chunk = null;
+    test_fail_after_source_stage_rename = true;
+    var saw_publication_crash = false;
+    for (0..1000) |_| {
+        response = executeResident(alloc, &target, env, request, .{}) catch |err| {
+            if (err != error.InjectedSourceStageRenameFailure) return err;
+            saw_publication_crash = true;
+            target.close();
+            target_open = false;
+            target = try db.DB.open(alloc, target_path, target_options);
+            target_open = true;
+            continue;
+        };
+        if (response.rewrite.?.snapshot_complete) break;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(saw_publication_crash);
+    const copied = (try target.get(alloc, "a")).?;
+    defer alloc.free(copied);
+    try std.testing.expectEqualSlices(u8, document, copied);
+    try std.testing.expectEqual(descriptor.total_bytes, response.source_next_offset);
+    _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .cancel }, .{});
+    try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, request, .{}));
 }
 
 fn testVerifiedDecoder(comptime portable: bool) !void {

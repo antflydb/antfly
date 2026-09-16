@@ -28,10 +28,11 @@ const row_store = @import("relational_store.zig");
 const internal = @import("../internal_keys.zig");
 const docstore = @import("../docstore.zig");
 const range_state = @import("range_state.zig");
+const maintenance = @import("relational_index_maintenance_contract.zig");
 const Allocator = std.mem.Allocator;
 const Digest = [32]u8;
 pub const progress_prefix = "\x00\x00__metadata__:relational_index_progress:";
-const header_len = 100;
+const header_len = 140;
 const max_cursor_bytes = 1024 * 1024;
 const full_range = [_]u8{0} ** 8;
 
@@ -44,6 +45,19 @@ fn digest(bytes: []const u8) Digest {
 pub const State = enum(u8) { building = 0, ready = 1, failed = 2 };
 pub const Failure = enum(u8) { none = 0, incompatible_schema = 1, invalid_row = 2 };
 
+/// Deterministic row failures are durable job outcomes, shared by primary
+/// construction and forward/reverse repair. Resource failures must propagate
+/// without poisoning a generation that can succeed on the next attempt.
+pub fn classifyRowFailure(err: anyerror) ?Failure {
+    if (@import("../../schema/relational_expression_errors.zig").isInvalidInput(err)) return .invalid_row;
+    return switch (err) {
+        error.UnknownSchemaVersion, error.RelationalIndexColumnNotFound, error.RelationalIndexColumnTypeMismatch, error.RelationalRowSchemaMismatch => .incompatible_schema,
+        error.InvalidRelationalRow, error.UnsupportedRelationalRowVersion, error.RelationalRowChecksumMismatch, error.InvalidColumnValue => .invalid_row,
+        else => null,
+    };
+}
+pub const Phase = enum(u8) { primary = 0, forward = 1, reverse = 2 };
+
 pub const Progress = struct {
     id: records.Id,
     owner: Digest,
@@ -52,6 +66,9 @@ pub const Progress = struct {
     rows_scanned: u64 = 0,
     cursor: []const u8 = "",
     failure: Failure = .none,
+    phase: Phase = .primary,
+    attempt: u64 = 0,
+    last_maintenance: Digest = @splat(0),
 
     pub fn encode(self: Progress, alloc: Allocator) ![]u8 {
         if (self.cursor.len > max_cursor_bytes or (self.state == .ready and self.cursor.len != 0) or
@@ -59,15 +76,18 @@ pub const Progress = struct {
             return error.InvalidRelationalIndexProgress;
         const out = try alloc.alloc(u8, header_len + self.cursor.len + 32);
         @memcpy(out[0..4], "AIRP");
-        std.mem.writeInt(u32, out[4..8], 1, .little);
+        std.mem.writeInt(u32, out[4..8], 2, .little);
         @memcpy(out[8..20], &self.id.encode());
         @memcpy(out[20..52], &self.owner);
         @memcpy(out[52..84], &self.comparison);
         out[84] = @intFromEnum(self.state);
         out[85] = @intFromEnum(self.failure);
-        @memset(out[86..88], 0);
+        out[86] = @intFromEnum(self.phase);
+        out[87] = 0;
         std.mem.writeInt(u64, out[88..96], self.rows_scanned, .little);
         std.mem.writeInt(u32, out[96..100], @intCast(self.cursor.len), .little);
+        std.mem.writeInt(u64, out[100..108], self.attempt, .little);
+        @memcpy(out[108..140], &self.last_maintenance);
         @memcpy(out[header_len..][0..self.cursor.len], self.cursor);
         @memcpy(out[out.len - 32 ..], &digest(out[0 .. out.len - 32]));
         return out;
@@ -77,8 +97,8 @@ pub const Progress = struct {
     /// nothing; progress cannot force an unbounded cursor allocation on reopen.
     pub fn decode(bytes: []const u8) !Progress {
         if (bytes.len < header_len + 32 or bytes.len > header_len + max_cursor_bytes + 32 or
-            !std.mem.eql(u8, bytes[0..4], "AIRP") or std.mem.readInt(u32, bytes[4..8], .little) != 1 or
-            !std.mem.eql(u8, bytes[86..88], &.{ 0, 0 })) return error.InvalidRelationalIndexProgress;
+            !std.mem.eql(u8, bytes[0..4], "AIRP") or std.mem.readInt(u32, bytes[4..8], .little) != 2 or
+            bytes[87] != 0) return error.InvalidRelationalIndexProgress;
         const size = std.mem.readInt(u32, bytes[96..100], .little);
         if (size != bytes.len - header_len - 32 or
             !std.mem.eql(u8, bytes[bytes.len - 32 ..], &digest(bytes[0 .. bytes.len - 32])))
@@ -105,6 +125,9 @@ pub const Progress = struct {
             .failure = failure,
             .rows_scanned = std.mem.readInt(u64, bytes[88..96], .little),
             .cursor = bytes[header_len..][0..size],
+            .phase = std.enums.fromInt(Phase, bytes[86]) orelse return error.InvalidRelationalIndexProgress,
+            .attempt = std.mem.readInt(u64, bytes[100..108], .little),
+            .last_maintenance = bytes[108..140].*,
         };
     }
 
@@ -113,6 +136,12 @@ pub const Progress = struct {
             std.mem.eql(u8, &self.comparison, &index.tuple.fingerprint);
     }
 };
+
+/// Shared by exact-proof retry/repair admission. Page publication preserves the
+/// attempt and bounded last-command receipt through failure and completion.
+pub fn resetProgress(current: Progress) !Progress {
+    return .{ .id = current.id, .owner = current.owner, .comparison = current.comparison, .attempt = try std.math.add(u64, current.attempt, 1), .last_maintenance = current.last_maintenance };
+}
 
 pub fn progressKey(id: records.Id) [progress_prefix.len + records.Id.encoded_len]u8 {
     var key: [progress_prefix.len + records.Id.encoded_len]u8 = undefined;
@@ -130,17 +159,50 @@ fn getOptional(txn: anytype, key: []const u8) !?[]const u8 {
 
 pub fn ownership(txn: *docstore.DocStore.Txn) !Digest {
     const range = (try getOptional(txn, range_state.range_key)) orelse &full_range;
-    return digest(range);
+    const identity = @import("doc_identity.zig");
+    const namespace = (try identity.loadNamespaceTxn(txn)) orelse identity.default_namespace;
+    var namespace_bytes: [24]u8 = undefined;
+    identity.encodeNamespace(&namespace_bytes, namespace);
+    // Range bounds alone are not ownership: a restored/reassigned incarnation
+    // may have exactly the same bounds while carrying an old coverage receipt.
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("antfly relational index coverage owner v1");
+    hash.update(&namespace_bytes);
+    hash.update(range);
+    var result: Digest = undefined;
+    hash.final(&result);
+    return result;
 }
 
 pub fn status(txn: *docstore.DocStore.Txn, index: plans.BoundIndex) !Progress {
-    const owner = try ownership(txn);
+    return statusWithOwnership(txn, index, try ownership(txn));
+}
+
+pub fn statusWithOwnership(txn: *docstore.DocStore.Txn, index: plans.BoundIndex, owner: Digest) !Progress {
+    return (try statusProofWithOwnership(txn, index, owner)).progress;
+}
+
+pub const StatusProof = struct { progress: Progress, digest: Digest, maintenance_epoch: u64, last_maintenance_request: Digest };
+
+pub fn statusProofWithOwnership(txn: *docstore.DocStore.Txn, index: plans.BoundIndex, owner: Digest) !StatusProof {
     const raw = try getOptional(txn, &progressKey(index.id()));
+    const control = try maintenance.readControl(txn, index.id());
+    var current = Progress{ .id = index.id(), .owner = owner, .comparison = index.tuple.fingerprint };
     if (raw) |bytes| {
-        const current = try Progress.decode(bytes);
-        if (current.matches(index, owner)) return current;
+        const decoded = try Progress.decode(bytes);
+        if (decoded.matches(index, owner)) current = decoded;
     }
-    return .{ .id = index.id(), .owner = owner, .comparison = index.tuple.fingerprint };
+    if (!std.mem.eql(u8, &current.last_maintenance, &control.last_request)) {
+        current = .{ .id = index.id(), .owner = owner, .comparison = index.tuple.fingerprint, .attempt = control.epoch, .last_maintenance = control.last_request };
+    }
+    var storage: [header_len + 32]u8 = undefined;
+    var arena = std.heap.FixedBufferAllocator.init(&storage);
+    const proof = if (raw) |bytes| digest(bytes) else digest(try current.encode(arena.allocator()));
+    return .{ .progress = current, .digest = proof, .maintenance_epoch = control.epoch, .last_maintenance_request = control.last_request };
+}
+
+pub fn progressDigest(txn: *docstore.DocStore.Txn, index: plans.BoundIndex) !Digest {
+    return (try statusProofWithOwnership(txn, index, try ownership(txn))).digest;
 }
 
 pub const Budget = struct {
@@ -162,27 +224,53 @@ pub const Page = struct {
     index_offset: usize,
     namespace_generation: u64,
     expected: ?[]const u8,
+    control: maintenance.Control,
     next: Progress,
     candidates: []const Candidate,
     failed_source: ?FailedSource = null,
     consumed: bool = false,
 
-    const Candidate = struct { primary: []const u8, document: []const u8, hash: Digest, tuple: []const u8 };
+    const Candidate = struct {
+        primary: ?[]const u8 = null,
+        document: []const u8 = "",
+        hash: ?Digest = null,
+        tuple: ?[]const u8 = null,
+        payload: []const u8 = "",
+        observed_key: ?[]const u8 = null,
+        observed_hash: Digest = @splat(0),
+        delete_observed: bool = false,
+        delete_reverse: ?[]const u8 = null,
+        nonmember: bool = false,
+    };
     const FailedSource = struct { primary: []const u8, hash: Digest };
 
-    fn prepareTuple(alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, value: []const u8, source: *?registry.SchemaView, projected: *?tuples.TuplePlan, encoded: *std.ArrayList(u8)) !void {
+    fn prepareTuple(alloc: Allocator, payload_alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, value: []const u8, source: *?registry.SchemaView, projected: *?tuples.TuplePlan, projected_cover: *?@import("relational_index_cover.zig").Source, projected_predicate: *?@import("relational_index_predicate.zig").Source, encoded: *std.ArrayList(u8)) !?[]const u8 {
         const version = try row_store.rowSchemaVersion(value);
         if (source.* == null or source.*.?.version() != version) {
             if (projected.*) |*tuple| tuple.deinit();
             projected.* = null;
+            if (projected_cover.*) |*cover| cover.deinit();
+            projected_cover.* = null;
+            if (projected_predicate.*) |*condition| condition.deinit();
+            projected_predicate.* = null;
             if (source.*) |*view| view.release();
             source.* = null;
             source.* = if (pinned.plan.schemaView().version() == version) pinned.plan.schemaView().clone() else (try core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
-            projected.* = try index.tuple.projectSource(alloc, source.*.?.tableSchema().*, source.*.?.physicalLayout());
+            if (index.predicate) |condition| projected_predicate.* = try condition.projectSource(alloc, source.*.?.tableSchema().*, source.*.?.physicalLayout());
         }
         const typed = try codec.ordinalRowView(value, source.*.?.tableSchema().*, source.*.?.physicalLayout());
         encoded.clearRetainingCapacity();
+        if (projected_predicate.*) |condition| if (!try condition.matches(alloc, encoded, typed)) {
+            encoded.clearRetainingCapacity();
+            return null;
+        };
+        encoded.clearRetainingCapacity();
+        if (projected.* == null) {
+            projected.* = try index.tuple.projectSource(alloc, source.*.?.tableSchema().*, source.*.?.physicalLayout());
+            if (index.cover) |cover| projected_cover.* = try cover.projectSource(alloc, source.*.?.tableSchema().*, source.*.?.physicalLayout());
+        }
         _ = try projected.*.?.append(alloc, encoded, typed);
+        return if (index.cover) |cover| try cover.encodeSource(payload_alloc, typed, &projected_cover.*.?) else "";
     }
 
     pub fn deinit(self: *Page) void {
@@ -209,8 +297,10 @@ pub const Page = struct {
         const page_alloc = arena.allocator();
         var read = try core.store.beginReadTxn();
         defer read.abort();
-        var progress = try status(&read, index);
+        const proof = try statusProofWithOwnership(&read, index, try ownership(&read));
+        var progress = proof.progress;
         if (progress.state != .building) return null;
+        if (progress.phase != .primary) return prepareDerived(alloc, io, core, name, budget);
         const expected = if (try getOptional(&read, &progressKey(index.id()))) |raw| try page_alloc.dupe(u8, raw) else null;
         const range_raw = (try getOptional(&read, range_state.range_key)) orelse &full_range;
         const range = try range_state.decodeRangeAlloc(page_alloc, range_raw);
@@ -226,6 +316,10 @@ pub const Page = struct {
         defer if (source) |*view| view.release();
         var projected: ?tuples.TuplePlan = null;
         defer if (projected) |*tuple| tuple.deinit();
+        var projected_cover: ?@import("relational_index_cover.zig").Source = null;
+        defer if (projected_cover) |*cover| cover.deinit();
+        var projected_predicate: ?@import("relational_index_predicate.zig").Source = null;
+        defer if (projected_predicate) |*condition| condition.deinit();
         var encoded = std.ArrayList(u8).empty;
         defer encoded.deinit(alloc);
         var inspected: usize = 0;
@@ -239,24 +333,21 @@ pub const Page = struct {
             if (io) |runtime_io| try runtime_io.checkCancel();
             if (progress.cursor.len != 0 and std.mem.order(u8, kv.key, progress.cursor) != .gt) continue;
             if (std.mem.order(u8, kv.key, upper) != .lt) break;
+            if (kv.key.len > max_cursor_bytes) return error.InvalidRelationalIndexProgress;
             inspected += 1;
             bytes +|= kv.key.len;
             after = try page_alloc.dupe(u8, kv.key);
             if (internal.isRelationalRowKey(kv.key)) {
                 bytes +|= kv.value.len;
-                prepareTuple(alloc, core, pinned, index, kv.value, &source, &projected, &encoded) catch |err| {
-                    progress.failure = switch (err) {
-                        error.UnknownSchemaVersion, error.RelationalIndexColumnNotFound, error.RelationalIndexColumnTypeMismatch, error.RelationalRowSchemaMismatch => .incompatible_schema,
-                        error.InvalidRelationalRow, error.UnsupportedRelationalRowVersion, error.RelationalRowChecksumMismatch, error.InvalidColumnValue => .invalid_row,
-                        else => return err,
-                    };
+                const payload = prepareTuple(alloc, page_alloc, core, pinned, index, kv.value, &source, &projected, &projected_cover, &projected_predicate, &encoded) catch |err| {
+                    progress.failure = classifyRowFailure(err) orelse return err;
                     progress.state = .failed;
                     failed_source = .{ .primary = after, .hash = digest(kv.value) };
                     candidates.clearRetainingCapacity();
                     break;
                 };
                 const document = (try internal.decodeStoredDocumentRowKeyAlloc(page_alloc, kv.key)).?;
-                try candidates.append(page_alloc, .{ .primary = after, .document = document, .hash = digest(kv.value), .tuple = try page_alloc.dupe(u8, encoded.items) });
+                try candidates.append(page_alloc, .{ .primary = after, .document = document, .hash = digest(kv.value), .tuple = if (payload != null) try page_alloc.dupe(u8, encoded.items) else null, .payload = payload orelse "", .nonmember = payload == null });
                 progress.rows_scanned = try std.math.add(u64, progress.rows_scanned, 1);
             }
             if (inspected >= budget.records or bytes >= budget.bytes or platform_time.monotonicNs() - started >= budget.time_ns) {
@@ -264,10 +355,160 @@ pub const Page = struct {
                 break;
             }
         }
-        if (failed_source == null) progress.state = if (exhausted) .ready else .building;
-        progress.cursor = if (progress.state == .ready) "" else after;
+        if (failed_source == null and exhausted) progress.phase = .forward;
+        progress.cursor = if (failed_source == null and exhausted) "" else after;
         transferred = true;
-        return .{ .arena = arena, .pinned = pinned, .index_offset = index_offset, .namespace_generation = namespace_generation, .expected = expected, .next = progress, .candidates = candidates.items, .failed_source = failed_source };
+        return .{ .arena = arena, .pinned = pinned, .index_offset = index_offset, .namespace_generation = namespace_generation, .expected = expected, .control = .{ .epoch = proof.maintenance_epoch, .last_request = proof.last_maintenance_request }, .next = progress, .candidates = candidates.items, .failed_source = failed_source };
+    }
+
+    fn prepareDerived(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget) !?Page {
+        const namespace = core.schemaNamespaceGeneration();
+        var pinned = core.relational_indexes.acquire() orelse return error.IndexNotFound;
+        var transferred = false;
+        defer if (!transferred) pinned.deinit();
+        const offset = for (pinned.plan.boundIndexes(), 0..) |index, i| {
+            if (std.mem.eql(u8, index.name, name)) break i;
+        } else return error.IndexNotFound;
+        const index = pinned.plan.boundIndexes()[offset];
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer if (!transferred) arena.deinit();
+        const page_alloc = arena.allocator();
+        var read = try core.store.beginReadTxn();
+        defer read.abort();
+        const proof = try statusProofWithOwnership(&read, index, try ownership(&read));
+        var progress = proof.progress;
+        if (progress.state != .building or progress.phase == .primary) return null;
+        const expected = if (try getOptional(&read, &progressKey(index.id()))) |raw| try page_alloc.dupe(u8, raw) else null;
+        const range = try range_state.decodeRangeAlloc(page_alloc, (try getOptional(&read, range_state.range_key)) orelse &full_range);
+        var active = std.AutoHashMapUnmanaged(u128, void).empty;
+        for (pinned.plan.boundIndexes()) |bound| try active.put(page_alloc, bound.id().mapKey(), {});
+        const lower: []const u8 = if (progress.phase == .forward) records.forward_namespace else &.{internal.user_namespace};
+        const upper: []const u8 = if (progress.phase == .forward) "\x00\x00R\x02" else &.{internal.user_namespace + 1};
+        if (progress.cursor.len != 0 and (std.mem.order(u8, progress.cursor, lower) == .lt or std.mem.order(u8, progress.cursor, upper) != .lt)) return error.InvalidRelationalIndexProgress;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(upper);
+        var candidates = std.ArrayList(Candidate).empty;
+        var source: ?registry.SchemaView = null;
+        defer if (source) |*view| view.release();
+        var projected: ?tuples.TuplePlan = null;
+        defer if (projected) |*tuple| tuple.deinit();
+        var projected_cover: ?@import("relational_index_cover.zig").Source = null;
+        defer if (projected_cover) |*cover| cover.deinit();
+        var projected_predicate: ?@import("relational_index_predicate.zig").Source = null;
+        defer if (projected_predicate) |*condition| condition.deinit();
+        var encoded = std.ArrayList(u8).empty;
+        defer encoded.deinit(alloc);
+        const started = platform_time.monotonicNs();
+        var inspected: usize = 0;
+        var bytes: usize = 0;
+        var after = progress.cursor;
+        var exhausted = true;
+        var failed_source: ?FailedSource = null;
+        var entry = try cursor.seekAtOrAfter(if (after.len == 0) lower else after);
+        while (entry) |kv| : (entry = try cursor.next()) {
+            if (progress.cursor.len != 0 and std.mem.order(u8, kv.key, progress.cursor) != .gt) continue;
+            if (std.mem.order(u8, kv.key, upper) != .lt) break;
+            if (io) |runtime| try runtime.checkCancel();
+            if (kv.key.len > max_cursor_bytes) return error.InvalidRelationalIndexProgress;
+            after = try page_alloc.dupe(u8, kv.key);
+            inspected += 1;
+            bytes +|= kv.key.len +| kv.value.len;
+            examine: {
+                var candidate = Candidate{ .observed_key = after, .observed_hash = digest(kv.value) };
+                var document_key: []const u8 = undefined;
+                var observed_tuple: ?[]const u8 = null;
+                if (progress.phase == .forward) {
+                    if (kv.key.len < records.forward_prefix_len) {
+                        candidate.delete_observed = true;
+                        try candidates.append(page_alloc, candidate);
+                        break :examine;
+                    }
+                    const id = records.Id.decode(kv.key[records.forward_namespace.len..records.forward_prefix_len]) catch {
+                        candidate.delete_observed = true;
+                        try candidates.append(page_alloc, candidate);
+                        break :examine;
+                    };
+                    if (id.mapKey() != index.id().mapKey()) {
+                        if (!active.contains(id.mapKey())) {
+                            candidate.delete_observed = true;
+                            try candidates.append(page_alloc, candidate);
+                        }
+                        break :examine;
+                    }
+                    const owner = records.forwardOwnership(kv.key) catch {
+                        candidate.delete_observed = true;
+                        try candidates.append(page_alloc, candidate);
+                        break :examine;
+                    };
+                    observed_tuple = owner.tuple;
+                    const raw_key = try page_alloc.alloc(u8, owner.document_component.len + 1);
+                    raw_key[0] = internal.user_namespace;
+                    @memcpy(raw_key[1..], owner.document_component);
+                    document_key = raw_key;
+                } else {
+                    const term = internal.findComponentTerminator(kv.key, 1) orelse break :examine;
+                    if (term + 2 >= kv.key.len or kv.key[term + 2] != internal.relational_index_reverse_kind) break :examine;
+                    const reverse = records.parseReverseKey(kv.key) catch {
+                        candidate.delete_observed = true;
+                        try candidates.append(page_alloc, candidate);
+                        break :examine;
+                    };
+                    if (reverse.id.mapKey() != index.id().mapKey()) {
+                        if (!active.contains(reverse.id.mapKey())) {
+                            candidate.delete_observed = true;
+                            try candidates.append(page_alloc, candidate);
+                        }
+                        break :examine;
+                    }
+                    document_key = kv.key;
+                }
+                const document = (try internal.decodeDocumentComponentAlloc(page_alloc, document_key)) orelse return error.InvalidRelationalIndexForwardKey;
+                if (!range.contains(document)) {
+                    candidate.delete_observed = true;
+                    try candidates.append(page_alloc, candidate);
+                    break :examine;
+                }
+                candidate.document = document;
+                const primary = try internal.relationalRowKeyAlloc(page_alloc, document);
+                candidate.primary = primary;
+                const row = try getOptional(&read, primary);
+                if (row) |raw| {
+                    bytes +|= raw.len;
+                    candidate.hash = digest(raw);
+                    const payload = prepareTuple(alloc, page_alloc, core, pinned, index, raw, &source, &projected, &projected_cover, &projected_predicate, &encoded) catch |err| {
+                        progress.failure = classifyRowFailure(err) orelse return err;
+                        progress.state = .failed;
+                        failed_source = .{ .primary = primary, .hash = candidate.hash.? };
+                        candidates.clearRetainingCapacity();
+                        break :examine;
+                    };
+                    candidate.tuple = if (payload != null) try page_alloc.dupe(u8, encoded.items) else null;
+                    candidate.payload = payload orelse "";
+                    candidate.nonmember = payload == null;
+                    candidate.delete_observed = if (payload == null) true else if (observed_tuple) |old| !std.mem.eql(u8, old, encoded.items) else false;
+                } else {
+                    candidate.delete_observed = true;
+                    if (progress.phase == .forward) {
+                        var reverse = std.ArrayList(u8).empty;
+                        try records.appendReverseKey(page_alloc, &reverse, index.id(), document);
+                        candidate.delete_reverse = reverse.items;
+                    }
+                }
+                try candidates.append(page_alloc, candidate);
+            }
+            if (failed_source != null) break;
+            if (inspected >= budget.records or bytes >= budget.bytes or platform_time.monotonicNs() -| started >= budget.time_ns) {
+                exhausted = false;
+                break;
+            }
+        }
+        if (failed_source == null and exhausted) {
+            if (progress.phase == .forward) progress.phase = .reverse else progress.state = .ready;
+            progress.cursor = "";
+        } else progress.cursor = after;
+        transferred = true;
+        return .{ .arena = arena, .pinned = pinned, .index_offset = offset, .namespace_generation = namespace, .expected = expected, .control = .{ .epoch = proof.maintenance_epoch, .last_request = proof.last_maintenance_request }, .next = progress, .candidates = candidates.items, .failed_source = failed_source };
     }
 
     /// Caller holds apply-exclusive and rechecks its HA/ownership authority.
@@ -277,9 +518,14 @@ pub const Page = struct {
         self.consumed = true;
         if (core.schemaNamespaceGeneration() != self.namespace_generation or !core.relational_indexes.isCurrent(self.pinned))
             return error.PreparedGenerationChanged;
+        var manager = try core.initTxnManager();
+        defer manager.deinit();
+        try manager.checkOrdinaryWriteConflict(&maintenance.controlKey(self.next.id));
         var txn = try core.store.beginWriteTxn();
         errdefer txn.abort();
         if (!std.mem.eql(u8, &self.next.owner, &(try ownership(&txn)))) return error.PreparedGenerationChanged;
+        const control = try maintenance.readControl(&txn, self.next.id);
+        if (control.epoch != self.control.epoch or !std.mem.eql(u8, &control.last_request, &self.control.last_request)) return error.PreparedGenerationChanged;
         const key = progressKey(self.next.id);
         const actual = try getOptional(&txn, &key);
         if ((actual == null) != (self.expected == null) or (actual != null and !std.mem.eql(u8, actual.?, self.expected.?)))
@@ -294,9 +540,22 @@ pub const Page = struct {
         defer writer.deinit();
         const index = self.pinned.plan.boundIndexes()[self.index_offset];
         for (self.candidates) |candidate| {
-            const current = (try getOptional(&txn, candidate.primary)) orelse continue;
-            if (!std.mem.eql(u8, &candidate.hash, &digest(current))) continue;
-            _ = try writer.upsert(&txn, index, candidate.document, candidate.tuple, .new_or_building);
+            if (candidate.primary) |primary| {
+                const current = try getOptional(&txn, primary);
+                if ((current == null) != (candidate.hash == null)) continue;
+                if (current) |bytes| if (!std.mem.eql(u8, &candidate.hash.?, &digest(bytes))) continue;
+            }
+            if (candidate.observed_key) |observed| {
+                const current = (try getOptional(&txn, observed)) orelse continue;
+                if (!std.mem.eql(u8, &candidate.observed_hash, &digest(current))) continue;
+            }
+            if (candidate.delete_observed) try txn.delete(candidate.observed_key.?);
+            if (candidate.delete_reverse) |reverse| txn.delete(reverse) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            if (candidate.nonmember) try writer.removeForRepair(&txn, index, candidate.document);
+            if (candidate.tuple) |tuple| _ = try writer.repairCovered(&txn, index, candidate.document, tuple, candidate.payload);
         }
         const encoded = try self.next.encode(self.arena.allocator());
         try txn.put(&key, encoded);

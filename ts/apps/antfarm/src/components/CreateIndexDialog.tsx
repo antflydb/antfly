@@ -1298,7 +1298,9 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
       ? "full-text"
       : describedIndexType === "graph"
         ? "graph"
-        : "vector";
+        : describedIndexType === "relational"
+          ? "relational"
+          : "vector";
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
@@ -1359,11 +1361,19 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
           }
         >
           {viewMode === "json" ? (
-            <AdvancedIndexEditor
-              source={jsonSource}
-              validationError={jsonValidationError}
-              onChange={handleJsonChange}
-            />
+            <>
+              <AdvancedIndexEditor
+                source={jsonSource}
+                validationError={jsonValidationError}
+                onChange={handleJsonChange}
+              />
+              <p className="text-xs text-muted-foreground">
+                Relational indexes use type "relational" with composite keys, optional
+                include_columns, and where comparisons. Columns must exist in a relational table.
+                Use strings for exact 64-bit integer literals; partial-index queries must repeat
+                every where conjunct.
+              </p>
+            </>
           ) : (
             <IndexKindForm
               schemaFields={schemaFields}

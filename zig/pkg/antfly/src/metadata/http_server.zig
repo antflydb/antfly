@@ -94,6 +94,7 @@ pub const AdminSource = struct {
         linearizable_head: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.MetadataHead = null,
         linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.AdminSnapshot = null,
         provisioning_snapshot: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, node_id: u64) anyerror!@import("restore_staging.zig").ProvisioningSnapshot = null,
+        restore_staging_authority: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, input: @import("restore_staging.zig").AuthorityRequest) anyerror!@import("restore_staging.zig").AuthorityResponse = null,
         runtime_topology: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataRuntimeTopology = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
@@ -507,6 +508,7 @@ pub const AdminSource = struct {
                 .status = metadataServiceStatus,
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .provisioning_snapshot = metadataServiceProvisioningSnapshot,
+                .restore_staging_authority = metadataServiceRestoreStagingAuthority,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
@@ -570,6 +572,7 @@ pub const AdminSource = struct {
                 .status = metadataHttpServiceStatus,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .provisioning_snapshot = metadataHttpServiceProvisioningSnapshot,
+                .restore_staging_authority = metadataHttpServiceRestoreStagingAuthority,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
@@ -698,6 +701,75 @@ pub const AdminSource = struct {
     fn metadataHttpServiceProvisioningSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, node_id: u64) !@import("restore_staging.zig").ProvisioningSnapshot {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return captureProvisioningSnapshot(service.MetadataHttpService, svc, alloc, request, node_id);
+    }
+
+    fn captureRestoreStagingAuthority(comptime Service: type, svc: *Service, alloc: std.mem.Allocator, request: operation.RequestContext, input: @import("restore_staging.zig").AuthorityRequest) !@import("restore_staging.zig").AuthorityResponse {
+        try input.validate();
+        const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+        for (0..3) |_| {
+            try request.ensureActive();
+            const before = try svc.adminSnapshotFence();
+            // Bind the leadership scope before the barrier and renew the
+            // barrier on every per-plan retry, not after an old proof.
+            try svc.ensureLinearizableReadWithContext(request);
+            const authority_head = svc.head();
+            // The host's existing internal-service middleware authenticates a
+            // cluster service claim. node_id is scoped against durable actual
+            // placement grants, not treated as cryptographic per-node proof.
+            if (!try store.restoreStagingAuthorityAllowed(alloc, svc.metadata_group_id, input.plan_id, input.node_id, if (input.receipt) |receipt| receipt.owner_group else null)) return error.RestoreStagingScopeChanged;
+            var result: @import("restore_staging.zig").AuthorityResponse = .{
+                .node_id = input.node_id,
+                .plan_id = input.plan_id,
+                .metadata_group_id = authority_head.metadata_group_id,
+                .metadata_incarnation = authority_head.metadata_incarnation orelse return error.MetadataIncarnationUnavailable,
+                .metadata_epoch = authority_head.metadata_epoch,
+                .progress = try store.loadRestoreStagingProgress(alloc, svc.metadata_group_id, input.plan_id),
+            };
+            errdefer result.deinit(alloc);
+            if (result.progress != null) {
+                if (input.include_plan) {
+                    if (try store.loadRestoreStaging(alloc, svc.metadata_group_id, input.plan_id)) |loaded_value| {
+                        var loaded = loaded_value;
+                        defer loaded.deinit();
+                        result.job_json = try std.json.Stringify.valueAlloc(alloc, loaded.value, .{});
+                    }
+                }
+                if (input.receipt) |receipt| {
+                    if (try store.loadRestoreStagingReceipt(alloc, svc.metadata_group_id, input.plan_id, receipt.state, receipt.owner_group)) |bytes| {
+                        defer alloc.free(bytes);
+                        if (bytes.len != 32) return error.InvalidRestoreStaging;
+                        result.receipt = bytes[0..32].*;
+                    }
+                }
+            }
+            try request.ensureActive();
+            const after_progress = try store.loadRestoreStagingProgress(alloc, svc.metadata_group_id, input.plan_id);
+            const after = try svc.adminSnapshotFence();
+            // The plan and granted owner identities are immutable. Runtime
+            // heartbeats can advance global catalog epochs continuously, so
+            // only this plan's revision and the read-index leadership scope
+            // invalidate a capture. Never retry a changed leader under the
+            // previous leader's read-index proof.
+            if (before.metadata_group_id != after.metadata_group_id or
+                !std.meta.eql(before.metadata_incarnation, after.metadata_incarnation) or
+                before.metadata_raft_term != after.metadata_raft_term) return error.NotLeader;
+            if (std.meta.eql(result.progress, after_progress)) {
+                try result.validate(input);
+                return result;
+            }
+            result.deinit(alloc);
+        }
+        return error.MetadataLinearizableReadTimeout;
+    }
+
+    fn metadataServiceRestoreStagingAuthority(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, input: @import("restore_staging.zig").AuthorityRequest) !@import("restore_staging.zig").AuthorityResponse {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return captureRestoreStagingAuthority(service.MetadataService, svc, alloc, request, input);
+    }
+
+    fn metadataHttpServiceRestoreStagingAuthority(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, input: @import("restore_staging.zig").AuthorityRequest) !@import("restore_staging.zig").AuthorityResponse {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return captureRestoreStagingAuthority(service.MetadataHttpService, svc, alloc, request, input);
     }
 
     fn metadataServiceStatus(ptr: *anyopaque) !metadata_api.MetadataStatus {
@@ -1700,6 +1772,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_linearizable_head, httpx.Handler.bind(self, metadataLinearizableHead));
         try server.post(routes.Routes.internal_linearizable_snapshot, httpx.Handler.bind(self, metadataLinearizableSnapshot));
         try server.post(routes.Routes.internal_provisioning_snapshot, httpx.Handler.bind(self, metadataProvisioningSnapshot));
+        try server.post(routes.Routes.internal_restore_staging_authority, httpx.Handler.bind(self, metadataRestoreStagingAuthority));
         try server.post(routes.Routes.internal_linearizable_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableRoutingSnapshot));
         try server.post(routes.Routes.internal_table_routing_snapshot, httpx.Handler.bind(self, metadataTableRoutingSnapshot));
         try server.post(routes.Routes.internal_linearizable_table_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableTableRoutingSnapshot));
@@ -2057,6 +2130,22 @@ pub const MetadataHttpServer = struct {
         if (parsed.value.node_id == 0) return ctx.status(400).text("invalid provisioning owner");
         var result = callback(self.source.ptr, ctx.allocator, requestContext(ctx), parsed.value.node_id) catch |err| return metadataReadError(ctx, err);
         defer result.catalog.deinit(ctx.allocator);
+        return self.trackedJson(ctx, result);
+    }
+
+    fn metadataRestoreStagingAuthority(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const callback = self.source.vtable.restore_staging_authority orelse return ctx.status(501).text("unsupported");
+        const body = (try ctx.body()) orelse return ctx.status(400).text("missing staging owner");
+        if (body.len == 0 or body.len > 1024) return ctx.status(400).text("invalid staging owner");
+        var parsed = std.json.parseFromSlice(@import("restore_staging.zig").AuthorityRequest, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid staging owner");
+        defer parsed.deinit();
+        parsed.value.validate() catch return ctx.status(400).text("invalid staging owner");
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        var result = callback(self.source.ptr, ctx.allocator, requestContext(ctx), parsed.value) catch |err| switch (err) {
+            error.RestoreStagingScopeChanged => return ctx.status(403).text("restore staging scope changed"),
+            else => return metadataReadError(ctx, err),
+        };
+        defer result.deinit(ctx.allocator);
         return self.trackedJson(ctx, result);
     }
 
@@ -6137,6 +6226,137 @@ test "metadata status uses the typed httpx handler" {
 
     try std.testing.expectEqual(@as(u16, 200), resp.status.code);
     try std.testing.expect(std.mem.indexOf(u8, resp.body.?, "\"metadata_group_id\":1900") != null);
+}
+
+test "restore staging authority HTTP rejects unscoped requests and preserves leader retry hints" {
+    const staging = @import("restore_staging.zig");
+    const Fake = struct {
+        calls: usize = 0,
+        leader: bool = true,
+        fn source(self: *@This()) AdminSource {
+            return .{ .ptr = self, .vtable = &.{ .restore_staging_authority = authority, .status = status, .admin_snapshot = snapshot, .free_admin_snapshot = freeSnapshot } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn authority(raw: *anyopaque, _: std.mem.Allocator, request: operation.RequestContext, input: staging.AuthorityRequest) !staging.AuthorityResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(request.deadline_ns != null);
+            try request.ensureActive();
+            if (!self.leader) return error.NotLeader;
+            if (input.node_id != 4) return error.RestoreStagingScopeChanged;
+            return .{ .node_id = input.node_id, .plan_id = input.plan_id, .metadata_group_id = 77, .metadata_incarnation = "11111111111111111111111111111111".*, .metadata_epoch = 2, .progress = .{ .state = .canceled, .revision = 8 } };
+        }
+    };
+    var fake: Fake = .{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, fake.source());
+    const valid: staging.AuthorityRequest = .{ .node_id = 4, .plan_id = @splat(255) };
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, valid, .{});
+    defer std.testing.allocator.free(encoded);
+    {
+        var response = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_restore_staging_authority, &.{}, encoded, MetadataHttpServer.metadataRestoreStagingAuthority);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        var parsed = try std.json.parseFromSlice(staging.AuthorityResponse, std.testing.allocator, response.body.?, .{});
+        defer parsed.deinit();
+        try parsed.value.validate(valid);
+        try std.testing.expectEqual(staging.State.canceled, parsed.value.progress.?.state);
+    }
+    {
+        var invalid = valid;
+        invalid.node_id = 0;
+        const body = try std.json.Stringify.valueAlloc(std.testing.allocator, invalid, .{});
+        defer std.testing.allocator.free(body);
+        var response = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_restore_staging_authority, &.{}, body, MetadataHttpServer.metadataRestoreStagingAuthority);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    }
+    {
+        var unauthorized = valid;
+        unauthorized.node_id = 5;
+        const body = try std.json.Stringify.valueAlloc(std.testing.allocator, unauthorized, .{});
+        defer std.testing.allocator.free(body);
+        var response = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_restore_staging_authority, &.{}, body, MetadataHttpServer.metadataRestoreStagingAuthority);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+    }
+    fake.leader = false;
+    var unavailable = try server.executeTypedHandlerWithBodyForTest(.POST, routes.Routes.internal_restore_staging_authority, &.{}, encoded, MetadataHttpServer.metadataRestoreStagingAuthority);
+    defer unavailable.deinit();
+    try std.testing.expectEqual(@as(u16, 503), unavailable.status.code);
+    try std.testing.expectEqualStrings(http_common.metadata_not_leader_value, unavailable.headers.get(http_common.metadata_not_leader_header).?);
+}
+
+test "restore staging authority capture is fenced compact and former-owner scoped" {
+    const staging = @import("restore_staging.zig");
+    const Fake = struct {
+        metadata_group_id: u64 = 77,
+        fences: usize = 0,
+        barriers: usize = 0,
+        progress_reads: usize = 0,
+        plan_reads: usize = 0,
+        allowed: bool = true,
+        term_changes: bool = false,
+        pub fn ensureLinearizableReadWithContext(self: *@This(), request: operation.RequestContext) !void {
+            try request.ensureActive();
+            self.barriers += 1;
+        }
+        pub fn projectedStore(self: *@This()) ?*@This() {
+            return self;
+        }
+        pub fn head(_: *@This()) metadata_api.MetadataHead {
+            return .{ .metadata_group_id = 77, .metadata_incarnation = "11111111111111111111111111111111".*, .metadata_epoch = 2 };
+        }
+        pub fn adminSnapshotFence(self: *@This()) !service.AdminSnapshotFence {
+            const epoch: u64 = self.fences + 1;
+            self.fences += 1;
+            return .{ .metadata_group_id = 77, .metadata_incarnation = "11111111111111111111111111111111".*, .metadata_raft_term = if (self.term_changes) epoch else 1, .metadata_raft_commit_index = epoch, .metadata_raft_applied_index = epoch, .projection_epoch = epoch, .catalog_epoch = epoch, .placement_epoch = epoch, .reconcile_lease_epoch = epoch, .transition_epoch = epoch };
+        }
+        pub fn restoreStagingAuthorityAllowed(self: *@This(), _: std.mem.Allocator, group: u64, id: staging.Id, node: u64, owner: ?u64) !bool {
+            try std.testing.expectEqual(@as(u64, 77), group);
+            try std.testing.expectEqual(@as(u64, 4), node);
+            try std.testing.expectEqual(@as(staging.Id, @splat(255)), id);
+            try std.testing.expectEqual(@as(?u64, 301), owner);
+            return self.allowed;
+        }
+        pub fn loadRestoreStagingProgress(self: *@This(), _: std.mem.Allocator, _: u64, _: staging.Id) !?staging.Progress {
+            self.progress_reads += 1;
+            return .{ .state = .canceled, .revision = if (self.progress_reads == 1) 11 else 12, .completed_owners = 3 };
+        }
+        pub fn loadRestoreStaging(self: *@This(), _: std.mem.Allocator, _: u64, _: staging.Id) !?std.json.Parsed(staging.Job) {
+            self.plan_reads += 1;
+            return error.TestUnexpectedResult;
+        }
+        pub fn loadRestoreStagingReceipt(_: *@This(), alloc: std.mem.Allocator, _: u64, _: staging.Id, _: staging.State, _: u64) !?[]u8 {
+            return try alloc.dupe(u8, &(@as(staging.Digest, @splat(255))));
+        }
+    };
+    var fake: Fake = .{};
+    const input: staging.AuthorityRequest = .{ .node_id = 4, .plan_id = @splat(255), .receipt = .{ .state = .canceling, .owner_group = 301 } };
+    var result = try AdminSource.captureRestoreStagingAuthority(Fake, &fake, std.testing.allocator, .{}, input);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(staging.State.canceled, result.progress.?.state);
+    try std.testing.expectEqual(@as(usize, 2), fake.barriers);
+    try std.testing.expectEqual(@as(usize, 4), fake.progress_reads);
+    try std.testing.expectEqual(@as(usize, 0), fake.plan_reads);
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, result, .{});
+    defer std.testing.allocator.free(encoded);
+    var decoded = try std.json.parseFromSlice(staging.AuthorityResponse, std.testing.allocator, encoded, .{});
+    defer decoded.deinit();
+    try decoded.value.validate(input);
+    try std.testing.expectEqual(@as(staging.Digest, @splat(255)), decoded.value.receipt.?);
+    fake.allowed = false;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, AdminSource.captureRestoreStagingAuthority(Fake, &fake, std.testing.allocator, .{}, input));
+    try std.testing.expectEqual(@as(usize, 4), fake.progress_reads);
+    fake.allowed = true;
+    fake.term_changes = true;
+    try std.testing.expectError(error.NotLeader, AdminSource.captureRestoreStagingAuthority(Fake, &fake, std.testing.allocator, .{}, input));
 }
 
 test "metadata linearizable head uses the fenced source operation" {

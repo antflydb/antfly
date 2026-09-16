@@ -49,11 +49,17 @@ fn restoreRetryDelayMs(job_id: u64, attempt_id: u64) u64 {
 }
 
 pub const Scope = enum { table, cluster };
-pub const SourceKind = enum { table_snapshot, cluster_cohort };
+pub const SourceKind = enum { table_snapshot, cluster_cohort, schema_rewrite };
 pub const Phase = enum { queued, running, succeeded, failed, cancelled };
 pub const AttemptState = enum { active, cancelled, fenced };
 pub const StagingResolution = enum { active, published, canceled };
 pub const TableIndexRange = [2]u16;
+pub const RewriteProgress = struct {
+    phase: enum { snapshot, catchup, fencing, tail, complete } = .snapshot,
+    round: u64 = 0,
+    owner: u32 = 0,
+    pending: bool = false,
+};
 
 pub const ClusterResultSummary = struct {
     encoded: []u8,
@@ -86,6 +92,7 @@ pub const JobState = struct {
     staging_owner_phase: u8 = 255,
     staging_owner_cursor: u32 = 0,
     staging_failure: []const u8 = "",
+    rewrite_progress: RewriteProgress = .{},
     scope: Scope,
     source_kind: SourceKind = .table_snapshot,
     table_name: ?[]const u8 = null,
@@ -128,6 +135,9 @@ pub const StartRequest = struct {
     idempotency_key: ?[]const u8 = null,
     destination_authorization_fingerprint: []const u8 = "",
     destination_authorization_principal: []const u8 = "",
+    /// Private compound admission; stored in metadata's staging journal, not
+    /// duplicated into the compact public job record.
+    rewrite_plan_json: ?[]const u8 = null,
 };
 
 pub const ListBatch = struct {
@@ -170,7 +180,7 @@ pub const ReplicatedPersistence = extern struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    pub const abi_version: u32 = 4;
+    pub const abi_version: u32 = 5;
 
     pub const OwnedRow = struct { key: []u8, value: []u8 };
     pub const AbiRow = extern struct {
@@ -188,6 +198,7 @@ pub const ReplicatedPersistence = extern struct {
         delete,
         delete_many,
         create,
+        create_with_staging,
         delete_matching,
     };
     pub const LocalFailure = struct {
@@ -195,6 +206,7 @@ pub const ReplicatedPersistence = extern struct {
         err: anyerror,
     };
     pub const VTable = extern struct {
+        create_with_staging: *const fn (ptr: *anyopaque, alloc: *const runtime_memory_abi.Allocator, key: runtime_memory_abi.Bytes, value: runtime_memory_abi.Bytes, plan_json: runtime_memory_abi.Bytes, leadership_term: u64, out: *runtime_memory_abi.OwnedBytes) callconv(.c) runtime_error_abi.Status,
         delete_matching: *const fn (ptr: *anyopaque, key: runtime_memory_abi.Bytes, value_hash: runtime_memory_abi.Bytes, leadership_term: u64, out: *u8) callconv(.c) runtime_error_abi.Status,
         create: *const fn (ptr: *anyopaque, alloc: *const runtime_memory_abi.Allocator, key: runtime_memory_abi.Bytes, value: runtime_memory_abi.Bytes, leadership_term: u64, out: *runtime_memory_abi.OwnedBytes) callconv(.c) runtime_error_abi.Status,
         load: *const fn (
@@ -228,6 +240,7 @@ pub const ReplicatedPersistence = extern struct {
         ) callconv(.c) runtime_error_abi.Status,
     };
     pub const LocalVTable = struct {
+        create_with_staging: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, leadership_term: u64) anyerror![]u8 = null,
         delete_matching: ?*const fn (ptr: *anyopaque, key: []const u8, value_hash: []const u8, leadership_term: u64) anyerror!bool = null,
         create: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, leadership_term: u64) anyerror![]u8 = null,
         load: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]OwnedRow,
@@ -251,6 +264,7 @@ pub const ReplicatedPersistence = extern struct {
             const Self = @This();
 
             const vtable: VTable = .{
+                .create_with_staging = Self.createWithStaging,
                 .delete_matching = Self.deleteMatching,
                 .create = Self.create,
                 .load = Self.load,
@@ -259,6 +273,14 @@ pub const ReplicatedPersistence = extern struct {
                 .delete = Self.delete,
                 .delete_many = Self.deleteMany,
             };
+
+            fn createWithStaging(ptr: *anyopaque, allocator: *const runtime_memory_abi.Allocator, key: runtime_memory_abi.Bytes, value: runtime_memory_abi.Bytes, plan_json: runtime_memory_abi.Bytes, leadership_term: u64, out: *runtime_memory_abi.OwnedBytes) callconv(.c) runtime_error_abi.Status {
+                if (!allocator.valid()) return fail(ptr, .create_with_staging, error.UnsupportedVersion);
+                const callback = local.create_with_staging orelse return fail(ptr, .create_with_staging, error.RestoreJobPersistenceUnavailable);
+                const bytes = callback(ptr, allocator.asStd(), key.slice(), value.slice(), plan_json.slice(), leadership_term) catch |err| return fail(ptr, .create_with_staging, err);
+                out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+                return .ok;
+            }
 
             fn create(ptr: *anyopaque, allocator: *const runtime_memory_abi.Allocator, key: runtime_memory_abi.Bytes, value: runtime_memory_abi.Bytes, leadership_term: u64, out: *runtime_memory_abi.OwnedBytes) callconv(.c) runtime_error_abi.Status {
                 if (!allocator.valid()) return fail(ptr, .create, error.UnsupportedVersion);
@@ -411,6 +433,15 @@ pub const ReplicatedPersistence = extern struct {
         var abi_allocator = runtime_memory_abi.Allocator.fromStd(&allocator);
         var out: runtime_memory_abi.OwnedBytes = .{};
         try statusToError(self.vtable.create(self.ptr, &abi_allocator, .fromSlice(key), .fromSlice(value), leadership_term, &out));
+        return out.slice();
+    }
+
+    pub fn createWithStaging(self: ReplicatedPersistence, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, leadership_term: u64) ![]u8 {
+        try self.validateVersion();
+        var allocator = alloc;
+        var abi_allocator = runtime_memory_abi.Allocator.fromStd(&allocator);
+        var out: runtime_memory_abi.OwnedBytes = .{};
+        try statusToError(self.vtable.create_with_staging(self.ptr, &abi_allocator, .fromSlice(key), .fromSlice(value), .fromSlice(plan_json), leadership_term, &out));
         return out.slice();
     }
 
@@ -568,7 +599,9 @@ pub const Store = struct {
                         .staging_owner_phase = parsed.value.staging_owner_phase,
                         .staging_owner_cursor = parsed.value.staging_owner_cursor,
                         .staging_failure = parsed.value.staging_failure,
+                        .rewrite_progress = parsed.value.rewrite_progress,
                         .scope = parsed.value.scope,
+                        .source_kind = parsed.value.source_kind,
                         .table_name = parsed.value.table_name,
                         .backup_id = parsed.value.backup_id,
                         .location = parsed.value.location,
@@ -960,6 +993,7 @@ pub const Store = struct {
         self.lock();
         defer self.mutex.unlock();
         const now_for_prune = nowMillis();
+        if (req.source_kind == .schema_rewrite and self.replicated == null) return error.AsyncRestoreUnavailable;
         if (now_for_prune >= self.next_prune_at_ms) {
             const more_expired = try self.pruneExpiredLocked(now_for_prune, restore_job_prune_batch_size);
             self.next_prune_at_ms = if (more_expired) now_for_prune else now_for_prune +| restore_job_prune_interval_ms;
@@ -1004,7 +1038,9 @@ pub const Store = struct {
                         .staging_owner_phase = parsed.value.staging_owner_phase,
                         .staging_owner_cursor = parsed.value.staging_owner_cursor,
                         .staging_failure = parsed.value.staging_failure,
+                        .rewrite_progress = parsed.value.rewrite_progress,
                         .scope = parsed.value.scope,
+                        .source_kind = parsed.value.source_kind,
                         .table_name = parsed.value.table_name,
                         .backup_id = parsed.value.backup_id,
                         .location = parsed.value.location,
@@ -1059,6 +1095,8 @@ pub const Store = struct {
             .enqueue_sequence = enqueue_sequence,
             .dispatch_sequence = dispatch_sequence,
             .not_before_ms = now,
+            .attempt_id = if (req.source_kind == .schema_rewrite) 1 else 0,
+            .staging_attempt_id = if (req.source_kind == .schema_rewrite) 1 else 0,
             .scope = req.scope,
             .source_kind = req.source_kind,
             .table_name = req.table_name,
@@ -1098,7 +1136,10 @@ pub const Store = struct {
             var retired_expired = false;
             while (true) {
                 self.fencePersistenceLocked(job_id);
-                const committed = replicated.create(alloc, key, encoded, self.replicated_leadership_term) catch
+                const committed = (if (req.rewrite_plan_json) |plan|
+                    replicated.createWithStaging(alloc, key, encoded, plan, self.replicated_leadership_term)
+                else
+                    replicated.create(alloc, key, encoded, self.replicated_leadership_term)) catch
                     return .{ .unknown = encoded };
                 var state = std.json.parseFromSlice(JobState, alloc, committed, .{ .ignore_unknown_fields = true }) catch {
                     alloc.free(committed);
@@ -1226,10 +1267,26 @@ pub const Store = struct {
         return self.updateLocked(alloc, parsed.value, .{ .phase = .running, .staging_validation_phase = phase, .staging_validation_owner = owner });
     }
 
+    /// Shared job scheduling checkpoint only. Native snapshot/tail receipts
+    /// remain the authority; a lost checkpoint merely repeats a bounded page.
+    pub fn recordRewriteProgress(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, progress: RewriteProgress) ![]u8 {
+        if (progress.owner > 4096) return error.InvalidRestoreProgress;
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(job_id) orelse return error.NotFound;
+        var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id or parsed.value.staging_attempt_id == 0 or parsed.value.staging_resolution != .active) return error.RestoreJobFenced;
+        const previous = parsed.value.rewrite_progress;
+        if (@intFromEnum(progress.phase) < @intFromEnum(previous.phase) or (progress.phase == previous.phase and
+            (progress.round < previous.round or (progress.round == previous.round and progress.owner < previous.owner)))) return error.RestoreJobCheckpointOrder;
+        return self.updateLocked(alloc, parsed.value, .{ .phase = .running, .rewrite_progress = progress });
+    }
+
     /// Call only after authoritative owner receipt (or native publication)
     /// succeeds. A stale checkpoint may replay work, but can never skip work.
     pub fn recordStagingOwner(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, phase: u8, owner: u32) ![]u8 {
-        if (phase > 5 or owner > 8192) return error.InvalidRestoreProgress;
+        if (phase > 6 or owner > 8192) return error.InvalidRestoreProgress;
         self.lock();
         defer self.mutex.unlock();
         const current = self.jobs.get(job_id) orelse return error.NotFound;
@@ -1333,6 +1390,24 @@ pub const Store = struct {
     pub fn load(self: *Store, alloc: std.mem.Allocator, job_id: u64) !?[]u8 {
         try self.refreshReplicatedJob(alloc, job_id);
         return try self.loadCached(alloc, job_id);
+    }
+
+    /// Recover a lost admission response before consulting source eligibility:
+    /// an already admitted pin correctly makes a fresh source admission busy.
+    pub fn existingRewriteAdmission(self: *Store, alloc: std.mem.Allocator, req: StartRequest) !?[]u8 {
+        if (req.source_kind != .schema_rewrite) return error.InvalidRestoreJobScope;
+        const key = req.idempotency_key orelse return null;
+        const id = try jobIdForIdempotency(alloc, req.idempotency_namespace, key);
+        const encoded = (try self.load(alloc, id)) orelse return null;
+        errdefer alloc.free(encoded);
+        const parsed = try std.json.parseFromSlice(JobState, alloc, encoded, .{});
+        defer parsed.deinit();
+        const expected = try requestFingerprintAlloc(alloc, req);
+        defer alloc.free(expected);
+        if (!std.mem.eql(u8, parsed.value.idempotency_namespace, req.idempotency_namespace) or
+            !std.mem.eql(u8, parsed.value.idempotency_key, key) or
+            !std.mem.eql(u8, parsed.value.request_fingerprint, expected)) return error.IdempotencyConflict;
+        return encoded;
     }
 
     pub fn loadCached(self: *Store, alloc: std.mem.Allocator, job_id: u64) !?[]u8 {
@@ -1836,6 +1911,7 @@ pub const Store = struct {
         staging_validation_owner: ?u32 = null,
         staging_owner_phase: ?u8 = null,
         staging_owner_cursor: ?u32 = null,
+        rewrite_progress: ?RewriteProgress = null,
         staging_failure: ?[]const u8 = null,
         dispatch_sequence: ?u64 = null,
         not_before_ms: ?u64 = null,
@@ -1870,6 +1946,7 @@ pub const Store = struct {
             .staging_validation_owner = update.staging_validation_owner orelse current.staging_validation_owner,
             .staging_owner_phase = update.staging_owner_phase orelse current.staging_owner_phase,
             .staging_owner_cursor = update.staging_owner_cursor orelse current.staging_owner_cursor,
+            .rewrite_progress = update.rewrite_progress orelse current.rewrite_progress,
             .staging_failure = update.staging_failure orelse current.staging_failure,
             .scope = current.scope,
             .source_kind = current.source_kind,
@@ -2249,6 +2326,8 @@ pub const Store = struct {
 };
 
 fn validateStartRequest(req: StartRequest) !void {
+    if ((req.source_kind == .schema_rewrite) != (req.rewrite_plan_json != null)) return error.InvalidRestoreJobScope;
+    if (req.source_kind == .schema_rewrite and (req.scope != .cluster or !std.mem.eql(u8, req.restore_mode, "overwrite"))) return error.InvalidRestoreJobScope;
     if (req.backup_id.len == 0 or req.backup_id.len > max_restore_string_bytes or
         req.location.len == 0 or req.location.len > max_restore_string_bytes or
         req.connection.len == 0 or req.connection.len > max_restore_string_bytes or
@@ -2399,6 +2478,9 @@ test "restore staging incarnation survives retries and cancellation waits for ow
         defer alloc.free(owner_checkpoint);
         const validation_checkpoint = try store.recordStagingValidation(alloc, job_id, worker.value.attempt_id, 1, 3);
         defer alloc.free(validation_checkpoint);
+        const rewrite_checkpoint = try store.recordRewriteProgress(alloc, job_id, worker.value.attempt_id, .{ .phase = .catchup, .round = 2, .owner = 1, .pending = true });
+        defer alloc.free(rewrite_checkpoint);
+        try std.testing.expectError(error.RestoreJobCheckpointOrder, store.recordRewriteProgress(alloc, job_id, worker.value.attempt_id, .{ .phase = .snapshot }));
         const retried = try store.retryRunning(alloc, staged.value, "RestoreValidationPending", 0);
         defer alloc.free(retried);
         const canceling = (try store.cancel(alloc, job_id)).?;
@@ -2417,6 +2499,7 @@ test "restore staging incarnation survives retries and cancellation waits for ow
         try std.testing.expectEqual(@as(u8, 0), replacement.value.staging_owner_phase);
         try std.testing.expectEqual(@as(u8, 1), replacement.value.staging_validation_phase);
         try std.testing.expectEqual(@as(u32, 3), replacement.value.staging_validation_owner);
+        try std.testing.expectEqualDeep(RewriteProgress{ .phase = .catchup, .round = 2, .owner = 1, .pending = true }, replacement.value.rewrite_progress);
         try std.testing.expectError(error.RestoreStagingResolutionPending, store.fail(alloc, replacement.value, "CancelRequested"));
         try std.testing.expectError(error.RestoreJobFenced, store.recordStagingResolution(alloc, job_id, staged.value.attempt_id, staged.value.staging_attempt_id, resolution));
         const resolved = try store.recordStagingResolution(alloc, job_id, replacement.value.attempt_id, replacement.value.staging_attempt_id, resolution);
@@ -2438,7 +2521,8 @@ fn stagingNeedsExecution(state: JobState) bool {
 
 fn validateProgressState(state: JobState) !void {
     if (state.format_version != restore_job_format_version) return error.UnsupportedRestoreJobFormat;
-    if ((state.staging_owner_phase != 255 and state.staging_owner_phase > 5) or state.staging_owner_cursor > 8192 or state.staging_failure.len > 128 or state.staging_validation_phase > 2 or state.staging_validation_owner > 4096 or state.staging_attempt_id > state.attempt_id or
+    if (state.rewrite_progress.owner > 4096) return error.CorruptRestoreJobStore;
+    if ((state.staging_owner_phase != 255 and state.staging_owner_phase > 6) or state.staging_owner_cursor > 8192 or state.staging_failure.len > 128 or state.staging_validation_phase > 2 or state.staging_validation_owner > 4096 or state.staging_attempt_id > state.attempt_id or
         (state.staging_attempt_id == 0 and state.staging_resolution != .active) or
         (isTerminal(state.phase) and stagingNeedsResolution(state))) return error.CorruptRestoreJobStore;
     if (state.enqueue_sequence == 0 or
@@ -2606,6 +2690,7 @@ fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
     // Preserve existing independent-snapshot idempotency keys while separating
     // the new shared-cohort admission from an otherwise identical request.
     if (req.source_kind == .cluster_cohort) hash.update("antfly:restore:cluster-cohort:v1\x00");
+    if (req.source_kind == .schema_rewrite) hash.update("antfly:restore:schema-rewrite:v1\x00");
     hash.update(canonical);
     hash.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
@@ -2663,6 +2748,12 @@ fn jobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}{x:0>16}", .{ key_prefix, job_id });
 }
 
+pub fn jobIdForIdempotency(alloc: std.mem.Allocator, namespace: []const u8, key: []const u8) !u64 {
+    const map_key = try idempotencyMapKeyAlloc(alloc, namespace, key);
+    defer alloc.free(map_key);
+    return admissionJobId(map_key);
+}
+
 fn admissionJobId(map_key: []const u8) u64 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(map_key, &digest, .{});
@@ -2690,6 +2781,7 @@ const TestReplicatedPersistence = struct {
     last_private_failure: ?ReplicatedPersistence.LocalFailure = null,
     required_leadership_term: ?u64 = null,
     last_mutation_term: u64 = 0,
+    compound_create_calls: usize = 0,
 
     fn init(alloc: std.mem.Allocator) TestReplicatedPersistence {
         return .{ .alloc = alloc };
@@ -2816,6 +2908,121 @@ const TestReplicatedPersistence = struct {
         for (keys) |key| try delete(ptr, key, leadership_term);
     }
 };
+
+test "restore jobs compound staging persistence transports plan separately and fails closed without callback" {
+    const alloc = std.testing.allocator;
+    var ordinary = TestReplicatedPersistence.init(alloc);
+    defer ordinary.deinit();
+    try std.testing.expectError(error.RestoreJobPersistenceUnavailable, ordinary.persistence().createWithStaging(alloc, "job-key", "job-value", "separate-plan", 7));
+    const Fixture = struct {
+        calls: usize = 0,
+        fn create(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8, value: []const u8, plan: []const u8, term: u64) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("job-key", key);
+            try std.testing.expectEqualStrings("job-value", value);
+            try std.testing.expectEqual(@as(usize, 96 * 1024), plan.len);
+            try std.testing.expect(std.mem.allEqual(u8, plan, 'p'));
+            try std.testing.expectEqual(@as(u64, 7), term);
+            self.calls += 1;
+            return a.dupe(u8, value);
+        }
+    };
+    var fixture: Fixture = .{};
+    const persistence = ReplicatedPersistence.fromLocal(&fixture, .{
+        .create_with_staging = Fixture.create,
+        .load = TestReplicatedPersistence.load,
+        .get = TestReplicatedPersistence.get,
+        .put = TestReplicatedPersistence.put,
+        .delete = TestReplicatedPersistence.delete,
+        .delete_many = TestReplicatedPersistence.deleteMany,
+    });
+    const plan = try alloc.alloc(u8, 96 * 1024);
+    defer alloc.free(plan);
+    @memset(plan, 'p');
+    const row = try persistence.createWithStaging(alloc, "job-key", "job-value", plan, 7);
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("job-value", row);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    var old = persistence;
+    old.version = 4;
+    try std.testing.expectError(error.UnsupportedVersion, old.createWithStaging(alloc, "job-key", "job-value", plan, 7));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "restore jobs compound staging persistence schema rewrite admission survives lost reply and rejects changed requests" {
+    const alloc = std.testing.allocator;
+    const Fixture = struct {
+        fn create(ptr: *anyopaque, a: std.mem.Allocator, key: []const u8, value: []const u8, plan: []const u8, term: u64) ![]u8 {
+            const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("separately-validated-staging-plan", plan);
+            self.compound_create_calls += 1;
+            return TestReplicatedPersistence.create(ptr, a, key, value, term);
+        }
+    };
+    var persistence = TestReplicatedPersistence.init(alloc);
+    defer persistence.deinit();
+    const adapter = ReplicatedPersistence.fromLocal(&persistence, .{
+        .create_with_staging = Fixture.create,
+        .load = TestReplicatedPersistence.load,
+        .get = TestReplicatedPersistence.get,
+        .put = TestReplicatedPersistence.put,
+        .delete = TestReplicatedPersistence.delete,
+        .delete_many = TestReplicatedPersistence.deleteMany,
+    });
+    const req: StartRequest = .{
+        .scope = .cluster,
+        .source_kind = .schema_rewrite,
+        .backup_id = "schema-digest",
+        .location = "metadata://schema-rewrite",
+        .connection = "internal",
+        .restore_mode = "overwrite",
+        .table_names = &.{"child"},
+        .idempotency_namespace = "basic:operator:schema:child",
+        .idempotency_key = "rewrite-1",
+        .rewrite_plan_json = "separately-validated-staging-plan",
+    };
+    var store = Store.initWithIo(alloc, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(adapter);
+    persistence.timeout_after_new_create = true;
+    const first = try store.startRecoverable(alloc, req);
+    try std.testing.expect(first == .unknown);
+    defer alloc.free(first.unknown);
+    try std.testing.expectEqual(@as(usize, 1), persistence.compound_create_calls);
+
+    // A fresh coordinator can recover the durable first row before probing
+    // sources whose already-admitted pins now reject fresh admission.
+    var reopened = Store.initWithIo(alloc, std.testing.io);
+    defer reopened.deinit();
+    try reopened.attachReplicated(adapter);
+    const recovered = (try reopened.existingRewriteAdmission(alloc, req)).?;
+    defer alloc.free(recovered);
+    const parsed = try std.json.parseFromSlice(JobState, alloc, recovered, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(Phase.queued, parsed.value.phase);
+    try std.testing.expectEqual(SourceKind.schema_rewrite, parsed.value.source_kind);
+    try std.testing.expectEqual(@as(u64, 1), parsed.value.attempt_id);
+    try std.testing.expectEqual(@as(u64, 1), parsed.value.staging_attempt_id);
+    const repeated = try reopened.startRecoverable(alloc, req);
+    try std.testing.expect(repeated == .accepted);
+    defer alloc.free(repeated.accepted);
+    try std.testing.expectEqualStrings(recovered, repeated.accepted);
+    try std.testing.expectEqual(@as(usize, 1), persistence.compound_create_calls);
+    var changed = req;
+    changed.backup_id = "changed-schema-digest";
+    try std.testing.expectError(error.IdempotencyConflict, reopened.existingRewriteAdmission(alloc, changed));
+    try std.testing.expectError(error.IdempotencyConflict, reopened.startRecoverable(alloc, changed));
+
+    var ordinary = TestReplicatedPersistence.init(alloc);
+    defer ordinary.deinit();
+    var unsupported = Store.initWithIo(alloc, std.testing.io);
+    defer unsupported.deinit();
+    try unsupported.attachReplicated(ordinary.persistence());
+    const absent = try unsupported.startRecoverable(alloc, req);
+    try std.testing.expect(absent == .unknown);
+    defer alloc.free(absent.unknown);
+    try std.testing.expectEqual(@as(u32, 0), ordinary.rows.count());
+}
 
 test "failed destination authorization refresh reuses the idempotent restore job" {
     const alloc = std.testing.allocator;

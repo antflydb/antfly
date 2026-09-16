@@ -23,8 +23,9 @@ class RelationalConstraintStatus:
     """
     Attributes:
         schema_version (int):
-        coverage_kind (RelationalConstraintStatusCoverageKind): This endpoint reports distributed unique/FK coverage,
-            not local scalar CHECK validation.
+        coverage_kind (RelationalConstraintStatusCoverageKind): Distributed UNIQUE, foreign-key, and scalar CHECK
+            coverage across every current table owner. Native local validation is not a substitute for this coordinated
+            proof.
         state (RelationalConstraintValidationState): Validation state of an existing-row constraint.
         ranges (list[RelationalConstraintRangeStatus]):
         retirement (RelationalConstraintRetirementStatus | Unset):

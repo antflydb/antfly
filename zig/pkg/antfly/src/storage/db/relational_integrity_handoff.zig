@@ -269,7 +269,7 @@ pub fn rebaseCoverage(alloc: Allocator, txn: anytype) !void {
     if (!progress.value.ready) return error.IntegrityHandoffIncomplete;
     var compiled = try catalog.decode(alloc, (try optional(txn, catalog.key)) orelse return error.IntegrityCatalogChanged);
     defer compiled.deinit();
-    const coverage: activation.Progress = .{ .generation_set = activation.generationSet(compiled), .owner = try activation.ownership(txn), .schema_version = compiled.schema_version, .state = .enforced, .phase = .foreign_key };
+    const coverage: activation.Progress = .{ .generation_set = activation.generationSet(compiled), .owner = try activation.ownership(txn), .schema_version = compiled.schema_version, .state = .enforced, .phase = if (@import("relational_integrity_activation_contract.zig").hasChecks(compiled)) .check else .foreign_key };
     const bytes = try coverage.encode(alloc);
     defer alloc.free(bytes);
     try txn.put(activation.key, bytes);
@@ -288,7 +288,7 @@ pub fn coverageForRange(alloc: Allocator, raw_catalog: []const u8, namespace: @i
     state.update(raw_range);
     var owner: integrity.Digest = undefined;
     state.final(&owner);
-    return (activation.Progress{ .generation_set = activation.generationSet(compiled), .owner = owner, .schema_version = compiled.schema_version, .state = .enforced, .phase = .foreign_key }).encode(alloc);
+    return (activation.Progress{ .generation_set = activation.generationSet(compiled), .owner = owner, .schema_version = compiled.schema_version, .state = .enforced, .phase = if (@import("relational_integrity_activation_contract.zig").hasChecks(compiled)) .check else .foreign_key }).encode(alloc);
 }
 
 /// Receiver-side admission for the existing primary bootstrap. Raw metadata

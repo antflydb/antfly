@@ -13,8 +13,8 @@ T = TypeVar("T", bound="RelationalUniqueConstraint")
 @_attrs_define
 class RelationalUniqueConstraint:
     """A named, ordered composite unique key. Validation status is maintained
-    by the server. TTL expiry cannot be combined with unique or foreign-key
-    declarations until expiry uses the distributed integrity coordinator.
+    by the server. TTL expiry uses the distributed integrity coordinator.
+    Referenced unique keys are nondeferrable.
 
         Attributes:
             name (str):

@@ -272,6 +272,8 @@ pub const TableApi = struct {
         DeadlineExceeded,
         NotFound,
         InternalFailure,
+        Conflict,
+        Unavailable,
     };
 
     pub const ExecuteGetIndexError = error{
@@ -279,6 +281,8 @@ pub const TableApi = struct {
         DeadlineExceeded,
         NotFound,
         InternalFailure,
+        Conflict,
+        Unavailable,
     };
 
     pub const ExecuteCreateIndexError = error{
@@ -327,6 +331,8 @@ pub const TableApi = struct {
         MethodNotAllowed,
         InternalFailure,
     };
+
+    pub const ExecuteIndexMaintenanceError = error{ Canceled, DeadlineExceeded, NotLeader, Conflict, Backpressured, InvalidIndexMaintenance, NotFound, MethodNotAllowed, Unavailable, InternalFailure };
 
     pub const ExecutePutArtifactEnrichmentError = error{
         Canceled,
@@ -486,6 +492,15 @@ pub const TableApi = struct {
             index_name: []const u8,
             request: operation.RequestContext,
         ) ExecuteDeleteIndexError!void,
+        execute_table_index_maintenance: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            action: @import("../storage/db/relational_index_maintenance_contract.zig").Action,
+            body: []const u8,
+            request: operation.RequestContext,
+        ) ExecuteIndexMaintenanceError![]u8 = null,
         execute_table_graph_metric_action: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2295,6 +2310,8 @@ pub fn handleTableListIndexes(
         error.Canceled, error.DeadlineExceeded => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index list failed") },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "index schema or ownership changed; refresh and retry") },
+        error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "index owners unavailable; retry status collection") },
     };
     return .{ .status = 200, .body = response_body, .json = true };
 }
@@ -2309,6 +2326,8 @@ pub fn handleTableGetIndex(
         error.Canceled, error.DeadlineExceeded => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index lookup failed") },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "index schema or ownership changed; refresh and retry") },
+        error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "index owners unavailable; retry status collection") },
     };
     return .{ .status = 200, .body = response_body, .json = true };
 }
@@ -2376,6 +2395,22 @@ pub fn handleTableDeleteIndex(
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "{\"error\":\"internal_error\",\"message\":\"index delete failed\",\"retryable\":false}"), .json = true },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}"), .json = true };
+}
+
+pub fn handleTableIndexMaintenance(alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, action: @import("../storage/db/relational_index_maintenance_contract.zig").Action, body: []const u8, api: TableApi) !OwnedResponse {
+    try api.ensureActive();
+    const callback = api.vtable.execute_table_index_maintenance orelse return .{ .status = 405, .body = try alloc.dupe(u8, "index maintenance is not supported") };
+    const response = callback(api.ptr, alloc, table_name, index_name, action, body, api.request) catch |err| switch (err) {
+        error.Canceled, error.DeadlineExceeded, error.NotLeader => return err,
+        error.InvalidIndexMaintenance => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid index maintenance proof") },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "index generation, owner, or maintenance observation changed; some selected owners may already be admitted") },
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "index not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "index maintenance is not supported") },
+        error.Backpressured => return .{ .status = 429, .body = try alloc.dupe(u8, "index maintenance admission is busy; retry the identical request"), .retry_after_seconds = 1 },
+        error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "index maintenance acknowledgement unavailable; retry the identical request") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index maintenance failed; retry the identical request") },
+    };
+    return .{ .status = 200, .json = true, .body = response };
 }
 
 pub fn handleTableGraphMetricAction(

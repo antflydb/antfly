@@ -1,4 +1,5 @@
 [
+  {"surface":"index_maintenance","disposition":"remote_apply","path_pattern":"/tables/{table}/indexes/{index}/{retry|repair}","methods":["POST"],"reason":"generation-fenced desired maintenance tickets enter the synchronous transaction mutation mirror"},
   {"surface":"document_batch","disposition":"remote_apply","path_pattern":"/tables/{table}/batch","methods":["POST"],"reason":"logical batch records enter the synchronous HA mutation mirror before local acknowledgement"},
   {"surface":"document_merge","disposition":"remote_apply","path_pattern":"/tables/{table}/merge","methods":["POST"],"reason":"merge writes use the same synchronous HA mutation mirror as batch writes"},
   {"surface":"auth_user","disposition":"reject","path_pattern":"/auth/v1/users/{user}","methods":["POST","DELETE"],"reason":"the live user store is not part of continuous replication"},

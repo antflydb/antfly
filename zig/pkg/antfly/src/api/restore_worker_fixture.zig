@@ -58,6 +58,101 @@ const Fixture = struct {
     target_open: [3]bool = @splat(false),
     restart_after_commit: bool = false,
     faults_seen: [3]u8 = @splat(0),
+    remote_calls: usize = 0,
+    owner_calls: usize = 0,
+    reported_http_failure: bool = false,
+    owner_http: ?@import("../raft/transport/http_common.zig").RequestExecutor = null,
+    owner_uri: []const u8 = "",
+    drop_owner_reply: std.atomic.Value(bool) = .init(false),
+    rewrite_mode: bool = false,
+    donors: [3]*db.DB = undefined,
+    donor_indices: [3]u64 = @splat(1),
+    root: []const u8 = "",
+    tail_injected: bool = false,
+    facts_alloc: ?std.mem.Allocator = null,
+
+    fn sourceIo(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, name: []const u8, request: @import("online_merge_io.zig").contract.Request, context: operation.RequestContext) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const i = try index(name);
+        const original = self.donors[i];
+        try std.testing.expectEqual(@as(u64, 20) + i, group);
+        try std.testing.expect(original.core.identity_namespace.eql(request.scope.fence.namespace));
+        // Deterministic manual executor: materialize the same production pin,
+        // without introducing an asynchronous worker into this failure fixture.
+        if (request.operation == .publication) return std.json.Stringify.valueAlloc(alloc, try original.prepareOnlineSourcePublication(request.scope, context.cancellation), .{});
+        var input = request;
+        if (self.non_raft and input.operation == .admission) input.scope.authority = .native;
+        return @import("../storage/db/online_merge_io.zig").executeJson(original, alloc, input, context.cancellation);
+    }
+    fn sourceBatch(ptr: *anyopaque, _: std.mem.Allocator, name: []const u8, request: db.types.BatchRequest) !?void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const i = try index(name);
+        self.donor_indices[i] += 1;
+        if (self.non_raft) try self.donors[i].batch(request) else try self.donors[i].batchRaftReplicatedApply(request, .{ .index = self.donor_indices[i], .term = 1 });
+        return {};
+    }
+    fn sourceLookup(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, key: []const u8, opts: db.types.LookupOptions, _: read_gate.ReadConsistency) !?reads.LookupResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const result = (try self.donors[try index(name)].lookup(alloc, key, opts)) orelse return null;
+        return .{ .json = result.json, .version = 0 };
+    }
+    pub fn readFacts(self: *Fixture, name: []const u8, request: @import("online_merge_io.zig").contract.Request) !@import("online_merge_io.zig").contract.AdmissionFacts {
+        const raw = try sourceIo(self, self.alloc, request.ownerGroup(), name, request, .{});
+        defer self.alloc.free(raw);
+        return std.json.parseFromSliceLeaky(@import("online_merge_io.zig").contract.AdmissionFacts, self.facts_alloc.?, raw, .{ .allocate = .alloc_always });
+    }
+    fn provisionRewrite(self: *Fixture, i: usize, scope: native.Scope) !void {
+        if (self.target_open[i]) return;
+        const encoded = (try self.source.getRestoreStaging(self.alloc, scope.plan_id, .{})).?;
+        defer self.alloc.free(encoded);
+        var job = try std.json.parseFromSlice(stages.Job, self.alloc, encoded, .{});
+        defer job.deinit();
+        const target = for (job.value.plan.targets) |target| {
+            if (target.table.table_id == scope.target_namespace.table_id) break target;
+        } else return error.RestoreStagingScopeChanged;
+        self.scopes[i] = scope;
+        self.dbs[i].* = try db.DB.open(self.alloc, self.target_paths[i], .{ .backend_runtime = self.runtime, .identity_namespace = scope.target_namespace, .online_source_authority = if (self.non_raft) .native else .raft, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
+        self.target_open[i] = true;
+        try self.dbs[i].setSchemaJson(self.alloc, target.table.schema_json);
+        try self.dbs[i].reserveRestoreStagingScoped(self.alloc, scope);
+        try self.dbs[i].installRestoreStagingBootstrap(self.alloc, .{ .scope = scope, .table_name = target.table.name, .schema_json = target.table.schema_json, .read_schema_json = target.table.read_schema_json, .indexes_json = target.table.indexes_json, .byte_range = .{ .start = "", .end = "" } });
+        _ = try @import("../metadata/table_provisioner.zig").reconcileDbIndexesWithOptions(self.alloc, self.dbs[i], target.table.indexes_json, .{ .restore_build_only = true });
+    }
+
+    /// Cross the production HTTP client, listener and owner route. The fault
+    /// transport discards a successful response only after owner() has durably
+    /// applied and reopened the destination database.
+    fn remoteOwner(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, group: u64, request: owner_api.Request, context: operation.RequestContext) !owner_api.Response {
+        const Transport = struct {
+            fixture: *Fixture,
+            name: []const u8,
+            group: u64,
+            context: operation.RequestContext,
+            fn execute(p: *anyopaque, a: std.mem.Allocator, wire: @import("../raft/transport/http_common.zig").HttpRequest) !@import("../raft/transport/http_common.zig").HttpResponse {
+                const self: *@This() = @ptrCast(@alignCast(p));
+                const expected = try std.fmt.allocPrint(a, "/internal/v1/groups/{d}/tables/{s}/restore-owner", .{ self.group, self.name });
+                defer a.free(expected);
+                try std.testing.expect(std.mem.endsWith(u8, wire.uri, expected));
+                try std.testing.expectEqual(.POST, wire.method);
+                self.fixture.remote_calls += 1;
+                var response = try self.fixture.owner_http.?.execute(a, wire);
+                if (response.status != 200 and !self.fixture.reported_http_failure) {
+                    self.fixture.reported_http_failure = true;
+                    std.debug.print("restore owner HTTP rejection table={s} status={d} body={s}\n", .{ self.name, response.status, response.body[0..@min(response.body.len, 256)] });
+                }
+                if (self.fixture.drop_owner_reply.swap(false, .acq_rel)) {
+                    defer response.deinit(a);
+                    try std.testing.expectEqual(@as(u16, 200), response.status);
+                    return error.ConnectionResetByPeer;
+                }
+                return response;
+            }
+        };
+        var transport: Transport = .{ .fixture = @ptrCast(@alignCast(ptr)), .name = name, .group = group, .context = context };
+        var client = @import("http_client.zig").ApiHttpClient.init(alloc, .{ .ptr = &transport, .vtable = &.{ .execute = Transport.execute } });
+        _ = client.withInternalServiceAuth("restore-worker-test-secret-0123456789", "restore-worker-test");
+        return client.fetchRestoreOwner(transport.fixture.owner_uri, group, name, request, context);
+    }
 
     fn descriptor(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -99,7 +194,9 @@ const Fixture = struct {
     };
     fn owner(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, group: u64, request: owner_api.Request, context: operation.RequestContext) !owner_api.Response {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.owner_calls += 1;
         const i = try index(name);
+        if (self.rewrite_mode) try self.provisionRewrite(i, request.scope);
         try std.testing.expectEqual(self.scopes[i].target_namespace.shard_id, group);
         const source = self.source;
         const progress = (try source.getRestoreStagingProgress(alloc, request.scope.plan_id, context)).?;
@@ -115,6 +212,10 @@ const Fixture = struct {
         }
         var apply: Apply = .{ .fixture = self, .index = i };
         const result = try @import("../storage/restore_owner.zig").executeResident(alloc, self.dbs[i], .{ .io = std.testing.io, .runtime = self.runtime, .location_options = .{ .filesystem_io = std.testing.io, .node_config = self.node_config }, .cache_path = self.cache_paths[i], .proposer = .{ .ptr = &apply, .propose = Apply.propose } }, request, context);
+        if (self.rewrite_mode and !self.tail_injected and result.rewrite != null and result.rewrite.?.snapshot_complete) {
+            self.tail_injected = true;
+            _ = try sourceBatch(self, alloc, "parent", .{ .timestamp_ns = 987, .writes = &.{ .{ .key = "row", .value = "{\"id\":1,\"x\":7}" }, .{ .key = "new", .value = "{\"id\":2,\"x\":9}" } }, .deletes = &.{"removed"} });
+        }
         if (request.action == .import_page) self.imports += 1;
         if (request.action == .publish) self.publications += 1;
         const fault_bit: u8 = switch (request.action) {
@@ -132,8 +233,12 @@ const Fixture = struct {
             // new owner or infer publication from its missing response.
             self.dbs[i].close();
             self.target_open[i] = false;
-            self.dbs[i].* = try db.DB.open(alloc, self.target_paths[i], .{ .backend_runtime = self.runtime, .identity_namespace = self.scopes[i].target_namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
+            self.dbs[i].* = try db.DB.open(self.alloc, self.target_paths[i], .{ .backend_runtime = self.runtime, .identity_namespace = self.scopes[i].target_namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
             self.target_open[i] = true;
+            if (self.owner_http != null) {
+                self.drop_owner_reply.store(true, .release);
+                return result;
+            }
             return error.ConnectionResetByPeer;
         }
         return result;
@@ -158,7 +263,7 @@ const Fixture = struct {
     }
     fn begin(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, name: []const u8, request: distributed.TxnBeginRequest) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const participant = try distributed.participantIdForGroup(alloc, name, group);
+        const participant = try distributed.participantIdForGroupScoped(alloc, name, group, request.restore_staging_scope, request.restore_staging_plan_id);
         defer alloc.free(participant);
         _ = try self.dbs[try index(name)].beginTransactionScoped(request.txn_id, request.begin_timestamp, request.begin_timestamp, request.participants, std.mem.eql(u8, participant, request.participants[0]), false, request.restore_staging_scope);
     }
@@ -191,6 +296,215 @@ pub fn run(comptime Driver: type, invalid_child: bool) !void {
     return runWithSource(Driver, invalid_child, null);
 }
 
+const RewritePersistence = struct {
+    fn get(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
+        const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+        return svc.projectedStore().?.getRestoreJobValue(alloc, svc.metadata_group_id, key);
+    }
+    fn load(ptr: *anyopaque, alloc: std.mem.Allocator) ![]restore_jobs.ReplicatedPersistence.OwnedRow {
+        const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+        const store = svc.projectedStore().?;
+        const rows = try store.listRestoreJobRows(alloc, svc.metadata_group_id);
+        defer store.freeRestoreJobRows(alloc, rows);
+        const result = try alloc.alloc(restore_jobs.ReplicatedPersistence.OwnedRow, rows.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            alloc.free(result);
+        }
+        for (rows, result) |row, *out| {
+            const key = try alloc.dupe(u8, row.key);
+            errdefer alloc.free(key);
+            out.* = .{ .key = key, .value = try alloc.dupe(u8, row.value) };
+            initialized += 1;
+        }
+        return result;
+    }
+    fn put(ptr: *anyopaque, key: []const u8, value: []const u8, term: u64) !void {
+        try std.testing.expectEqual(@as(u64, 1), term);
+        const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.proposeTransitionCommand(.{ .upsert_restore_job = .{ .key = key, .value = value } });
+        try svc.runRound();
+    }
+    fn delete(ptr: *anyopaque, key: []const u8, _: u64) !void {
+        const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.proposeTransitionCommand(.{ .remove_restore_job = .{ .key = key } });
+        try svc.runRound();
+    }
+    fn deleteMany(ptr: *anyopaque, keys: []const []const u8, term: u64) !void {
+        for (keys) |key| try delete(ptr, key, term);
+    }
+    fn createWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan: []const u8, term: u64) ![]u8 {
+        try std.testing.expectEqual(@as(u64, 1), term);
+        const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.proposeTransitionCommand(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan } });
+        try svc.runRound();
+        return (try get(ptr, alloc, key)) orelse error.RestoreJobCommitNotApplied;
+    }
+};
+
+/// Real retained donors, peer materialization, immutable rewrite programs and
+/// shared metadata publication. Lose replies after durable target commits and
+/// reopen targets; acknowledged writes after the source cut must still appear.
+pub fn runRewrite(comptime Driver: type) !void {
+    for ([_]bool{ false, true }) |non_raft| {
+        try runRewriteWithFailure(Driver, false, non_raft);
+        try runRewriteWithFailure(Driver, true, non_raft);
+    }
+}
+
+fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bool) !void {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = std.testing.io });
+    defer runtime.deinit();
+    var api_runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = std.testing.io, .borrowed_io = .{ .general = std.testing.io, .api = std.testing.io } });
+    defer api_runtime.deinit();
+    var raft = raft_engine.core.MemoryStorage.init(alloc);
+    defer raft.deinit();
+    var fixture: Fixture = .{ .alloc = alloc, .raft = &raft, .runtime = &runtime, .rewrite_mode = true, .restart_after_commit = true, .root = root, .facts_alloc = a, .non_raft = non_raft };
+    var allocated: usize = 0;
+    var donors_open: usize = 0;
+    defer {
+        for (fixture.dbs[0..allocated], 0..) |target, i| {
+            if (fixture.target_open[i]) target.close();
+            alloc.destroy(target);
+        }
+        for (fixture.donors[0..donors_open]) |original| {
+            original.close();
+            alloc.destroy(original);
+        }
+    }
+    var svc = try metadata_service.MetadataService.init(alloc, .{ .host = .{ .local_node_id = 1, .metadata_group_id = 1988, .replica_root_dir = try std.fmt.allocPrint(a, "{s}/metadata", .{root}), .replica_catalog_path = try std.fmt.allocPrint(a, "{s}/metadata-catalog", .{root}) } }, .{ .host = .{ .host = .{ .descriptor_factory = .{ .ptr = &fixture, .vtable = &.{ .build_descriptor = Fixture.descriptor, .free_descriptor = Fixture.freeDescriptor } } } } }, .{});
+    defer svc.deinit();
+    _ = try svc.ensureMetadataReplica(.{ .group_id = 1988, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
+    try svc.campaignMetadataGroup();
+    try svc.runRound();
+    const source = http.StatusSource.fromMetadataService(&svc);
+    fixture.source = source;
+    var node_config = try Driver.nodeConfig(alloc);
+    defer node_config.deinit();
+    fixture.node_config = &node_config;
+    var server = http.ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .backend_runtime = &api_runtime, .node_config = &node_config, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.sourceIo }, .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.owner }, .restore_validation = .{ .status = source, .factory = .{ .ptr = &fixture, .bind = Fixture.bind } } }, source, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.sourceLookup, .scan = Fixture.scan, .query = Fixture.query } }, .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.sourceBatch } });
+    defer server.deinit();
+    server.restore_job_store.deinit();
+    server.restore_job_store = restore_jobs.Store.initWithIo(alloc, std.testing.io);
+    try server.restore_job_store.attachReplicated(restore_jobs.ReplicatedPersistence.fromLocal(&svc, .{ .load = RewritePersistence.load, .get = RewritePersistence.get, .put = RewritePersistence.put, .delete = RewritePersistence.delete, .delete_many = RewritePersistence.deleteMany, .create_with_staging = RewritePersistence.createWithStaging }));
+    try server.restore_job_store.prepareReplicatedLeadership(alloc, 1);
+    server.restore_leadership_term.store(1, .release);
+    const job_id = try restore_jobs.jobIdForIdempotency(a, "rewrite-worker", "one");
+    const plan_id = try stages.idForAttempt(job_id, 1);
+    const old_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"add","args":[{"op":"column","column":"x"},{"op":"literal","type":"integer","value":"1"}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"x":{"type":"integer"},"g":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const active_schema = try std.mem.replaceOwned(u8, a, old_schema, "\"version\":1", "\"version\":2");
+    const next_schema = try std.mem.replaceOwned(u8, a, active_schema, "\"op\":\"add\"", "\"op\":\"multiply\"");
+    const proposed = try std.mem.replaceOwned(u8, a, next_schema, "\"value\":\"1\"", if (invalid_tail) "\"value\":\"2000000000000000000\"" else "\"value\":\"3\"");
+    var records: [3]tables.TableRecord = undefined;
+    var ranges: [3]tables.RangeRecord = undefined;
+    for ([_][]const u8{ "parent", "child", "docs" }, 0..) |name, i| {
+        const original = try alloc.create(db.DB);
+        errdefer if (donors_open == i) alloc.destroy(original);
+        // Existing ranges may keep pre-split logical identity aliases which
+        // must not be replaced with their current routing group in a rewrite.
+        original.* = try db.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/source-{d}", .{ root, i }), .{ .backend_runtime = &runtime, .online_source_authority = if (non_raft) .native else .raft, .identity_namespace = .{ .table_id = 10 + i, .shard_id = 120 + i, .range_id = 220 + i }, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
+        fixture.donors[i] = original;
+        donors_open += 1;
+        const schema = if (i == 2) "{}" else old_schema;
+        try original.setSchemaJson(alloc, schema);
+        const initial: db.types.BatchRequest = .{ .timestamp_ns = 123, .writes = &.{ .{ .key = "row", .value = "{\"id\":1,\"x\":2}" }, .{ .key = "removed", .value = "{\"id\":3,\"x\":4}" } } };
+        if (non_raft) try original.batch(initial) else try original.batchRaftReplicatedApply(initial, .{ .index = 1, .term = 1 });
+        // v1 rows remain physically present but no active/read definition
+        // names their epoch. Admission must include the native history map.
+        if (i == 0) try original.setSchemaJson(alloc, active_schema);
+        records[i] = .{ .table_id = 10 + i, .name = name, .schema_json = if (i == 0) active_schema else schema };
+        ranges[i] = .{ .table_id = 10 + i, .group_id = 20 + i, .range_id = 20 + i, .doc_identity_shard_id = 120 + i, .doc_identity_range_id = 220 + i, .start_key = "" };
+        try svc.upsertTable(records[i]);
+        try svc.upsertRange(ranges[i]);
+        fixture.dbs[i] = try alloc.create(db.DB);
+        allocated += 1;
+        fixture.target_paths[i] = try std.fmt.allocPrint(a, "{s}/target-{d}", .{ root, i });
+        fixture.cache_paths[i] = try std.fmt.allocPrint(a, "{s}/decoder-{d}", .{ root, i });
+    }
+    try svc.runRound();
+    const plan = try @import("relational_rewrite_admission.zig").build(a, plan_id, &records, &ranges, "parent", proposed, &fixture);
+    _ = try server.restore_job_store.start(a, .{ .scope = .cluster, .source_kind = .schema_rewrite, .backup_id = "rewrite", .location = "metadata://rewrite", .connection = "internal", .restore_mode = "overwrite", .idempotency_namespace = "rewrite-worker", .idempotency_key = "one", .table_names = &.{ "parent", "child", "docs" }, .destination_authorization_principal = @import("stored_destination_authorization.zig").auth_disabled_principal, .rewrite_plan_json = try std.json.Stringify.valueAlloc(a, plan, .{}) });
+    for (0..600) |_| {
+        try Driver.work(&server, job_id);
+        const bytes = (try server.restore_job_store.load(a, job_id)).?;
+        const state = try std.json.parseFromSlice(restore_jobs.JobState, a, bytes, .{});
+        if (state.value.phase == .succeeded) {
+            try std.testing.expect(!invalid_tail);
+            const result = try std.json.parseFromSlice(std.json.Value, a, state.value.result_json orelse return error.MissingRestoreResult, .{});
+            try std.testing.expectEqualStrings("completed", result.value.object.get("status").?.string);
+            try std.testing.expectEqual(@as(i64, 3), result.value.object.get("committed_table_count").?.integer);
+            try std.testing.expectEqual(@as(i64, 0), result.value.object.get("failed_table_count").?.integer);
+            try std.testing.expectEqual(@as(i64, 0), result.value.object.get("durability_pending_table_count").?.integer);
+            break;
+        }
+        if (state.value.phase == .failed) {
+            if (!invalid_tail) {
+                std.debug.print("rewrite worker failed: {s}\n", .{bytes});
+                return error.RewriteWorkerFailed;
+            }
+            try std.testing.expectEqual(restore_jobs.StagingResolution.canceled, state.value.staging_resolution);
+            break;
+        }
+    } else {
+        std.debug.print("rewrite worker stalled: {s}\n", .{(try server.restore_job_store.load(a, job_id)).?});
+        return error.RewriteWorkerDidNotComplete;
+    }
+    try std.testing.expect(fixture.tail_injected);
+    if (non_raft) {
+        for (fixture.donors) |donor| try std.testing.expect((try donor.raftAppliedEntry()) == null);
+        for (fixture.dbs, fixture.target_open) |target, opened| if (opened) try std.testing.expect((try target.raftAppliedEntry()) == null);
+    }
+    var published = (try source.adminSnapshot()).?;
+    defer source.freeAdminSnapshot(&published);
+    if (invalid_tail) {
+        // Target overflow is terminal only for the immutable rewrite. All old
+        // names/identities and acknowledged source mutations remain live.
+        for (published.tables) |record| try std.testing.expect(record.table_id >= 10 and record.table_id <= 12);
+        const original = (try fixture.donors[0].lookup(alloc, "row", .{})).?;
+        defer alloc.free(original.json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, original.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 8), parsed.value.object.get("g").?.integer);
+        _ = try Fixture.sourceBatch(&fixture, alloc, "parent", .{ .writes = &.{.{ .key = "after-cancel", .value = "{\"id\":4,\"x\":1}" }} });
+        for (plan.targets) |target| for (target.rewrite_sources) |scope| {
+            const progress = try fixture.donors[try Fixture.index(target.table.name)].onlineSourceStatus(scope);
+            try std.testing.expectEqual(.released, progress.phase);
+        };
+        return;
+    }
+    for (published.tables) |record| try std.testing.expect(record.table_id >= 13);
+    for (fixture.dbs, 0..) |target, i| {
+        const row = (try target.lookup(alloc, "row", .{})).?;
+        defer alloc.free(row.json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row.json, .{});
+        defer parsed.deinit();
+        if (i == 0) {
+            try std.testing.expectEqual(@as(i64, 21), parsed.value.object.get("g").?.integer);
+            try std.testing.expectEqual(@as(?u64, 987), try target.getTimestamp(alloc, "row"));
+            try std.testing.expect((try target.lookup(alloc, "removed", .{})) == null);
+            const added = (try target.lookup(alloc, "new", .{})).?;
+            defer alloc.free(added.json);
+            var added_parsed = try std.json.parseFromSlice(std.json.Value, alloc, added.json, .{});
+            defer added_parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 27), added_parsed.value.object.get("g").?.integer);
+        } else if (i == 1) try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("g").?.integer) else try std.testing.expect(!parsed.value.object.contains("g"));
+        try std.testing.expect(fixture.faults_seen[i] & 15 == 15);
+    }
+}
+
 pub fn runWithSource(comptime Driver: type, invalid_child: bool, override: ?http.StatusSource) !void {
     return runWithPersistence(Driver, invalid_child, override, null);
 }
@@ -199,7 +513,33 @@ pub fn runWithPersistence(comptime Driver: type, invalid_child: bool, override: 
     return runWithPolicy(Driver, invalid_child, override, persistence, .{});
 }
 
-pub const Policy = struct { failover_safe: bool = false, guard: ?http.RestoreExecutionGuard = null, gate: ?db.HAWriteGate = null, mirror: ?db.HAAsyncEffectMirror = null, term: u64 = 1, portable: bool = false, restart_after_commit: bool = false, table_restore: bool = false, migration: bool = false, benchmark_rows: usize = 1 };
+pub const Policy = struct { failover_safe: bool = false, guard: ?http.RestoreExecutionGuard = null, gate: ?db.HAWriteGate = null, mirror: ?db.HAAsyncEffectMirror = null, term: u64 = 1, portable: bool = false, restart_after_commit: bool = false, table_restore: bool = false, migration: bool = false, generated: bool = false, remote_owner: bool = false, benchmark_rows: usize = 1 };
+
+fn generatedSchema(alloc: std.mem.Allocator, input: []const u8, default_base: []const u8) ![]const u8 {
+    var schema = try std.json.parseFromSlice(std.json.Value, alloc, input, .{});
+    defer schema.deinit();
+    const a = schema.arena.allocator();
+    const properties = schema.value.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?.object.getPtr("properties").?;
+    const integer = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"integer\"}", .{});
+    try properties.object.put(a, "base", integer.value);
+    try properties.object.put(a, "doubled", integer.value);
+    try properties.object.put(a, "later", integer.value);
+    const expressions = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"column":"id","expression":{"op":"add","args":[{"op":"column","column":"base"},{"op":"literal","type":"integer","value":"1"}]}},{"column":"doubled","expression":{"op":"multiply","args":[{"op":"column","column":"id"},{"op":"literal","type":"integer","value":"2"}]}}]
+    , .{});
+    try schema.value.object.put(a, "generated_columns", expressions.value);
+    var defaults = try std.json.parseFromSlice(std.json.Value, a, try std.fmt.allocPrint(a, "[{{\"column\":\"base\",\"expression\":{{\"op\":\"literal\",\"type\":\"integer\",\"value\":\"{s}\"}}}}]", .{default_base}), .{});
+    if (!std.mem.eql(u8, default_base, "0")) {
+        const later = try std.json.parseFromSlice(std.json.Value, a, "{\"column\":\"later\",\"expression\":{\"op\":\"literal\",\"type\":\"integer\",\"value\":\"9\"}}", .{});
+        try defaults.value.array.append(later.value);
+    }
+    try schema.value.object.put(a, "column_defaults", defaults.value);
+    const indexes = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"name":"generated_cover","keys":[{"column":"id"}],"include_columns":["doubled"],"where":[{"column":"id","op":"gt","value":0}]}]
+    , .{});
+    try schema.value.object.put(a, "relational_indexes", indexes.value);
+    return std.json.Stringify.valueAlloc(alloc, schema.value, .{});
+}
 pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http.StatusSource, persistence: ?restore_jobs.ReplicatedPersistence, policy: Policy) !void {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -231,8 +571,20 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     var node_config = try Driver.nodeConfig(alloc);
     defer node_config.deinit();
     fixture.node_config = &node_config;
-    var server = http.ApiHttpServer.init(alloc, .{ .backend_runtime = &api_runtime, .node_config = &node_config, .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.owner }, .restore_validation = .{ .status = source, .factory = .{ .ptr = &fixture, .bind = Fixture.bind } }, .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = Fixture.localStatus, .group_leader_node_id = Fixture.leader, .node_base_uri = Fixture.uri } } }, source, null, null);
+    var server = http.ApiHttpServer.init(alloc, .{ .backend_runtime = &api_runtime, .node_config = &node_config, .restore_owner = .{ .ptr = &fixture, .execute_fn = if (policy.remote_owner) Fixture.remoteOwner else Fixture.owner }, .restore_validation = .{ .status = source, .factory = .{ .ptr = &fixture, .bind = Fixture.bind } }, .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = Fixture.localStatus, .group_leader_node_id = Fixture.leader, .node_base_uri = Fixture.uri } } }, source, null, null);
     defer server.deinit();
+    var owner_server = http.ApiHttpServer.init(alloc, .{ .backend_runtime = &api_runtime, .node_config = &node_config, .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.owner } }, source, null, null);
+    owner_server.cfg.internal_service_secret = "restore-worker-test-secret-0123456789";
+    owner_server.cfg.internal_service_issuer = "restore-worker-test";
+    defer owner_server.deinit();
+    var owner_transport = @import("../raft/transport/std_http_executor.zig").StdHttpExecutor.init(alloc, .{});
+    defer owner_transport.deinit();
+    var owner_listener: ?@import("http_test_runtime.zig").Runtime = if (policy.remote_owner) try @import("http_test_runtime.zig").Runtime.startOwned(alloc, &owner_server) else null;
+    defer if (owner_listener) |*listener| listener.deinit();
+    if (owner_listener) |*listener| {
+        fixture.owner_uri = try listener.baseUri(a);
+        fixture.owner_http = owner_transport.executor();
+    }
     server.cfg.ha_failover_safe_mutations_only = policy.failover_safe;
     server.cfg.restore_execution_guard = policy.guard;
     server.restore_leadership_term.store(policy.term, .release);
@@ -267,15 +619,19 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         const path = try std.fmt.allocPrint(a, "{s}/source-{d}", .{ root, i });
         var original = try db.DB.open(alloc, path, .{ .backend_runtime = &runtime, .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
         defer original.close();
-        try original.setSchemaJson(alloc, if (i == 2) (if (policy.migration) previous_doc_schema else "{}") else plain_schema);
+        try original.setSchemaJson(alloc, if (i == 2) (if (policy.migration) previous_doc_schema else "{}") else if (policy.generated) try generatedSchema(a, plain_schema, "0") else plain_schema);
         const input = try a.alloc(db.types.BatchWrite, policy.benchmark_rows);
         for (input, 0..) |*row, ordinal| row.* = .{ .key = if (ordinal == 0) "row" else try std.fmt.allocPrint(a, "row-{d:0>8}", .{ordinal}), .value = if (policy.migration and i == 2) "{\"id\":1,\"name\":\"Old Mapping\"}" else try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{ordinal + (if (invalid_child and i == 1) @as(usize, 2) else 1)}) };
+        if (policy.generated and i < 2) for (input, 0..) |*row, ordinal| {
+            row.value = if (ordinal == 0 and !(invalid_child and i == 1)) "{}" else try std.fmt.allocPrint(a, "{{\"base\":{d}}}", .{ordinal + @intFromBool(invalid_child and i == 1)});
+        };
         try original.batch(.{ .timestamp_ns = 123, .writes = input });
-        const schema = switch (i) {
+        const base_schema = switch (i) {
             0 => parent_schema,
             1 => child_schema,
             else => if (policy.migration) active_doc_schema else "{}",
         };
+        const schema = if (policy.generated and i < 2) try generatedSchema(a, base_schema, "7") else base_schema;
         try original.setSchemaJson(alloc, schema);
         const identity = try original.relationalTopologyIdentity();
         const fence: @import("../storage/db/relational_integrity_topology.zig").Fence = .{ .transition_id = 700, .attempt = 1, .owner_group_id = namespace.shard_id, .peer_group_id = namespace.shard_id, .admission_epoch = identity.next_epoch, .role = .backup_snapshot, .namespace = namespace, .catalog_digest = identity.catalog_digest };
@@ -351,10 +707,24 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     const started_ns = @import("antfly_platform").time.monotonicNs();
     for (0..(if (policy.restart_after_commit) @as(usize, 6000) else 120)) |_| {
         try Driver.work(&server, worker.value.job_id);
+        // A routing/authentication setup error is not a simulated owner retry.
+        // Fail promptly with the first bounded HTTP diagnostic above instead
+        // of spending the recovery matrix's whole budget outside the owner.
+        if (policy.remote_owner and fixture.remote_calls >= 4 and fixture.owner_calls == 0)
+            return error.RestoreOwnerRouteDidNotReachOwner;
         const bytes = (try server.restore_job_store.load(a, worker.value.job_id)).?;
         const state = try std.json.parseFromSlice(restore_jobs.JobState, a, bytes, .{});
         if (state.value.phase == .succeeded) {
             try std.testing.expect(!invalid_child);
+            const result = try std.json.parseFromSlice(std.json.Value, a, state.value.result_json orelse return error.MissingRestoreResult, .{});
+            if (policy.table_restore) {
+                try std.testing.expectEqualStrings("triggered", result.value.object.get("restore").?.string);
+                try std.testing.expect(result.value.object.get("committed_table_count") == null);
+                try std.testing.expect(result.value.object.get("tables") == null);
+            } else {
+                try std.testing.expectEqualStrings("completed", result.value.object.get("status").?.string);
+                try std.testing.expectEqual(@as(i64, 3), result.value.object.get("committed_table_count").?.integer);
+            }
             break;
         }
         if (state.value.phase == .failed) {
@@ -378,6 +748,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         std.debug.print("restore benchmark format={s} rows={d} artifact_bytes={d} owner_import_calls={d} validation_calls={d} integrity_transactions={d} elapsed_ms={d}\n", .{ if (policy.portable) "portable" else "native", policy.benchmark_rows * fixture.owner_count, artifact_bytes, fixture.imports, fixture.validations, fixture.sequence, (@import("antfly_platform").time.monotonicNs() - started_ns) / std.time.ns_per_ms });
     }
     defer source.freeAdminSnapshot(&published);
+    if (policy.remote_owner) try std.testing.expect(fixture.remote_calls > fixture.owner_count);
     if (policy.restart_after_commit) for (fixture.faults_seen[0..fixture.owner_count]) |seen| {
         const expected: u8 = if (invalid_child) 1 | 2 | 16 else 1 | 2 | 4 | 8;
         try std.testing.expectEqual(expected, seen);
@@ -405,6 +776,24 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         defer progress.deinit();
         try std.testing.expectEqual(native.Phase.published, progress.value.phase);
     }
+    if (policy.generated) for (fixture.dbs[0..2]) |target| {
+        var row = (try target.lookup(alloc, "row", .{ .include_all_fields = true })).?;
+        defer row.deinit(alloc);
+        var logical = try std.json.parseFromSlice(std.json.Value, alloc, row.json, .{});
+        defer logical.deinit();
+        try std.testing.expectEqual(@as(i64, 0), logical.value.object.get("base").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), logical.value.object.get("id").?.integer);
+        try std.testing.expectEqual(@as(i64, 2), logical.value.object.get("doubled").?.integer);
+        try std.testing.expect(!logical.value.object.contains("later"));
+        try std.testing.expectEqual(@as(u64, 123), try target.getTimestamp(alloc, "row"));
+        var reader = try target.beginRelationalRows(alloc, .{ .index = "generated_cover", .fields = &.{ "id", "doubled" }, .conditions = &.{.{ .column = "id", .op = .gt, .value = .{ .integer = 0 } }} });
+        defer reader.deinit();
+        var page = try reader.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+        try std.testing.expectEqualStrings("{\"id\":1,\"doubled\":2}", page.rows[0].json);
+    };
     if (policy.migration) {
         fixture.dbs[2].close();
         fixture.target_open[2] = false;

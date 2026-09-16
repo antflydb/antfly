@@ -21,6 +21,7 @@ const std = @import("std");
 const schema = @import("../schema.zig");
 const indexes = @import("../relational_index.zig");
 const rows = @import("algebraic/relational_row_codec.zig");
+const expressions = @import("../../schema/relational_expression.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -42,10 +43,46 @@ pub const Value = union(enum) {
 
 const BoundKey = struct {
     ordinal: u32,
+    expression: ?*CompiledExpression = null,
     column_type: schema.RelationalColumnType,
     descending: bool,
     nulls_first: bool,
     fold_ascii: bool,
+};
+
+const CompiledExpression = struct {
+    plan: expressions.Plan,
+    json: []u8,
+    fingerprint: [32]u8,
+
+    fn init(alloc: Allocator, table: schema.TableSchema, json: []const u8, result_type: schema.RelationalColumnType) !*CompiledExpression {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        var plan = try expressions.Plan.init(alloc, table, parsed.value, result_type);
+        errdefer plan.deinit();
+        const canonical = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        errdefer alloc.free(canonical);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly:index-expression:v1\x00");
+        hash.update(&plan.fingerprint);
+        for (plan.dependencies) |ordinal| {
+            const column = table.relational_columns[ordinal];
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, column.path.len, .little);
+            hash.update(&length);
+            hash.update(column.path);
+        }
+        const result = try alloc.create(CompiledExpression);
+        result.* = .{ .plan = plan, .json = canonical, .fingerprint = undefined };
+        hash.final(&result.fingerprint);
+        return result;
+    }
+
+    fn deinit(self: *CompiledExpression, alloc: Allocator) void {
+        self.plan.deinit();
+        alloc.free(self.json);
+        alloc.destroy(self);
+    }
 };
 
 pub const EncodedTuple = struct {
@@ -79,16 +116,34 @@ pub const TuplePlan = struct {
         layout: *const rows.PhysicalLayout,
         definitions: []const indexes.RelationalIndexKey,
     ) !TuplePlan {
-        if (table_schema.storage_mode != .relational or definitions.len == 0)
+        if (table_schema.storage_mode != .relational or definitions.len == 0 or definitions.len > 32)
             return error.InvalidRelationalIndexDefinition;
         if (layout.schema_version != table_schema.version or layout.column_count != table_schema.relational_columns.len)
             return error.RelationalRowSchemaMismatch;
         const keys = try alloc.alloc(BoundKey, definitions.len);
-        errdefer alloc.free(keys);
+        var initialized: usize = 0;
+        errdefer {
+            for (keys[0..initialized]) |key| if (key.expression) |expression| expression.deinit(alloc);
+            alloc.free(keys);
+        }
+        var expression_nodes: usize = 0;
+        var expression_literal_bytes: usize = 0;
         for (definitions, keys) |definition, *key| {
-            const ordinal = layout.ordinalForName(table_schema.relational_columns, definition.column) orelse
-                return error.RelationalIndexColumnNotFound;
-            const column_type = table_schema.relational_columns[ordinal].column_type;
+            if ((definition.expression_json != null) != (definition.result_type != null) or
+                (definition.expression_json != null) == (definition.column.len != 0)) return error.InvalidRelationalIndexDefinition;
+            const expression = if (definition.expression_json) |json|
+                try CompiledExpression.init(alloc, table_schema, json, definition.result_type.?)
+            else
+                null;
+            errdefer if (expression) |compiled| compiled.deinit(alloc);
+            if (expression) |compiled| {
+                expression_nodes += compiled.plan.nodes.len;
+                expression_literal_bytes += compiled.plan.literal_bytes;
+                if (expression_nodes > 4096 or expression_literal_bytes > expressions.max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
+            }
+            const ordinal = if (expression == null) layout.ordinalForName(table_schema.relational_columns, definition.column) orelse
+                return error.RelationalIndexColumnNotFound else 0;
+            const column_type = if (expression) |compiled| compiled.plan.result_kind else table_schema.relational_columns[ordinal].column_type;
             switch (column_type) {
                 .string, .blob, .boolean, .datetime, .integer, .number => {},
                 .json, .geopoint, .geoshape, .dense_vector => return error.UnsupportedRelationalIndexColumn,
@@ -108,6 +163,7 @@ pub const TuplePlan = struct {
             }
             key.* = .{
                 .ordinal = @intCast(ordinal),
+                .expression = expression,
                 .column_type = column_type,
                 .descending = definition.direction == .desc,
                 .nulls_first = switch (definition.nulls) {
@@ -117,6 +173,7 @@ pub const TuplePlan = struct {
                 },
                 .fold_ascii = fold_ascii,
             };
+            initialized += 1;
         }
         var hasher = std.crypto.hash.Blake3.init(.{});
         hasher.update("antfly:relational-ordered-tuple-definition\x00");
@@ -127,10 +184,11 @@ pub const TuplePlan = struct {
         std.mem.writeInt(u64, &size, keys.len, .little);
         hasher.update(&size);
         for (keys) |key| {
-            const name = table_schema.relational_columns[key.ordinal].name;
+            const name = if (key.expression != null) "" else table_schema.relational_columns[key.ordinal].name;
             std.mem.writeInt(u64, &size, name.len, .little);
             hasher.update(&size);
             hasher.update(name);
+            if (key.expression) |expression| hasher.update(&expression.fingerprint);
             hasher.update(&.{ @intFromEnum(key.column_type), @intFromBool(key.descending), @intFromBool(key.nulls_first), @intFromBool(key.fold_ascii) });
         }
         var fingerprint: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
@@ -139,6 +197,7 @@ pub const TuplePlan = struct {
     }
 
     pub fn deinit(self: *TuplePlan) void {
+        for (self.keys) |key| if (key.expression) |expression| expression.deinit(self.alloc);
         self.alloc.free(self.keys);
         self.* = undefined;
     }
@@ -152,15 +211,32 @@ pub const TuplePlan = struct {
         if (source.storage_mode != .relational or layout.schema_version != source.version or
             layout.column_count != source.relational_columns.len)
             return error.RelationalRowSchemaMismatch;
-        const keys = try alloc.dupe(BoundKey, self.keys);
-        errdefer alloc.free(keys);
+        const keys = try alloc.alloc(BoundKey, self.keys.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (keys[0..initialized]) |key| if (key.expression) |expression| expression.deinit(alloc);
+            alloc.free(keys);
+        }
         for (self.keys, keys) |original, *key| {
+            key.* = original;
+            key.expression = null;
+            if (original.expression) |expression| {
+                const projected = try CompiledExpression.init(alloc, source, expression.json, original.column_type);
+                if (!std.mem.eql(u8, &projected.fingerprint, &expression.fingerprint)) {
+                    projected.deinit(alloc);
+                    return error.RelationalIndexColumnTypeMismatch;
+                }
+                key.expression = projected;
+                initialized += 1;
+                continue;
+            }
             const name = self.columns[original.ordinal].name;
             const ordinal = layout.ordinalForName(source.relational_columns, name) orelse
                 return error.RelationalIndexColumnNotFound;
             if (source.relational_columns[ordinal].column_type != original.column_type)
                 return error.RelationalIndexColumnTypeMismatch;
             key.ordinal = @intCast(ordinal);
+            initialized += 1;
         }
         return .{ .alloc = alloc, .layout = layout, .columns = source.relational_columns, .keys = keys, .fingerprint = self.fingerprint };
     }
@@ -197,7 +273,32 @@ pub const TuplePlan = struct {
         const start = out.items.len;
         errdefer out.shrinkRetainingCapacity(start);
         var has_null = false;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var expression_budget: usize = expressions.max_allocated_bytes;
         for (self.keys) |key| {
+            if (key.expression) |expression| {
+                // The tuple's layout/column-pointer fence above certifies the
+                // expression compiler's ordinals, including cold projections.
+                const value = try expression.plan.evaluateBoundRowWithBudget(scratch.allocator(), row, &expression_budget);
+                // Borrowed column/literal results allocate nothing in the
+                // evaluator but still expand the physical key. Charge that
+                // output before appending, including worst-case escaping.
+                const encoded_bound: usize = switch (value) {
+                    .string, .blob => |bytes| blk: {
+                        if (bytes.len > expressions.max_output_bytes) return error.RelationalExpressionBudgetExceeded;
+                        break :blk bytes.len * 2 + 3;
+                    },
+                    .null => 1,
+                    .boolean => 2,
+                    else => 9,
+                };
+                if (encoded_bound > expression_budget) return error.RelationalExpressionBudgetExceeded;
+                expression_budget -= encoded_bound;
+                has_null = has_null or value == .null;
+                try appendValue(alloc, out, key, value);
+                continue;
+            }
             const cell = try row.findCell(key.ordinal);
             if (cell == null or cell.?.is_null) {
                 has_null = true;

@@ -597,6 +597,7 @@ pub const OpenOptions = struct {
     /// An authenticated restore decoder needs rows and schema layouts, never
     /// source projections. Do not open intentionally omitted index artifacts.
     primary_only_readonly: bool = false,
+    initial_owner_range: ?range_state_mod.InitialOwnerRange = null,
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
     primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default },
@@ -624,6 +625,9 @@ pub const OpenOptions = struct {
     /// mapper before the provisioner got a chance to call `setSchema`.
     schema_before_index_load: ?SchemaBeforeIndexLoad = null,
     identity_namespace: ?doc_identity.Namespace = null,
+    /// Immutable authenticated deployment ownership, not selected by a source
+    /// request. Decoders/library opens may leave this unset.
+    online_source_authority: ?@import("../source_authority.zig").Kind = null,
     prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
@@ -2643,6 +2647,86 @@ const PreparedRowEffects = struct {
     timestamp_value: ?[]u8 = null,
 };
 
+/// Partial indexes cannot infer prior membership from reverse-key absence.
+/// Reuse one projection per index and one historical epoch for the batch;
+/// ordinary full indexes retain their reverse-only update fast path.
+const RelationalPriorMembership = struct {
+    const Source = @import("relational_index_predicate.zig").Source;
+    alloc: Allocator,
+    members: []bool,
+    sources: []?Source,
+    historical: ?schema_registry_mod.SchemaView = null,
+    scratch: std.ArrayList(u8) = .empty,
+
+    fn init(alloc: Allocator, plan: ?relational_index_plans.View) !@This() {
+        const count = if (plan) |view| blk: {
+            for (view.boundIndexes()) |index| if (index.predicate != null) break :blk view.boundIndexes().len;
+            break :blk 0;
+        } else 0;
+        const members = try alloc.alloc(bool, count);
+        errdefer alloc.free(members);
+        const sources = try alloc.alloc(?Source, count);
+        @memset(sources, null);
+        return .{ .alloc = alloc, .members = members, .sources = sources };
+    }
+
+    fn clearHistorical(self: *@This()) void {
+        for (self.sources) |*source| {
+            if (source.*) |*projection| projection.deinit();
+            source.* = null;
+        }
+        if (self.historical) |*view| view.release();
+        self.historical = null;
+    }
+
+    fn deinit(self: *@This()) void {
+        self.clearHistorical();
+        self.scratch.deinit(self.alloc);
+        self.alloc.free(self.sources);
+        self.alloc.free(self.members);
+    }
+
+    fn read(self: *@This(), db: *DB, txn: *docstore_mod.DocStore.Txn, plan: relational_index_plans.View, ready: []const bool, document: []const u8) ![]const bool {
+        if (self.members.len == 0) return self.members;
+        @memset(self.members, false);
+        const needed = for (plan.boundIndexes(), ready) |index, is_ready| {
+            if (index.predicate != null and is_ready) break true;
+        } else false;
+        if (!needed) return self.members;
+        const key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(db, self.alloc, document, plan.schemaView().*);
+        defer self.alloc.free(key);
+        const bytes = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return self.members,
+            else => return err,
+        };
+        const version = try relational_store.rowSchemaVersion(bytes);
+        const current = plan.schemaView();
+        const view = if (version == current.version()) current else blk: {
+            if (self.historical == null or self.historical.?.version() != version) {
+                self.clearHistorical();
+                self.historical = (try db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
+            }
+            break :blk &self.historical.?;
+        };
+        const row = if (db.core.store.valuesAreAuthenticated())
+            try relational_row_codec.ordinalRowViewTrusted(bytes, view.tableSchema().*, view.physicalLayout())
+        else
+            try relational_row_codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
+        for (plan.boundIndexes(), ready, self.members, self.sources) |index, is_ready, *member, *source| {
+            if (!is_ready) continue;
+            if (index.predicate) |condition| {
+                if (version == current.version()) {
+                    member.* = try condition.active.matches(self.alloc, &self.scratch, row);
+                } else {
+                    if (source.* == null) source.* = try condition.projectSource(self.alloc, view.tableSchema().*, view.physicalLayout());
+                    member.* = try source.*.?.matches(self.alloc, &self.scratch, row);
+                }
+            }
+        }
+        return self.members;
+    }
+};
+
 fn retainPreparedTextRoots(sync_level: types.SyncLevel, has_text_consumers: bool, split_shadow: bool) bool {
     return split_shadow or (has_text_consumers and (sync_level == .full_text or sync_level == .full_index));
 }
@@ -2708,6 +2792,7 @@ fn prepareRelationalRows(
     rows: []?mapper.PreparedRelationalWrite,
     durable_rows: ?*const std.StringHashMapUnmanaged([]const u8),
     restore_timestamps: ?*const std.StringHashMapUnmanaged(u64),
+    preserve_logical_values: bool,
 ) !void {
     if (writes.len != rows.len) return error.InvalidArgument;
     const Context = struct {
@@ -2724,6 +2809,7 @@ fn prepareRelationalRows(
         rows: []?mapper.PreparedRelationalWrite,
         durable_rows: ?*const std.StringHashMapUnmanaged([]const u8),
         restore_timestamps: ?*const std.StringHashMapUnmanaged(u64),
+        preserve_logical_values: bool,
         next: std.atomic.Value(usize) = .init(0),
         failed: std.atomic.Value(bool) = .init(false),
         io: std.Io,
@@ -2751,17 +2837,20 @@ fn prepareRelationalRows(
             while (!ctx.failed.load(.acquire)) {
                 const index = ctx.next.fetchAdd(1, .monotonic);
                 if (index >= ctx.writes.len) return;
-                var prepared = mapper.PreparedRelationalWrite.initInSharedRegionFromIntent(
-                    region,
-                    scratch_arena.allocator(),
-                    ctx.retain_text_roots,
-                    ctx.writes[index].key,
-                    ctx.writes[index].value,
-                    ctx.validator,
-                    ctx.table_schema,
-                    ctx.physical_layout,
-                    if (ctx.durable_rows) |durable| durable.get(ctx.writes[index].key) else null,
-                ) catch |err| {
+                var prepared = (if (ctx.preserve_logical_values)
+                    mapper.PreparedRelationalWrite.initInSharedRegionPreserved(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout)
+                else
+                    mapper.PreparedRelationalWrite.initInSharedRegionFromIntent(
+                        region,
+                        scratch_arena.allocator(),
+                        ctx.retain_text_roots,
+                        ctx.writes[index].key,
+                        ctx.writes[index].value,
+                        ctx.validator,
+                        ctx.table_schema,
+                        ctx.physical_layout,
+                        if (ctx.durable_rows) |durable| durable.get(ctx.writes[index].key) else null,
+                    )) catch |err| {
                     ctx.fail(err);
                     return;
                 };
@@ -2881,6 +2970,7 @@ fn prepareRelationalRows(
         .rows = rows,
         .durable_rows = durable_rows,
         .restore_timestamps = restore_timestamps,
+        .preserve_logical_values = preserve_logical_values,
         .io = io orelse std.Options.debug_io,
     };
     if (!parallel) {
@@ -2902,6 +2992,7 @@ fn prepareRelationalRows(
 const BatchExecutionOptions = struct {
     restore_staging: ?@import("restore_staging.zig").BatchAdmission = null,
     restore_timestamps: ?*const std.StringHashMapUnmanaged(u64) = null,
+    preserve_logical_values: bool = false,
     restore_ha_request: ?types.BatchRequest = null,
     validate_range_ownership: bool = true,
     store_batch_options: backend_types.BatchOptions = .{},
@@ -2911,9 +3002,12 @@ const BatchExecutionOptions = struct {
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
     bypass_ha_write_gate: bool = false,
     ha_applied_lsn_marker: ?u64 = null,
+    online_source_applied_index: ?u64 = null,
     raft_applied_entry_marker: ?RaftAppliedEntryIdentity = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
+    extra_store_deletes: []const []const u8 = &.{},
+    merge_chunk_expected_progress: ?[32]u8 = null,
     transaction_resolution: ?TransactionResolution = null,
     durable_rows: ?*const std.StringHashMapUnmanaged([]const u8) = null,
     /// Borrowed by this synchronous call and consumed only after primary
@@ -5066,6 +5160,8 @@ const GraphRestoreParseCache = struct {
 };
 
 pub const DB = struct {
+    online_merge_reader: @import("online_merge_io.zig").Cache = .{},
+    source_publication: @import("source_publication_job.zig").Job = .{},
     restore_staging_required: std.atomic.Value(bool) = .init(false),
     table_storage: table_storage_mod.Settings = .{},
     source_vectors: ?*vector_payload_store_mod.Store = null,
@@ -5127,6 +5223,14 @@ pub const DB = struct {
     /// under apply before committing an outbox; only an apply-fenced empty scan
     /// may return it to false.
     durable_ha_outbox_maybe: std.atomic.Value(bool) = .init(true),
+    source_pin_gc_epoch: std.atomic.Value(u64) = .init(1),
+    source_pin_gc_turn: std.atomic.Value(u64) = .init(0),
+    source_pin_gc_next_ns: std.atomic.Value(u64) = .init(0),
+    source_pin_gc_failures: std.atomic.Value(u64) = .init(0),
+    source_pin_gc_failure_streak: std.atomic.Value(u64) = .init(0),
+    source_pin_gc_work_units: std.atomic.Value(u64) = .init(0),
+    source_pin_gc_error: std.atomic.Value(u32) = .init(0),
+    source_pin_gc_log_next_ns: std.atomic.Value(u64) = .init(0),
     durable_ha_flush_mutex: std.Io.Mutex = .init,
     /// Crash-left records must be replayed before this process publishes its
     /// first HA mutation. Once crossed, foreground commits append under the
@@ -5453,10 +5557,14 @@ pub const DB = struct {
     /// coverage are reconstructed independently on every replica; progress is
     /// never an HA command and cannot make a different owner query-ready.
     pub fn buildRelationalIndexStep(self: *DB, name: []const u8, budget: RelationalIndexBuildBudget) !void {
+        return self.buildRelationalIndexStepLocal(name, budget, false);
+    }
+
+    fn buildRelationalIndexStepLocal(self: *DB, name: []const u8, budget: RelationalIndexBuildBudget, replicated: bool) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var ha_mutation = self.acquireHAMutationShared();
+        var ha_mutation = if (replicated) null else self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        if (!replicated) try self.enforceHAWriteGate();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         var replay_mutation = try self.acquireSnapshotReplayMutation();
@@ -5465,7 +5573,7 @@ pub const DB = struct {
         defer page.deinit();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        try self.enforceHAWriteGate();
+        if (!replicated) try self.enforceHAWriteGate();
         try page.commit(self.core);
     }
 
@@ -5507,13 +5615,20 @@ pub const DB = struct {
             if (std.mem.eql(u8, name, index.name)) break index;
         } else return error.IndexNotFound;
         if (index.generation != generation) return error.PreparedGenerationChanged;
+        var maintenance_manager = try self.core.initTxnManager();
+        defer maintenance_manager.deinit();
+        try maintenance_manager.checkOrdinaryWriteConflict(&@import("relational_index_maintenance_contract.zig").controlKey(index.id()));
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
-        if ((try relational_index_jobs.status(&txn, index)).state != .failed) {
+        const current_progress = try relational_index_jobs.status(&txn, index);
+        if (current_progress.state != .failed) {
             txn.abort();
             return false;
         }
-        try txn.delete(&relational_index_jobs.progressKey(index.id()));
+        const reset_progress = try relational_index_jobs.resetProgress(current_progress);
+        const encoded_progress = try reset_progress.encode(self.alloc);
+        defer self.alloc.free(encoded_progress);
+        try txn.put(&relational_index_jobs.progressKey(index.id()), encoded_progress);
         try txn.commit();
         self.relational_index_maintenance_pending.store(true, .release);
         self.relational_index_retry_after_ns.store(0, .release);
@@ -6008,6 +6123,7 @@ pub const DB = struct {
                 &opened_primary.store,
                 openModeRequiresReadOnlyBackends(opts.open_mode),
             );
+            if (opts.initial_owner_range) |initial| try range_state_mod.initializeOwnerRange(alloc, &opened_primary.store, initial);
             profile.primary_store_ns = elapsedSince(open_primary_started_ns);
             const core_resources_started_ns = monotonicTimeNs();
             // openCoreResourcesFromPrimaryStore assumes ownership on entry,
@@ -6124,6 +6240,26 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
+            if (opts.online_source_authority) |authority| {
+                const source_authority = @import("../source_authority.zig");
+                const namespace = @import("online_source_contract.zig").namespaceBytes(db.core.identity_namespace);
+                if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                    var authority_txn = try db.core.store.beginWriteTxn();
+                    errdefer authority_txn.abort();
+                    try source_authority.bind(&authority_txn, authority, namespace);
+                    try authority_txn.commit();
+                } else {
+                    var authority_txn = try db.core.store.beginReadTxn();
+                    defer authority_txn.abort();
+                    if (try source_authority.load(&authority_txn) != null) _ = try source_authority.require(&authority_txn, authority, namespace);
+                }
+            }
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                try db.resumePreparedSourcePin();
+                try @import("source_pin.zig").reconcileReleased(&db);
+            } else {
+                db.source_pin_gc_epoch.store(0, .release);
+            }
             try db.initializeTableStorage(opts.table_storage);
             if (!openModeRequiresReadOnlyBackends(opts.open_mode) and
                 opts.physical_root_mode == .filesystem_managed)
@@ -6497,6 +6633,8 @@ pub const DB = struct {
     pub fn close(self: *DB) void {
         if (self.closed) return;
         self.closed = true;
+        self.source_publication.stop(self.backend_runtime.io() orelse std.Options.debug_io);
+        self.online_merge_reader.retire(self.backend_runtime.io() orelse std.Options.debug_io, null);
         self.deinitWrapperState(true);
     }
 
@@ -7947,17 +8085,17 @@ pub const DB = struct {
     pub fn lsmMaintenanceScore(self: *DB) u64 {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
-        return @max(
+        return @max(@intFromBool(self.source_pin_gc_epoch.load(.acquire) != 0), @max(
             self.core.primary_store_owner.lsmMaintenanceScore(),
             self.core.index_manager.lsmMaintenanceScore(),
-        );
+        ));
     }
 
     pub fn lsmMaintenanceDebtHint(self: *DB) u64 {
-        return @max(
+        return @max(@intFromBool(self.source_pin_gc_epoch.load(.acquire) != 0), @max(
             self.core.primary_store_owner.lsmMaintenanceDebtHint(),
             self.core.index_manager.lsmMaintenanceDebtHint(),
-        );
+        ));
     }
 
     pub fn primaryLsmMaintenanceDebtHint(self: *DB) u64 {
@@ -7967,6 +8105,10 @@ pub const DB = struct {
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *DB) ?u64 {
         var delay_ns = self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort();
         if (self.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        }
+        if (self.source_pin_gc_epoch.load(.acquire) != 0) {
+            const candidate = self.source_pin_gc_next_ns.load(.acquire) -| monotonicTimeNs();
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
         return delay_ns;
@@ -8261,6 +8403,7 @@ pub const DB = struct {
     fn runLsmMaintenanceStepWithHAMutationHeld(self: *DB) !bool {
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
+        if (self.source_pin_gc_turn.fetchAdd(1, .monotonic) % 4 == 0 and try self.runSourcePinCleanupStep()) return true;
         if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -8272,7 +8415,7 @@ pub const DB = struct {
         if (primary_score == 0 and index_score == 0) {
             self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
             self.core.index_manager.refreshLsmMaintenanceDebtHint();
-            return false;
+            return try self.runSourcePinCleanupStep();
         }
         if (primary_score >= index_score) {
             return try self.core.primary_store_owner.runLsmMaintenanceStep();
@@ -8285,6 +8428,7 @@ pub const DB = struct {
         defer if (ha_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
+        if (self.source_pin_gc_turn.fetchAdd(1, .monotonic) % 4 == 0 and try self.runSourcePinCleanupStep()) return true;
         if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -8299,7 +8443,54 @@ pub const DB = struct {
         if (primary_score > 0) {
             self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
         }
-        return false;
+        return try self.runSourcePinCleanupStep();
+    }
+
+    /// Source-pin deletion shares the LSM maintenance lane; it never creates a
+    /// dedicated thread or monopolizes compaction while the corpus is large.
+    pub fn runSourcePinCleanupStep(self: *DB) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode) or self.source_pin_gc_epoch.load(.acquire) == 0) return false;
+        if (monotonicTimeNs() < self.source_pin_gc_next_ns.load(.acquire)) return false;
+        const units_before = self.source_pin_gc_work_units.load(.acquire);
+        const work = @import("source_pin.zig").reconcileReleasedWithBudget(self, .{}) catch |err| {
+            const progressed = self.source_pin_gc_work_units.load(.acquire) != units_before;
+            self.recordSourcePinCleanupFailureWithProgress(err, progressed);
+            return progressed;
+        };
+        self.source_pin_gc_error.store(0, .release);
+        self.source_pin_gc_failure_streak.store(0, .release);
+        const progressed = work.completed_units != 0;
+        self.source_pin_gc_next_ns.store(monotonicTimeNs() +| (if (progressed) @as(u64, std.time.ns_per_ms) else 20 * std.time.ns_per_ms), .release);
+        return progressed;
+    }
+
+    pub fn recordSourcePinCleanupFailure(self: *DB, err: anyerror) void {
+        self.recordSourcePinCleanupFailureWithProgress(err, false);
+    }
+
+    fn recordSourcePinCleanupFailureWithProgress(self: *DB, err: anyerror, progressed: bool) void {
+        const failures = self.source_pin_gc_failures.fetchAdd(1, .acq_rel) +| 1;
+        const streak = self.source_pin_gc_failure_streak.fetchAdd(1, .acq_rel) +| 1;
+        const previous = self.source_pin_gc_error.swap(@intFromError(err), .acq_rel);
+        const delay = if (progressed) std.time.ns_per_ms else (20 * std.time.ns_per_ms) * (@as(u64, 1) << @as(u6, @intCast(@min(streak - 1, 8))));
+        const now = monotonicTimeNs();
+        self.source_pin_gc_next_ns.store(now +| delay, .release);
+        const log_after = self.source_pin_gc_log_next_ns.load(.acquire);
+        if ((previous != @intFromError(err) or std.math.isPowerOfTwo(streak)) and now >= log_after and
+            self.source_pin_gc_log_next_ns.cmpxchgStrong(log_after, now +| 30 * std.time.ns_per_s, .acq_rel, .acquire) == null)
+        {
+            std.log.warn("source pin cleanup pending path={s} err={s} failures={} retry_ms={}", .{ self.core.path, @errorName(err), failures, delay / std.time.ns_per_ms });
+        }
+    }
+
+    pub fn sourcePinCleanupStatus(self: *DB) struct { pending: bool, failures: u64, last_error: ?[]const u8, next_attempt_ns: u64 } {
+        const code = self.source_pin_gc_error.load(.acquire);
+        return .{
+            .pending = self.source_pin_gc_epoch.load(.acquire) != 0,
+            .failures = self.source_pin_gc_failures.load(.acquire),
+            .last_error = if (code == 0) null else @errorName(@errorFromInt(@as(u16, @intCast(code)))),
+            .next_attempt_ns = self.source_pin_gc_next_ns.load(.acquire),
+        };
     }
 
     pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
@@ -8733,7 +8924,7 @@ pub const DB = struct {
     /// same primary-store batch. Replaying the entry after a crash becomes an
     /// allocation-light no-op before transforms or derived work execute.
     fn requiresDurableLifecycleHA(req: types.BatchRequest) bool {
-        return req.restore_staging != null or req.restore_staging_scope != null or
+        return req.online_source != null or req.restore_staging != null or req.restore_staging_scope != null or
             req.relational_topology != null or req.split_transition != null or
             req.split_checkpoint != null or req.split_replication != null or
             req.merge_checkpoint != null or req.merge_replication != null;
@@ -8753,7 +8944,27 @@ pub const DB = struct {
         // admission, transform expansion, and derived-payload construction.
         // batchInternal repeats this check under the mutation lock, which is
         // the correctness fence if another caller advances the marker here.
-        if (try self.raftEntryAlreadyApplied(identity)) return;
+        if (try self.raftEntryAlreadyApplied(identity)) {
+            // Admission commits its write fence before sealing the immutable
+            // pin. A crash in that window must repair the exact pending cut
+            // before this outer replay fast path acknowledges the entry.
+            if (req.online_source) |command| if (command == .admit) {
+                try self.applyOnlineSourceBatch(req, .{
+                    .validate_range_ownership = false,
+                    .wait_for_sync_level = false,
+                    .bypass_ha_write_gate = !mirror_scoped_restore,
+                    .raft_applied_entry_marker = identity,
+                });
+            };
+            if (req.restore_staging) |command| if (command == .finish and
+                (command.finish.phase == .validated or command.finish.phase == .published))
+            {
+                const current = try readRaftAppliedEntry(self.alloc, self.core.store);
+                if (current != null and current.?.index == identity.index and current.?.term == identity.term)
+                    try self.prepareAppliedRestoreFinishReplay(req);
+            };
+            return;
+        }
         var apply_req = req;
         apply_req.sync_level = .write;
         self.batchInternal(apply_req, null, .{
@@ -8866,6 +9077,49 @@ pub const DB = struct {
         }
         try rebaseRangeCoverageMetadata(self.alloc, self.core.store, self.core.index_manager, range, metadata_writes.items);
         self.core.adoptRangeInMemoryOwned(start, end);
+    }
+
+    /// Called only under the Raft owner's completion fence. Protocol-only
+    /// entries may advance that fence without changing the native marker.
+    pub fn captureNativeRaftSnapshot(self: *DB, group_id: u64, through_index: u64) !@import("native_raft_snapshot.zig").Capture {
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        var namespace: [24]u8 = undefined;
+        doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+        {
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            try @import("../source_pin_state.zig").requireNoPrepared(&read, namespace);
+            try @import("online_source.zig").requireTransferableSnapshots(&read, namespace);
+        }
+        const marker = try readRaftAppliedEntry(self.alloc, self.core.store);
+        if (group_id == 0 or (marker != null and marker.?.index > through_index)) return error.InvalidSnapshot;
+        var primary = try self.core.pinNativeSnapshot();
+        errdefer primary.deinit();
+        switch (primary) {
+            .logical => return error.UnsupportedSnapshotFormat,
+            .lsm => |checkpoint| if (!checkpoint.storage.supportsHostPathGenerationPublication()) return error.UnsupportedSnapshotFormat,
+        }
+        return .{ .alloc = self.alloc, .io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable, .identity = .{
+            .group_id = group_id,
+            .namespace = namespace,
+            .through_index = through_index,
+            .native_term = if (marker) |value| value.term else 0,
+            .native_index = if (marker) |value| value.index else 0,
+        }, .primary = primary };
+    }
+
+    pub fn verifyNativeRaftSnapshot(self: *DB, expected: @import("native_raft_snapshot.zig").Identity) !void {
+        var namespace: [24]u8 = undefined;
+        doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &expected.namespace)) return error.InvalidSnapshot;
+        const marker = try self.raftAppliedEntry();
+        if ((if (marker) |value| value.index else 0) != expected.native_index or
+            (if (marker) |value| value.term else 0) != expected.native_term) return error.InvalidSnapshot;
+        var read = try self.core.store.beginProbeTxn();
+        defer read.abort();
+        try @import("../source_pin_state.zig").requireNoPrepared(&read, namespace);
+        try @import("online_source.zig").requireTransferableSnapshots(&read, namespace);
     }
 
     pub fn raftAppliedEntry(self: *DB) !?RaftAppliedEntryIdentity {
@@ -9044,13 +9298,42 @@ pub const DB = struct {
     }
 
     pub fn applyHAReplicationRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!void {
-        if (try self.haReplicationRecordAlreadyApplied(record)) return;
+        if (try self.haReplicationRecordAlreadyApplied(record)) {
+            // Older records remain allocation-light no-ops. Only the current
+            // receipt on a restored owner can require replica-local repair;
+            // ordinary batch replays never decode their row payload here.
+            if (record.kind == .batch_mutation and record.lsn == try self.haAppliedReplicationLsn()) {
+                // The replicated marker can precede local immutable-pin
+                // completion. Resume that exact durable cut before ACKing an
+                // already applied retry; never recapture a current live view.
+                try self.resumePreparedSourcePin();
+                if (try self.restoreStagingStatus(self.alloc)) |stored| {
+                    var progress = stored;
+                    defer progress.deinit();
+                    if (progress.value.phase == .validated or progress.value.phase == .published) {
+                        if (try ha_effects_mod.decodeRestoreFinishForReplay(self.alloc, record)) |finish|
+                            try self.prepareAppliedRestoreFinishReplay(.{ .restore_staging = .{ .finish = finish } });
+                    }
+                }
+            }
+            return;
+        }
 
         switch (record.kind) {
             .batch_mutation => {
                 var decoded = try ha_effects_mod.decodeBatchMutationRequest(self.alloc, record);
                 defer decoded.deinit();
-                try self.batchReplicatedApplyWithMarker(decoded.value.request, record.lsn);
+                if (decoded.value.request.online_source != null) {
+                    var source_req = decoded.value.request;
+                    source_req.sync_level = .write;
+                    try self.batchInternal(source_req, null, .{
+                        .validate_range_ownership = false,
+                        .wait_for_sync_level = false,
+                        .bypass_ha_write_gate = true,
+                        .ha_applied_lsn_marker = record.lsn,
+                        .online_source_applied_index = decoded.value.online_source_applied_index orelse return error.InvalidOnlineSourceCommand,
+                    });
+                } else try self.batchReplicatedApplyWithMarker(decoded.value.request, record.lsn);
             },
             .metadata_mutation => {
                 var decoded = try ha_effects_mod.decodeSchemaMetadataMutation(self.alloc, record);
@@ -9273,8 +9556,19 @@ pub const DB = struct {
     /// the global serialization fence. The bound prevents catalog churn from
     /// turning one request into unbounded CPU/provider work.
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        try @import("merge_page_contract.zig").validateRequest(req);
+        try @import("online_source_contract.zig").validateRequest(req);
+        if (req.online_source != null) return self.applyOnlineSourceBatch(req, opts);
+        if (self.core.store.retained_effects_cache.load(.acquire) != 1) {
+            var source_read = try self.core.store.beginReadTxn();
+            defer source_read.abort();
+            var source_namespace: [24]u8 = undefined;
+            doc_identity.encodeNamespace(&source_namespace, self.core.identity_namespace);
+            try @import("../source_pin_state.zig").requireNoPrepared(&source_read, source_namespace);
+        }
+        if (req.relational_index_maintenance != null and (req.restore_staging != null or req.relational_topology != null)) return error.InvalidBatchRequest;
         if (req.restore_staging) |control| {
-            if (req.transaction != null or req.relational_topology != null or req.deletes.len != 0 or req.transforms.len != 0 or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.predicates.len != 0 or req.relational_repair or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_artifacts.len != 0) return error.InvalidRestoreStagingCommand;
+            if (req.transaction != null or req.relational_topology != null or (req.deletes.len != 0 and control != .rewrite_page) or req.transforms.len != 0 or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.predicates.len != 0 or req.relational_repair or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_artifacts.len != 0) return error.InvalidRestoreStagingCommand;
             switch (control) {
                 .begin => |scope| {
                     if (req.writes.len != 0) return error.InvalidRestoreStagingCommand;
@@ -9286,8 +9580,8 @@ pub const DB = struct {
                     _ = finish;
                     return self.applyRestoreStagingControl(req, opts);
                 },
-                .import_page => |page| {
-                    if (req.writes.len > 128 or page.timestamps.len != req.writes.len or page.next.len > 8 * 1024 * 1024) return error.InvalidRestoreStagingCommand;
+                .import_page, .rewrite_page => |page| {
+                    if (req.writes.len +| req.deletes.len > 128 or page.timestamps.len != req.writes.len or page.next.len > 8 * 1024 * 1024) return error.InvalidRestoreStagingCommand;
                     var timestamps: std.StringHashMapUnmanaged(u64) = .empty;
                     defer timestamps.deinit(self.alloc);
                     var input_bytes: usize = 0;
@@ -9299,12 +9593,19 @@ pub const DB = struct {
                         if (entry.found_existing) return error.InvalidRestoreStagingCommand;
                         entry.value_ptr.* = timestamp.timestamp;
                     }
+                    for (req.deletes) |key| {
+                        input_bytes = std.math.add(usize, input_bytes, key.len) catch return error.TransactionTooLarge;
+                        if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
+                        const entry = try timestamps.getOrPut(self.alloc, key);
+                        if (entry.found_existing) return error.InvalidRestoreStagingCommand;
+                        entry.value_ptr.* = 0;
+                    }
                     var apply_req = req;
                     apply_req.restore_staging = null;
                     apply_req.sync_level = .full_index;
                     var apply_opts = opts;
                     apply_opts.wait_for_sync_level = true;
-                    apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope };
+                    apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects };
                     apply_opts.restore_timestamps = &timestamps;
                     apply_opts.restore_ha_request = req;
                     const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1);
@@ -9325,7 +9626,37 @@ pub const DB = struct {
         var preparation: RequestPreparationContext = undefined;
         preparation.init(self);
         defer preparation.deinit();
-        self.batchInternalWithPreparationAllocator(req, profile, opts, &preparation.guard) catch |err|
+        var page_timestamps: std.StringHashMapUnmanaged(u64) = .empty;
+        defer page_timestamps.deinit(self.alloc);
+        var apply_opts = opts;
+        var apply_req = req;
+        var chunk_prepared: ?@import("merge_page_chunks.zig").Prepared = null;
+        defer if (chunk_prepared) |*prepared| prepared.deinit();
+        if (req.merge_page) |page| if (page.chunk != null) {
+            chunk_prepared = self.prepareMergePageChunk(preparation.guard.allocator(), req, opts.visibility_cancellation) catch |err| return preparation.mapError(err);
+            const prepared = &chunk_prepared.?;
+            apply_req = prepared.request;
+            apply_opts.merge_chunk_expected_progress = prepared.expected_progress;
+            const extra_writes = prepared.arena.allocator().alloc(docstore_mod.KVPair, opts.extra_store_writes.len + prepared.writes.len) catch |err| return preparation.mapError(err);
+            @memcpy(extra_writes[0..opts.extra_store_writes.len], opts.extra_store_writes);
+            @memcpy(extra_writes[opts.extra_store_writes.len..], prepared.writes);
+            apply_opts.extra_store_writes = extra_writes;
+            const extra_deletes = prepared.arena.allocator().alloc([]const u8, opts.extra_store_deletes.len + prepared.deletes.len) catch |err| return preparation.mapError(err);
+            @memcpy(extra_deletes[0..opts.extra_store_deletes.len], opts.extra_store_deletes);
+            @memcpy(extra_deletes[opts.extra_store_deletes.len..], prepared.deletes);
+            apply_opts.extra_store_deletes = extra_deletes;
+            // Standby receives the same bounded command, never the assembled
+            // row re-escaped into an oversized replication JSON envelope.
+            apply_opts.restore_ha_request = req;
+        };
+        if (apply_req.merge_page) |page| if (page.phase == .rows or page.phase == .tail) {
+            if (page.chunk) |chunk| {
+                if (apply_req.writes.len != 0) try page_timestamps.put(self.alloc, chunk.row_key, chunk.timestamp);
+            } else for (apply_req.writes, page.timestamps) |row, timestamp| try page_timestamps.put(self.alloc, row.key, timestamp);
+            apply_opts.restore_timestamps = &page_timestamps;
+            apply_opts.preserve_logical_values = true;
+        };
+        self.batchInternalWithPreparationAllocator(apply_req, profile, apply_opts, &preparation.guard) catch |err|
             return preparation.mapError(err);
     }
 
@@ -9365,7 +9696,20 @@ pub const DB = struct {
         generated_memo: *GeneratedEmbeddingMemo,
         prepared_row_allocator: *PreparedRowAllocator,
     ) anyerror!void {
-        for (req.writes) |write| if (relational_index_catalog.Controller.isReservedMetadataKey(write.key)) return error.ReservedRelationalIndexMetadataKey;
+        const maintenance_contract = @import("relational_index_maintenance_contract.zig");
+        var maintenance_attempted = false;
+        defer if (maintenance_attempted) {
+            // Only a scheduling hint: the worker re-reads durable desired state.
+            // Also wake on an ambiguous result after the store committed.
+            self.relational_index_maintenance_pending.store(true, .release);
+            self.relational_index_retry_after_ns.store(0, .release);
+        };
+        for (req.writes) |write| if (relational_index_catalog.Controller.isReservedMetadataKey(write.key)) {
+            const trusted = opts.transaction_resolution != null or opts.ha_applied_lsn_marker != null;
+            if (!trusted or !maintenance_contract.isControlKey(write.key)) return error.ReservedRelationalIndexMetadataKey;
+            _ = try maintenance_contract.Control.decode(write.value);
+            maintenance_attempted = true;
+        };
         for (req.deletes) |key| if (relational_index_catalog.Controller.isReservedMetadataKey(key)) return error.ReservedRelationalIndexMetadataKey;
         for (req.transforms) |transform| if (relational_index_catalog.Controller.isReservedMetadataKey(transform.key)) return error.ReservedRelationalIndexMetadataKey;
         const schema_namespace = if (opts.transaction_resolution) |resolution|
@@ -9461,6 +9805,7 @@ pub const DB = struct {
 
         const effective_req: types.BatchRequest = .{
             .restore_staging_scope = req.restore_staging_scope,
+            .restore_staging_plan_id = req.restore_staging_plan_id,
             .relational_schema_version = req.relational_schema_version,
             .relational_integrity_generation_set = req.relational_integrity_generation_set,
             .relational_repair = req.relational_repair,
@@ -9468,6 +9813,7 @@ pub const DB = struct {
             .integrity_commands = req.integrity_commands,
             .relational_activation = req.relational_activation,
             .relational_retirement = req.relational_retirement,
+            .relational_index_maintenance = req.relational_index_maintenance,
             .writes = effective_ops.writes,
             .deletes = effective_ops.deletes,
             .graph_writes = effective_graph_writes,
@@ -9483,6 +9829,7 @@ pub const DB = struct {
             .merge_source_transition = req.merge_source_transition,
             .merge_checkpoint = req.merge_checkpoint,
             .merge_replication = req.merge_replication,
+            .merge_page = req.merge_page,
             .merge_artifacts = req.merge_artifacts,
             .transaction = req.transaction,
         };
@@ -9512,7 +9859,7 @@ pub const DB = struct {
             if (view.version() != version) return error.PreparedGenerationChanged;
         }
         // Integrity effects may only enter through durable transaction prepare.
-        if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null) return error.InvalidIntegrityOperation;
+        if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null) return error.InvalidIntegrityOperation;
         var relational_index_snapshot = self.core.relational_indexes.acquire();
         defer if (relational_index_snapshot) |*index_snapshot| index_snapshot.deinit();
         const index_ready = try preparation_alloc.alloc(bool, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan.boundIndexes().len else 0);
@@ -9596,16 +9943,23 @@ pub const DB = struct {
                     rows,
                     opts.durable_rows,
                     opts.restore_timestamps,
+                    opts.restore_staging != null or opts.preserve_logical_values,
                 );
                 if (prepared_index_keys) |*keys| {
                     var largest_document: usize = 0;
                     var largest_tuple: usize = 0;
+                    var largest_payload: usize = 0;
                     for (rows, effective_req.writes) |*maybe_row, write| {
                         const index_row = try keys.appendPrepared(&maybe_row.*.?);
                         largest_document = @max(largest_document, internal_keys.encodedComponentLen(write.key));
-                        for (keys.view.boundIndexes(), 0..) |_, index| largest_tuple = @max(largest_tuple, (try keys.key(index_row, index)).bytes.len);
+                        for (keys.view.boundIndexes(), 0..) |_, index| {
+                            const key = try keys.key(index_row, index);
+                            largest_tuple = @max(largest_tuple, key.bytes.len);
+                            largest_payload = @max(largest_payload, key.payload.len);
+                        }
                     }
                     try index_writer.reserve(largest_document, largest_tuple);
+                    try index_writer.reservePayload(largest_payload);
                 }
                 // Copy every borrowed catalog input into request-owned effects
                 // while holding only the catalog read lease. Schema/index
@@ -9789,7 +10143,7 @@ pub const DB = struct {
             var restore_read = try self.core.store.beginProbeTxn();
             defer restore_read.abort();
             if (opts.restore_staging) |admission|
-                try @import("restore_staging.zig").validateImport(preparation_alloc, &restore_read, admission, effective_req.writes.len)
+                try @import("restore_staging.zig").validateImport(preparation_alloc, &restore_read, admission, effective_req.writes.len, effective_req.deletes.len)
             else if (opts.transaction_resolution == null) {
                 if (opts.ha_applied_lsn_marker != null and effective_req.restore_staging_scope != null) {
                     try @import("restore_staging.zig").requireMutableScope(preparation_alloc, &restore_read, effective_req.restore_staging_scope);
@@ -9811,6 +10165,8 @@ pub const DB = struct {
             }
         }
 
+        var merge_page_value: ?[]u8 = null;
+        defer if (merge_page_value) |value| self.alloc.free(value);
         // Checkpoints certify a copy; payloads must use a separately fenced
         // command so a stale checkpoint cannot smuggle destructive mutations.
         if (req.merge_checkpoint != null and (req.writes.len != 0 or req.deletes.len != 0 or
@@ -9830,9 +10186,65 @@ pub const DB = struct {
                     var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
                     try self.core.store.putBatch(&.{raftAppliedEntryWrite(identity, &marker_buf)}, &.{});
                 }
+                if (opts.ha_applied_lsn_marker) |lsn| {
+                    var marker_buf: [ha_applied_lsn_value_len]u8 = undefined;
+                    try self.core.store.putBatch(&.{haAppliedReplicationLsnWrite(lsn, &marker_buf)}, &.{});
+                }
                 self.core.unlockApply();
                 apply_mutex_held = false;
                 return;
+            }
+            const pages = @import("merge_page_contract.zig");
+            const page_raw = try self.core.getStoreValue(self.alloc, pages.key);
+            defer if (page_raw) |value| self.alloc.free(value);
+            if (req.merge_page != null or page_raw != null) {
+                var progress = if (page_raw) |value| try pages.decode(self.alloc, value) else return error.MergePageSourceMissing;
+                defer progress.deinit();
+                if (progress.value.matches(replication)) {
+                    if (req.merge_page == null) return error.MergePageRequired;
+                    if (!replication.identity_namespace.eql(self.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
+                    try pages.validateRange(self.alloc, state.?, req);
+                    switch (try pages.plan(progress.value, req)) {
+                        .replay => {
+                            var marker_writes: [2]docstore_mod.KVPair = undefined;
+                            var count: usize = 0;
+                            var raft_buffer: [raft_applied_entry_value_len]u8 = undefined;
+                            var standby_buffer: [ha_applied_lsn_value_len]u8 = undefined;
+                            if (opts.raft_applied_entry_marker) |identity| {
+                                marker_writes[count] = raftAppliedEntryWrite(identity, &raft_buffer);
+                                count += 1;
+                            }
+                            if (opts.ha_applied_lsn_marker) |lsn| {
+                                marker_writes[count] = haAppliedReplicationLsnWrite(lsn, &standby_buffer);
+                                count += 1;
+                            }
+                            if (count != 0) try self.core.store.putBatch(marker_writes[0..count], &.{});
+                            self.core.unlockApply();
+                            apply_mutex_held = false;
+                            return;
+                        },
+                        .apply => |next| {
+                            if (req.merge_page.?.chunk != null) {
+                                const expected = opts.merge_chunk_expected_progress orelse return error.InvalidMergePage;
+                                if (!std.mem.eql(u8, &expected, &@import("merge_page_chunks.zig").checksum(page_raw.?))) return error.MergePageSequenceGap;
+                            }
+                            if (req.merge_page.?.phase == .cleanup) try self.validateMergeCleanupPageLocked(state.?, req);
+                            if (req.merge_page.?.phase == .cleanup_integrity) {
+                                const merged = state.?.merged_range orelse return error.InvalidMergeState;
+                                const base = state.?.receiver_base_range;
+                                const donor: types.ByteRange = if (!std.mem.eql(u8, merged.start, base.start)) .{ .start = merged.start, .end = base.start } else .{ .start = base.end, .end = merged.end };
+                                var cleanup_scan = try self.core.store.beginCurrentScanTxn();
+                                defer cleanup_scan.abort();
+                                var cleanup_arena = std.heap.ArenaAllocator.init(self.alloc);
+                                defer cleanup_arena.deinit();
+                                const expected = try @import("online_integrity_shadow.zig").cleanup(cleanup_arena.allocator(), &cleanup_scan, donor, req.merge_page.?.after);
+                                if (expected.effects.len != req.merge_page.?.integrity.len or expected.exhausted != req.merge_page.?.exhausted) return error.InvalidMergePage;
+                                for (expected.effects, req.merge_page.?.integrity) |left, right| if (!std.mem.eql(u8, left.key, right.key) or right.value != null) return error.InvalidMergePage;
+                            }
+                            merge_page_value = try pages.encode(self.alloc, next);
+                        },
+                    }
+                } else if (req.merge_page != null) return error.MergePageSourceMissing;
             }
         };
 
@@ -9892,6 +10304,11 @@ pub const DB = struct {
                 if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - reacquire_wait_start_ns;
                 apply_mutex_held = true;
                 apply_lock_acquired_ns = monotonicTimeNs();
+                // A merge page's authority includes the exact durable cursor
+                // observed above. Flushing released that fence; another page
+                // or cancellation may have won meanwhile. Reprepare/recheck
+                // instead of committing the previously computed progress.
+                if (req.merge_page != null) return error.PreparedGenerationChanged;
             }
         }
 
@@ -9902,10 +10319,18 @@ pub const DB = struct {
             coordinated_handoff = try @import("relational_integrity_handoff.zig").admitSplitRequest(self.alloc, &topology_read, req);
             if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
         }
-        if (req.merge_replication != null or req.merge_checkpoint != null) {
+        if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
             var topology_read = try self.core.store.beginProbeTxn();
             defer topology_read.abort();
-            coordinated_handoff = try @import("relational_integrity_handoff.zig").admitMergeRequest(self.alloc, &topology_read, req);
+            // Source retention remains authoritative after its brief pin
+            // fence is released. Receiving another merge would replace that
+            // source's range state while its immutable cut/tail are in use.
+            if (try @import("../retained_effects.zig").load(&topology_read)) |retained| {
+                const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+                if (retained.active() and std.mem.eql(u8, &retained.namespace, &namespace)) return error.IntegrityTopologyBusy;
+            }
+            coordinated_handoff = try @import("online_integrity_shadow.zig").admit(self.alloc, &topology_read, req, self.core.identity_namespace);
+            if (!coordinated_handoff) coordinated_handoff = try @import("relational_integrity_handoff.zig").admitMergeRequest(self.alloc, &topology_read, req);
             if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
         }
         // HA carries already committed effects, including prepared decisions
@@ -10021,11 +10446,19 @@ pub const DB = struct {
         };
         var index_stage: ?relational_index_records.Staged = if (index_read) |*read| relational_index_records.Staged.init(preparation_alloc, read) else null;
         defer if (index_stage) |*stage| stage.deinit();
+        var prior_membership = try RelationalPriorMembership.init(preparation_alloc, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan else null);
+        defer prior_membership.deinit();
         // Consume the coalesced logical request, not raw input ordering. API
         // deletes win over writes; transforms may subsequently recreate a row.
         // Its effective write/delete sets are disjoint.
         if (index_stage) |*stage| for (effective_req.deletes) |key| {
-            if (!isMetadataKey(key)) try stage.deleteDocument(&index_writer, key);
+            if (isMetadataKey(key)) continue;
+            const plan = relational_index_snapshot.?.plan;
+            const members = try prior_membership.read(self, &index_read.?, plan, index_ready, key);
+            if (members.len != 0) for (plan.boundIndexes(), members) |index, member| {
+                if (member) _ = try stage.deleteIndex(&index_writer, index.id(), key, .indexed);
+            };
+            try stage.deleteDocument(&index_writer, key);
         };
         var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer store_writes.deinit(self.alloc);
@@ -10137,23 +10570,21 @@ pub const DB = struct {
                 preprepared_rows.?[i] = null;
                 break :blk prepared;
             } else if (apply_schema_view) |view|
-                try mapper.PreparedRelationalWrite.initFromIntent(
-                    self.alloc,
-                    write.key,
-                    write.value,
-                    view.validator(),
-                    view.tableSchema().*,
-                    view.physicalLayout(),
-                    if (opts.durable_rows) |durable| durable.get(write.key) else null,
-                )
+                if (opts.restore_staging != null or opts.preserve_logical_values)
+                    try mapper.PreparedRelationalWrite.initPreserved(self.alloc, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout())
+                else
+                    try mapper.PreparedRelationalWrite.initFromIntent(
+                        self.alloc,
+                        write.key,
+                        write.value,
+                        view.validator(),
+                        view.tableSchema().*,
+                        view.physicalLayout(),
+                        if (opts.durable_rows) |durable| durable.get(write.key) else null,
+                    )
             else
                 null;
             defer if (prepared_relational) |*prepared| prepared.deinit(self.alloc);
-            if (index_stage) |*stage| if (prepared_relational) |*prepared| {
-                const keys = &prepared_index_keys.?;
-                const row = if (use_preprepared_rows) i else try keys.appendPrepared(prepared);
-                try stage.upsertPreparedWithReadiness(&index_writer, relational_index_snapshot.?.plan, keys, row, write.key, index_ready);
-            };
             var fallback_consumer_plan = if (!use_preprepared_rows and prepared_relational != null) try self.core.index_manager.acquireWritePlanSnapshot() else null;
             defer if (fallback_consumer_plan) |*plan| plan.release();
             if (fallback_consumer_plan) |plan| try requireRelationalConsumerFields(&prepared_relational.?, apply_schema_view.?.tableSchema().*, plan.plan().*, false);
@@ -10169,6 +10600,9 @@ pub const DB = struct {
                 prepared.takeExtracted()
             else
                 try mapper.extractWrite(self.alloc, write.key, write.value);
+            // Ownership has transferred even if a later graph/vector consumer
+            // rejects this row. Include it in error cleanup immediately.
+            extracted_initialized += 1;
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_mapper_ns, mapper_extract_start_ns);
             const graph_field_extract_start_ns = monotonicTimeNs();
             if (!use_preprepared_rows) {
@@ -10186,7 +10620,6 @@ pub const DB = struct {
                     try self.core.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(self.alloc, write.key, write.value, &extracted[i]);
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_index_field_embeddings_ns, index_field_embeddings_start_ns);
-            extracted_initialized += 1;
             const embedding_artifacts_start_ns = monotonicTimeNs();
             if (use_preprepared_rows) {
                 const effects = &preprepared_effects.?[i];
@@ -10258,6 +10691,18 @@ pub const DB = struct {
                     null;
                 if (!use_preprepared_rows) if (prepared_relational) |*prepared|
                     try prepared.finalizeMetadata(resolved_write_timestamp_ns orelse 0);
+                // Covering values carry the authoritative full-row timestamp
+                // and semantic hash. Prepare/stage fallback index effects only
+                // after those metadata fields have been finalized.
+                if (index_stage) |*stage| if (prepared_relational) |*prepared| {
+                    const keys = &prepared_index_keys.?;
+                    const row = if (use_preprepared_rows) i else try keys.appendPrepared(prepared);
+                    const plan = relational_index_snapshot.?.plan;
+                    // Effective writes/deletes are coalesced before this loop,
+                    // so the pinned base is the exact prior row for each key.
+                    const members = try prior_membership.read(self, &index_read.?, plan, index_ready, write.key);
+                    try stage.upsertPreparedWithMembership(&index_writer, plan, keys, row, write.key, index_ready, members);
+                };
                 if (!use_preprepared_rows) {
                     if (prepared_relational) |*prepared|
                         try validateDocumentExtractionInlineSourcesSnapshotParsed(self.alloc, self, fallback_consumer_plan.?.plan().*, prepared.parsedValue(), extracted[i])
@@ -10371,6 +10816,10 @@ pub const DB = struct {
         // publish the newly prepared physical row even when derived content is
         // unchanged. The derived journal remains safely elided in both modes.
         for (overwrite_probe_entries.items) |entry| {
+            // Prepared retention credits bind the new physical afterimage.
+            // Keeping a semantically equal but arbitrarily larger old JSON
+            // value while updating TTL would violate that durable bound.
+            if (opts.transaction_resolution != null) continue;
             if (derived_changed_flags[entry.write_index]) continue;
             if (internal_keys.isRelationalRowKey(entry.key)) continue;
             semantic_noop_store_keys.putAssumeCapacity(entry.key, {});
@@ -10632,7 +11081,8 @@ pub const DB = struct {
             active_profile.identity_metadata_writes += @intCast(identity_writes.items.len);
         }
         const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
-        if (pending_identity_visibility_summary) |summary| {
+        const merge_count_prepared = try @import("merge_cardinality.zig").prepare(self.alloc, self.core.store, effective_req, identity_upsert_keys.items, effective_req.deletes, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
+        if (!merge_count_prepared) if (pending_identity_visibility_summary) |summary| {
             try range_cardinality.appendIdentityTransitionAlloc(
                 self.alloc,
                 self.core.store,
@@ -10641,10 +11091,10 @@ pub const DB = struct {
                 summary.live_ordinals,
                 &identity_writes,
             );
-        }
+        };
         var next_table_catalog: ?table_catalog_mod.Catalog = null;
         var table_catalog_value: [table_catalog_mod.encoded_len]u8 = undefined;
-        if (pending_identity_visibility_summary != null) {
+        if (pending_identity_visibility_summary != null or merge_count_prepared) {
             var catalog = self.core.table_catalog;
             const previous = catalog;
             catalog.mode_initialized = true;
@@ -10666,6 +11116,25 @@ pub const DB = struct {
                 catalog.row_count != previous.row_count or
                 catalog.reconciled != previous.reconciled)
             {
+                catalog.generation +|= 1;
+                table_catalog_value = catalog.encode();
+                next_table_catalog = catalog;
+            }
+        } else if (self.core.table_catalog.row_count == 0 and (effective_req.writes.len != 0 or effective_req.deletes.len != 0)) {
+            // An older/unreconciled owner can contain primary rows but lack a
+            // visibility summary. Absence of a counter is not an empty-table
+            // proof: a write proves presence, while a delete keeps it unknown
+            // unless one bounded user-namespace probe proves the prior root
+            // empty. Never grant empty-table CHECK/rewrite admission from zero
+            // metadata on a populated root. A later explicit reconciliation
+            // may clear this conservative presence bit after delete-only work.
+            const has_user_data = effective_req.writes.len != 0 or try storeHasUserDataBounded(self.core.store);
+            if (has_user_data) {
+                var catalog = self.core.table_catalog;
+                catalog.mode_initialized = true;
+                catalog.storage_mode = if (self.core.schema) |table_schema| table_schema.storage_mode else .document;
+                catalog.active_schema_version = if (self.core.schema) |table_schema| table_schema.version else 0;
+                catalog.row_count = 1;
                 catalog.generation +|= 1;
                 table_catalog_value = catalog.encode();
                 next_table_catalog = catalog;
@@ -10827,6 +11296,7 @@ pub const DB = struct {
         defer if (merge_range_value) |value| self.alloc.free(value);
         var merge_state_value = std.ArrayListUnmanaged(u8).empty;
         defer merge_state_value.deinit(self.alloc);
+        if (merge_page_value) |value| try store_writes.append(self.alloc, .{ .key = @import("merge_page_contract.zig").key, .value = value });
         var split_sequence_buf: [8]u8 = undefined;
         var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
         var persisted_range: ?types.ByteRange = null;
@@ -10896,6 +11366,43 @@ pub const DB = struct {
                 checkpoint,
             );
             defer plan.deinit(self.alloc);
+            const pages = @import("merge_page_contract.zig");
+            if ((checkpoint.page_source != null) != (checkpoint.page_receiver_namespace != null) or
+                (checkpoint.page_source != null and checkpoint.kind != .begin_copy and !(checkpoint.kind == .accept and checkpoint.page_source.?.integrity != null))) return error.InvalidMergeCheckpoint;
+            const page_raw = try self.core.getStoreValue(self.alloc, pages.key);
+            defer if (page_raw) |value| self.alloc.free(value);
+            var page_progress = if (page_raw) |value| try pages.decode(self.alloc, value) else null;
+            defer if (page_progress) |*value| value.deinit();
+            const page_plan = try pages.checkpointPlan(existing_state, plan.state, checkpoint, if (page_progress) |value| value.value else null);
+            switch (page_plan) {
+                .unchanged => {},
+                .clear => try delete_keys.append(self.alloc, pages.key),
+                .bind => |progress| {
+                    if (!progress.receiver_namespace.eql(self.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
+                    merge_page_value = try pages.encode(self.alloc, progress);
+                    try store_writes.append(self.alloc, .{ .key = pages.key, .value = merge_page_value.? });
+                },
+            }
+            if (page_plan != .unchanged) {
+                const chunks = @import("merge_page_chunks.zig");
+                const manifest = self.core.store.get(self.alloc, chunks.manifest_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                defer if (manifest) |value| self.alloc.free(value);
+                if (manifest) |value| {
+                    const count = try chunks.slotCount(value);
+                    for (0..count) |i| {
+                        const slot_key = try chunks.slotKey(self.alloc, @intCast(i));
+                        owned_store_keys.append(self.alloc, slot_key) catch |err| {
+                            self.alloc.free(slot_key);
+                            return err;
+                        };
+                        try delete_keys.append(self.alloc, slot_key);
+                    }
+                    try delete_keys.append(self.alloc, chunks.manifest_key);
+                }
+            }
             persisted_range = plan.range;
             persisted_range_start_owned = try self.alloc.dupe(u8, plan.range.start);
             persisted_range_end_owned = try self.alloc.dupe(u8, plan.range.end);
@@ -10910,6 +11417,21 @@ pub const DB = struct {
                 .value = merge_state_value.items,
             });
             try delete_keys.append(self.alloc, merge_state_mod.legacy_key);
+            const shadow = @import("online_integrity_shadow.zig");
+            if ((checkpoint.kind == .begin_copy or (checkpoint.kind == .accept and plan.state.copy_attempt.sequence == 0)) and plan.state.phase == .accepting and checkpoint.page_source != null and checkpoint.page_source.?.integrity != null) {
+                const shadow_state = try std.json.Stringify.valueAlloc(self.alloc, shadow.State{ .source = checkpoint.page_source.?, .context = .{ .transition_id = checkpoint.transition_id, .donor_group_id = checkpoint.donor_group_id, .receiver_group_id = checkpoint.receiver_group_id, .identity_namespace = self.core.identity_namespace, .copy_attempt = checkpoint.copy_attempt } }, .{});
+                try owned_store_values.append(self.alloc, shadow_state);
+                try store_writes.append(self.alloc, .{ .key = shadow.key, .value = shadow_state });
+                const serving_range = try range_state_mod.encodeRangeAlloc(self.alloc, plan.state.receiver_base_range);
+                try owned_store_values.append(self.alloc, serving_range);
+                try store_writes.append(self.alloc, .{ .key = shadow.range_key, .value = serving_range });
+            }
+            if (coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
+                // Keep one bounded exact-source terminal receipt for lost
+                // checkpoint responses. A new transition replaces it; only
+                // the serving-range override controls live shadow admission.
+                try delete_keys.append(self.alloc, shadow.range_key);
+            }
             if (coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
                 const catalog = @import("relational_integrity_catalog.zig");
                 const raw_catalog = try self.core.store.get(self.alloc, catalog.key);
@@ -10944,6 +11466,23 @@ pub const DB = struct {
             &owned_store_values,
         );
         try store_writes.appendSlice(self.alloc, opts.extra_store_writes);
+        if (req.merge_page) |page| if (page.integrity.len != 0) {
+            // Private page shape, exact generation/ownership and replay cursor
+            // have been checked under this same apply fence. The physical
+            // shadow records commit with primary/index effects and receipt.
+            if (!coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
+            const catalog_mod = @import("relational_integrity_catalog.zig");
+            const raw = try self.core.store.get(self.alloc, catalog_mod.key);
+            defer self.alloc.free(raw);
+            var compiled = try catalog_mod.decode(self.alloc, raw);
+            defer compiled.deinit();
+            for (page.integrity) |effect| {
+                const address = (try @import("relational_integrity_contract.zig").parseKey(effect.key)).address;
+                if (page.phase != .cleanup_integrity and compiled.findGeneration(address.generation) == null) return error.IntegrityCatalogChanged;
+                if (effect.value) |value| try store_writes.append(self.alloc, .{ .key = effect.key, .value = value }) else try delete_keys.append(self.alloc, effect.key);
+            }
+        };
+        try delete_keys.appendSlice(self.alloc, opts.extra_store_deletes);
         if (index_stage) |*stage| {
             const effects = try stage.seal();
             try store_writes.appendSlice(self.alloc, effects.writes);
@@ -21480,14 +22019,96 @@ pub const DB = struct {
         }) };
     }
 
+    fn lookupRelationalIndexStatus(self: *DB, alloc: Allocator, bytes: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+        const contract = @import("relational_index_status_contract.zig");
+        if (bytes.len > 4096) return error.InvalidArgument;
+        var request = try std.json.parseFromSlice(contract.Request, alloc, bytes, .{});
+        defer request.deinit();
+        if (request.value.name) |name| if (name.len == 0 or name.len > 1024) return error.InvalidArgument;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const temporary = arena.allocator();
+        var statuses: std.ArrayList(contract.NamedStatus) = .empty;
+        // Capture one owner snapshot, then release the apply lock and storage
+        // snapshot before JSON encoding/network delivery. All escaped slices
+        // below are request-owned, not borrowed from a retired schema plan.
+        {
+            try self.lockApplySharedForPortableRuntime();
+            defer self.core.unlockApplyShared();
+            var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+            defer view.release();
+            if (view.storageMode() != .relational) return error.RelationalTableRequired;
+            if (view.version() != request.value.schema_version) return error.PreparedGenerationChanged;
+            var pinned = self.core.relational_indexes.acquire() orelse return error.IndexNotFound;
+            defer pinned.deinit();
+            if (pinned.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const range = self.core.byteRange();
+            var admitted_bytes: usize = 0;
+            for (pinned.plan.boundIndexes()) |index| {
+                if (request.value.name) |name| if (!std.mem.eql(u8, index.name, name)) continue;
+                // JSON's worst case is six bytes per input byte. Admit before
+                // materializing status arrays or encoding escaped range keys.
+                admitted_bytes +|= 2048 +| (6 *| (index.name.len +| range.start.len +| range.end.len));
+                if (admitted_bytes > contract.max_response_bytes) return error.ResourceBudgetExceeded;
+            }
+            const range_start = try temporary.dupe(u8, range.start);
+            const range_end = try temporary.dupe(u8, range.end);
+            const ownership = try relational_index_jobs.ownership(&read);
+            for (pinned.plan.boundIndexes()) |index| {
+                try checkLookupOptionsActive(opts);
+                if (request.value.name) |name| if (!std.mem.eql(u8, index.name, name)) continue;
+                const proof = try relational_index_jobs.statusProofWithOwnership(&read, index, ownership);
+                const progress = proof.progress;
+                const value = contract.Status{
+                    .table_id = self.core.identity_namespace.table_id,
+                    .schema_version = view.version(),
+                    .generation = index.generation,
+                    .slot = index.slot,
+                    .catalog = pinned.head.blob_digest,
+                    .comparison = progress.comparison,
+                    .owner = progress.owner,
+                    .range_start = range_start,
+                    .range_end = range_end,
+                    .state = switch (progress.state) {
+                        .building => .building,
+                        .ready => .ready,
+                        .failed => .failed,
+                    },
+                    .rows_scanned = progress.rows_scanned,
+                    .progress_digest = proof.digest,
+                    .maintenance_epoch = proof.maintenance_epoch,
+                    .last_maintenance_request = proof.last_maintenance_request,
+                    .failure = switch (progress.failure) {
+                        .none => .none,
+                        .incompatible_schema => .incompatible_schema,
+                        .invalid_row => .invalid_row,
+                    },
+                };
+                try statuses.append(temporary, .{ .name = try temporary.dupe(u8, index.name), .status = value });
+            }
+        }
+        if (request.value.name != null and statuses.items.len == 0) return error.IndexNotFound;
+        try checkLookupOptionsActive(opts);
+        const json = if (request.value.name != null)
+            try std.json.Stringify.valueAlloc(alloc, statuses.items[0].status, .{})
+        else
+            try std.json.Stringify.valueAlloc(alloc, contract.Batch{ .statuses = statuses.items }, .{});
+        errdefer alloc.free(json);
+        if (json.len > contract.max_response_bytes) return error.ResourceBudgetExceeded;
+        try checkLookupOptionsActive(opts);
+        return .{ .json = json };
+    }
+
     fn lookupRelationalIntegrityAction(self: *DB, alloc: Allocator, routing: []const u8) !?types.LookupResult {
         const integrity = @import("relational_integrity.zig");
         if (routing.len != 32) return error.InvalidIntegrityAddress;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        if (!self.core.byteRange().contains(routing)) return error.KeyOutOfRange;
         var read = try integrity.CurrentView.init(self.core.store);
         defer read.deinit();
+        try @import("online_integrity_shadow.zig").requireServing(&read, self.core.byteRange(), routing);
         var prefix: [integrity.namespace.len + 1 + 32]u8 = undefined;
         @memcpy(prefix[0..integrity.namespace.len], integrity.namespace);
         prefix[integrity.namespace.len] = @intFromEnum(integrity.Kind.job);
@@ -21546,9 +22167,9 @@ pub const DB = struct {
         } else null;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        const range = self.core.byteRange();
         var read = try integrity.CurrentView.init(self.core.store);
         defer read.deinit();
+        const range = try @import("online_integrity_shadow.zig").servingRange(&read, self.core.byteRange());
         const prefix = integrity.namespace ++ &[_]u8{@intFromEnum(integrity.Kind.job)};
         const lower = try std.mem.concat(owned, u8, &.{ prefix, range.start });
         const start = if (after) |key| if (std.mem.order(u8, key, lower) == .gt) key else lower else lower;
@@ -21612,9 +22233,9 @@ pub const DB = struct {
         } else null;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        if (!self.core.byteRange().contains(&address.routing)) return error.KeyOutOfRange;
         var read = try integrity.CurrentView.init(self.core.store);
         defer read.deinit();
+        try @import("online_integrity_shadow.zig").requireServing(&read, self.core.byteRange(), &address.routing);
         const raw_claim = read.get(&address.claimKey()) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
@@ -21680,6 +22301,7 @@ pub const DB = struct {
             try @import("restore_staging.zig").requireScope(alloc, &staging_read, opts.restore_staging_scope, false);
         }
         if (opts.relational_topology_json.len != 0) return self.lookupRelationalTopology(alloc, opts.relational_topology_json);
+        if (opts.relational_index_status_json.len != 0) return self.lookupRelationalIndexStatus(alloc, opts.relational_index_status_json, opts);
         if (opts.relational_activation_json.len != 0) return self.lookupRelationalActivation(alloc, opts.relational_activation_json);
         if (opts.relational_integrity_catalog) return self.lookupRelationalIntegrityCatalog(alloc);
         if (opts.relational_integrity_action) return self.lookupRelationalIntegrityAction(alloc, key);
@@ -21880,7 +22502,8 @@ pub const DB = struct {
                 try @import("relational_integrity_json.zig").write(response, jw);
             }
         };
-        return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .catalog = raw_catalog, .progress = raw_progress, .owner = try activation.ownership(&read), .range_start = self.core.byteRange().start, .range_end = self.core.byteRange().end }, .{}) };
+        const serving_range = try @import("online_integrity_shadow.zig").servingRange(&read, self.core.byteRange());
+        return .{ .json = try std.json.Stringify.valueAlloc(alloc, Response{ .catalog = raw_catalog, .progress = raw_progress, .owner = try activation.ownership(&read), .range_start = serving_range.start, .range_end = serving_range.end }, .{}) };
     }
 
     fn lookupRelationalActivation(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
@@ -21894,19 +22517,6 @@ pub const DB = struct {
             var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
             defer view.release();
             const public_schema = (view.validator() orelse return error.ConstraintNotFound).schema;
-            var fields = std.ArrayList([]const u8).empty;
-            defer fields.deinit(alloc);
-            var selected = std.StringHashMapUnmanaged(void).empty;
-            defer selected.deinit(alloc);
-            // Backfill derives only constraint tuples, not replacement rows.
-            // Project the union of their columns and preserve source versions
-            // rather than materializing unrelated potentially large payloads.
-            if (public_schema.unique_constraints) |constraints| for (constraints.value) |constraint| {
-                for (constraint.columns) |column| if (!(try selected.getOrPut(alloc, column)).found_existing) try fields.append(alloc, column);
-            };
-            if (public_schema.foreign_keys) |constraints| for (constraints.value) |constraint| {
-                for (constraint.child_columns) |column| if (!(try selected.getOrPut(alloc, column)).found_existing) try fields.append(alloc, column);
-            };
             // Reserve half the native admission credits for encoded tuple and
             // existing claim bytes. The worker can shrink further when actual
             // values exceed this declaration-only estimate.
@@ -21914,7 +22524,7 @@ pub const DB = struct {
             const foreign_count = if (public_schema.foreign_keys) |values| values.value.len else 0;
             const per_row = @max(@as(usize, 1), @max(unique_count, foreign_count));
             const declaration_limit = @max(@as(usize, 1), @import("relational_integrity.zig").max_commands / (2 * per_row));
-            var page = (try activation.Page.prepare(alloc, self.backend_runtime.io(), self.core, fields.items, .{ .rows = @min(request.value.max_rows, declaration_limit), .output_bytes = 1024 * 1024 })) orelse return null;
+            var page = (try activation.Page.prepare(alloc, self.backend_runtime.io(), self.core, .{ .rows = @min(request.value.max_rows, declaration_limit), .output_bytes = 1024 * 1024 })) orelse return null;
             defer page.deinit();
             if (page.progress.schema_version != view.version()) return error.PreparedGenerationChanged;
             const Row = struct { key: []const u8, json: []const u8, version: u64, expected_content_digest: ?[32]u8 };
@@ -21943,8 +22553,9 @@ pub const DB = struct {
         var catalog = try catalog_mod.decode(alloc, raw_catalog);
         defer catalog.deinit();
         const progress = try activation.status(&read, catalog);
-        const range = self.core.byteRange();
+        const range = try @import("online_integrity_shadow.zig").servingRange(&read, self.core.byteRange());
         if (request.value.mode == .retry) {
+            try @import("online_integrity_shadow.zig").requireCatalogMutable(&read);
             if ((request.value.schema_version orelse return error.InvalidConstraintActivation) != catalog.schema_version) return error.PreparedGenerationChanged;
             if (progress.state != .invalid) return null;
             const next = try (try progress.retry(catalog)).encode(alloc);
@@ -22735,6 +23346,10 @@ pub const DB = struct {
     /// Portable logical rows from the identical immutable cut used by native
     /// cohorts. The live root may already have resumed writes at this point.
     pub fn exportBackupCohortPortable(self: *DB, handle: @import("native_backup_seal.zig").Handle, writer: *std.Io.Writer, options: portable_backup.ExportOptions, cancellation: types.CancellationToken) !void {
+        if (options.source_certificate) |certificate| certificate.output.* = null;
+        errdefer if (options.source_certificate) |certificate| {
+            certificate.output.* = null;
+        };
         if (!handle.fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
         try lockAtomicWithCancellation(&self.snapshot_publication_mutex, cancellation);
         defer self.snapshot_publication_mutex.unlock();
@@ -23209,6 +23824,71 @@ pub const DB = struct {
         try self.core.index_manager.syncAll(force);
     }
 
+    fn prepareMergePageChunk(self: *DB, alloc: Allocator, req: types.BatchRequest, cancellation: types.CancellationToken) !@import("merge_page_chunks.zig").Prepared {
+        const chunks = @import("merge_page_chunks.zig");
+        self.core.lockApplyShared();
+        var locked = true;
+        defer if (locked) self.core.unlockApplyShared();
+        var txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer txn.abort();
+        const raw = txn.get(merge_state_mod.key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        var state = if (raw) |value| try merge_state_mod.decodeAlloc(alloc, value) else null;
+        defer if (state) |*value| value.deinit(alloc);
+        const allowed = merge_state_mod.copyAllowed(state, req.merge_replication.?);
+        self.core.unlockApplyShared();
+        locked = false;
+        // The regular apply fence retains its existing committed-stale-entry
+        // no-op behavior, without trying to read a discarded attempt's spool.
+        if (!allowed) return chunks.Prepared.init(alloc, req);
+        var reader: chunks.NativeReader = .{ .txn = &txn };
+        return chunks.prepare(alloc, &reader, req, cancellation);
+    }
+
+    pub fn mergeCopyPageStatus(self: *DB, alloc: Allocator) !?std.json.Parsed(@import("merge_page_contract.zig").Progress) {
+        const pages = @import("merge_page_contract.zig");
+        const raw = (try self.core.getStoreValue(alloc, pages.key)) orelse return null;
+        defer alloc.free(raw);
+        return try pages.decode(alloc, raw);
+    }
+
+    /// Receiver-owned cleanup must prove it did not skip retained primary
+    /// rows. The cursor and deletes are checked under their commit fence;
+    /// exhaustion is never accepted solely on a sender's assertion.
+    fn validateMergeCleanupPageLocked(self: *DB, state: merge_state_mod.State, req: types.BatchRequest) !void {
+        const page = req.merge_page.?;
+        const merged = state.merged_range.?;
+        const donor: types.ByteRange = if (!std.mem.eql(u8, merged.start, state.receiver_base_range.start))
+            .{ .start = merged.start, .end = state.receiver_base_range.start }
+        else
+            .{ .start = state.receiver_base_range.end, .end = merged.end };
+        const lower = if (page.after.len != 0) try internal_keys.documentKeyAlloc(self.alloc, page.after) else try documentRangeLowerAlloc(self.alloc, donor.start);
+        defer self.alloc.free(lower);
+        const upper = if (donor.end.len != 0) try documentRangeLowerAlloc(self.alloc, donor.end) else null;
+        defer if (upper) |value| self.alloc.free(value);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        // Cleanup does not need row payload hydration or JSON reconstruction.
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        cursor.setUpperBound(upper);
+        var index: usize = 0;
+        var item = try cursor.seekAtOrAfter(lower);
+        while (item) |row| : (item = try cursor.next()) {
+            if (upper) |bound| if (std.mem.order(u8, row.key, bound) != .lt) break;
+            if (!internal_keys.isStoredDocumentRowKey(row.key)) continue;
+            const logical = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, row.key)).?;
+            defer self.alloc.free(logical);
+            if (page.after.len != 0 and std.mem.order(u8, logical, page.after) != .gt) continue;
+            if (index == req.deletes.len or !std.mem.eql(u8, logical, req.deletes[index])) return error.InvalidMergePage;
+            index += 1;
+            if (index == req.deletes.len and !page.exhausted) return;
+        }
+        if (index != req.deletes.len) return error.InvalidMergePage;
+    }
+
     /// Raw primary outcomes for a transition snapshot. Do not use public scan
     /// projection here: it can hydrate derived fields into the returned JSON.
     pub fn mergeDocumentsPage(self: *DB, alloc: Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) ![]types.BatchWrite {
@@ -23554,6 +24234,39 @@ pub const DB = struct {
         _ = try restored.rebuildSparseIndexesForTargetCoverage(alloc);
         try restored.rebuildGraphIndexesForTargetCoverage(alloc);
         try restored.core.index_manager.syncAll(true);
+    }
+
+    /// An NRSP primary is already verified and complete. Reconstruct only
+    /// derived projections in its unpublished generation; never run optional
+    /// transaction recovery or advance the replicated mutation watermark.
+    pub fn repairNativeRaftSnapshot(
+        alloc: Allocator,
+        staged: *const generation_lifecycle.StagedGeneration,
+        identity: @import("native_raft_snapshot.zig").Identity,
+        root_generation: u64,
+    ) !void {
+        try staged.validatePath(staged.path());
+        const options: OpenOptions = .{
+            .staged_generation = staged,
+            .open_mode = .writer_no_replay,
+            .start_optional_runtimes = false,
+            .start_index_workers = false,
+            .lsm_root_generation = root_generation,
+            .identity_namespace = .{
+                .table_id = std.mem.readInt(u64, identity.namespace[0..8], .big),
+                .shard_id = std.mem.readInt(u64, identity.namespace[8..16], .big),
+                .range_id = std.mem.readInt(u64, identity.namespace[16..24], .big),
+            },
+        };
+        try finishSnapshotRuntimeRepair(alloc, staged.path(), options);
+        // Prove a fresh owner can use the files, not merely the rebuilding
+        // owner's transient in-memory structures.
+        var verify = try DB.open(alloc, staged.path(), options);
+        defer verify.close();
+        try verify.verifyNativeRaftSnapshot(identity);
+        if (verify.core.index_manager.hasLoadFailures() or verify.core.index_manager.hasRepairUnavailableIndexes()) return error.RestoreIndexLoadIncomplete;
+        try verify.core.index_manager.syncAll(true);
+        try verify.core.syncStore(true);
     }
 
     pub fn restoreSnapshotToStagedGeneration(
@@ -25162,6 +25875,38 @@ pub const DB = struct {
         return state.row_count;
     }
 
+    /// Reinstall an already durable owner descriptor without requiring mutation
+    /// authority. All schema/catalog/coverage effects must be exact no-ops; a
+    /// changed descriptor returns false and must use setSchemaJson instead.
+    pub fn rehydrateSchemaJson(self: *DB, schema_json: []const u8) !bool {
+        var parsed_schema = try public_table_schema.parseValidatedTableSchema(self.alloc, schema_json);
+        defer parsed_schema.deinit(self.alloc);
+        const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(self.alloc, parsed_schema);
+        defer schema_mod.freeSchema(self.alloc, runtime_schema);
+        const versioned_public_key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, runtime_schema.version);
+        defer self.alloc.free(versioned_public_key);
+        const writes = [_]docstore_mod.KVPair{
+            .{ .key = public_schema_json_key, .value = schema_json },
+            .{ .key = versioned_public_key, .value = schema_json },
+        };
+        var prepared_schema = try self.core.prepareSchemaMetadata(runtime_schema, &writes);
+        defer prepared_schema.deinit();
+        var prepared_recovery = if (self.transaction_recovery_identity_context != null)
+            try db_core.PreparedRecoveryRelationalState.init(
+                self.runtime_alloc,
+                if (runtime_schema.storage_mode == .relational) runtime_schema.relational_columns else null,
+                runtime_schema.version,
+            )
+        else
+            null;
+        defer if (prepared_recovery) |*prepared| prepared.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (!try self.core.rehydratePreparedSchemaMetadata(&prepared_schema, &writes)) return false;
+        self.publishRelationalRuntimeModePrepared(if (prepared_recovery) |*prepared| prepared else null);
+        return true;
+    }
+
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
         var schedule_ha_recovery_on_exit = false;
         defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
@@ -25542,6 +26287,11 @@ pub const DB = struct {
         raft_entry: ?RaftAppliedEntryIdentity,
         preparation_alloc: Allocator,
     ) !void {
+        if (req.relational_index_maintenance != null and
+            (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+                req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or
+                req.relational_activation != null or req.relational_retirement != null or
+                req.relational_repair or req.restore_staging_scope != null)) return error.InvalidBatchRequest;
         const schema_namespace = self.core.schemaNamespaceGeneration();
         // Parse and expand transforms from one optimistic read snapshot before
         // entering the serialized commit section. The commit fence below
@@ -25610,7 +26360,7 @@ pub const DB = struct {
         const binding = try self.core.transactionSchemaBinding(preparation_alloc, txn_id);
         var prepared_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (prepared_schema_view) |*view| view.release();
-        if (hasCoordinatedConstraints(prepared_schema_view) and
+        if ((hasCoordinatedConstraints(prepared_schema_view) or req.relational_repair) and
             (req.relational_schema_version == null or req.relational_integrity_generation_set == null) and
             (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0)) return error.ForeignKeyCoordinationRequired;
         if (req.relational_schema_version) |version| {
@@ -25625,7 +26375,7 @@ pub const DB = struct {
         var integrity_catalog: ?integrity_catalog_mod.Catalog = null;
         var integrity_catalog_digest: ?[32]u8 = null;
         defer if (integrity_catalog) |*catalog| catalog.deinit();
-        if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or hasCoordinatedConstraints(prepared_schema_view)) {
+        if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_repair or hasCoordinatedConstraints(prepared_schema_view)) {
             const raw_catalog = (try self.core.getStoreValue(preparation_alloc, integrity_catalog_mod.key)) orelse return error.IntegrityCatalogChanged;
             defer preparation_alloc.free(raw_catalog);
             integrity_catalog = try integrity_catalog_mod.decode(preparation_alloc, raw_catalog);
@@ -25671,11 +26421,36 @@ pub const DB = struct {
             }
             try @import("relational_integrity_topology.zig").admitPrepare(&topology_read, &topology_manager, preparation_alloc, txn_id);
         }
+        var maintenance_preparation: ?@import("relational_index_maintenance.zig").Prepared = null;
+        defer if (maintenance_preparation) |*value| value.deinit();
+        if (req.relational_index_maintenance) |command| {
+            const view = prepared_schema_view orelse return error.RelationalTableRequired;
+            if (view.version() != command.schema_version) return error.PreparedGenerationChanged;
+            var plan = self.core.relational_indexes.acquire() orelse return error.PreparedGenerationChanged;
+            defer plan.deinit();
+            if (plan.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
+            var maintenance_read = try self.core.store.beginProbeTxn();
+            defer maintenance_read.abort();
+            maintenance_preparation = try @import("relational_index_maintenance.zig").prepareCommand(
+                preparation_alloc,
+                &maintenance_read,
+                plan.plan,
+                self.core.identity_namespace.table_id,
+                command,
+            );
+            try intents.append(preparation_alloc, maintenance_preparation.?.intent);
+            try predicates.append(preparation_alloc, maintenance_preparation.?.predicate);
+        }
         var integrity_effects: ?integrity_mod.Effects = null;
         defer if (integrity_effects) |*effects| effects.deinit();
         if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or integrity_catalog != null) {
             var integrity_read = try integrity_mod.CurrentView.init(self.core.store);
             defer integrity_read.deinit();
+            // Shadow claims must remain unobservable even to a participant
+            // whose stale route happens to name this receiver. Check before
+            // any claim/reference lookup or semantic preparation occurs.
+            for (req.integrity_commands) |command| try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), &command.address.routing);
+            for (req.integrity) |operation| try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), operation.routing_key);
             // Layout epochs alone do not fence changes to UNIQUE/FK declarations.
             // Compare the exact catalog observed during preparation under apply.
             const current_catalog = integrity_read.get(integrity_catalog_mod.key) catch |err| switch (err) {
@@ -25687,7 +26462,8 @@ pub const DB = struct {
             if (!std.mem.eql(u8, &current_digest, &integrity_catalog_digest.?)) return error.IntegrityCatalogChanged;
             if (req.relational_retirement) |command| {
                 if (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0 or req.relational_activation != null or req.relational_repair) return error.InvalidConstraintRetirementCommand;
-                if (!self.core.byteRange().contains(command.routing_key)) return error.KeyOutOfRange;
+                try @import("online_integrity_shadow.zig").requireCatalogMutable(&integrity_read);
+                try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), command.routing_key);
                 const retirement = try @import("relational_integrity_retirement.zig").prepareCommand(preparation_alloc, &integrity_read, integrity_catalog.?, command);
                 const after = try @import("relational_integrity_retirement.zig").Progress.decode(command.next);
                 if (command.expected) |expected| {
@@ -25699,10 +26475,11 @@ pub const DB = struct {
             }
             if (req.relational_activation) |command| {
                 try @import("relational_integrity_retirement.zig").requireMutable(&integrity_read);
+                try @import("online_integrity_shadow.zig").requireCatalogMutable(&integrity_read);
                 // A backfill page changes claims and its durable cursor, never
                 // primary rows. Its observed rows are retained read guards.
                 if (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0) return error.InvalidConstraintActivationCommand;
-                if (!self.core.byteRange().contains(command.routing_key)) return error.KeyOutOfRange;
+                try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), command.routing_key);
                 const activation = try activation_mod.prepareCommand(preparation_alloc, &integrity_read, integrity_catalog.?, command);
                 try intents.append(preparation_alloc, activation.intent);
                 try predicates.append(preparation_alloc, activation.predicate);
@@ -25723,7 +26500,7 @@ pub const DB = struct {
             } else req.integrity;
             try integrity_mod.validatePreparedEffects(preparation_alloc, &integrity_read, integrity_operations);
             for (integrity_operations) |operation| {
-                if (!self.core.byteRange().contains(operation.routing_key)) return error.KeyOutOfRange;
+                try @import("online_integrity_shadow.zig").requireServing(&integrity_read, self.core.byteRange(), operation.routing_key);
                 const parsed_key = try integrity_mod.parseKey(operation.key);
                 const generation = integrity_catalog.?.findGeneration(parsed_key.address.generation) orelse return error.IntegrityCatalogChanged;
                 if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
@@ -25764,6 +26541,7 @@ pub const DB = struct {
     }
 
     fn isProtectedIntegrityKey(key: []const u8) bool {
+        if (@import("relational_index_catalog.zig").Controller.isReservedMetadataKey(key)) return true;
         return std.mem.eql(u8, key, @import("restore_staging.zig").key) or std.mem.eql(u8, key, @import("restore_staging.zig").bootstrap_key) or @import("relational_integrity.zig").isKey(key) or std.mem.eql(u8, key, @import("relational_integrity_catalog.zig").key) or
             std.mem.eql(u8, key, @import("relational_integrity_activation.zig").key) or
             std.mem.eql(u8, key, @import("relational_integrity_topology.zig").fence_key) or
@@ -26123,14 +26901,47 @@ pub const DB = struct {
     pub const RelationalTopologyIdentity = @import("relational_integrity_topology_contract.zig").Identity;
 
     fn lookupRelationalTopology(self: *DB, alloc: Allocator, request_json: []const u8) !?types.LookupResult {
-        var request = try std.json.parseFromSlice(struct { mode: enum { identity, status, completed, handoff_progress, handoff_manifest, prune_progress } }, alloc, request_json, .{});
+        var request = try std.json.parseFromSlice(struct {
+            mode: enum { identity, status, completed, handoff_progress, handoff_manifest, prune_progress, online_source_status, merge_copy_receipt },
+            scope: ?@import("online_source_contract.zig").Scope = null,
+        }, alloc, request_json, .{});
         defer request.deinit();
+        if ((request.value.mode == .online_source_status) != (request.value.scope != null)) return error.InvalidOnlineSourceCommand;
         var output: std.Io.Writer.Allocating = .init(alloc);
         errdefer output.deinit();
         var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
         switch (request.value.mode) {
             .identity => try @import("relational_integrity_json.zig").write(try self.relationalTopologyIdentity(), &stream),
             .status => try @import("relational_integrity_json.zig").write(try self.relationalTopologyStatus(), &stream),
+            .online_source_status => try @import("relational_integrity_json.zig").write(try self.onlineSourceStatus(request.value.scope.?), &stream),
+            .merge_copy_receipt => {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                var read = try self.core.store.beginProbeTxn();
+                defer read.abort();
+                const raw = read.get(merge_state_mod.key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                var state = if (raw) |value| try merge_state_mod.decodeAlloc(alloc, value) else null;
+                defer if (state) |*value| value.deinit(alloc);
+                const table = @import("table_catalog.zig");
+                const table_raw = read.get(table.key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                const row_derived_document = if (table_raw) |value| blk: {
+                    const catalog = try table.Catalog.decode(value);
+                    break :blk catalog.mode_initialized and catalog.storage_mode == .document and
+                        try @import("online_merge_io.zig").rowDerivedIndexesAssumeApply(self, alloc);
+                } else false;
+                try @import("relational_integrity_json.zig").write(@import("merge_contract.zig").CopyReceipt{
+                    .namespace = self.core.identity_namespace,
+                    .range = self.core.byteRange(),
+                    .state = state,
+                    .row_derived_document = row_derived_document,
+                }, &stream);
+            },
             .completed => {
                 self.core.lockApplyShared();
                 defer self.core.unlockApplyShared();
@@ -26268,7 +27079,203 @@ pub const DB = struct {
         return self.applyRelationalTopologyControlWithHA(command, raft_entry, null, null);
     }
 
+    /// Internal source-retention controls share the lifecycle transaction path:
+    /// source progress, retained log, replication marker and durable outbox are
+    /// one commit. The public API has no admission route for these commands.
+    fn applyOnlineSourceBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        try @import("online_source_contract.zig").validateRequest(req);
+        const command = req.online_source orelse return error.InvalidOnlineSourceCommand;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        // A committed admission retry must not need a later Raft GC command to
+        // free its slot. Try the bounded local cleanup catalog without waiting
+        // on exports and before taking the apply fence.
+        if (command == .admit) @import("source_pin.zig").reconcileReleased(self) catch |err| switch (err) {
+            error.OnlineSourcePinPending => {}, // Repair this exact prepared cut below.
+            else => return err,
+        };
+        var ha_mutation = if (opts.bypass_ha_write_gate) null else self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        if (!opts.bypass_ha_write_gate) {
+            try self.enforceHAWriteGate();
+            try self.ensureDurableHAStartupBarrier();
+            try self.flushDurableHAOutboxes();
+            try self.preflightHABatchSyncCommit();
+        }
+        var applied_index = if (opts.raft_applied_entry_marker) |entry| entry.index else opts.online_source_applied_index orelse 0;
+        var payload: ?[]u8 = null;
+        defer if (payload) |bytes| self.alloc.free(bytes);
+        apply_source: {
+            var admission = self.core.snapshot_admission.acquireMutation();
+            defer admission.release();
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            if (opts.raft_applied_entry_marker) |entry| switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), entry)) {
+                .already_applied => {
+                    if (command == .admit) {
+                        const repair = blk: {
+                            var read = try self.core.store.beginReadTxn();
+                            defer read.abort();
+                            const pending = try @import("../source_pin_state.zig").load(&read) orelse break :blk false;
+                            break :blk std.mem.eql(u8, &pending.namespace, &command.scope().namespace()) and std.mem.eql(u8, &pending.pin, &command.scope().pin());
+                        };
+                        if (repair) try @import("source_pin.zig").ensureAssumeApply(self, command.scope());
+                    }
+                    break :apply_source;
+                },
+                .apply => {},
+            };
+            if (!command.scope().fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+            if (command.scope().authority == .native and opts.raft_applied_entry_marker != null) return error.OnlineSourceScopeChanged;
+            // Complete any committed native admission before a retry can
+            // advance the owner clock. It must never recapture a later cut.
+            if (command.scope().authority == .native and command == .admit) {
+                const pending_scope = blk: {
+                    var read = try self.core.store.beginReadTxn();
+                    defer read.abort();
+                    const pending = try @import("../source_pin_state.zig").load(&read) orelse break :blk null;
+                    break :blk try @import("online_source_contract.zig").Scope.decode(&pending.scope_bytes);
+                };
+                if (pending_scope) |scope| {
+                    if (!std.meta.eql(scope, command.scope())) return error.OnlineSourcePinPending;
+                    try @import("source_pin.zig").ensureAssumeApply(self, scope);
+                }
+            }
+            // Reject unsupported backends before publishing a durable write
+            // fence which they could never turn into an immutable pin.
+            if (command == .admit) {
+                const lsm = self.core.primary_store_owner.lsmBackend() orelse return error.BackupSealBackendUnsupported;
+                if (lsm.storage) |storage| {
+                    if (!storage.supportsHostPathGenerationPublication()) return error.NativeBackupStorageBackendUnsupported;
+                }
+            }
+            var txn = try self.core.store.beginWriteTxn();
+            var txn_open = true;
+            defer if (txn_open) txn.abort();
+            try @import("restore_staging.zig").requireScope(self.alloc, &txn, null, false);
+            if (command != .admit and command != .release) try @import("../source_pin_state.zig").requireNoPrepared(&txn, command.scope().namespace());
+            if (try doc_identity.loadNamespaceTxn(&txn)) |stored| {
+                if (!stored.eql(command.scope().fence.namespace)) return error.IdentityNamespaceMismatch;
+            } else {
+                const namespace_bytes = command.scope().namespace();
+                try txn.put(&internal_keys.identity_namespace_key, &namespace_bytes);
+            }
+            const source_authority = @import("../source_authority.zig");
+            if (command.scope().authority == .native) {
+                applied_index = try source_authority.advance(&txn, command.scope().namespace(), opts.online_source_applied_index);
+            } else if (try source_authority.load(&txn) != null) {
+                _ = try source_authority.require(&txn, .raft, command.scope().namespace());
+            }
+            if (command == .final_fence) {
+                var manager = try self.core.initTxnManager();
+                defer manager.deinit();
+                try @import("relational_integrity_topology.zig").requireDrained(&txn, &manager, command.scope().fence);
+            }
+            if (command == .admit) {
+                // Candidate discovery is advisory. Recheck the durable local
+                // receiver transition in this admission transaction so an
+                // intervening ordinary merge cannot acquire both roles.
+                const merge_raw = txn.get(merge_state_mod.key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (merge_raw) |raw| {
+                    var state = try merge_state_mod.decodeAlloc(self.alloc, raw);
+                    defer state.deinit(self.alloc);
+                    if (state.phase != .finalized and state.phase != .rolled_back and state.phase != .none) return error.IntegrityTopologyBusy;
+                }
+            }
+            try @import("online_source.zig").stage(&txn, command, applied_index);
+            if (!opts.bypass_ha_write_gate and self.ha_async_batch_mirror != null)
+                payload = try ha_effects_mod.encodeOnlineSourceMutationRequestAlloc(self.alloc, req, applied_index);
+            for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
+            if (opts.raft_applied_entry_marker) |entry| {
+                var bytes: [raft_applied_entry_value_len]u8 = undefined;
+                const marker = raftAppliedEntryWrite(entry, &bytes);
+                try txn.put(marker.key, marker.value);
+            }
+            if (opts.ha_applied_lsn_marker) |lsn| {
+                var bytes: [ha_applied_lsn_value_len]u8 = undefined;
+                const marker = haAppliedReplicationLsnWrite(lsn, &bytes);
+                try txn.put(marker.key, marker.value);
+            }
+            try self.stageRestoreStagingHAOutbox(&txn, payload);
+            try txn.commit();
+            txn_open = false;
+            if (command == .admit) {
+                try @import("source_pin.zig").afterPrepare();
+                try @import("source_pin.zig").ensureAssumeApply(self, command.scope());
+            }
+        }
+        if (command == .release) {
+            const io = self.backend_runtime.io() orelse std.Options.debug_io;
+            self.source_publication.cancelScope(io, command.scope());
+            self.online_merge_reader.retire(io, command.scope());
+        }
+        if (command == .release) @import("source_pin.zig").reclaimReleased(self, command.scope()) catch |err| {
+            // Release is already durable. Replica-local cleanup failures keep
+            // the bounded slot reserved, but cannot suppress its outbox flush
+            // or misreport the replicated terminal decision as rejected.
+            if (builtin.is_test and err == error.InjectedSourcePinFailure) return err;
+        };
+        if (payload != null) try self.flushDurableHAOutboxes();
+    }
+
+    pub fn onlineSourceStatus(self: *DB, scope: @import("online_source_contract.zig").Scope) !@import("online_source.zig").Progress {
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return try @import("online_source.zig").status(&txn, scope);
+    }
+
+    /// Writer-open recovery runs before any optional worker or catalog replay.
+    /// A durable prepared admission cannot be hidden by its applied watermark.
+    fn resumePreparedSourcePin(self: *DB) !void {
+        const pending = blk: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            break :blk try @import("../source_pin_state.zig").load(&read);
+        };
+        if (pending) |prepared| {
+            var namespace: [24]u8 = undefined;
+            doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+            if (!std.mem.eql(u8, &prepared.namespace, &namespace)) return;
+            const scope = try @import("online_source_contract.zig").Scope.decode(&prepared.scope_bytes);
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            try @import("source_pin.zig").ensureAssumeApply(self, scope);
+        }
+    }
+
+    pub fn prepareOnlineSourcePublication(self: *DB, scope: @import("online_source_contract.zig").Scope, cancellation: types.CancellationToken) !@import("../source_snapshot.zig").Certificate {
+        return @import("source_pin.zig").preparePublication(self, scope, cancellation);
+    }
+
+    pub fn describeOnlineSourceArtifact(self: *DB, scope: @import("online_source_contract.zig").Scope, cancellation: types.CancellationToken) !@import("source_artifact_transfer.zig").Descriptor {
+        return @import("source_artifact_transfer.zig").describe(self, scope, cancellation);
+    }
+
+    pub fn readOnlineSourceArtifact(self: *DB, alloc: Allocator, descriptor: @import("source_artifact_transfer.zig").Descriptor, offset: u64, cancellation: types.CancellationToken) !@import("source_artifact_transfer.zig").OwnedChunk {
+        return @import("source_artifact_transfer.zig").read(self, alloc, descriptor, offset, cancellation);
+    }
+
+    pub fn receiveOnlineSourceArtifact(self: *DB, descriptor: @import("source_artifact_transfer.zig").Descriptor, chunk: @import("source_artifact_transfer.zig").Chunk, cancellation: types.CancellationToken) !@import("source_artifact_transfer.zig").Status {
+        return @import("source_artifact_transfer.zig").receive(self, descriptor, chunk, cancellation);
+    }
+
+    pub fn onlineSourceArtifactStatus(self: *DB, descriptor: @import("source_artifact_transfer.zig").Descriptor, cancellation: types.CancellationToken) !@import("source_artifact_transfer.zig").Status {
+        return @import("source_artifact_transfer.zig").status(self, descriptor, cancellation);
+    }
+
+    pub fn finishOnlineSourceArtifact(self: *DB, descriptor: @import("source_artifact_transfer.zig").Descriptor, cancellation: types.CancellationToken) !@import("source_artifact_transfer.zig").Status {
+        return @import("source_artifact_transfer.zig").finish(self, descriptor, cancellation);
+    }
+
+    /// Keep this DB/owner leased until the returned frame session is released.
+    pub fn beginMergeTailRead(self: *DB, scope: @import("online_source_contract.zig").Scope, after_sequence: u64) !?@import("merge_tail_reader.zig").Session {
+        return try @import("merge_tail_reader.zig").Session.open(self, scope, after_sequence);
+    }
+
     fn applyRelationalTopologyBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        if (req.relational_index_maintenance != null) return error.InvalidBatchRequest;
         if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
             req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.integrity.len != 0 or
             req.integrity_commands.len != 0 or req.predicates.len != 0 or req.transaction != null or
@@ -29652,7 +30659,7 @@ pub const DB = struct {
             else => std.log.warn("relational column maintenance failed: {s}", .{@errorName(err)}),
         };
         _ = self.runRelationalIndexMaintenancePass() catch |err| switch (err) {
-            error.Canceled, error.PreparedGenerationChanged, error.ResourceBudgetExceeded, error.PortableRuntimeActivationPending, error.IndexNotFound => {},
+            error.Canceled, error.PreparedGenerationChanged, error.IntentConflict, error.ResourceBudgetExceeded, error.PortableRuntimeActivationPending, error.IndexNotFound => {},
             else => std.log.warn("relational index maintenance failed: {s}", .{@errorName(err)}),
         };
     }
@@ -34583,6 +35590,10 @@ pub const DB = struct {
         defer self.core.unlockApply();
         try doc_identity.reassignNamespaceAlloc(self.alloc, self.core.store, namespace);
         self.core.identity_namespace = namespace;
+        // Coverage is bound to the durable namespace even when bounds stay
+        // unchanged. Wake an idle worker after the new identity commits.
+        self.relational_index_maintenance_pending.store(true, .release);
+        self.relational_index_retry_after_ns.store(0, .release);
         if (self.transaction_recovery_identity_context) |ctx| ctx.updateIdentityNamespace(namespace);
     }
 
@@ -34886,9 +35897,28 @@ pub const DB = struct {
         var progress = (try self.restoreStagingStatus(alloc)) orelse return error.RestoreStagingScopeChanged;
         defer progress.deinit();
         if (!std.mem.eql(u8, &progress.value.scope.digest(), &scope)) return error.RestoreStagingScopeChanged;
-        if (progress.value.phase == .validated) return true;
-        if (progress.value.phase != .imported) return error.RestoreStagingInProgress;
+        if (progress.value.phase != .imported and progress.value.phase != .validated and progress.value.phase != .published) return error.RestoreStagingInProgress;
         _ = try self.validateConstraintsStepLocal(.{}, replicated);
+        // A persisted receipt is not replica-local relational index coverage.
+        // Advance one bounded page independently on every importing/recovering
+        // owner, including after a lost validated/published acknowledgement.
+        if (self.core.relational_indexes.acquire()) |index_snapshot| {
+            var pinned = index_snapshot;
+            defer pinned.deinit();
+            const indexes = pinned.plan.boundIndexes();
+            if (indexes.len != 0) for (0..@min(indexes.len, 16)) |_| {
+                const ordinal = self.relational_index_maintenance_cursor.fetchAdd(1, .monotonic) % indexes.len;
+                const index = indexes[ordinal];
+                switch ((try self.relationalIndexBuildStatus(index.name)).state) {
+                    .ready => {},
+                    .failed => return error.RestoreProjectionCorrupt,
+                    .building => {
+                        try self.buildRelationalIndexStepLocal(index.name, .{}, replicated);
+                        break;
+                    },
+                }
+            };
+        }
         replayPendingDerivedBatches(self, null, null, .{
             .truncate_replay = false,
             .max_windows_per_index = 1,
@@ -34919,6 +35949,19 @@ pub const DB = struct {
     }
 
     fn restoreStagingIndexesReadyAssumeApply(self: *DB, alloc: Allocator) !bool {
+        if (self.core.relational_indexes.acquire()) |index_snapshot| {
+            var pinned = index_snapshot;
+            defer pinned.deinit();
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            for (pinned.plan.boundIndexes()) |index| {
+                switch ((try relational_index_jobs.status(&read, index)).state) {
+                    .ready => {},
+                    .building => return false,
+                    .failed => return error.RestoreProjectionCorrupt,
+                }
+            }
+        }
         const debt = try self.listDerivedReplayDebtAssumeApplyLockHeld(alloc);
         defer {
             for (debt) |*entry| entry.deinit(alloc);
@@ -35112,6 +36155,25 @@ pub const DB = struct {
         return ha_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req);
     }
 
+    /// An exact replicated completion receipt may survive a crash before its
+    /// local index coverage does. Repair only the still-current scope/phase;
+    /// old entries and canceled/replaced attempts retain no-op replay semantics.
+    /// This never reapplies logical controls or advances replication markers.
+    fn prepareAppliedRestoreFinishReplay(self: *DB, req: types.BatchRequest) !void {
+        const command = req.restore_staging orelse return;
+        if (command != .finish or (command.finish.phase != .validated and command.finish.phase != .published)) return;
+        var progress = (try self.restoreStagingStatus(self.alloc)) orelse return;
+        defer progress.deinit();
+        if (progress.value.phase != command.finish.phase or !std.mem.eql(u8, &progress.value.scope.digest(), &command.finish.scope)) return;
+        const ready = self.prepareRestoreStagingIndexesStepLocal(self.alloc, command.finish.scope, true) catch |err| switch (err) {
+            // A concurrently completed cancellation/replacement must not turn
+            // an already-applied entry into a stale logical command failure.
+            error.RestoreStagingScopeChanged, error.RestoreStagingInProgress => return,
+            else => return err,
+        };
+        if (!ready) return error.RestoreProjectionCatchUpPending;
+    }
+
     /// Control payload and owner marker are committed together. Every HA mode
     /// retains a local append obligation; remote acknowledgement still follows
     /// the configured policy. Retrying an applied Raft entry drains this record.
@@ -35122,7 +36184,7 @@ pub const DB = struct {
         // bounded local slice on EVERY committed-control retry; no optional
         // worker or leader RPC is required, and no apply lock is held here.
         if (opts.raft_applied_entry_marker != null or opts.ha_applied_lsn_marker != null) {
-            if (req.restore_staging.? == .finish and req.restore_staging.?.finish.phase == .validated) {
+            if (req.restore_staging.? == .finish and (req.restore_staging.?.finish.phase == .validated or req.restore_staging.?.finish.phase == .published)) {
                 if (!try self.prepareRestoreStagingIndexesStepLocal(self.alloc, req.restore_staging.?.finish.scope, true)) return error.RestoreProjectionCatchUpPending;
             }
         }
@@ -35142,7 +36204,7 @@ pub const DB = struct {
         switch (req.restore_staging.?) {
             .begin => |scope| try self.beginRestoreStagingWithMarker(self.alloc, scope, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload),
             .finish => |finish| _ = try self.finishRestoreStagingWithMarker(self.alloc, finish.scope, finish.phase, opts.raft_applied_entry_marker, opts.ha_applied_lsn_marker, payload),
-            .import_page => unreachable,
+            .import_page, .rewrite_page => unreachable,
         }
         if (payload != null) try self.flushDurableHAOutboxes();
     }
@@ -35151,6 +36213,7 @@ pub const DB = struct {
     /// participant commands. They may touch only this hidden owner's current
     /// claims/coverage; primary rows enter exclusively through import controls.
     fn validateRestoreStagingHAEffects(self: *DB, alloc: Allocator, txn: anytype, req: types.BatchRequest) !void {
+        if (req.relational_index_maintenance != null) return error.InvalidRestoreStagingCommand;
         const integrity = @import("relational_integrity.zig");
         const activation = @import("relational_integrity_activation.zig");
         const catalog_mod = @import("relational_integrity_catalog.zig");
@@ -35195,6 +36258,24 @@ pub const DB = struct {
         defer if (loaded) |*catalog| catalog.deinit();
         for (req.writes) |write| {
             if (!isProtectedIntegrityKey(write.key)) continue;
+            const maintenance = @import("relational_index_maintenance_contract.zig");
+            if (maintenance.isControlKey(write.key)) {
+                // Index maintenance does not require an FK/unique catalog.
+                // The replicated desired state is fenced by its index identity,
+                // never by this replica's independent coverage progress.
+                const id = try @import("relational_index_records.zig").Id.decode(write.key[maintenance.control_prefix.len..]);
+                var pinned = self.core.relational_indexes.acquire() orelse return error.PreparedGenerationChanged;
+                defer pinned.deinit();
+                const index = for (pinned.plan.boundIndexes()) |candidate| {
+                    if (candidate.id().mapKey() == id.mapKey()) break candidate;
+                } else return error.PreparedGenerationChanged;
+                const next = try maintenance.Control.decode(write.value);
+                const before = try maintenance.readControl(txn, index.id());
+                const identical = next.epoch == before.epoch and std.mem.eql(u8, &next.last_request, &before.last_request);
+                if (!identical and (before.epoch == std.math.maxInt(u64) or next.epoch != before.epoch + 1))
+                    return error.PreparedGenerationChanged;
+                continue;
+            }
             if (loaded == null) loaded = try catalog_mod.decode(alloc, txn.get(catalog_mod.key) catch |err| switch (err) {
                 error.NotFound => return error.IntegrityCatalogChanged,
                 else => return err,
@@ -35304,7 +36385,7 @@ pub const DB = struct {
                 try txn.put(@import("relational_integrity_activation.zig").key, coverage);
             }
         }
-        const initial = try (staging.Progress{ .scope = scope }).encode(alloc);
+        const initial = try (staging.Progress{ .scope = scope, .rewrite = if (scope.rewrite) |rewrite| .{ .sequence = rewrite.retained_start } else null }).encode(alloc);
         defer alloc.free(initial);
         try txn.put(staging.key, initial);
         try self.stageRestoreStagingHAOutbox(&txn, ha_payload);
@@ -35336,6 +36417,17 @@ pub const DB = struct {
     }
 
     pub fn prepareRestoreStagingPage(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken) !@import("restore_staging.zig").PreparedPage {
+        if (scope.rewrite != null) return error.InvalidRestoreStagingCommand;
+        return self.prepareRestoreStagingPageInternal(alloc, scope, source, max_rows, cancellation, null);
+    }
+
+    pub fn prepareRewriteStagingPage(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: *const @import("relational_rewrite_staging.zig").ProgramSet) !@import("restore_staging.zig").PreparedPage {
+        try program.requireScope(scope);
+        try @import("relational_rewrite_staging.zig").requireSnapshotSource(alloc, scope, source);
+        return self.prepareRestoreStagingPageInternal(alloc, scope, source, max_rows, cancellation, program);
+    }
+
+    fn prepareRestoreStagingPageInternal(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, source: *DB, max_rows: usize, cancellation: types.CancellationToken, program: ?*const @import("relational_rewrite_staging.zig").ProgramSet) !@import("restore_staging.zig").PreparedPage {
         const staging = @import("restore_staging.zig");
         if (max_rows == 0 or max_rows > 128 or source.open_mode != .query_readonly or !source.core.identity_namespace.eql(scope.source_namespace)) return error.InvalidRestoreStagingCommand;
         if (!std.mem.eql(u8, source.core.byteRange().start, self.core.byteRange().start) or !std.mem.eql(u8, source.core.byteRange().end, self.core.byteRange().end)) return error.RestoreStagingScopeChanged;
@@ -35349,6 +36441,7 @@ pub const DB = struct {
         if (next.phase == .canceled) return error.RestoreStagingCanceled;
         if (next.phase == .reserved) return error.RestoreStagingInProgress;
         if (next.phase != .importing) return .{ .arena = arena, .phase = next.phase, .batch = null };
+        if (next.rewrite) |rewrite| if (rewrite.snapshot_complete) return .{ .arena = arena, .phase = next.phase, .batch = null };
         var source_read = try source.core.store.beginReadTxn();
         defer source_read.abort();
         var cursor = try source_read.openCursor();
@@ -35379,6 +36472,11 @@ pub const DB = struct {
             if (!self.core.byteRange().contains(document_key)) return error.RestoreStagingScopeChanged;
             var timestamp: u64 = 0;
             const json = if (internal_keys.isRelationalRowKey(row.key)) logical: {
+                if (program) |rewrite| {
+                    const transformed = try rewrite.transformJson(owned, row.value);
+                    timestamp = transformed.timestamp;
+                    break :logical transformed.json;
+                }
                 const version = try relational_store.rowSchemaVersion(row.value);
                 if (historical == null or historical.?.version() != version) {
                     if (historical) |*view| view.release();
@@ -35390,12 +36488,17 @@ pub const DB = struct {
                 break :logical try typed.reconstructValueAlloc(owned);
             } else logical: {
                 timestamp = try source.getTimestamp(owned, document_key);
+                if (program) |rewrite| break :logical try rewrite.preserveDocument(owned, row.value);
                 break :logical try owned.dupe(u8, row.value);
             };
             const row_bytes = std.math.add(usize, document_key.len, json.len) catch return error.TransactionTooLarge;
             if (row_bytes > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
             if (writes.items.len != 0 and bytes + row_bytes > 16 * 1024 * 1024) break;
             bytes += row_bytes;
+            // The import-page admission below selects preserved-value row
+            // preparation. These historical logical values must be validated,
+            // not treated as new API input that fills today's defaults or
+            // recomputes (and thereby repairs) stored generated results.
             try writes.append(owned, .{ .key = document_key, .value = json });
             try timestamps.append(owned, .{ .key = document_key, .timestamp = timestamp });
             var hash = std.crypto.hash.Blake3.init(.{});
@@ -35410,13 +36513,24 @@ pub const DB = struct {
             next.cursor = try owned.dupe(u8, row.key);
             examined += 1;
         }
-        if (entry == null) next.phase = .imported;
+        if (entry == null) {
+            if (next.rewrite) |*rewrite| rewrite.snapshot_complete = true else next.phase = .imported;
+        }
         const encoded = try next.encode(owned);
-        return .{ .arena = arena, .phase = next.phase, .batch = .{
-            .writes = writes.items,
-            .sync_level = .full_index,
-            .restore_staging = .{ .import_page = .{ .expected = staging.digest(raw), .next = encoded, .scope = scope.digest(), .timestamps = timestamps.items } },
-        } };
+        const page: staging.ImportPage = .{ .expected = staging.digest(raw), .next = encoded, .scope = scope.digest(), .timestamps = timestamps.items };
+        return .{
+            .arena = arena,
+            .phase = next.phase,
+            .batch = .{
+                .writes = writes.items,
+                // The scoped native import synchronizes derived writes internally.
+                // Request only durable apply acknowledgement here: the outer
+                // serving-table visibility lookup cannot resolve this hidden owner.
+                // Validation rechecks all local coverage before sealing its receipt.
+                .sync_level = .write,
+                .restore_staging = if (program != null) .{ .rewrite_page = page } else .{ .import_page = page },
+            },
+        };
     }
 
     /// Scope is retained as a tombstone after publication/cancellation. Late
@@ -35445,6 +36559,15 @@ pub const DB = struct {
             .already_applied => return next.receipt(),
             .apply => {},
         };
+        if (next.phase != phase) {
+            if (next.phase == .canceled or next.phase == .published) return error.RestoreStagingScopeChanged;
+            if (phase == .validated and next.phase != .imported) return error.RestoreStagingInProgress;
+            if (phase == .published and next.phase != .validated) return error.RestoreStagingInProgress;
+        }
+        if ((phase == .validated or phase == .published) and
+            (next.phase == .imported or next.phase == .validated or next.phase == .published) and
+            !try self.restoreStagingIndexesReadyAssumeApply(alloc))
+            return if (marker != null or ha_lsn != null) error.RestoreProjectionCatchUpPending else error.IndexRebuilding;
         if (next.phase == phase) {
             if (marker != null or ha_lsn != null or ha_payload != null) {
                 if (marker) |entry| {
@@ -35463,9 +36586,7 @@ pub const DB = struct {
             }
             return next.receipt();
         }
-        if (next.phase == .canceled or next.phase == .published) return error.RestoreStagingScopeChanged;
         if (phase == .validated) {
-            if (next.phase != .imported) return error.RestoreStagingInProgress;
             if (self.core.acquireSchemaView()) |active| {
                 var view = active;
                 defer view.release();
@@ -35489,7 +36610,7 @@ pub const DB = struct {
                 defer catalog.deinit();
                 try @import("relational_integrity_activation.zig").requireReady(&txn, catalog);
             }
-        } else if (phase == .published and next.phase != .validated) return error.RestoreStagingInProgress;
+        }
         next.phase = phase;
         const encoded = try next.encode(alloc);
         defer alloc.free(encoded);
@@ -37029,6 +38150,8 @@ pub const DB = struct {
                 if (collector.include_documents) try collector.documents.ensureUnusedCapacity(collector.alloc, 1);
                 const hash_id = try collector.alloc.dupe(u8, entry.id);
                 errdefer collector.alloc.free(hash_id);
+                const row_cursor = if (entry.relational_cursor) |value| try collector.alloc.dupe(u8, value) else null;
+                errdefer if (row_cursor) |value| collector.alloc.free(value);
                 if (collector.include_documents) {
                     const document_id = try collector.alloc.dupe(u8, entry.id);
                     errdefer collector.alloc.free(document_id);
@@ -37041,6 +38164,7 @@ pub const DB = struct {
                     .hash = entry.hash,
                     .content_hash = entry.content_hash,
                     .relational_schema_version = entry.relational_schema_version,
+                    .relational_cursor = row_cursor,
                 });
             }
         };
@@ -37064,6 +38188,10 @@ pub const DB = struct {
         if (opts.relational_query_json.len > 1024 * 1024 or opts.limit > 4096) return error.InvalidRelationalRowsRequest;
         const Input = struct {
             fields: []const []const u8,
+            index: ?[]const u8 = null,
+            after: ?[]const u8 = null,
+            lower: ?struct { values: []const std.json.Value, inclusive: bool = true } = null,
+            upper: ?struct { values: []const std.json.Value, inclusive: bool = true } = null,
             conditions: []const struct {
                 column: []const u8,
                 op: @import("../relational_index.zig").RelationalCheckOp,
@@ -37081,9 +38209,32 @@ pub const DB = struct {
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();
         if (view.storageMode() != .relational) return error.RelationalTableRequired;
+        if (parsed.value.schema_version) |version| if (version != view.version()) return error.PreparedGenerationChanged;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
+        if (parsed.value.index == null and (parsed.value.after != null or parsed.value.lower != null or parsed.value.upper != null)) return error.InvalidRelationalRowsRequest;
+        if (parsed.value.index != null and (parsed.value.schema_version == null or from_key.len != 0 or to_key.len != 0)) return error.InvalidRelationalRowsRequest;
+        var lower: ?RelationalRows.Bound = null;
+        var upper: ?RelationalRows.Bound = null;
+        if (parsed.value.index) |name| {
+            var indexes = self.core.relational_indexes.acquire() orelse return error.IndexNotFound;
+            defer indexes.deinit();
+            if (indexes.plan.schemaView().epoch != view.epoch) return error.PreparedGenerationChanged;
+            const index = for (indexes.plan.boundIndexes()) |candidate| {
+                if (std.mem.eql(u8, candidate.name, name)) break candidate;
+            } else return error.IndexNotFound;
+            inline for (.{ "lower", "upper" }) |field| {
+                if (@field(parsed.value, field)) |bound| {
+                    if (bound.values.len == 0 or bound.values.len > index.tuple.keys.len) return error.InvalidRelationalIndexBound;
+                    const values = try scratch.alloc(RelationalRows.Value, bound.values.len);
+                    for (bound.values, values, index.tuple.keys[0..bound.values.len]) |value, *target, key| {
+                        target.* = try @import("../../schema/relational_checks.zig").valueFromJson(scratch, key.column_type, value, true);
+                    }
+                    if (comptime std.mem.eql(u8, field, "lower")) lower = .{ .values = values, .inclusive = bound.inclusive } else upper = .{ .values = values, .inclusive = bound.inclusive };
+                }
+            }
+        }
         const conditions = try scratch.alloc(RelationalRows.Condition, parsed.value.conditions.len);
         for (parsed.value.conditions, conditions) |condition, *compiled| {
             const ordinal = view.physicalLayout().ordinalForName(view.tableSchema().relational_columns, condition.column) orelse return error.RelationalIndexColumnNotFound;
@@ -37126,6 +38277,11 @@ pub const DB = struct {
         var filter = if (opts.filter_query_json.len != 0) Filter{ .alloc = alloc, .source = try db_query_graph.PreparedPatternFilter.init(alloc, opts.filter_query_json) } else null;
         defer if (filter) |*active| active.deinit();
         var reader = try self.beginRelationalRows(alloc, .{
+            .index = parsed.value.index,
+            .include_cursor = parsed.value.index != null,
+            .after = parsed.value.after,
+            .lower = lower,
+            .upper = upper,
             .fields = parsed.value.fields,
             .conditions = conditions,
             .primary_lower = if (from_key.len != 0) .{ .key = from_key, .inclusive = opts.inclusive_from } else null,
@@ -37150,6 +38306,7 @@ pub const DB = struct {
                     .hash = row.version,
                     .content_hash = if (opts.include_content_hashes) row.semantic_hash else null,
                     .relational_schema_version = reader.active.version(),
+                    .relational_cursor = row.cursor,
                     .document_json = if (opts.include_documents) row.json else null,
                 });
                 delivered += 1;
@@ -51717,6 +52874,17 @@ const TtlDeleteGuard = struct {
     now_ns: u64,
 };
 
+/// A missing identity summary cannot certify emptiness. This single transient
+/// prefix seek is used only while holding the apply fence on an uncounted root.
+fn storeHasUserDataBounded(store: *docstore_mod.DocStore) !bool {
+    var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+    defer read.abort();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    const first = try cursor.seekAtOrAfter(&.{internal_keys.user_namespace});
+    return if (first) |entry| internal_keys.isInternalUserKey(entry.key) else false;
+}
+
 fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: []const []const u8, sync_level: types.SyncLevel, ttl_guard: ?TtlDeleteGuard) !u32 {
     if (candidate_keys.len == 0) return 0;
     var ha_mutation = acquireHAMutationSharedContext(ctx);
@@ -51909,7 +53077,8 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
         keys,
     );
     const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
-    if (pending_identity_visibility_summary) |summary| {
+    const merge_count_prepared = try @import("merge_cardinality.zig").prepare(ctx.alloc, ctx.store, req, &.{}, keys, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
+    if (!merge_count_prepared) if (pending_identity_visibility_summary) |summary| {
         try range_cardinality.appendIdentityTransitionAlloc(
             ctx.alloc,
             ctx.store,
@@ -51918,7 +53087,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
             summary.live_ordinals,
             &identity_writes,
         );
-    }
+    };
     try store_writes.appendSlice(ctx.alloc, identity_writes.items);
     try appendAssetArtifactSourceIndexMutations(
         ctx.alloc,
@@ -51952,6 +53121,17 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
                 next_table_catalog = next;
                 try store_writes.append(ctx.alloc, .{ .key = table_catalog_mod.key, .value = &table_catalog_value });
             }
+        }
+    } else if (ctx.table_catalog) |current| {
+        // TTL/context deletion has the same conservative presence semantics as
+        // ordinary mutation: unknown cardinality must never publish empty.
+        if (current.row_count == 0 and keys.len != 0 and try storeHasUserDataBounded(ctx.store)) {
+            var next = current.*;
+            next.row_count = 1;
+            next.generation +|= 1;
+            table_catalog_value = next.encode();
+            next_table_catalog = next;
+            try store_writes.append(ctx.alloc, .{ .key = table_catalog_mod.key, .value = &table_catalog_value });
         }
     }
     if (index_stage) |*stage| {
@@ -71029,6 +72209,7 @@ test "prepared relational batch uses bounded parallel workers safely" {
         &rows,
         null,
         null,
+        false,
     );
     for (rows) |row| {
         try std.testing.expect(row != null);
@@ -124598,6 +125779,64 @@ test "db raced replicated transaction completion persists receipt and participan
     const unresolved_after = try db.getUnresolvedTransactionParticipants(alloc, txn_id);
     defer transactions_mod.freeParticipantList(alloc, unresolved_after);
     try std.testing.expectEqual(@as(usize, 0), unresolved_after.len);
+}
+
+test "db transaction retained credits bind compact no-op and prepared generated AROW after reopen" {
+    const alloc = std.testing.allocator;
+    const retention = @import("../retained_effects.zig");
+    for ([_]bool{ false, true }) |typed| {
+        var directory = try TestDirectory.init("reserved-db-rows");
+        defer directory.cleanup();
+        const options: OpenOptions = .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} } };
+        var db = try DB.open(alloc, directory.path(), options);
+        defer db.close();
+        if (typed) try db.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"b","expression":{"op":"literal","type":"integer","value":"2"}}],"generated_columns":[{"column":"total","expression":{"op":"add","args":[{"op":"column","column":"a"},{"op":"column","column":"b"}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"},"total":{"type":"integer"}},"required":["a","b","total"],"additionalProperties":false}}}}
+        );
+        const spaces = try alloc.alloc(u8, 64 * 1024);
+        defer alloc.free(spaces);
+        @memset(spaces, ' ');
+        const prior = try std.fmt.allocPrint(alloc, "{{{s}\"a\":5}}", .{spaces});
+        defer alloc.free(prior);
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value = if (typed) "{\"a\":5}" else prior }}, .timestamp_ns = 10 });
+        const id = try db.beginTransaction(20);
+        try db.writeTransaction(id, .{ .writes = &.{.{ .key = "row", .value = "{\"a\":5}" }} });
+        var reserved: u64 = 0;
+        var ns: retention.Namespace = undefined;
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            ns = (try txn.get(&internal_keys.identity_namespace_key))[0..24].*;
+            reserved = (try retention.loadReservations(&txn)).?.bytes;
+            try std.testing.expect(reserved < prior.len);
+            // A newly admitted source includes already prepared obligations.
+            _ = try retention.admit(&txn, ns, 1, @splat(9), retention.default_limit);
+            try txn.commit();
+        }
+        db.close();
+        db = try DB.open(alloc, directory.path(), options);
+        try db.resolveTransactionIntents(id, .committed, 30);
+        {
+            var txn = try db.core.store.beginReadTxn();
+            defer txn.abort();
+            const state = (try retention.load(&txn)).?;
+            try std.testing.expectEqual(reserved, state.retained_bytes);
+            try std.testing.expectEqual(@as(u64, 0), (try retention.loadReservations(&txn)).?.bytes);
+            var frame = (try retention.read(&txn, ns, 1, @splat(9), 0)).?;
+            const effect = (try frame.next()).?;
+            try std.testing.expectEqual(@as(u64, 30), effect.timestamp);
+            try std.testing.expect(try frame.next() == null);
+            if (!typed) try std.testing.expectEqualStrings("{\"a\":5}", effect.value.?);
+        }
+        const logical = (try db.get(alloc, "row")).?;
+        defer alloc.free(logical);
+        if (typed) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, logical, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("b").?.integer);
+            try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("total").?.integer);
+        }
+    }
 }
 
 test "db transaction repeated committed resolve cannot overwrite a newer write" {

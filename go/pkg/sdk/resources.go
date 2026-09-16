@@ -198,6 +198,8 @@ func createdIndexName(config oapi.CreatedIndex) (string, error) {
 		name = typed.Name
 	case CreatedAlgebraicIndex:
 		name = typed.Name
+	case CreatedRelationalIndex:
+		name = typed.Name
 	default:
 		return "", fmt.Errorf("unsupported created index type %T", value)
 	}

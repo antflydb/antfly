@@ -50,6 +50,17 @@ pub const State = struct {
     }
 };
 
+/// One native apply-lock snapshot, served only through the authenticated,
+/// metadata-scoped transition read-index boundary.
+pub const CopyReceipt = struct {
+    namespace: doc_identity.Namespace,
+    range: db_types.ByteRange,
+    state: ?State,
+    /// Positive native proof: document rows with no independently authored
+    /// artifacts or coordinated constraints. Missing proof never permits reuse.
+    row_derived_document: bool = false,
+};
+
 pub fn encode(
     list: *std.ArrayListUnmanaged(u8),
     alloc: std.mem.Allocator,

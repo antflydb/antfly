@@ -34,6 +34,208 @@ test "bulk callback ABI retains exact consumer error identity" {
     try kernel_owner_source.ProvisionedKernelOwnerSource.validateBulkCallbackIdentityForTest();
 }
 
+test "replica retirement drains active compiled owners before deleting physical roots" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    inline for (.{ @as(?[]const u8, "retired"), @as(?[]const u8, null) }) |retirement_name| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+        defer alloc.free(root);
+        const path = try std.fs.path.join(alloc, &.{ root, "group-7198/table-db" });
+        defer alloc.free(path);
+        var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer owners.deinit();
+        try std.testing.expectError(error.InvalidArgument, owners.writeSource().retireTableGroupLocal(0, ""));
+        var lease = try owners.leaseTransitionOwner(7198, "retired", .{
+            .lsm_root_generation = table_reads.backend_current_root_generation,
+            .identity = .{ .table_id = 71, .shard_id = 7198, .range_id = 7198 },
+        });
+        var lease_owned = true;
+        defer if (lease_owned) lease.deinit();
+        const identity = try lease.readRelationalTopologyJson(alloc, "identity");
+        alloc.free(identity);
+        const retained_path = try std.fs.path.join(alloc, &.{ root, "group-7197/table-db" });
+        defer alloc.free(retained_path);
+        var retained = try owners.leaseTransitionOwner(7197, "retired", .{
+            .lsm_root_generation = table_reads.backend_current_root_generation,
+            .identity = .{ .table_id = 71, .shard_id = 7197, .range_id = 7197 },
+        });
+        retained.deinit();
+        try std.testing.expectEqual(@as(usize, 2), owners.ownerCountForTest());
+        var source = table_writes.ProvisionedTableWriteSource.init(root, table_catalog.emptyCatalogSource());
+        defer source.deinit();
+        const Drain = struct {
+            owner: @import("../api/table_write_source.zig").TableWriteSource,
+            io: std.Io,
+            entered: std.Io.Event = .unset,
+            fn run(ptr: *anyopaque, group_id: u64, name: []const u8) !?void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.entered.set(self.io);
+                return self.owner.retireTableGroupLocal(group_id, name);
+            }
+            fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                return error.UnexpectedBatch;
+            }
+        };
+        var drain = Drain{ .owner = owners.writeSource(), .io = io };
+        _ = source.withLocalWriteSource(.{ .ptr = &drain, .vtable = &.{ .batch = Drain.batch, .retire_table_group_local = Drain.run } });
+        const Ownership = struct {
+            fn classify(_: *anyopaque, group_id: u64) !table_writes.ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
+                if (group_id != 7198) return error.UnexpectedGroup;
+                return .retired;
+            }
+        };
+        _ = source.withReplicaRetirementOwnership(.{ .ptr = &source, .classify = Ownership.classify });
+        var prepared = try source.prepareReplicaRetirements(alloc, &.{.{ .group_id = 7198, .table_name = retirement_name }});
+        defer prepared.deinit();
+        const Release = struct {
+            fn run(wait_io: std.Io, held: *kernel_owner_source.ProvisionedKernelOwnerSource.TransitionLease, physical_path: []const u8, drain_entered: *std.Io.Event) !void {
+                defer held.deinit();
+                try drain_entered.waitTimeout(wait_io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+                try wait_io.sleep(.fromMilliseconds(50), .awake);
+                // A live lease must still own its original files even after
+                // the durable retirement has admitted physical cleanup.
+                try std.Io.Dir.cwd().access(wait_io, physical_path, .{});
+            }
+        };
+        var releasing = try io.concurrent(Release.run, .{ io, &lease, path, &drain.entered });
+        lease_owned = false;
+        defer _ = releasing.await(io) catch {};
+        try source.completePreparedReplicaRetirements(&prepared);
+        try releasing.await(io);
+        try std.testing.expectEqual(@as(usize, 1), owners.ownerCountForTest());
+        try std.Io.Dir.cwd().access(io, retained_path, .{});
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, path, .{}));
+        // Closing the source can no longer recreate WAL/index files beneath
+        // the deleted path: all compiled owners were drained before rename.
+        owners.deinit();
+        owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, path, .{}));
+        try std.Io.Dir.cwd().access(io, retained_path, .{});
+    }
+}
+
+test "hidden constrained lookup recovers cold compiled owner from exact plan authority" {
+    const alloc = std.testing.allocator;
+    const Source = kernel_owner_source.ProvisionedKernelOwnerSource;
+    const staging = @import("db/restore_staging_contract.zig");
+    const schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"unique_constraints\":[{\"name\":\"pk\",\"columns\":[\"id\"]}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
+    const tables = @import("../api/tables.zig");
+    var parsed = try tables.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try tables.deriveRuntimeTableSchema(alloc, parsed);
+    defer @import("schema.zig").freeSchema(alloc, schema);
+    const encoded_schema = try @import("schema.zig").serializeSchema(alloc, schema);
+    defer alloc.free(encoded_schema);
+    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 70, .shard_id = 7001, .range_id = 7001 }, .target_namespace = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .target_schema_digest = staging.digest(encoded_schema) };
+    const bootstrap: staging.OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = schema_json, .indexes_json = "{}", .byte_range = .{ .start = "a", .end = "m" } };
+    const bootstrap_json = try std.json.Stringify.valueAlloc(alloc, bootstrap, .{});
+    defer alloc.free(bootstrap_json);
+    const descriptor: @import("kernel_owner_descriptor.zig").Descriptor = .{ .lsm_root_generation = table_reads.backend_current_root_generation, .identity = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .schema_json = schema_json, .indexes_json = "{}", .restore_bootstrap_json = bootstrap_json };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const Authority = struct {
+        descriptor: @import("kernel_owner_descriptor.zig").Descriptor,
+        expected: staging.Scope,
+        denied: bool = true,
+        expected_use: Source.RestoreDescriptorUse = .read,
+        reads: usize = 0,
+        barrier_blocked: bool = false,
+        barriers: usize = 0,
+        fn recover(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64, name: []const u8, digest: [32]u8, plan_id: [16]u8, use: Source.RestoreDescriptorUse, context: @import("../api/operation.zig").RequestContext) !Source.OwnedRestoreDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            try std.testing.expectEqual(@as(u64, 7196), group_id);
+            try std.testing.expectEqualStrings("hidden", name);
+            try std.testing.expectEqual(self.expected.digest(), digest);
+            try std.testing.expectEqual(self.expected.plan_id, plan_id);
+            try std.testing.expectEqual(self.expected_use, use);
+            self.reads += 1;
+            if (self.denied) return error.RestoreStagingCanceled;
+            const schema_owned = try allocator.dupe(u8, self.descriptor.schema_json);
+            errdefer allocator.free(schema_owned);
+            const indexes_owned = try allocator.dupe(u8, self.descriptor.indexes_json);
+            errdefer allocator.free(indexes_owned);
+            const bootstrap_owned = try allocator.dupe(u8, self.descriptor.restore_bootstrap_json);
+            var result = self.descriptor;
+            result.schema_json = schema_owned;
+            result.indexes_json = indexes_owned;
+            result.restore_bootstrap_json = bootstrap_owned;
+            return .{ .descriptor = result };
+        }
+        fn barrier(ptr: *anyopaque, group_id: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7196), group_id);
+            self.barriers += 1;
+            if (self.barrier_blocked) return error.NotLeader;
+        }
+    };
+    var authority = Authority{ .descriptor = descriptor, .expected = scope };
+    const barrier: read_gate.ReadSafetyBarrier = .{ .ptr = &authority, .vtable = &.{ .wait_read_safe = Authority.barrier } };
+    var owners = Source.init(alloc, root, table_catalog.emptyCatalogSource(), barrier);
+    defer owners.deinit();
+    _ = try owners.restoreOwnerControl(alloc, 7196, "hidden", descriptor, .{ .scope = scope, .action = .begin }, null, .{}, .{});
+    const before = try (staging.Progress{ .scope = scope }).encode(alloc);
+    defer alloc.free(before);
+    const imported = try (staging.Progress{ .scope = scope, .phase = .imported }).encode(alloc);
+    defer alloc.free(imported);
+    try owners.applyPreparedReplicatedBatchGroupLocal(alloc, 7196, "hidden", descriptor, .{
+        .restore_staging = .{ .import_page = .{ .expected = staging.digest(before), .next = imported, .scope = scope.digest(), .timestamps = &.{} } },
+    });
+    owners.deinit();
+    owners = Source.init(alloc, root, table_catalog.emptyCatalogSource(), barrier);
+    _ = owners.withRestoreDescriptorRecovery(.{ .ptr = &authority, .recover_fn = Authority.recover });
+    var options: db_mod.types.LookupOptions = .{ .restore_staging_scope = scope.digest(), .relational_activation_json = "{\"mode\":\"status\"}" };
+    try std.testing.expectError(error.RestoreStagingScopeChanged, owners.readSource().lookupGroupLocal(alloc, 7196, "hidden", "a", options, .read_index));
+    options.restore_staging_plan_id = scope.plan_id;
+    try std.testing.expectError(error.RestoreStagingCanceled, owners.readSource().lookupGroupLocal(alloc, 7196, "hidden", "a", options, .read_index));
+    try std.testing.expectEqual(@as(usize, 0), owners.ownerCountForTest());
+    authority.denied = false;
+    authority.barrier_blocked = true;
+    try std.testing.expectError(error.NotLeader, owners.readSource().lookupGroupLocal(alloc, 7196, "hidden", "a", options, .stale));
+    try std.testing.expectEqual(@as(usize, 0), owners.ownerCountForTest());
+    authority.barrier_blocked = false;
+    var status = (try owners.readSource().lookupGroupLocal(alloc, 7196, "hidden", "a", options, .stale)).?;
+    defer status.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, status.json, "state") != null);
+    try std.testing.expect(authority.barriers >= 2);
+    options.restore_staging_plan_id = @splat(9);
+    try std.testing.expectError(error.RestoreStagingScopeChanged, owners.readSource().lookupGroupLocal(alloc, 7196, "hidden", "a", options, .read_index));
+    try std.testing.expectError(error.TableNotFound, owners.readSource().lookupGroupLocal(alloc, 7196, "hidden", "a", .{}, .read_index));
+    // The direct compiled transaction adapter must not drop private authority
+    // from pre-decision context, and status must recover it after another cold
+    // owner restart without relying on an earlier read to prime the cache.
+    const txn: db_mod.types.TxnId = @splat(0x71);
+    const participant = try @import("../api/distributed_txn.zig").participantIdForGroupScoped(alloc, "hidden", 7196, scope.digest(), scope.plan_id);
+    defer alloc.free(participant);
+    owners.deinit();
+    owners = Source.init(alloc, root, table_catalog.emptyCatalogSource(), barrier);
+    _ = owners.withRestoreDescriptorRecovery(.{ .ptr = &authority, .recover_fn = Authority.recover });
+    authority.expected_use = .mutate;
+    _ = try owners.writeSource().txnBeginGroupLocalWithPreDecisionContext(alloc, 7196, "hidden", txn, 1, 1, true, &.{participant}, .{ .restore_staging_scope = scope.digest(), .restore_staging_plan_id = scope.plan_id });
+    owners.deinit();
+    owners = Source.init(alloc, root, table_catalog.emptyCatalogSource(), barrier);
+    _ = owners.withRestoreDescriptorRecovery(.{ .ptr = &authority, .recover_fn = Authority.recover });
+    authority.expected_use = .resolve;
+    const status_request: @import("../api/distributed_txn_contract.zig").TxnStatusRequest = .{ .txn_id = txn, .restore_staging_scope = scope.digest(), .restore_staging_plan_id = scope.plan_id };
+    authority.barrier_blocked = true;
+    try std.testing.expectError(error.NotLeader, owners.writeSource().txnStatusGroupLocalWithRequest(alloc, 7196, "hidden", status_request, .{}));
+    try std.testing.expectEqual(@as(usize, 0), owners.ownerCountForTest());
+    authority.barrier_blocked = false;
+    try std.testing.expectEqual(db_mod.types.TxnStatus.pending, (try owners.writeSource().txnStatusGroupLocalWithRequest(alloc, 7196, "hidden", status_request, .{})).?);
+    var wrong_status = status_request;
+    wrong_status.restore_staging_plan_id = @splat(0xaa);
+    try std.testing.expectError(error.RestoreStagingScopeChanged, owners.writeSource().txnStatusGroupLocalWithRequest(alloc, 7196, "hidden", wrong_status, .{}));
+    wrong_status = status_request;
+    wrong_status.restore_staging_scope = @splat(0xbb);
+    try std.testing.expectError(error.RestoreStagingScopeChanged, owners.writeSource().txnStatusGroupLocalWithRequest(alloc, 7196, "hidden", wrong_status, .{}));
+}
+
 test "transition lease reads unpublished owner metadata without admitting document reads" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -61,22 +263,31 @@ test "transition lease reads unpublished owner metadata without admitting docume
     var status = try std.json.parseFromSlice(topology.Status, alloc, status_json, .{});
     defer status.deinit();
     try std.testing.expect(status.value.drained and status.value.fence == null);
+    // Exercise the compiled transition lease, not only native DB lookup: its
+    // lifecycle allowlist must accept the same receipt mode as the wire.
+    const receipt_json = try lease.readRelationalTopologyJson(alloc, "merge_copy_receipt");
+    defer alloc.free(receipt_json);
+    var receipt = try std.json.parseFromSlice(@import("db/merge_contract.zig").CopyReceipt, alloc, receipt_json, .{});
+    defer receipt.deinit();
+    try std.testing.expectEqual(identity.value.namespace, receipt.value.namespace);
+    try std.testing.expect(receipt.value.state == null);
+    // An uninitialized owner is not affirmative document-copy authority.
+    try std.testing.expect(!receipt.value.row_derived_document);
     try std.testing.expectError(error.InvalidArgument, lease.readRelationalTopologyJson(alloc, "document"));
     try std.testing.expectError(error.InvalidArgument, lease.readRelationalTopologyJson(alloc, ""));
     try std.testing.expectError(error.TableNotFound, source.readSource().lookupGroupLocal(alloc, 7199, "unpublished", "private-row", .{}, .read_index));
 }
 
-fn cleanup(path: []const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-}
-
 test "provisioned batch lookup scan and query share one opaque live storage owner" {
     const alloc = std.testing.allocator;
-    const replica_root = "/tmp/antfly-storage-kernel-provisioned-source";
-    cleanup(replica_root);
-    defer cleanup(replica_root);
+    var replica_tmp = std.testing.tmpDir(.{});
+    defer replica_tmp.cleanup();
+    var backup_tmp = std.testing.tmpDir(.{});
+    defer backup_tmp.cleanup();
+    const replica_root = try replica_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(replica_root);
+    const backup_root = try backup_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(backup_root);
 
     const Catalog = struct {
         const metadata_incarnation: metadata_api.MetadataClusterIncarnation = "31313131313131313131313131313131".*;
@@ -232,6 +443,28 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
 
     try std.testing.expect((try write_source.source().createTable(alloc, "articles", .{})) != null);
     {
+        // A guarded merge copy pins the transition descriptor without the
+        // catalog's initial-range hint. Its final donor proposal must drop
+        // only that native pin before ordinary admission reacquires the exact
+        // catalog descriptor, retaining the transition admission gate.
+        var descriptor = try owner_source.loadDescriptor(alloc, 7001, "articles");
+        defer descriptor.deinit(alloc);
+        try std.testing.expect(descriptor.initial_range != null);
+        var transition_descriptor = descriptor.view();
+        transition_descriptor.initial_range = null;
+        var activity = write_source.beginGroupTransitionActivity("articles", 7001);
+        defer activity.deinit();
+        var copied_owner = try owner_source.leaseTransitionOwner(7001, "articles", transition_descriptor);
+        var pinned = true;
+        defer if (pinned) copied_owner.deinit();
+        try std.testing.expectError(error.StorageBusy, owner_source.writeSource().preflightWriteAdmissionGroupLocal(7001, "articles"));
+        copied_owner.deinit();
+        pinned = false;
+        try std.testing.expect(write_source.hasReadBlockingActivityBestEffort("articles", 7001));
+        try std.testing.expect((try owner_source.writeSource().preflightWriteAdmissionGroupLocal(7001, "articles")) != null);
+        try std.testing.expect(write_source.hasReadBlockingActivityBestEffort("articles", 7001));
+    }
+    {
         const response = (try write_source.source().graphMetricAction(alloc, "articles", "relations_graph", "degree", "pause")) orelse return error.ExpectedGraphMetricStatus;
         var status = response;
         defer status.deinit(alloc);
@@ -361,9 +594,6 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         txn_participant,
     )) != null);
 
-    const backup_root = "/tmp/antfly-storage-kernel-provisioned-source-backups";
-    cleanup(backup_root);
-    defer cleanup(backup_root);
     const backup_formats = [_]struct {
         format: backup_contract.BackupFormat,
         backup_id: []const u8,

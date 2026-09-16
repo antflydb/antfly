@@ -32,7 +32,24 @@ const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const platform_time = @import("antfly_platform").time;
 
-pub const Error = operation.ApiError || @import("relational_integrity_errors.zig").Error || error{
+// Bound diagnostics for repeatedly retried private lifecycle operations. Never
+// include request bodies, credentials, or user rows in this diagnostic.
+var next_unknown_transition_log_ns: std.atomic.Value(u64) = .init(0);
+var next_unknown_topology_read_log_ns: std.atomic.Value(u64) = .init(0);
+
+fn logUnknownTransitionFailure(group_id: u64, action: metadata_mod.TransitionAction, err: anyerror) void {
+    const now = platform_time.monotonicNs();
+    const next = next_unknown_transition_log_ns.load(.monotonic);
+    if (now < next) return;
+    if (next_unknown_transition_log_ns.cmpxchgStrong(next, now +| 5 * std.time.ns_per_s, .monotonic, .monotonic) != null) return;
+    // ShardOperationAdapter translates foreign failures to this unit's error
+    // domain before they reach this diagnostic.
+    std.log.warn("private transition failed group_id={} action={s} err={s}", .{ group_id, @tagName(action), @errorName(err) });
+}
+
+pub const Error = operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
+    RetainedEffectsFull,
+    AuthoritativeLookupMissing,
     TopologyChanged,
     IdentityReadGenerationChanged,
     IndexGenerationMismatch,
@@ -58,6 +75,25 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     InvalidRepairCancelToken,
 };
 
+/// A rejected primary mutation can be retried after retention catches up.
+/// A resolve/acknowledgement may belong to an already committed transaction;
+/// never describe its pressure as a not-written admission rejection.
+fn retainedBatchPressure(input: db_mod.types.BatchRequest) Error {
+    if (input.transaction) |transaction| return switch (transaction) {
+        .begin, .prepare => error.RetainedEffectsFull,
+        .resolve => |resolve| if (resolve.status == .committed) error.EnrichmentRetryInProgress else error.Unavailable,
+        else => error.Unavailable,
+    };
+    return error.RetainedEffectsFull;
+}
+
+test "retained quota classification never labels committed resolve not written" {
+    try std.testing.expectEqual(error.RetainedEffectsFull, retainedBatchPressure(.{}));
+    try std.testing.expectEqual(error.RetainedEffectsFull, retainedBatchPressure(.{ .transaction = .{ .prepare = .{ .txn_id = @splat(7), .topology_epoch = 1 } } }));
+    try std.testing.expectEqual(error.EnrichmentRetryInProgress, retainedBatchPressure(.{ .transaction = .{ .resolve = .{ .txn_id = @splat(7), .status = .committed, .commit_version = 1 } } }));
+    try std.testing.expectEqual(error.Unavailable, retainedBatchPressure(.{ .transaction = .{ .resolve = .{ .txn_id = @splat(7), .status = .aborted, .commit_version = 0 } } }));
+}
+
 pub const RepairCancellationLookup = struct {
     ptr: *anyopaque,
     is_requested_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, u64, u64, ?[]const u8) anyerror!bool,
@@ -78,21 +114,51 @@ pub const RoutedBatchAuthority = union(enum) {
     relational_topology,
 };
 
+/// Cancellation may need to revoke an exact legacy donor transition before
+/// online admission exists. This grants no ordinary mutation authority: every
+/// other effect must retain its empty/default value, including future fields.
+fn validatePrivateMergeSourceRollback(group_id: u64, input: db_mod.types.BatchRequest) !void {
+    const control = input.merge_source_transition orelse return error.InvalidArgument;
+    if (control.kind != .rollback or group_id == 0 or control.transition_id == 0 or
+        control.receiver_group_id == 0 or control.receiver_group_id == group_id)
+        return error.InvalidArgument;
+    const empty: db_mod.types.BatchRequest = .{};
+    inline for (std.meta.fields(db_mod.types.BatchRequest)) |field| {
+        if (comptime !std.mem.eql(u8, field.name, "merge_source_transition") and
+            !std.mem.eql(u8, field.name, "timestamp_ns") and
+            !std.mem.eql(u8, field.name, "sync_level"))
+        {
+            const value = @field(input, field.name);
+            if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
+                if (value.len != 0) return error.InvalidArgument;
+            } else if (!std.meta.eql(value, @field(empty, field.name))) return error.InvalidArgument;
+        }
+    }
+}
+
 pub const RoutedRaftBatchWriter = struct {
     ptr: *anyopaque,
-    write_fn: *const fn (
-        *anyopaque,
-        std.mem.Allocator,
-        RoutedBatchAuthority,
-        u64,
-        []const u8,
-        db_mod.types.BatchRequest,
-        internal_batch_forwarding.Context,
-        CancellationToken,
-    ) anyerror!?void,
+    write_fn: @FieldType(VTable, "write"),
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
-    fn write(self: @This(), alloc: std.mem.Allocator, authority: RoutedBatchAuthority, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, cancellation: CancellationToken) !?void {
-        return self.write_fn(self.ptr, alloc, authority, group_id, table_name, input, forwarding, cancellation);
+    pub const VTable = struct {
+        write: *const fn (
+            *anyopaque,
+            std.mem.Allocator,
+            RoutedBatchAuthority,
+            u64,
+            []const u8,
+            db_mod.types.BatchRequest,
+            internal_batch_forwarding.Context,
+            CancellationToken,
+        ) anyerror!?void,
+    };
+    const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+
+    pub fn write(self: @This(), alloc: std.mem.Allocator, authority: RoutedBatchAuthority, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, cancellation: CancellationToken) !?void {
+        // The data runtime supplies this callback to the separately compiled
+        // API runtime. Native error integers are private to each archive.
+        return BoundaryAbi.call("write", self.boundary_dispatch, self.write_fn, .{ self.ptr, alloc, authority, group_id, table_name, input, forwarding, cancellation });
     }
 };
 
@@ -149,6 +215,7 @@ pub const Operations = struct {
     }
 
     fn mapCommonReadError(err: anyerror) ?Error {
+        if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
         if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
         return switch (err) {
             error.Timeout,
@@ -161,6 +228,15 @@ pub const Operations = struct {
             error.IndexGenerationMismatch => error.IndexGenerationMismatch,
             error.GenerationTransitionActive => error.GenerationTransitionActive,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
+            // Reads share the same leadership admission as point lookup. Do
+            // not turn a leader election/routing race into an opaque 500 at
+            // the internal scan boundary.
+            error.NotLeader,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.UnknownGroup,
+            error.ReadUnavailable,
+            => error.GroupLeaderUnavailable,
             error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
             error.CatalogRoutingUnavailable,
             error.CatalogProjectionRefreshRequired,
@@ -265,8 +341,16 @@ pub const Operations = struct {
             error.BackgroundOwnerClosing,
             error.BackgroundOwnerClosed,
             error.TransitionOperationBusy,
+            error.MergeTransitionNotReady,
+            error.MergeReceiverProjectionNotReady,
+            error.MergeSourceProjectionNotReady,
+            error.MergeSourceProjectionAdvanced,
+            error.StorageBusy,
             => return error.GroupLeaderUnavailable,
-            else => return error.Internal,
+            else => {
+                logUnknownTransitionFailure(group_id, action, err);
+                return error.Internal;
+            },
         };
     }
 
@@ -285,6 +369,7 @@ pub const Operations = struct {
         validator.validate(table_name, input.writes) catch |err| switch (err) {
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             else => {
+                if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("group-local Raft batch validation failed group_id={} table={s} err={s}", .{
                     group_id,
                     table_name,
@@ -294,6 +379,8 @@ pub const Operations = struct {
             },
         };
         _ = (writes.batchGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
+            error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
+            error.RetainedEffectsFull => return retainedBatchPressure(input),
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
             error.IntegrityTopologyBusy, error.TransactionTopologyBusy, error.ConstraintRetirementInProgress => return error.Unavailable,
@@ -306,6 +393,7 @@ pub const Operations = struct {
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("group-local Raft batch failed group_id={} table={s} err={s}", .{
                     group_id,
                     table_name,
@@ -335,6 +423,7 @@ pub const Operations = struct {
         validator.validate(table_name, input.writes) catch |err| switch (err) {
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             else => {
+                if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("routed Raft batch validation failed group_id={} table={s} err={s}", .{
                     group_id,
                     table_name,
@@ -359,6 +448,18 @@ pub const Operations = struct {
             parsed_fence.?.value.admission_deadline_io = request.deadline_io;
             parsed_fence.?.value.admission_cancellation = request.cancellation;
             break :fence .{ .catalog = parsed_fence.?.value };
+        } else if (input.merge_source_transition != null) rollback: {
+            // Authenticated private cleanup only. The replicated donor state
+            // remains responsible for matching this transition and receiver;
+            // neither prepare/finalize nor bundled effects gain this authority.
+            try validatePrivateMergeSourceRollback(group_id, input);
+            break :rollback .relational_topology;
+        } else if (input.online_source) |control| source: {
+            @import("../storage/db/online_source_contract.zig").validateRequest(input) catch return error.InvalidArgument;
+            if (control.scope().fence.owner_group_id != group_id) return error.InvalidArgument;
+            // Source retention uses the same private exact-owner authority as
+            // topology lifecycle commands; it never grants public row writes.
+            break :source .relational_topology;
         } else if (input.transaction) |transaction| transaction: {
             // A transaction may be forwarded after the originating replica
             // validated its catalog epoch. Require every pre-decision command
@@ -442,6 +543,8 @@ pub const Operations = struct {
             break :merge .merge_replication;
         } else return error.Unavailable;
         _ = (writer.write(alloc, authority, group_id, table_name, input, forwarding, request.cancellation) catch |err| switch (err) {
+            error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
+            error.RetainedEffectsFull => return retainedBatchPressure(input),
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.InvalidIntegrityTopologyFence => return error.InvalidArgument,
             error.IntegrityTopologyBusy, error.TransactionTopologyBusy, error.ConstraintRetirementInProgress => return error.Unavailable,
@@ -458,6 +561,7 @@ pub const Operations = struct {
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("routed Raft batch failed group_id={} table={s} err={s}", .{
                     group_id,
                     table_name,
@@ -480,10 +584,13 @@ pub const Operations = struct {
             writes.vtable.txn_begin_group_local_with_pre_decision_context != null;
         _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, .{
             .restore_staging_scope = input.restore_staging_scope,
+            .restore_staging_plan_id = input.restore_staging_plan_id,
             .deadline_ns = request.deadline_ns,
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
+            error.RetainedEffectsFull => return error.RetainedEffectsFull,
+            error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
@@ -520,7 +627,10 @@ pub const Operations = struct {
             const validator = self.txn_validator orelse return error.Unavailable;
             validator.validate(table_name, input.req.writes) catch |err| switch (err) {
                 error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
-                else => return error.Internal,
+                else => {
+                    if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
+                    return error.Internal;
+                },
             };
         }
         _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, .{
@@ -528,6 +638,8 @@ pub const Operations = struct {
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
+            error.RetainedEffectsFull => return error.RetainedEffectsFull,
+            error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.TransactionTooLarge => return error.TransactionTooLarge,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             error.Canceled, error.Cancelled => return error.Canceled,
@@ -550,6 +662,7 @@ pub const Operations = struct {
                 // One registry drives Raft terminal results and participant
                 // transport; adding a lifecycle fence must not silently turn
                 // its recoverable typed rejection into an HTTP 500.
+                if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 return error.Internal;
             },
@@ -559,7 +672,9 @@ pub const Operations = struct {
     pub fn txnResolve(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnResolveRequest) Error!void {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        _ = (writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level, request.cancellation) catch |err| switch (err) {
+        _ = (distributed_txn.resolveGroupLocalWithRequest(writes, alloc, group_id, table_name, input, request.cancellation) catch |err| switch (err) {
+            error.OnlineSourcePinPending => return error.EnrichmentRetryInProgress,
+            error.RetainedEffectsFull => return if (input.status == .committed) error.EnrichmentRetryInProgress else error.Unavailable,
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -574,13 +689,20 @@ pub const Operations = struct {
     }
 
     pub fn txnStatus(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) Error!db_mod.types.TxnStatus {
+        return self.txnStatusWithRequest(alloc, request, group_id, table_name, .{ .txn_id = txn_id });
+    }
+
+    pub fn txnStatusWithRequest(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnStatusRequest) Error!db_mod.types.TxnStatus {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        const status = if (request.deadline_ns) |deadline_ns|
-            writes.txnStatusGroupAuthoritativeLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns)
+        const status = if (input.restore_staging_scope != null or input.restore_staging_plan_id != null)
+            writes.txnStatusGroupLocalWithRequest(alloc, group_id, table_name, input, request)
+        else if (request.deadline_ns) |deadline_ns|
+            writes.txnStatusGroupAuthoritativeLocalUntil(alloc, group_id, table_name, input.txn_id, deadline_ns)
         else
-            writes.txnStatusGroupAuthoritativeLocal(alloc, group_id, table_name, txn_id);
+            writes.txnStatusGroupAuthoritativeLocal(alloc, group_id, table_name, input.txn_id);
         return (status catch |err| switch (err) {
+            error.InvalidTxnRequest, error.RestoreStagingScopeChanged => return error.InvalidArgument,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.LeaderUnavailable,
             error.NotLeader,
@@ -596,7 +718,8 @@ pub const Operations = struct {
     pub fn txnAcknowledge(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnAcknowledgeRequest) Error!void {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        _ = (writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, input.txn_id, input.participant) catch |err| switch (err) {
+        _ = (distributed_txn.acknowledgeGroupLocalWithRequest(writes, alloc, group_id, table_name, input, request.cancellation) catch |err| switch (err) {
+            error.InvalidTxnRequest, error.RestoreStagingScopeChanged => return error.InvalidArgument,
             error.InvalidParticipant, error.DecisionConflict => return error.DecisionConflict,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
@@ -799,14 +922,22 @@ pub const Operations = struct {
     ) Error!table_reads.LookupResponse {
         try request.ensureActive();
         if (input.options.relational_topology_json.len != 0) {
-            if (input.options.relational_topology_json.len > 512) return error.InvalidArgument;
-            const Probe = struct { transition_id: ?u64 = null };
+            if (input.options.relational_topology_json.len > 4096) return error.InvalidArgument;
+            const Probe = struct { transition_id: ?u64 = null, mode: ?[]const u8 = null };
             var probe = std.json.parseFromSlice(Probe, alloc, input.options.relational_topology_json, .{ .ignore_unknown_fields = true }) catch return error.InvalidArgument;
             defer probe.deinit();
+            if (probe.value.mode) |mode| if (std.mem.eql(u8, mode, "online_source_status")) {
+                const StatusRequest = struct { mode: enum { online_source_status }, scope: @import("../storage/db/online_source_contract.zig").Scope };
+                var scoped = std.json.parseFromSlice(StatusRequest, alloc, input.options.relational_topology_json, .{}) catch return error.InvalidArgument;
+                defer scoped.deinit();
+                scoped.value.scope.validate() catch return error.InvalidArgument;
+                if (scoped.value.scope.fence.owner_group_id != input.group_id or input.consistency != .read_index or
+                    input.key.len != 0 or input.options.restore_staging_scope != null) return error.InvalidArgument;
+            };
             if (probe.value.transition_id != null) {
                 if (input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
                     input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
-                    input.options.relational_integrity_jobs_json.len != 0 or input.options.relational_activation_json.len != 0 or input.options.fields.len != 0) return error.InvalidArgument;
+                    input.options.relational_integrity_jobs_json.len != 0 or input.options.relational_index_status_json.len != 0 or input.options.relational_activation_json.len != 0 or input.options.fields.len != 0) return error.InvalidArgument;
                 var scoped = std.json.parseFromSlice(@import("../raft/shard_ops.zig").TopologyReadRequest, alloc, input.options.relational_topology_json, .{}) catch return error.InvalidArgument;
                 defer scoped.deinit();
                 const ops = self.shard_ops orelse return error.NotFound;
@@ -821,7 +952,14 @@ pub const Operations = struct {
                 const deadline: Deadline = .{ .context = request };
                 const json = ops.topologyRead(alloc, input.group_id, input.table_name, scoped.value, .{ .ptr = &deadline, .is_cancelled_fn = Deadline.canceled }) catch |err| {
                     try request.ensureActive();
-                    return mapCommonReadError(err) orelse mapLookupError(err);
+                    const mapped = mapCommonReadError(err) orelse mapLookupError(err);
+                    if (mapped == error.Internal) {
+                        const now = platform_time.monotonicNs();
+                        const next = next_unknown_topology_read_log_ns.load(.monotonic);
+                        if (now >= next and next_unknown_topology_read_log_ns.cmpxchgStrong(next, now +| 5 * std.time.ns_per_s, .monotonic, .monotonic) == null)
+                            std.log.warn("private topology read failed group_id={} mode={s} err={s}", .{ input.group_id, @tagName(scoped.value.mode), @errorName(err) });
+                    }
+                    return mapped;
                 };
                 errdefer alloc.free(json);
                 try request.ensureActive();
@@ -841,7 +979,10 @@ pub const Operations = struct {
             options,
             input.consistency,
         ) catch |err| return mapCommonReadError(err) orelse mapLookupError(err);
-        return result orelse error.NotFound;
+        if (result) |value| return value;
+        try request.ensureActive();
+        if (input.consistency == .read_index and reads.route_fence != null and reads.strict_read_index_absence) return error.AuthoritativeLookupMissing;
+        return error.NotFound;
     }
 
     /// The returned manifest owns its nested allocations and must be
@@ -1239,6 +1380,10 @@ fn consumerTests() type {
                 source.failure = @field(errors.Error, field.name);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
+            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
+                source.failure = @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
+                try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
+            }
         }
 
         test "internal transaction operations preserve pre-decision leader unavailability" {
@@ -1502,6 +1647,7 @@ fn consumerTests() type {
                 saw_unfenced_split: bool = false,
                 saw_unfenced_merge: bool = false,
                 saw_unfenced_transaction: bool = false,
+                saw_unfenced_source: bool = false,
 
                 fn validate(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1528,7 +1674,7 @@ fn consumerTests() type {
                         .transaction => self.saw_unfenced_transaction = true,
                         .split_replication => self.saw_unfenced_split = true,
                         .merge_replication => self.saw_unfenced_merge = true,
-                        .relational_topology => return error.UnexpectedTestCall,
+                        .relational_topology => self.saw_unfenced_source = true,
                     }
                     try std.testing.expectEqualStrings("documents", table_name);
                     try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
@@ -1707,6 +1853,62 @@ fn consumerTests() type {
                 forwarding,
             ));
             try std.testing.expectEqual(@as(usize, 7), state.calls);
+            const source: db_mod.types.BatchRequest = .{ .online_source = .{ .admit = .{ .scope = .{
+                .fence = .{ .transition_id = 92, .attempt = 1, .owner_group_id = 17, .peer_group_id = 18, .role = .merge_source, .namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 17 }, .catalog_digest = @splat(1) },
+                .receiver_namespace = .{ .table_id = 7, .shard_id = 18, .range_id = 18 },
+                .consumer_epoch = 1,
+                .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+            } } } };
+            _ = try operations.routedBatch(std.testing.allocator, unfenced_request, 17, "documents", source, forwarding);
+            try std.testing.expect(state.saw_unfenced_source);
+            try std.testing.expectEqual(@as(usize, 8), state.calls);
+            try std.testing.expectError(error.InvalidArgument, operations.routedBatch(std.testing.allocator, unfenced_request, 18, "documents", source, forwarding));
+            try std.testing.expectEqual(@as(usize, 8), state.calls);
+
+            // A canceled online admission can encounter an exact legacy donor
+            // preparation. Its private rollback must reach Raft without a
+            // serving-catalog fence, but no other command gains that authority.
+            const rollback: db_mod.types.BatchRequest = .{
+                .merge_source_transition = .{ .kind = .rollback, .transition_id = 92, .receiver_group_id = 18 },
+                .timestamp_ns = 123,
+                .sync_level = .full_index,
+            };
+            _ = try operations.routedBatch(std.testing.allocator, unfenced_request, 17, "documents", rollback, forwarding);
+            try std.testing.expectEqual(@as(usize, 9), state.calls);
+            inline for (.{ .prepare, .finalize }) |kind| {
+                var invalid = rollback;
+                invalid.merge_source_transition.?.kind = kind;
+                try std.testing.expectError(error.InvalidArgument, operations.routedBatch(std.testing.allocator, unfenced_request, 17, "documents", invalid, forwarding));
+            }
+            for ([_]u64{ 0, 18 }) |invalid_group| {
+                try std.testing.expectError(error.InvalidArgument, operations.routedBatch(std.testing.allocator, unfenced_request, invalid_group, "documents", rollback, forwarding));
+            }
+            inline for (.{ "transition_id", "receiver_group_id" }) |field| {
+                var invalid = rollback;
+                @field(invalid.merge_source_transition.?, field) = 0;
+                try std.testing.expectError(error.InvalidArgument, operations.routedBatch(std.testing.allocator, unfenced_request, 17, "documents", invalid, forwarding));
+            }
+            const unrelated = [_]db_mod.types.BatchRequest{
+                .{ .deletes = &.{"victim"} },
+                .{ .relational_repair = true },
+                .{ .relational_schema_version = 0 },
+                .{ .relational_integrity_generation_set = @splat(1) },
+                .{ .restore_staging_scope = @splat(1) },
+                .{ .restore_staging_plan_id = @splat(1) },
+                .{ .reject_graph_transform_projections = true },
+                .{ .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 2 } } },
+                .{ .online_source = source.online_source },
+                .{ .merge_replication = merge_replication },
+                .{ .split_replication = split_replication },
+                .{ .merge_artifacts = &.{.{ .key = "artifact", .value = "value" }} },
+            };
+            for (unrelated) |other| {
+                var invalid = other;
+                invalid.merge_source_transition = rollback.merge_source_transition;
+                try std.testing.expectError(error.InvalidArgument, operations.routedBatch(std.testing.allocator, unfenced_request, 17, "documents", invalid, forwarding));
+            }
+            // None of the rejected requests reached the proposal callback.
+            try std.testing.expectEqual(@as(usize, 9), state.calls);
         }
 
         test "typed internal query workers preserve identity generation validation" {
@@ -1807,8 +2009,10 @@ fn consumerTests() type {
                 Operations.mapCommonReadError(error.CatalogRoutingUnavailable).?,
             );
             const FakeReads = struct {
-                fn source() table_reads.TableReadSource {
-                    return .{ .ptr = undefined, .vtable = &.{
+                scan_error: anyerror = error.StorageReadTemporarilyUnavailable,
+
+                fn source(self: *@This()) table_reads.TableReadSource {
+                    return .{ .ptr = self, .vtable = &.{
                         .lookup = lookup,
                         .scan = scan,
                         .query = publicQuery,
@@ -1842,8 +2046,17 @@ fn consumerTests() type {
                     return error.StorageReadTemporarilyUnavailable;
                 }
 
-                fn groupScan(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
-                    return error.StorageReadTemporarilyUnavailable;
+                fn groupScan(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.scan_error;
+                }
+
+                fn unexpectedStart(_: ?*anyopaque) !void {
+                    return error.TestUnexpectedResult;
+                }
+
+                fn unexpectedWrite(_: ?*anyopaque, _: []const u8) !void {
+                    return error.TestUnexpectedResult;
                 }
 
                 fn auxiliary(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8) !?query_api.QueryResponse {
@@ -1859,7 +2072,8 @@ fn consumerTests() type {
                 }
             };
 
-            const operations = Operations{ .reads = FakeReads.source(), .shard_db_adapter = null };
+            var fake = FakeReads{};
+            const operations = Operations{ .reads = fake.source(), .shard_db_adapter = null };
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.scan(alloc, .{}, 7, "docs", "", "", .{}));
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.query(alloc, .{}, 7, "docs", .{}));
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.queryPreflight(alloc, .{}, 7, "docs", .{}, 0));
@@ -1874,6 +2088,15 @@ fn consumerTests() type {
                 mapLookupError(error.ResourceBudgetExceeded),
             );
             try std.testing.expectEqual(error.Internal, mapLookupError(error.CorruptInput));
+            const sink = table_reads.ScanStreamSink{ .context = null, .start_fn = FakeReads.unexpectedStart, .write_fn = FakeReads.unexpectedWrite };
+            for ([_]anyerror{ error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.UnknownGroup, error.ReadUnavailable }) |failure| {
+                fake.scan_error = failure;
+                try std.testing.expectError(error.GroupLeaderUnavailable, operations.scan(alloc, .{}, 7, "docs", "", "", .{}));
+                try std.testing.expectError(error.GroupLeaderUnavailable, operations.scanStream(alloc, .{}, 7, "docs", "", "", .{}, sink));
+            }
+            fake.scan_error = error.CorruptInput;
+            try std.testing.expectError(error.Internal, operations.scan(alloc, .{}, 7, "docs", "", "", .{}));
+            try std.testing.expectError(error.Internal, operations.scanStream(alloc, .{}, 7, "docs", "", "", .{}, sink));
         }
 
         test "internal group reads are callable without an HTTP request" {

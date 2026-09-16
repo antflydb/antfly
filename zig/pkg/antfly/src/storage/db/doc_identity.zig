@@ -531,6 +531,28 @@ fn readVisibilitySummaryTxn(txn: anytype) !?VisibilitySummary {
     return try decodeVisibilitySummary(raw);
 }
 
+/// Schema/source lifecycle admission may persist the namespace before the
+/// first row. Namespace presence alone therefore cannot distinguish an old
+/// uncounted store from a pristine owner. Prove the latter with two bounded
+/// prefix probes and the ordinal head, once, when its summary is absent.
+/// Existing rows or identities keep an unknown summary unknown; never invent
+/// zero coverage for an upgrade/corrupt populated root.
+fn initialVisibilitySummaryTxn(store: *docstore_mod.DocStore) !?VisibilitySummary {
+    // The mutation fast path uses a point-probe transaction, which deliberately
+    // does not support cursors. Open a transient snapshot only for this rare
+    // missing-summary proof; callers retain the mutation/apply fence.
+    var txn = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+    defer txn.abort();
+    if (try readNextOrdinalTxn(&txn) != 1) return null;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    if (try cursor.seekAtOrAfter(&.{internal_keys.user_namespace})) |entry|
+        if (internal_keys.isInternalUserKey(entry.key)) return null;
+    if (try cursor.seekAtOrAfter(&.{internal_keys.identity_namespace})) |entry|
+        if (entry.key.len > 1 and entry.key[0] == internal_keys.identity_namespace and entry.key[1] != 0xff) return null;
+    return VisibilitySummary{};
+}
+
 pub fn lookupOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?DocOrdinal {
     const mutable_txn = txn;
     const key = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, doc_id);
@@ -1988,7 +2010,7 @@ pub fn appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
         break :blk true;
     };
 
-    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else null;
+    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else try initialVisibilitySummaryTxn(store);
     var visibility_summary_dirty = visibility_summary != null and missing_namespace;
 
     var seen_upserts = std.StringHashMapUnmanaged(void).empty;
@@ -2139,7 +2161,7 @@ pub fn appendBatchIdentityMetadataAllNewTrustedForNamespaceAlloc(
         try seen_canonical_ids.put(alloc, canonical_doc_id, {});
     }
 
-    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else null;
+    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else try initialVisibilitySummaryTxn(store);
     if (missing_namespace) try appendNamespaceWrite(alloc, out, namespace);
 
     var next_ordinal = try readNextOrdinalTxn(&txn);
@@ -2308,7 +2330,7 @@ fn appendBatchIdentityMetadataBatchedFastPath(
     if (identityLookupsContainDuplicateKeys(canonical_lookups)) return false;
     if (!missing_namespace and try anyIdentityLookupExists(alloc, &txn, canonical_lookups)) return false;
 
-    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else null;
+    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else try initialVisibilitySummaryTxn(store);
     if (missing_namespace) try appendNamespaceWrite(alloc, out, namespace);
     var next_ordinal = try readNextOrdinalTxn(&txn);
     const available_ordinals: usize = std.math.maxInt(DocOrdinal) - next_ordinal;
@@ -2438,6 +2460,42 @@ test "identity unchanged batch proves live state and canonical mappings with thr
     const wrong = [_]u8{ 0, 0, 0, 99 };
     try store.putBatchWithReplay(null, &.{.{ .key = &canonical_key, .value = &wrong }}, &.{}, null);
     try std.testing.expectError(error.InvalidDocIdentity, appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 22, &unchanged, &.{ "doc:m", "doc:z", "doc:a" }, &.{}));
+}
+
+test "relational index system namespace preinitialization seeds first visibility summary only with bounded empty proof" {
+    const mem_backend = @import("../mem_backend.zig");
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
+    var namespace_bytes: [24]u8 = undefined;
+    encodeNamespace(&namespace_bytes, namespace);
+    try store.putBatch(&.{.{ .key = &internal_keys.identity_namespace_key, .value = &namespace_bytes }}, &.{});
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try readVisibilitySummaryTxn(&read) == null);
+        try std.testing.expect(try initialVisibilitySummaryTxn(&store) != null);
+    }
+    const old_key = try internal_keys.documentKeyAlloc(alloc, "uncounted-old-row");
+    defer alloc.free(old_key);
+    try store.putBatch(&.{.{ .key = old_key, .value = "{}" }}, &.{});
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        // Never turn a missing legacy/corrupt summary into a zero-data proof.
+        try std.testing.expect(try initialVisibilitySummaryTxn(&store) == null);
+    }
+    try store.putBatch(&.{}, &.{old_key});
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &writes);
+    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, namespace, 10, &writes, &.{ "a", "b" }, &.{});
+    const summary = (try visibilitySummaryFromWrites(writes.items)).?;
+    try std.testing.expectEqual(@as(u64, 2), summary.live_ordinals);
+    try store.putBatch(writes.items, &.{});
+    try std.testing.expectEqual(@as(u64, 2), (try visibilitySummaryFromStore(&store)).?.live_ordinals);
 }
 
 fn identityLookupsContainDuplicateKeys(lookups: []const IdentityLookup) bool {

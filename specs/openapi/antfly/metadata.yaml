@@ -5286,11 +5286,34 @@ components:
       additionalProperties: false
       required: [fields]
       description: |
-        Bounded relational scan in primary-key order. Each shard read pins an
-        immutable schema and row snapshot. Resume with the last returned _id
-        as from; a resumed request opens a fresh snapshot, not a retained cursor.
+        Bounded relational scan in primary-key order, or composite index order
+        when index is supplied. Index queries require schema_version and every
+        owning shard must have the selected generation ready. Partial indexes
+        require their WHERE predicates to be implied by the query conditions.
+        The bounded proof combines per-column equality, tighter ranges,
+        exclusions, and NULL-aware predicates using exact typed values and
+        matching collations. Unsupported implications fail closed. Explicit
+        scan bounds alone are not an implication proof. Equal tuples are
+        ordered by primary key. Each shard read pins its own immutable schema
+        and row snapshot; this is not a table-wide consistent snapshot.
+        Resume with the last returned _id as from for primary scans, or its
+        cursor as after for index scans. A resumed request opens a fresh snapshot,
+        not a retained cursor; concurrent mutations may move rows across the
+        continuation boundary. Keep index, bounds and conditions unchanged when paging.
         An empty projection returns row identities and versions only.
       properties:
+        index:
+          type: string
+          minLength: 1
+          description: Ready composite secondary index. Requires schema_version; cannot be combined with from/to.
+        after:
+          type: string
+          maxLength: 131168
+          description: Opaque exclusive index-order cursor from the last returned row. Binds the immutable schema version, logical index name, and comparison semantics, independent of owner-local physical generations. Each owner must still prove its current local index is ready.
+        lower:
+          $ref: "#/components/schemas/RelationalRowIndexBound"
+        upper:
+          $ref: "#/components/schemas/RelationalRowIndexBound"
         fields:
           type: array
           maxItems: 256
@@ -5317,12 +5340,34 @@ components:
         schema_version:
           type: integer
           format: uint32
-          description: Reject the read if an owning shard has a different active schema epoch.
+          x-go-type-skip-optional-pointer: false
+          description: Reject the read if an owning shard has a different active schema epoch. Zero is a valid epoch and is distinct from omission.
+
+    RelationalRowIndexBound:
+      type: object
+      additionalProperties: false
+      required: [values]
+      description: >
+        Typed left-prefix bound in declared index order, including descending
+        components. Inclusive bounds include the entire matching prefix.
+        Integer components accept exact decimal strings; null is an indexed null.
+      properties:
+        values:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items: {}
+        inclusive:
+          type: boolean
+          default: true
 
     RelationalRow:
       type: object
       required: [_id, row, version, schema_version]
       properties:
+        cursor:
+          type: string
+          description: Opaque index-order continuation; present only for secondary-index queries.
         _id:
           type: string
         row:
@@ -5683,7 +5728,7 @@ components:
       description: Deterministic relational integrity failure; changing the mutation or data is required before retry.
     RelationalConstraintActivationPhase:
       type: string
-      enum: [unique, foreign_key]
+      enum: [unique, foreign_key, check]
     RelationalConstraintRangeStatus:
       type: object
       required: [group_id, state, phase, rows_scanned, owner]
@@ -5771,8 +5816,8 @@ components:
           format: uint32
         coverage_kind:
           type: string
-          enum: [unique_and_foreign_key]
-          description: This endpoint reports distributed unique/FK coverage, not local scalar CHECK validation.
+          enum: [unique_foreign_key_and_check]
+          description: Distributed UNIQUE, foreign-key, and scalar CHECK coverage across every current table owner. Native local validation is not a substitute for this coordinated proof.
         state:
           $ref: "schema.yaml#/components/schemas/RelationalConstraintValidationState"
         ranges:
@@ -11730,7 +11775,7 @@ paths:
           type: string
     get:
       operationId: getRelationalConstraintStatus
-      summary: Read distributed unique and foreign-key validation coverage
+      summary: Read distributed UNIQUE, foreign-key, and CHECK validation coverage
       tags: [data_operations]
       responses:
         "200":
@@ -11759,7 +11804,7 @@ paths:
       summary: Repair version-conditional rows after failed constraint activation
       description: |
         Requires table administrator permission. Each affected target range must
-        have failed UNIQUE/FK activation. Replacement values still satisfy all
+        have failed UNIQUE/FK/CHECK activation. Replacement values still satisfy all
         constraints, and referential actions require write permission on every
         affected table. Existing dependencies remain protected. Repairs do not
         mark historical coverage valid; invoke constraint retry after repairs.
@@ -11802,7 +11847,7 @@ paths:
           type: string
     post:
       operationId: retryRelationalConstraints
-      summary: Restart failed UNIQUE/FK validation after administrative repair
+      summary: Restart failed UNIQUE/FK/CHECK validation after administrative repair
       description: |
         Requires table administrator permission. Resets each failed owner using
         an exact checkpoint precondition. Owners already validating or enforced
@@ -12246,6 +12291,31 @@ paths:
         description: Name of the table
         schema:
           type: string
+      - name: rewrite
+        in: query
+        required: false
+        description: |
+          Explicitly enqueue a durable fresh-generation schema rewrite instead
+          of changing the live schema. Requires administrator permission on the
+          entire dependency cohort. Sources remain writable during snapshot and
+          catch-up; final validation and publication are atomic across the cohort.
+          Returns a restore job (202), whose existing status/cancel routes apply.
+          Independent graph/vector artifacts without a retained row-derived
+          source proof are rejected before admission. The default false retains
+          ordinary schema-update behavior. Existing absent values remain absent
+          rather than retroactively receiving defaults. Stored column type
+          changes and destructive column removal are rejected.
+        schema:
+          type: boolean
+          default: false
+      - name: Idempotency-Key
+        in: header
+        required: false
+        description: Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409.
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 256
     put:
       summary: Replace a table's schema
       description: |
@@ -12283,7 +12353,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/Table"
         "202":
-          $ref: "#/components/responses/CommittedMutationAccepted"
+          description: Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility
+          headers:
+            Location:
+              description: Restore job status URL when rewrite=true.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/RestoreJob"
+                  - $ref: "#/components/schemas/CommittedMutationOutcome"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -12333,7 +12413,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/Table"
         "202":
-          $ref: "#/components/responses/CommittedMutationAccepted"
+          description: Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility
+          headers:
+            Location:
+              description: Restore job status URL when rewrite=true.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/RestoreJob"
+                  - $ref: "#/components/schemas/CommittedMutationOutcome"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -13263,6 +13353,98 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/indexes/{indexName}/retry:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Retry a failed index build
+      description: >-
+        Generation-fenced relational index maintenance. Requires table ADMIN permission.
+        Retry accepts failed generations.
+        Owners are admitted independently and durably; exact request replay resumes
+        after partial acknowledgements. Unsupported index types return 405.
+      tags: [index_management]
+      operationId: retryIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/IndexMaintenanceRequest"
+      responses:
+        "200":
+          description: All selected owner maintenance commands acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/IndexMaintenanceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/IndexMutationConflict"
+        "429":
+          $ref: "#/components/responses/StorageResourceExhausted"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
+  /tables/{tableName}/indexes/{indexName}/repair:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Repair an index generation
+      description: >-
+        Generation-fenced relational index maintenance. Requires table ADMIN permission.
+        Repair accepts ready or failed generations and rebuilds their derived records.
+        Owners are admitted independently and durably; exact request replay resumes
+        after partial acknowledgements. Unsupported index types return 405.
+      tags: [index_management]
+      operationId: repairIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/IndexMaintenanceRequest"
+      responses:
+        "200":
+          description: All selected owner maintenance commands acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/IndexMaintenanceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/IndexMutationConflict"
+        "429":
+          $ref: "#/components/responses/StorageResourceExhausted"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
   /tables/{tableName}/indexes/{indexName}:
     parameters:
       - name: tableName

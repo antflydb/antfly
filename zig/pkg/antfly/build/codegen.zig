@@ -180,6 +180,7 @@ pub fn addOpenApiSourceSteps(
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/generated/graph_identifier.yaml"), "antfly_graph_identifier_openapi", antfly_generated_root ++ "/antfly_graph_identifier_openapi", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/sort.yaml"), "antfly_sort_openapi", antfly_generated_root ++ "/antfly_sort_openapi", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/indexes.yaml"), "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi", "types", &.{
+            .{ "schema.yaml", "antfly_schema_openapi" },
             .{ "sort.yaml", "antfly_sort_openapi" },
             .{ "embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
@@ -371,6 +372,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     indexes_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     indexes_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
     indexes_openapi_mod.addImport("antfly_graph_identifier_openapi", graph_identifier_openapi_mod);
+    indexes_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     websearch_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     eval_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     generating_api_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);

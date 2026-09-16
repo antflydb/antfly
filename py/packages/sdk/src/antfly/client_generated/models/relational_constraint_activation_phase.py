@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class RelationalConstraintActivationPhase(StrEnum):
+    CHECK = "check"
     FOREIGN_KEY = "foreign_key"
     UNIQUE = "unique"
 

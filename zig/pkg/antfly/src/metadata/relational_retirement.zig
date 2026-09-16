@@ -13,9 +13,10 @@
 // limitations.
 
 //! Internal metadata retirement barrier. Jobs are immutable except for their
-//! monotonic phase; the exact source and replacement schema remain pinned.
+//! monotonic phase and verified-owner continuation; the exact source and
+//! replacement schema remain pinned.
 const std = @import("std");
-const native = @import("../storage/db/relational_integrity_retirement.zig");
+const native = @import("../storage/db/relational_integrity_retirement_contract.zig");
 const topology = @import("../common/topology_records.zig");
 pub const Phase = enum { fencing, foreign_keys, unique, ready, published };
 pub const Job = struct {
@@ -28,6 +29,10 @@ pub const Job = struct {
     drop: bool = false,
     phase: Phase = .fencing,
     failure: []const u8 = "",
+    /// Prefix of the immutable owner list whose linearizable phase proof was
+    /// durably observed. Native fences cannot regress while this job pins the
+    /// topology, so a successor need not rescan already-verified owners.
+    verified_owners: u32 = 0,
     /// Exact source routing topology; all-owner proofs are never transferable
     /// across split/merge, restore or a newly allocated range identity.
     owners: []const Owner,
@@ -49,12 +54,16 @@ pub const Job = struct {
         try jw.write(@tagName(self.phase));
         try jw.objectField("failure");
         try jw.write(self.failure);
+        try jw.objectField("verified_owners");
+        try jw.write(self.verified_owners);
         try jw.endObject();
     }
 
     pub fn validate(self: Job) !void {
         if (self.failure.len > 4096 or std.mem.allEqual(u8, &self.id, 0) or self.generations.len == 0 or self.generations.len > 1024 or
             self.owners.len == 0 or self.owners.len > 4096 or self.target_schema_json.len == 0 or self.target_schema_json.len > 1024 * 1024) return error.InvalidConstraintRetirement;
+        if (self.verified_owners >= self.owners.len or
+            ((self.phase == .ready or self.phase == .published) and self.verified_owners != 0)) return error.InvalidConstraintRetirement;
         for (self.generations, 0..) |generation, index| {
             if (std.mem.allEqual(u8, &generation, 0)) return error.InvalidConstraintRetirement;
             for (self.generations[0..index]) |previous| if (std.mem.eql(u8, &generation, &previous)) return error.InvalidConstraintRetirement;
@@ -92,7 +101,7 @@ pub fn transitionAllowed(alloc: std.mem.Allocator, before: topology.TableRecord,
         if (after.relational_retirement_json.len == 0) return true;
         var job = try parse(alloc, after.relational_retirement_json);
         defer job.deinit();
-        return job.value.phase == .fencing and job.value.failure.len == 0 and std.mem.eql(u8, &job.value.source_schema_digest, &digest(before.schema_json)) and
+        return job.value.phase == .fencing and job.value.failure.len == 0 and job.value.verified_owners == 0 and std.mem.eql(u8, &job.value.source_schema_digest, &digest(before.schema_json)) and
             std.mem.eql(u8, before.schema_json, after.schema_json) and std.mem.eql(u8, before.read_schema_json, after.read_schema_json);
     }
     var old = try parse(alloc, before.relational_retirement_json);
@@ -102,15 +111,22 @@ pub fn transitionAllowed(alloc: std.mem.Allocator, before: topology.TableRecord,
     var next = try parse(alloc, after.relational_retirement_json);
     defer next.deinit();
     const phase = next.value.phase;
+    const verified_owners = next.value.verified_owners;
     const failure_changed = !std.mem.eql(u8, next.value.failure, old.value.failure);
     next.value.phase = old.value.phase;
     next.value.failure = old.value.failure;
+    next.value.verified_owners = old.value.verified_owners;
     const old_bytes = try std.json.Stringify.valueAlloc(alloc, old.value, .{});
     defer alloc.free(old_bytes);
     const next_bytes = try std.json.Stringify.valueAlloc(alloc, next.value, .{});
     defer alloc.free(next_bytes);
+    const diagnostic = failure_changed and phase == old.value.phase and verified_owners == old.value.verified_owners;
+    const continuation = !failure_changed and old.value.failure.len == 0 and phase == old.value.phase and
+        verified_owners == old.value.verified_owners + 1;
+    const phase_advance = !failure_changed and old.value.failure.len == 0 and @intFromEnum(phase) == @intFromEnum(old.value.phase) + 1 and
+        verified_owners == 0 and (old.value.phase == .ready or old.value.verified_owners + 1 == old.value.owners.len);
     return std.mem.eql(u8, old_bytes, next_bytes) and
-        ((failure_changed and phase == old.value.phase) or (!failure_changed and old.value.failure.len == 0 and @intFromEnum(phase) == @intFromEnum(old.value.phase) + 1)) and
+        (diagnostic or continuation or phase_advance) and
         ((old.value.phase == .ready and phase == .published and !old.value.drop and std.mem.eql(u8, after.schema_json, old.value.target_schema_json)) or
             (std.mem.eql(u8, before.schema_json, after.schema_json) and std.mem.eql(u8, before.read_schema_json, after.read_schema_json)));
 }
@@ -181,4 +197,60 @@ pub fn phaseForOwner(phase: Phase) native.Phase {
         .ready => .ready,
         .published => .ready,
     };
+}
+
+test "distributed txn retirement barrier cursor is monotonic and preserved by failure retry" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var job: Job = .{
+        .id = @splat(1),
+        .source_schema_digest = digest("{}"),
+        .target_schema_digest = @splat(2),
+        .generation_set = @splat(3),
+        .generations = &.{@splat(4)},
+        .target_schema_json = "{\"version\":2}",
+        .owners = &.{
+            .{ .group_id = 1, .range_id = 1, .start = "", .end = "a" },
+            .{ .group_id = 2, .range_id = 2, .start = "a", .end = "b" },
+            .{ .group_id = 3, .range_id = 3, .start = "b", .end = "" },
+        },
+    };
+    var before: topology.TableRecord = .{ .table_id = 1, .name = "rows", .schema_json = "{}", .relational_retirement_json = try std.json.Stringify.valueAlloc(owned, job, .{}) };
+    var after = before;
+    job.verified_owners = 2;
+    after.relational_retirement_json = try std.json.Stringify.valueAlloc(owned, job, .{});
+    try std.testing.expect(!try transitionAllowed(alloc, before, after));
+    job.verified_owners = 1;
+    after.relational_retirement_json = try std.json.Stringify.valueAlloc(owned, job, .{});
+    try std.testing.expect(try transitionAllowed(alloc, before, after));
+    before = after;
+    job.failure = "TransactionTooLarge";
+    after.relational_retirement_json = try std.json.Stringify.valueAlloc(owned, job, .{});
+    try std.testing.expect(try transitionAllowed(alloc, before, after));
+    before = after;
+    job.failure = "";
+    job.verified_owners = 0;
+    after.relational_retirement_json = try std.json.Stringify.valueAlloc(owned, job, .{});
+    try std.testing.expect(!try transitionAllowed(alloc, before, after));
+    job.verified_owners = 1;
+    after.relational_retirement_json = try std.json.Stringify.valueAlloc(owned, job, .{});
+    try std.testing.expect(try transitionAllowed(alloc, before, after));
+    before = after;
+    job.phase = .foreign_keys;
+    job.verified_owners = 0;
+    after.relational_retirement_json = try std.json.Stringify.valueAlloc(owned, job, .{});
+    try std.testing.expect(!try transitionAllowed(alloc, before, after));
+    job.phase = .fencing;
+    job.verified_owners = 2;
+    after.relational_retirement_json = try std.json.Stringify.valueAlloc(owned, job, .{});
+    try std.testing.expect(try transitionAllowed(alloc, before, after));
+    before = after;
+    job.phase = .foreign_keys;
+    job.verified_owners = 0;
+    after.relational_retirement_json = try std.json.Stringify.valueAlloc(owned, job, .{});
+    try std.testing.expect(try transitionAllowed(alloc, before, after));
+    job.verified_owners = 3;
+    try std.testing.expectError(error.InvalidConstraintRetirement, job.validate());
 }
