@@ -150,6 +150,7 @@ pub const ParamState = struct {
 
     pub fn init(allocator: std.mem.Allocator, size: usize, needs_v: bool) !ParamState {
         const m = try allocator.alloc(f32, size);
+        errdefer allocator.free(m);
         @memset(m, 0.0);
 
         const v: []f32 = if (needs_v) blk: {
@@ -200,15 +201,18 @@ pub const OptimizerState = struct {
     }
 
     pub fn getOrCreate(self: *OptimizerState, name: []const u8, size: usize, needs_v: bool) !*ParamState {
+        if (self.param_states.getPtr(name)) |existing| {
+            if (existing.m.len != size or (needs_v and existing.v.len != size)) return error.InvalidOptimizerStateShape;
+            return existing;
+        }
         const owned_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned_name);
-        const gop = try self.param_states.getOrPut(self.allocator, owned_name);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = try ParamState.init(self.allocator, size, needs_v);
-        } else {
-            self.allocator.free(owned_name);
-        }
-        return gop.value_ptr;
+        var state = try ParamState.init(self.allocator, size, needs_v);
+        errdefer state.deinit();
+        // Publish only initialized ownership. An allocation failure must not
+        // leave a dangling key and uninitialized moments in the registry.
+        try self.param_states.putNoClobber(self.allocator, owned_name, state);
+        return self.param_states.getPtr(owned_name).?;
     }
 };
 

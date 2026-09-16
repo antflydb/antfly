@@ -62,12 +62,45 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
     }
     for (0..count) |i| {
         const n = graph.node(@intCast(i));
+        if (n.num_inputs > n.inputs.len) return error.InvalidGraphDependency;
+        for (n.getInputs()) |input| if (input != null_node and input >= count) return error.InvalidGraphDependency;
+        if (n.vjp_alternate != null_node and n.vjp_alternate >= count) return error.InvalidGraphDependency;
         if (n.op == .fused_gelu or n.op == .fused_gelu_exact or n.op == .fused_softmax) continue;
         // Fused disentangled attention keeps its fused forward kernel and is
         // differentiated by a custom VJP rule (not vjp_alternate lowering).
         if (n.op == .fused_disentangled_attention or n.op == .fused_disentangled_attention_backward) continue;
+        // A materialized alternate would discard replay/control semantics and
+        // reintroduce quadratic owners. These versioned kernels have a VJP.
+        if (n.op == .fused_deberta_training_attention_v1 or n.op == .fused_deberta_training_attention_backward_v1) continue;
         if (n.op.isFused() and n.vjp_alternate != null_node) {
+            if (n.vjp_alternate == i) return error.CyclicGraph;
             redirect[i] = n.vjp_alternate;
+        }
+    }
+
+    // Resolve complete alternate chains once. A public id_map must name the
+    // final semantic value regardless of the original ID order; one-hop maps
+    // can otherwise leave a live fused output unmapped after adapter rewrites.
+    const redirect_state = try allocator.alloc(u2, count);
+    defer allocator.free(redirect_state);
+    @memset(redirect_state, 0);
+    var chain = std.ArrayListUnmanaged(NodeId).empty;
+    defer chain.deinit(allocator);
+    for (0..count) |start| {
+        if (redirect_state[start] == 2) continue;
+        chain.clearRetainingCapacity();
+        var current: NodeId = @intCast(start);
+        while (redirect[current] != current and redirect_state[current] != 2) {
+            if (redirect_state[current] == 1) return error.CyclicGraph;
+            redirect_state[current] = 1;
+            try chain.append(allocator, current);
+            current = redirect[current];
+        }
+        const target = redirect[current];
+        redirect_state[current] = 2;
+        for (chain.items) |id| {
+            redirect[id] = target;
+            redirect_state[id] = 2;
         }
     }
 
@@ -76,9 +109,25 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
     defer allocator.free(reachable);
     @memset(reachable, false);
 
+    var stack = std.ArrayListUnmanaged(NodeId).empty;
+    defer stack.deinit(allocator);
     for (graph.outputs.items) |out_id| {
-        markReachable(graph, reachable, redirect, redirect[out_id]);
+        if (out_id >= count) return error.InvalidGraphDependency;
+        const id = redirect[out_id];
+        if (reachable[id]) continue;
+        reachable[id] = true;
+        try stack.append(allocator, id);
     }
+    // Iterative reachability bounds call-stack use for long unrolled training
+    // graphs. Each semantic node is pushed at most once, including shared uses.
+    while (stack.pop()) |id| for (graph.node(id).getInputs()) |input| {
+        if (input == null_node) continue;
+        const target = redirect[input];
+        if (reachable[target]) continue;
+        reachable[target] = true;
+        try stack.append(allocator, target);
+    };
+    for (graph.parameters.items) |id| if (id >= count) return error.InvalidGraphDependency;
 
     // Step 3: Collect reachable node IDs and compute their redirected
     // dependencies so we can topologically sort them. LoRA injection may
@@ -101,49 +150,41 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
         tmp_idx[old_id] = @intCast(pos);
     }
 
-    // Kahn's algorithm: compute in-degree per reachable node (using
-    // redirected inputs), then BFS from zero-indegree nodes.
+    // Kahn's algorithm with compact successor lists. Scanning every node for
+    // each popped dependency made large training graphs quadratic to lower.
+    // Successors retain original-node order, preserving deterministic ties.
     const in_degree = try allocator.alloc(u32, num_reachable);
     defer allocator.free(in_degree);
     @memset(in_degree, 0);
-
+    const offsets = try allocator.alloc(usize, @as(usize, num_reachable) + 1);
+    defer allocator.free(offsets);
+    @memset(offsets, 0);
     for (reachable_ids.items, 0..) |old_id, pos| {
-        const n = graph.node(old_id);
-        for (n.getInputs()) |inp| {
-            if (inp != null_node) {
-                const redir = redirect[inp];
-                if (redir < count and reachable[redir]) {
-                    _ = pos; // suppress unused
-                    in_degree[tmp_idx[redir]] +%= 0; // ensure redir is counted
-                }
-            }
-        }
-        _ = pos;
-    }
-    // Recompute properly: for each edge (dep → node), increment in_degree[node].
-    @memset(in_degree, 0);
-    for (reachable_ids.items) |old_id| {
-        const n = graph.node(old_id);
-        for (n.getInputs()) |inp| {
-            if (inp != null_node) {
-                const redir = redirect[inp];
-                if (redir < count and reachable[redir]) {
-                    // Edge: redir → old_id, so old_id has one more dependency.
-                    in_degree[tmp_idx[old_id]] += 1;
-                }
-            }
+        for (graph.node(old_id).getInputs()) |input| {
+            if (input == null_node) continue;
+            const redirected = redirect[input];
+            if (redirected >= count or !reachable[redirected]) return error.InvalidGraphDependency;
+            in_degree[pos] += 1;
+            offsets[@as(usize, tmp_idx[redirected]) + 1] += 1;
         }
     }
-
+    for (1..offsets.len) |i| offsets[i] = try std.math.add(usize, offsets[i], offsets[i - 1]);
+    const successors = try allocator.alloc(u32, offsets[num_reachable]);
+    defer allocator.free(successors);
+    const next = try allocator.dupe(usize, offsets[0..num_reachable]);
+    defer allocator.free(next);
+    for (reachable_ids.items, 0..) |old_id, pos| {
+        for (graph.node(old_id).getInputs()) |input| {
+            if (input == null_node) continue;
+            const dep = tmp_idx[redirect[input]];
+            successors[next[dep]] = @intCast(pos);
+            next[dep] += 1;
+        }
+    }
     var queue = std.ArrayListUnmanaged(u32).empty;
     defer queue.deinit(allocator);
-    for (0..num_reachable) |pos| {
-        if (in_degree[pos] == 0) {
-            try queue.append(allocator, @intCast(pos));
-        }
-    }
-
-    var topo_order = try allocator.alloc(NodeId, num_reachable);
+    for (0..num_reachable) |pos| if (in_degree[pos] == 0) try queue.append(allocator, @intCast(pos));
+    const topo_order = try allocator.alloc(NodeId, num_reachable);
     defer allocator.free(topo_order);
     var topo_count: u32 = 0;
     var q_head: usize = 0;
@@ -152,28 +193,16 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
         q_head += 1;
         topo_order[topo_count] = reachable_ids.items[pos];
         topo_count += 1;
-
-        // Find successors: nodes that list reachable_ids[pos] as a
-        // (redirected) dependency.
-        const old_id = reachable_ids.items[pos];
-        for (reachable_ids.items, 0..) |succ_old, succ_pos| {
-            const n = graph.node(succ_old);
-            for (n.getInputs()) |inp| {
-                if (inp != null_node) {
-                    const redir = redirect[inp];
-                    if (redir == old_id) {
-                        in_degree[succ_pos] -= 1;
-                        if (in_degree[succ_pos] == 0) {
-                            try queue.append(allocator, @intCast(succ_pos));
-                        }
-                    }
-                }
-            }
+        for (successors[offsets[pos]..offsets[pos + 1]]) |successor| {
+            in_degree[successor] -= 1;
+            if (in_degree[successor] == 0) try queue.append(allocator, successor);
         }
     }
+    if (topo_count != num_reachable) return error.CyclicGraph;
 
     // Step 4: Build old→new ID mapping using topological order.
     const id_map = try allocator.alloc(NodeId, count);
+    errdefer allocator.free(id_map);
     @memset(id_map, null_node);
     for (0..topo_count) |i| {
         id_map[topo_order[i]] = @intCast(i);
@@ -216,22 +245,15 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
         }
     }
 
-    return .{ .graph = new_graph, .id_map = id_map };
-}
-
-fn markReachable(graph: *const Graph, reachable: []bool, redirect: []const NodeId, id: NodeId) void {
-    if (id == null_node or id >= reachable.len) return;
-    if (reachable[id]) return;
-
-    reachable[id] = true;
-
-    const n = graph.node(id);
-    for (n.getInputs()) |input_id| {
-        if (input_id != null_node) {
-            // Follow redirects for inputs too.
-            markReachable(graph, reachable, redirect, redirect[input_id]);
-        }
+    // The public map describes original graph values, including a fused value
+    // replaced by its alternate. Leaving those entries null loses vector
+    // seed roots and captured intermediate identities even though consumers
+    // and graph outputs were already redirected correctly.
+    for (redirect, 0..) |target, original| {
+        if (target != original) id_map[original] = id_map[target];
     }
+
+    return .{ .graph = new_graph, .id_map = id_map };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -268,6 +290,7 @@ test "lower replaces fused linear with primitives" {
 
     // Output should be the add node
     try std.testing.expectEqual(@as(usize, 1), lowered.graph.outputs.items.len);
+    try std.testing.expectEqual(lowered.graph.outputs.items[0], lowered.id_map[result]);
 }
 
 test "lower preserves pure primitive graph" {
@@ -348,4 +371,45 @@ test "lower preserves parameter names" {
     }
     try std.testing.expect(found_input);
     try std.testing.expect(found_weight);
+}
+
+test "lower resolves transitive fused value identities and rejects cyclic or invalid dependencies" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const x = try b.parameter("x", Shape.init(.f32, &.{2}));
+    const primitive = try b.mul(x, x);
+    const inner = try g.addNode(.{ .op = .fused_elem_multiply, .output_shape = g.node(x).output_shape, .inputs = .{ x, x, null_node, null_node }, .num_inputs = 2, .vjp_alternate = primitive });
+    const outer = try g.addNode(.{ .op = .fused_elem_multiply, .output_shape = g.node(x).output_shape, .inputs = .{ x, x, null_node, null_node }, .num_inputs = 2, .vjp_alternate = inner });
+    try g.markOutput(try b.add(inner, outer));
+    var lowered = try lower(a, &g);
+    defer lowered.deinit();
+    try std.testing.expect(lowered.id_map[outer] != null_node);
+    try std.testing.expectEqual(lowered.id_map[primitive], lowered.id_map[inner]);
+    try std.testing.expectEqual(lowered.id_map[primitive], lowered.id_map[outer]);
+    const output = lowered.graph.node(lowered.graph.outputs.items[0]);
+    try std.testing.expectEqual(output.inputs[0], output.inputs[1]);
+    g.nodes.items[inner].vjp_alternate = outer;
+    try std.testing.expectError(error.CyclicGraph, lower(a, &g));
+    g.nodes.items[inner].vjp_alternate = primitive;
+    g.nodes.items[primitive].inputs[0] = @intCast(g.nodes.items.len);
+    try std.testing.expectError(error.InvalidGraphDependency, lower(a, &g));
+    g.nodes.items[primitive].inputs[0] = primitive;
+    try std.testing.expectError(error.CyclicGraph, lower(a, &g));
+}
+
+test "lower traverses deep shared graphs without recursive call stack growth" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const x = try b.parameter("x", Shape.init(.f32, &.{1}));
+    var value = x;
+    for (0..32768) |_| value = try b.add(value, x);
+    try g.markOutput(value);
+    var lowered = try lower(a, &g);
+    defer lowered.deinit();
+    try std.testing.expectEqual(g.nodeCount(), lowered.graph.nodeCount());
+    try std.testing.expectEqual(@as(usize, 1), lowered.graph.parameters.items.len);
 }

@@ -257,7 +257,9 @@ pub const TranscriptionPipeline = struct {
         else
             audio.WHISPER_CHUNK_LENGTH;
         const n_frames = audio.whisperFramesForSeconds(context_seconds);
-        const mel_elements = std.math.mul(usize, audio.WHISPER_N_MELS, n_frames) catch return error.ResourceLimitExceeded;
+        const n_mels = self.config.n_mels;
+        if (n_mels == 0 or n_mels > std.math.maxInt(u32)) return error.InvalidInputShape;
+        const mel_elements = std.math.mul(usize, n_mels, n_frames) catch return error.ResourceLimitExceeded;
         const mel_bytes = std.math.mul(usize, mel_elements, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
         const pcm_bytes = std.math.mul(usize, samples.len, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
         var encoder_permit = try self.encoder.admit(.{
@@ -269,13 +271,13 @@ pub const TranscriptionPipeline = struct {
         defer encoder_permit.deinit();
 
         const mel_started = platform.time.monotonicNs();
-        const mel = try audio.whisperMelFromPcmSeconds(allocator, samples, sample_rate, context_seconds);
+        const mel = try audio.whisperMelFromPcmSecondsMels(allocator, samples, sample_rate, context_seconds, @intCast(n_mels));
         defer allocator.free(mel);
         timing.mel_ns = platform.time.monotonicNs() -| mel_started;
 
-        // 1. Run encoder on [1, 80, n_frames] log-mel input.
+        // 1. Run encoder on [1, n_mels, n_frames] log-mel input.
         const encoder_started = platform.time.monotonicNs();
-        const mel_shape = [_]i64{ 1, @intCast(audio.WHISPER_N_MELS), @intCast(n_frames) };
+        const mel_shape = [_]i64{ 1, @intCast(n_mels), @intCast(n_frames) };
         var mel_tensor = try backends.Tensor.initFloat32(allocator, "input_features", &mel_shape, mel);
         defer mel_tensor.deinit();
         const encoder_outputs = if (self.batch_dispatch) |dispatch|

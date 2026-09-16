@@ -7,13 +7,14 @@ change. Concurrent compiler activity introduces noise.
 
 ## Finetuning: share compilation, retain every entrypoint
 
-The registry contains 66 command entrypoints. Previously the finetuning gate
+At the profiling base, the registry contained 66 command entrypoints. Previously the finetuning gate
 compiled each as a separate executable; the measured compile steps summed to
 1,077 seconds, excluding the actual test executables and auxiliary tools.
 Summed compile durations are not elapsed gate time.
 
 The root `inference-finetune-test` and standalone `test-finetune` gate now use
-34 compile/link groups. Groups must have identical named imports, asset owner,
+35 compile/link groups for 68 entrypoints after merging the two new GLiNER2.5
+commands from main (the measured change initially used 34 groups for 66). Groups must have identical named imports, asset owner,
 native linkage, libc setting, and release metadata. The generated dispatcher
 selects a CLI at runtime, keeping every registered `main` reachable for semantic
 analysis, code generation, and linking. The checks are not installed or executed.
@@ -89,12 +90,13 @@ the large tracing-related fixture speedups.
 
 ## Validation and remaining work
 
-Validation passed for all 34 command groups and the finetuning gate, 99 storage
+Before the latest main merge, validation passed for all 34 command groups and the finetuning gate, 99 storage
 work-contract tests, 20 sparse tests, 38 foundation tests, the retained graph and
 relational scale cases, and 10 selected graph release-blocker tests. The PDF and
 focused extractor build reported 486/486 tests passed; the Python checks passed
 five tests. The small graph fixture also passed with allocation traces enabled
-(17.1 s). The standalone inference build exposes the new command-check target.
+(17.1 s). The standalone inference build exposes the new command-check target. CI on the
+merged revision also covers main's two new GLiNER2.5 entrypoints.
 
 Run the changed gate and bounded-work regressions:
 

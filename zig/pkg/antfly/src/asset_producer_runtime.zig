@@ -1667,6 +1667,7 @@ pub const Runtime = struct {
 
         const extract_request = extracting.Request{
             .inputs = inputs,
+            .schema_version = cfg.schema_version,
             .schema_json = cfg.schema_json,
             .options_json = cfg.options_json,
             .attachments = attachments,
@@ -1700,11 +1701,17 @@ pub const Runtime = struct {
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
                 try self.invalidateExtractorCapabilityLease(alloc, cfg);
+            if (err == error.InvalidExtractionResponse) return error.InvalidExtractorResponse;
             return err;
         };
         defer response.deinit();
 
-        return try extractionResultsJsonAlloc(alloc, response.json, cfg.model, input_ids, output_ids);
+        return try extractionResultsJsonAllocExpected(alloc, response.json, .{
+            .model = cfg.model,
+            .item_count = input_ids.len,
+            .schema_version = cfg.schema_version,
+            .max_response_bytes = extract_request.max_response_bytes,
+        }, input_ids, output_ids);
     }
 
     fn tryGenerateBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
@@ -2896,6 +2903,7 @@ pub const Runtime = struct {
         };
         const extract_request = extracting.Request{
             .inputs = &.{input},
+            .schema_version = cfg.schema_version,
             .schema_json = cfg.schema_json,
             .options_json = cfg.options_json,
             .attachments = attachments,
@@ -2930,14 +2938,17 @@ pub const Runtime = struct {
         }) catch |err| {
             if (err == error.InferenceCapabilitiesStale)
                 try self.invalidateExtractorCapabilityLease(alloc, cfg);
+            if (err == error.InvalidExtractionResponse) return error.InvalidExtractorResponse;
             return err;
         };
         defer response.deinit();
 
-        if (isJsonContentType(request.content_type) or request.content_type.len == 0) {
-            return try extracting.firstResultJsonAlloc(alloc, response.json);
-        }
-        return try alloc.dupe(u8, response.json);
+        return try extractionResultJsonAlloc(alloc, response.json, .{
+            .model = cfg.model,
+            .item_count = 1,
+            .schema_version = cfg.schema_version,
+            .max_response_bytes = extract_request.max_response_bytes,
+        }, input.id, !(isJsonContentType(request.content_type) or request.content_type.len == 0));
     }
 
     fn effectiveGeneratorConfig(self: *const Runtime, cfg: generating_runtime.GeneratorConfig) generating_runtime.GeneratorConfig {
@@ -4500,6 +4511,176 @@ fn extractionContentJsonAlloc(alloc: Allocator, source_text: []const u8, source_
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(source_text, .{})});
 }
 
+fn extractionInteger(alloc: Allocator, value: std.json.Value) !i64 {
+    switch (value) {
+        .integer, .float, .number_string => {},
+        else => return error.InvalidExtractorResponse,
+    }
+    return std.json.innerParseFromValue(i64, alloc, value, .{}) catch return error.InvalidExtractorResponse;
+}
+
+fn extractionNumber(value: std.json.Value, probability: bool) !f64 {
+    const number: f64 = switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidExtractorResponse,
+        else => return error.InvalidExtractorResponse,
+    };
+    if (!std.math.isFinite(number) or (probability and (number < 0 or number > 1))) return error.InvalidExtractorResponse;
+    return number;
+}
+
+fn extractionOptionalNumber(item: std.json.Value, key: []const u8, probability: bool) !void {
+    if (item != .object) return error.InvalidExtractorResponse;
+    if (item.object.get(key)) |value| if (value != .null) {
+        _ = try extractionNumber(value, probability);
+    };
+}
+
+fn extractionOffsets(alloc: Allocator, item: std.json.Value, nonnegative: bool, required: bool) !void {
+    if (item != .object) return error.InvalidExtractorResponse;
+    const raw_start = item.object.get("start") orelse .null;
+    const raw_end = item.object.get("end") orelse .null;
+    if (required and (raw_start == .null or raw_end == .null)) return error.InvalidExtractorResponse;
+    const start = if (raw_start == .null) null else try extractionInteger(alloc, raw_start);
+    const end = if (raw_end == .null) null else try extractionInteger(alloc, raw_end);
+    if (nonnegative) {
+        if (start) |value| if (value < 0) return error.InvalidExtractorResponse;
+        if (end) |value| if (value < 0) return error.InvalidExtractorResponse;
+    }
+    if (start) |first| if (end) |last| if (last < first) return error.InvalidExtractorResponse;
+}
+
+fn extractionString(item: std.json.Value, key: []const u8) ![]const u8 {
+    if (item != .object) return error.InvalidExtractorResponse;
+    const value = item.object.get(key) orelse return error.InvalidExtractorResponse;
+    if (value != .string) return error.InvalidExtractorResponse;
+    return value.string;
+}
+
+fn extractionStringChoice(item: std.json.Value, key: []const u8, choices: []const []const u8) !void {
+    const value = try extractionString(item, key);
+    for (choices) |choice| if (std.mem.eql(u8, value, choice)) return;
+    return error.InvalidExtractorResponse;
+}
+
+fn validateExtractionAttribute(item: std.json.Value) !void {
+    _ = try extractionString(item, "label");
+    _ = try extractionNumber(item.object.get("confidence") orelse return error.InvalidExtractorResponse, true);
+}
+
+fn validateExtractionField(alloc: Allocator, item: std.json.Value) !void {
+    _ = try extractionString(item, "value");
+    try extractionOptionalNumber(item, "score", true);
+    try extractionOffsets(alloc, item, true, false);
+    if (item.object.get("source")) |source| if (source != .null) {
+        try extractionStringChoice(item, "source", &.{ "document", "schema" });
+        if (std.mem.eql(u8, source.string, "schema")) {
+            if (item.object.get("start")) |value| if (value != .null) return error.InvalidExtractorResponse;
+            if (item.object.get("end")) |value| if (value != .null) return error.InvalidExtractorResponse;
+        }
+    };
+}
+
+fn validateExtractionEndpoint(alloc: Allocator, item: std.json.Value, endpoint: extraction_api.ExtractionRelationEndpoint, entity_count: usize) !void {
+    for ([_][]const u8{ "id", "label", "text" }) |key| if (item.object.get(key)) |value| if (value != .null and value != .string) return error.InvalidExtractorResponse;
+    try extractionOffsets(alloc, item, true, false);
+    try extractionOptionalNumber(item, "score", false);
+    if (endpoint.score) |score| if (!std.math.isFinite(score)) return error.InvalidExtractorResponse;
+    if (endpoint.entity_index) |index| {
+        _ = try extractionInteger(alloc, item.object.get("entity_index").?);
+        if (index < 0 or @as(u64, @intCast(index)) >= entity_count) return error.InvalidExtractorResponse;
+    }
+}
+
+fn validateExtractionResult(alloc: Allocator, item: std.json.Value, typed: extraction_api.ExtractionObject, v2: bool) !void {
+    // Generated DTOs establish object/array/string structure, but JSON's
+    // generic scalar parser can coerce numeric strings and overflow f32.
+    // Check actual numeric tokens and the ranges declared by the wire schema.
+    if (typed.offset_unit) |unit| if (unit != .null)
+        try extractionStringChoice(item, "offset_unit", &.{ "utf8_bytes", "unicode_codepoints", "utf16_codeunits" });
+    const entity_count = if (typed.entities) |entities| entities.len else 0;
+    if (typed.entities) |entities| for (item.object.get("entities").?.array.items, entities) |raw, entity| {
+        _ = try extractionString(raw, "label");
+        _ = try extractionString(raw, "text");
+        try extractionOffsets(alloc, raw, v2, false);
+        try extractionOptionalNumber(raw, "score", false);
+        if (entity.score) |score| if (!std.math.isFinite(score)) return error.InvalidExtractorResponse;
+        if (entity.attributes) |_| {
+            var groups = raw.object.get("attributes").?.object.iterator();
+            while (groups.next()) |group| switch (group.value_ptr.*) {
+                .object => try validateExtractionAttribute(group.value_ptr.*),
+                .array => |labels| {
+                    if (labels.items.len > 128) return error.InvalidExtractorResponse;
+                    for (labels.items) |label| try validateExtractionAttribute(label);
+                },
+                else => return error.InvalidExtractorResponse,
+            };
+        }
+    };
+    if (typed.classifications) |classifications| for (item.object.get("classifications").?.array.items, classifications) |raw, classification| {
+        _ = try extractionString(raw, "name");
+        _ = try extractionString(raw, "label");
+        try extractionOptionalNumber(raw, "score", false);
+        if (classification.score) |score| if (!std.math.isFinite(score)) return error.InvalidExtractorResponse;
+    };
+    if (typed.relations) |relations| for (item.object.get("relations").?.array.items, relations) |raw, relation| {
+        _ = try extractionString(raw, "type");
+        try extractionOptionalNumber(raw, "score", false);
+        if (relation.score) |score| if (!std.math.isFinite(score)) return error.InvalidExtractorResponse;
+        if (relation.source) |endpoint| try validateExtractionEndpoint(alloc, raw.object.get("source").?, endpoint, entity_count);
+        if (relation.target) |endpoint| try validateExtractionEndpoint(alloc, raw.object.get("target").?, endpoint, entity_count);
+    };
+    if (v2 and typed.structures != null) {
+        var structures = item.object.get("structures").?.object.iterator();
+        while (structures.next()) |structure| {
+            if (structure.value_ptr.* != .array) return error.InvalidExtractorResponse;
+            for (structure.value_ptr.array.items) |record| {
+                if (record != .object) return error.InvalidExtractorResponse;
+                var fields = record.object.iterator();
+                while (fields.next()) |field| switch (field.value_ptr.*) {
+                    .object => try validateExtractionField(alloc, field.value_ptr.*),
+                    .array => |values| for (values.items) |value| try validateExtractionField(alloc, value),
+                    else => return error.InvalidExtractorResponse,
+                };
+            }
+        }
+    }
+    if (typed.structure_metadata != null) {
+        var groups = item.object.get("structure_metadata").?.object.iterator();
+        while (groups.next()) |group| {
+            const structures = item.object.get("structures") orelse return error.InvalidExtractorResponse;
+            if (structures != .object) return error.InvalidExtractorResponse;
+            const records = structures.object.get(group.key_ptr.*) orelse return error.InvalidExtractorResponse;
+            if (records != .array or records.array.items.len != group.value_ptr.array.items.len) return error.InvalidExtractorResponse;
+            for (group.value_ptr.array.items) |metadata| {
+                try extractionOptionalNumber(metadata, "score", true);
+                if (metadata.object.get("anchor")) |anchor| if (anchor != .null) try extractionOffsets(alloc, anchor, true, true);
+            }
+        }
+    }
+    if (typed.solvers) |solvers| if (solvers != .null) {
+        if (solvers != .object) return error.InvalidExtractorResponse;
+        for ([_][]const u8{ "classification", "joint_ie", "records" }) |name| if (solvers.object.get(name)) |status| if (status != .null) {
+            try extractionStringChoice(status, "status", &.{ "optimal", "feasible" });
+            _ = try extractionNumber(status.object.get("utility") orelse return error.InvalidExtractorResponse, false);
+            if (try extractionInteger(alloc, status.object.get("visited_nodes") orelse return error.InvalidExtractorResponse) < 0) return error.InvalidExtractorResponse;
+            if ((status.object.get("exhausted") orelse return error.InvalidExtractorResponse) != .bool) return error.InvalidExtractorResponse;
+        };
+    };
+    if (typed.long_document) |metadata| if (metadata != .null) {
+        if (metadata != .object) return error.InvalidExtractorResponse;
+        if (try extractionInteger(alloc, metadata.object.get("version") orelse return error.InvalidExtractorResponse) != 1 or
+            try extractionInteger(alloc, metadata.object.get("window_count") orelse return error.InvalidExtractorResponse) < 1) return error.InvalidExtractorResponse;
+        try extractionStringChoice(metadata, "window_policy", &.{"source_words_midpoint_ownership"});
+        try extractionStringChoice(metadata, "classification_aggregation", &.{"owned_word_weighted_mean_raw_logits"});
+        try extractionStringChoice(metadata, "duplicate_score", &.{"maximum_calibrated_score"});
+        try extractionStringChoice(metadata, "natural_record_identity", &.{"exact_source_anchor"});
+        try extractionStringChoice(metadata, "other_record_identity", &.{ "occurrence", "semantic" });
+        try extractionStringChoice(metadata, "solver_optimality_scope", &.{"retained_candidate_graph"});
+    };
+}
+
 fn extractionResultsJsonAlloc(
     alloc: Allocator,
     response_json: []const u8,
@@ -4507,23 +4688,15 @@ fn extractionResultsJsonAlloc(
     wire_ids: []const []const u8,
     output_ids: []const []const u8,
 ) ![][]u8 {
-    if (wire_ids.len != output_ids.len) return error.InvalidWorkIdentity;
-    var expected_by_id = std.StringHashMapUnmanaged(usize).empty;
-    defer expected_by_id.deinit(alloc);
-    for (wire_ids, 0..) |id, index| {
-        if (id.len == 0) return error.InvalidWorkIdentity;
-        const entry = try expected_by_id.getOrPut(alloc, id);
-        if (entry.found_existing) return error.InvalidWorkIdentity;
-        entry.value_ptr.* = index;
-    }
+    return extractionResultsJsonAllocExpected(alloc, response_json, .{ .model = expected_model, .item_count = wire_ids.len }, wire_ids, output_ids);
+}
 
-    var raw = std.json.parseFromSlice(std.json.Value, alloc, response_json, .{
-        .duplicate_field_behavior = .@"error",
-    }) catch |err| return switch (err) {
+fn parseExtractionResponse(alloc: Allocator, response_json: []const u8, expected: extracting.ResponseExpectation) !std.json.Parsed(std.json.Value) {
+    var raw = extracting.parseResponse(alloc, response_json, expected) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidExtractorResponse,
     };
-    defer raw.deinit();
+    errdefer raw.deinit();
     var typed = std.json.parseFromValue(extraction_api.ExtractionResponse, alloc, raw.value, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
@@ -4533,14 +4706,48 @@ fn extractionResultsJsonAlloc(
         else => error.InvalidExtractorResponse,
     };
     defer typed.deinit();
-    if (!std.mem.eql(u8, typed.value.object, "extraction") or
-        !std.mem.eql(u8, typed.value.model, expected_model))
-        return error.InvalidExtractorResponse;
-    if (typed.value.data.len != wire_ids.len) return error.InvalidExtractorResponse;
-    if (raw.value != .object) return error.InvalidExtractorResponse;
-    const raw_data = raw.value.object.get("data") orelse return error.InvalidExtractorResponse;
-    if (raw_data != .array or raw_data.array.items.len != wire_ids.len)
-        return error.InvalidExtractorResponse;
+    const version = if (raw.value.object.get("schema_version")) |value| try extractionInteger(alloc, value) else 1;
+    const data = raw.value.object.get("data").?.array.items;
+    for (data, typed.value.data) |item, typed_item| try validateExtractionResult(alloc, item, typed_item, version == 2);
+    return raw;
+}
+
+fn extractionResultJsonAlloc(alloc: Allocator, response_json: []const u8, expected: extracting.ResponseExpectation, wire_id: ?[]const u8, whole_envelope: bool) ![]u8 {
+    if (expected.item_count != 1) return error.InvalidWorkIdentity;
+    var raw = try parseExtractionResponse(alloc, response_json, expected);
+    defer raw.deinit();
+    const item = raw.value.object.get("data").?.array.items[0];
+    const id = item.object.get("id") orelse .null;
+    if (wire_id) |requested| {
+        if (id != .string or !std.mem.eql(u8, id.string, requested)) return error.InvalidExtractorResponse;
+    } else if (id != .null) return error.InvalidExtractorResponse;
+    // The single-item wire request remains anonymous, even if the enclosing
+    // enrichment has a durable item_id. Never invent or accept another ID.
+    if (whole_envelope) return alloc.dupe(u8, response_json);
+    return std.json.Stringify.valueAlloc(alloc, item, .{});
+}
+
+fn extractionResultsJsonAllocExpected(
+    alloc: Allocator,
+    response_json: []const u8,
+    expected: extracting.ResponseExpectation,
+    wire_ids: []const []const u8,
+    output_ids: []const []const u8,
+) ![][]u8 {
+    if (wire_ids.len != output_ids.len) return error.InvalidWorkIdentity;
+    if (expected.item_count != wire_ids.len) return error.InvalidWorkIdentity;
+    var expected_by_id = std.StringHashMapUnmanaged(usize).empty;
+    defer expected_by_id.deinit(alloc);
+    for (wire_ids, 0..) |id, index| {
+        if (id.len == 0) return error.InvalidWorkIdentity;
+        const entry = try expected_by_id.getOrPut(alloc, id);
+        if (entry.found_existing) return error.InvalidWorkIdentity;
+        entry.value_ptr.* = index;
+    }
+
+    var raw = try parseExtractionResponse(alloc, response_json, expected);
+    defer raw.deinit();
+    const raw_data = raw.value.object.get("data").?;
 
     const out = try alloc.alloc([]u8, wire_ids.len);
     for (out) |*item| item.* = &.{};
@@ -4666,6 +4873,107 @@ test "asset producer runtime typed extractor response parsing is allocation-fail
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+const extraction_v2_response_fixture =
+    \\{"object":"extraction","model":"owner/model","schema_version":2,"data":[{"offset_unit":"utf8_bytes","entities":[{"label":"person","text":"Ada","start":0,"end":3,"score":0.9,"attributes":{"tone":{"label":"positive","confidence":0.8}},"provider_entity":{"rank":1}}],"relations":[{"type":"works_for","source":{"entity_index":0},"target":{"text":"Antfly","start":13,"end":19},"score":0.7,"derived":false}],"classifications":[{"name":"topic","label":"work","score":0.6}],"structures":{"person":[{"role":{"value":"staff","source":"schema","score":0.5}}]},"structure_metadata":{"person":[{"score":0.4,"anchor":{"start":0,"end":3}}]},"solvers":{"records":{"status":"feasible","utility":-0.25,"visited_nodes":3,"exhausted":true}},"long_document":{"version":1,"window_count":2,"window_policy":"source_words_midpoint_ownership","classification_aggregation":"owned_word_weighted_mean_raw_logits","duplicate_score":"maximum_calibrated_score","natural_record_identity":"exact_source_anchor","other_record_identity":"occurrence","solver_optimality_scope":"retained_candidate_graph"},"provider_extension":{"exact":1.2345678901234567890123456789}}]}
+;
+
+fn exerciseSingleExtractionResponse(alloc: Allocator) !void {
+    const expected = extracting.ResponseExpectation{ .model = "owner/model", .item_count = 1, .schema_version = 2 };
+    const result = blk: {
+        var response = extracting.Response{ .allocator = alloc, .json = try alloc.dupe(u8, extraction_v2_response_fixture) };
+        defer response.deinit();
+        break :blk try extractionResultJsonAlloc(alloc, response.json, expected, null, false);
+    };
+    defer alloc.free(result);
+    // The response and both parse arenas are gone; the result owns every byte.
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"provider_entity\":{\"rank\":1}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"exact\":1.2345678901234567890123456789") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"long_document\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"exhausted\":true") != null);
+    const envelope = try extractionResultJsonAlloc(alloc, extraction_v2_response_fixture, expected, null, true);
+    defer alloc.free(envelope);
+    try std.testing.expectEqualStrings(extraction_v2_response_fixture, envelope);
+}
+
+test "asset producer runtime single extractor response preserves v2 extensions and ownership" {
+    try exerciseSingleExtractionResponse(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseSingleExtractionResponse, .{});
+}
+
+test "asset producer runtime single extractor response rejects malformed envelopes and typed values" {
+    const a = std.testing.allocator;
+    const expected = extracting.ResponseExpectation{ .model = "owner/model", .item_count = 1, .schema_version = 1 };
+    const envelopes = [_][]const u8{
+        "{}",
+        "[]",
+        "{\"object\":\"extraction\",\"data\":[{}]}",
+        "{\"object\":\"extraction\",\"model\":\"other/model\",\"data\":[{}]}",
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[]}",
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{},{}]}",
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[1]}",
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"id\":\"invented\"}]}",
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"entities\":[1]}]}",
+        "{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"text\":\"Grace\"}]}]}",
+    };
+    for (envelopes) |payload| for ([_]bool{ false, true }) |whole_envelope|
+        try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, expected, null, whole_envelope));
+
+    const malformed_items = [_][]const u8{
+        "{\"entities\":[{\"label\":\"person\",\"text\":[65]}]}",
+        "{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"score\":\"0.9\"}]}",
+        "{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"score\":1e100}]}",
+        "{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"start\":\"0\",\"end\":3}]}",
+        "{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"start\":3,\"end\":0}]}",
+        "{\"classifications\":[{\"name\":\"topic\",\"label\":\"work\",\"score\":1e999}]}",
+        "{\"relations\":[{\"type\":\"knows\",\"source\":{\"entity_index\":0}}]}",
+        "{\"relations\":[{\"type\":\"knows\",\"source\":{\"start\":-1}}]}",
+        "{\"relations\":[{\"type\":\"knows\",\"source\":{\"text\":[65]}}]}",
+        "{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"attributes\":{\"tone\":{\"label\":\"positive\",\"confidence\":1.1}}}]}",
+        "{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\",\"attributes\":{\"tone\":{\"label\":\"positive\",\"confidence\":\"0.8\"}}}]}",
+        "{\"offset_unit\":\"utf16\"}",
+        "{\"solvers\":{\"records\":{\"status\":\"optimal\",\"utility\":1e999,\"visited_nodes\":1,\"exhausted\":false}}}",
+        "{\"solvers\":{\"records\":{\"status\":\"optimal\",\"utility\":0,\"visited_nodes\":-1,\"exhausted\":false}}}",
+        "{\"structure_metadata\":{\"missing\":[{}]}}",
+    };
+    for (malformed_items) |item| {
+        const payload = try std.fmt.allocPrint(a, "{{\"object\":\"extraction\",\"model\":\"owner/model\",\"data\":[{s}]}}", .{item});
+        defer a.free(payload);
+        try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, expected, null, false));
+    }
+    const v2_items = [_][]const u8{
+        "{\"entities\":[{\"label\":\"p\",\"text\":\"x\",\"start\":-1,\"end\":1}]}",
+        "{\"structures\":{\"record\":[{\"field\":{\"value\":\"x\",\"score\":-0.1}}]}}",
+        "{\"structures\":{\"record\":[{\"field\":{\"value\":\"x\",\"source\":\"schema\",\"start\":0,\"end\":1}}]}}",
+        "{\"structures\":{\"record\":[{\"field\":\"x\"}]}}",
+        "{\"long_document\":{\"version\":1,\"window_count\":0}}",
+    };
+    for (v2_items) |item| {
+        const payload = try std.fmt.allocPrint(a, "{{\"object\":\"extraction\",\"model\":\"owner/model\",\"schema_version\":2,\"data\":[{s}]}}", .{item});
+        defer a.free(payload);
+        try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, .{ .model = "owner/model", .item_count = 1, .schema_version = 2 }, null, false));
+    }
+}
+
+test "asset producer runtime single extractor response preserves legacy optional fields and exact identity" {
+    const a = std.testing.allocator;
+    const expected = extracting.ResponseExpectation{ .model = "m", .item_count = 1, .schema_version = 1 };
+    // Legacy generic scores are finite floats, not declared probabilities;
+    // legacy structure payloads remain open-ended. Anonymous IDs are omitted:
+    // the original v1 schema and generated serializer do not admit null IDs.
+    const payload = "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{\"entities\":[{\"label\":\"p\",\"text\":\"x\",\"score\":2.5}],\"structures\":{\"legacy\":{\"arbitrary\":true}}}]}";
+    const value = try extractionResultJsonAlloc(a, payload, expected, null, false);
+    defer a.free(value);
+    try std.testing.expect(std.mem.indexOf(u8, value, "\"score\":2.5") != null);
+    const named = "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{\"id\":\"wire-1\"}]}";
+    const echoed = try extractionResultJsonAlloc(a, named, expected, "wire-1", false);
+    defer a.free(echoed);
+    try std.testing.expectEqualStrings("{\"id\":\"wire-1\"}", echoed);
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, "{\"object\":\"extraction\",\"model\":\"m\",\"data\":[{\"id\":null}]}", expected, null, false));
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, named, expected, "wire-2", false));
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, expected, "wire-1", false));
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, .{ .model = "m", .item_count = 1, .schema_version = 2 }, null, false));
 }
 
 fn antflyGenerateBatchUrlAlloc(alloc: Allocator, base_url: []const u8) ![]u8 {
@@ -6696,6 +7004,7 @@ test "asset producer runtime routes antfly extractor without url to local provid
 
     const Local = struct {
         extract_calls: usize = 0,
+        response_json: ?[]const u8 = null,
 
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
@@ -6734,11 +7043,12 @@ test "asset producer runtime routes antfly extractor without url to local provid
             self.extract_calls += 1;
             try std.testing.expectEqualStrings("local-extractor", model);
             try std.testing.expectEqual(@as(usize, 1), request.inputs.len);
+            try std.testing.expect(request.inputs[0].id == null);
             try std.testing.expect(std.mem.indexOf(u8, request.inputs[0].content_json, "Ada") != null);
             try std.testing.expect(std.mem.indexOf(u8, request.schema_json, "person") != null);
             return .{
                 .allocator = a,
-                .json = try a.dupe(u8, "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\"}],\"relations\":[]}]}"),
+                .json = try a.dupe(u8, self.response_json orelse "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\"}],\"relations\":[]}]}"),
             };
         }
     };
@@ -6761,6 +7071,25 @@ test "asset producer runtime routes antfly extractor without url to local provid
     try std.testing.expect(std.mem.indexOf(u8, result, "\"entities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"Ada\"") != null);
     try std.testing.expectEqual(@as(usize, 1), local.extract_calls);
+
+    const invalid = [_][]const u8{
+        "{\"object\":\"extraction\",\"model\":\"wrong-model\",\"data\":[{}]}",
+        "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[]}",
+        "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{},{}]}",
+        "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"id\":\"different-document\"}]}",
+        "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"entities\":[1]}]}",
+        "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"entities\":[],\"entities\":[]}]}",
+    };
+    for (invalid) |payload| for ([_][]const u8{ "application/json", "text/plain" }) |content_type| {
+        local.response_json = payload;
+        try std.testing.expectError(error.InvalidExtractorResponse, producer.produce(alloc, .{
+            .producer_type = .extractor,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"local-extractor\",\"schema\":{\"entities\":[\"person\"]}}",
+            .source_text = "Ada works at Antfly.",
+            .item_id = "caller-page:000001",
+            .content_type = content_type,
+        }));
+    };
 }
 
 test "asset producer runtime batches compatible antfly extractor requests" {
