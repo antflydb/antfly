@@ -293,6 +293,8 @@ DEFAULT_MODEL_BY_PATH = {
     "/ai/v1/extract": (DEFAULT_EXTRACTOR_MODEL, "extractors"),
     "/ai/v1/read": ("antflydb/florence-2-base", "readers"),
     "/ai/v1/transcribe": ("openai/whisper-tiny", "transcribers"),
+    "/ai/v1/dictate": ("openai/whisper-tiny", "transcribers"),
+    "/ai/v1/transcription/sessions": ("openai/whisper-tiny", "transcribers"),
 }
 
 TASK_NAME_BY_DIR = {

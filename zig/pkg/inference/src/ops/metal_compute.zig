@@ -1227,6 +1227,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return compute;
     }
 
+    /// Create a compute context on the store's shared native provider
+    /// without taking the execution lease. Intended for long-lived runtimes
+    /// (the whole-model executor cached on the loaded model) that are only
+    /// ever driven by a request which already holds the lease on this store;
+    /// taking a second lease there would either fail (nested tryLock) or, if
+    /// it succeeded, pin the lease for the runtime's lifetime and starve every
+    /// later request. Fails when no lease holder has created the provider.
+    pub fn initBorrowingSharedProvider(
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        io: ?std.Io,
+        kernel_jit_options: metal_runtime.MetalJitOptions,
+    ) !MetalCompute {
+        try kernel_jit_options.config.validate();
+        const provider_impl = data.shared_metal_native_provider orelse return error.SharedProviderUnavailable;
+        if (provider_impl.jit_mode != kernel_jit_options.config.mode or
+            !provider_impl.jit_scope.eql(kernel_jit_options.scope)) return error.MetalKernelJitConfigConflict;
+        var compute: MetalCompute = .{
+            .allocator = allocator,
+            .data = data,
+            .provider = if (false) null else {},
+            .provider_impl = provider_impl,
+            .owned_native_provider = false,
+            .shared_provider_lease_io = null,
+            .io = io,
+        };
+        compute.captureRuntimeFrameBaselines();
+        return compute;
+    }
+
     fn captureRuntimeFrameBaselines(self: *MetalCompute) void {
         const runtime_stats = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
         self.runtime_frame_begin_baseline = runtime_stats.frame_begin_count;
@@ -13132,6 +13162,91 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .eps = eps,
         }, &self.timing_stats)) orelse return null;
         return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn addLayerNormSumOp(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?ops.AddLayerNormSumResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const a_buf = toBuf(a);
+        const b_buf = toBuf(b);
+        const gamma_buf = toBuf(gamma);
+        const beta_buf = toBuf(beta);
+        if (bufHasAnyQuantizedStorage(a_buf) or
+            bufHasAnyQuantizedStorage(b_buf) or
+            bufHasAnyQuantizedStorage(gamma_buf) or
+            bufHasAnyQuantizedStorage(beta_buf))
+        {
+            return null;
+        }
+        if (disableRuntimeElementwise()) return null;
+        const a_metal = if (a_buf.metal_tensor) |*tensor| tensor else return null;
+        const b_metal = if (b_buf.metal_tensor) |*tensor| tensor else return null;
+        if (!a_metal.isDevice() or !b_metal.isDevice()) return null;
+        if (a_metal.ndim() != 2 or b_metal.ndim() != 2) return null;
+        const rows = @as(usize, @intCast(a_metal.dim(0)));
+        if (rows == 0) return null;
+        if (@as(usize, @intCast(a_metal.dim(1))) != dim) return null;
+        if (@as(usize, @intCast(b_metal.dim(0))) != rows) return null;
+        if (@as(usize, @intCast(b_metal.dim(1))) != dim) return null;
+        if (bufElemCount(gamma_buf) != dim or bufElemCount(beta_buf) != dim) return null;
+        const slot = (try self.ensureDynamicLayerNormSlot(gamma, beta, dim)) orelse return null;
+        var a_mt = try a_metal.retainedCopy();
+        defer a_mt.deinit();
+        var b_mt = try b_metal.retainedCopy();
+        defer b_mt.deinit();
+        const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
+        defer self.endActivePlannedComputeScope(scope);
+        const result = (try metal_runtime.decoderRuntimeApplyAddLayerNormSum(self.provider_impl, .{
+            .slot = slot,
+            .a = a_mt,
+            .b = b_mt,
+            .hidden_size = dim,
+            .eps = eps,
+        }, &self.timing_stats)) orelse return null;
+        var sum_tensor = result.sum;
+        const sum_ct = self.ctFromOwnedMetalTensor(sum_tensor) catch |err| {
+            sum_tensor.deinit();
+            var normed_tensor = result.normed;
+            normed_tensor.deinit();
+            return err;
+        };
+        const normed_ct = self.ctFromOwnedMetalTensor(result.normed) catch |err| {
+            freeOp(ctx, sum_ct);
+            return err;
+        };
+        return .{ .sum = sum_ct, .normed = normed_ct };
+    }
+
+    fn ensureDeviceResidentOp(ctx: *anyopaque, tensor: CT) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const buf = toBuf(tensor);
+        if (bufHasAnyQuantizedStorage(buf)) return null;
+        if (buf.metal_tensor) |*existing| {
+            if (existing.isDevice() and !hasHostView(buf)) return null;
+        }
+        if (self.provider_impl.raw_decode_runtime == null) return null;
+        const device_tensor = try self.ownedDeviceMetalTensorFromCt(tensor);
+        return try self.ctFromOwnedMetalTensor(device_tensor);
+    }
+
+    fn whisperLogitsStatsEncodeOp(ctx: *anyopaque, logits: CT, params: *const ops.WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const logits_buf = toBuf(logits);
+        if (bufHasAnyQuantizedStorage(logits_buf)) return false;
+        const logits_metal = if (logits_buf.metal_tensor) |*tensor| tensor else return false;
+        if (!logits_metal.isDevice()) return false;
+        var logits_mt = try logits_metal.retainedCopy();
+        defer logits_mt.deinit();
+        return metal_runtime.whisperLogitsStatsEncode(
+            self.provider_impl,
+            logits_mt,
+            @ptrCast(params),
+            suppress_ids,
+        );
+    }
+
+    fn whisperLogitsStatsReadOp(ctx: *anyopaque, out: *ops.WhisperLogitsStatsRaw) bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return metal_runtime.whisperLogitsStatsRead(self.provider_impl, out);
     }
 
     fn linearNoBiasOp(
@@ -28099,6 +28214,56 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
     }
 
+    fn decoderRuntimeApplyLinearQkvIntoOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const k_buf = toBuf(k_out);
+        const v_buf = toBuf(v_out);
+        if (bufHasAnyQuantizedStorage(k_buf) or bufHasAnyQuantizedStorage(v_buf)) return null;
+        const k_metal = if (k_buf.metal_tensor) |*tensor| tensor else return null;
+        const v_metal = if (v_buf.metal_tensor) |*tensor| tensor else return null;
+        if (!k_metal.isDevice() or !v_metal.isDevice()) return null;
+        var input = try self.ownedMetalTensorFromCt(request.input);
+        defer input.deinit();
+        var linear_input = try retainedLinearInputView(&input, request.in_dim);
+        defer linear_input.deinit();
+        if (!linear_input.isDevice()) return null;
+        var k_mt = try k_metal.retainedCopy();
+        defer k_mt.deinit();
+        var v_mt = try v_metal.retainedCopy();
+        defer v_mt.deinit();
+        const q = (try metal_runtime.tryApplyDenseRuntimeLinearQkvInto(
+            self.provider_impl,
+            request.q_slot,
+            request.k_slot,
+            request.v_slot,
+            linear_input,
+            request.in_dim,
+            request.q_out_dim,
+            request.kv_out_dim,
+            k_mt,
+            v_mt,
+        )) orelse return null;
+        return try self.ctFromOwnedMetalTensor(q);
+    }
+
+    fn decoderRuntimeBeginPlannedComputeScopeOp(ctx: *anyopaque) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        if (!metal_runtime.hasActiveFrame(runtime)) return false;
+        if (!self.beginActivePlannedComputeScopeIfPossible(.layer, .layer)) return false;
+        // The scope's encoder is serial, so dispatch order already carries
+        // every hazard; skip the range scans that only place barriers.
+        metal_runtime.pushPlannedComputeBarrierSuppression(runtime) catch {};
+        return true;
+    }
+
+    fn decoderRuntimeEndPlannedComputeScopeOp(ctx: *anyopaque) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return;
+        metal_runtime.popPlannedComputeBarrierSuppression(runtime) catch {};
+        self.endActivePlannedComputeScopeIfAny();
+    }
+
     fn decoderRuntimeApplyLinearQkvOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest) anyerror!?ops.LinearNoBiasTripleResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
@@ -28572,6 +28737,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.layerNorm = layerNormOp;
         vt.layerNormBackward = layerNormBackwardOp;
         vt.addLayerNorm = addLayerNormOp;
+        vt.addLayerNormSum = addLayerNormSumOp;
+        vt.ensureDeviceResident = ensureDeviceResidentOp;
+        vt.whisperLogitsStatsEncode = whisperLogitsStatsEncodeOp;
+        vt.whisperLogitsStatsRead = whisperLogitsStatsReadOp;
         vt.linear = linearOp;
         vt.denseMlp2 = denseMlp2Op;
         vt.denseFfnLayerNorm = denseFfnLayerNormOp;
@@ -28674,6 +28843,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimeApplyLinearArgmax = decoderRuntimeApplyLinearArgmaxOp;
         vt.decoderRuntimeApplyLinearPair = decoderRuntimeApplyLinearPairOp;
         vt.decoderRuntimeApplyLinearQkv = decoderRuntimeApplyLinearQkvOp;
+        vt.decoderRuntimeApplyLinearQkvInto = decoderRuntimeApplyLinearQkvIntoOp;
+        vt.decoderRuntimeBeginPlannedComputeScope = decoderRuntimeBeginPlannedComputeScopeOp;
+        vt.decoderRuntimeEndPlannedComputeScope = decoderRuntimeEndPlannedComputeScopeOp;
         vt.decoderRuntimeApplyActivation = decoderRuntimeApplyActivationOp;
         vt.decoderRuntimeApplyGeluBackward = decoderRuntimeApplyGeluBackwardOp;
         vt.decoderRuntimeFfnGeluBackwardChain = decoderRuntimeFfnGeluBackwardChainOp;
@@ -28887,6 +29059,29 @@ test "metal_compute: owned backend handle destroys its request context" {
         compute.* = try MetalCompute.init(allocator, &store, null);
         compute.ownedComputeBackend().deinit();
     }
+}
+
+test "metal_compute: borrowed shared provider does not take or release the execution lease" {
+    const metal_runtime = @import("../backends/metal_runtime.zig");
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var store = testMetalWeightStoreInit(alloc);
+    defer deinitSharedNativeProvider(&store);
+    // Nobody holds the lease yet, so there is no provider to borrow.
+    try std.testing.expectError(error.SharedProviderUnavailable, MetalCompute.initBorrowingSharedProvider(alloc, &store, null, .{}));
+
+    var owner = try MetalCompute.init(alloc, &store, null);
+    defer owner.deinit();
+    // A nested context (whole-model executor runtime) borrows the provider
+    // while the request keeps the lease.
+    var borrowed = try MetalCompute.initBorrowingSharedProvider(alloc, &store, null, .{});
+    try std.testing.expect(borrowed.provider_impl == owner.provider_impl);
+    try std.testing.expect(borrowed.shared_provider_lease_io == null);
+    try std.testing.expectError(error.QueueFull, MetalCompute.init(alloc, &store, null));
+    // Releasing the borrowed context leaves the owner's lease intact.
+    borrowed.deinit();
+    try std.testing.expectError(error.QueueFull, MetalCompute.init(alloc, &store, null));
 }
 
 test "metal_compute: shared provider execution lease rejects overlapping frames and recovers" {

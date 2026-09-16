@@ -2407,6 +2407,203 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/dictate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Dictate speech into clean written text
+         * @description Push-to-talk dictation. Transcribes one recorded clip with a Whisper
+         *     transcriber, then rewrites the transcript as clean written text with a
+         *     generator model: fillers, false starts, and repeated words are removed,
+         *     punctuation and paragraphing are added, and preferred spellings from
+         *     `dictionary` are applied. Clips longer than the 30 s Whisper window
+         *     are transcribed in windows cut at the quietest pause near the boundary.
+         *
+         *     Set `cleanup_model` to the generator that rewrites the transcript.
+         *     Without it, or with `style: verbatim`, the response carries the raw
+         *     transcript and no generation runs.
+         *
+         *     The framed attachment transport is accepted: send the JSON as the
+         *     envelope metadata with `"audio": "attachment:0"` and the clip as the
+         *     single attachment.
+         *
+         *     With `stream: true` the response is Server-Sent Events. The stream
+         *     emits one `dictation.transcript` event as soon as transcription
+         *     finishes, then `dictation.delta` events with cleaned-text tokens,
+         *     then `dictation.completed` with the full cleaned text, then `[DONE]`.
+         *
+         *     ```json
+         *     {
+         *       "model": "openai/whisper-tiny",
+         *       "cleanup_model": "ggml-org/gemma-4-E4B-it-GGUF",
+         *       "audio": "UklGRi...",
+         *       "dictionary": ["Antfly", "Colony"],
+         *       "context": "reply in a Slack thread",
+         *       "stream": true
+         *     }
+         *     ```
+         */
+        post: operations["dictate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/transcription/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Open a streaming transcription session
+         * @description Creates a server-side session that accepts audio in chunks and returns
+         *     transcript events as speech is endpointed. Append audio with
+         *     `POST /transcription/sessions/{session_id}/audio`; each append runs
+         *     voice activity detection over the buffered audio and returns the
+         *     events it produced:
+         *
+         *     - `partial`: the open speech segment decoded again. `stable_text` is
+         *       the word prefix that agreed with the previous hypothesis and can be
+         *       rendered as committed text.
+         *     - `final`: a segment closed by `vad.min_silence_ms` of silence, by
+         *       `max_segment_ms` of continuous speech, or by `commit: true`.
+         *
+         *     Sessions expire after `ttl_seconds` without appends and are closed
+         *     with `DELETE`.
+         */
+        post: operations["createTranscriptionSession"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/transcription/sessions/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Inspect a streaming transcription session */
+        get: operations["getTranscriptionSession"];
+        put?: never;
+        post?: never;
+        /**
+         * Close a streaming transcription session
+         * @description Discards buffered audio that has not been committed.
+         */
+        delete: operations["deleteTranscriptionSession"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/transcription/sessions/{session_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Subscribe to a session's transcript events
+         * @description Long-lived Server-Sent Events stream that pushes every `partial` and
+         *     `final` event the session produces, whether they came from
+         *     `POST .../audio` appends or a `POST .../stream` upload. Clients that
+         *     append from one connection and render from another use this instead
+         *     of reading the append responses. A `ping` is sent after 15 s of
+         *     silence. The stream ends with `session.closed` and `[DONE]` when the
+         *     session is deleted or expires.
+         */
+        get: operations["streamTranscriptionSessionEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/transcription/sessions/{session_id}/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stream raw audio into a session and receive events as they occur
+         * @description Full-duplex transcription over one request. The request body is raw
+         *     little-endian mono PCM (`format` selects 16-bit or float32 samples at
+         *     `sample_rate`), sent as it is captured. The server decodes as chunks
+         *     arrive and writes `transcription.event` messages on the response while
+         *     the upload continues. At end of body, buffered speech is finalized
+         *     when `commit` is true (the default).
+         *
+         *     Over HTTP/2 the body is read incrementally. Over HTTP/1.1 the body is
+         *     read after it has fully arrived, so use `/audio` appends there for
+         *     live results. Appends to the same session are refused with 409 while
+         *     a stream is open.
+         */
+        post: operations["streamTranscriptionAudio"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/ai/v1/transcription/sessions/{session_id}/audio": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Append audio to a streaming transcription session
+         * @description Appends one chunk of audio and runs endpointing and decoding over the
+         *     session buffer. The response lists the events produced by this
+         *     append, in order. Appends to one session must be sequential; a
+         *     concurrent append is rejected with 409.
+         *
+         *     `audio` is base64. With `format: auto` (default) the bytes are a
+         *     container the runtime can decode (WAV, Opus, MP3, FLAC, ...). With
+         *     `format: pcm16` or `pcm_f32` the bytes are raw little-endian mono
+         *     samples at `sample_rate`, which lets a client send microphone frames
+         *     without re-encoding. Chunks of 250 ms to 1 s balance latency and
+         *     decoder work.
+         *
+         *     `commit: true` finalizes buffered speech even without trailing
+         *     silence. It may be sent without `audio` to flush at the end of a
+         *     recording.
+         *
+         *     The framed attachment transport is accepted: send the JSON as the
+         *     envelope metadata with `"audio": "attachment:0"` and the bytes as the
+         *     single attachment.
+         */
+        post: operations["appendTranscriptionAudio"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/extract": {
         parameters: {
             query?: never;
@@ -14785,7 +14982,7 @@ export interface components {
             model: string;
             /**
              * Format: byte
-             * @description Base64-encoded audio data (WAV, MP3, FLAC, etc.)
+             * @description Base64-encoded audio data (WAV, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
              */
             audio: string;
             /**
@@ -14821,6 +15018,264 @@ export interface components {
              * @example en
              */
             language?: string;
+        };
+        /**
+         * @description How the cleanup pass rewrites the transcript. `clean` removes fillers
+         *     and fixes punctuation while keeping the speaker's wording; `formal`
+         *     and `casual` also adjust register; `verbatim` skips the generator and
+         *     returns the raw transcript.
+         * @enum {string}
+         */
+        InferenceDictationStyle: "clean" | "formal" | "casual" | "verbatim";
+        InferenceDictateRequest: {
+            /**
+             * @description Transcriber model from models_dir/transcribers/.
+             * @example openai/whisper-tiny
+             */
+            model: string;
+            /**
+             * Format: byte
+             * @description Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows.
+             */
+            audio: string;
+            /**
+             * @description Force the transcript language (ISO 639-1). Omit for automatic detection.
+             * @example en
+             */
+            language?: string;
+            /**
+             * @description Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
+             * @example ggml-org/gemma-4-E4B-it-GGUF
+             */
+            cleanup_model?: string;
+            style?: components["schemas"]["InferenceDictationStyle"];
+            /** @description Preferred spellings for names and terms the recognizer tends to miss. */
+            dictionary?: string[];
+            /** @description Where the text will be inserted, for example "email to a customer". Steers tone and formatting. */
+            context?: string;
+            /** @description Extra cleanup instructions appended to the built-in rules. */
+            instructions?: string;
+            /** @description Text the recognizer treats as preceding context, so it prefers these spellings and this style. Defaults to the dictionary entries joined by commas. */
+            transcript_prompt?: string;
+            vad?: components["schemas"]["InferenceVadConfig"];
+            audio_context?: components["schemas"]["InferenceAudioContext"];
+            /**
+             * @description Stream the response as Server-Sent Events.
+             * @default false
+             */
+            stream?: boolean;
+            /** @description Output budget for the cleanup pass. Defaults to about twice the transcript length. */
+            max_tokens?: number;
+        };
+        InferenceDictationWord: {
+            word: string;
+            start_ms: number;
+            end_ms: number;
+        };
+        /** @description One phrase bracketed by Whisper timestamp tokens (about 20 ms resolution). */
+        InferenceDictationSegment: {
+            text: string;
+            /** @description Phrase start offset in the clip, in milliseconds. */
+            start_ms: number;
+            /** @description Phrase end offset in the clip, in milliseconds. */
+            end_ms: number;
+            /** @description Word spans estimated inside the phrase by distributing its duration over word lengths. */
+            words: components["schemas"]["InferenceDictationWord"][];
+        };
+        InferenceDictationTranscript: {
+            /** @description Raw transcript before cleanup. */
+            text: string;
+            /** @description Detected or forced language. */
+            language?: string;
+            /** @description Decoded clip duration in milliseconds. */
+            duration_ms: number;
+            /** @description Timestamped phrases in clip order. */
+            segments: components["schemas"]["InferenceDictationSegment"][];
+        };
+        InferenceDictateResponse: {
+            /** @enum {string} */
+            object: "dictation";
+            id: string;
+            /** @description Unix timestamp (seconds). */
+            created: number;
+            /** @description Transcriber model used. */
+            model: string;
+            /** @description Generator model used for cleanup, when one ran. */
+            cleanup_model?: string;
+            transcript: components["schemas"]["InferenceDictationTranscript"];
+            /** @description Cleaned text, or the raw transcript when no cleanup ran. */
+            text: string;
+            usage: components["schemas"]["InferenceGenerateUsage"];
+        };
+        /**
+         * @description One Server-Sent Event of a streaming dictation. `dictation.transcript`
+         *     carries `transcript`; `dictation.delta` carries `delta`;
+         *     `dictation.completed` carries `text` and `usage`; `error` carries
+         *     `error` and `message`. The stream ends with the literal `[DONE]`.
+         */
+        InferenceDictationEvent: {
+            /** @enum {string} */
+            type: "dictation.transcript" | "dictation.delta" | "dictation.completed" | "error";
+            id: string;
+            model?: string;
+            cleanup_model?: string;
+            transcript?: components["schemas"]["InferenceDictationTranscript"];
+            delta?: string;
+            text?: string;
+            usage?: components["schemas"]["InferenceGenerateUsage"];
+            error?: string;
+            message?: string;
+        };
+        /**
+         * @description How much of Whisper's 30 s window the encoder processes. `full` pads
+         *     every clip to 30 s, which is what the model was trained on and gives
+         *     the most accurate transcripts. `dynamic` trims the encoder to the
+         *     audio actually present (plus one second), which cuts encoder time
+         *     roughly in proportion for short clips at a small accuracy cost on
+         *     some models. Dictation defaults to `full`; streaming sessions default
+         *     to `dynamic` because partials re-decode short open segments many times.
+         * @enum {string}
+         */
+        InferenceAudioContext: "full" | "dynamic";
+        /**
+         * @description Voice activity detection. Without `model`, frames are classified by
+         *     RMS energy against `threshold`. With `model` naming a pulled Silero
+         *     VAD export (`antfly inference pull onnx-community/silero-vad --tasks vad`),
+         *     512-sample frames at 16 kHz are scored by the neural model, which
+         *     separates speech from tones, music, and keyboard noise that the
+         *     energy rule accepts.
+         */
+        InferenceVadConfig: {
+            /**
+             * @description Silero VAD model directory name from models_dir, for example `onnx-community/silero-vad`.
+             * @example onnx-community/silero-vad
+             */
+            model?: string;
+            /**
+             * Format: float
+             * @description Speech probability at or above which a Silero frame counts as speech. Default 0.5.
+             */
+            silero_threshold?: number;
+            /**
+             * Format: float
+             * @description RMS amplitude on [-1, 1] PCM at or above which a 20 ms frame counts as speech. Default 0.012 (about -38 dBFS).
+             */
+            threshold?: number;
+            /** @description Consecutive speech needed to open a segment. Default 120. */
+            min_speech_ms?: number;
+            /** @description Continuous silence that closes a segment. Default 600. */
+            min_silence_ms?: number;
+            /** @description Padding kept on both sides of each segment. Default 120. */
+            speech_pad_ms?: number;
+        };
+        InferenceTranscriptionSessionRequest: {
+            /**
+             * @description Transcriber model from models_dir/transcribers/.
+             * @example openai/whisper-tiny
+             */
+            model: string;
+            /** @description Force the transcript language (ISO 639-1). Omit for automatic detection. */
+            language?: string;
+            vad?: components["schemas"]["InferenceVadConfig"];
+            audio_context?: components["schemas"]["InferenceAudioContext"];
+            /** @description Minimum new audio before the open segment is decoded again for a partial. Each partial is a full Whisper pass, so lower values raise decoder load. Default 2000. */
+            partial_interval_ms?: number;
+            /** @description Continuous speech that forces a segment boundary. Default 25000. */
+            max_segment_ms?: number;
+            /**
+             * @description Emit partial hypotheses for the open segment.
+             * @default true
+             */
+            emit_partials?: boolean;
+            /** @description Preferred spellings for names and terms; joined into the recognizer's preceding-context prompt. */
+            dictionary?: string[];
+            /** @description Explicit preceding-context text for the recognizer. Overrides `dictionary`. */
+            transcript_prompt?: string;
+            /** @description Idle time after which the session expires. Default 300. */
+            ttl_seconds?: number;
+        };
+        InferenceTranscriptionSession: {
+            /** @enum {string} */
+            object: "transcription.session";
+            id: string;
+            model: string;
+            language?: string;
+            /** @description Unix timestamp (seconds). */
+            created: number;
+            /** @description Unix timestamp (seconds) after which the session is reclaimed unless audio is appended. */
+            expires_at: number;
+            /** @description Audio held for the open segment. */
+            buffered_ms: number;
+            /** @description Audio appended over the session lifetime. */
+            total_ms: number;
+            finals: number;
+            partials: number;
+        };
+        InferenceTranscriptionSessionDeleted: {
+            /** @enum {string} */
+            object: "transcription.session.deleted";
+            id: string;
+            deleted: boolean;
+        };
+        /** @enum {string} */
+        InferenceTranscriptionAudioFormat: "auto" | "pcm16" | "pcm_f32";
+        InferenceTranscriptionAudioAppend: {
+            /**
+             * Format: byte
+             * @description Base64 audio chunk. Optional when `commit` is true.
+             */
+            audio?: string;
+            format?: components["schemas"]["InferenceTranscriptionAudioFormat"];
+            /** @description Sample rate of raw `pcm16` / `pcm_f32` chunks. Default 16000. Ignored for containers. */
+            sample_rate?: number;
+            /**
+             * @description Finalize buffered speech even without trailing silence.
+             * @default false
+             */
+            commit?: boolean;
+        };
+        InferenceTranscriptionEvent: {
+            /** @enum {string} */
+            object: "transcription.event";
+            /** @enum {string} */
+            type: "partial" | "final";
+            /** @description Monotonic per-session event counter. */
+            sequence: number;
+            /** @description Current hypothesis for the segment. */
+            text: string;
+            /** @description Prefix of `text` that agreed with the previous hypothesis. Equals `text` for final events. */
+            stable_text: string;
+            /** @description Segment start in the session timeline, in milliseconds. */
+            start_ms: number;
+            end_ms: number;
+            language?: string;
+            /** @description Word spans on the session timeline. Empty for partial events. */
+            words?: components["schemas"]["InferenceDictationWord"][];
+        };
+        /**
+         * @description One Server-Sent Event on a session event stream. `session.open` starts
+         *     the stream, `transcription.event` carries `event`, `ping` keeps the
+         *     connection alive, `session.closed` ends it, and `error` carries
+         *     `error` and `message`. The stream ends with the literal `[DONE]`.
+         */
+        InferenceTranscriptionStreamMessage: {
+            /** @enum {string} */
+            type: "session.open" | "transcription.event" | "ping" | "session.closed" | "error";
+            session_id: string;
+            event?: components["schemas"]["InferenceTranscriptionEvent"];
+            buffered_ms?: number;
+            total_ms?: number;
+            error?: string;
+            message?: string;
+        };
+        InferenceTranscriptionEventList: {
+            /** @enum {string} */
+            object: "list";
+            session_id: string;
+            model: string;
+            data: components["schemas"]["InferenceTranscriptionEvent"][];
+            buffered_ms: number;
+            total_ms: number;
         };
         /** @description Information about a model including its capabilities */
         InferenceModelInfo: {
@@ -15376,8 +15831,8 @@ export interface components {
         /** @description Native generator prompt KV cache configuration. */
         InferencePromptCacheConfig: {
             /**
-             * @description Enable inference-native prompt KV cache reuse for generator requests.
-             * @default false
+             * @description Enable inference-native prompt KV cache reuse for generator requests. On by default; set false to disable.
+             * @default true
              */
             enabled?: boolean;
             /**
@@ -20839,6 +21294,461 @@ export interface operations {
             };
             /** @description Model not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    dictate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceDictateRequest"];
+            };
+        };
+        responses: {
+            /**
+             * @description Dictation result. Returns JSON for non-streaming requests, or
+             *     Server-Sent Events for streaming requests (stream: true).
+             */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDictateResponse"];
+                    "text/event-stream": components["schemas"]["InferenceDictationEvent"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Audio exceeds the configured size limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    createTranscriptionSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceTranscriptionSessionRequest"];
+            };
+        };
+        responses: {
+            /** @description Session created */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceTranscriptionSession"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session limit reached */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    getTranscriptionSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceTranscriptionSession"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    deleteTranscriptionSession: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session closed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceTranscriptionSessionDeleted"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session is processing an append */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    streamTranscriptionSessionEvents: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Event stream */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": components["schemas"]["InferenceTranscriptionStreamMessage"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    streamTranscriptionAudio: {
+        parameters: {
+            query?: {
+                /** @description Raw sample format. Default pcm16. */
+                format?: "pcm16" | "pcm_f32";
+                /** @description Sample rate of the raw stream. Default 16000. */
+                sample_rate?: number;
+                /** @description Finalize open speech at end of body. Default true. */
+                commit?: boolean;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Event stream */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": components["schemas"]["InferenceTranscriptionStreamMessage"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session or model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session is processing another request */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    appendTranscriptionAudio: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceTranscriptionAudioAppend"];
+            };
+        };
+        responses: {
+            /** @description Events produced by this append */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceTranscriptionEventList"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session or model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Session is processing another append */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Audio exceeds the session buffer or size limit */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };

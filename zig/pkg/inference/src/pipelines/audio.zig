@@ -94,10 +94,42 @@ pub fn whisperMelFromPcm(
     samples: []const f32,
     sample_rate: u32,
 ) ![]f32 {
+    return whisperMelFromPcmSeconds(allocator, samples, sample_rate, WHISPER_CHUNK_LENGTH);
+}
+
+/// Log-mel over a `seconds`-long context (1 to 30). Audio beyond it is
+/// dropped; shorter audio is zero-padded to it. `WHISPER_CHUNK_LENGTH`
+/// reproduces the reference 30 s input; smaller values are the dynamic
+/// audio context used to encode short segments cheaply.
+pub fn whisperMelFromPcmSeconds(
+    allocator: std.mem.Allocator,
+    samples: []const f32,
+    sample_rate: u32,
+    seconds: u32,
+) ![]f32 {
+    if (seconds == 0 or seconds > WHISPER_CHUNK_LENGTH) return error.UnsupportedAudioFormat;
     const window = try whisperInputWindow(samples, sample_rate);
     const prepared = try copyOrResample(allocator, window, sample_rate, WHISPER_SAMPLE_RATE);
     defer allocator.free(prepared);
-    return logMelSpectrogram(allocator, prepared);
+    const bounded = prepared[0..@min(prepared.len, @as(usize, seconds) * WHISPER_SAMPLE_RATE)];
+    var config = WHISPER_CONFIG;
+    config.chunk_length_s = seconds;
+    return logMelSpectrogramWithConfig(allocator, bounded, config);
+}
+
+/// Mel frames produced for a `seconds` context (100 per second at 16 kHz).
+pub fn whisperFramesForSeconds(seconds: u32) usize {
+    return @as(usize, seconds) * (WHISPER_SAMPLE_RATE / WHISPER_HOP_LENGTH);
+}
+
+/// Whole seconds of context for `sample_count` samples: the audio rounded
+/// up, plus one second of silence so the decoder sees the utterance end,
+/// clamped to the model window.
+pub fn dynamicContextSeconds(sample_count: usize, sample_rate: u32) u32 {
+    if (sample_rate == 0) return WHISPER_CHUNK_LENGTH;
+    const whole: usize = (sample_count + sample_rate - 1) / sample_rate;
+    const padded = whole + 1;
+    return @intCast(@min(@as(usize, WHISPER_CHUNK_LENGTH), @max(@as(usize, 1), padded)));
 }
 
 fn whisperInputWindow(samples: []const f32, sample_rate: u32) ![]const f32 {
@@ -447,6 +479,18 @@ test "whisper mel from pcm returns whisper-shaped output" {
     const mel = try whisperMelFromPcm(std.testing.allocator, &samples, WHISPER_SAMPLE_RATE);
     defer std.testing.allocator.free(mel);
     try std.testing.expectEqual(@as(usize, WHISPER_N_MELS * WHISPER_N_FRAMES), mel.len);
+}
+
+test "whisper dynamic context sizes the mel to the audio" {
+    try std.testing.expectEqual(@as(u32, 4), dynamicContextSeconds(WHISPER_SAMPLE_RATE * 5 / 2, WHISPER_SAMPLE_RATE));
+    try std.testing.expectEqual(@as(u32, 30), dynamicContextSeconds(WHISPER_SAMPLE_RATE * 60, WHISPER_SAMPLE_RATE));
+    try std.testing.expectEqual(@as(u32, 1), dynamicContextSeconds(0, WHISPER_SAMPLE_RATE));
+    try std.testing.expectEqual(@as(usize, 400), whisperFramesForSeconds(4));
+    const samples = [_]f32{0.0} ** 1600;
+    const mel = try whisperMelFromPcmSeconds(std.testing.allocator, &samples, WHISPER_SAMPLE_RATE, 2);
+    defer std.testing.allocator.free(mel);
+    try std.testing.expectEqual(@as(usize, WHISPER_N_MELS * 200), mel.len);
+    try std.testing.expectError(error.UnsupportedAudioFormat, whisperMelFromPcmSeconds(std.testing.allocator, &samples, WHISPER_SAMPLE_RATE, 31));
 }
 
 test "whisper input is validated and sliced before resampling" {

@@ -64,6 +64,14 @@ const graph_mod = @import("../graph/root.zig");
 const gliner_mod = @import("../pipelines/gliner.zig");
 const grammar_mod = @import("../pipelines/grammar.zig");
 const audio_mod = @import("../pipelines/audio.zig");
+const transcription_mod = @import("../pipelines/transcription.zig");
+const whisper_prompt_mod = @import("../pipelines/whisper_prompt.zig");
+const long_transcription = @import("../pipelines/long_transcription.zig");
+const streaming_transcription = @import("../pipelines/streaming_transcription.zig");
+const dictation_mod = @import("../pipelines/dictation.zig");
+const vad_mod = @import("../pipelines/vad.zig");
+const silero_vad_mod = @import("../pipelines/silero_vad.zig");
+const transcription_sessions = @import("transcription_sessions.zig");
 const readers_mod = @import("../readers/reader.zig");
 const qwen3vl_reader_mod = @import("../readers/qwen3vl.zig");
 const rebel_mod = @import("../pipelines/rebel.zig");
@@ -849,7 +857,7 @@ pub const BudgetOverrides = struct {
 };
 
 pub const PromptCacheConfig = struct {
-    enabled: bool = false,
+    enabled: bool = true,
     mode: runtime.kv.prompt_cache.Mode = .block_hash,
     max_bytes_mb: usize = 512,
     min_tokens: usize = 64,
@@ -1999,6 +2007,13 @@ fn allocCompletionId(allocator: std.mem.Allocator) ![]u8 {
     var padded = [_]u8{'0'} ** 16;
     @memcpy(padded[padded.len - rendered.len ..], rendered);
     return std.fmt.allocPrint(allocator, "chatcmpl-{s}", .{padded[0..]});
+}
+
+fn allocDictationId(allocator: std.mem.Allocator) ![]u8 {
+    var bytes: [8]u8 = undefined;
+    try fillRandomBytes(&bytes);
+    const value = std.mem.readInt(u64, &bytes, .little);
+    return std.fmt.allocPrint(allocator, "dict-{x:0>16}", .{value});
 }
 
 fn fillRandomBytes(buffer: []u8) !void {
@@ -3512,6 +3527,12 @@ pub const Node = struct {
     embed_cache: cache_mod.ResultCache([]const f32),
     metrics: metrics_mod.Metrics,
     inference_admission: inference_admission_mod.InferenceAdmission,
+    /// Live streaming transcription sessions (voice API).
+    transcription_sessions: transcription_sessions.Registry,
+    /// Silero VAD weights by resolved model directory. Loaded once and kept
+    /// for the node's lifetime; session configs point into this cache.
+    silero_weights: std.StringHashMapUnmanaged(*silero_vad_mod.Weights) = .empty,
+    silero_weights_lock: std.atomic.Mutex = .unlocked,
     /// Lazily allocates only while compatible native executor work is queued.
     /// Ownership is here, rather than the storage BackendRuntime, because Node
     /// owns resolved model generations and concrete fused executor callbacks.
@@ -3640,6 +3661,7 @@ pub const Node = struct {
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
             .metrics = metrics_mod.Metrics.default,
             .inference_admission = inference_admission_mod.InferenceAdmission.init(config.max_concurrent_requests),
+            .transcription_sessions = transcription_sessions.Registry.init(allocator),
             .compatibility_cache = .empty,
             .hard_cancellation_watchdog = hard_cancellation_watchdog,
         };
@@ -3746,6 +3768,15 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node) void {
+        // Sessions hold only PCM buffers; drop them before any runtime teardown.
+        self.transcription_sessions.deinit();
+        var silero_it = self.silero_weights.iterator();
+        while (silero_it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.silero_weights.deinit(self.allocator);
         // The refresher borrows Node, its allocator, and the models directory.
         // Cancel and join it before releasing any of those dependencies.
         if (self.readiness_refresh_io) |io| self.readiness_refresh_group.cancel(io);
@@ -4778,6 +4809,8 @@ pub const Node = struct {
             null,
             false,
             null,
+            null,
+            null,
         );
     }
 
@@ -4898,6 +4931,8 @@ pub const Node = struct {
             null,
             false,
             null,
+            null,
+            null,
         );
     }
 
@@ -4916,6 +4951,14 @@ pub const Node = struct {
         ));
     }
 
+    /// Optional token streaming for direct generation. `continue_fn` lets
+    /// the pipeline stop when the consumer goes away.
+    pub const DirectGenerateStream = struct {
+        ctx: *anyopaque,
+        on_token: generation.TokenCallback,
+        continue_fn: ?*const fn (*anyopaque) bool = null,
+    };
+
     const DirectGenerateTiming = struct {
         resolve_ms: u64 = 0,
         load_ms: u64 = 0,
@@ -4929,6 +4972,8 @@ pub const Node = struct {
         prompt_tokens: usize,
         completion_tokens: usize,
         truncated: bool,
+        /// Prompt tokens served from the model's prefix KV cache.
+        cached_prompt_tokens: usize = 0,
     };
 
     const NativePromptTokenCount = struct {
@@ -5010,6 +5055,8 @@ pub const Node = struct {
             timing,
             pin_after_success,
             a4b_request,
+            null,
+            null,
         );
     }
 
@@ -5024,6 +5071,8 @@ pub const Node = struct {
         timing: ?*DirectGenerateTiming,
         pin_after_success: bool,
         a4b_request: ?ops.A4bInferenceRequest,
+        stream: ?DirectGenerateStream,
+        prompt_cache_key: ?[]const u8,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const admitted_node = admission.node orelse return error.InvalidGenerationAdmission;
@@ -5041,6 +5090,8 @@ pub const Node = struct {
             timing,
             pin_after_success,
             a4b_request,
+            stream,
+            prompt_cache_key,
             try admission.boundExecutionControl(),
         );
         return output.text;
@@ -5059,6 +5110,11 @@ pub const Node = struct {
         timing: ?*DirectGenerateTiming,
         pin_after_success: bool,
         a4b_request: ?ops.A4bInferenceRequest,
+        stream: ?DirectGenerateStream,
+        /// Opt into the model's prefix KV cache under this key. Only honored
+        /// when the node enables the prompt cache; forces the eager paged-KV
+        /// route because the compiled whole-model path cannot attach a cache.
+        prompt_cache_key: ?[]const u8,
         supplied_control: InferenceExecutionControl,
     ) !DirectGenerateOutput {
         var synchronized = executor_microbatch.SynchronizedAllocator{ .child = caller_allocator };
@@ -5126,12 +5182,18 @@ pub const Node = struct {
             .pjrt, .onnx, .wasm => return error.UnsupportedGeneratorProvider,
         };
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
+        const prompt_cache_requested = prompt_cache_key != null and
+            self.config.prompt_cache.enabled and
+            promptCacheBackendEligible(self.config.prompt_cache.mode, backend_kind);
         const use_metal_whole_model = build_options.enable_metal and
             model.session.backend() == .metal and
             graph_mod.metal_executor.supportsSession(model.session) and
-            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
+            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and
+            !prompt_cache_requested;
         var generation_config = generation.GenerationConfig{
             .max_tokens = max_tokens,
+            .prompt_cache_enabled = prompt_cache_requested,
+            .prompt_cache_key = if (prompt_cache_requested) prompt_cache_key else null,
         };
         const kv_capacity_policy = generation.generationKvCapacityPolicyForRoute(
             if (use_metal_whole_model) .metal_whole_model else .standard,
@@ -5251,12 +5313,65 @@ pub const Node = struct {
         defer cb.deinit();
 
         const kv_pool_config = generation.kvPoolConfig(backend_kind, kv_dtype, gpt_config, generationKvSlidingTrimForced());
-        const pool_id = try kv_manager.addPool(kv_pool_config);
-        var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
-        defer kv_storage.deinit();
-        try cb.provisionKvDeviceWriteHook(&kv_storage);
-        var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
-        decode_state.kv_storage = &kv_storage;
+        // Prefix cache activation mirrors the HTTP generate route: the cache's
+        // own KV manager and (on GPU backends) its device storage replace the
+        // request-local pool so cached blocks are addressable by the decode.
+        var prompt_cache: ?*runtime.kv.prompt_cache.PromptPrefixCache = null;
+        var active_kv_manager: *runtime.kv.manager.KvManager = &kv_manager;
+        var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
+        var pool_id: runtime.kv.block.KvPoolId = undefined;
+        if (prompt_cache_requested) {
+            const prompt_cache_config = self.config.prompt_cache.runtimeConfig(self.config.prompt_cache_resource_usage_observer);
+            self.model_manager.rebalancePromptCaches(model, prompt_cache_config);
+            const cache_ready = if (backend_kind == .metal or backend_kind == .cuda) blk: {
+                const ensured = model.prompt_prefix_cache.ensureStorage(kv_pool_config) catch |err| {
+                    self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
+                    std.log.warn("prompt cache storage activation failed; using request-local KV: {s}", .{@errorName(err)});
+                    break :blk false;
+                };
+                const storage = if (ensured) |result| result.storage else break :blk false;
+                if (storage.device_write_hook == null) {
+                    cb.provisionKvDeviceWriteHook(storage) catch |err| {
+                        self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
+                        std.log.warn("prompt cache device activation failed; using request-local KV: {s}", .{@errorName(err)});
+                        break :blk false;
+                    };
+                }
+                if (storage.device_write_hook == null) break :blk false;
+                active_kv_storage = storage;
+                break :blk true;
+            } else blk: {
+                const maybe_cache_pool_id = model.prompt_prefix_cache.ensurePool(kv_pool_config) catch |err| {
+                    self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
+                    std.log.warn("prompt cache activation failed; using request-local KV: {s}", .{@errorName(err)});
+                    break :blk false;
+                };
+                break :blk maybe_cache_pool_id != null;
+            };
+            if (cache_ready) {
+                active_kv_manager = model.prompt_prefix_cache.managerPtr();
+                pool_id = model.prompt_prefix_cache.pool_id.?;
+                prompt_cache = &model.prompt_prefix_cache;
+            } else {
+                pool_id = try kv_manager.addPool(kv_pool_config);
+                generation_config.prompt_cache_enabled = false;
+                self.model_manager.cancelPromptCacheActivation(model, prompt_cache_config);
+            }
+        } else {
+            pool_id = try kv_manager.addPool(kv_pool_config);
+        }
+        var kv_storage: ?runtime.kv.storage_runtime.KvStorageRuntime = if (active_kv_storage == null)
+            try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config)
+        else
+            null;
+        defer if (kv_storage) |*storage| storage.deinit();
+        if (kv_storage) |*storage| try cb.provisionKvDeviceWriteHook(storage);
+        var decode_state = generation.NativeDecodeState.initPaged(allocator, active_kv_manager, pool_id, model.shared_moe_cache);
+        if (active_kv_storage) |storage| {
+            decode_state.kv_storage = storage;
+        } else if (kv_storage) |*storage| {
+            decode_state.kv_storage = storage;
+        }
         defer decode_state.deinit();
 
         var pipeline = generation.NativeGenerationPipeline{
@@ -5276,6 +5391,7 @@ pub const Node = struct {
             .decode_state = &decode_state,
             .scheduler = if (scheduler_lease != null) model.native_generate_coordinator else null,
             .scheduler_lease = if (scheduler_lease) |*lease| lease else null,
+            .prompt_cache = prompt_cache,
             .execution_lock = model_lock.pipelineExecutionLock(),
             .graph_cache = if (use_metal_whole_model) &model.native_generation_graph_cache else null,
             .compiled_partition_backend = if (use_metal_whole_model) .metal else null,
@@ -5295,7 +5411,14 @@ pub const Node = struct {
                 (if (session_factory.cudaOpProfileLoggingEnabled()) session_factory.getCudaRuntimeStats(model.session) else null)
             else
                 null;
-        var result = pipeline.generate(messages, generation_config) catch |err| {
+        if (stream) |active| if (active.continue_fn) |continue_fn| {
+            pipeline.continue_ctx = active.ctx;
+            pipeline.continue_fn = continue_fn;
+        };
+        var result = (if (stream) |active|
+            pipeline.generateStreaming(messages, generation_config, active.ctx, active.on_token)
+        else
+            pipeline.generate(messages, generation_config)) catch |err| {
             if (comptime build_options.enable_cuda) session_factory.drainCudaProfile(model.session);
             if (err == error.MemoryBudgetExceeded)
                 logMemoryBudgetExceeded(model.session, &run_budget);
@@ -5343,6 +5466,7 @@ pub const Node = struct {
             .prompt_tokens = result.prompt_tokens,
             .completion_tokens = result.tokens_used,
             .truncated = std.mem.eql(u8, result.finish_reason, "length"),
+            .cached_prompt_tokens = result.cached_prompt_tokens,
         };
     }
 
@@ -6820,6 +6944,8 @@ pub const Node = struct {
                 false,
                 if (read_timing_enabled) &read_timing else null,
                 false,
+                null,
+                null,
                 null,
                 control,
             );
@@ -16337,113 +16463,44 @@ pub const Node = struct {
         };
         defer decoded.deinit();
 
-        // Resolve model
-        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, transcribe_model_name, "transcribers") catch |err|
-            return requestModelResolutionError(ctx, err);
-        defer ctx.allocator.free(model_path);
-        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-        defer admission_manifest.deinit();
-        const executor_contract = resolvedInferenceExecutorContract(self, "transcribe", &admission_manifest) catch |err|
-            return inferenceExecutorContractFailureResponse(ctx, err);
-        if (decoded_audio_mime) |declared_mime| {
-            const essence = data_uri_mod.mediaTypeEssence(declared_mime) catch
-                return inferenceExecutorContractFailureResponse(ctx, error.UnsupportedInferenceMimeType);
-            if (!manifestAcceptsExecutorMime(&admission_manifest, essence))
-                return inferenceExecutorContractFailureResponse(ctx, error.UnsupportedInferenceMimeType);
-        }
-        validateInferenceExecutorInvocation(executor_contract, .{
-            .item_count = 1,
-            .encoded_media_bytes = media_budget.used_bytes,
-            .media_parts_per_item = 1,
-            .has_audio = true,
-        }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
+        // Whisper consumes 16 kHz mono; resample once rather than per window.
+        const pcm = audio_mod.copyOrResample(ctx.allocator, decoded.samples, decoded.sample_rate, audio_mod.WHISPER_SAMPLE_RATE) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return unsupportedAudioResponse(ctx, "unsupported audio input"),
+        };
+        defer ctx.allocator.free(pcm);
 
-        // Find encoder/decoder sessions
-        const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
-        const tokenizer_mod = @import("inference_tokenizer");
-        const whisper_prompt = @import("../pipelines/whisper_prompt.zig");
-        var encoder_session: backends_mod.Session = undefined;
-        var decoder_session: backends_mod.Session = undefined;
-        var tokenizer: tokenizer_mod.Tokenizer = undefined;
-        var decoder_config: enc_dec_mod.DecoderConfig = undefined;
-        var loaded_model_handle: ?model_manager_mod.ModelHandle = null;
-        defer if (loaded_model_handle) |*handle| handle.release();
-        var whisper_assets_handle: ?model_manager_mod.CompositeAssetsHandle = null;
-        defer if (whisper_assets_handle) |*handle| handle.release();
-        var prompt_cache: ?*const whisper_prompt.PromptCache = null;
-
-        if (enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path)) |paths| {
-            defer ctx.allocator.free(paths.encoder);
-            defer ctx.allocator.free(paths.decoder);
-
-            whisper_assets_handle = self.model_manager.acquireCompositeRuntime(
-                model_path,
-                &.{ paths.encoder, paths.decoder },
-                .whisper,
-                execution_control,
-            ) catch |err| return modelLoadFailureResponse(ctx, err);
-            const assets = whisper_assets_handle.?.get();
-            encoder_session = assets.encoder.?.session;
-            decoder_session = assets.decoder.?.session;
-            tokenizer = assets.tokenizer();
-            decoder_config = assets.decoder_config;
-            prompt_cache = &assets.prompt_cache.?;
-        } else |_| {
-            loaded_model_handle = self.model_manager.acquireFromDirWithControl(model_path, execution_control) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-            const model = loaded_model_handle.?.get();
-            const whisper_config = session_factory.getWhisperConfig(model.session) orelse {
-                return ctx.status(400).json(.{
-                    .@"error" = "INVALID_MODEL",
-                    .message = "model does not support transcription",
-                });
-            };
-            encoder_session = model.session;
-            decoder_session = model.session;
-            tokenizer = model.getTokenizer();
-            prompt_cache = if (model.whisper_prompt_cache) |*cache| cache else null;
-            decoder_config = .{
-                .max_length = @intCast(whisper_config.max_target_positions),
-                .decoder_start_token_id = whisper_config.decoder_start_token_id,
-                .vocab_size = whisper_config.vocab_size,
-                .eos_token_id = whisper_config.eos_token_id,
-                .pad_token_id = whisper_config.pad_token_id,
-            };
-        }
-
-        const effective_prompt_cache = prompt_cache orelse
-            return ctx.status(500).json(.{ .@"error" = "INVALID_MODEL", .message = "WhisperPromptCacheUnavailable" });
-        var prompt_scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
-        const forced_ids = effective_prompt_cache.resolve(&prompt_scratch, body.language) catch
-            return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
-                .message = "language is not supported by this Whisper model",
-            });
-        const transcription = @import("../pipelines/transcription.zig");
-        var pipeline = transcription.TranscriptionPipeline.init(
+        // The same runtime as dictation: windowing for clips over 30 s and
+        // the hallucination guards that stop the decoder on silence instead
+        // of running to max_length.
+        var whisper = WhisperRuntime{ .node = self, .allocator = ctx.allocator };
+        defer whisper.deinit();
+        var stage: WhisperRuntimeStage = .resolve;
+        self.acquireWhisperRuntime(
+            &whisper,
+            ctx.io,
+            transcribe_model_name,
+            decoded_audio_mime,
+            media_budget.used_bytes,
+            execution_control,
+            &stage,
+        ) catch |err| return whisperRuntimeFailureResponse(ctx, stage, err);
+        var pipeline = whisper.pipeline(body.language, audio_admission.max_decode_working_bytes, execution_control, false, .full) catch |err|
+            return whisperRuntimeFailureResponse(ctx, .language, err);
+        var result = long_transcription.transcribeLong(
             ctx.allocator,
-            encoder_session,
-            decoder_session,
-            tokenizer,
-            .{
-                .max_length = decoder_config.max_length,
-                .decoder_start_token_id = decoder_config.decoder_start_token_id,
-                .vocab_size = decoder_config.vocab_size,
-                .eos_token_id = decoder_config.eos_token_id,
-                .language = body.language,
-                .forced_decoder_ids = forced_ids,
-                .max_decode_working_bytes = audio_admission.max_decode_working_bytes,
-                .language_tokens = effective_prompt_cache.language_tokens,
-            },
-        );
-        pipeline.execution_control = execution_control;
-
-        pipeline.batch_dispatch = self.tensorBatchDispatch(.transcribe);
-        var result = pipeline.transcribePcm(decoded.samples, decoded.sample_rate) catch |err| switch (err) {
+            &pipeline,
+            pcm,
+            audio_mod.WHISPER_SAMPLE_RATE,
+            .{},
+        ) catch |err| switch (err) {
             error.UnsupportedAudioFormat => return unsupportedAudioResponse(ctx, "unsupported audio input"),
             error.OutOfMemory => return err,
-            else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+            error.Timeout, error.Cancelled, error.Canceled => return inferenceFailureResponse(ctx, err),
+            else => if (isTransientInferenceCapacityError(err))
+                return modelResourceBusyResponse(ctx)
+            else
+                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
         };
         defer result.deinit();
 
@@ -16457,8 +16514,1433 @@ pub const Node = struct {
             .object = "list",
             .data = &data,
             .model = transcribe_model_name,
-            .usage = tokenUsage(0, countTokenizerTokens(ctx.allocator, self.session_manager.io, tokenizer, result.text) catch estimateTextTokens(result.text)),
+            .usage = tokenUsage(0, countTokenizerTokens(ctx.allocator, self.session_manager.io, whisper.tokenizer, result.text) catch estimateTextTokens(result.text)),
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Voice: push-to-talk dictation and streaming transcription sessions.
+    // -----------------------------------------------------------------------
+
+    const WhisperRuntimeStage = enum {
+        resolve,
+        manifest,
+        contract,
+        load,
+        unsupported_model,
+        prompt_cache,
+        language,
+    };
+
+    /// One resolved Whisper transcriber. Owns the model handles until
+    /// `deinit`; pipelines built from it borrow those handles and the
+    /// forced-decoder scratch, so the runtime must not move while a pipeline
+    /// is alive.
+    const WhisperRuntime = struct {
+        node: *Node,
+        allocator: std.mem.Allocator,
+        model_path: ?[]const u8 = null,
+        manifest: ?manifest_mod.ModelManifest = null,
+        composite_handle: ?model_manager_mod.CompositeAssetsHandle = null,
+        model_handle: ?model_manager_mod.ModelHandle = null,
+        encoder: backends_mod.Session = undefined,
+        decoder: backends_mod.Session = undefined,
+        tokenizer: @import("inference_tokenizer").Tokenizer = undefined,
+        decoder_config: @import("../pipelines/encoder_decoder.zig").DecoderConfig = .{},
+        prompt_cache: ?*const whisper_prompt_mod.PromptCache = null,
+        prompt_scratch: [3]whisper_prompt_mod.ForcedDecoderId = undefined,
+
+        fn deinit(self: *WhisperRuntime) void {
+            if (self.composite_handle) |*handle| handle.release();
+            self.composite_handle = null;
+            if (self.model_handle) |*handle| handle.release();
+            self.model_handle = null;
+            if (self.manifest) |*manifest| manifest.deinit();
+            self.manifest = null;
+            if (self.model_path) |path| self.allocator.free(path);
+            self.model_path = null;
+        }
+
+        fn validateLanguage(self: *WhisperRuntime, language: ?[]const u8) !void {
+            const cache = self.prompt_cache orelse return error.WhisperPromptCacheUnavailable;
+            _ = try cache.resolve(&self.prompt_scratch, language);
+        }
+
+        /// Build a transcription pipeline that borrows this runtime.
+        fn pipeline(
+            self: *WhisperRuntime,
+            language: ?[]const u8,
+            max_decode_working_bytes: usize,
+            control: InferenceExecutionControl,
+            timestamps: bool,
+            audio_context: transcription_mod.AudioContext,
+        ) !transcription_mod.TranscriptionPipeline {
+            const cache = self.prompt_cache orelse return error.WhisperPromptCacheUnavailable;
+            const forced_ids = try cache.resolveWithTimestamps(&self.prompt_scratch, language, timestamps);
+            var result = transcription_mod.TranscriptionPipeline.init(
+                self.allocator,
+                self.encoder,
+                self.decoder,
+                self.tokenizer,
+                .{
+                    .max_length = self.decoder_config.max_length,
+                    .decoder_start_token_id = self.decoder_config.decoder_start_token_id,
+                    .vocab_size = self.decoder_config.vocab_size,
+                    .eos_token_id = self.decoder_config.eos_token_id,
+                    .language = language,
+                    .forced_decoder_ids = forced_ids,
+                    .max_decode_working_bytes = max_decode_working_bytes,
+                    .language_tokens = cache.language_tokens,
+                    .decode = cache.decode,
+                    .no_timestamps_id = cache.no_timestamps_id,
+                    .timestamps = timestamps,
+                    .audio_context = audio_context,
+                },
+            );
+            result.execution_control = control;
+            result.batch_dispatch = self.node.tensorBatchDispatch(.transcribe);
+            return result;
+        }
+    };
+
+    /// Resolve, validate, and load a transcriber into `runtime`. On error
+    /// `stage` names the step that failed so the caller can map it to the
+    /// same HTTP responses `transcribeAudio` produces. `runtime` is left
+    /// deinit-safe on every path.
+    fn acquireWhisperRuntime(
+        self: *Node,
+        whisper: *WhisperRuntime,
+        io: std.Io,
+        model_name: []const u8,
+        declared_mime: ?[]const u8,
+        encoded_media_bytes: usize,
+        control: InferenceExecutionControl,
+        stage: *WhisperRuntimeStage,
+    ) !void {
+        const allocator = whisper.allocator;
+        errdefer whisper.deinit();
+        stage.* = .resolve;
+        whisper.model_path = try self.resolveRequestModelPath(allocator, io, model_name, "transcribers");
+        const model_path = whisper.model_path.?;
+        stage.* = .manifest;
+        whisper.manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        const manifest = &whisper.manifest.?;
+        stage.* = .contract;
+        const executor_contract = try resolvedInferenceExecutorContract(self, "transcribe", manifest);
+        if (declared_mime) |mime| {
+            const essence = data_uri_mod.mediaTypeEssence(mime) catch return error.UnsupportedInferenceMimeType;
+            if (!manifestAcceptsExecutorMime(manifest, essence)) return error.UnsupportedInferenceMimeType;
+        }
+        try validateInferenceExecutorInvocation(executor_contract, .{
+            .item_count = 1,
+            .encoded_media_bytes = encoded_media_bytes,
+            .media_parts_per_item = 1,
+            .has_audio = true,
+        });
+
+        stage.* = .load;
+        const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
+        if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
+            defer allocator.free(paths.encoder);
+            defer allocator.free(paths.decoder);
+            whisper.composite_handle = try self.model_manager.acquireCompositeRuntime(
+                model_path,
+                &.{ paths.encoder, paths.decoder },
+                .whisper,
+                control,
+            );
+            const assets = whisper.composite_handle.?.get();
+            whisper.encoder = assets.encoder.?.session;
+            whisper.decoder = assets.decoder.?.session;
+            whisper.tokenizer = assets.tokenizer();
+            whisper.decoder_config = assets.decoder_config;
+            stage.* = .prompt_cache;
+            whisper.prompt_cache = if (assets.prompt_cache) |*cache| cache else return error.WhisperPromptCacheUnavailable;
+        } else |_| {
+            whisper.model_handle = try self.model_manager.acquireFromDirWithControl(model_path, control);
+            const model = whisper.model_handle.?.get();
+            stage.* = .unsupported_model;
+            const whisper_config = session_factory.getWhisperConfig(model.session) orelse return error.UnsupportedTranscriberProvider;
+            whisper.encoder = model.session;
+            whisper.decoder = model.session;
+            whisper.tokenizer = model.getTokenizer();
+            whisper.decoder_config = .{
+                .max_length = @intCast(whisper_config.max_target_positions),
+                .decoder_start_token_id = whisper_config.decoder_start_token_id,
+                .vocab_size = whisper_config.vocab_size,
+                .eos_token_id = whisper_config.eos_token_id,
+                .pad_token_id = whisper_config.pad_token_id,
+            };
+            stage.* = .prompt_cache;
+            whisper.prompt_cache = if (model.whisper_prompt_cache) |*cache| cache else return error.WhisperPromptCacheUnavailable;
+        }
+    }
+
+    fn whisperRuntimeFailureResponse(ctx: *httpx.Context, stage: WhisperRuntimeStage, err: anyerror) !httpx.Response {
+        if (err == error.OutOfMemory) return err;
+        return switch (stage) {
+            .resolve => requestModelResolutionError(ctx, err),
+            .manifest, .load => modelLoadFailureResponse(ctx, err),
+            .contract => inferenceExecutorContractFailureResponse(ctx, err),
+            .unsupported_model => ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "model does not support transcription",
+            }),
+            .prompt_cache => ctx.status(500).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "WhisperPromptCacheUnavailable",
+            }),
+            .language => ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "language is not supported by this Whisper model",
+            }),
+        };
+    }
+
+    fn dictationStyleFromApi(style: ?api.DictationStyle) dictation_mod.Style {
+        const value = style orelse return .clean;
+        return std.meta.stringToEnum(dictation_mod.Style, @tagName(value)) orelse .clean;
+    }
+
+    fn dictationOptionsResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.DictionaryTooLarge => ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "dictionary exceeds the maximum number of entries",
+            }),
+            error.InvalidDictionaryEntry => ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "dictionary entries must be single non-empty lines of at most 128 bytes",
+            }),
+            error.ContextTooLarge => ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "context exceeds the maximum length",
+            }),
+            error.InstructionsTooLarge => ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "instructions exceed the maximum length",
+            }),
+            else => err,
+        };
+    }
+
+    const DictationStreamCtx = struct {
+        writer: *httpx.Context.StreamWriter,
+        payload: *std.Io.Writer.Allocating,
+        id: []const u8,
+        model: []const u8,
+        cleanup_model: ?[]const u8,
+        request_context: *const httpx.Context,
+        write_error: ?anyerror = null,
+
+        fn shouldContinue(raw: *anyopaque) bool {
+            const stream: *@This() = @ptrCast(@alignCast(raw));
+            return stream.write_error == null and !stream.request_context.isCancellationRequested();
+        }
+
+        fn onToken(raw: *anyopaque, token_text: []const u8) bool {
+            const stream: *@This() = @ptrCast(@alignCast(raw));
+            if (token_text.len > 0) {
+                writeDictationEvent(stream.writer, stream.payload, .{
+                    .type = "dictation.delta",
+                    .id = stream.id,
+                    .model = stream.model,
+                    .cleanup_model = stream.cleanup_model,
+                    .delta = token_text,
+                }) catch |err| {
+                    stream.write_error = err;
+                    return false;
+                };
+            }
+            return shouldContinue(raw);
+        }
+    };
+
+    fn writeDictationEvent(
+        writer: *httpx.Context.StreamWriter,
+        payload: *std.Io.Writer.Allocating,
+        event: api.DictationEvent,
+    ) !void {
+        payload.clearRetainingCapacity();
+        std.json.Stringify.value(event, .{}, &payload.writer) catch return error.OutOfMemory;
+        try writer.writeEvent(null, payload.written());
+    }
+
+    /// API projection of transcript segments; `words` backs every segment's spans.
+    const ApiSegments = struct {
+        segments: []api.DictationSegment,
+        words: []api.DictationWord,
+
+        fn deinit(self: *ApiSegments, allocator: std.mem.Allocator) void {
+            allocator.free(self.segments);
+            allocator.free(self.words);
+        }
+    };
+
+    fn dictationTranscriptSegments(allocator: std.mem.Allocator, transcript: *const long_transcription.Result) !ApiSegments {
+        var total_words: usize = 0;
+        for (transcript.segments) |segment| total_words += segment.words.len;
+        const words = try allocator.alloc(api.DictationWord, total_words);
+        errdefer allocator.free(words);
+        const segments = try allocator.alloc(api.DictationSegment, transcript.segments.len);
+        var cursor: usize = 0;
+        for (transcript.segments, 0..) |segment, i| {
+            const span = words[cursor .. cursor + segment.words.len];
+            for (segment.words, 0..) |word, j| span[j] = .{
+                .word = word.word,
+                .start_ms = @intCast(word.start_ms),
+                .end_ms = @intCast(word.end_ms),
+            };
+            cursor += segment.words.len;
+            segments[i] = .{
+                .text = segment.text,
+                .start_ms = @intCast(segment.start_ms),
+                .end_ms = @intCast(segment.end_ms),
+                .words = span,
+            };
+        }
+        return .{ .segments = segments, .words = words };
+    }
+
+    pub const max_transcript_prompt_bytes: usize = 1024;
+
+    /// Stable prefix-cache key for a cleanup rule set: same model and same
+    /// rendered system prompt share cached prefill blocks.
+    fn dictationPromptCacheKey(allocator: std.mem.Allocator, cleanup_model: []const u8, system_prompt: []const u8) ![]u8 {
+        var hasher = std.hash.Wyhash.init(0x6d1c7a7e);
+        hasher.update(cleanup_model);
+        hasher.update(&[_]u8{0});
+        hasher.update(system_prompt);
+        return std.fmt.allocPrint(allocator, "dictation-cleanup-{x:0>16}", .{hasher.final()});
+    }
+
+    /// The recognizer's preceding-context text: an explicit prompt, else the
+    /// dictionary entries joined. Caller frees the result.
+    fn resolveTranscriptPrompt(
+        allocator: std.mem.Allocator,
+        explicit: ?[]const u8,
+        dictionary: ?[]const []const u8,
+    ) !?[]u8 {
+        if (explicit) |prompt| {
+            const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
+            return if (trimmed.len == 0) null else try allocator.dupe(u8, trimmed);
+        }
+        const entries = dictionary orelse return null;
+        if (entries.len == 0) return null;
+        const joined = try std.mem.join(allocator, ", ", entries);
+        if (joined.len > max_transcript_prompt_bytes) {
+            defer allocator.free(joined);
+            return try allocator.dupe(u8, joined[0..max_transcript_prompt_bytes]);
+        }
+        return joined;
+    }
+
+    pub fn dictate(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        var parsed = if (uses_attachment_envelope) blk: {
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
+                .max_metadata_bytes = ctx.max_request_body_size,
+                .max_attachments = 1,
+                .max_attachment_bytes = requestMediaMaxBytes(self),
+                .max_total_attachment_bytes = requestMediaMaxBytes(self),
+            }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
+                .@"error" = attachmentEnvelopeErrorCode(err),
+                .message = attachmentEnvelopeErrorMessage(err),
+            });
+            break :blk std.json.parseFromSlice(api.DictateRequest, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "attachment envelope metadata must be a valid dictation request",
+                });
+        } else (try ctx.parseJson(api.DictateRequest)) orelse
+            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        defer parsed.deinit();
+        const body = parsed.value;
+        const model_name = std.mem.trim(u8, body.model, " \t\r\n");
+        if (model_name.len == 0) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
+        }
+        const cleanup_model_name: ?[]const u8 = if (body.cleanup_model) |raw| blk: {
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            break :blk if (trimmed.len == 0) null else trimmed;
+        } else null;
+        const dictation_options = dictation_mod.Options{
+            .style = dictationStyleFromApi(body.style),
+            .dictionary = body.dictionary orelse &.{},
+            .context = body.context,
+            .instructions = body.instructions,
+            .language = body.language,
+        };
+        dictation_mod.validate(dictation_options) catch |err| return dictationOptionsResponse(ctx, err);
+        if (body.max_tokens) |max_tokens| if (max_tokens < 1 or max_tokens > 8192) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "max_tokens must be between 1 and 8192" });
+        };
+        if (body.transcript_prompt) |prompt| if (prompt.len > max_transcript_prompt_bytes) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "transcript_prompt exceeds the maximum length" });
+        };
+        const transcript_prompt = try resolveTranscriptPrompt(ctx.allocator, body.transcript_prompt, body.dictionary);
+        defer if (transcript_prompt) |prompt| ctx.allocator.free(prompt);
+        var vad_config = vad_mod.Config{};
+        if (body.vad) |requested| applyVadTuning(&vad_config, requested) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid vad configuration" });
+        vad_config.validate() catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid vad configuration" });
+        const want_stream = body.stream orelse false;
+        const run_cleanup = cleanup_model_name != null and dictation_mod.needsCleanup(dictation_options);
+
+        const attachments: []const httpx.attachment_envelope.Attachment = if (attachment_envelope) |envelope|
+            envelope.attachments
+        else
+            &.{};
+        const audio_attachment_index = parseAttachmentUrl(body.audio) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid framed attachment reference" });
+        var framed_audio_mime: ?[]const u8 = null;
+        if (uses_attachment_envelope) {
+            if (attachments.len != 1 or audio_attachment_index == null or audio_attachment_index.? != 0)
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "dictation requires exactly one referenced attachment" });
+            framed_audio_mime = canonicalAudioMimeForBytes(attachments[0].mime_type, attachments[0].data) catch |err|
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = if (err == error.InvalidInferenceMedia)
+                        "audio attachment MIME type does not match its bytes"
+                    else
+                        "unsupported audio attachment MIME type",
+                });
+        } else if (audio_attachment_index != null) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "attachment references require the framed attachment transport" });
+        }
+
+        var media_shape: RequestMediaAdmissionShape = .{};
+        if (uses_attachment_envelope)
+            media_shape.addBorrowed(attachments[0].data.len, false)
+        else
+            media_shape.addInline(body.audio.len, false);
+        const media_admission = requestMediaAdmission(self, media_shape);
+        const resident_bytes = if (uses_attachment_envelope)
+            media_admission.byte_cap
+        else
+            std.math.add(usize, media_admission.byte_cap, media_admission.byte_cap) catch std.math.maxInt(usize);
+        const audio_admission = audioDecodeAdmission(self, resident_bytes);
+        var reserved_units = @max(self.estimateHttpRequestAdmissionUnits(ctx), audio_admission.units);
+        if (try self.acquireSlotUnits(ctx, reserved_units)) |resp| return resp;
+        defer self.releaseSlotUnits(reserved_units);
+        self.metrics.incRequest("dictate");
+        defer self.metrics.decActive();
+        if (try self.attachVadModel(ctx, &vad_config, body.vad)) |response| return response;
+
+        var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
+        var decoded_audio_owned: ?DecodedDataUri = null;
+        defer if (decoded_audio_owned) |decoded_audio| decoded_audio.deinit(ctx.allocator);
+        if (uses_attachment_envelope) {
+            media_budget.add(attachments[0].data.len) catch |err| return remoteContentErrorResponse(ctx, err);
+        } else {
+            decoded_audio_owned = decodeMediaDataWithBudget(ctx.allocator, body.audio, &media_budget) catch |err| switch (err) {
+                error.RemoteContentTooLarge => return remoteContentErrorResponse(ctx, err),
+                error.InvalidDataUri, error.InvalidBase64 => return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = if (data_uri_mod.hasScheme(body.audio)) "invalid audio data URI" else "invalid base64 audio data",
+                }),
+                error.OutOfMemory => return err,
+            };
+        }
+        const decoded_audio_data = if (uses_attachment_envelope) attachments[0].data else decoded_audio_owned.?.data;
+        const decoded_audio_mime: ?[]const u8 = if (uses_attachment_envelope) framed_audio_mime else decoded_audio_owned.?.mime_type;
+        var decoded = audio_mod.decodeBounded(
+            ctx.allocator,
+            decoded_audio_data,
+            .{ .mime_hint = decoded_audio_mime },
+            audio_admission.max_decode_working_bytes,
+        ) catch |err| switch (err) {
+            error.AudioTooLarge => return audioTooLargeResponse(ctx),
+            error.OutOfMemory => return err,
+            else => return unsupportedAudioResponse(ctx, "unsupported or corrupt audio input"),
+        };
+        defer decoded.deinit();
+        // Whisper consumes 16 kHz mono; resample once rather than per window.
+        const pcm = audio_mod.copyOrResample(ctx.allocator, decoded.samples, decoded.sample_rate, audio_mod.WHISPER_SAMPLE_RATE) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return unsupportedAudioResponse(ctx, "unsupported audio input"),
+        };
+        defer ctx.allocator.free(pcm);
+
+        var transcript: long_transcription.Result = blk: {
+            var whisper = WhisperRuntime{ .node = self, .allocator = ctx.allocator };
+            defer whisper.deinit();
+            var stage: WhisperRuntimeStage = .resolve;
+            self.acquireWhisperRuntime(
+                &whisper,
+                ctx.io,
+                model_name,
+                decoded_audio_mime,
+                media_budget.used_bytes,
+                execution_control,
+                &stage,
+            ) catch |err| return whisperRuntimeFailureResponse(ctx, stage, err);
+            var pipeline = whisper.pipeline(body.language, audio_admission.max_decode_working_bytes, execution_control, true, audioContextFromRequest(body.audio_context, .full)) catch |err|
+                return whisperRuntimeFailureResponse(ctx, .language, err);
+            break :blk long_transcription.transcribeLong(
+                ctx.allocator,
+                &pipeline,
+                pcm,
+                audio_mod.WHISPER_SAMPLE_RATE,
+                .{ .initial_prompt = transcript_prompt, .vad = vad_config },
+            ) catch |err| switch (err) {
+                error.UnsupportedAudioFormat => return unsupportedAudioResponse(ctx, "unsupported audio input"),
+                error.OutOfMemory => return err,
+                error.Timeout, error.Cancelled, error.Canceled => return inferenceFailureResponse(ctx, err),
+                else => if (isTransientInferenceCapacityError(err))
+                    return modelResourceBusyResponse(ctx)
+                else
+                    return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+            };
+        };
+        defer transcript.deinit();
+        if (serverGenerateTimingEnabled()) {
+            const t = transcript.timing;
+            std.log.info("dictate timing model={s} audio_ms={d} mel_ms={d} encoder_ms={d} prefill_ms={d} decode_ms={d} decode_steps={d} kv_cached={}", .{
+                model_name,
+                transcript.duration_ms,
+                t.mel_ns / std.time.ns_per_ms,
+                t.encoder_ns / std.time.ns_per_ms,
+                t.prefill_ns / std.time.ns_per_ms,
+                t.decode_ns / std.time.ns_per_ms,
+                t.decode_steps,
+                t.kv_cached,
+            });
+        }
+
+        const dictation_id = try allocDictationId(ctx.allocator);
+        defer ctx.allocator.free(dictation_id);
+        const created = completionCreatedTimestamp();
+        var api_segments = try dictationTranscriptSegments(ctx.allocator, &transcript);
+        defer api_segments.deinit(ctx.allocator);
+        const api_transcript = api.DictationTranscript{
+            .text = transcript.text,
+            .language = transcript.language,
+            .duration_ms = @intCast(transcript.duration_ms),
+            .segments = api_segments.segments,
+        };
+
+        if (!run_cleanup) {
+            const usage = tokenUsage(0, estimateTextTokens(transcript.text));
+            if (want_stream) {
+                return self.streamDictationWithoutCleanup(ctx, dictation_id, model_name, api_transcript, usage);
+            }
+            return ctx.json(api.DictateResponse{
+                .object = "dictation",
+                .id = dictation_id,
+                .created = created,
+                .model = model_name,
+                .cleanup_model = null,
+                .transcript = api_transcript,
+                .text = transcript.text,
+                .usage = usage,
+            });
+        }
+
+        const cleanup_model = cleanup_model_name.?;
+        const system_prompt = try dictation_mod.buildSystemPrompt(ctx.allocator, dictation_options);
+        defer ctx.allocator.free(system_prompt);
+        // The rule set is identical across requests with the same options, so
+        // its prefill is served from the prefix cache when the node has one.
+        const cleanup_cache_key = try dictationPromptCacheKey(ctx.allocator, cleanup_model, system_prompt);
+        defer ctx.allocator.free(cleanup_cache_key);
+        const user_prompt = try dictation_mod.buildUserPrompt(ctx.allocator, transcript.text);
+        defer ctx.allocator.free(user_prompt);
+        const messages = [_]generation.Message{
+            .{ .role = "system", .content = system_prompt },
+            .{ .role = "user", .content = user_prompt },
+        };
+        const max_tokens: i32 = if (body.max_tokens) |requested| @intCast(requested) else dictation_mod.suggestedMaxTokens(transcript.text.len);
+        const preflight = try directGeneratePreflightForMessages(&messages);
+        const generation_units = estimateGenerateAdmissionUnitsFromShape(preflight.text_bytes, preflight.media_count, max_tokens);
+        const required_units = @max(reserved_units, generation_units);
+        if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
+        reserved_units = required_units;
+        self.prepareDirectGenerateMessages(&messages, preflight, preflight.decoded_media_bytes, &reserved_units) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        const cleanup_model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, cleanup_model, "generators") catch |err|
+            return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(cleanup_model_path);
+        if (try rejectDisallowedModel(self, ctx, cleanup_model_path)) |response| return response;
+
+        if (want_stream) {
+            var writer = ctx.streamResponse(200) catch |err| {
+                return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = internalErrorMessage("STREAM_INIT_FAILED", err) });
+            };
+            var payload: std.Io.Writer.Allocating = .init(ctx.allocator);
+            defer payload.deinit();
+            writeDictationEvent(&writer, &payload, .{
+                .type = "dictation.transcript",
+                .id = dictation_id,
+                .model = model_name,
+                .cleanup_model = cleanup_model,
+                .transcript = api_transcript,
+            }) catch |err| {
+                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                writer.close() catch {};
+                return ctx.response.build();
+            };
+            var stream_ctx = DictationStreamCtx{
+                .writer = &writer,
+                .payload = &payload,
+                .id = dictation_id,
+                .model = model_name,
+                .cleanup_model = cleanup_model,
+                .request_context = ctx,
+            };
+            const generated = self.generateMessagesDirectPrepared(
+                ctx.allocator,
+                cleanup_model_path,
+                &messages,
+                max_tokens,
+                preflight,
+                reserved_units,
+                null,
+                false,
+                null,
+                false,
+                null,
+                .{ .ctx = @ptrCast(&stream_ctx), .on_token = DictationStreamCtx.onToken, .continue_fn = DictationStreamCtx.shouldContinue },
+                cleanup_cache_key,
+                execution_control,
+            ) catch |err| {
+                writeGenerationStreamError(&writer, err);
+                writer.close() catch {};
+                return ctx.response.build();
+            };
+            defer ctx.allocator.free(generated.text);
+            if (stream_ctx.write_error) |err| {
+                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                writer.close() catch {};
+                return ctx.response.build();
+            }
+            const cleaned = try dictation_mod.normalizeOutput(ctx.allocator, generated.text);
+            defer ctx.allocator.free(cleaned);
+            writeDictationEvent(&writer, &payload, .{
+                .type = "dictation.completed",
+                .id = dictation_id,
+                .model = model_name,
+                .cleanup_model = cleanup_model,
+                .text = cleaned,
+                .usage = tokenUsageWithCachedPrompt(generated.prompt_tokens, generated.completion_tokens, generated.cached_prompt_tokens),
+            }) catch |err| {
+                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                writer.close() catch {};
+                return ctx.response.build();
+            };
+            writer.writeEvent(null, "[DONE]") catch {};
+            writer.close() catch {};
+            return ctx.response.build();
+        }
+
+        const generated = self.generateMessagesDirectPrepared(
+            ctx.allocator,
+            cleanup_model_path,
+            &messages,
+            max_tokens,
+            preflight,
+            reserved_units,
+            null,
+            false,
+            null,
+            false,
+            null,
+            null,
+            cleanup_cache_key,
+            execution_control,
+        ) catch |err| return inferenceFailureResponse(ctx, err);
+        defer ctx.allocator.free(generated.text);
+        const cleaned = try dictation_mod.normalizeOutput(ctx.allocator, generated.text);
+        defer ctx.allocator.free(cleaned);
+        return ctx.json(api.DictateResponse{
+            .object = "dictation",
+            .id = dictation_id,
+            .created = created,
+            .model = model_name,
+            .cleanup_model = cleanup_model,
+            .transcript = api_transcript,
+            .text = cleaned,
+            .usage = tokenUsageWithCachedPrompt(generated.prompt_tokens, generated.completion_tokens, generated.cached_prompt_tokens),
+        });
+    }
+
+    fn streamDictationWithoutCleanup(
+        _: *Node,
+        ctx: *httpx.Context,
+        dictation_id: []const u8,
+        model_name: []const u8,
+        transcript: api.DictationTranscript,
+        usage: api.GenerateUsage,
+    ) !httpx.Response {
+        var writer = ctx.streamResponse(200) catch |err| {
+            return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = internalErrorMessage("STREAM_INIT_FAILED", err) });
+        };
+        var payload: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer payload.deinit();
+        const events = [_]api.DictationEvent{
+            .{ .type = "dictation.transcript", .id = dictation_id, .model = model_name, .transcript = transcript },
+            .{ .type = "dictation.completed", .id = dictation_id, .model = model_name, .text = transcript.text, .usage = usage },
+        };
+        for (events) |event| {
+            writeDictationEvent(&writer, &payload, event) catch |err| {
+                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                writer.close() catch {};
+                return ctx.response.build();
+            };
+        }
+        writer.writeEvent(null, "[DONE]") catch {};
+        writer.close() catch {};
+        return ctx.response.build();
+    }
+
+    /// Tuning fields of a VAD request applied onto a config. The neural model
+    /// is attached separately by `attachVadModel` because it resolves a path.
+    fn applyVadTuning(config: *vad_mod.Config, vad_config: api.VadConfig) !void {
+        if (vad_config.threshold) |threshold| config.threshold = threshold;
+        if (vad_config.silero_threshold) |threshold| config.silero_threshold = threshold;
+        if (vad_config.min_speech_ms) |value| config.min_speech_ms = try boundedU32(value);
+        if (vad_config.min_silence_ms) |value| config.min_silence_ms = try boundedU32(value);
+        if (vad_config.speech_pad_ms) |value| config.speech_pad_ms = try boundedU32(value);
+    }
+
+    const SileroModelStage = enum { resolve, load };
+
+    /// Resolve `model` to loaded Silero weights, loading and caching them on
+    /// first use. `stage` says which step failed so the caller can map it.
+    fn sileroWeightsForModel(
+        self: *Node,
+        ctx: *httpx.Context,
+        model_name: []const u8,
+        stage: *SileroModelStage,
+    ) !*const silero_vad_mod.Weights {
+        stage.* = .resolve;
+        const model_path = try self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "classifiers");
+        defer ctx.allocator.free(model_path);
+        spinLock(&self.silero_weights_lock);
+        defer self.silero_weights_lock.unlock();
+        if (self.silero_weights.get(model_path)) |weights| return weights;
+        stage.* = .load;
+        const candidates = [_][]const u8{ "onnx/model.onnx", "model.onnx", "silero_vad.onnx" };
+        var loaded: ?silero_vad_mod.Weights = null;
+        for (candidates) |candidate| {
+            const onnx_path = try std.fs.path.join(ctx.allocator, &.{ model_path, candidate });
+            defer ctx.allocator.free(onnx_path);
+            loaded = silero_vad_mod.Weights.load(self.allocator, onnx_path) catch continue;
+            break;
+        }
+        var weights = loaded orelse return error.InvalidSileroModel;
+        errdefer weights.deinit();
+        const owned = try self.allocator.create(silero_vad_mod.Weights);
+        errdefer self.allocator.destroy(owned);
+        owned.* = weights;
+        const key = try self.allocator.dupe(u8, model_path);
+        errdefer self.allocator.free(key);
+        try self.silero_weights.put(self.allocator, key, owned);
+        return owned;
+    }
+
+    fn sileroModelFailureResponse(ctx: *httpx.Context, stage: SileroModelStage, err: anyerror) !httpx.Response {
+        if (err == error.OutOfMemory) return err;
+        return switch (stage) {
+            .resolve => requestModelResolutionError(ctx, err),
+            .load => ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "vad.model is not a Silero VAD ONNX export (expected onnx/model.onnx with the 16 kHz branch)",
+            }),
+        };
+    }
+
+    /// Attach the neural classifier named by `vad.model`, if any. Returns a
+    /// response on failure.
+    fn attachVadModel(self: *Node, ctx: *httpx.Context, config: *vad_mod.Config, vad_config: ?api.VadConfig) !?httpx.Response {
+        const requested = vad_config orelse return null;
+        const raw = requested.model orelse return null;
+        const model_name = std.mem.trim(u8, raw, " \t\r\n");
+        if (model_name.len == 0) return null;
+        var stage: SileroModelStage = .resolve;
+        config.silero = self.sileroWeightsForModel(ctx, model_name, &stage) catch |err|
+            return try sileroModelFailureResponse(ctx, stage, err);
+        return null;
+    }
+
+    fn streamingConfigFromRequest(body: api.TranscriptionSessionRequest) !streaming_transcription.Config {
+        var config = streaming_transcription.Config{};
+        if (body.vad) |vad_config| try applyVadTuning(&config.vad, vad_config);
+        if (body.partial_interval_ms) |value| config.partial_interval_ms = try boundedU32(value);
+        if (body.max_segment_ms) |value| config.max_segment_ms = try boundedU32(value);
+        if (body.emit_partials) |value| config.emit_partials = value;
+        config.audio_context = audioContextFromRequest(body.audio_context, .dynamic);
+        try config.validate();
+        return config;
+    }
+
+    fn audioContextFromRequest(value: ?api.AudioContext, default: transcription_mod.AudioContext) transcription_mod.AudioContext {
+        const requested = value orelse return default;
+        return switch (requested) {
+            .full => .full,
+            .dynamic => .dynamic,
+        };
+    }
+
+    fn boundedU32(value: i64) !u32 {
+        if (value < 0 or value > std.math.maxInt(u32)) return error.InvalidStreamingConfig;
+        return @intCast(value);
+    }
+
+    fn transcriptionSessionResponse(ctx: *httpx.Context, snapshot: *const transcription_sessions.Snapshot) !httpx.Response {
+        return ctx.json(api.TranscriptionSession{
+            .object = "transcription.session",
+            .id = &snapshot.id,
+            .model = snapshot.model,
+            .language = snapshot.language,
+            .created = snapshot.created,
+            .expires_at = snapshot.expires_at,
+            .buffered_ms = @intCast(snapshot.stats.buffered_ms),
+            .total_ms = @intCast(snapshot.stats.total_ms),
+            .finals = @intCast(snapshot.stats.finals),
+            .partials = @intCast(snapshot.stats.partials),
+        });
+    }
+
+    fn transcriptionSessionCapacity(ctx: *httpx.Context) !httpx.Response {
+        return ctx.status(429).json(.{
+            .@"error" = "SESSION_CAPACITY",
+            .message = "node-wide session audio buffer is full; commit or close idle sessions, or wait for endpoints",
+            .retryable = true,
+        });
+    }
+
+    fn transcriptionSessionNotFound(ctx: *httpx.Context) !httpx.Response {
+        return ctx.status(404).json(.{ .@"error" = "SESSION_NOT_FOUND", .message = "transcription session not found or expired" });
+    }
+
+    fn transcriptionSessionBusy(ctx: *httpx.Context) !httpx.Response {
+        return ctx.status(409).json(.{
+            .@"error" = "SESSION_BUSY",
+            .message = "transcription session is processing another request; appends must be sequential",
+            .retryable = true,
+        });
+    }
+
+    pub fn createTranscriptionSession(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        var parsed = (try ctx.parseJson(api.TranscriptionSessionRequest)) orelse
+            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        defer parsed.deinit();
+        const body = parsed.value;
+        const model_name = std.mem.trim(u8, body.model, " \t\r\n");
+        if (model_name.len == 0) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "model is required" });
+        }
+        const streaming_config = streamingConfigFromRequest(body) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid session configuration: max_segment_ms must be at most 30000, min_silence_ms and partial_interval_ms must be positive, threshold must be within [0, 1]" });
+        const ttl_seconds_raw = body.ttl_seconds orelse transcription_sessions.default_ttl_seconds;
+        if (ttl_seconds_raw < 1 or ttl_seconds_raw > transcription_sessions.max_ttl_seconds) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "ttl_seconds must be between 1 and 3600" });
+        }
+        const ttl_seconds: u32 = @intCast(ttl_seconds_raw);
+        dictation_mod.validate(.{ .dictionary = body.dictionary orelse &.{} }) catch |err| return dictationOptionsResponse(ctx, err);
+        if (body.transcript_prompt) |prompt| if (prompt.len > max_transcript_prompt_bytes) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "transcript_prompt exceeds the maximum length" });
+        };
+        const transcript_prompt = try resolveTranscriptPrompt(ctx.allocator, body.transcript_prompt, body.dictionary);
+        defer if (transcript_prompt) |prompt| ctx.allocator.free(prompt);
+        var streaming_with_prompt = streaming_config;
+        streaming_with_prompt.initial_prompt = transcript_prompt;
+
+        const admission_units = self.estimateHttpRequestAdmissionUnits(ctx);
+        if (try self.acquireSlotUnits(ctx, admission_units)) |resp| return resp;
+        defer self.releaseSlotUnits(admission_units);
+        self.metrics.incRequest("transcription.session.create");
+        if (try self.attachVadModel(ctx, &streaming_with_prompt.vad, body.vad)) |response| return response;
+        defer self.metrics.decActive();
+
+        // Resolve and load the transcriber now so a bad model or language
+        // fails at create time and the first append finds a warm model.
+        {
+            var whisper = WhisperRuntime{ .node = self, .allocator = ctx.allocator };
+            defer whisper.deinit();
+            var stage: WhisperRuntimeStage = .resolve;
+            self.acquireWhisperRuntime(&whisper, ctx.io, model_name, null, 0, execution_control, &stage) catch |err|
+                return whisperRuntimeFailureResponse(ctx, stage, err);
+            whisper.validateLanguage(body.language) catch |err| return whisperRuntimeFailureResponse(ctx, .language, err);
+        }
+
+        var random: [transcription_sessions.id_len / 2]u8 = undefined;
+        fillRandomBytes(&random) catch return ctx.status(500).json(.{ .@"error" = "INTERNAL_ERROR", .message = "entropy unavailable" });
+        var snapshot = self.transcription_sessions.create(ctx.allocator, .{
+            .id = transcription_sessions.formatId(random),
+            .model = model_name,
+            .language = body.language,
+            .streaming = streaming_with_prompt,
+            .ttl_seconds = ttl_seconds,
+            .now_wall_s = completionCreatedTimestamp(),
+            .now_mono_ns = platform.time.monotonicNs(),
+            .io = ctx.io,
+        }) catch |err| switch (err) {
+            error.TooManySessions => return ctx.status(429).json(.{
+                .@"error" = "SESSION_LIMIT",
+                .message = "too many open transcription sessions; close or let idle sessions expire",
+                .retryable = true,
+            }),
+            error.OutOfMemory => return err,
+            else => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+        };
+        defer snapshot.deinit(ctx.allocator);
+        return transcriptionSessionResponse(ctx, &snapshot);
+    }
+
+    pub fn getTranscriptionSession(self: *Node, ctx: *httpx.Context, session_id: []const u8) !httpx.Response {
+        if (!transcription_sessions.isValidId(session_id)) return transcriptionSessionNotFound(ctx);
+        _ = self.transcription_sessions.sweepExpired(platform.time.monotonicNs(), ctx.io);
+        var snapshot = (try self.transcription_sessions.snapshot(ctx.allocator, session_id)) orelse
+            return transcriptionSessionNotFound(ctx);
+        defer snapshot.deinit(ctx.allocator);
+        return transcriptionSessionResponse(ctx, &snapshot);
+    }
+
+    pub fn deleteTranscriptionSession(self: *Node, ctx: *httpx.Context, session_id: []const u8) !httpx.Response {
+        if (!transcription_sessions.isValidId(session_id)) return transcriptionSessionNotFound(ctx);
+        self.transcription_sessions.remove(session_id, ctx.io) catch |err| switch (err) {
+            error.SessionNotFound => return transcriptionSessionNotFound(ctx),
+            error.SessionBusy => return transcriptionSessionBusy(ctx),
+        };
+        return ctx.json(api.TranscriptionSessionDeleted{
+            .object = "transcription.session.deleted",
+            .id = session_id,
+            .deleted = true,
+        });
+    }
+
+    fn rawPcmToSamples(allocator: std.mem.Allocator, bytes: []const u8, format: api.TranscriptionAudioFormat) ![]f32 {
+        switch (format) {
+            .pcm16 => {
+                if (bytes.len == 0 or bytes.len % 2 != 0) return error.UnsupportedAudioFormat;
+                const out = try allocator.alloc(f32, bytes.len / 2);
+                for (out, 0..) |*sample, i| {
+                    const value = std.mem.readInt(i16, bytes[i * 2 ..][0..2], .little);
+                    sample.* = @as(f32, @floatFromInt(value)) / 32768.0;
+                }
+                return out;
+            },
+            .pcm_f32 => {
+                if (bytes.len == 0 or bytes.len % 4 != 0) return error.UnsupportedAudioFormat;
+                const out = try allocator.alloc(f32, bytes.len / 4);
+                errdefer allocator.free(out);
+                for (out, 0..) |*sample, i| {
+                    const bits = std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little);
+                    const value: f32 = @bitCast(bits);
+                    if (!std.math.isFinite(value)) return error.UnsupportedAudioFormat;
+                    sample.* = std.math.clamp(value, -1.0, 1.0);
+                }
+                return out;
+            },
+            .auto => return error.UnsupportedAudioFormat,
+        }
+    }
+
+    pub fn appendTranscriptionAudio(self: *Node, ctx: *httpx.Context, session_id: []const u8) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        if (!transcription_sessions.isValidId(session_id)) return transcriptionSessionNotFound(ctx);
+        const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
+        var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
+        defer if (attachment_envelope) |*envelope| envelope.deinit();
+        var parsed = if (uses_attachment_envelope) blk: {
+            attachment_envelope = parseRequestAttachmentEnvelope(ctx, .{
+                .max_metadata_bytes = ctx.max_request_body_size,
+                .max_attachments = 1,
+                .max_attachment_bytes = requestMediaMaxBytes(self),
+                .max_total_attachment_bytes = requestMediaMaxBytes(self),
+            }) catch |err| return ctx.status(attachmentEnvelopeErrorStatus(err)).json(.{
+                .@"error" = attachmentEnvelopeErrorCode(err),
+                .message = attachmentEnvelopeErrorMessage(err),
+            });
+            break :blk std.json.parseFromSlice(api.TranscriptionAudioAppend, ctx.allocator, attachment_envelope.?.metadata, .{}) catch
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "attachment envelope metadata must be a valid append request",
+                });
+        } else (try ctx.parseJson(api.TranscriptionAudioAppend)) orelse
+            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        defer parsed.deinit();
+        const body = parsed.value;
+        const commit = body.commit orelse false;
+        const format = body.format orelse .auto;
+        const audio_b64: ?[]const u8 = if (body.audio) |raw| (if (raw.len == 0) null else raw) else null;
+        if (audio_b64 == null and !commit) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "audio is required unless commit is true" });
+        }
+        const raw_sample_rate_i64 = body.sample_rate orelse audio_mod.WHISPER_SAMPLE_RATE;
+        if (raw_sample_rate_i64 < 8000 or raw_sample_rate_i64 > 192_000) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "sample_rate must be between 8000 and 192000" });
+        }
+        const raw_sample_rate: u32 = @intCast(raw_sample_rate_i64);
+        const attachments: []const httpx.attachment_envelope.Attachment = if (attachment_envelope) |envelope|
+            envelope.attachments
+        else
+            &.{};
+        const audio_attachment_index: ?usize = if (audio_b64) |reference| (parseAttachmentUrl(reference) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid framed attachment reference" })) else null;
+        var framed_audio_mime: ?[]const u8 = null;
+        if (uses_attachment_envelope) {
+            if (attachments.len != 1 or audio_attachment_index == null or audio_attachment_index.? != 0)
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "framed appends require exactly one referenced attachment" });
+            if (format == .auto) {
+                framed_audio_mime = canonicalAudioMimeForBytes(attachments[0].mime_type, attachments[0].data) catch |err|
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = if (err == error.InvalidInferenceMedia)
+                            "audio attachment MIME type does not match its bytes"
+                        else
+                            "unsupported audio attachment MIME type; declare format pcm16 or pcm_f32 for raw samples",
+                    });
+            }
+        } else if (audio_attachment_index != null) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "attachment references require the framed attachment transport" });
+        }
+        // Session ownership is checked before any media work so an unknown
+        // id never pays for a decode.
+        if (!self.transcription_sessions.contains(session_id)) return transcriptionSessionNotFound(ctx);
+
+        var media_shape: RequestMediaAdmissionShape = .{};
+        if (uses_attachment_envelope)
+            media_shape.addBorrowed(attachments[0].data.len, false)
+        else
+            media_shape.addInline(if (audio_b64) |a| a.len else 0, false);
+        const media_admission = requestMediaAdmission(self, media_shape);
+        const resident_bytes = if (uses_attachment_envelope)
+            media_admission.byte_cap
+        else
+            std.math.add(usize, media_admission.byte_cap, media_admission.byte_cap) catch std.math.maxInt(usize);
+        const audio_admission = audioDecodeAdmission(self, resident_bytes);
+        const reserved_units = @max(self.estimateHttpRequestAdmissionUnits(ctx), audio_admission.units);
+        if (try self.acquireSlotUnits(ctx, reserved_units)) |resp| return resp;
+        defer self.releaseSlotUnits(reserved_units);
+        self.metrics.incRequest("transcription.session.append");
+        defer self.metrics.decActive();
+
+        var samples: ?[]f32 = null;
+        defer if (samples) |owned| ctx.allocator.free(owned);
+        var sample_rate: u32 = audio_mod.WHISPER_SAMPLE_RATE;
+        if (audio_b64 != null) {
+            var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
+            var decoded_audio_owned: ?DecodedDataUri = null;
+            defer if (decoded_audio_owned) |decoded_audio| decoded_audio.deinit(ctx.allocator);
+            if (uses_attachment_envelope) {
+                media_budget.add(attachments[0].data.len) catch |err| return remoteContentErrorResponse(ctx, err);
+            } else {
+                decoded_audio_owned = decodeMediaDataWithBudget(ctx.allocator, audio_b64.?, &media_budget) catch |err| switch (err) {
+                    error.RemoteContentTooLarge => return remoteContentErrorResponse(ctx, err),
+                    error.InvalidDataUri, error.InvalidBase64 => return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "invalid base64 audio data",
+                    }),
+                    error.OutOfMemory => return err,
+                };
+            }
+            const audio_bytes = if (uses_attachment_envelope) attachments[0].data else decoded_audio_owned.?.data;
+            const audio_mime: ?[]const u8 = if (uses_attachment_envelope) framed_audio_mime else decoded_audio_owned.?.mime_type;
+            if (format == .auto) {
+                const decoded = audio_mod.decodeBounded(
+                    ctx.allocator,
+                    audio_bytes,
+                    .{ .mime_hint = audio_mime },
+                    audio_admission.max_decode_working_bytes,
+                ) catch |err| switch (err) {
+                    error.AudioTooLarge => return audioTooLargeResponse(ctx),
+                    error.OutOfMemory => return err,
+                    else => return unsupportedAudioResponse(ctx, "unsupported or corrupt audio chunk; use format pcm16 for raw samples"),
+                };
+                samples = decoded.samples;
+                sample_rate = decoded.sample_rate;
+            } else {
+                samples = rawPcmToSamples(ctx.allocator, audio_bytes, format) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return unsupportedAudioResponse(ctx, "raw PCM chunk length does not match the declared format"),
+                };
+                sample_rate = raw_sample_rate;
+            }
+        }
+
+        const acquired_at = platform.time.monotonicNs();
+        _ = self.transcription_sessions.sweepExpired(acquired_at, ctx.io);
+        const entry = self.transcription_sessions.acquire(session_id, acquired_at, ctx.io) catch |err| switch (err) {
+            error.SessionNotFound, error.SessionExpired => return transcriptionSessionNotFound(ctx),
+            error.SessionBusy => return transcriptionSessionBusy(ctx),
+        };
+        defer self.transcription_sessions.release(entry, platform.time.monotonicNs());
+
+        if (samples) |chunk| {
+            const chunk_ms: u64 = (@as(u64, chunk.len) * 1000) / @max(sample_rate, 1);
+            if (!self.transcription_sessions.canBuffer(entry, chunk_ms)) return transcriptionSessionCapacity(ctx);
+            entry.session.append(chunk, sample_rate) catch |err| switch (err) {
+                error.SessionBufferFull => return ctx.status(413).json(.{
+                    .@"error" = "SESSION_BUFFER_FULL",
+                    .message = "session audio buffer is full; send commit: true or wait for an endpoint before appending more",
+                }),
+                error.UnsupportedAudioFormat => return unsupportedAudioResponse(ctx, "unsupported audio chunk"),
+                error.OutOfMemory => return err,
+            };
+        }
+
+        var whisper = WhisperRuntime{ .node = self, .allocator = ctx.allocator };
+        defer whisper.deinit();
+        var stage: WhisperRuntimeStage = .resolve;
+        self.acquireWhisperRuntime(&whisper, ctx.io, entry.model, null, 0, execution_control, &stage) catch |err|
+            return whisperRuntimeFailureResponse(ctx, stage, err);
+        var pipeline = whisper.pipeline(entry.language, audio_admission.max_decode_working_bytes, execution_control, true, entry.session.config.audio_context) catch |err|
+            return whisperRuntimeFailureResponse(ctx, .language, err);
+
+        var events = std.ArrayListUnmanaged(streaming_transcription.Event).empty;
+        defer {
+            for (events.items) |*event| event.deinit(ctx.allocator);
+            events.deinit(ctx.allocator);
+        }
+        entry.session.process(&pipeline, &events, commit) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.Timeout, error.Cancelled, error.Canceled => return inferenceFailureResponse(ctx, err),
+            else => if (isTransientInferenceCapacityError(err))
+                return modelResourceBusyResponse(ctx)
+            else
+                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+        };
+
+        var api_events = try transcriptionEventsToApi(ctx.allocator, events.items);
+        defer api_events.deinit(ctx.allocator);
+        const stats = entry.session.stats();
+        const response = try ctx.json(api.TranscriptionEventList{
+            .object = "list",
+            .session_id = session_id,
+            .model = entry.model,
+            .data = api_events.events,
+            .buffered_ms = @intCast(stats.buffered_ms),
+            .total_ms = @intCast(stats.total_ms),
+        });
+        // The response is serialized; hand the events to any event stream on
+        // this session. publish takes ownership, so the deferred free skips them.
+        self.publishSessionEvents(ctx, entry, &events);
+        return response;
+    }
+
+    /// Move produced events onto the session's event stream queue.
+    fn publishSessionEvents(self: *Node, ctx: *httpx.Context, entry: *transcription_sessions.Entry, events: *std.ArrayListUnmanaged(streaming_transcription.Event)) void {
+        if (events.items.len == 0) return;
+        self.transcription_sessions.publish(entry, events.items, ctx.io) catch {
+            for (events.items) |*event| event.deinit(ctx.allocator);
+        };
+        events.clearRetainingCapacity();
+    }
+
+    /// Flat API projection of session events; `words` backs every event's spans.
+    const ApiEvents = struct {
+        events: []api.TranscriptionEvent,
+        words: []api.DictationWord,
+
+        fn deinit(self: *ApiEvents, allocator: std.mem.Allocator) void {
+            allocator.free(self.events);
+            allocator.free(self.words);
+        }
+    };
+
+    fn transcriptionEventsToApi(allocator: std.mem.Allocator, events: []const streaming_transcription.Event) !ApiEvents {
+        var total_words: usize = 0;
+        for (events) |event| total_words += event.words.len;
+        const words = try allocator.alloc(api.DictationWord, total_words);
+        errdefer allocator.free(words);
+        const out = try allocator.alloc(api.TranscriptionEvent, events.len);
+        var cursor: usize = 0;
+        for (events, 0..) |event, i| {
+            const span = words[cursor .. cursor + event.words.len];
+            for (event.words, 0..) |word, j| span[j] = .{
+                .word = word.word,
+                .start_ms = @intCast(word.start_ms),
+                .end_ms = @intCast(word.end_ms),
+            };
+            cursor += event.words.len;
+            out[i] = .{
+                .object = "transcription.event",
+                .type = switch (event.kind) {
+                    .partial => "partial",
+                    .final => "final",
+                },
+                .sequence = @intCast(event.sequence),
+                .text = event.text,
+                .stable_text = event.stable_text,
+                .start_ms = @intCast(event.start_ms),
+                .end_ms = @intCast(event.end_ms),
+                .language = event.language,
+                .words = span,
+            };
+        }
+        return .{ .events = out, .words = words };
+    }
+
+    const session_stream_ping_ms: u64 = 15_000;
+    /// Raw audio consumed from a streaming upload before each decode pass:
+    /// 500 ms at the declared rate.
+    /// Audio accumulated before the session runs endpointing on a streamed
+    /// upload. Bytes below this wait for the next read, so it bounds how
+    /// long the tail of an utterance sits unprocessed while the client keeps
+    /// streaming; a client that stops sending must commit or close.
+    const session_stream_chunk_ms: u64 = 100;
+    const session_stream_read_buffer: usize = 16 * 1024;
+
+    fn writeSessionStreamMessage(
+        writer: *httpx.Context.StreamWriter,
+        payload: *std.Io.Writer.Allocating,
+        message: api.TranscriptionStreamMessage,
+    ) !void {
+        payload.clearRetainingCapacity();
+        std.json.Stringify.value(message, .{}, &payload.writer) catch return error.OutOfMemory;
+        try writer.writeEvent(null, payload.written());
+    }
+
+    fn writeSessionStreamError(
+        writer: *httpx.Context.StreamWriter,
+        payload: *std.Io.Writer.Allocating,
+        session_id: []const u8,
+        code: []const u8,
+        message: []const u8,
+    ) void {
+        writeSessionStreamMessage(writer, payload, .{
+            .type = "error",
+            .session_id = session_id,
+            .@"error" = code,
+            .message = message,
+        }) catch {};
+    }
+
+    fn writeSessionEvents(
+        allocator: std.mem.Allocator,
+        writer: *httpx.Context.StreamWriter,
+        payload: *std.Io.Writer.Allocating,
+        session_id: []const u8,
+        events: []const streaming_transcription.Event,
+    ) !void {
+        var projected = try transcriptionEventsToApi(allocator, events);
+        defer projected.deinit(allocator);
+        for (projected.events) |event| {
+            try writeSessionStreamMessage(writer, payload, .{
+                .type = "transcription.event",
+                .session_id = session_id,
+                .event = event,
+            });
+        }
+    }
+
+    pub fn streamTranscriptionSessionEvents(self: *Node, ctx: *httpx.Context, session_id: []const u8) !httpx.Response {
+        if (!transcription_sessions.isValidId(session_id)) return transcriptionSessionNotFound(ctx);
+        const entry = self.transcription_sessions.watch(session_id) catch return transcriptionSessionNotFound(ctx);
+        defer self.transcription_sessions.unwatch(entry);
+        self.metrics.incRequest("transcription.session.events");
+        defer self.metrics.decActive();
+
+        var writer = ctx.streamResponse(200) catch |err| {
+            return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = internalErrorMessage("STREAM_INIT_FAILED", err) });
+        };
+        var payload: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer payload.deinit();
+        var batch = std.ArrayListUnmanaged(streaming_transcription.Event).empty;
+        defer {
+            for (batch.items) |*event| event.deinit(ctx.allocator);
+            batch.deinit(ctx.allocator);
+        }
+        writeSessionStreamMessage(&writer, &payload, .{ .type = "session.open", .session_id = session_id }) catch |err| {
+            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+            writer.close() catch {};
+            return ctx.response.build();
+        };
+        const ping_timeout: std.Io.Timeout = .{ .duration = .{
+            .raw = std.Io.Duration.fromMilliseconds(session_stream_ping_ms),
+            .clock = .awake,
+        } };
+        while (true) {
+            const alive = self.transcription_sessions.drain(entry, &batch) catch |err| {
+                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                break;
+            };
+            if (batch.items.len > 0) {
+                const wrote = writeSessionEvents(ctx.allocator, &writer, &payload, session_id, batch.items);
+                for (batch.items) |*event| event.deinit(ctx.allocator);
+                batch.clearRetainingCapacity();
+                wrote catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    break;
+                };
+            }
+            if (!alive) {
+                writeSessionStreamMessage(&writer, &payload, .{ .type = "session.closed", .session_id = session_id }) catch {};
+                break;
+            }
+            if (ctx.isCancellationRequested()) break;
+            entry.wake.waitTimeout(ctx.io, ping_timeout) catch |err| switch (err) {
+                error.Timeout => {
+                    writeSessionStreamMessage(&writer, &payload, .{ .type = "ping", .session_id = session_id }) catch |write_err| {
+                        writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", write_err);
+                        break;
+                    };
+                },
+                error.Canceled => break,
+            };
+        }
+        writer.writeEvent(null, "[DONE]") catch {};
+        writer.close() catch {};
+        return ctx.response.build();
+    }
+
+    pub fn streamTranscriptionAudio(
+        self: *Node,
+        ctx: *httpx.Context,
+        session_id: []const u8,
+        params: api.server.StreamTranscriptionAudioParams,
+    ) !httpx.Response {
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        if (!transcription_sessions.isValidId(session_id)) return transcriptionSessionNotFound(ctx);
+        const format: api.TranscriptionAudioFormat = if (params.format) |raw|
+            std.meta.stringToEnum(api.TranscriptionAudioFormat, raw) orelse .auto
+        else
+            .pcm16;
+        if (format == .auto) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "format must be pcm16 or pcm_f32 for streamed audio" });
+        }
+        const sample_rate: u32 = if (params.sample_rate) |raw|
+            std.fmt.parseUnsigned(u32, raw, 10) catch 0
+        else
+            audio_mod.WHISPER_SAMPLE_RATE;
+        if (sample_rate < 8000 or sample_rate > 192_000) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "sample_rate must be between 8000 and 192000" });
+        }
+        const commit = if (params.commit) |raw| !std.ascii.eqlIgnoreCase(raw, "false") and !std.mem.eql(u8, raw, "0") else true;
+        if (!self.transcription_sessions.contains(session_id)) return transcriptionSessionNotFound(ctx);
+
+        const bytes_per_sample: usize = if (format == .pcm16) 2 else 4;
+        const chunk_bytes: usize = @intCast((@as(u64, sample_rate) * bytes_per_sample * session_stream_chunk_ms) / 1000);
+        const audio_admission = audioDecodeAdmission(self, chunk_bytes * 2);
+        const reserved_units = @max(self.estimateHttpRequestAdmissionUnits(ctx), audio_admission.units);
+        if (try self.acquireSlotUnits(ctx, reserved_units)) |resp| return resp;
+        defer self.releaseSlotUnits(reserved_units);
+        self.metrics.incRequest("transcription.session.stream");
+        defer self.metrics.decActive();
+
+        const stream_started_at = platform.time.monotonicNs();
+        _ = self.transcription_sessions.sweepExpired(stream_started_at, ctx.io);
+        const entry = self.transcription_sessions.acquire(session_id, stream_started_at, ctx.io) catch |err| switch (err) {
+            error.SessionNotFound, error.SessionExpired => return transcriptionSessionNotFound(ctx),
+            error.SessionBusy => return transcriptionSessionBusy(ctx),
+        };
+        defer self.transcription_sessions.release(entry, platform.time.monotonicNs());
+
+        var whisper = WhisperRuntime{ .node = self, .allocator = ctx.allocator };
+        defer whisper.deinit();
+        var stage: WhisperRuntimeStage = .resolve;
+        self.acquireWhisperRuntime(&whisper, ctx.io, entry.model, null, 0, execution_control, &stage) catch |err|
+            return whisperRuntimeFailureResponse(ctx, stage, err);
+        var pipeline = whisper.pipeline(entry.language, audio_admission.max_decode_working_bytes, execution_control, true, entry.session.config.audio_context) catch |err|
+            return whisperRuntimeFailureResponse(ctx, .language, err);
+
+        // The response starts before the body is consumed. Closing the
+        // HTTP/1.1 connection afterwards keeps the exchange well formed even
+        // if the client stops uploading early.
+        ctx.h1_keep_alive = false;
+        var writer = ctx.streamResponse(200) catch |err| {
+            return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = internalErrorMessage("STREAM_INIT_FAILED", err) });
+        };
+        var payload: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer payload.deinit();
+        writeSessionStreamMessage(&writer, &payload, .{ .type = "session.open", .session_id = session_id }) catch |err| {
+            writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+            writer.close() catch {};
+            return ctx.response.build();
+        };
+
+        var events = std.ArrayListUnmanaged(streaming_transcription.Event).empty;
+        defer {
+            for (events.items) |*event| event.deinit(ctx.allocator);
+            events.deinit(ctx.allocator);
+        }
+        var chunk = std.ArrayListUnmanaged(u8).empty;
+        defer chunk.deinit(ctx.allocator);
+        var read_buf: [session_stream_read_buffer]u8 = undefined;
+        var reader = ctx.requestBodyReader();
+        var healthy = true;
+        while (healthy) {
+            const n = reader.read(&read_buf) catch |err| {
+                writeSessionStreamError(&writer, &payload, session_id, "REQUEST_BODY_READ_FAILED", @errorName(err));
+                healthy = false;
+                break;
+            };
+            if (n == 0) break;
+            chunk.appendSlice(ctx.allocator, read_buf[0..n]) catch {
+                writeSessionStreamError(&writer, &payload, session_id, "OUT_OF_MEMORY", "could not buffer streamed audio");
+                healthy = false;
+                break;
+            };
+            if (chunk.items.len < chunk_bytes) continue;
+            const usable = chunk.items.len - (chunk.items.len % bytes_per_sample);
+            healthy = self.streamSessionChunk(ctx, entry, &pipeline, chunk.items[0..usable], format, sample_rate, false, &events, &writer, &payload, session_id);
+            const remainder = chunk.items.len - usable;
+            std.mem.copyForwards(u8, chunk.items[0..remainder], chunk.items[usable..]);
+            chunk.items.len = remainder;
+        }
+        if (healthy) {
+            const usable = chunk.items.len - (chunk.items.len % bytes_per_sample);
+            _ = self.streamSessionChunk(ctx, entry, &pipeline, chunk.items[0..usable], format, sample_rate, commit, &events, &writer, &payload, session_id);
+        }
+        const stats = entry.session.stats();
+        writeSessionStreamMessage(&writer, &payload, .{
+            .type = "session.open",
+            .session_id = session_id,
+            .buffered_ms = @intCast(stats.buffered_ms),
+            .total_ms = @intCast(stats.total_ms),
+        }) catch {};
+        writer.writeEvent(null, "[DONE]") catch {};
+        writer.close() catch {};
+        return ctx.response.build();
+    }
+
+    /// Decode one raw chunk into the session, run endpointing, then write and
+    /// publish the produced events. Returns false once the stream cannot
+    /// continue (the error has already been written).
+    fn streamSessionChunk(
+        self: *Node,
+        ctx: *httpx.Context,
+        entry: *transcription_sessions.Entry,
+        pipeline: *transcription_mod.TranscriptionPipeline,
+        bytes: []const u8,
+        format: api.TranscriptionAudioFormat,
+        sample_rate: u32,
+        commit: bool,
+        events: *std.ArrayListUnmanaged(streaming_transcription.Event),
+        writer: *httpx.Context.StreamWriter,
+        payload: *std.Io.Writer.Allocating,
+        session_id: []const u8,
+    ) bool {
+        if (bytes.len > 0) {
+            const samples = rawPcmToSamples(ctx.allocator, bytes, format) catch {
+                writeSessionStreamError(writer, payload, session_id, "UNSUPPORTED_AUDIO", "raw PCM chunk does not match the declared format");
+                return false;
+            };
+            defer ctx.allocator.free(samples);
+            entry.session.append(samples, sample_rate) catch |err| {
+                writeSessionStreamError(writer, payload, session_id, if (err == error.SessionBufferFull) "SESSION_BUFFER_FULL" else "UNSUPPORTED_AUDIO", @errorName(err));
+                return false;
+            };
+        } else if (!commit) return true;
+        entry.session.process(pipeline, events, commit) catch |err| {
+            writeSessionStreamError(writer, payload, session_id, if (isTransientInferenceCapacityError(err)) "MODEL_RESOURCE_BUSY" else "INFERENCE_FAILED", @errorName(err));
+            return false;
+        };
+        if (events.items.len == 0) return !ctx.isCancellationRequested();
+        writeSessionEvents(ctx.allocator, writer, payload, session_id, events.items) catch |err| {
+            if (!generationStreamWriteIsPeerDisconnect(err)) writeInternalStreamError(writer, "STREAM_WRITE_FAILED", err);
+            return false;
+        };
+        self.publishSessionEvents(ctx, entry, events);
+        return !ctx.isCancellationRequested();
     }
 
     pub fn extractJSON(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -20517,10 +21999,19 @@ const InferenceHttpRouteAdmission = enum { none, inference };
 /// route is a build error rather than a silent admission bypass.
 fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []const u8) InferenceHttpRouteAdmission {
     if (comptime std.mem.eql(u8, method, "GET")) {
-        if (comptime std.mem.eql(u8, path, "/models") or std.mem.eql(u8, path, "/predictors")) return .none;
+        if (comptime std.mem.eql(u8, path, "/models") or
+            std.mem.eql(u8, path, "/predictors") or
+            std.mem.eql(u8, path, "/transcription/sessions/:session_id") or
+            std.mem.eql(u8, path, "/transcription/sessions/:session_id/events")) return .none;
+    } else if (comptime std.mem.eql(u8, method, "DELETE")) {
+        if (comptime std.mem.eql(u8, path, "/transcription/sessions/:session_id")) return .none;
     } else if (comptime std.mem.eql(u8, method, "POST")) {
         if (comptime std.mem.eql(u8, path, "/chat/completions") or
             std.mem.eql(u8, path, "/chunk") or
+            std.mem.eql(u8, path, "/dictate") or
+            std.mem.eql(u8, path, "/transcription/sessions") or
+            std.mem.eql(u8, path, "/transcription/sessions/:session_id/audio") or
+            std.mem.eql(u8, path, "/transcription/sessions/:session_id/stream") or
             std.mem.eql(u8, path, "/embed") or
             std.mem.eql(u8, path, "/embeddings") or
             std.mem.eql(u8, path, "/extract") or
@@ -20536,8 +22027,18 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
     @compileError(std.fmt.comptimePrint("unclassified inference HTTP route: {s} {s}", .{ method, path }));
 }
 
+/// Routes whose handlers consume the raw request body as it arrives, for any
+/// content type, while already writing a streamed response. Registered as
+/// raw streaming routes so HTTP/1.1 clients get the same duplex exchange
+/// (chunked upload in, chunked messages out) that HTTP/2 provides.
+fn inferenceRouteStreamsRawBody(comptime path: []const u8) bool {
+    return std.mem.eql(u8, path, "/transcription/sessions/:session_id/stream");
+}
+
 fn inferenceRouteSupportsFramedAttachments(comptime path: []const u8) bool {
     return std.mem.eql(u8, path, "/chunk") or
+        std.mem.eql(u8, path, "/dictate") or
+        std.mem.eql(u8, path, "/transcription/sessions/:session_id/audio") or
         std.mem.eql(u8, path, "/embed") or
         std.mem.eql(u8, path, "/embeddings") or
         std.mem.eql(u8, path, "/extract") or
@@ -20572,7 +22073,9 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             comptime std.debug.assert(inferenceHttpRouteAdmission("POST", path) == .inference);
             const wrapped = httpx.Handler.wrap(self.node, handler, admittedInferenceHandler);
-            if (comptime inferenceRouteSupportsFramedAttachments(path) and @hasDecl(Inner, "postStreaming"))
+            if (comptime inferenceRouteStreamsRawBody(path) and @hasDecl(Inner, "postStreamingRaw"))
+                try self.inner.postStreamingRaw(prefix ++ path, wrapped)
+            else if (comptime inferenceRouteSupportsFramedAttachments(path) and @hasDecl(Inner, "postStreaming"))
                 try self.inner.postStreaming(prefix ++ path, wrapped)
             else
                 try self.inner.post(prefix ++ path, wrapped);
@@ -20612,7 +22115,9 @@ fn AiPrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
             if (comptime isMlOnlyRoute(path)) return;
             comptime std.debug.assert(inferenceHttpRouteAdmission("POST", path) == .inference);
             const wrapped = httpx.Handler.wrap(self.node, handler, admittedInferenceHandler);
-            if (comptime inferenceRouteSupportsFramedAttachments(path) and @hasDecl(Inner, "postStreaming"))
+            if (comptime inferenceRouteStreamsRawBody(path) and @hasDecl(Inner, "postStreamingRaw"))
+                try self.inner.postStreamingRaw(prefix ++ path, wrapped)
+            else if (comptime inferenceRouteSupportsFramedAttachments(path) and @hasDecl(Inner, "postStreaming"))
                 try self.inner.postStreaming(prefix ++ path, wrapped)
             else
                 try self.inner.post(prefix ++ path, wrapped);
@@ -22754,6 +24259,386 @@ test "transcribe bounded-decodes corrupt and metadata-amplified audio before mod
     }
 }
 
+fn voiceTestSilentWavBase64(allocator: std.mem.Allocator, sample_count: usize) ![]u8 {
+    const data_size: u32 = @intCast(sample_count * 2);
+    var wav = std.ArrayListUnmanaged(u8).empty;
+    defer wav.deinit(allocator);
+    try wav.appendSlice(allocator, "RIFF");
+    try wav.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u32, 36 + data_size)));
+    try wav.appendSlice(allocator, "WAVEfmt ");
+    try wav.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u32, 16)));
+    try wav.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u16, 1)));
+    try wav.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u16, 1)));
+    try wav.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u32, 16_000)));
+    try wav.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u32, 32_000)));
+    try wav.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u16, 2)));
+    try wav.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u16, 16)));
+    try wav.appendSlice(allocator, "data");
+    try wav.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u32, data_size)));
+    try wav.appendNTimes(allocator, 0, data_size);
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(wav.items.len));
+    _ = std.base64.standard.Encoder.encode(encoded, wav.items);
+    return encoded;
+}
+
+fn voiceTestPost(allocator: std.mem.Allocator, node: *Node, path: []const u8, body: []const u8) !httpx.Response {
+    var request = try httpx.Request.init(allocator, .POST, path);
+    defer request.deinit();
+    try request.setJson(body);
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    if (std.mem.eql(u8, path, "/ai/v1/dictate")) return node.dictate(&ctx);
+    if (std.mem.eql(u8, path, "/ai/v1/transcription/sessions")) return node.createTranscriptionSession(&ctx);
+    return error.TestUnexpectedResult;
+}
+
+test "dictate requires an explicit model before admission or media work" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    resetRequestWorkTestCounters();
+    var response = try voiceTestPost(allocator, &node, "/ai/v1/dictate", "{\"model\":\" \\t\",\"audio\":\"YQ==\"}");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "model is required") != null);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+}
+
+test "dictate validates cleanup options and audio before model resolution" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    const cases = [_]struct { body: []const u8, expected_status: u16, expected_text: []const u8 }{
+        .{ .body = "{\"model\":\"missing\",\"audio\":\"YQ==\",\"dictionary\":[\"multi\\nline\"]}", .expected_status = 400, .expected_text = "dictionary entries" },
+        .{ .body = "{\"model\":\"missing\",\"audio\":\"YQ==\",\"max_tokens\":0}", .expected_status = 400, .expected_text = "max_tokens" },
+        .{ .body = "{\"model\":\"missing\",\"audio\":\"%%%\"}", .expected_status = 400, .expected_text = "invalid base64" },
+        .{ .body = "{\"model\":\"missing\",\"audio\":\"attachment:0\"}", .expected_status = 400, .expected_text = "attachment" },
+        .{ .body = "{\"model\":\"missing\",\"audio\":\"UklGRnh4eHhXQVZF\"}", .expected_status = 400, .expected_text = "UNSUPPORTED" },
+    };
+    for (cases) |case| {
+        resetRequestWorkTestCounters();
+        var response = try voiceTestPost(allocator, &node, "/ai/v1/dictate", case.body);
+        defer response.deinit();
+        try std.testing.expectEqual(case.expected_status, response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, case.expected_text) != null);
+        try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+        try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+    }
+}
+
+test "dictate resolves the transcriber only after the clip decodes" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    const wav_b64 = try voiceTestSilentWavBase64(allocator, 1600);
+    defer allocator.free(wav_b64);
+    const body = try std.fmt.allocPrint(allocator, "{{\"model\":\"missing\",\"cleanup_model\":\"also-missing\",\"audio\":\"{s}\",\"stream\":true}}", .{wav_b64});
+    defer allocator.free(body);
+
+    resetRequestWorkTestCounters();
+    var response = try voiceTestPost(allocator, &node, "/ai/v1/dictate", body);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_NOT_FOUND") != null);
+    try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+}
+
+test "transcription session create validates configuration before model resolution" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    const invalid = [_]struct { body: []const u8, expected_text: []const u8 }{
+        .{ .body = "{\"model\":\"\"}", .expected_text = "model is required" },
+        .{ .body = "{\"model\":\"missing\",\"ttl_seconds\":0}", .expected_text = "ttl_seconds" },
+        .{ .body = "{\"model\":\"missing\",\"max_segment_ms\":40000}", .expected_text = "invalid session configuration" },
+        .{ .body = "{\"model\":\"missing\",\"vad\":{\"threshold\":4}}", .expected_text = "invalid session configuration" },
+    };
+    for (invalid) |case| {
+        resetRequestWorkTestCounters();
+        var response = try voiceTestPost(allocator, &node, "/ai/v1/transcription/sessions", case.body);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, case.expected_text) != null);
+        try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+    }
+
+    resetRequestWorkTestCounters();
+    var response = try voiceTestPost(allocator, &node, "/ai/v1/transcription/sessions", "{\"model\":\"missing\",\"language\":\"en\"}");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_NOT_FOUND") != null);
+    try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.transcription_sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+}
+
+test "transcription session lookups reject unknown ids without media work" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+    const unknown_id = "0123456789abcdef0123456789abcdef";
+
+    {
+        var request = try httpx.Request.init(allocator, .GET, "/ai/v1/transcription/sessions/" ++ unknown_id);
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.getTranscriptionSession(&ctx, unknown_id);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 404), response.status.code);
+    }
+    {
+        var request = try httpx.Request.init(allocator, .DELETE, "/ai/v1/transcription/sessions/not-an-id");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.deleteTranscriptionSession(&ctx, "not-an-id");
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 404), response.status.code);
+    }
+    {
+        resetRequestWorkTestCounters();
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcription/sessions/" ++ unknown_id ++ "/audio");
+        defer request.deinit();
+        try request.setJson("{\"audio\":\"YQ==\"}");
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.appendTranscriptionAudio(&ctx, unknown_id);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 404), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "SESSION_NOT_FOUND") != null);
+        try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+    }
+}
+
+test "transcription session append buffers raw pcm before the transcriber loads and delete closes it" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    var created = try node.transcription_sessions.create(allocator, .{
+        .id = transcription_sessions.formatId([_]u8{0xab} ** 16),
+        .model = "missing",
+        .now_wall_s = 0,
+        .now_mono_ns = platform.time.monotonicNs(),
+        .io = std.testing.io,
+    });
+    defer created.deinit(allocator);
+    const session_id: []const u8 = &created.id;
+
+    // 100 ms of 16 kHz silence as raw little-endian PCM16.
+    const raw = try allocator.alloc(u8, 3200);
+    defer allocator.free(raw);
+    @memset(raw, 0);
+    const raw_b64 = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len));
+    defer allocator.free(raw_b64);
+    _ = std.base64.standard.Encoder.encode(raw_b64, raw);
+    const body = try std.fmt.allocPrint(allocator, "{{\"audio\":\"{s}\",\"format\":\"pcm16\"}}", .{raw_b64});
+    defer allocator.free(body);
+
+    {
+        resetRequestWorkTestCounters();
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcription/sessions/x/audio");
+        defer request.deinit();
+        try request.setJson(body);
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.appendTranscriptionAudio(&ctx, session_id);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 404), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_NOT_FOUND") != null);
+        try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.model_resolution_attempts);
+    }
+    {
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcription/sessions/x/audio");
+        defer request.deinit();
+        try request.setJson("{\"audio\":\"YQ==\",\"format\":\"pcm16\"}");
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.appendTranscriptionAudio(&ctx, session_id);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "raw PCM") != null);
+    }
+    {
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcription/sessions/x/audio");
+        defer request.deinit();
+        try request.setJson("{}");
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.appendTranscriptionAudio(&ctx, session_id);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "audio is required") != null);
+    }
+
+    var snapshot = (try node.transcription_sessions.snapshot(allocator, session_id)).?;
+    defer snapshot.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 100), snapshot.stats.total_ms);
+
+    {
+        var request = try httpx.Request.init(allocator, .GET, "/ai/v1/transcription/sessions/x");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.getTranscriptionSession(&ctx, session_id);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"total_ms\":100") != null);
+    }
+    {
+        var request = try httpx.Request.init(allocator, .DELETE, "/ai/v1/transcription/sessions/x");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.deleteTranscriptionSession(&ctx, session_id);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"deleted\":true") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.transcription_sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+fn voiceTestEnvelope(allocator: std.mem.Allocator, metadata: []const u8, mime: []const u8, data: []const u8) ![]u8 {
+    const attachments = [_]httpx.attachment_envelope.Attachment{.{ .mime_type = mime, .data = data }};
+    return httpx.attachment_envelope.encodeAlloc(allocator, metadata, &attachments);
+}
+
+test "dictate accepts the framed attachment transport and resolves the model afterwards" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+
+    // Silent 100 ms WAV as the single attachment.
+    const wav_b64 = try voiceTestSilentWavBase64(allocator, 1600);
+    defer allocator.free(wav_b64);
+    const wav = try allocator.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(wav_b64));
+    defer allocator.free(wav);
+    try std.base64.standard.Decoder.decode(wav, wav_b64);
+    const envelope = try voiceTestEnvelope(allocator, "{\"model\":\"missing\",\"audio\":\"attachment:0\"}", "audio/wav", wav);
+    defer allocator.free(envelope);
+
+    resetRequestWorkTestCounters();
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/dictate");
+    defer request.deinit();
+    try request.setBody(envelope);
+    try request.setHeader("Content-Type", httpx.attachment_envelope.content_type);
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.dictate(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_NOT_FOUND") != null);
+    try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.model_resolution_attempts);
+
+    // A framed request whose JSON does not reference the attachment is rejected before any decode.
+    const unreferenced = try voiceTestEnvelope(allocator, "{\"model\":\"missing\",\"audio\":\"YQ==\"}", "audio/wav", wav);
+    defer allocator.free(unreferenced);
+    resetRequestWorkTestCounters();
+    var request2 = try httpx.Request.init(allocator, .POST, "/ai/v1/dictate");
+    defer request2.deinit();
+    try request2.setBody(unreferenced);
+    try request2.setHeader("Content-Type", httpx.attachment_envelope.content_type);
+    var ctx2 = httpx.Context.init(allocator, std.testing.io, &request2);
+    defer ctx2.deinit();
+    var response2 = try node.dictate(&ctx2);
+    defer response2.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response2.status.code);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "transcription session append accepts framed raw pcm and the events stream drains a closed session" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+    var created = try node.transcription_sessions.create(allocator, .{
+        .id = transcription_sessions.formatId([_]u8{0xcd} ** 16),
+        .model = "missing",
+        .now_wall_s = 0,
+        .now_mono_ns = platform.time.monotonicNs(),
+        .io = std.testing.io,
+    });
+    defer created.deinit(allocator);
+    const session_id: []const u8 = &created.id;
+
+    const raw = try allocator.alloc(u8, 3200);
+    defer allocator.free(raw);
+    @memset(raw, 0);
+    const envelope = try voiceTestEnvelope(allocator, "{\"audio\":\"attachment:0\",\"format\":\"pcm16\",\"sample_rate\":16000}", "audio/pcm", raw);
+    defer allocator.free(envelope);
+    {
+        resetRequestWorkTestCounters();
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcription/sessions/x/audio");
+        defer request.deinit();
+        try request.setBody(envelope);
+    try request.setHeader("Content-Type", httpx.attachment_envelope.content_type);
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.appendTranscriptionAudio(&ctx, session_id);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 404), response.status.code);
+        try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.model_resolution_attempts);
+    }
+    var snapshot = (try node.transcription_sessions.snapshot(allocator, session_id)).?;
+    defer snapshot.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 100), snapshot.stats.total_ms);
+
+    // Queue an event, close the session, then read the stream: it must
+    // deliver the event, report the close, and end with [DONE].
+    const entry = try node.transcription_sessions.watch(session_id);
+    var events = [_]streaming_transcription.Event{.{
+        .kind = .final,
+        .sequence = 0,
+        .text = try allocator.dupe(u8, "hello there"),
+        .stable_text = try allocator.dupe(u8, "hello there"),
+        .start_ms = 0,
+        .end_ms = 900,
+        .language = null,
+    }};
+    try node.transcription_sessions.publish(entry, &events, std.testing.io);
+    node.transcription_sessions.unwatch(entry);
+    try node.transcription_sessions.remove(session_id, std.testing.io);
+    {
+        var request = try httpx.Request.init(allocator, .GET, "/ai/v1/transcription/sessions/x/events");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.streamTranscriptionSessionEvents(&ctx, session_id);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 404), response.status.code);
+    }
+    // Unknown ids on the streaming upload route fail before reading any body.
+    {
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcription/sessions/x/stream");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.streamTranscriptionAudio(&ctx, "0123456789abcdef0123456789abcdef", .{ .format = "pcm16" });
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 404), response.status.code);
+        var bad = try node.streamTranscriptionAudio(&ctx, session_id, .{ .format = "auto" });
+        defer bad.deinit();
+        try std.testing.expectEqual(@as(u16, 400), bad.status.code);
+    }
+}
+
 test "direct extraction media shape reserves remote and cumulative inline sources" {
     const allocator = std.testing.allocator;
     var remote_shape: RequestMediaAdmissionShape = .{};
@@ -22970,6 +24855,8 @@ test "Qwen3-VL read and prepared generation stop cancelled work before model loa
         false,
         null,
         false,
+        null,
+        null,
         null,
         cancelled,
     ));
@@ -23486,6 +25373,13 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
     try std.testing.expectEqual(@as(usize, 1), server.routeCount(.get, public_api_prefix ++ "/models"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
+    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/dictate"));
+    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/transcription/sessions"));
+    try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/transcription/sessions/:session_id"));
+    try std.testing.expect(server.hasRoute(.delete, public_api_prefix ++ "/transcription/sessions/:session_id"));
+    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/transcription/sessions/:session_id/audio"));
+    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/transcription/sessions/:session_id/stream"));
+    try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/transcription/sessions/:session_id/events"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/healthz"));
     try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/readyz"));
 }
@@ -24297,6 +26191,9 @@ test "registerAiRoutesOn excludes Traditional ML predictor routes" {
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/generate/batch"));
     try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/models"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/recognize"));
+    try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/dictate"));
+    try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/transcription/sessions/:session_id/audio"));
+    try std.testing.expect(server.hasRoute(.delete, ai_api_prefix ++ "/transcription/sessions/:session_id"));
     try std.testing.expect(!server.hasRoute(.post, ai_api_prefix ++ "/predict"));
     try std.testing.expect(!server.hasRoute(.get, ai_api_prefix ++ "/predictors"));
 }

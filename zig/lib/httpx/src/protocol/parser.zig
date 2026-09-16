@@ -484,7 +484,7 @@ pub const Parser = struct {
             }
         }
         if (self.mode == .request and !self.headers_only and
-            self.content_length != null and self.content_length.? > 0 and !self.chunked)
+            (self.chunked or (self.content_length != null and self.content_length.? > 0)))
         {
             if (self.request_body_streaming_resolver) |resolve| {
                 if (self.request_body_streaming_context) |context| {

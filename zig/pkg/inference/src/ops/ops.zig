@@ -81,6 +81,32 @@ pub const LinearNoBiasTripleResult = struct {
     third: CT,
 };
 
+/// `a + b` alongside `layer_norm(a + b)`; see `ComputeBackend.addLayerNormSum`.
+pub const AddLayerNormSumResult = struct {
+    sum: CT,
+    normed: CT,
+};
+
+/// Constraints for `whisperLogitsStatsEncode`: which tokens may be chosen
+/// this step. Text tokens are `[0, ts_begin)`; timestamps `[ts_begin,
+/// out_dim)` are allowed within `[ts_min, ts_max)`; `eot` is always
+/// allowed; `suppress_count` explicit ids are removed; `probe_id`'s raw
+/// logit is reported (`out_dim` or more disables the probe).
+pub const WhisperLogitsParams = extern struct {
+    out_dim: u32,
+    suppress_count: u32,
+    ts_begin: u32,
+    text_allowed: u32,
+    ts_min: u32,
+    ts_max: u32,
+    eot: u32,
+    probe_id: u32,
+};
+
+/// Sixteen floats written by the Whisper logits kernel. Ids are u32 bit
+/// patterns; 0xffffffff means "no candidate".
+pub const WhisperLogitsStatsRaw = [16]f32;
+
 pub const RmsNormTripleResult = struct {
     first: CT,
     second: CT,
@@ -1665,6 +1691,10 @@ pub const ComputeBackend = struct {
         /// Y = layer_norm(A + B). Backends may fuse residual add and layer norm;
         /// callers fall back to add + layerNorm.
         addLayerNorm: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT = null,
+        addLayerNormSum: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?AddLayerNormSumResult = null,
+        ensureDeviceResident: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
+        whisperLogitsStatsEncode: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
+        whisperLogitsStatsRead: ?*const fn (ctx: *anyopaque, out: *WhisperLogitsStatsRaw) bool = null,
 
         /// Planned variant for graph executors that already selected a
         /// backend-specific operator. Backends that leave this null use
@@ -2514,6 +2544,9 @@ pub const ComputeBackend = struct {
         /// Apply three previously prepared q/k/v linear slots to the same
         /// input and return all projected outputs.
         decoderRuntimeApplyLinearQkv: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest) anyerror!?LinearNoBiasTripleResult = null,
+        decoderRuntimeApplyLinearQkvInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) anyerror!?CT = null,
+        decoderRuntimeBeginPlannedComputeScope: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        decoderRuntimeEndPlannedComputeScope: ?*const fn (ctx: *anyopaque) void = null,
 
         /// Apply an activation inside the backend-owned decoder runtime.
         decoderRuntimeApplyActivation: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyActivationRequest) anyerror!?CT = null,
@@ -3406,6 +3439,39 @@ pub const ComputeBackend = struct {
     pub fn layerNormBackward(self: *const ComputeBackend, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) !?CT {
         if (self.vtable.layerNormBackward) |f| return try f(self.ptr, input, gamma, beta, dy, dim, eps);
         return null;
+    }
+
+    /// Copy a host-side tensor to the accelerator once, for values that many
+    /// later device ops will read (Whisper's projected encoder keys and
+    /// values). Returns the resident copy, which replaces `tensor` (the
+    /// caller frees the original), or null when the tensor is already
+    /// resident or the backend has no device memory.
+    pub fn ensureDeviceResident(self: *const ComputeBackend, tensor: CT) !?CT {
+        if (self.vtable.ensureDeviceResident) |f| return f(self.ptr, tensor);
+        return null;
+    }
+
+    /// Fused residual add and layer norm returning both the sum (the new
+    /// residual stream) and the normalized tensor. Null when the backend has
+    /// no fused kernel or an input is not device resident.
+    pub fn addLayerNormSum(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?AddLayerNormSumResult {
+        if (self.vtable.addLayerNormSum) |f| return f(self.ptr, a, b, gamma, beta, dim, eps);
+        return null;
+    }
+
+    /// Encode Whisper's constrained argmax and log-sum-exp statistics over a
+    /// `[1, vocab]` device logits row. The values are read back with
+    /// `whisperLogitsStatsRead` once the enclosing frame has completed (or
+    /// immediately when no frame is active). False means the caller must
+    /// fall back to reading the logits row.
+    pub fn whisperLogitsStatsEncode(self: *const ComputeBackend, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) !bool {
+        if (self.vtable.whisperLogitsStatsEncode) |f| return f(self.ptr, logits, params, suppress_ids);
+        return false;
+    }
+
+    pub fn whisperLogitsStatsRead(self: *const ComputeBackend, out: *WhisperLogitsStatsRaw) bool {
+        if (self.vtable.whisperLogitsStatsRead) |f| return f(self.ptr, out);
+        return false;
     }
 
     pub fn addLayerNorm(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
@@ -4544,6 +4610,27 @@ pub const ComputeBackend = struct {
             return op(self.ptr, request);
         }
         return null;
+    }
+
+    /// Single-row fused Q/K/V where K and V are written into `k_out` and
+    /// `v_out` (device row views, e.g. rows of a resident cache) and Q is
+    /// returned. Null when the backend cannot place the outputs.
+    pub fn decoderRuntimeApplyLinearQkvInto(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) !?CT {
+        if (self.vtable.decoderRuntimeApplyLinearQkvInto) |op| return op(self.ptr, request, k_out, v_out);
+        return null;
+    }
+
+    /// Open one compute encoder that every subsequent runtime op joins until
+    /// the frame is submitted, so a decode step is a single command sequence
+    /// instead of one encoder per op. Requires an active frame; returns
+    /// false when unsupported.
+    pub fn decoderRuntimeBeginPlannedComputeScope(self: *const ComputeBackend) !bool {
+        if (self.vtable.decoderRuntimeBeginPlannedComputeScope) |op| return op(self.ptr);
+        return false;
+    }
+
+    pub fn decoderRuntimeEndPlannedComputeScope(self: *const ComputeBackend) void {
+        if (self.vtable.decoderRuntimeEndPlannedComputeScope) |op| op(self.ptr);
     }
 
     pub fn decoderRuntimeApplyLinearQkv(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearQkvRequest) !?LinearNoBiasTripleResult {

@@ -1437,7 +1437,7 @@ fn inferModelTypeFromTasks(tasks: []const []const u8) ?ModelType {
         if (std.mem.eql(u8, task, "rerank")) return .reranker;
     }
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "classify")) return .classifier;
+        if (std.mem.eql(u8, task, "classify") or std.mem.eql(u8, task, "vad")) return .classifier;
     }
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "read")) return .reader;
