@@ -58,10 +58,15 @@ async function main({github, context, core, mode, config, env = process.env}) {
   const getPR = async () => (await github.rest.pulls.get({...repo, pull_number: number})).data;
   const getCheck = async id => (await github.rest.checks.get({...repo, check_run_id: Number(id)})).data;
   const writeCheck = async (check, data, status, summary, conclusion) => {
+    const runUrl = data.run_id
+      ? `${context.serverUrl || 'https://github.com'}/${repository}/actions/runs/${data.run_id}`
+      : null;
     const body = {
       ...repo, check_run_id: check.id, status,
-      output: {title: CHECK, summary, text: JSON.stringify(data)},
+      output: {title: CHECK, summary: runUrl ? `${summary}\n\n[View CI run](${runUrl})` : summary,
+        text: JSON.stringify(data)},
     };
+    if (runUrl) body.details_url = runUrl;
     if (conclusion) body.conclusion = conclusion;
     await github.rest.checks.update(body);
   };
