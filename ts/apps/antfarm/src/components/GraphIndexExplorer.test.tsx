@@ -110,6 +110,8 @@ describe("GraphIndexExplorer", () => {
     fireEvent.click(screen.getByRole("button", { name: /run graph query/i }));
 
     await waitFor(() => expect(mocks.query).toHaveBeenCalledTimes(1));
+    const request = mocks.query.mock.calls[0][1];
+    expect("edge_weight" in request.graph_queries.explorer.traverse).toBe(false);
     expect(mocks.query).toHaveBeenCalledWith(
       "papers",
       expect.objectContaining({
