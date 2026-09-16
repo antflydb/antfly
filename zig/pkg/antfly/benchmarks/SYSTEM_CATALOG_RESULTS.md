@@ -2042,3 +2042,104 @@ observed diagnostic-admission convoy, not the absence of other scale bottlenecks
 Raw records, coordinator/placement identities, settings, and binary hashes:
 [`system_catalog_read_routing_baseline_2026_09_15.json`](system_catalog_read_routing_baseline_2026_09_15.json)
 and [`system_catalog_read_routing_candidate_2026_09_15.json`](system_catalog_read_routing_candidate_2026_09_15.json).
+
+### Request budgets, peer publication, and sustained routing (2026-09-15)
+
+Read-peer refresh now shares the request's remaining deadline and cancellation
+through cache admission, clock translation, metadata endpoint selection, and HTTP
+transport. Query, preflight, text-statistics, and aggregation fanouts resolve all
+destinations from one retained peer view per phase, including sequential dispatch.
+Join forwarding deducts routing time from its original timeout. The shared control
+snapshot refresh can return a retained peer index directly, avoiding the full
+catalog/schema result clone; retired observations are freed outside the cache lock.
+
+The Debug component workload compares both result modes in the same implementation:
+1,000 tables, 8 KiB schema payloads, one warmup pair and seven measured pairs.
+Median publication/result construction fell from 376.95 ms for an owned snapshot
+to 200.90 ms for a retained peer view (46.7%). Incoming observation construction
+and caller result destruction are excluded; retirement of the previous observation
+is included. This uses the checking test allocator, so it isolates redundant work
+rather than predicting production HTTP latency or throughput.
+[Raw component samples](system_catalog_peer_publication_2026_09_15.json).
+
+Validation passed with no skips: 81 table-read contracts, six focused peer-routing
+and fanout contracts, the modeled three-DataServer merge/split/failover/restart
+scenario, public API smoke, both dense-storage regressions, six standalone
+transaction/catalog E2Es, and two three-data-node catalog E2Es. Fixture fixes use
+physical table identities for activity waits, structured candidate-key assertions,
+and the new write-validation protocol in the modeled metadata adapter. The dense
+artifact rebuild functional test uses the existing completion-test budget rather
+than a production scheduling quantum. The earlier dense catch-up checkpoint and
+transaction-transform HTTP 503 failures did not reproduce locally; these passes
+do not establish that their Linux CI failure modes are fixed.
+
+The sustained cluster pair uses the previous `093d95d8f` binary as baseline and
+`e399de8b3` as candidate. Both already contain the shared peer-routing cache;
+this comparison measures the subsequent budget, publication, and fanout changes.
+Each fresh three-data-node cluster uses 32 extra schema fields, 20 sequential
+samples, two warmups, and eight concurrent clients reading for at least 30 seconds
+at both 10 and 100 tables. The harness verifies a nonmember ingress node and every
+lookup body, and also checks writes, queries, joins, NDJSON, listing, and rename.
+Both binaries completed every operation without errors.
+
+| Tables | Concurrent lookup metric | Baseline | Candidate |
+| --- | --- | ---: | ---: |
+| 10 | Completed lookups | 5,401 | 4,582 |
+| 10 | p50 / p95 | 47.53 / 78.51 ms | 52.30 / 82.30 ms |
+| 10 | Maximum | 300.51 ms | 444.61 ms |
+| 10 | Throughput | 179.78 requests/s | 152.35 requests/s |
+| 100 | Completed lookups | 3,185 | 3,497 |
+| 100 | p50 / p95 | 52.68 / 129.76 ms | 52.20 / 107.39 ms |
+| 100 | Maximum | 1,911.27 ms | 1,163.72 ms |
+| 100 | Throughput | 105.96 requests/s | 116.45 requests/s |
+
+The 100-table candidate improved observed p95, maximum, and throughput, while the
+10-table candidate was slower. These samples therefore do not establish a uniform
+end-to-end speedup. The candidate's 1.16-second maximum also leaves a sustained
+read-tail qualification gap. No task-owned compiler, profiler, or second workload
+ran during measurement; other worktrees had active tests/builds. These are local
+Debug observations, not isolated production SLO measurements. The 30-second phases
+cover many peer-cache freshness intervals, unlike the earlier one-second runs.
+[Baseline records](system_catalog_sustained_routing_baseline_2026_09_15.json) and
+[candidate records](system_catalog_sustained_routing_candidate_2026_09_15.json)
+include per-request timings, exact binary hashes, and coordinator/placement IDs.
+
+The eight-shard catalog workload uncovered an additional correctness gap. Join
+coordinators called the provisioned source's local-only exact-group callbacks,
+causing `UnknownGroup` when a right-hand shard belonged to another node. Remote
+forwarding also needs a catalog fence selected for that exact table/group. The
+final implementation routes coordinator calls through the hosted adapter and
+binds the selected fence; fenced worker callbacks retain the existing resident
+storage and admission owners. Caller deadlines are translated into the catalog
+clock for selection and into the native clock for fence admission.
+
+The Zig regression starts from an unbound catalog, checks that a remote typed
+probe does not attempt local admission, and requires fence acknowledgement for
+its HTTP fallback. The Python regression covers both lookup and broadcast joins,
+qualified targets versus literal lookalike names, and one/eight shards. Single-
+replica placement ensures the cluster cannot hide the bug behind local replicas.
+Both standalone cases and all four cluster catalog cases passed; the 81 read
+contracts and production build also passed after the complete fix.
+
+The final `b66389f3a` binary completed the full ten-table/eight-shard workload,
+including all 20 samples and two warmups for every operation. The baseline and
+initial candidates failed during joins, so no successful before/after fanout
+latency comparison is available.
+
+| Final eight-shard operation | p50 | p95 | Maximum |
+| --- | ---: | ---: | ---: |
+| Qualified query | 79.84 ms | 107.90 ms | 112.86 ms |
+| Qualified join | 277.72 ms | 416.92 ms | 8,129.14 ms |
+| 20-line NDJSON query stream | 1,430.51 ms | 8,484.84 ms | 9,018.71 ms |
+
+The join and NDJSON outliers remain a performance qualification gap despite all
+requests completing correctly. This workload does not establish bounded low-tail
+latency or a fanout speedup. It does establish that the new real-work scenario
+caught a routing/fencing failure missed by single-shard and fully replicated tests.
+No task-owned compiler or other task-owned workload ran during these measurements.
+Shared-host Debug limitations remain the same as for the sustained pair above.
+
+Raw observations: [baseline failure](system_catalog_fanout_baseline_2026_09_15.json),
+[initial candidate failure](system_catalog_fanout_initial_candidate_2026_09_15.json),
+[missing-fence failure](system_catalog_fanout_unfenced_candidate_2026_09_15.json), and
+[complete candidate workload](system_catalog_fanout_candidate_2026_09_15.json).
