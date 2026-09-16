@@ -30,6 +30,7 @@ const runtime_http_bridge = @import("../runtime_http_bridge.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
+const runtime_io_abi = @import("../runtime_io_abi.zig");
 
 pub const CreateContext = abi.CreateContext;
 pub const CallContext = abi.CallContext;
@@ -39,6 +40,30 @@ const ServerState = struct {
     owner_alloc: std.mem.Allocator,
     server: server_mod.ApiHttpServer,
     request_alloc_abi: abi.memory_abi.Allocator,
+    runtime_io: RuntimeIoReceivers = .{},
+};
+
+const RuntimeIoReceivers = struct {
+    api: ?runtime_io_abi.Receiver = null,
+    api_network: ?runtime_io_abi.Receiver = null,
+    api_filesystem: ?runtime_io_abi.Receiver = null,
+    durable: ?runtime_io_abi.Receiver = null,
+
+    fn init(self: *@This(), borrows: *const abi.RuntimeIoBorrows) !void {
+        if (!abi.validContext(abi.RuntimeIoBorrows, borrows.version, borrows.struct_size))
+            return error.UnsupportedVersion;
+        inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+            @field(self, field) = if (@field(borrows, field)) |borrow| try borrow.receive() else null;
+        }
+    }
+
+    fn views(self: *@This()) server_mod.RuntimeIoViews {
+        var result: server_mod.RuntimeIoViews = .{};
+        inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+            @field(result, field) = if (@field(self, field)) |*receiver| receiver.io() else null;
+        }
+        return result;
+    }
 };
 
 const HandlerState = struct {
@@ -130,6 +155,8 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         !context.table_writes_contract.matches(.of(?table_writes.TableWriteSource)))
         return fail(error.InvalidArgument);
     const cfg: *const server_mod.ApiHttpServerConfig = @ptrCast(@alignCast(context.cfg));
+    if (cfg.backend_runtime != null and context.runtime_io == null)
+        return fail(error.InvalidArgument);
     const source: *const server_mod.StatusSource = @ptrCast(@alignCast(context.source));
     const reads: *const ?table_reads.TableReadSource = @ptrCast(@alignCast(context.table_reads));
     const writes: *const ?table_writes.TableWriteSource = @ptrCast(@alignCast(context.table_writes));
@@ -138,23 +165,29 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         std.log.err("API kernel create failed allocating state: error.{s}", .{@errorName(err)});
         return fail(err);
     };
-    errdefer owner_alloc.destroy(state);
+    var published = false;
+    defer if (!published) owner_alloc.destroy(state);
 
-    state.* = .{
-        .owner_alloc = owner_alloc,
-        .server = if (context.flags & CreateContext.fallible_init != 0)
-            server_mod.ApiHttpServer.initWithConfig(owner_alloc, cfg.*, source.*, reads.*, writes.*) catch |err| {
-                std.log.err("API kernel create failed initializing server: error.{s}", .{@errorName(err)});
-                return fail(err);
-            }
-        else
-            server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, cfg.*, source.*, reads.*, writes.*),
-        .request_alloc_abi = undefined,
-    };
+    state.owner_alloc = owner_alloc;
+    state.runtime_io = .{};
+    var imported_cfg = cfg.*;
+    imported_cfg.imported_runtime_io = null;
+    if (context.runtime_io) |borrows| {
+        state.runtime_io.init(borrows) catch |err| return fail(err);
+        imported_cfg.imported_runtime_io = state.runtime_io.views();
+    }
+    state.server = if (context.flags & CreateContext.fallible_init != 0)
+        server_mod.ApiHttpServer.initWithConfig(owner_alloc, imported_cfg, source.*, reads.*, writes.*) catch |err| {
+            std.log.err("API kernel create failed initializing server: error.{s}", .{@errorName(err)});
+            return fail(err);
+        }
+    else
+        server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, imported_cfg, source.*, reads.*, writes.*);
     if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(&state.server.incoming_graph_routes);
     state.request_alloc_abi = .fromStd(&state.server.alloc);
     context.out_handle.* = state;
     context.out_request_alloc.* = &state.request_alloc_abi;
+    published = true;
     return .ok;
 }
 
@@ -900,4 +933,230 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
         retry_response.body.slice(),
     );
     try std.testing.expectEqual(@as(u64, 6), api_server.requestStats().request_count);
+}
+
+test "API kernel create rejects raw owner runtime without transferred capabilities" {
+    const background = @import("../storage/background_runtime.zig");
+    var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = std.testing.io },
+    });
+    defer runtime.deinit();
+    const cfg: server_mod.ApiHttpServerConfig = .{ .backend_runtime = runtime.ptr() };
+    var token: u8 = 0;
+    const Stub = struct {
+        fn status(_: *anyopaque) anyerror!metadata_api.MetadataStatus {
+            return error.UnsupportedOperation;
+        }
+    };
+    const source: server_mod.StatusSource = .{ .ptr = &token, .vtable = &.{ .status = Stub.status } };
+    const reads: ?table_reads.TableReadSource = null;
+    const writes: ?table_writes.TableWriteSource = null;
+    var allocator = std.testing.allocator;
+    const owner_alloc = abi.memory_abi.Allocator.fromStd(&allocator);
+    var handle: ?*anyopaque = null;
+    var request_alloc: ?*const abi.memory_abi.Allocator = null;
+    var context: CreateContext = .{
+        .abi_version = abi.abi_version,
+        .owner_alloc = &owner_alloc,
+        .cfg = &cfg,
+        .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+        .source = &source,
+        .source_contract = .of(server_mod.StatusSource),
+        .table_reads = &reads,
+        .table_reads_contract = .of(?table_reads.TableReadSource),
+        .table_writes = &writes,
+        .table_writes_contract = .of(?table_writes.TableWriteSource),
+        .out_handle = &handle,
+        .out_request_alloc = &request_alloc,
+    };
+    const result = create(&context);
+    defer if (handle) |created| destroy(created);
+    std.debug.print("API_RUNTIME_IO_RAW_REJECT expects InvalidArgument\n", .{});
+    try std.testing.expect(!result.isOk());
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(result));
+    try std.testing.expect(handle == null);
+    try std.testing.expect(request_alloc == null);
+}
+
+test "API kernel failed fallible create releases unpublished state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "not-a-directory", .{});
+    file.close(std.testing.io);
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/not-a-directory/store", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var accounting = std.testing.FailingAllocator.init(arena.allocator(), .{});
+    var allocator = accounting.allocator();
+    const owner_alloc = abi.memory_abi.Allocator.fromStd(&allocator);
+    const cfg: server_mod.ApiHttpServerConfig = .{ .session_store_path = path };
+    var token: u8 = 0;
+    const Stub = struct {
+        fn status(_: *anyopaque) anyerror!metadata_api.MetadataStatus {
+            return error.UnsupportedOperation;
+        }
+    };
+    const source: server_mod.StatusSource = .{ .ptr = &token, .vtable = &.{ .status = Stub.status } };
+    const reads: ?table_reads.TableReadSource = null;
+    const writes: ?table_writes.TableWriteSource = null;
+    var handle: ?*anyopaque = null;
+    var request_alloc: ?*const abi.memory_abi.Allocator = null;
+    @import("../test_error_logs.zig").expectErrorLogs(1);
+    const result = create(&.{
+        .abi_version = abi.abi_version,
+        .owner_alloc = &owner_alloc,
+        .cfg = &cfg,
+        .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+        .source = &source,
+        .source_contract = .of(server_mod.StatusSource),
+        .table_reads = &reads,
+        .table_reads_contract = .of(?table_reads.TableReadSource),
+        .table_writes = &writes,
+        .table_writes_contract = .of(?table_writes.TableWriteSource),
+        .flags = CreateContext.fallible_init,
+        .out_handle = &handle,
+        .out_request_alloc = &request_alloc,
+    });
+    defer if (handle) |created| destroy(created);
+    try std.testing.expect(!result.isOk());
+    try std.testing.expect(handle == null);
+    try std.testing.expect(request_alloc == null);
+    try std.testing.expect(accounting.allocated_bytes > 0);
+    std.debug.print("API_CREATE_CLEANUP expects all owner bytes freed\n", .{});
+    try std.testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
+}
+
+test "API kernel runtime I/O receivers validate capability layout and domains" {
+    var receivers: RuntimeIoReceivers = .{};
+    var borrow = abi.native_abi.IoBorrow.init(&std.testing.io);
+    var borrows: abi.RuntimeIoBorrows = .{
+        .api = &borrow,
+        .api_network = &borrow,
+        .api_filesystem = &borrow,
+        .durable = &borrow,
+    };
+    try receivers.init(&borrows);
+    const views = receivers.views();
+    inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+        const io = @field(views, field).?;
+        try std.testing.expect(io.userdata == std.testing.io.userdata);
+        try std.testing.expect(io.vtable == std.testing.io.vtable);
+    }
+    borrows.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, receivers.init(&borrows));
+    borrows.version = abi.abi_version;
+    borrows.struct_size -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, receivers.init(&borrows));
+    borrows.struct_size = @sizeOf(abi.RuntimeIoBorrows);
+    borrow.contract.version +%= 1;
+    try std.testing.expectError(error.InvalidArgument, receivers.init(&borrows));
+}
+
+test "API kernel runtime I/O receiver keeps imported unavailable views null" {
+    var receivers: RuntimeIoReceivers = .{};
+    try receivers.init(&.{});
+    const views = receivers.views();
+    inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+        try std.testing.expect(@field(views, field) == null);
+    }
+}
+
+test "API kernel create enforces owner I/O capabilities and preserves their lifetime" {
+    const background = @import("../storage/background_runtime.zig");
+    var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = std.testing.io },
+    });
+    defer runtime.deinit();
+    const cfg: server_mod.ApiHttpServerConfig = .{ .backend_runtime = runtime.ptr() };
+    var token: u8 = 0;
+    const Stub = struct {
+        fn status(_: *anyopaque) anyerror!metadata_api.MetadataStatus {
+            return error.UnsupportedOperation;
+        }
+    };
+    const source: server_mod.StatusSource = .{ .ptr = &token, .vtable = &.{ .status = Stub.status } };
+    const reads: ?table_reads.TableReadSource = null;
+    const writes: ?table_writes.TableWriteSource = null;
+    var allocator = std.testing.allocator;
+    const owner_alloc = abi.memory_abi.Allocator.fromStd(&allocator);
+    var handle: ?*anyopaque = null;
+    var request_alloc: ?*const abi.memory_abi.Allocator = null;
+    var context: CreateContext = .{
+        .abi_version = abi.abi_version,
+        .owner_alloc = &owner_alloc,
+        .cfg = &cfg,
+        .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+        .source = &source,
+        .source_contract = .of(server_mod.StatusSource),
+        .table_reads = &reads,
+        .table_reads_contract = .of(?table_reads.TableReadSource),
+        .table_writes = &writes,
+        .table_writes_contract = .of(?table_writes.TableWriteSource),
+        .out_handle = &handle,
+        .out_request_alloc = &request_alloc,
+    };
+    const result = create(&context);
+    defer if (handle) |created| destroy(created);
+    try std.testing.expect(!result.isOk());
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(result));
+    try std.testing.expect(handle == null);
+    try std.testing.expect(request_alloc == null);
+    var borrow = abi.native_abi.IoBorrow.init(&std.testing.io);
+    const borrows: abi.RuntimeIoBorrows = .{
+        .api = &borrow,
+        .api_network = &borrow,
+        .api_filesystem = &borrow,
+        .durable = &borrow,
+    };
+    context.runtime_io = &borrows;
+    borrow.contract.version +%= 1;
+    const malformed = create(&context);
+    try std.testing.expect(!malformed.isOk());
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(malformed));
+    try std.testing.expect(handle == null);
+    borrow = abi.native_abi.IoBorrow.init(&std.testing.io);
+    const Dispatch = @FieldType(abi.native_abi.IoBorrow, "dispatch");
+    const Parameters = @typeInfo(@typeInfo(Dispatch).pointer.child).@"fn".params;
+    const Forward = struct {
+        var owner_dispatch: Dispatch = undefined;
+
+        fn dispatch(
+            owner: Parameters[0].type.?,
+            operation: Parameters[1].type.?,
+            arguments: Parameters[2].type.?,
+            out_value: Parameters[3].type.?,
+            reader: Parameters[4].type.?,
+            error_names: Parameters[5].type.?,
+        ) callconv(.c) void {
+            owner_dispatch(owner, operation, arguments, out_value, reader, error_names);
+        }
+    };
+    Forward.owner_dispatch = borrow.dispatch;
+    borrow.dispatch = &Forward.dispatch;
+    const Probe = struct {
+        fn run(io: std.Io) !void {
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, "/antfly-api-owner-borrow-missing", .{}));
+        }
+    };
+    for ([_]u32{ 0, CreateContext.fallible_init }) |flags| {
+        context.flags = flags;
+        try std.testing.expect(create(&context).isOk());
+        const state: *ServerState = @ptrCast(@alignCast(handle.?));
+        try std.testing.expect(state.server.cfg.imported_runtime_io != null);
+        const views = state.server.cfg.imported_runtime_io.?;
+        inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+            const view = @field(views, field).?;
+            try std.testing.expect(view.userdata == @as(?*anyopaque, &@field(state.runtime_io, field).?));
+            try std.testing.expect(view.vtable != std.testing.io.vtable);
+        }
+        const imported = state.server.sharedApiFilesystemIo().?;
+        var future = try state.server.sharedApiIo().?.concurrent(Probe.run, .{imported});
+        try future.await(state.server.sharedApiIo().?);
+        destroy(handle.?);
+        handle = null;
+        try Probe.run(std.testing.io);
+    }
 }

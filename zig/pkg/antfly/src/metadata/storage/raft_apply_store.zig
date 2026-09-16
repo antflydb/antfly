@@ -4193,6 +4193,16 @@ pub const RaftApplyStore = struct {
         entries_bytes: []const u8,
         collect_transition_deltas: bool,
     ) !CommittedApplyOutcome {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        var apply_locked = true;
+        defer if (apply_locked) self.apply_mutex.unlock(io);
+        const applied_index = try self.durableAppliedIndex(group_id);
+        if (commit_index <= applied_index) return .{
+            .alloc = self.alloc,
+            .collect_transition_deltas = collect_transition_deltas,
+        };
+
         var value = try self.alloc.alloc(u8, @sizeOf(u64) + entries_bytes.len);
         defer self.alloc.free(value);
         std.mem.writeInt(u64, value[0..8], commit_index, .little);
@@ -4201,10 +4211,6 @@ pub const RaftApplyStore = struct {
         const owned_entries = try self.alloc.dupe(u8, entries_bytes);
         errdefer self.alloc.free(owned_entries);
 
-        const io = self.io_impl.io();
-        self.apply_mutex.lockUncancelable(io);
-        var apply_locked = true;
-        defer if (apply_locked) self.apply_mutex.unlock(io);
         try self.batches.ensureUnusedCapacity(self.alloc, 1);
         std.debug.assert(self.active_outcome == null);
         var outcome = CommittedApplyOutcome{
@@ -4220,7 +4226,7 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginWriteTxn();
         errdefer txn.abort();
         try txn.put(key, value);
-        try self.projectEntriesTxn(&txn, group_id, entries_bytes);
+        try self.projectEntriesTxn(&txn, group_id, entries_bytes, applied_index);
         if (outcome.failure) |err| return err;
         if (outcomeChangesCatalog(outcome.projection_signals.items)) {
             var catalog_revision_buf: [@sizeOf(u64)]u8 = undefined;
@@ -4262,6 +4268,18 @@ pub const RaftApplyStore = struct {
         return outcome;
     }
 
+    fn durableAppliedIndex(self: *RaftApplyStore, group_id: u64) !u64 {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [128]u8 = undefined;
+        const encoded = txn.get(try keyForGroup(&key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        if (encoded.len < @sizeOf(u64)) return error.InvalidMetadataApplyBatch;
+        return std.mem.readInt(u64, encoded[0..8], .little);
+    }
+
     fn ensureLoaded(self: *RaftApplyStore, group_id: u64) !?*OwnedBatch {
         if (self.batches.getPtr(group_id)) |batch| return batch;
 
@@ -4296,7 +4314,7 @@ pub const RaftApplyStore = struct {
         return false;
     }
 
-    fn projectEntriesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, entries_bytes: []const u8) !void {
+    fn projectEntriesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, entries_bytes: []const u8, applied_index: u64) !void {
         _ = try self.ensureDerivedCatalogIndexesTxn(txn, group_id);
         const decoded = raft_state_machine.decodeCommittedEntries(self.alloc, entries_bytes) catch |err| switch (err) {
             error.InvalidCommittedEntriesEncoding => return,
@@ -4305,7 +4323,7 @@ pub const RaftApplyStore = struct {
         defer self.alloc.free(decoded);
 
         for (decoded) |entry| {
-            if (entry.entry_type != .normal) continue;
+            if (entry.index <= applied_index or entry.entry_type != .normal) continue;
             var command = (try decodeTransitionCommand(self.alloc, entry.data)) orelse continue;
             defer command.deinit(self.alloc);
             try self.applyTransitionCommandTxn(txn, group_id, command);
@@ -16178,3 +16196,224 @@ test "metadata apply store replay is idempotent when applied watermark lags WAL 
 const restore_job_logical_prefix = "\x00\x00__api_restore_jobs__:";
 const max_restore_job_logical_key_bytes: usize = 128;
 const max_restore_job_value_bytes: usize = 64 * 1024;
+
+const MetadataReplayTest = struct {
+    const alloc = std.testing.allocator;
+    const group_id: u64 = 41;
+    const incarnation = "11111111111111111111111111111111".*;
+
+    fn apply(store: *RaftApplyStore, group: u64, entries: []const raft_engine.core.Entry) !CommittedApplyOutcome {
+        const encoded = try raft_state_machine.encodeCommittedEntries(alloc, entries);
+        defer alloc.free(encoded);
+        return try store.applyCommittedBatch(group, entries[entries.len - 1].index, encoded);
+    }
+
+    fn seed(store: *RaftApplyStore) !void {
+        const initialize = try encodeTransitionCommand(alloc, .{ .initialize_metadata_incarnation = incarnation });
+        defer alloc.free(initialize);
+        const old_table = try encodeTransitionCommand(alloc, .{ .upsert_table = .{ .table_id = 7, .name = "replay-old" } });
+        defer alloc.free(old_table);
+        const new_table = try encodeTransitionCommand(alloc, .{ .upsert_table = .{ .table_id = 7, .name = "replay-new" } });
+        defer alloc.free(new_table);
+        var prefix = try apply(store, group_id, &.{
+            .{ .index = 1, .term = 1, .data = initialize },
+            .{ .index = 2, .term = 1, .data = old_table },
+            .{ .index = 3, .term = 1 },
+            .{ .index = 4, .term = 1, .data = new_table },
+        });
+        defer prefix.deinit();
+        var suffix = try apply(store, group_id, &.{.{ .index = 5, .term = 1 }});
+        defer suffix.deinit();
+    }
+
+    const Capture = struct {
+        projections: usize = 0,
+        keys: usize = 0,
+        begins: usize = 0,
+        ends: usize = 0,
+        barrier_active: bool = false,
+
+        fn register(self: *@This(), store: *RaftApplyStore) !void {
+            try store.addProjectionListener(.{
+                .ptr = self,
+                .commit_barrier_kind = .table,
+                .vtable = &.{ .on_projection_signal = onProjection, .before_projection_commit = begin, .after_projection_commit = end },
+            });
+            try store.addCommittedKeyListener(.{ .ptr = self, .vtable = &.{ .matches_key = matchesKey, .on_committed_key = onKey } });
+        }
+
+        fn begin(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(!self.barrier_active);
+            self.barrier_active = true;
+            self.begins += 1;
+        }
+
+        fn end(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.barrier_active);
+            self.barrier_active = false;
+            self.ends += 1;
+        }
+
+        fn onProjection(ptr: *anyopaque, signal: ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (signal.kind == .table) std.debug.assert(self.barrier_active);
+            self.projections += 1;
+        }
+
+        fn matchesKey(_: *anyopaque, _: CommittedKeySignal) bool {
+            return true;
+        }
+
+        fn onKey(ptr: *anyopaque, _: CommittedKeySignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.keys += 1;
+        }
+    };
+};
+
+test "metadata replay skips durable stale and equal batches after reopen" {
+    const T = MetadataReplayTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(T.alloc, ".zig-cache/tmp/{s}/metadata-durable-replay", .{tmp.sub_path});
+    defer T.alloc.free(root);
+    {
+        var initial = try RaftApplyStore.init(T.alloc, .{ .root_dir = root });
+        defer initial.deinit();
+        try T.seed(&initial);
+    }
+    {
+        var store = try RaftApplyStore.init(T.alloc, .{ .root_dir = root });
+        defer store.deinit();
+        var capture = T.Capture{};
+        try capture.register(&store);
+        const before = try store.snapshotBuilder().buildSnapshot(T.alloc, T.group_id);
+        defer T.alloc.free(before);
+        const old_table = try encodeTransitionCommand(T.alloc, .{ .upsert_table = .{ .table_id = 7, .name = "replay-old" } });
+        defer T.alloc.free(old_table);
+        var stale = try T.apply(&store, T.group_id, &.{.{ .index = 2, .term = 1, .data = old_table }});
+        defer stale.deinit();
+        std.debug.print("metadata-replay-stale expected_index=5 actual_index={d}\n", .{(try store.latestBatch(T.group_id)).?.commit_index});
+        try std.testing.expectEqual(@as(u64, 5), (try store.latestBatch(T.group_id)).?.commit_index);
+        try std.testing.expectEqual(@as(usize, 0), stale.projection_signals.items.len);
+        try std.testing.expectEqual(@as(usize, 0), stale.committed_keys.items.len);
+        try std.testing.expectEqual(@as(usize, 0), stale.transition_deltas.items.len);
+        var equal = try T.apply(&store, T.group_id, &.{.{ .index = 5, .term = 1 }});
+        defer equal.deinit();
+        try std.testing.expectEqual(@as(usize, 0), equal.projection_signals.items.len);
+        try std.testing.expectEqual(@as(usize, 0), equal.committed_keys.items.len);
+        try std.testing.expectEqual(@as(usize, 0), equal.transition_deltas.items.len);
+        try store.snapshotBuilder().applyBatch(.{ .group_id = T.group_id, .commit_index = 5, .entries_bytes = "obsolete opaque batch" });
+        const expected_entries = try raft_state_machine.encodeCommittedEntries(T.alloc, &.{.{ .index = 5, .term = 1 }});
+        defer T.alloc.free(expected_entries);
+        try std.testing.expectEqualSlices(u8, expected_entries, (try store.latestBatch(T.group_id)).?.entries_bytes);
+        try std.testing.expectEqualDeep(T.Capture{}, capture);
+        const after = try store.snapshotBuilder().buildSnapshot(T.alloc, T.group_id);
+        defer T.alloc.free(after);
+        try std.testing.expectEqualSlices(u8, before, after);
+    }
+    var reopened = try RaftApplyStore.init(T.alloc, .{ .root_dir = root });
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 5), (try reopened.latestBatch(T.group_id)).?.commit_index);
+    const cursor = try reopened.captureCatalogCursor(T.group_id);
+    try std.testing.expectEqual(@as(u64, 4), cursor.revision);
+    try std.testing.expectEqual(T.incarnation, cursor.metadata_incarnation.?);
+    const tables = try reopened.listTables(T.alloc, T.group_id);
+    defer reopened.freeTables(T.alloc, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqualStrings("replay-new", tables[0].name);
+}
+
+test "metadata replay skips only the durable prefix of mixed batches" {
+    const T = MetadataReplayTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(T.alloc, ".zig-cache/tmp/{s}/metadata-mixed-replay", .{tmp.sub_path});
+    defer T.alloc.free(root);
+    var store = try RaftApplyStore.init(T.alloc, .{ .root_dir = root });
+    defer store.deinit();
+    try T.seed(&store);
+    var capture = T.Capture{};
+    try capture.register(&store);
+    const next_table = try encodeTransitionCommand(T.alloc, .{ .upsert_table = .{ .table_id = 7, .name = "replay-next" } });
+    defer T.alloc.free(next_table);
+    std.debug.print("metadata-replay-mixed durable=5 obsolete_index=2 new_index=6 terminal_index=7\n", .{});
+    var outcome = try T.apply(&store, T.group_id, &.{
+        .{ .index = 2, .term = 1, .data = @constCast("afmd1\xff") },
+        .{ .index = 5, .term = 1, .data = @constCast("afmd1\xff") },
+        .{ .index = 6, .term = 1, .data = next_table },
+        .{ .index = 7, .term = 1 },
+    });
+    defer outcome.deinit();
+    try std.testing.expectEqual(@as(u64, 7), (try store.latestBatch(T.group_id)).?.commit_index);
+    try std.testing.expectEqual(@as(u64, 7), (try store.captureCatalogCursor(T.group_id)).revision);
+    try std.testing.expectEqual(@as(usize, 1), outcome.projection_signals.items.len);
+    try std.testing.expectEqual(@as(usize, 1), outcome.committed_keys.items.len);
+    try std.testing.expectEqual(@as(usize, 0), outcome.transition_deltas.items.len);
+    try std.testing.expectEqualDeep(T.Capture{ .projections = 1, .keys = 1, .begins = 1, .ends = 1 }, capture);
+    const tables = try store.listTables(T.alloc, T.group_id);
+    defer store.freeTables(T.alloc, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqualStrings("replay-next", tables[0].name);
+    const before = try store.snapshotBuilder().buildSnapshot(T.alloc, T.group_id);
+    defer T.alloc.free(before);
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, T.apply(&store, T.group_id, &.{
+        .{ .index = 8, .term = 1, .data = @constCast("afmd1\xff") },
+    }));
+    try std.testing.expectEqual(@as(u64, 7), (try store.latestBatch(T.group_id)).?.commit_index);
+    try std.testing.expectEqualDeep(T.Capture{ .projections = 1, .keys = 1, .begins = 1, .ends = 1 }, capture);
+    const after = try store.snapshotBuilder().buildSnapshot(T.alloc, T.group_id);
+    defer T.alloc.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "metadata replay advances new noops without changing catalog authority or other groups" {
+    const T = MetadataReplayTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(T.alloc, ".zig-cache/tmp/{s}/metadata-replay-noops", .{tmp.sub_path});
+    defer T.alloc.free(root);
+    var store = try RaftApplyStore.init(T.alloc, .{ .root_dir = root });
+    defer store.deinit();
+    try T.seed(&store);
+    var capture = T.Capture{};
+    try capture.register(&store);
+    const compete = try encodeTransitionCommand(T.alloc, .{ .initialize_metadata_incarnation = "22222222222222222222222222222222".* });
+    defer T.alloc.free(compete);
+    var noops = try T.apply(&store, T.group_id, &.{
+        .{ .index = 6, .term = 1 },
+        .{ .index = 7, .term = 1, .data = compete },
+    });
+    defer noops.deinit();
+    try std.testing.expectEqual(@as(u64, 7), (try store.latestBatch(T.group_id)).?.commit_index);
+    try std.testing.expectEqual(@as(usize, 0), noops.projection_signals.items.len);
+    try std.testing.expectEqual(@as(usize, 0), noops.committed_keys.items.len);
+    try std.testing.expectEqual(@as(usize, 0), noops.transition_deltas.items.len);
+    try std.testing.expectEqualDeep(T.Capture{}, capture);
+    const key = "\x00\x00__api_restore_jobs__:000000000000002a";
+    const restore = try encodeTransitionCommand(T.alloc, .{ .upsert_restore_job = .{ .key = key, .value = "retained" } });
+    defer T.alloc.free(restore);
+    var noncatalog = try T.apply(&store, T.group_id, &.{.{ .index = 8, .term = 1, .data = restore }});
+    defer noncatalog.deinit();
+    try std.testing.expectEqual(@as(usize, 1), noncatalog.projection_signals.items.len);
+    try std.testing.expectEqual(ProjectionSignalKind.restore_job, noncatalog.projection_signals.items[0].signal.kind);
+    try std.testing.expectEqual(@as(usize, 1), noncatalog.committed_keys.items.len);
+    try std.testing.expectEqualDeep(T.Capture{ .projections = 1, .keys = 1 }, capture);
+    const cursor = try store.captureCatalogCursor(T.group_id);
+    try std.testing.expectEqual(@as(u64, 4), cursor.revision);
+    try std.testing.expectEqual(T.incarnation, cursor.metadata_incarnation.?);
+    const other_table = try encodeTransitionCommand(T.alloc, .{ .upsert_table = .{ .table_id = 7, .name = "other-group" } });
+    defer T.alloc.free(other_table);
+    var other = try T.apply(&store, 42, &.{.{ .index = 1, .term = 1, .data = other_table }});
+    defer other.deinit();
+    try std.testing.expectEqual(@as(u64, 1), (try store.latestBatch(42)).?.commit_index);
+    try std.testing.expectEqual(@as(u64, 1), (try store.captureCatalogCursor(42)).revision);
+    try std.testing.expectEqual(@as(u64, 8), (try store.latestBatch(T.group_id)).?.commit_index);
+    try std.testing.expectEqual(@as(u64, 4), (try store.captureCatalogCursor(T.group_id)).revision);
+    try std.testing.expectEqualDeep(T.Capture{ .projections = 2, .keys = 2, .begins = 1, .ends = 1 }, capture);
+    const value = (try store.getRestoreJobValue(T.alloc, T.group_id, key)).?;
+    defer T.alloc.free(value);
+    try std.testing.expectEqualStrings("retained", value);
+}

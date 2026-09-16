@@ -52,4 +52,16 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      - run: node --test .github/scripts/pr-ci.test.cjs
+      # Release branches may predate the approval controller. Validate the
+      # policy actually executing this run regardless of the PR's branch age.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted-ci
+          persist-credentials: false
+      - name: Test executing CI policy
+        working-directory: trusted-ci
+        run: node --test .github/scripts/pr-ci.test.cjs
+      - name: Test proposed CI policy when present
+        if: ${{ hashFiles('.github/scripts/pr-ci.test.cjs') != '' }}
+        run: node --test .github/scripts/pr-ci.test.cjs
