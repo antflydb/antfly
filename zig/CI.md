@@ -21,6 +21,11 @@ use the same controller implementation and repository-specific suite maps.
    approval rights. No per-user allowlist, GitHub App, or additional credential is
    required; permission checks use the automatically provided `GITHUB_TOKEN`.
 4. Follow **Approved PR CI** in Actions and the **PR CI** check on the PR head.
+   The advisory **CI run** status provides a clickable Details link: queued
+   approvals link to the PR-filtered workflow listing, and admitted runs link
+   directly to their jobs. `PR CI` remains the required gate; do not require
+   `CI run` in branch protection. Actions-created checks cannot override their
+   Details URL, so the separate status supplies navigation.
 
 Posting a new approval cancels the previous PR run and starts another attempt.
 Use a fresh comment to retry failed tests; Actions' **Re-run jobs** is not an

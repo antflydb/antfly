@@ -69,6 +69,25 @@ async function main({github, context, core, mode, config, env = process.env}) {
     if (runUrl) body.details_url = runUrl;
     if (conclusion) body.conclusion = conclusion;
     await github.rest.checks.update(body);
+    // Actions-owned checks ignore custom Details URLs. An advisory commit
+    // status supplies a clickable link without replacing the required check.
+    const listingUrl = `${context.serverUrl || 'https://github.com'}/${repository}/actions/workflows/${WORKFLOW}?query=${encodeURIComponent(`PR CI #${number} /`)}`;
+    try {
+      await github.rest.repos.createCommitStatus({
+        ...repo, sha: check.head_sha, context: 'CI run',
+        state: status !== 'completed' ? 'pending'
+          : conclusion === 'success' ? 'success'
+          : conclusion === 'failure' ? 'failure' : 'error',
+        target_url: runUrl || listingUrl,
+        description: (status !== 'completed'
+          ? runUrl ? 'CI running; view workflow jobs' : 'CI queued; view workflow runs'
+          : summary).slice(0, 140),
+      });
+    } catch (error) {
+      // Navigation must not interrupt dispatch, admission, or required-check
+      // publication, including workflows started before statuses permission.
+      core.notice(`Could not publish CI run link: ${error.message}`);
+    }
   };
   const checkFor = async pr => {
     const checks = await github.paginate(github.rest.checks.listForRef, {

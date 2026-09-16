@@ -18,6 +18,7 @@ function fixture() {
   const context = {repo: {owner: 'acme', repo: 'project'}, eventName: 'issue_comment',
     ref: 'refs/heads/main', runId: 91, apiUrl: 'https://api.github.com',
     payload: {action: 'created', repository, issue: {number: 7, pull_request: {}, labels: []}, comment}};
+  const statuses = [];
   const checks = [], dispatches = [], cancelled = [], runs = [], outputs = {}, notices = [];
   let permission = 'write';
   let files = [{filename: 'docs/guide.md'}];
@@ -41,7 +42,7 @@ function fixture() {
       },
     },
     issues: {getComment: async () => ({data: structuredClone(comment)})},
-    repos: {getCollaboratorPermissionLevel: async () => {
+    repos: {createCommitStatus: async body => {statuses.push(structuredClone(body));}, getCollaboratorPermissionLevel: async () => {
       if (typeof permission === 'number') throw Object.assign(new Error('Permission lookup failed'), {status: permission});
       return {data: {permission}};
     }},
@@ -55,7 +56,7 @@ function fixture() {
   }, paginate: async (method, args) => method(args)};
   const core = {setOutput: (k,v) => {outputs[k]=v;}, notice: msg => notices.push(msg)};
   const env = {PR_NUMBER: '7', CHECK_ID: '1', COMMENT_ID: '17', HEAD_SHA: SHA, BASE_SHA: BASE};
-  return {pr, comment, context, checks, dispatches, cancelled, runs, outputs, env, github,
+  return {pr, comment, context, checks, statuses, notices, dispatches, cancelled, runs, outputs, env, github,
     permission: value => {permission = value;}, files: value => {files = value;},
     jobs: value => {jobs = value;},
     call: (mode='event') => main({github, context, core, mode, config, env}),
@@ -212,6 +213,8 @@ test('a fresh approval revokes the old run; a late completion cannot pass it', a
   assert.equal(f.checks[0].conclusion,'action_required');
   assert.equal(f.checks[1].status,'queued');
   assert.equal(f.checks[1].details_url, undefined);
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.ok(f.statuses.at(-1).target_url.includes('/actions/workflows/'));
   assert.ok(!f.checks[1].output.summary.includes('View CI run'));
   f.finish(); await f.call();
   assert.equal(f.checks[1].status,'queued');
@@ -376,4 +379,52 @@ test('finalizer rejects other approval inputs and cannot restore a revoked check
   f.env.CHECK_ID='1';
   f.checks[0].output.text=JSON.stringify({...JSON.parse(f.checks[0].output.text),revoked:true});
   await f.call('complete'); assert.notEqual(f.checks[0].conclusion,'success');
+});
+
+
+test('CI run status links queued approval to listing and admitted run to jobs', async () => {
+  const f = fixture();
+  await f.call();
+  assert.deepEqual(f.statuses.at(-1), {
+    owner: 'acme', repo: 'project', sha: SHA, context: 'CI run', state: 'pending',
+    target_url: 'https://github.com/acme/project/actions/workflows/pr-ci.yml?query=PR%20CI%20%237%20%2F',
+    description: 'CI queued; view workflow runs',
+  });
+  await f.call('admit');
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.com/acme/project/actions/runs/91');
+  f.finish(); await f.call();
+  assert.equal(f.statuses.at(-1).state, 'success');
+  assert.equal(f.statuses.at(-1).sha, SHA);
+});
+
+test('CI run status reflects failure, dispatch failure, and invalidated approval', async t => {
+  for (const outcome of ['failure', 'dispatch failure', 'revoked']) await t.test(outcome, async () => {
+    const f = fixture();
+    if (outcome === 'dispatch failure') {
+      f.github.rest.actions.createWorkflowDispatch = async () => {throw new Error('dispatch failed');};
+      await assert.rejects(f.call(), /dispatch failed/);
+    } else {
+      await f.call(); await f.call('admit');
+      if (outcome === 'revoked') {
+        f.context.payload.action = 'edited';
+      } else {
+        f.finish(); f.context.payload.workflow_run.conclusion = 'failure';
+      }
+      await f.call();
+    }
+    assert.equal(f.statuses.at(-1).state, outcome === 'revoked' ? 'error' : 'failure');
+    assert.notEqual(f.checks.at(-1).conclusion, 'success');
+  });
+});
+
+test('CI run status supports enterprise URLs and cannot block the required check', async () => {
+  const f = fixture(); f.context.serverUrl = 'https://github.example.com';
+  await f.call();
+  assert.ok(f.statuses.at(-1).target_url.startsWith('https://github.example.com/'));
+  f.github.rest.repos.createCommitStatus = async () => {throw new Error('permission denied');};
+  await f.call('admit');
+  f.finish(); await f.call();
+  assert.equal(f.checks.at(-1).conclusion, 'success');
+  assert.ok(f.notices.some(n => n.includes('Could not publish CI run link')));
 });
