@@ -3766,7 +3766,7 @@ fn validateCatalogOwnerSemanticIdentity(
     if (embedder_cfg.url.len > 0) {
         const endpoint = switch (provider) {
             .openai, .ollama => try appendPathIfMissing(alloc, embedder_cfg.url, "/v1"),
-            .openrouter => try provider_defaults.appendPathIfMissing(alloc, embedder_cfg.url, embeddings_types.openrouter_default_url, "/v1"),
+            .openrouter => try normalizeOpenRouterBaseUrl(alloc, embedder_cfg.url),
             .cohere => try appendPathIfMissing(alloc, embedder_cfg.url, "/v2"),
             .gemini, .vertex => try alloc.dupe(u8, std.mem.trimEnd(u8, embedder_cfg.url, "/")),
             .bedrock => try alloc.dupe(u8, embedder_cfg.url),
@@ -6258,7 +6258,12 @@ fn resolveOpenRouterBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types
         embeddings_types.openrouter_default_url,
     );
     defer alloc.free(raw);
-    return try provider_defaults.appendPathIfMissing(alloc, raw, embeddings_types.openrouter_default_url, "/v1");
+    return try normalizeOpenRouterBaseUrl(alloc, raw);
+}
+
+fn normalizeOpenRouterBaseUrl(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    // Match model discovery: add /v1 only to a bare origin, preserving gateway paths.
+    return try appendPathIfMissing(alloc, std.mem.trimEnd(u8, raw, "/"), "/v1");
 }
 
 fn resolveOllamaBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
@@ -8447,7 +8452,7 @@ test "managed embedder openrouter probes dimensions and embeds queries and docum
 
         fn execute(_: *anyopaque, response_alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expectEqualStrings("/api/v1/embeddings", req.uri);
+            try std.testing.expectEqualStrings("/openrouter/embeddings", req.uri);
             try std.testing.expectEqualStrings("Bearer router-test-key", req.authorization orelse req.header("authorization") orelse "");
             var body = try std.json.parseFromSlice(std.json.Value, response_alloc, req.body, .{});
             defer body.deinit();
@@ -8478,7 +8483,7 @@ test "managed embedder openrouter probes dimensions and embeds queries and docum
     const base_uri = try listener.baseUri(alloc);
     defer alloc.free(base_uri);
     const config = try std.fmt.allocPrint(alloc,
-        \\{{"type":"embeddings","field":"body","embedder":{{"provider":"openrouter","model":"openai/text-embedding-3-small","url":"{s}/api/v1/","api_key":"router-test-key"}}}}
+        \\{{"type":"embeddings","field":"body","embedder":{{"provider":"openrouter","model":"openai/text-embedding-3-small","url":"{s}/openrouter/","api_key":"router-test-key"}}}}
     , .{base_uri});
     defer alloc.free(config);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, config, .{});
@@ -8490,10 +8495,16 @@ test "managed embedder openrouter probes dimensions and embeds queries and docum
     try std.testing.expectEqual(@as(i64, 3), normalized_parsed.value.object.get("dimension").?.integer);
     const semantic = try embeddingSemanticProducerJsonAlloc(alloc, parsed.value);
     defer alloc.free(semantic);
+    try validateCatalogOwnerSemanticIdentity(alloc, .{
+        .sparse = false,
+        .dimensions = 3,
+        .semantic_producer_json = semantic,
+        .index_value = normalized_parsed.value,
+    });
     var identity = try std.json.parseFromSlice(std.json.Value, alloc, semantic, .{});
     defer identity.deinit();
     try std.testing.expectEqualStrings("openrouter", identity.value.object.get("provider").?.string);
-    try std.testing.expect(std.mem.endsWith(u8, identity.value.object.get("endpoint").?.string, "/api/v1"));
+    try std.testing.expect(std.mem.endsWith(u8, identity.value.object.get("endpoint").?.string, "/openrouter"));
     const indexes = try std.fmt.allocPrint(alloc, "{{\"semantic_idx\":{s}}}", .{normalized});
     defer alloc.free(indexes);
     var managed = try ManagedEmbedder.initFromIndexesJson(alloc, indexes);
