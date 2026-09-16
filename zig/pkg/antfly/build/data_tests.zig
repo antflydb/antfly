@@ -36,6 +36,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data ownership fallback requires a single store across all roles",
         "data runtime background worker capacity is reserved and closes with its owner",
         "failed full index enrichment does not make resident reads unavailable",
         "enrichment runtime status reports worker lifecycle diagnostics",
@@ -216,6 +217,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
+        "remote metadata deadline ",
     };
     const lib_data_runtime_tests = @import("linked_tests.zig").add(b, .{
         .name = "data-runtime-tests",
