@@ -58,11 +58,33 @@ async function main({github, context, core, mode, config, env = process.env}) {
   const getPR = async () => (await github.rest.pulls.get({...repo, pull_number: number})).data;
   const getCheck = async id => (await github.rest.checks.get({...repo, check_run_id: Number(id)})).data;
   const writeCheck = async (check, data, status, summary, conclusion) => {
+    const runUrl = data.run_id
+      ? `${context.serverUrl || 'https://github.com'}/${repository}/actions/runs/${data.run_id}`
+      : null;
     const body = {
       ...repo, check_run_id: check.id, status,
-      output: {title: CHECK, summary, text: JSON.stringify(data)},
+      output: {title: CHECK, summary: runUrl ? `${summary}\n\n[View CI run](${runUrl})` : summary,
+        text: JSON.stringify(data)},
     };
+    if (runUrl) body.details_url = runUrl;
     if (conclusion) body.conclusion = conclusion;
+    // Actions-created checks can remain in an older workflow check suite,
+    // invisible to the merge box after a newer controller run on the same SHA.
+    // Use a distinct commit-status context as the required gate. Unlike a check,
+    // it is selected by SHA/context, independent of Actions suite association.
+    const listingUrl = `${context.serverUrl || 'https://github.com'}/${repository}/actions/workflows/${WORKFLOW}?query=${encodeURIComponent(`PR CI #${number} /`)}`;
+    await github.rest.repos.createCommitStatus({
+      ...repo, sha: check.head_sha, context: 'PR CI gate',
+      state: status !== 'completed' ? 'pending'
+        : conclusion === 'success' ? 'success'
+        : conclusion === 'failure' ? 'failure' : 'error',
+      target_url: runUrl || listingUrl,
+      description: (status !== 'completed'
+        ? runUrl ? 'CI running; view workflow jobs' : 'CI queued; view workflow runs'
+        : summary).slice(0, 140),
+    });
+    // Fail closed if gate publication fails: do not consume an approval or
+    // dispatch tests with a stale successful status from a previous attempt.
     await github.rest.checks.update(body);
   };
   const checkFor = async pr => {
