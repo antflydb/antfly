@@ -549,11 +549,8 @@ pub const Page = struct {
                 const current = (try getOptional(&txn, observed)) orelse continue;
                 if (!std.mem.eql(u8, &candidate.observed_hash, &digest(current))) continue;
             }
-            if (candidate.delete_observed) try txn.delete(candidate.observed_key.?);
-            if (candidate.delete_reverse) |reverse| txn.delete(reverse) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
+            if (candidate.delete_observed) try deleteDerived(self.arena.allocator(), &txn, candidate.observed_key.?);
+            if (candidate.delete_reverse) |reverse| try deleteDerived(self.arena.allocator(), &txn, reverse);
             if (candidate.nonmember) try writer.removeForRepair(&txn, index, candidate.document);
             if (candidate.tuple) |tuple| _ = try writer.repairCovered(&txn, index, candidate.document, tuple, candidate.payload);
         }
@@ -562,6 +559,22 @@ pub const Page = struct {
         try txn.commit();
     }
 };
+
+fn deleteDerived(alloc: Allocator, txn: anytype, key: []const u8) !void {
+    if (internal.isRelationalIndexReverseKey(key)) {
+        var ownership_key = std.ArrayList(u8).empty;
+        defer ownership_key.deinit(alloc);
+        try records.appendOwnershipFromReverse(alloc, &ownership_key, key);
+        txn.delete(ownership_key.items) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+    txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+}
 
 test "relational index progress checksums framing and readiness are strict" {
     const alloc = std.testing.allocator;

@@ -600,6 +600,83 @@ fn installPartial(db: *db_mod.DB, version: u32, indexed: bool) !void {
     try db.setSchemaJson(alloc, json);
 }
 
+test "relational index system retirement work follows generation size not unrelated table size" {
+    const gc = @import("relational_index_gc.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("generation-local-retirement");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    var db = try db_mod.DB.open(alloc, directory.path(), options);
+    defer db.close();
+    try installPartial(&db, 1, true);
+    // Ten thousand genuine primary rows, none belonging to the partial index.
+    for (0..40) |batch_number| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var writes: [250]@import("types.zig").BatchWrite = undefined;
+        for (&writes, 0..) |*item, i| item.* = .{
+            .key = try std.fmt.allocPrint(a, "doc:{d:0>8}", .{batch_number * writes.len + i}),
+            .value = try std.fmt.allocPrint(a, "{{\"tenant\":0,\"id\":{d},\"payload\":\"unchanged\"}}", .{batch_number * writes.len + i}),
+        };
+        try db.batch(.{ .writes = &writes });
+    }
+    try installPartial(&db, 2, false);
+    var empty_scanned: usize = 0;
+    while (try gc.Page.prepare(alloc, std.testing.io, db.core)) |value| {
+        var page = value;
+        defer page.deinit();
+        empty_scanned += page.records_scanned;
+        try page.commit(db.core);
+    }
+    try std.testing.expectEqual(@as(usize, 0), empty_scanned);
+
+    try installPartial(&db, 3, true);
+    for (0..5) |i| try write(&db, i, 1);
+    const id = blk: {
+        var plan = db.core.relational_indexes.acquire().?;
+        defer plan.deinit();
+        break :blk plan.plan.boundIndexes()[0].id();
+    };
+    // Lose one forward key; the independently owned locator must still find
+    // its reverse. Retirement cannot depend on decoding corrupt tuple values.
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var cursor = try txn.openCursor();
+        const first = (try cursor.seekAtOrAfter(&(try records.forwardPrefix(id)))).?;
+        const lost = try alloc.dupe(u8, first.key);
+        defer alloc.free(lost);
+        cursor.close();
+        try txn.delete(lost);
+        try txn.commit();
+    }
+    try installPartial(&db, 4, false);
+    var visited: usize = 0;
+    var pages: usize = 0;
+    while (try gc.Page.prepare(alloc, std.testing.io, db.core)) |value| {
+        {
+            var page = value;
+            defer page.deinit();
+            visited += page.records_scanned;
+            try page.commit(db.core);
+        }
+        pages += 1;
+        db.close();
+        db = try db_mod.DB.open(alloc, directory.path(), options);
+    }
+    try std.testing.expectEqual(@as(usize, 9), visited);
+    try std.testing.expectEqual(@as(usize, 2), pages);
+    var key = std.ArrayList(u8).empty;
+    defer key.deinit(alloc);
+    for (0..5) |i| {
+        var name: [64]u8 = undefined;
+        key.clearRetainingCapacity();
+        try records.appendReverseKey(alloc, &key, id, try std.fmt.bufPrint(&name, "doc:{d:0>8}", .{i}));
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, key.items));
+    }
+    std.debug.print("\nretirement work: 10000 unrelated rows; empty generation={} visits, 5-row damaged generation={} visits / {} pages (reopen each page)\n", .{ empty_scanned, visited, pages });
+}
+
 test "relational index system partial membership discharges uncovered predicates without primary probes" {
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("relational-partial-cover-proof");
     defer directory.cleanup();

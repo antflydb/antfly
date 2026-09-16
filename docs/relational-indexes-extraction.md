@@ -236,8 +236,8 @@ enum ordinals must never become persisted tags.
   and retirement pages with retry backoff. No direct std.Thread worker or yield
   was introduced. Readiness/status and indexed row reads now have public
   distributed adapters; explicit generation-fenced retry remains a DB method.
-- `relational_index_gc.zig` walks each retired generation's forward namespace,
-  reconstructing reverse keys from ownership framing without primary/reverse
+- `relational_index_gc.zig` walks each retired generation's forward and ownership
+  namespaces, reconstructing reverse keys from locators without primary/reverse
   point reads during preparation. Retired-value corruption does not prevent
   deletion. Cleanup cursors and deletions commit atomically and survive reopen;
   split destinations inherit cleanup authority with reset cursors. Retirement
@@ -1182,6 +1182,18 @@ Local lifecycle tests cover creation on existing rows through public schema
 JSON, outstanding transaction-lease rejection, live update/delete races,
 competing page CAS, durable failure/retry, LSM/LMDB reopen, ownership changes,
 600-row multi-page retirement, retired corruption, and private metadata guards.
+Retirement is generation-local: each reverse membership has a compact private
+`(generation, slot, document)` ownership locator committed atomically with it.
+Bounded GC pages visit only that generation's forward and ownership prefixes,
+so missing forward entries cannot hide reverse records and unrelated primary
+rows do not contribute cleanup work. Locators add one key on membership insertion
+and deletion, but are not rewritten for tuple/payload updates or unchanged rows.
+Range transfer prunes/reconstructs locators with the other derived companions;
+portable backups omit them and restore rebuilds them from canonical rows.
+The LSM regression with 10,000 unrelated rows visits zero records for an empty
+generation and nine for five memberships with one missing forward, reopening
+between both cleanup pages.
+
 Expiration regressions cover the actual stopped TTL runtime context, retired and
 current physical generations, and empty-table transitions after a split.
 The existing adaptive-aging regression now permits bounded maintenance slices

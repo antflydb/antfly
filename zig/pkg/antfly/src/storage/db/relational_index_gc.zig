@@ -22,7 +22,6 @@ const catalog = @import("relational_index_catalog.zig");
 const records = @import("relational_index_records.zig");
 const jobs = @import("relational_index_jobs.zig");
 const maintenance = @import("relational_index_maintenance_contract.zig");
-const internal = @import("../internal_keys.zig");
 const Allocator = std.mem.Allocator;
 pub const prefix = "\x00\x00__metadata__:relational_index_retired:";
 const max_cursor = 1024 * 1024;
@@ -62,12 +61,12 @@ fn checksum(id: records.Id, bytes: []const u8) [32]u8 {
     return result;
 }
 
-const Phase = enum(u8) { forward, reverse };
+const Phase = enum(u8) { forward, ownership };
 const Progress = struct { phase: Phase, after: []const u8 };
 
 pub fn initial(id: records.Id) [40]u8 {
     var value: [40]u8 = undefined;
-    @memcpy(value[0..8], "ARGC\x02\x00\x00\x00");
+    @memcpy(value[0..8], "ARGC\x03\x00\x00\x00");
     @memcpy(value[8..], &checksum(id, value[0..8]));
     return value;
 }
@@ -75,7 +74,7 @@ pub fn initial(id: records.Id) [40]u8 {
 fn encode(alloc: Allocator, id: records.Id, phase: Phase, after: []const u8) ![]u8 {
     if (after.len > max_cursor) return error.InvalidRelationalIndexGcProgress;
     const value = try alloc.alloc(u8, 40 + after.len);
-    @memcpy(value[0..8], "ARGC\x02\x00\x00\x00");
+    @memcpy(value[0..8], "ARGC\x03\x00\x00\x00");
     value[5] = @intFromEnum(phase);
     @memcpy(value[8..][0..after.len], after);
     @memcpy(value[value.len - 32 ..], &checksum(id, value[0 .. value.len - 32]));
@@ -87,7 +86,7 @@ pub fn decode(id: records.Id, value: []const u8) ![]const u8 {
 }
 
 fn decodeProgress(id: records.Id, value: []const u8) !Progress {
-    if (value.len < 40 or value.len > 40 + max_cursor or !std.mem.eql(u8, value[0..5], "ARGC\x02") or value[6] != 0 or value[7] != 0 or
+    if (value.len < 40 or value.len > 40 + max_cursor or !std.mem.eql(u8, value[0..5], "ARGC\x03") or value[6] != 0 or value[7] != 0 or
         !std.mem.eql(u8, value[value.len - 32 ..], &checksum(id, value[0 .. value.len - 32])))
         return error.InvalidRelationalIndexGcProgress;
     const phase = std.enums.fromInt(Phase, value[5]) orelse return error.InvalidRelationalIndexGcProgress;
@@ -95,7 +94,7 @@ fn decodeProgress(id: records.Id, value: []const u8) !Progress {
     if (after.len != 0) {
         if (phase == .forward) {
             if (!std.mem.startsWith(u8, after, &(try records.forwardPrefix(id)))) return error.InvalidRelationalIndexGcProgress;
-        } else if (after[0] != internal.user_namespace) return error.InvalidRelationalIndexGcProgress;
+        } else if (!std.mem.startsWith(u8, after, &(try records.ownershipPrefix(id)))) return error.InvalidRelationalIndexGcProgress;
     }
     return .{ .phase = phase, .after = after };
 }
@@ -109,6 +108,7 @@ pub const Page = struct {
     expected: []const u8,
     next: ?[]const u8,
     deletes: []const []const u8,
+    records_scanned: usize,
     consumed: bool = false,
 
     pub fn deinit(self: *Page) void {
@@ -140,13 +140,14 @@ pub const Page = struct {
         const progress = try decodeProgress(id, expected);
         const after = progress.after;
         const forward_prefix = try records.forwardPrefix(id);
+        const ownership_prefix = try records.ownershipPrefix(id);
         var deletes = std.ArrayList([]const u8).empty;
         var next = after;
         var scanned: usize = 0;
         var bytes: usize = 0;
         var exhausted = true;
         const started = time.monotonicNs();
-        const lower: []const u8 = if (progress.phase == .forward) &forward_prefix else &.{internal.user_namespace};
+        const lower: []const u8 = if (progress.phase == .forward) &forward_prefix else &ownership_prefix;
         var entry = try cursor.seekAtOrAfter(if (after.len == 0) lower else after);
         while (entry) |kv| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, kv.key, lower)) break;
@@ -154,24 +155,15 @@ pub const Page = struct {
             if (io) |runtime| try runtime.checkCancel();
             if (kv.key.len > max_cursor) return error.ResourceBudgetExceeded;
             next = try page_alloc.dupe(u8, kv.key);
-            if (progress.phase == .forward) {
-                try deletes.append(page_alloc, next);
-                if (records.forwardOwnership(kv.key)) |forward| {
-                    const reverse = try page_alloc.alloc(u8, 1 + forward.document_component.len + 1 + records.Id.encoded_len);
-                    reverse[0] = internal.user_namespace;
-                    @memcpy(reverse[1..][0..forward.document_component.len], forward.document_component);
-                    reverse[reverse.len - records.Id.encoded_len - 1] = internal.relational_index_reverse_kind;
-                    @memcpy(reverse[reverse.len - records.Id.encoded_len ..], &id.encode());
-                    // Retirement authorizes deletion of the entire generation, not
-                    // conditional replacement of a tuple. Its validated key ownership
-                    // is sufficient: avoid a cold reverse point-read per entry and do
-                    // not make a corrupt retired value prevent its own deletion.
-                    try deletes.append(page_alloc, reverse);
-                    bytes +|= reverse.len;
-                } else |_| {} // The retired prefix authorizes malformed derived keys too.
-            } else if (records.parseReverseKey(kv.key)) |reverse| {
-                if (reverse.id.mapKey() == id.mapKey()) try deletes.append(page_alloc, next);
-            } else |_| {}
+            try deletes.append(page_alloc, next);
+            if (progress.phase == .ownership) {
+                var reverse = std.ArrayList(u8).empty;
+                // Ownership is independent of tuple/value integrity. A lost
+                // forward entry cannot hide its reverse from this prefix scan.
+                try records.appendReverseFromOwnership(page_alloc, &reverse, kv.key);
+                try deletes.append(page_alloc, reverse.items);
+                bytes +|= reverse.items.len;
+            }
             scanned += 1;
             bytes +|= next.len;
             if (scanned >= 256 or bytes >= 1024 * 1024 or time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) {
@@ -179,9 +171,9 @@ pub const Page = struct {
                 break;
             }
         }
-        const continuation = if (!exhausted) try encode(page_alloc, id, progress.phase, next) else if (progress.phase == .forward) try encode(page_alloc, id, .reverse, "") else null;
+        const continuation = if (!exhausted) try encode(page_alloc, id, progress.phase, next) else if (progress.phase == .forward) try encode(page_alloc, id, .ownership, "") else null;
         owned = false;
-        return .{ .arena = arena, .pinned = pinned, .namespace = namespace, .owner = owner, .id = id, .expected = expected, .next = continuation, .deletes = deletes.items };
+        return .{ .arena = arena, .pinned = pinned, .namespace = namespace, .owner = owner, .id = id, .expected = expected, .next = continuation, .deletes = deletes.items, .records_scanned = scanned };
     }
 
     /// Caller owns apply-exclusive and the snapshot/HA mutation leases.

@@ -154,6 +154,8 @@ fn runRewrite(preserve_document: bool) !void {
     defer wire_frame.deinit(alloc);
     const spool_root = try std.fmt.allocPrint(a, "{s}.spool", .{target_path});
     var frame_digest: [32]u8 = undefined;
+    var frame_cache: @import("../rewrite_tail_spool.zig").Cache = .{};
+    defer frame_cache.deinit(std.testing.io);
     for (0..10000) |_| {
         const wire_json = try @import("online_merge_io.zig").executeJson(&source, alloc, .{ .scope = source_scope, .operation = .{ .rewrite_tail = .{ .after = start, .offset = @intCast(wire_frame.items.len), .max_bytes = 7 } } }, .none);
         defer alloc.free(wire_json);
@@ -166,17 +168,15 @@ fn runRewrite(preserve_document: bool) !void {
         try std.testing.expectEqual(wire_frame.items.len, value.offset);
         if (wire_frame.items.len != 0) try std.testing.expectEqualSlices(u8, &frame_digest, &value.frame_digest);
         frame_digest = value.frame_digest;
-        const spooled = try @import("../rewrite_tail_spool.zig").receive(alloc, std.testing.io, spool_root, scope, start, value);
-        defer spooled.deinit(alloc);
-        const repeated = try @import("../rewrite_tail_spool.zig").receive(alloc, std.testing.io, spool_root, scope, start, value);
-        defer repeated.deinit(alloc);
+        const spooled = try @import("../rewrite_tail_spool.zig").receive(alloc, std.testing.io, spool_root, scope, start, value, &frame_cache, alloc, null);
+        const repeated = try @import("../rewrite_tail_spool.zig").receive(alloc, std.testing.io, spool_root, scope, start, value, &frame_cache, alloc, null);
         try std.testing.expectEqual(value.offset + value.data.len, spooled.next);
         try std.testing.expectEqual(spooled.next, repeated.next);
         try std.testing.expectEqual(if (spooled.next == value.total) spooled.next - 1 else spooled.next, try @import("../rewrite_tail_spool.zig").resumeOffset(alloc, std.testing.io, spool_root, scope, start));
         try wire_frame.appendSlice(alloc, value.data);
         if (wire_frame.items.len == value.total) {
-            try std.testing.expectEqualSlices(u8, wire_frame.items, spooled.frame.?);
-            try std.testing.expectEqualSlices(u8, wire_frame.items, repeated.frame.?);
+            try std.testing.expectEqualSlices(u8, wire_frame.items, spooled.frame.?.reader.encoded_frame);
+            try std.testing.expectEqualSlices(u8, wire_frame.items, repeated.frame.?.reader.encoded_frame);
             break;
         }
     } else return error.TestUnexpectedResult;
@@ -186,7 +186,7 @@ fn runRewrite(preserve_document: bool) !void {
         const complete = before_tail.value.rewrite.?.sequence == cut.sequence;
         before_tail.deinit();
         if (complete) break;
-        var tail = try rewrite.prepareTailFrame(&target, alloc, scope, wire_frame.items, frame_digest, &programs, 1, .none);
+        var tail = try rewrite.prepareTailVerified(&target, alloc, scope, &frame_cache.entry.?.frame, &programs, 1, .none);
         defer tail.deinit();
         if (tail.batch == null) break;
         try apply(&target, &tail, index);

@@ -18,6 +18,9 @@
 //! Reverse: [document prefix][reverse kind][12-byte ID] -> [v1][tuple][CRC32C].
 //! Reverse records participate in document-range ownership. Range transfer must
 //! derive their forward companions and exclude unselected global forward keys.
+//! Ownership: [private ownership namespace][12-byte ID][encoded document] -> empty.
+//! This atomic reverse companion permits generation-local GC even if a forward
+//! entry is lost. Tuple updates and unchanged rows do not rewrite ownership.
 //! Neither this module nor a write plan establishes query readiness.
 
 const std = @import("std");
@@ -29,6 +32,7 @@ pub const Id = native.RelationalIndexId;
 /// Private metadata namespace; cannot be mistaken for a primary user row.
 /// This is an unpublished format, not the mega branch's escaped tuple format.
 pub const forward_namespace = "\x00\x00R\x01";
+pub const ownership_namespace = "\x00\x00R\x02";
 const reverse_version: u8 = 1;
 pub const forward_prefix_len = forward_namespace.len + Id.encoded_len;
 
@@ -42,6 +46,38 @@ pub fn forwardPrefix(id: Id) ![forward_prefix_len]u8 {
 
 pub fn isForwardKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, forward_namespace);
+}
+
+pub fn ownershipPrefix(id: Id) ![forward_prefix_len]u8 {
+    var prefix = try forwardPrefix(id);
+    @memcpy(prefix[0..ownership_namespace.len], ownership_namespace);
+    return prefix;
+}
+
+pub fn isOwnershipKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, ownership_namespace);
+}
+
+pub fn appendOwnershipFromReverse(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8) !void {
+    const reverse = try parseReverseKey(key);
+    try out.appendSlice(alloc, &(try ownershipPrefix(reverse.id)));
+    try out.appendSlice(alloc, reverse.document_component);
+}
+
+pub fn ownershipDocument(key: []const u8) ![]const u8 {
+    if (!isOwnershipKey(key) or key.len < forward_prefix_len + 2) return error.InvalidRelationalIndexReverseKey;
+    _ = try Id.decode(key[ownership_namespace.len..forward_prefix_len]);
+    const term = internal.findComponentTerminator(key, forward_prefix_len) orelse return error.InvalidRelationalIndexReverseKey;
+    if (term + 2 != key.len) return error.InvalidRelationalIndexReverseKey;
+    return key[forward_prefix_len..];
+}
+
+pub fn appendReverseFromOwnership(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8) !void {
+    const document = try ownershipDocument(key);
+    try out.append(alloc, internal.user_namespace);
+    try out.appendSlice(alloc, document);
+    try out.append(alloc, internal.relational_index_reverse_kind);
+    try out.appendSlice(alloc, key[ownership_namespace.len..forward_prefix_len]);
 }
 
 pub fn appendReverseKey(alloc: Allocator, out: *std.ArrayList(u8), id: Id, document: []const u8) !void {
@@ -171,6 +207,7 @@ pub const Writer = struct {
     old_forward: std.ArrayList(u8) = .empty,
     new_forward: std.ArrayList(u8) = .empty,
     forward_value: std.ArrayList(u8) = .empty,
+    ownership_key: std.ArrayList(u8) = .empty,
 
     pub fn init(alloc: Allocator) Writer {
         return .{ .alloc = alloc };
@@ -182,6 +219,7 @@ pub const Writer = struct {
         self.old_forward.deinit(self.alloc);
         self.new_forward.deinit(self.alloc);
         self.forward_value.deinit(self.alloc);
+        self.ownership_key.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -193,6 +231,7 @@ pub const Writer = struct {
         try self.reverse_value.ensureTotalCapacity(self.alloc, try std.math.add(usize, tuple_bytes, 5));
         try self.old_forward.ensureTotalCapacity(self.alloc, forward_len);
         try self.new_forward.ensureTotalCapacity(self.alloc, forward_len);
+        try self.ownership_key.ensureTotalCapacity(self.alloc, forward_prefix_len + encoded_document_bytes);
     }
 
     pub fn reservePayload(self: *Writer, bytes: usize) !void {
@@ -205,6 +244,7 @@ pub const Writer = struct {
         self.old_forward.clearRetainingCapacity();
         self.new_forward.clearRetainingCapacity();
         self.forward_value.clearRetainingCapacity();
+        self.ownership_key.clearRetainingCapacity();
     }
 
     fn encodeForwardValue(self: *Writer, payload: []const u8) !void {
@@ -259,6 +299,7 @@ pub const Writer = struct {
         try appendForwardEncoded(self.alloc, &self.new_forward, index.id(), tuple, owner.document_component);
         try appendReverseValue(self.alloc, &self.reverse_value, self.reverse_key.items, tuple);
         try self.encodeForwardValue(payload);
+        if (old == null) try appendOwnershipFromReverse(self.alloc, &self.ownership_key, self.reverse_key.items);
         // Included values and full-row visibility metadata can change while
         // comparison keys stay identical. Only rewrite the forward payload;
         // the document-owned reverse record remains a tuple-only record.
@@ -275,6 +316,7 @@ pub const Writer = struct {
         if (old != null) try deleteIfPresent(txn, self.old_forward.items);
         try txn.put(self.new_forward.items, self.forward_value.items);
         try txn.put(self.reverse_key.items, self.reverse_value.items);
+        if (old == null) try txn.put(self.ownership_key.items, "");
         return if (old != null) .updated else .inserted;
     }
 
@@ -286,8 +328,10 @@ pub const Writer = struct {
             else => return err,
         };
         try appendForwardFromReverse(self.alloc, &self.old_forward, self.reverse_key.items, old);
+        try appendOwnershipFromReverse(self.alloc, &self.ownership_key, self.reverse_key.items);
         try deleteIfPresent(txn, self.old_forward.items);
         try txn.delete(self.reverse_key.items);
+        try deleteIfPresent(txn, self.ownership_key.items);
         return .deleted;
     }
 
@@ -316,8 +360,10 @@ pub const Writer = struct {
             error.InvalidRelationalIndexReverseValue, error.RelationalIndexReverseChecksumMismatch => {},
             else => return err,
         };
+        try appendOwnershipFromReverse(self.alloc, &self.ownership_key, self.reverse_key.items);
         if (self.old_forward.items.len != 0) try deleteIfPresent(txn, self.old_forward.items);
         try txn.delete(self.reverse_key.items);
+        try deleteIfPresent(txn, self.ownership_key.items);
     }
 
     /// A repair caller has already pinned and rechecked the authoritative
@@ -337,6 +383,7 @@ pub const Writer = struct {
         try appendForwardEncoded(self.alloc, &self.new_forward, index.id(), tuple, owner.document_component);
         try appendReverseValue(self.alloc, &self.reverse_value, self.reverse_key.items, tuple);
         try self.encodeForwardValue(payload);
+        try appendOwnershipFromReverse(self.alloc, &self.ownership_key, self.reverse_key.items);
         var changed: usize = 0;
         const forward = txn.get(self.new_forward.items) catch |err| switch (err) {
             error.NotFound => null,
@@ -352,6 +399,14 @@ pub const Writer = struct {
         };
         if (reverse == null or !std.mem.eql(u8, reverse.?, self.reverse_value.items)) {
             try txn.put(self.reverse_key.items, self.reverse_value.items);
+            changed += 1;
+        }
+        const ownership = txn.get(self.ownership_key.items) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (ownership == null or ownership.?.len != 0) {
+            try txn.put(self.ownership_key.items, "");
             changed += 1;
         }
         return changed;
@@ -373,7 +428,7 @@ fn deleteIfPresent(txn: anytype, key: []const u8) !void {
 /// Publication must wait for done. A failed page leaves the cursor unchanged.
 pub const RangeRepair = struct {
     alloc: Allocator,
-    phase: enum { prune, reconstruct, done } = .prune,
+    phase: enum { prune, prune_ownership, reconstruct, done } = .prune,
     after: ?[]u8 = null,
 
     pub fn deinit(self: *RangeRepair) void {
@@ -394,7 +449,11 @@ pub const RangeRepair = struct {
         try internal.appendDocumentPrefix(&lower_prefix, alloc, lower);
         var upper_prefix = std.ArrayList(u8).empty;
         if (upper.len != 0) try internal.appendDocumentPrefix(&upper_prefix, alloc, upper);
-        const prefix = if (self.phase == .prune) forward_namespace else lower_prefix.items;
+        const prefix = switch (self.phase) {
+            .prune => forward_namespace,
+            .prune_ownership => ownership_namespace,
+            else => lower_prefix.items,
+        };
         var read = try store.beginReadTxn();
         defer read.abort();
         var cursor = try read.openCursor();
@@ -408,8 +467,8 @@ pub const RangeRepair = struct {
         var entry = try cursor.seekAtOrAfter(self.after orelse prefix);
         while (entry) |kv| : (entry = try cursor.next()) {
             if (self.after) |after| if (std.mem.order(u8, kv.key, after) != .gt) continue;
-            if (self.phase == .prune) {
-                if (!isForwardKey(kv.key)) break;
+            if (self.phase != .reconstruct) {
+                if (!std.mem.startsWith(u8, kv.key, prefix)) break;
             } else {
                 if (kv.key.len == 0 or kv.key[0] != internal.user_namespace) break;
                 if (upper.len != 0 and std.mem.order(u8, kv.key, upper_prefix.items) != .lt) break;
@@ -417,12 +476,19 @@ pub const RangeRepair = struct {
             scanned += 1;
             bytes +|= kv.key.len;
             last = try alloc.dupe(u8, kv.key);
-            if (self.phase == .prune) {
-                const owner = try forwardOwnership(kv.key);
-                const outside = std.mem.order(u8, owner.document_component, lower_prefix.items[1..]) == .lt or
-                    (upper.len != 0 and std.mem.order(u8, owner.document_component, upper_prefix.items[1..]) != .lt);
+            if (self.phase != .reconstruct) {
+                const document = if (self.phase == .prune) (try forwardOwnership(kv.key)).document_component else try ownershipDocument(kv.key);
+                const outside = std.mem.order(u8, document, lower_prefix.items[1..]) == .lt or
+                    (upper.len != 0 and std.mem.order(u8, document, upper_prefix.items[1..]) != .lt);
                 if (outside) try deletes.append(alloc, last.?);
             } else if (internal.isRelationalIndexReverseKey(kv.key)) {
+                var ownership_key = std.ArrayList(u8).empty;
+                try appendOwnershipFromReverse(alloc, &ownership_key, kv.key);
+                const locator = read.get(ownership_key.items) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (locator == null or locator.?.len != 0) try writes.append(alloc, .{ .key = ownership_key.items, .value = "" });
                 var forward = std.ArrayList(u8).empty;
                 try appendForwardFromReverse(alloc, &forward, kv.key, kv.value);
                 const existing: ?[]const u8 = read.get(forward.items) catch |err| switch (err) {
@@ -450,7 +516,11 @@ pub const RangeRepair = struct {
             try store.putBatch(writes.items, deletes.items);
         if (self.after) |key| self.alloc.free(key);
         self.after = next;
-        if (exhausted) self.phase = if (self.phase == .prune) .reconstruct else .done;
+        if (exhausted) self.phase = switch (self.phase) {
+            .prune => .prune_ownership,
+            .prune_ownership => .reconstruct,
+            else => .done,
+        };
         return writes.items.len + deletes.items.len;
     }
 };
@@ -687,7 +757,7 @@ fn testMutations(comptime Backend: type) !void {
         try txn.put(primary_key, old.packed_row);
         var counted = CountingTxn{ .txn = &txn };
         try writer.upsertPrepared(&counted, plan, &batch, 0, document, .new_or_building);
-        try std.testing.expectEqual(@as(usize, 4), counted.writes);
+        try std.testing.expectEqual(@as(usize, 6), counted.writes);
         try txn.commit();
     }
     {
@@ -810,10 +880,13 @@ fn testRangeRepair(comptime Backend: type) !void {
         try std.testing.expect(calls < 12);
     }
     try std.testing.expect(calls >= 3);
-    try std.testing.expectEqual(@as(usize, 600), effects);
+    try std.testing.expectEqual(@as(usize, 1080), effects);
     const stored = try store.scanPrefix(alloc, forward_namespace);
     defer docstore.DocStore.freeResults(alloc, stored);
     try std.testing.expectEqual(@as(usize, 120), stored.len);
+    const locators = try store.scanPrefix(alloc, ownership_namespace);
+    defer docstore.DocStore.freeResults(alloc, locators);
+    try std.testing.expectEqual(@as(usize, 120), locators.len);
     for (stored) |entry| {
         const owner = try forwardOwnership(entry.key);
         try std.testing.expect(owner.tuple.len != 0);
@@ -945,7 +1018,7 @@ fn testStagedMutations(comptime Backend: type) !void {
     }
     try staged.upsertPrepared(&writer, plan, &batch, 1, document, .new_or_building);
     const effects = try staged.seal();
-    try std.testing.expectEqual(@as(usize, 4), effects.writes.len);
+    try std.testing.expectEqual(@as(usize, 6), effects.writes.len);
     try std.testing.expectEqual(@as(usize, 2), effects.deletes.len);
     try std.testing.expectError(error.RelationalIndexStageClosed, staged.seal());
     try std.testing.expectError(error.RelationalIndexStageClosed, staged.upsertPrepared(&writer, plan, &batch, 0, document, .indexed));
@@ -1002,8 +1075,10 @@ test "relational index records primary repair writes only damaged companions" {
     defer writer.deinit();
     var txn = try store.beginWriteTxn();
     defer txn.abort();
-    try std.testing.expectEqual(@as(usize, 2), try writer.repair(&txn, plan.boundIndexes()[0], "doc", tuple.bytes));
+    try std.testing.expectEqual(@as(usize, 3), try writer.repair(&txn, plan.boundIndexes()[0], "doc", tuple.bytes));
     try std.testing.expectEqual(@as(usize, 0), try writer.repair(&txn, plan.boundIndexes()[0], "doc", tuple.bytes));
+    try txn.delete(writer.ownership_key.items);
+    try std.testing.expectEqual(@as(usize, 1), try writer.repair(&txn, plan.boundIndexes()[0], "doc", tuple.bytes));
     try txn.delete(writer.new_forward.items);
     try txn.put(writer.reverse_key.items, "damaged");
     try std.testing.expectEqual(@as(usize, 2), try writer.repair(&txn, plan.boundIndexes()[0], "doc", tuple.bytes));

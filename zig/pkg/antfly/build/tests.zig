@@ -385,10 +385,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, relational_index_system_mod, true, true);
     const relational_index_system_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
-        .filters = &.{"relational index system"},
+        .filters = &.{ "relational index system", "relational index records" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addFilteredTestRunArtifact(b, relational_index_system_tests).step);
+    b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{

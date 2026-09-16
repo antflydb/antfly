@@ -103,6 +103,20 @@ transfer in bounded 64 KiB chunks from a cached checksum-verified frame and are
 assembled in a disposable durable spool under the existing restore source
 generation. The shared owner importer validates the immutable program and uses
 the same replicated staging CAS for snapshot and transformed tail pages.
+The receiving DB retains one immutable, authenticated frame and an ordinal
+boundary table across page RPCs. Each durable `(offset, remaining)` cursor is
+checked against that table in O(1); consumed prefixes are neither reread nor
+rehashed. The cache is limited to the 16 MiB frame ceiling plus boundary metadata,
+charged to the shared relational preparation budget, and reclaimable while idle.
+Restart, eviction, and corruption always require fresh spool verification; only
+replicated progress acknowledges effects. Frame completion, terminal cleanup,
+and owner close release the cache. Cache leases use `std.Io.Mutex`.
+The work-count regression consumes 4,096 effects in 32 pages from an 8,519,728-byte
+frame: one payload read/verification instead of 272,631,296 bytes of per-page
+reloads. Warm page access allocates nothing for the frame and boundary lookup.
+Separate checks cover both slice-local and aggregate pressure eviction, leased
+frame protection, allocation-failure retries, and corrupt persisted spool bytes.
+
 The shared restore worker now drives source publication, bounded authenticated
 peer-artifact push, snapshot transformation, retained catchup, all-source
 fence/drain, exact final tails, shared validation and atomic cohort publication.

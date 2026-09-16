@@ -301,11 +301,11 @@ pub const Reader = struct {
             std.mem.readInt(u64, bytes[4..12], .little) != sequence)
             return error.RetainedEffectsCorrupt;
         // Share the payload hash pass between checksum validation and complete
-        // frame identity. finalResult clones the hash state, so extending it
+        // frame identity. peek clones the hash state, so extending it
         // with the stored checksum avoids hashing a 16 MiB payload twice.
         var frame_hash = std.crypto.hash.sha2.Sha256.init(.{});
         frame_hash.update(bytes[0 .. bytes.len - 32]);
-        if (!std.mem.eql(u8, bytes[bytes.len - 32 ..], &frame_hash.finalResult())) return error.RetainedEffectsCorrupt;
+        if (!std.mem.eql(u8, bytes[bytes.len - 32 ..], &frame_hash.peek())) return error.RetainedEffectsCorrupt;
         frame_hash.update(bytes[bytes.len - 32 ..]);
         const count = std.mem.readInt(u32, bytes[12..16], .little);
         if (count == 0 or count > max_keys) return error.RetainedEffectsCorrupt;

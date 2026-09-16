@@ -5167,6 +5167,7 @@ const GraphRestoreParseCache = struct {
 };
 
 pub const DB = struct {
+    rewrite_tail_cache: @import("../rewrite_tail_spool.zig").Cache = .{},
     online_merge_reader: @import("online_merge_io.zig").Cache = .{},
     source_publication: @import("source_publication_job.zig").Job = .{},
     restore_staging_required: std.atomic.Value(bool) = .init(false),
@@ -7058,6 +7059,7 @@ pub const DB = struct {
         self.closed = true;
         self.source_publication.stop(self.backend_runtime.io() orelse std.Options.debug_io);
         self.online_merge_reader.retire(self.backend_runtime.io() orelse std.Options.debug_io, null);
+        self.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
         self.deinitWrapperState(true);
     }
 

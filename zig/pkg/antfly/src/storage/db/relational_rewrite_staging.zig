@@ -25,6 +25,7 @@ const keys = @import("../internal_keys.zig");
 const DB = @import("db.zig").DB;
 const Allocator = std.mem.Allocator;
 const LogicalRow = @import("relational_rewrite_program.zig").LogicalRow;
+const VerifiedFrame = @import("../verified_retained_frame.zig").Frame;
 
 pub const ProgramSet = @import("relational_rewrite_program.zig").ProgramSet;
 /// A numeric source schema version and a read-only handle do not identify the
@@ -64,11 +65,20 @@ pub fn prepareTail(target: *DB, alloc: Allocator, scope: staging.Scope, source: 
 /// digest, then uses the same transformer as local capture. Source integrity
 /// bytes never become target claims. The caller retains frame for this call.
 pub fn prepareTailFrame(target: *DB, alloc: Allocator, scope: staging.Scope, frame: []const u8, expected_digest: contract.Digest, programs: *const ProgramSet, max_effects: usize, cancellation: types.CancellationToken) !staging.PreparedPage {
-    if (frame.len > 16 * 1024 * 1024) return error.InvalidRestoreStagingCommand;
-    return prepareTailInternal(target, alloc, scope, null, .{ .bytes = frame, .digest = expected_digest }, programs, max_effects, cancellation);
+    if (frame.len < 16 or frame.len > 16 * 1024 * 1024) return error.InvalidRestoreStagingCommand;
+    var verified = try VerifiedFrame.init(alloc, frame, std.mem.readInt(u64, frame[4..12], .little));
+    defer verified.deinit();
+    if (!std.mem.eql(u8, &verified.reader.frame_digest, &expected_digest)) return error.RetainedEffectsCorrupt;
+    return prepareTailVerified(target, alloc, scope, &verified, programs, max_effects, cancellation);
 }
 
-fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, source: ?*DB, frame: ?struct { bytes: []const u8, digest: contract.Digest }, programs: *const ProgramSet, max_effects: usize, cancellation: types.CancellationToken) !staging.PreparedPage {
+/// Owner's immutable cache stays leased through this call. Durable progress,
+/// never a speculative in-memory position, selects the verified boundary.
+pub fn prepareTailVerified(target: *DB, alloc: Allocator, scope: staging.Scope, frame: *const VerifiedFrame, programs: *const ProgramSet, max_effects: usize, cancellation: types.CancellationToken) !staging.PreparedPage {
+    return prepareTailInternal(target, alloc, scope, null, frame, programs, max_effects, cancellation);
+}
+
+fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, source: ?*DB, frame: ?*const VerifiedFrame, programs: *const ProgramSet, max_effects: usize, cancellation: types.CancellationToken) !staging.PreparedPage {
     try programs.requireScope(scope);
     if (max_effects == 0 or max_effects > 128 or (source != null and !source.?.core.identity_namespace.eql(scope.source_namespace)) or
         !target.core.identity_namespace.eql(scope.target_namespace)) return error.InvalidRestoreStagingCommand;
@@ -88,14 +98,16 @@ fn prepareTailInternal(target: *DB, alloc: Allocator, scope: staging.Scope, sour
     var namespace: [24]u8 = undefined;
     @import("doc_identity.zig").encodeNamespace(&namespace, scope.source_namespace);
     const binding = scope.rewrite.?;
-    var reader = if (frame) |value| try retained.Reader.init(value.bytes, try std.math.add(u64, previous.sequence, 1)) else (try retained.read(&source_txn.?, namespace, binding.retained_epoch, binding.retained_pin, previous.sequence)) orelse
+    if (frame) |value| if (std.mem.readInt(u64, value.reader.bytes[4..12], .little) != try std.math.add(u64, previous.sequence, 1)) return error.RetainedEffectsCorrupt;
+    var reader = if (frame) |value| try value.readerAt(previous.frame_offset, previous.frame_remaining) else (try retained.read(&source_txn.?, namespace, binding.retained_epoch, binding.retained_pin, previous.sequence)) orelse
         return .{ .arena = arena, .phase = next.phase, .batch = null };
-    if (frame) |value| if (!std.mem.eql(u8, &reader.frame_digest, &value.digest)) return error.RetainedEffectsCorrupt;
     if (previous.frame_offset != 0) {
         if (!std.mem.eql(u8, &reader.frame_digest, &previous.frame_digest)) return error.RestoreStagingProgressChanged;
         // Validate the stored byte offset against an actual frame boundary,
         // rather than trusting a cursor to skip or reinterpret committed bytes.
-        while (reader.pos < previous.frame_offset) _ = (try reader.next()) orelse return error.InvalidRestoreStagingRecord;
+        if (frame == null) while (reader.pos < previous.frame_offset) {
+            _ = (try reader.next()) orelse return error.InvalidRestoreStagingRecord;
+        };
         if (reader.pos != previous.frame_offset or reader.remaining != previous.frame_remaining) return error.InvalidRestoreStagingRecord;
     }
     var writes: std.ArrayList(types.BatchWrite) = .empty;

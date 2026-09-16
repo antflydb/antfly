@@ -489,6 +489,8 @@ pub fn exportPortableToWriterWithOptions(
 fn nextPortableDataEntry(cursor: anytype, initial: anytype, stats: ?*ExportStats) !@TypeOf(initial) {
     var entry = initial;
     const exclusions = .{
+        .{ relational_index_records.forward_namespace, "\x00\x00R\x03" },
+        .{ relational_index_records.ownership_namespace, "\x00\x00R\x03" },
         .{ internal_keys.relational_columnar_prefix, "\x00\x00__columnar__;" },
         .{ portable_metadata_prefix, "\x00\x00__metadata__;" },
         .{ &[_]u8{internal_keys.replay_namespace}, &[_]u8{internal_keys.replay_namespace + 1} },
@@ -812,7 +814,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
         // Ordered indexes are derived from canonical rows during staged import.
         // Do not copy stale generations or serialize each tuple twice. The
         // active definition manifest is emitted before the primary-row stream.
-        if (relational_index_records.isForwardKey(kv.key) or internal_keys.isRelationalIndexReverseKey(kv.key))
+        if (relational_index_records.isForwardKey(kv.key) or relational_index_records.isOwnershipKey(kv.key) or internal_keys.isRelationalIndexReverseKey(kv.key))
             continue;
 
         if (kv.key.len > 0 and kv.key[0] == internal_keys.identity_namespace) {

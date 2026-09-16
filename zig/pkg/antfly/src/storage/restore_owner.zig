@@ -302,6 +302,9 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         else => null,
     };
     if (desired) |phase| if (before.value.phase == phase) {
+        target.rewrite_tail_cache.mutex.lockUncancelable(env.io);
+        target.rewrite_tail_cache.clear();
+        target.rewrite_tail_cache.mutex.unlock(env.io);
         if (phase == .published or phase == .canceled) try releaseSource(alloc, env, input.scope);
         return .{ .phase = phase, .rows = before.value.rows, .receipt = before.value.receipt() };
     };
@@ -326,15 +329,22 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 // No target apply lock is held during bounded chunk fsync.
                 var transition = try generation.beginProcessExclusiveWithRuntimeAndIo(env.cache_path, env.runtime, env.io);
                 defer transition.deinit();
-                const assembled = try @import("rewrite_tail_spool.zig").receive(alloc, env.io, env.cache_path, input.scope, progress.sequence, chunk);
-                defer assembled.deinit(alloc);
+                const cache = &target.rewrite_tail_cache;
+                try cache.mutex.lock(env.io);
+                defer cache.mutex.unlock(env.io);
+                const assembled = try @import("rewrite_tail_spool.zig").receive(alloc, env.io, env.cache_path, input.scope, progress.sequence, chunk, cache, target.alloc, target.core.index_manager.resource_manager);
                 tail_next = assembled.next;
                 if (assembled.frame) |frame| {
                     var program = try @import("db/relational_rewrite_staging.zig").ProgramSet.initIntent(alloc, input.rewrite.?);
                     defer program.deinit();
-                    var page = try @import("db/relational_rewrite_staging.zig").prepareTailFrame(target, alloc, input.scope, frame, chunk.frame_digest, &program, input.max_rows, context.cancellation);
+                    var page = try @import("db/relational_rewrite_staging.zig").prepareTailVerified(target, alloc, input.scope, frame, &program, input.max_rows, context.cancellation);
                     defer page.deinit();
-                    if (page.batch) |batch| try env.proposer.propose(env.proposer.ptr, batch, context);
+                    if (page.batch) |batch| {
+                        try env.proposer.propose(env.proposer.ptr, batch, context);
+                        var advanced = try staging.Progress.decode(alloc, batch.restore_staging.?.rewrite_page.next);
+                        defer advanced.deinit();
+                        if (advanced.value.rewrite.?.sequence == chunk.sequence) cache.clear();
+                    }
                 }
                 break :import;
             }
@@ -358,7 +368,12 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     }
     var after = (try target.restoreStagingStatus(alloc)) orelse return error.RestoreStagingScopeChanged;
     defer after.deinit();
-    if (after.value.phase == .published or after.value.phase == .canceled) try releaseSource(alloc, env, input.scope);
+    if (after.value.phase == .published or after.value.phase == .canceled) {
+        target.rewrite_tail_cache.mutex.lockUncancelable(env.io);
+        target.rewrite_tail_cache.clear();
+        target.rewrite_tail_cache.mutex.unlock(env.io);
+        try releaseSource(alloc, env, input.scope);
+    }
     return .{ .phase = after.value.phase, .rows = after.value.rows, .receipt = after.value.receipt(), .rewrite = after.value.rewrite, .tail_next = tail_next, .source_next_offset = source_next_offset };
 }
 
