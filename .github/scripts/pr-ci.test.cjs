@@ -100,6 +100,42 @@ test('approval is consumed once, uses the default branch, and publishes on the P
   await assert.rejects(f.call('verify'),/expired/);
 });
 
+test('PR checks link to the admitted run through completion and revocation', async t => {
+  for (const outcome of ['success', 'failure', 'cancelled', 'revoked']) {
+    await t.test(outcome, async () => {
+      const f = fixture();
+      await f.call();
+      assert.equal(f.checks[0].details_url, undefined);
+      assert.ok(!f.checks[0].output.summary.includes('View CI run'));
+      await f.call('admit');
+      const url = 'https://github.com/acme/project/actions/runs/91';
+      const assertLink = () => {
+        assert.equal(f.checks[0].details_url, url);
+        assert.ok(f.checks[0].output.summary.endsWith(`[View CI run](${url})`));
+        assert.equal(JSON.parse(f.checks[0].output.text).run_id, 91);
+      };
+      assertLink();
+      if (outcome === 'revoked') {
+        f.context.payload.action = 'edited';
+      } else {
+        f.finish();
+        f.context.payload.workflow_run.conclusion = outcome;
+      }
+      await f.call();
+      assert.equal(f.checks[0].status, 'completed');
+      assertLink();
+    });
+  }
+});
+
+test('run links use the configured GitHub server', async () => {
+  const f = fixture();
+  f.context.serverUrl = 'https://github.example.com';
+  await f.call();
+  await f.call('admit');
+  assert.equal(f.checks[0].details_url, 'https://github.example.com/acme/project/actions/runs/91');
+});
+
 test('writers, maintainers, and admins approve using the default token, including outside collaborators', async t => {
   for (const permission of ['write','maintain','admin']) await t.test(permission,async()=>{
     const f=fixture(); f.permission(permission);
@@ -175,6 +211,8 @@ test('a fresh approval revokes the old run; a late completion cannot pass it', a
   assert.deepEqual(f.cancelled,[91]);
   assert.equal(f.checks[0].conclusion,'action_required');
   assert.equal(f.checks[1].status,'queued');
+  assert.equal(f.checks[1].details_url, undefined);
+  assert.ok(!f.checks[1].output.summary.includes('View CI run'));
   f.finish(); await f.call();
   assert.equal(f.checks[1].status,'queued');
   assert.equal(JSON.parse(f.checks[1].output.text).comment_id,18);
