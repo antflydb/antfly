@@ -92,6 +92,8 @@ pub const Stats = struct {
     resolved_bytes: u64 = 0,
     active_wal_bytes: u64 = 0,
     immutable_block_bytes: u64 = 0,
+    // Owner-local collection observations, not restored with retained inventory
+    // on open. Require collections > 0 when asserting a completed collection.
     live_payloads_at_collection: u64 = 0,
     live_payload_bytes_at_collection: u64 = 0,
     collections: u64 = 0,
