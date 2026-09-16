@@ -1,6 +1,6 @@
 # HTTP Runtime: Implementation Checkpoint
 
-> Relocated verbatim from `zig/STD_IO_HTTP.md` (lines 17–349 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`STD_IO_HTTP.md`](../../../zig/STD_IO_HTTP.md). Durable decisions from this log were folded into that document before the move.
+> Relocated verbatim from `zig/HTTP_API_RUNTIME.md` (lines 17–349 at commit 271838a195) on 2026-09-16 during the documentation cleanup. This is a historical implementation log kept for context; the living design is [`HTTP_API_RUNTIME.md`](../../../zig/HTTP_API_RUNTIME.md). Durable decisions from this log were folded into that document before the move.
 
 ### Implementation checkpoint
 

@@ -334,7 +334,7 @@ file's own title and a one-line description taken from its first paragraph.
 
 ### Runtime, ops, and product surface
 
-- [STD_IO_HTTP.md](STD_IO_HTTP.md) — Structured `std.Io` HTTP and API Runtime
+- [HTTP_API_RUNTIME.md](HTTP_API_RUNTIME.md) — Structured `std.Io` HTTP and API Runtime
   Design: HTTP transport, listener concurrency, and runtime supervision across
   runtimes.
 - [STARTUP.md](STARTUP.md) — Startup Status And Provisioning: keeping

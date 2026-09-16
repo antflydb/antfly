@@ -36,7 +36,7 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../zig/ROADMAP.md).
 | DOCID | [docid/query-bench-diary.md](completed/docid/query-bench-diary.md) | [zig/DOCID.md](../zig/DOCID.md) | Query and bulk-load optimization diary |
 | Algebraic | [algebraic/churn-benchmarks-2026-05.md](completed/algebraic/churn-benchmarks-2026-05.md) | [zig/ALGEBRAIC.md](../zig/ALGEBRAIC.md) | May 2026 churn smoke and microbench chain |
 | Relational | [relational/benchmarks.md](completed/relational/benchmarks.md) | [zig/RELATIONAL.md](../zig/RELATIONAL.md) | Single-host LSM benchmark tables with repro commands |
-| HTTP runtime | [http-runtime/implementation-checkpoint.md](completed/http-runtime/implementation-checkpoint.md) | [zig/STD_IO_HTTP.md](../zig/STD_IO_HTTP.md) | Route-by-route migration checkpoint |
+| HTTP runtime | [http-runtime/implementation-checkpoint.md](completed/http-runtime/implementation-checkpoint.md) | [zig/HTTP_API_RUNTIME.md](../zig/HTTP_API_RUNTIME.md) | Route-by-route migration checkpoint |
 | PDF | [pdf/render-control-verification-2026-09.md](completed/pdf/render-control-verification-2026-09.md) | [zig/PDF.md](../zig/PDF.md) | September 2026 render-control verification notes |
 | Status | [status/dated-e2e-observations-2026-05.md](completed/status/dated-e2e-observations-2026-05.md) | [zig/STATUS.md](../zig/STATUS.md) | 2026-05-01 E2E observations |
 | E2E | [e2e/resolved-failures-2026-05.md](completed/e2e/resolved-failures-2026-05.md) | [zig/TODO.md](../zig/TODO.md) | 2026-05-11 full-suite run and per-test resolutions |
