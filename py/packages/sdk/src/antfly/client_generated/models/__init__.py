@@ -560,6 +560,7 @@ from .index_type import IndexType
 from .inference_a4b_residency_mode import InferenceA4BResidencyMode
 from .inference_admission_config import InferenceAdmissionConfig
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
+from .inference_audio_context import InferenceAudioContext
 from .inference_backend_runtimes import InferenceBackendRuntimes
 from .inference_batch_execution_report import InferenceBatchExecutionReport
 from .inference_binary_content import InferenceBinaryContent
@@ -578,6 +579,15 @@ from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
+from .inference_dictate_request import InferenceDictateRequest
+from .inference_dictate_response import InferenceDictateResponse
+from .inference_dictate_response_object import InferenceDictateResponseObject
+from .inference_dictation_event import InferenceDictationEvent
+from .inference_dictation_event_type import InferenceDictationEventType
+from .inference_dictation_segment import InferenceDictationSegment
+from .inference_dictation_style import InferenceDictationStyle
+from .inference_dictation_transcript import InferenceDictationTranscript
+from .inference_dictation_word import InferenceDictationWord
 from .inference_embed_request import InferenceEmbedRequest
 from .inference_embed_request_encoding_format import InferenceEmbedRequestEncodingFormat
 from .inference_embed_request_error_policy import InferenceEmbedRequestErrorPolicy
@@ -706,8 +716,23 @@ from .inference_transcribe_object_object import InferenceTranscribeObjectObject
 from .inference_transcribe_request import InferenceTranscribeRequest
 from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
+from .inference_transcription_audio_append import InferenceTranscriptionAudioAppend
+from .inference_transcription_audio_format import InferenceTranscriptionAudioFormat
+from .inference_transcription_event import InferenceTranscriptionEvent
+from .inference_transcription_event_list import InferenceTranscriptionEventList
+from .inference_transcription_event_list_object import InferenceTranscriptionEventListObject
+from .inference_transcription_event_object import InferenceTranscriptionEventObject
+from .inference_transcription_event_type import InferenceTranscriptionEventType
+from .inference_transcription_session import InferenceTranscriptionSession
+from .inference_transcription_session_deleted import InferenceTranscriptionSessionDeleted
+from .inference_transcription_session_deleted_object import InferenceTranscriptionSessionDeletedObject
+from .inference_transcription_session_object import InferenceTranscriptionSessionObject
+from .inference_transcription_session_request import InferenceTranscriptionSessionRequest
+from .inference_transcription_stream_message import InferenceTranscriptionStreamMessage
+from .inference_transcription_stream_message_type import InferenceTranscriptionStreamMessageType
 from .inference_transient_capacity_error import InferenceTransientCapacityError
 from .inference_transient_capacity_error_reason import InferenceTransientCapacityErrorReason
+from .inference_vad_config import InferenceVadConfig
 from .inferenceschemas_config import InferenceschemasConfig
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
@@ -791,6 +816,8 @@ from .open_ai_generator_config import OpenAIGeneratorConfig
 from .open_ai_generator_config_provider import OpenAIGeneratorConfigProvider
 from .open_router_embedder_config import OpenRouterEmbedderConfig
 from .open_router_embedder_config_provider import OpenRouterEmbedderConfigProvider
+from .open_router_generator_config import OpenRouterGeneratorConfig
+from .open_router_generator_config_provider import OpenRouterGeneratorConfigProvider
 from .package_artifact import PackageArtifact
 from .package_artifact_kind import PackageArtifactKind
 from .package_dependency import PackageDependency
@@ -945,6 +972,7 @@ from .storage_resource_exhausted_error_error import StorageResourceExhaustedErro
 from .storage_runtime_status import StorageRuntimeStatus
 from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
+from .stream_transcription_audio_format import StreamTranscriptionAudioFormat
 from .success_message import SuccessMessage
 from .sync_level import SyncLevel
 from .table import Table
@@ -1626,6 +1654,7 @@ __all__ = (
     "InferenceA4BResidencyMode",
     "InferenceAdmissionConfig",
     "InferenceAudioChunkConfig",
+    "InferenceAudioContext",
     "InferenceBackendRuntimes",
     "InferenceBatchExecutionReport",
     "InferenceBinaryContent",
@@ -1644,6 +1673,15 @@ __all__ = (
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
+    "InferenceDictateRequest",
+    "InferenceDictateResponse",
+    "InferenceDictateResponseObject",
+    "InferenceDictationEvent",
+    "InferenceDictationEventType",
+    "InferenceDictationSegment",
+    "InferenceDictationStyle",
+    "InferenceDictationTranscript",
+    "InferenceDictationWord",
     "InferenceEmbeddingBatchSummary",
     "InferenceEmbeddingItemError",
     "InferenceEmbeddingItemErrorStage",
@@ -1771,8 +1809,23 @@ __all__ = (
     "InferenceTranscribeRequest",
     "InferenceTranscribeResponse",
     "InferenceTranscribeResponseObject",
+    "InferenceTranscriptionAudioAppend",
+    "InferenceTranscriptionAudioFormat",
+    "InferenceTranscriptionEvent",
+    "InferenceTranscriptionEventList",
+    "InferenceTranscriptionEventListObject",
+    "InferenceTranscriptionEventObject",
+    "InferenceTranscriptionEventType",
+    "InferenceTranscriptionSession",
+    "InferenceTranscriptionSessionDeleted",
+    "InferenceTranscriptionSessionDeletedObject",
+    "InferenceTranscriptionSessionObject",
+    "InferenceTranscriptionSessionRequest",
+    "InferenceTranscriptionStreamMessage",
+    "InferenceTranscriptionStreamMessageType",
     "InferenceTransientCapacityError",
     "InferenceTransientCapacityErrorReason",
+    "InferenceVadConfig",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
@@ -1853,6 +1906,8 @@ __all__ = (
     "OpenAIGeneratorConfigProvider",
     "OpenRouterEmbedderConfig",
     "OpenRouterEmbedderConfigProvider",
+    "OpenRouterGeneratorConfig",
+    "OpenRouterGeneratorConfigProvider",
     "PackageArtifact",
     "PackageArtifactKind",
     "PackageDependency",
@@ -2007,6 +2062,7 @@ __all__ = (
     "StorageRuntimeStatus",
     "StorageRuntimeStatusEngine",
     "StorageStatus",
+    "StreamTranscriptionAudioFormat",
     "SuccessMessage",
     "SyncLevel",
     "Table",

@@ -393,5 +393,9 @@ pub const release_scale_test_filters = [_][]const u8{
 };
 
 pub fn productionVoprCompileMaxRss(target: std.Build.ResolvedTarget) usize {
-    return @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024;
+    // The production DataServer VOPR root reached 13,255,065,600 bytes on
+    // Linux ReleaseSafe in soak qualification run 34927431365. Reserve 16 GiB
+    // for production-owner roots so build admission reflects their compiler
+    // footprint; this is not an Antfly runtime memory limit.
+    return @as(usize, if (target.result.os.tag == .macos) 18 else 16) * 1024 * 1024 * 1024;
 }

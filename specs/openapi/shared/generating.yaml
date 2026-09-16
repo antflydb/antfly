@@ -14,6 +14,7 @@ components:
         - vertex
         - ollama
         - openai
+        - openrouter
         - antfly
       description: "Generator providers implemented by Antfly's generation runtime."
 
@@ -27,6 +28,7 @@ components:
             - $ref: "#/components/schemas/OllamaGeneratorConfig"
             - $ref: "#/components/schemas/AntflyGeneratorConfig"
             - $ref: "#/components/schemas/OpenAIGeneratorConfig"
+            - $ref: "#/components/schemas/OpenRouterGeneratorConfig"
         - properties:
             rate_limit:
               x-go-type-skip-optional-pointer: false
@@ -592,16 +594,18 @@ components:
       description: |
         Configuration for the OpenRouter generative AI provider.
       properties:
+        provider:
+          type: string
+          enum: [openrouter]
         model:
           type: string
-          description: "Single model identifier. Either model or models must be provided."
+          description: "The OpenRouter model identifier to use."
           example: "openai/gpt-4.1"
-        models:
-          type: array
-          items:
-            type: string
-          description: |
-            Array of model identifiers for fallback routing. Either model or models must be provided.
+        url:
+          type: string
+          format: uri
+          description: "The URL of the OpenRouter API endpoint."
+          default: "https://openrouter.ai/api/v1"
         api_key:
           type: string
           writeOnly: true
@@ -633,3 +637,6 @@ components:
           description: "Penalty for token presence (-2.0 to 2.0)."
           minimum: -2.0
           maximum: 2.0
+      required:
+        - provider
+        - model

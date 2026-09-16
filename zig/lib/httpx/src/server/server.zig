@@ -688,32 +688,122 @@ pub const Context = struct {
         sock: *Socket,
         buffer: *[8192]u8,
         leftover: *usize,
+        /// Undelivered bytes of a fixed-length body. Unused when `chunked`.
         remaining: u64,
         deadline_ms: i64,
+        /// Upper bound for `readAll` on a chunked body, whose size is not
+        /// declared up front.
+        max_body: usize = std.math.maxInt(usize),
+        /// Decode `Transfer-Encoding: chunked` on the fly, so a client can
+        /// stream an open-ended body (audio frames, NDJSON) over HTTP/1.1
+        /// without knowing its length.
+        chunked: bool = false,
+        chunk_state: ChunkState = .size,
+        chunk_remaining: u64 = 0,
+        line_buf: [256]u8 = undefined,
         owned_body: ?[]u8 = null,
+
+        pub const ChunkState = enum { size, data, crlf, trailer, done };
 
         pub fn deinit(self: *H1StreamReader) void {
             if (self.owned_body) |body_bytes| self.allocator.free(body_bytes);
             self.owned_body = null;
         }
 
+        /// True once the whole body has been consumed, so the connection can
+        /// be reused; a chunked body whose terminator was never read must
+        /// close the connection instead.
+        pub fn finished(self: *const H1StreamReader) bool {
+            return if (self.chunked) self.chunk_state == .done else self.remaining == 0;
+        }
+
         pub fn read(self: *H1StreamReader, dest: []u8) !usize {
-            if (dest.len == 0 or self.remaining == 0) return 0;
-            const requested = @min(dest.len, std.math.cast(usize, self.remaining) orelse dest.len);
+            if (dest.len == 0) return 0;
+            if (!self.chunked) {
+                if (self.remaining == 0) return 0;
+                const requested = @min(dest.len, std.math.cast(usize, self.remaining) orelse dest.len);
+                const n = try self.readRaw(dest[0..requested]);
+                if (n == 0) return error.EndOfStream;
+                self.remaining -= n;
+                return n;
+            }
+            while (true) switch (self.chunk_state) {
+                .done => return 0,
+                .size => {
+                    const line = try self.takeLine();
+                    const hex_end = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+                    const hex = std.mem.trim(u8, line[0..hex_end], " \t");
+                    if (hex.len == 0) return error.InvalidChunkedEncoding;
+                    const size = std.fmt.parseUnsigned(u64, hex, 16) catch return error.InvalidChunkedEncoding;
+                    if (size == 0) {
+                        self.chunk_state = .trailer;
+                        continue;
+                    }
+                    self.chunk_remaining = size;
+                    self.chunk_state = .data;
+                },
+                .data => {
+                    const requested = @min(dest.len, std.math.cast(usize, self.chunk_remaining) orelse dest.len);
+                    const n = try self.readRaw(dest[0..requested]);
+                    if (n == 0) return error.EndOfStream;
+                    self.chunk_remaining -= n;
+                    if (self.chunk_remaining == 0) self.chunk_state = .crlf;
+                    return n;
+                },
+                .crlf => {
+                    const line = try self.takeLine();
+                    if (line.len != 0) return error.InvalidChunkedEncoding;
+                    self.chunk_state = .size;
+                },
+                .trailer => {
+                    const line = try self.takeLine();
+                    if (line.len == 0) {
+                        self.chunk_state = .done;
+                        return 0;
+                    }
+                },
+            };
+        }
+
+        /// Deliver raw transport bytes: the parser's leftover first, then the
+        /// socket. Returns 0 only when the peer closed the connection.
+        fn readRaw(self: *H1StreamReader, dest: []u8) !usize {
             if (self.leftover.* > 0) {
-                const n = @min(requested, self.leftover.*);
+                const n = @min(dest.len, self.leftover.*);
                 @memcpy(dest[0..n], self.buffer[0..n]);
                 if (n < self.leftover.*)
                     std.mem.copyForwards(u8, self.buffer[0 .. self.leftover.* - n], self.buffer[n..self.leftover.*]);
                 self.leftover.* -= n;
-                self.remaining -= n;
                 return n;
             }
             try applyReadDeadline(self.sock, self.io, self.deadline_ms);
-            const n = try self.sock.recv(dest[0..requested]);
-            if (n == 0) return error.EndOfStream;
-            self.remaining -= n;
-            return n;
+            return try self.sock.recv(dest);
+        }
+
+        /// Consume one CRLF-terminated line from the leftover buffer, refilling
+        /// it from the socket as needed. The returned slice aliases `line_buf`
+        /// and is valid until the next call.
+        fn takeLine(self: *H1StreamReader) ![]const u8 {
+            while (true) {
+                const buffered = self.buffer[0..self.leftover.*];
+                if (std.mem.indexOfScalar(u8, buffered, '\n')) |nl| {
+                    var line_len = nl;
+                    if (line_len > 0 and buffered[line_len - 1] == '\r') line_len -= 1;
+                    const consumed = nl + 1;
+                    // Only the hex size prefix and emptiness matter, so a
+                    // long chunk extension is truncated rather than kept.
+                    const kept = @min(line_len, self.line_buf.len);
+                    @memcpy(self.line_buf[0..kept], buffered[0..kept]);
+                    std.mem.copyForwards(u8, self.buffer[0 .. self.leftover.* - consumed], self.buffer[consumed..self.leftover.*]);
+                    self.leftover.* -= consumed;
+                    return self.line_buf[0..kept];
+                }
+                if (self.leftover.* >= self.buffer.len) return error.InvalidChunkedEncoding;
+                try applyReadDeadline(self.sock, self.io, self.deadline_ms);
+                const n = try self.sock.recv(self.buffer[self.leftover.*..]);
+                if (n == 0) return error.EndOfStream;
+                self.leftover.* += n;
+            }
         }
 
         fn readErased(ptr: ?*anyopaque, dest: []u8) anyerror!usize {
@@ -724,6 +814,19 @@ pub const Context = struct {
         fn readAllErased(ptr: ?*anyopaque) anyerror!?[]const u8 {
             const self: *H1StreamReader = @ptrCast(@alignCast(ptr orelse return error.EndOfStream));
             if (self.owned_body != null) return self.owned_body.?;
+            if (self.chunked) {
+                var collected = std.ArrayListUnmanaged(u8).empty;
+                errdefer collected.deinit(self.allocator);
+                var chunk: [8192]u8 = undefined;
+                while (true) {
+                    const n = try self.read(&chunk);
+                    if (n == 0) break;
+                    if (collected.items.len + n > self.max_body) return error.BodyTooLarge;
+                    try collected.appendSlice(self.allocator, chunk[0..n]);
+                }
+                self.owned_body = try collected.toOwnedSlice(self.allocator);
+                return self.owned_body.?;
+            }
             const len = std.math.cast(usize, self.remaining) orelse return error.BodyTooLarge;
             const body_bytes = try self.allocator.alloc(u8, len);
             errdefer self.allocator.free(body_bytes);
@@ -1612,6 +1715,14 @@ pub const Server = struct {
         try self.router.addStreaming(method, path, handler);
     }
 
+    /// Streams the request body for every content type. The handler reads the
+    /// body incrementally via `requestBodyReader` while it may already be
+    /// writing a streamed response, which gives HTTP/1.1 clients a duplex
+    /// exchange (chunked upload in, chunked response out).
+    pub fn routeStreamingRaw(self: *Self, method: types.Method, path: []const u8, handler: anytype) !void {
+        try self.router.addStreamingRaw(method, path, handler);
+    }
+
     /// Registers a route with borrowed opaque data copied into Context.
     pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
         try self.router.addWithData(method, path, handler, data);
@@ -1637,6 +1748,10 @@ pub const Server = struct {
 
     pub fn postStreaming(self: *Self, path: []const u8, handler: anytype) !void {
         try self.routeStreaming(.POST, path, handler);
+    }
+
+    pub fn postStreamingRaw(self: *Self, path: []const u8, handler: anytype) !void {
+        try self.routeStreamingRaw(.POST, path, handler);
     }
 
     pub fn postWithBodyLimit(self: *Self, path: []const u8, max_body_size: usize, handler: anytype) !void {
@@ -1780,10 +1895,12 @@ pub const Server = struct {
 
             const conn = self.listener.?.accept() catch |err| {
                 self.conn_semaphore.post(self.connectionIo());
-                if (!self.running or self.shutdown_mode.load(.acquire) != 0 or self.listener == null) break;
+                // Cancellation ends the listener task; retrying would consume
+                // the cancellation and leave its owner waiting during teardown.
+                if (err == error.Canceled or !self.running or self.shutdown_mode.load(.acquire) != 0 or self.listener == null) break;
                 _ = self.accept_errors_total.fetchAdd(1, .monotonic);
                 std.log.warn("httpx accept failed; backing off delay_ms={d} err={s}", .{ accept_error_backoff_ms, @errorName(err) });
-                self.io.sleep(Io.Duration.fromMilliseconds(accept_error_backoff_ms), .awake) catch {};
+                self.io.sleep(Io.Duration.fromMilliseconds(accept_error_backoff_ms), .awake) catch break;
                 accept_error_backoff_ms = @min(self.config.accept_error_backoff_max_ms, accept_error_backoff_ms *| 2);
                 continue;
             };
@@ -2267,13 +2384,16 @@ pub const Server = struct {
             ctx.max_request_body_size = resolveRequestBodyLimit(self, req.method, req.uri.path) orelse self.config.max_body_size;
             req.body_budget = &self.body_budget;
             ctx.h1_sock = &sock;
-            var h1_stream_reader: ?Context.H1StreamReader = if (parser.headers_only and parser.content_length.? > 0) .{
+            var h1_stream_reader: ?Context.H1StreamReader = if (parser.headers_only and
+                (parser.chunked or (parser.content_length orelse 0) > 0)) .{
                 .allocator = self.allocator,
                 .io = self.io,
                 .sock = &sock,
                 .buffer = &buffer,
                 .leftover = &leftover,
-                .remaining = parser.content_length.?,
+                .remaining = if (parser.chunked) 0 else parser.content_length.?,
+                .chunked = parser.chunked,
+                .max_body = ctx.max_request_body_size,
                 .deadline_ms = deadlineAfter(self.io, self.config.body_read_timeout_ms),
             } else null;
             defer if (h1_stream_reader) |*reader| reader.deinit();
@@ -2396,6 +2516,11 @@ pub const Server = struct {
 
             if (!keep_alive) return;
 
+            // A chunked upload the handler did not read to its terminator
+            // leaves an unknown number of bytes in flight; close rather than
+            // misparse them as the next request.
+            if (h1_stream_reader) |reader| if (reader.chunked and !reader.finished()) return;
+
             // Drain any unread request body before reusing the connection
             // for the next request, similar to Go's net/http finishRequest.
             if (parser.content_length) |cl| {
@@ -2455,7 +2580,11 @@ pub const Server = struct {
         if (method != .POST and method != .PUT and method != .PATCH) return false;
         const self: *Self = @ptrCast(@alignCast(ptr));
         const query_start = mem.indexOfScalar(u8, request_target, '?') orelse request_target.len;
-        if (!self.router.streamsRequestBody(method, request_target[0..query_start])) return false;
+        switch (self.router.requestBodyStreaming(method, request_target[0..query_start])) {
+            .none => return false,
+            .raw => return true,
+            .attachments => {},
+        }
         const content_type = content_type_value orelse return false;
         const separator = mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
         return std.ascii.eqlIgnoreCase(
@@ -4242,6 +4371,199 @@ test "H1 opted-in framed route dispatches before the full body arrives" {
     try std.testing.expect(mem.indexOf(u8, response[0..n], "streamed") != null);
 }
 
+test "raw streaming routes stream every content type" {
+    var server = Server.init(std.testing.allocator, std.testing.io);
+    defer server.deinit();
+    const handler = struct {
+        fn h(ctx: *Context) !Response {
+            return ctx.text("ok");
+        }
+    }.h;
+    try server.postStreamingRaw("/raw/:id", handler);
+    try server.postStreaming("/framed", handler);
+
+    try std.testing.expect(Server.resolveRequestBodyStreaming(&server, .POST, "/raw/1", "application/octet-stream"));
+    try std.testing.expect(Server.resolveRequestBodyStreaming(&server, .POST, "/raw/1", null));
+    try std.testing.expect(!Server.resolveRequestBodyStreaming(&server, .POST, "/framed", "application/octet-stream"));
+    try std.testing.expect(Server.resolveRequestBodyStreaming(&server, .POST, "/framed", attachment_envelope.content_type));
+}
+
+test "H1 raw streaming route reads a chunked upload while streaming its response" {
+    const State = struct {
+        var started = std.atomic.Value(bool).init(false);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            started.store(true, .release);
+            ctx.h1_keep_alive = false;
+            var writer = try ctx.streamResponse(200);
+            var reader = ctx.requestBodyReader();
+            var buf: [64]u8 = undefined;
+            var total: usize = 0;
+            while (true) {
+                const n = try reader.read(&buf);
+                if (n == 0) break;
+                total += n;
+                try writer.write(buf[0..n]);
+            }
+            var tail: [32]u8 = undefined;
+            try writer.write(try std.fmt.bufPrint(&tail, "|total={d}", .{total}));
+            try writer.close();
+            return ctx.response.build();
+        }
+    };
+    State.started.store(false, .release);
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .body_read_timeout_ms = 5_000,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.postStreamingRaw("/upload", State.handler);
+    try server.bind();
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("chunked streaming listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll(
+        "POST /upload HTTP/1.1\r\n" ++
+            "Host: test\r\n" ++
+            "Content-Type: application/octet-stream\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "Connection: close\r\n\r\n" ++
+            "3\r\nabc\r\n",
+    );
+
+    const start_deadline = milliTimestamp(client_io) + 2_000;
+    while (!State.started.load(.acquire) and milliTimestamp(client_io) < start_deadline)
+        std.Thread.yield() catch {};
+    try std.testing.expect(State.started.load(.acquire));
+
+    // The handler echoes each chunk as it arrives, so the first chunk must be
+    // visible before the upload terminates.
+    var response: [1024]u8 = undefined;
+    var received: usize = 0;
+    while (mem.indexOf(u8, response[0..received], "abc") == null) {
+        const n = try client.recv(response[received..]);
+        if (n == 0) return error.TestUnexpectedResult;
+        received += n;
+    }
+    try client.sendAll("4;ext=1\r\ndefg\r\n0\r\n\r\n");
+    while (mem.indexOf(u8, response[0..received], "|total=7") == null) {
+        const n = try client.recv(response[received..]);
+        if (n == 0) break;
+        received += n;
+    }
+    try std.testing.expect(mem.indexOf(u8, response[0..received], "abc") != null);
+    try std.testing.expect(mem.indexOf(u8, response[0..received], "defg") != null);
+    try std.testing.expect(mem.indexOf(u8, response[0..received], "|total=7") != null);
+}
+
+test "H1 raw streaming route delivers large chunked pieces before the terminator" {
+    const State = struct {
+        fn handler(ctx: *Context) anyerror!Response {
+            ctx.h1_keep_alive = false;
+            var writer = try ctx.streamResponse(200);
+            var reader = ctx.requestBodyReader();
+            var buf: [16 * 1024]u8 = undefined;
+            var total: usize = 0;
+            var reads: usize = 0;
+            while (true) {
+                const n = try reader.read(&buf);
+                if (n == 0) break;
+                total += n;
+                reads += 1;
+                var line: [64]u8 = undefined;
+                try writer.write(try std.fmt.bufPrint(&line, "got {d} total {d}\n", .{ n, total }));
+            }
+            var tail: [32]u8 = undefined;
+            try writer.write(try std.fmt.bufPrint(&tail, "|end={d}", .{total}));
+            try writer.close();
+            return ctx.response.build();
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    // Default disconnect cancellation, as production listeners run it.
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .body_read_timeout_ms = 5_000,
+    });
+    defer server.deinit();
+    try server.postStreamingRaw("/upload", State.handler);
+    try server.bind();
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("chunked pieces listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll(
+        "POST /upload HTTP/1.1\r\n" ++
+            "Host: test\r\n" ++
+            "Content-Type: application/octet-stream\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "Connection: close\r\n\r\n",
+    );
+    // Fourteen 8000-byte chunks in one burst, the way an audio client
+    // that already buffered a phrase uploads it.
+    const piece = [_]u8{'a'} ** 8000;
+    var burst = std.ArrayListUnmanaged(u8).empty;
+    defer burst.deinit(allocator);
+    for (0..14) |_| {
+        try burst.appendSlice(allocator, "1f40\r\n");
+        try burst.appendSlice(allocator, &piece);
+        try burst.appendSlice(allocator, "\r\n");
+    }
+    try client.sendAll(burst.items);
+
+    var response: [4096]u8 = undefined;
+    var received: usize = 0;
+    // Every byte of the burst must be visible to the handler before the
+    // terminator is sent.
+    while (mem.indexOf(u8, response[0..received], "total 112000") == null) {
+        const n = try client.recv(response[received..]);
+        if (n == 0) return error.TestUnexpectedResult;
+        received += n;
+    }
+    try client.sendAll("0\r\n\r\n");
+    while (mem.indexOf(u8, response[0..received], "|end=112000") == null) {
+        const n = try client.recv(response[received..]);
+        if (n == 0) break;
+        received += n;
+    }
+    try std.testing.expect(mem.indexOf(u8, response[0..received], "|end=112000") != null);
+}
+
 test "H1 oversized content length returns 413 before handler admission" {
     const State = struct {
         var handled = std.atomic.Value(usize).init(0);
@@ -5075,6 +5397,38 @@ test "repeated stop requests do not inflate connection admission permits" {
     server.requestStop();
     server.requestStop();
     try std.testing.expectEqual(@as(usize, 3), server.conn_semaphore.permits);
+}
+
+test "listener cancellation exits without accept error or retry" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var server: *Server = undefined;
+
+        fn accept(_: ?*anyopaque, _: Io.net.Socket.Handle, _: Io.net.Server.AcceptOptions) Io.net.Server.AcceptError!Io.net.Socket {
+            calls += 1;
+            // Bound a regression: an incorrect retry must fail the assertions
+            // below instead of leaving the test in an infinite accept loop.
+            if (calls > 1) server.running = false;
+            return error.Canceled;
+        }
+    };
+    Fake.calls = 0;
+    var vtable = std.testing.io.vtable.*;
+    vtable.netAccept = Fake.accept;
+    const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var server = Server.initWithConfig(std.testing.allocator, io, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .borrow_http_runtime_io = true,
+        // No connection is accepted, so this test needs no native H1 observer.
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    Fake.server = &server;
+    try server.listen();
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+    try std.testing.expectEqual(@as(u64, 0), server.accept_errors_total.load(.acquire));
+    try std.testing.expect(!server.running);
 }
 
 test "accept backoff is normalized and bounded" {

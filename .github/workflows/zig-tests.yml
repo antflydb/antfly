@@ -41,6 +41,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   checks: read
   pull-requests: read
 
@@ -79,6 +80,7 @@ jobs:
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
       backup_s3: ${{ steps.detect.outputs.backup_s3 }}
+      vopr_qualification: ${{ steps.vopr.outputs.required }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -152,6 +154,8 @@ jobs:
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
+            ':(glob)scripts/ci/*vopr*.py' \
+            .github/workflows/zig-vopr-soak.yml \
             scripts/ci/check_zig_checksum_usage.py \
             scripts/ci/test_check_zig_checksum_usage.py \
             scripts/ci/toolchain-policy.json \
@@ -255,6 +259,36 @@ jobs:
             echo "trace_validate=false" >> "$GITHUB_OUTPUT"
           else
             echo "trace_validate=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect VOPR qualification changes
+        id: vopr
+        if: inputs.pr_number != ''
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+            zig/build.zig \
+            zig/build.zig.zon \
+            ':(glob)zig/lib/vopr/**' \
+            ':(glob)zig/pkg/antfly/src/vopr/**' \
+            ':(glob)zig/pkg/antfly/src/storage/hot_standby/**' \
+            ':(glob)zig/pkg/antfly/src/raft/transport/**' \
+            zig/pkg/antfly/src/raft/host.zig \
+            zig/pkg/antfly/src/raft/reconciler.zig \
+            zig/pkg/antfly/src/raft/vopr_harness.zig \
+            zig/pkg/antfly/src/data/runtime.zig \
+            ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)scripts/ci/*vopr*.py' \
+            scripts/ci/toolchain-policy.json \
+            .github/actions/load-toolchain-policy/action.yml \
+            .github/workflows/zig-vopr-soak.yml \
+            .github/workflows/zig-tests.yml
+          then
+            echo "required=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "required=true" >> "$GITHUB_OUTPUT"
           fi
 
   backup-s3-integration:
@@ -470,6 +504,7 @@ jobs:
           python3 -m unittest
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
+          tools/test_prune_completed_test_cache.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
@@ -569,6 +604,12 @@ jobs:
 
           dump_stacks() {
             local root_pid="$1"
+            for partition_log in "$ANTFLY_TEST_LOG_DIR"/*.log; do
+              [ -f "$partition_log" ] || continue
+              echo "::group::partition progress $partition_log"
+              tail -n 80 "$partition_log" || true
+              echo "::endgroup::"
+            done
             echo "::group::antfly unit watchdog ptrace settings"
             if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
               cat /proc/sys/kernel/yama/ptrace_scope || true
@@ -589,7 +630,7 @@ jobs:
               local cmdline
               cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
               case "$cmdline" in
-                *"/test "*|*"/test"*|*"zig build"*|*" make "*)
+                *"/test "*|*"/test"*|*"-tests "*|*"-tests"|*"zig build"*|*" make "*)
                   echo "::group::proc snapshot pid=$pid cmd=$cmdline"
                   if [ -r "/proc/$pid/status" ]; then
                     grep -E "^(Name|State|Pid|PPid|Threads|VmRSS|VmHWM|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):" "/proc/$pid/status" || true
@@ -646,6 +687,8 @@ jobs:
 
           unit_log="${RUNNER_TEMP:-/tmp}/antfly-zig-unit.log"
           : > "$unit_log"
+          export ANTFLY_TEST_LOG_DIR="${RUNNER_TEMP:-/tmp}/antfly-zig-test-logs"
+          mkdir -p "$ANTFLY_TEST_LOG_DIR"
 
           (
             set +e
@@ -668,13 +711,14 @@ jobs:
             while kill -0 "$unit_pid" 2>/dev/null; do
               sleep 15
               now_epoch="$(date +%s)"
-              if [ -e "$unit_log" ]; then
-                current_mtime="$(stat -c %Y "$unit_log" 2>/dev/null || echo 0)"
+              for progress_log in "$unit_log" "$ANTFLY_TEST_LOG_DIR"/*.log; do
+                [ -f "$progress_log" ] || continue
+                current_mtime="$(stat -c %Y "$progress_log" 2>/dev/null || echo 0)"
                 if [ "$current_mtime" -gt "$last_mtime" ]; then
                   last_mtime="$current_mtime"
                   last_progress_epoch="$now_epoch"
                 fi
-              fi
+              done
 
               elapsed_secs=$((now_epoch - start_epoch))
               idle_secs=$((now_epoch - last_progress_epoch))
@@ -711,6 +755,17 @@ jobs:
             echo "::endgroup::"
           fi
           exit "$status"
+
+      - name: Retain unit test progress
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zig-unit-progress-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/antfly-zig-unit.log
+            ${{ runner.temp }}/antfly-zig-test-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
@@ -794,6 +849,7 @@ jobs:
           python3 -m unittest
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
+          tools/test_prune_completed_test_cache.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
@@ -842,6 +898,16 @@ jobs:
           fi
           exit "$status"
 
+      - name: Release completed phase compiler cache
+        run: |
+          # The preceding build has finished. Release its large test outputs
+          # while keeping compiler, dependency, and generator artifacts warm.
+          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          du -sh "$cache"
+          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          df -h "$cache"
+          df -i "$cache"
+
       - name: Run corpus-scale release regressions
         working-directory: zig
         run: >-
@@ -866,17 +932,57 @@ jobs:
 
       # Includes index-maintenance and index-ownership replay campaigns. The
       # fixed maintenance seed is already part of the zig-base unit aggregate.
+      - name: Release completed phase compiler cache
+        run: |
+          # The preceding build has finished. Release its large test outputs
+          # while keeping compiler, dependency, and generator artifacts warm.
+          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          du -sh "$cache"
+          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          df -h "$cache"
+          df -i "$cache"
+
       - name: Run Zig VOPR tests
         working-directory: zig
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
           vopr-test
+          vopr-build
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
+      - name: Test VOPR corpus retention and reuse
+        timeout-minutes: 10
+        run: |
+          python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
+          python3 scripts/ci/zig_vopr_qualification.py --binary zig/zig-out/bin/vopr --output "$RUNNER_TEMP/vopr-qualification"
+
+      - name: Retain VOPR qualification diagnostics
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-qualification-diagnostics
+          path: |
+            ${{ runner.temp }}/vopr-qualification/**/*.json
+            ${{ runner.temp }}/vopr-qualification/**/*.log
+            ${{ runner.temp }}/vopr-qualification/**/*.voprtrace
+            ${{ runner.temp }}/vopr-qualification/**/*.voprquarantine
+          retention-days: 90
+
       # Includes complete graph owner coverage and the native maintenance fixture;
       # no graph-specific CLI or promotion matrix is built here.
+      - name: Release completed phase compiler cache
+        run: |
+          # The preceding build has finished. Release its large test outputs
+          # while keeping compiler, dependency, and generator artifacts warm.
+          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          du -sh "$cache"
+          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          df -h "$cache"
+          df -i "$cache"
+
       - name: Run Zig integration tests
         working-directory: zig
         run: >-
@@ -903,6 +1009,11 @@ jobs:
           antfly-chaos-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
+
+      - name: Remove job compiler cache
+        if: always()
+        run: |
+          rm -rf -- "/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
 
   zig-build-cache-tests:
     if: >-
@@ -971,6 +1082,22 @@ jobs:
           path: zig/storage-compilation.json
           if-no-files-found: ignore
 
+  vopr-qualification:
+    name: VOPR qualification
+    needs: [admission, changes]
+    if: >-
+      ${{ !cancelled() && success() &&
+      needs.admission.result == 'success' &&
+      github.run_attempt == 1 && inputs.pr_number != '' &&
+      needs.changes.outputs.vopr_qualification == 'true' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/zig-vopr-soak.yml
+    with:
+      qualification_only: true
+      head_sha: ${{ inputs.head_sha }}
+
   zig-base:
     if: >-
       ${{ !cancelled() &&
@@ -985,7 +1112,7 @@ jobs:
       needs.changes.outputs.model_check == 'true' ||
       needs.changes.outputs.trace_validate == 'true' )) }}
     name: zig-base
-    needs: [admission, changes, zig-base-tests, arm64-codec]
+    needs: [admission, changes, zig-base-tests, arm64-codec, vopr-qualification]
     runs-on: arc-antfly-standard
     steps:
       - name: Verify zig-base shards
@@ -993,11 +1120,14 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           X86_64_RESULT: ${{ needs.zig-base-tests.result }}
           ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
+          VOPR_REQUIRED: ${{ needs.changes.outputs.vopr_qualification }}
+          VOPR_RESULT: ${{ needs.vopr-qualification.result }}
         run: |
           set -euo pipefail
           test "$CHANGES_RESULT" = "success"
           test "$X86_64_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
+          if [ "$VOPR_REQUIRED" = "true" ]; then test "$VOPR_RESULT" = "success"; fi
 
   zig-full:
     if: >-
@@ -1123,6 +1253,8 @@ jobs:
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
       ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
+      # Permit the diagnostic debugger to attach to disposable test children.
+      ANTFLY_E2E_NATIVE_STACKS: "1"
       ANTFLY_CI_TRACE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1204,6 +1336,7 @@ jobs:
         env:
           SKIP_BUILD: "1"
           ANTFLY_E2E_SUITE: ${{ matrix.suite }}
+          ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE: "1"
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
 
       - name: Run inference config contract with a real CPU model
@@ -1237,6 +1370,15 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }}
           scripts/ci/zig-e2e-regression-loop.sh
           e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
+
+      - name: Retain failed standalone E2E server logs
+        if: failure() && matrix.suite == 'antfly'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: antfly-e2e-server-logs-${{ github.run_attempt }}
+          path: ${{ env.TMPDIR }}/antfly-zig-standalone-e2e-*/server.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   e2e-base:
     if: >-

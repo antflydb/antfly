@@ -448,6 +448,8 @@ pub const Status = enum(u32) {
     vector_store_requires_local_single_shard_table = 490,
     vector_store_requires_offline_command = 491,
     index_rebuilding = 492,
+    read_index_timeout = 493,
+    incomplete_published_snapshot = 494,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

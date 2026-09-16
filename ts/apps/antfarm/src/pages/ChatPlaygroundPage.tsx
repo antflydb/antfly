@@ -45,6 +45,7 @@ import {
 } from "@/components/ai-elements/prompt-input";
 import { Source, Sources, SourcesContent, SourcesTrigger } from "@/components/ai-elements/sources";
 import { Suggestion, Suggestions } from "@/components/ai-elements/suggestion";
+import { getChatRequestGenerator } from "@/components/playground/chat-generator";
 import {
   GENERATOR_DEFAULT_CONFIG,
   GeneratorSelector,
@@ -123,6 +124,7 @@ const ChatPlaygroundPage: React.FC = () => {
     () => typeof window !== "undefined" && window.innerWidth >= 1024
   );
   const effectiveGenerator = generatorOverride ?? dashboardGenerator ?? null;
+  const requestGenerator = getChatRequestGenerator(effectiveGenerator);
   const { label: inheritedGeneratorLabel, description: inheritedGeneratorDescription } =
     getInheritedGeneratorLabels(dashboardGenerator);
 
@@ -418,11 +420,11 @@ const ChatPlaygroundPage: React.FC = () => {
               <CardTitle className="text-lg">Chat</CardTitle>
             </CardHeader>
             <CardContent className="flex-1 overflow-hidden flex flex-col p-0">
-              {effectiveGenerator ? (
+              {requestGenerator ? (
                 <ChatBar
                   key={chatKey}
                   id="chat-playground"
-                  generator={effectiveGenerator}
+                  generator={requestGenerator}
                   table={selectedTable}
                   semanticIndexes={chatIndexes.length > 0 ? chatIndexes : undefined}
                   agentKnowledge={agentKnowledge || undefined}

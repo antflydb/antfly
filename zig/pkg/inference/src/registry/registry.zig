@@ -1129,8 +1129,20 @@ fn normalizeTaskHint(raw_task: []const u8) []const u8 {
         "transcribe"
     else if (std.mem.eql(u8, raw_task, "extractors"))
         "extract"
+    else if (std.mem.eql(u8, raw_task, "vads") or std.mem.eql(u8, raw_task, "voice-activity"))
+        "vad"
     else
         raw_task;
+}
+
+/// Voice activity detection models (Silero) are frame classifiers over audio.
+/// They keep the classifier registry kind but advertise the `vad` task and an
+/// audio input so dictation and session requests can find them.
+pub const vad_task = "vad";
+
+fn tasksIncludeVad(tasks: []const []const u8) bool {
+    for (tasks) |task| if (std.mem.eql(u8, task, vad_task)) return true;
+    return false;
 }
 
 fn appendCsvCapabilities(
@@ -1249,6 +1261,7 @@ fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.Model
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .recognizer;
     }
+    if (tasksIncludeVad(tasks)) return .classifier;
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "rerank") or std.mem.eql(u8, task, "rerankers")) return .reranker;
     }
@@ -1340,7 +1353,10 @@ fn synthesizePulledModelManifestJsonInternal(
         for (inputs.items) |input| allocator.free(input);
         inputs.deinit(allocator);
     }
-    try appendInferredInputs(allocator, &manifest, manifest_type, &inputs);
+    if (tasksIncludeVad(tasks.items))
+        try appendUniqueOwnedString(allocator, &inputs, "audio")
+    else
+        try appendInferredInputs(allocator, &manifest, manifest_type, &inputs);
 
     var capabilities = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -1736,6 +1752,32 @@ test "synthesized pulled manifest accepts plural task directory hints" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"read\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"image\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\"") == null);
+}
+
+test "synthesized pulled manifest records a vad task as an audio classifier" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/silero-vad/onnx");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/silero-vad/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/silero-vad/onnx/model.onnx", .data = "" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/silero-vad" });
+    defer allocator.free(model_dir);
+
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, model_dir, "vad", null);
+    defer allocator.free(manifest_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"classifier\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"vad\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"audio\"]") != null);
+    try std.testing.expectEqualStrings("vad", normalizeTaskHint("vads"));
 }
 
 test "synthesized pulled manifest keeps generate read gguf as generator" {

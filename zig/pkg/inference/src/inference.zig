@@ -140,6 +140,7 @@ test {
     _ = @import("architectures/gemma4_projector.zig");
     _ = @import("embedding_trace.zig");
     _ = @import("server/model_manager.zig");
+    _ = @import("server/transcription_sessions.zig");
     _ = finetune;
     _ = finetune_cli;
     _ = run;

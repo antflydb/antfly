@@ -209,6 +209,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data server HA state change synchronously adopts promotion and rewires live HTTP executor",
         "data server promotion open failure preserves retryable standby",
         "data server resumes HA standby replication from durable progress after restart",
+        "data server setHAStandbyUpstream swaps the upstream a replication round uses",
         "data runtime records and backs off HA standby replication round failures",
         "data runtime HA replication HTTP budget covers base64 apply envelope",
         "data runtime HA apply window remains bounded for control-plane liveness",

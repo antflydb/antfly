@@ -390,6 +390,8 @@ pub const Detail = enum(c_int) {
     vector_migration_copy_mismatch,
     vector_migration_unsupported_file,
     vector_store_requires_offline_command,
+    read_index_timeout,
+    incomplete_published_snapshot,
 };
 
 pub const Status = extern struct {
@@ -485,6 +487,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.GenerationDurabilityUncertain => status(.retryable, .generation_durability_uncertain),
         error.GenerationTransitionActive => status(.retryable, .generation_transition_active),
         error.IndexRebuilding => status(.retryable, .index_rebuilding),
+        error.IncompletePublishedSnapshot => status(.retryable, .incomplete_published_snapshot),
         error.TableVisibilityTimeout => status(.timeout, .table_visibility_timeout),
         error.WriterLocked => status(.retryable, .writer_locked),
         error.LsmRootWriterAlreadyOpen => status(.retryable, .lsm_root_writer_already_open),
@@ -506,6 +509,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedVersion => status(.unsupported, .unsupported_version),
         error.UnsupportedPlatform => status(.unsupported, .unsupported_platform),
         error.Timeout => status(.timeout, .timeout),
+        error.ReadIndexTimeout => status(.timeout, .read_index_timeout),
         error.DeadlineExceeded => status(.timeout, .deadline_exceeded),
         error.PreDecisionDeadlineExceeded => status(.timeout, .pre_decision_deadline_exceeded),
         error.ConnectionTimeout => status(.timeout, .connection_timeout),
@@ -896,6 +900,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .generation_durability_uncertain => "GenerationDurabilityUncertain",
         .generation_transition_active => "GenerationTransitionActive",
         .index_rebuilding => "IndexRebuilding",
+        .incomplete_published_snapshot => "IncompletePublishedSnapshot",
         .table_visibility_timeout => "TableVisibilityTimeout",
         .writer_locked => "WriterLocked",
         .lsm_root_writer_already_open => "LsmRootWriterAlreadyOpen",
@@ -911,6 +916,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_exact_sort => "UnsupportedExactSort",
         .unsupported_version => "UnsupportedVersion",
         .timeout => "Timeout",
+        .read_index_timeout => "ReadIndexTimeout",
         .connection_timeout => "ConnectionTimeout",
         .connection_timed_out => "ConnectionTimedOut",
         .cancelled => "Cancelled",
@@ -1162,6 +1168,13 @@ test "transaction capacity rejection retains a permanent public status" {
 }
 
 test "stable status preserves public boundary semantics" {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot }) |err| {
+        const readiness = statusFromError(err);
+        try std.testing.expectEqual(@intFromEnum(Code.retryable), readiness.code);
+        try std.testing.expectEqual(err, errorFromStatus(readiness));
+    }
+    try std.testing.expectEqual(error.ReadIndexTimeout, errorFromStatus(statusFromError(error.ReadIndexTimeout)));
+    try std.testing.expectEqual(@intFromEnum(Code.timeout), statusFromError(error.ReadIndexTimeout).code);
     try std.testing.expectEqual(error.GenerationTransitionActive, errorFromStatus(statusFromError(error.GenerationTransitionActive)));
     try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.GenerationTransitionActive).code);
     try std.testing.expectEqual(error.IndexGenerationMismatch, errorFromStatus(statusFromError(error.IndexGenerationMismatch)));

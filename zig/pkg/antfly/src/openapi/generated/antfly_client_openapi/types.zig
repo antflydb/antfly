@@ -12666,6 +12666,7 @@ pub const GeneratorProvider = enum {
     vertex,
     ollama,
     openai,
+    openrouter,
     antfly,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -12674,6 +12675,7 @@ pub const GeneratorProvider = enum {
             .vertex => "vertex",
             .ollama => "ollama",
             .openai => "openai",
+            .openrouter => "openrouter",
             .antfly => "antfly",
         };
         try jw.write(s);
@@ -12689,6 +12691,7 @@ pub const GeneratorProvider = enum {
             .{ "vertex", .vertex },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
+            .{ "openrouter", .openrouter },
             .{ "antfly", .antfly },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -18270,6 +18273,7 @@ pub const IndexConfig = struct {
 pub const IndexEmbedderConfig = union(enum) {
     ollama_embedder_config: OllamaEmbedderConfig,
     open_ai_embedder_config: OpenAIEmbedderConfig,
+    open_router_embedder_config: OpenRouterEmbedderConfig,
     bedrock_embedder_config: BedrockEmbedderConfig,
     cohere_embedder_config: CohereEmbedderConfig,
     google_embedder_config: GoogleEmbedderConfig,
@@ -18299,6 +18303,9 @@ pub const IndexEmbedderConfig = union(enum) {
         }
         if (std.mem.eql(u8, disc_str, "openai")) {
             return .{ .open_ai_embedder_config = try std.json.parseFromSliceLeaky(OpenAIEmbedderConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "openrouter")) {
+            return .{ .open_router_embedder_config = try std.json.parseFromSliceLeaky(OpenRouterEmbedderConfig, allocator, input, options) };
         }
         if (std.mem.eql(u8, disc_str, "bedrock")) {
             return .{ .bedrock_embedder_config = try std.json.parseFromSliceLeaky(BedrockEmbedderConfig, allocator, input, options) };
@@ -18338,6 +18345,9 @@ pub const IndexEmbedderConfig = union(enum) {
         if (std.mem.eql(u8, disc_str, "openai")) {
             return .{ .open_ai_embedder_config = try std.json.parseFromValueLeaky(OpenAIEmbedderConfig, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "openrouter")) {
+            return .{ .open_router_embedder_config = try std.json.parseFromValueLeaky(OpenRouterEmbedderConfig, allocator, source, options) };
+        }
         if (std.mem.eql(u8, disc_str, "bedrock")) {
             return .{ .bedrock_embedder_config = try std.json.parseFromValueLeaky(BedrockEmbedderConfig, allocator, source, options) };
         }
@@ -18360,6 +18370,7 @@ pub const IndexEmbedderConfig = union(enum) {
         switch (self) {
             .ollama_embedder_config => |v| try jw.write(v),
             .open_ai_embedder_config => |v| try jw.write(v),
+            .open_router_embedder_config => |v| try jw.write(v),
             .bedrock_embedder_config => |v| try jw.write(v),
             .cohere_embedder_config => |v| try jw.write(v),
             .google_embedder_config => |v| try jw.write(v),
@@ -18928,6 +18939,32 @@ pub const InferenceAudioChunkConfig = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// How much of Whisper's 30 s window the encoder processes. `full` pads every clip to 30 s, which is what the model was trained on and gives the most accurate transcripts. `dynamic` trims the encoder to the audio actually present (plus one second), which cuts encoder time roughly in proportion for short clips at a small accuracy cost on some models. Dictation defaults to `full`; streaming sessions default to `dynamic` because partials re-decode short open segments many times.
+pub const InferenceAudioContext = enum {
+    full,
+    dynamic,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .full => "full",
+            .dynamic => "dynamic",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "full", .full },
+            .{ "dynamic", .dynamic },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -19877,6 +19914,336 @@ pub const InferenceCredentials = struct {
         }
         try jw.endObject();
     }
+};
+
+pub const InferenceDictateRequest = struct {
+    /// Transcriber model from models_dir/transcribers/.
+    model: []const u8,
+    /// Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows.
+    audio: []const u8,
+    /// Force the transcript language (ISO 639-1). Omit for automatic detection.
+    language: ?[]const u8 = null,
+    /// Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
+    cleanup_model: ?[]const u8 = null,
+    style: ?InferenceDictationStyle = null,
+    /// Preferred spellings for names and terms the recognizer tends to miss.
+    dictionary: ?[]const []const u8 = null,
+    /// Where the text will be inserted, for example "email to a customer". Steers tone and formatting.
+    context: ?[]const u8 = null,
+    /// Extra cleanup instructions appended to the built-in rules.
+    instructions: ?[]const u8 = null,
+    /// Text the recognizer treats as preceding context, so it prefers these spellings and this style. Defaults to the dictionary entries joined by commas.
+    transcript_prompt: ?[]const u8 = null,
+    vad: ?InferenceVadConfig = null,
+    audio_context: ?InferenceAudioContext = null,
+    /// Stream the response as Server-Sent Events.
+    stream: ?bool = null,
+    /// Output budget for the cleanup pass. Defaults to about twice the transcript length.
+    max_tokens: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "audio", "audio", false },
+        .{ "language", "language", true },
+        .{ "cleanup_model", "cleanup_model", true },
+        .{ "style", "style", true },
+        .{ "dictionary", "dictionary", true },
+        .{ "context", "context", true },
+        .{ "instructions", "instructions", true },
+        .{ "transcript_prompt", "transcript_prompt", true },
+        .{ "vad", "vad", true },
+        .{ "audio_context", "audio_context", true },
+        .{ "stream", "stream", true },
+        .{ "max_tokens", "max_tokens", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("audio");
+        try jw.write(self.audio);
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.cleanup_model) |value| {
+            try jw.objectField("cleanup_model");
+            try jw.write(value);
+        }
+        if (self.style) |value| {
+            try jw.objectField("style");
+            try jw.write(value);
+        }
+        if (self.dictionary) |value| {
+            try jw.objectField("dictionary");
+            try jw.write(value);
+        }
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.transcript_prompt) |value| {
+            try jw.objectField("transcript_prompt");
+            try jw.write(value);
+        }
+        if (self.vad) |value| {
+            try jw.objectField("vad");
+            try jw.write(value);
+        }
+        if (self.audio_context) |value| {
+            try jw.objectField("audio_context");
+            try jw.write(value);
+        }
+        if (self.stream) |value| {
+            try jw.objectField("stream");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceDictateResponse = struct {
+    object: []const u8,
+    id: []const u8,
+    /// Unix timestamp (seconds).
+    created: i64,
+    /// Transcriber model used.
+    model: []const u8,
+    /// Generator model used for cleanup, when one ran.
+    cleanup_model: ?[]const u8 = null,
+    transcript: InferenceDictationTranscript,
+    /// Cleaned text, or the raw transcript when no cleanup ran.
+    text: []const u8,
+    usage: InferenceGenerateUsage,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "id", "id", false },
+        .{ "created", "created", false },
+        .{ "model", "model", false },
+        .{ "cleanup_model", "cleanup_model", true },
+        .{ "transcript", "transcript", false },
+        .{ "text", "text", false },
+        .{ "usage", "usage", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("created");
+        try jw.write(self.created);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.cleanup_model) |value| {
+            try jw.objectField("cleanup_model");
+            try jw.write(value);
+        }
+        try jw.objectField("transcript");
+        try jw.write(self.transcript);
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        try jw.endObject();
+    }
+};
+
+/// One Server-Sent Event of a streaming dictation. `dictation.transcript` carries `transcript`; `dictation.delta` carries `delta`; `dictation.completed` carries `text` and `usage`; `error` carries `error` and `message`. The stream ends with the literal `[DONE]`.
+pub const InferenceDictationEvent = struct {
+    type: []const u8,
+    id: []const u8,
+    model: ?[]const u8 = null,
+    cleanup_model: ?[]const u8 = null,
+    transcript: ?InferenceDictationTranscript = null,
+    delta: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+    usage: ?InferenceGenerateUsage = null,
+    @"error": ?[]const u8 = null,
+    message: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "model", "model", true },
+        .{ "cleanup_model", "cleanup_model", true },
+        .{ "transcript", "transcript", true },
+        .{ "delta", "delta", true },
+        .{ "text", "text", true },
+        .{ "usage", "usage", true },
+        .{ "error", "error", true },
+        .{ "message", "message", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.cleanup_model) |value| {
+            try jw.objectField("cleanup_model");
+            try jw.write(value);
+        }
+        if (self.transcript) |value| {
+            try jw.objectField("transcript");
+            try jw.write(value);
+        }
+        if (self.delta) |value| {
+            try jw.objectField("delta");
+            try jw.write(value);
+        }
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// One phrase bracketed by Whisper timestamp tokens (about 20 ms resolution).
+pub const InferenceDictationSegment = struct {
+    text: []const u8,
+    /// Phrase start offset in the clip, in milliseconds.
+    start_ms: i64,
+    /// Phrase end offset in the clip, in milliseconds.
+    end_ms: i64,
+    /// Word spans estimated inside the phrase by distributing its duration over word lengths.
+    words: []const InferenceDictationWord,
+};
+
+/// How the cleanup pass rewrites the transcript. `clean` removes fillers and fixes punctuation while keeping the speaker's wording; `formal` and `casual` also adjust register; `verbatim` skips the generator and returns the raw transcript.
+pub const InferenceDictationStyle = enum {
+    clean,
+    formal,
+    casual,
+    verbatim,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .clean => "clean",
+            .formal => "formal",
+            .casual => "casual",
+            .verbatim => "verbatim",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "clean", .clean },
+            .{ "formal", .formal },
+            .{ "casual", .casual },
+            .{ "verbatim", .verbatim },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceDictationTranscript = struct {
+    /// Raw transcript before cleanup.
+    text: []const u8,
+    /// Detected or forced language.
+    language: ?[]const u8 = null,
+    /// Decoded clip duration in milliseconds.
+    duration_ms: i64,
+    /// Timestamped phrases in clip order.
+    segments: []const InferenceDictationSegment,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "text", "text", false },
+        .{ "language", "language", true },
+        .{ "duration_ms", "duration_ms", false },
+        .{ "segments", "segments", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        try jw.objectField("duration_ms");
+        try jw.write(self.duration_ms);
+        try jw.objectField("segments");
+        try jw.write(self.segments);
+        try jw.endObject();
+    }
+};
+
+pub const InferenceDictationWord = struct {
+    word: []const u8,
+    start_ms: i64,
+    end_ms: i64,
 };
 
 /// OpenAI-compatible embedding request with inference multimodal content-part extension
@@ -21528,7 +21895,7 @@ pub const InferencePredictorsResponse = struct {
 
 /// Native generator prompt KV cache configuration.
 pub const InferencePromptCacheConfig = struct {
-    /// Enable inference-native prompt KV cache reuse for generator requests.
+    /// Enable inference-native prompt KV cache reuse for generator requests. On by default; set false to disable.
     enabled: ?bool = null,
     /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an opt-in page-aligned compressed radix tree with shared-prefix ownership and leaf-only LRU eviction; it is currently qualified for native and Metal backends. Eligible Metal requests use eager paged attention; explicit compiled generation is incompatible with prompt caching. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
     mode: ?[]const u8 = null,
@@ -22320,7 +22687,7 @@ pub const InferenceTranscribeObject = struct {
 pub const InferenceTranscribeRequest = struct {
     /// Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
     model: []const u8,
-    /// Base64-encoded audio data (WAV, MP3, FLAC, etc.)
+    /// Base64-encoded audio data (WAV, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
     audio: []const u8,
     /// Force specific language for transcription (optional, model-dependent)
     language: ?[]const u8 = null,
@@ -22364,6 +22731,372 @@ pub const InferenceTranscribeResponse = struct {
     usage: InferenceGenerateUsage,
 };
 
+pub const InferenceTranscriptionAudioAppend = struct {
+    /// Base64 audio chunk. Optional when `commit` is true.
+    audio: ?[]const u8 = null,
+    format: ?InferenceTranscriptionAudioFormat = null,
+    /// Sample rate of raw `pcm16` / `pcm_f32` chunks. Default 16000. Ignored for containers.
+    sample_rate: ?i64 = null,
+    /// Finalize buffered speech even without trailing silence.
+    commit: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "audio", "audio", true },
+        .{ "format", "format", true },
+        .{ "sample_rate", "sample_rate", true },
+        .{ "commit", "commit", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        if (self.format) |value| {
+            try jw.objectField("format");
+            try jw.write(value);
+        }
+        if (self.sample_rate) |value| {
+            try jw.objectField("sample_rate");
+            try jw.write(value);
+        }
+        if (self.commit) |value| {
+            try jw.objectField("commit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceTranscriptionAudioFormat = enum {
+    auto,
+    pcm16,
+    pcm_f32,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .pcm16 => "pcm16",
+            .pcm_f32 => "pcm_f32",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "pcm16", .pcm16 },
+            .{ "pcm_f32", .pcm_f32 },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceTranscriptionEvent = struct {
+    object: []const u8,
+    type: []const u8,
+    /// Monotonic per-session event counter.
+    sequence: i64,
+    /// Current hypothesis for the segment.
+    text: []const u8,
+    /// Prefix of `text` that agreed with the previous hypothesis. Equals `text` for final events.
+    stable_text: []const u8,
+    /// Segment start in the session timeline, in milliseconds.
+    start_ms: i64,
+    end_ms: i64,
+    language: ?[]const u8 = null,
+    /// Word spans on the session timeline. Empty for partial events.
+    words: ?[]const InferenceDictationWord = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "type", "type", false },
+        .{ "sequence", "sequence", false },
+        .{ "text", "text", false },
+        .{ "stable_text", "stable_text", false },
+        .{ "start_ms", "start_ms", false },
+        .{ "end_ms", "end_ms", false },
+        .{ "language", "language", true },
+        .{ "words", "words", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("sequence");
+        try jw.write(self.sequence);
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("stable_text");
+        try jw.write(self.stable_text);
+        try jw.objectField("start_ms");
+        try jw.write(self.start_ms);
+        try jw.objectField("end_ms");
+        try jw.write(self.end_ms);
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.words) |value| {
+            try jw.objectField("words");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceTranscriptionEventList = struct {
+    object: []const u8,
+    session_id: []const u8,
+    model: []const u8,
+    data: []const InferenceTranscriptionEvent,
+    buffered_ms: i64,
+    total_ms: i64,
+};
+
+pub const InferenceTranscriptionSession = struct {
+    object: []const u8,
+    id: []const u8,
+    model: []const u8,
+    language: ?[]const u8 = null,
+    /// Unix timestamp (seconds).
+    created: i64,
+    /// Unix timestamp (seconds) after which the session is reclaimed unless audio is appended.
+    expires_at: i64,
+    /// Audio held for the open segment.
+    buffered_ms: i64,
+    /// Audio appended over the session lifetime.
+    total_ms: i64,
+    finals: i64,
+    partials: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "id", "id", false },
+        .{ "model", "model", false },
+        .{ "language", "language", true },
+        .{ "created", "created", false },
+        .{ "expires_at", "expires_at", false },
+        .{ "buffered_ms", "buffered_ms", false },
+        .{ "total_ms", "total_ms", false },
+        .{ "finals", "finals", false },
+        .{ "partials", "partials", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        try jw.objectField("created");
+        try jw.write(self.created);
+        try jw.objectField("expires_at");
+        try jw.write(self.expires_at);
+        try jw.objectField("buffered_ms");
+        try jw.write(self.buffered_ms);
+        try jw.objectField("total_ms");
+        try jw.write(self.total_ms);
+        try jw.objectField("finals");
+        try jw.write(self.finals);
+        try jw.objectField("partials");
+        try jw.write(self.partials);
+        try jw.endObject();
+    }
+};
+
+pub const InferenceTranscriptionSessionDeleted = struct {
+    object: []const u8,
+    id: []const u8,
+    deleted: bool,
+};
+
+pub const InferenceTranscriptionSessionRequest = struct {
+    /// Transcriber model from models_dir/transcribers/.
+    model: []const u8,
+    /// Force the transcript language (ISO 639-1). Omit for automatic detection.
+    language: ?[]const u8 = null,
+    vad: ?InferenceVadConfig = null,
+    audio_context: ?InferenceAudioContext = null,
+    /// Minimum new audio before the open segment is decoded again for a partial. Each partial is a full Whisper pass, so lower values raise decoder load. Default 2000.
+    partial_interval_ms: ?i64 = null,
+    /// Continuous speech that forces a segment boundary. Default 25000.
+    max_segment_ms: ?i64 = null,
+    /// Emit partial hypotheses for the open segment.
+    emit_partials: ?bool = null,
+    /// Preferred spellings for names and terms; joined into the recognizer's preceding-context prompt.
+    dictionary: ?[]const []const u8 = null,
+    /// Explicit preceding-context text for the recognizer. Overrides `dictionary`.
+    transcript_prompt: ?[]const u8 = null,
+    /// Idle time after which the session expires. Default 300.
+    ttl_seconds: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "language", "language", true },
+        .{ "vad", "vad", true },
+        .{ "audio_context", "audio_context", true },
+        .{ "partial_interval_ms", "partial_interval_ms", true },
+        .{ "max_segment_ms", "max_segment_ms", true },
+        .{ "emit_partials", "emit_partials", true },
+        .{ "dictionary", "dictionary", true },
+        .{ "transcript_prompt", "transcript_prompt", true },
+        .{ "ttl_seconds", "ttl_seconds", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.vad) |value| {
+            try jw.objectField("vad");
+            try jw.write(value);
+        }
+        if (self.audio_context) |value| {
+            try jw.objectField("audio_context");
+            try jw.write(value);
+        }
+        if (self.partial_interval_ms) |value| {
+            try jw.objectField("partial_interval_ms");
+            try jw.write(value);
+        }
+        if (self.max_segment_ms) |value| {
+            try jw.objectField("max_segment_ms");
+            try jw.write(value);
+        }
+        if (self.emit_partials) |value| {
+            try jw.objectField("emit_partials");
+            try jw.write(value);
+        }
+        if (self.dictionary) |value| {
+            try jw.objectField("dictionary");
+            try jw.write(value);
+        }
+        if (self.transcript_prompt) |value| {
+            try jw.objectField("transcript_prompt");
+            try jw.write(value);
+        }
+        if (self.ttl_seconds) |value| {
+            try jw.objectField("ttl_seconds");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// One Server-Sent Event on a session event stream. `session.open` starts the stream, `transcription.event` carries `event`, `ping` keeps the connection alive, `session.closed` ends it, and `error` carries `error` and `message`. The stream ends with the literal `[DONE]`.
+pub const InferenceTranscriptionStreamMessage = struct {
+    type: []const u8,
+    session_id: []const u8,
+    event: ?InferenceTranscriptionEvent = null,
+    buffered_ms: ?i64 = null,
+    total_ms: ?i64 = null,
+    @"error": ?[]const u8 = null,
+    message: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "session_id", "session_id", false },
+        .{ "event", "event", true },
+        .{ "buffered_ms", "buffered_ms", true },
+        .{ "total_ms", "total_ms", true },
+        .{ "error", "error", true },
+        .{ "message", "message", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("session_id");
+        try jw.write(self.session_id);
+        if (self.event) |value| {
+            try jw.objectField("event");
+            try jw.write(value);
+        }
+        if (self.buffered_ms) |value| {
+            try jw.objectField("buffered_ms");
+            try jw.write(value);
+        }
+        if (self.total_ms) |value| {
+            try jw.objectField("total_ms");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Actionable retry contract for temporary inference-capacity failures.
 pub const InferenceTransientCapacityError = struct {
     /// Stable machine-readable error code
@@ -22376,6 +23109,69 @@ pub const InferenceTransientCapacityError = struct {
     retryable: bool,
     /// Minimum retry delay in milliseconds
     retry_after_ms: i64,
+};
+
+/// Voice activity detection. Without `model`, frames are classified by RMS energy against `threshold`. With `model` naming a pulled Silero VAD export (`antfly inference pull onnx-community/silero-vad --tasks vad`), 512-sample frames at 16 kHz are scored by the neural model, which separates speech from tones, music, and keyboard noise that the energy rule accepts.
+pub const InferenceVadConfig = struct {
+    /// Silero VAD model directory name from models_dir, for example `onnx-community/silero-vad`.
+    model: ?[]const u8 = null,
+    /// Speech probability at or above which a Silero frame counts as speech. Default 0.5.
+    silero_threshold: ?f32 = null,
+    /// RMS amplitude on [-1, 1] PCM at or above which a 20 ms frame counts as speech. Default 0.012 (about -38 dBFS).
+    threshold: ?f32 = null,
+    /// Consecutive speech needed to open a segment. Default 120.
+    min_speech_ms: ?i64 = null,
+    /// Continuous silence that closes a segment. Default 600.
+    min_silence_ms: ?i64 = null,
+    /// Padding kept on both sides of each segment. Default 120.
+    speech_pad_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "silero_threshold", "silero_threshold", true },
+        .{ "threshold", "threshold", true },
+        .{ "min_speech_ms", "min_speech_ms", true },
+        .{ "min_silence_ms", "min_silence_ms", true },
+        .{ "speech_pad_ms", "speech_pad_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.silero_threshold) |value| {
+            try jw.objectField("silero_threshold");
+            try jw.write(value);
+        }
+        if (self.threshold) |value| {
+            try jw.objectField("threshold");
+            try jw.write(value);
+        }
+        if (self.min_speech_ms) |value| {
+            try jw.objectField("min_speech_ms");
+            try jw.write(value);
+        }
+        if (self.min_silence_ms) |value| {
+            try jw.objectField("min_silence_ms");
+            try jw.write(value);
+        }
+        if (self.speech_pad_ms) |value| {
+            try jw.objectField("speech_pad_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Legacy inference-local logging configuration. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
@@ -24948,11 +25744,13 @@ pub const OpenAIGeneratorConfig = struct {
     }
 };
 
-/// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
+/// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. Antfly currently supports dense text embeddings through this provider. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
 pub const OpenRouterEmbedderConfig = struct {
     provider: []const u8,
     /// The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
     model: []const u8,
+    /// The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
+    url: ?[]const u8 = null,
     /// The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
     api_key: ?[]const u8 = null,
     /// Output dimension for the embedding (if supported by the model).
@@ -24962,6 +25760,7 @@ pub const OpenRouterEmbedderConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
         .{ "model", "model", false },
+        .{ "url", "url", true },
         .{ "api_key", "api_key", true },
         .{ "dimensions", "dimensions", true },
     };
@@ -24980,12 +25779,95 @@ pub const OpenRouterEmbedderConfig = struct {
         try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
             try jw.write(value);
         }
         if (self.dimensions) |value| {
             try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Configuration for the OpenRouter generative AI provider.
+pub const OpenRouterGeneratorConfig = struct {
+    provider: []const u8,
+    /// The OpenRouter model identifier to use.
+    model: []const u8,
+    /// The URL of the OpenRouter API endpoint.
+    url: ?[]const u8 = null,
+    /// The OpenRouter API key.
+    api_key: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
+    top_p: ?f32 = null,
+    /// Penalty for token frequency (-2.0 to 2.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (-2.0 to 2.0).
+    presence_penalty: ?f32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", false },
+        .{ "url", "url", true },
+        .{ "api_key", "api_key", true },
+        .{ "temperature", "temperature", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "top_p", "top_p", true },
+        .{ "frequency_penalty", "frequency_penalty", true },
+        .{ "presence_penalty", "presence_penalty", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.frequency_penalty) |value| {
+            try jw.objectField("frequency_penalty");
+            try jw.write(value);
+        }
+        if (self.presence_penalty) |value| {
+            try jw.objectField("presence_penalty");
             try jw.write(value);
         }
         try jw.endObject();

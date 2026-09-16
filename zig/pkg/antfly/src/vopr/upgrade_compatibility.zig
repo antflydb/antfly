@@ -58,7 +58,7 @@ fn manifestV12FixtureAlloc(allocator: std.mem.Allocator) ![]u8 {
 
 pub const Scenario = struct {
     pub const name: []const u8 = "upgrade-compatibility";
-    pub const version: u32 = 2;
+    pub const version: u32 = 3;
 
     const sound_id = vopr.id.stable(name, "safe-compatible-outcome");
     const complete_id = vopr.id.stable(name, "mode-completes");
@@ -76,7 +76,8 @@ pub const Scenario = struct {
         serverless_future_head_rejected,
         serverless_inventory_v14_forward,
         serverless_inventory_future_rejected,
-        serverless_manifest_v12_forward,
+        serverless_manifest_current_round_trip,
+        serverless_manifest_v12_rejected,
         serverless_manifest_future_rejected,
     };
 
@@ -112,7 +113,8 @@ pub const Scenario = struct {
                 .serverless_future_head_rejected => try self.futureHeadRejected(),
                 .serverless_inventory_v14_forward => try self.inventoryV14Forwards(),
                 .serverless_inventory_future_rejected => try self.inventoryFutureRejected(),
-                .serverless_manifest_v12_forward => try self.manifestV12Forwards(),
+                .serverless_manifest_current_round_trip => try self.manifestCurrentRoundTrip(),
+                .serverless_manifest_v12_rejected => try self.manifestV12Rejected(),
                 .serverless_manifest_future_rejected => try self.manifestFutureRejected(),
             }
             self.progress += 1;
@@ -203,15 +205,26 @@ pub const Scenario = struct {
             } else |err| self.sound = err == error.UnsupportedExternalSourceInventoryVersion;
         }
 
-        fn manifestV12Forwards(self: *State) !void {
-            const legacy = try manifestV12FixtureAlloc(self.allocator);
-            defer self.allocator.free(legacy);
-            var decoded = try manifest_codec.decodeAlloc(self.allocator, legacy);
+        fn manifestCurrentRoundTrip(self: *State) !void {
+            const encoded = try manifest_codec.encodeAlloc(self.allocator, minimalManifest());
+            defer self.allocator.free(encoded);
+            var decoded = try manifest_codec.decodeAlloc(self.allocator, encoded);
             defer decoded.deinit(self.allocator);
             self.sound = decoded.version == 7 and
                 decoded.stats.document_base_version == 7 and
-                !decoded.publication_lineage_tracked and
-                decoded.publication_parent_version == null;
+                std.mem.eql(u8, decoded.namespace, "docs");
+        }
+
+        fn manifestV12Rejected(self: *State) !void {
+            // The manifest codec is forward-only: old artifacts must fail
+            // explicitly instead of being interpreted using the current layout.
+            const legacy = try manifestV12FixtureAlloc(self.allocator);
+            defer self.allocator.free(legacy);
+            if (manifest_codec.decodeAlloc(self.allocator, legacy)) |unexpected_value| {
+                var unexpected = unexpected_value;
+                unexpected.deinit(self.allocator);
+                self.sound = false;
+            } else |err| self.sound = err == error.UnsupportedManifestVersion;
         }
 
         fn manifestFutureRejected(self: *State) !void {
@@ -253,7 +266,7 @@ pub const Scenario = struct {
             .id = id,
             .name = mode_name,
             .kind = switch (mode) {
-                .storage_hot_standby_v1_golden, .serverless_legacy_head_forward, .serverless_inventory_v14_forward, .serverless_manifest_v12_forward => .maintenance,
+                .storage_hot_standby_v1_golden, .serverless_legacy_head_forward, .serverless_inventory_v14_forward, .serverless_manifest_current_round_trip => .maintenance,
                 else => .fault,
             },
         });
