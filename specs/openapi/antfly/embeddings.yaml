@@ -318,6 +318,8 @@ components:
         OpenRouter provides a unified API for multiple embedding models from different providers.
         API key via `api_key` field or `OPENROUTER_API_KEY` environment variable.
 
+        Antfly currently supports dense text embeddings through this provider.
+
         **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large,
         google/gemini-embedding-001, qwen/qwen3-embedding-8b
 
@@ -331,6 +333,10 @@ components:
           description: "The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001')."
           default: "openai/text-embedding-3-small"
           example: "openai/text-embedding-3-small"
+        url:
+          type: string
+          format: uri
+          description: "The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1."
         api_key:
           type: string
           writeOnly: true
@@ -423,6 +429,7 @@ components:
       oneOf:
         - $ref: "#/components/schemas/OllamaEmbedderConfig"
         - $ref: "#/components/schemas/OpenAIEmbedderConfig"
+        - $ref: "#/components/schemas/OpenRouterEmbedderConfig"
         - $ref: "#/components/schemas/BedrockEmbedderConfig"
         - $ref: "#/components/schemas/CohereEmbedderConfig"
         - $ref: "#/components/schemas/GoogleEmbedderConfig"
@@ -433,6 +440,7 @@ components:
         mapping:
           ollama: "#/components/schemas/OllamaEmbedderConfig"
           openai: "#/components/schemas/OpenAIEmbedderConfig"
+          openrouter: "#/components/schemas/OpenRouterEmbedderConfig"
           bedrock: "#/components/schemas/BedrockEmbedderConfig"
           cohere: "#/components/schemas/CohereEmbedderConfig"
           gemini: "#/components/schemas/GoogleEmbedderConfig"

@@ -532,6 +532,7 @@ pub const GoogleEmbedderConfig = struct {
 pub const IndexEmbedderConfig = union(enum) {
     ollama_embedder_config: OllamaEmbedderConfig,
     open_ai_embedder_config: OpenAIEmbedderConfig,
+    open_router_embedder_config: OpenRouterEmbedderConfig,
     bedrock_embedder_config: BedrockEmbedderConfig,
     cohere_embedder_config: CohereEmbedderConfig,
     google_embedder_config: GoogleEmbedderConfig,
@@ -561,6 +562,9 @@ pub const IndexEmbedderConfig = union(enum) {
         }
         if (std.mem.eql(u8, disc_str, "openai")) {
             return .{ .open_ai_embedder_config = try std.json.parseFromSliceLeaky(OpenAIEmbedderConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "openrouter")) {
+            return .{ .open_router_embedder_config = try std.json.parseFromSliceLeaky(OpenRouterEmbedderConfig, allocator, input, options) };
         }
         if (std.mem.eql(u8, disc_str, "bedrock")) {
             return .{ .bedrock_embedder_config = try std.json.parseFromSliceLeaky(BedrockEmbedderConfig, allocator, input, options) };
@@ -600,6 +604,9 @@ pub const IndexEmbedderConfig = union(enum) {
         if (std.mem.eql(u8, disc_str, "openai")) {
             return .{ .open_ai_embedder_config = try std.json.parseFromValueLeaky(OpenAIEmbedderConfig, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "openrouter")) {
+            return .{ .open_router_embedder_config = try std.json.parseFromValueLeaky(OpenRouterEmbedderConfig, allocator, source, options) };
+        }
         if (std.mem.eql(u8, disc_str, "bedrock")) {
             return .{ .bedrock_embedder_config = try std.json.parseFromValueLeaky(BedrockEmbedderConfig, allocator, source, options) };
         }
@@ -622,6 +629,7 @@ pub const IndexEmbedderConfig = union(enum) {
         switch (self) {
             .ollama_embedder_config => |v| try jw.write(v),
             .open_ai_embedder_config => |v| try jw.write(v),
+            .open_router_embedder_config => |v| try jw.write(v),
             .bedrock_embedder_config => |v| try jw.write(v),
             .cohere_embedder_config => |v| try jw.write(v),
             .google_embedder_config => |v| try jw.write(v),
@@ -719,11 +727,13 @@ pub const OpenAIEmbedderConfig = struct {
     }
 };
 
-/// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
+/// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. Antfly currently supports dense text embeddings through this provider. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
 pub const OpenRouterEmbedderConfig = struct {
     provider: []const u8,
     /// The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
     model: []const u8,
+    /// The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
+    url: ?[]const u8 = null,
     /// The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
     api_key: ?[]const u8 = null,
     /// Output dimension for the embedding (if supported by the model).
@@ -733,6 +743,7 @@ pub const OpenRouterEmbedderConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
         .{ "model", "model", false },
+        .{ "url", "url", true },
         .{ "api_key", "api_key", true },
         .{ "dimensions", "dimensions", true },
     };
@@ -751,6 +762,10 @@ pub const OpenRouterEmbedderConfig = struct {
         try jw.write(self.provider);
         try jw.objectField("model");
         try jw.write(self.model);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
             try jw.write(value);
