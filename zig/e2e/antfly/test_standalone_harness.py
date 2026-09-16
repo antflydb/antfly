@@ -718,3 +718,62 @@ def test_wait_until_preserves_nonretryable_service_unavailable():
         helpers.wait_until(probe, timeout_s=1.0)
 
     assert raised.value is expected
+
+
+@pytest.mark.parametrize("restartable", [False, True])
+def test_backup_api_restart_capability_and_session_lifecycle(monkeypatch, restartable):
+    sessions = []
+    events = []
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.closed = False
+            sessions.append(self)
+
+        def close(self):
+            self.closed = True
+
+    server = SimpleNamespace(
+        url="http://127.0.0.1:9999",
+        debug_logs=lambda: "fixture logs",
+        stop=lambda **kwargs: events.append("stop"),
+    )
+
+    def restart():
+        assert sessions[0].closed
+        events.append("restart")
+
+    if restartable:
+        server.restart = restart
+    monkeypatch.setattr(e2e_conftest, "_uses_reusable_antfly_process", lambda _: False)
+    monkeypatch.setattr(e2e_conftest, "resolve_binary_path", lambda _: sys.executable)
+    monkeypatch.setattr(e2e_conftest, "find_free_port", lambda: 9999)
+    monkeypatch.setattr(e2e_conftest, "PublicAntflyServer", lambda *args: server)
+    monkeypatch.setattr(e2e_conftest, "wait_for_server", lambda *args, **kwargs: True)
+    monkeypatch.setattr(e2e_conftest.requests, "Session", Session)
+    fixture = e2e_conftest.backup_api.__wrapped__(
+        SimpleNamespace(node=SimpleNamespace())
+    )
+    api = next(fixture)
+    try:
+        assert api.supports_restart is restartable
+        if restartable:
+            api.restart_server()
+            assert events == ["restart"]
+            assert len(sessions) == 2
+            assert api.s is sessions[1]
+            assert not api.s.closed
+            assert api.s.headers == {
+                "Content-Type": "application/json",
+                "Connection": "close",
+            }
+        else:
+            with pytest.raises(RuntimeError, match="restart is only available"):
+                api.restart_server()
+            assert len(sessions) == 1
+    finally:
+        with pytest.raises(StopIteration):
+            next(fixture)
+    assert all(session.closed for session in sessions)
+    assert events[-1] == "stop"
