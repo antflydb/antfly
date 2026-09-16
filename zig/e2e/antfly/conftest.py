@@ -3380,6 +3380,33 @@ def backup_api(request: pytest.FixtureRequest):
             self._request_lock = threading.Lock()
             self._created_tables: set[str] = set()
 
+        @property
+        def supports_restart(self) -> bool:
+            """Whether this fixture owns a server with a restart lifecycle."""
+            return self._server is not None and callable(
+                getattr(self._server, "restart", None)
+            )
+
+        def restart_server(self) -> None:
+            server = self._server
+            if not self.supports_restart:
+                raise RuntimeError(
+                    "restart is only available for locally managed stateful servers"
+                )
+            assert server is not None
+            with self._request_lock:
+                self.s.close()
+                server.restart()
+                if not wait_for_server(self.url, timeout=20):
+                    logs = server.debug_logs().strip()
+                    raise RuntimeError(
+                        f"stateful server failed to restart at {self.url}\n{logs}"
+                    )
+                new_session = requests.Session()
+                new_session.headers["Content-Type"] = "application/json"
+                new_session.headers["Connection"] = "close"
+                self.s = new_session
+
         def debug_logs(self) -> str:
             if self._server is None:
                 return ""
@@ -3711,7 +3738,7 @@ def backup_api(request: pytest.FixtureRequest):
         if reusable_runtime is not None
         else []
     )
-    session.close()
+    api.s.close()
     if reusable_runtime is not None:
         reusable_runtime.test_failed = (
             reusable_runtime.test_failed or test_failed or bool(cleanup_errors)

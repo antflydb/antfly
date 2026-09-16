@@ -534,6 +534,7 @@ pub const IoReaderHelpers = struct {
 pub const SocketIoReader = struct {
     socket: *Socket,
     reader_iface: Io.Reader,
+    last_read_error: ?anyerror = null,
 
     pub fn init(socket: *Socket, buffer: []u8) SocketIoReader {
         return .{
@@ -559,7 +560,11 @@ pub const SocketIoReader = struct {
         if (dest.len == 0 or dest[0].len == 0) return 0;
         // Route TLS transport reads through Socket.recv so absolute request
         // deadlines and per-request kernel timeout resets apply consistently.
-        const n = p.socket.recv(dest[0]) catch return error.ReadFailed;
+        p.last_read_error = null;
+        const n = p.socket.recv(dest[0]) catch |err| {
+            p.last_read_error = err;
+            return error.ReadFailed;
+        };
         if (n == 0) return error.EndOfStream;
         if (n > data_size) {
             r.end += n - data_size;
