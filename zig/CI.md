@@ -21,8 +21,11 @@ use the same controller implementation and repository-specific suite maps.
    approval rights. No per-user allowlist, GitHub App, or additional credential is
    required; permission checks use the automatically provided `GITHUB_TOKEN`.
 4. Follow **Approved PR CI** in Actions and the **PR CI gate** status on the PR head.
-   Queued approvals link to the PR-filtered workflow listing, and admitted runs
-   link directly to their jobs. The **PR CI** check retains the approval record.
+   The gate links to the exact workflow run as soon as dispatch returns its ID,
+   including while queued before any runner starts. It remains pending until
+   admission and all required suites complete. Before dispatch (or on older
+   GitHub Enterprise versions without run details), it links to the PR-filtered
+   workflow listing. The **PR CI** check retains the approval record.
 
 ### Required merge gate
 

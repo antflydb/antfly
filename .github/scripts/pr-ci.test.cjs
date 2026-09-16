@@ -454,3 +454,59 @@ test('gate invalidation replaces success on the same head', async () => {
   assert.equal(f.statuses.at(-1).sha, SHA);
   assert.equal(f.statuses.at(-1).state, 'error');
 });
+
+
+test('dispatch returns an exact queued link without consuming admission', async () => {
+  const f = fixture();
+  f.github.rest.actions.createWorkflowDispatch = async body => {
+    f.dispatches.push(body);
+    return {data: {workflow_run_id: 91}};
+  };
+  await f.call();
+  assert.equal(f.dispatches[0].return_run_details, true);
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.com/acme/project/actions/runs/91');
+  assert.equal(f.statuses.at(-1).description, 'CI queued; view workflow runs');
+  assert.equal(f.checks.at(-1).status, 'queued');
+  assert.equal(JSON.parse(f.checks.at(-1).output.text).run_id, undefined);
+  assert.equal(JSON.parse(f.checks.at(-1).output.text).dispatched_run_id, 91);
+  await f.call(); assert.equal(f.dispatches.length, 1);
+  f.context.runId = 92;
+  await assert.rejects(f.call('admit'), /another dispatched run/);
+  f.context.runId = 91;
+  await f.call('admit');
+  assert.equal(f.checks.at(-1).status, 'in_progress');
+  f.finish(); await f.call();
+  assert.equal(f.statuses.at(-1).state, 'success');
+});
+
+test('queued dispatch cannot pass without admission or finish from another run', async () => {
+  const f = fixture();
+  f.github.rest.actions.createWorkflowDispatch = async () => ({data: {workflow_run_id: 91}});
+  await f.call(); f.finish(); f.context.payload.workflow_run.id = 92;
+  await f.call();
+  assert.equal(f.statuses.at(-1).state, 'pending');
+  f.context.payload.workflow_run.id = 91;
+  await f.call();
+  assert.equal(f.statuses.at(-1).state, 'failure');
+});
+
+test('invalid dispatch IDs fail closed', async () => {
+  for (const id of [null, 0, -1, '91', 1.5]) {
+    const f = fixture();
+    f.github.rest.actions.createWorkflowDispatch = async () => ({data: {workflow_run_id: id}});
+    await assert.rejects(f.call(), /Invalid dispatched run ID/);
+    assert.equal(f.statuses.at(-1).state, 'failure');
+  }
+});
+
+test('queued run link is replaced on a fresh approval', async () => {
+  const f = fixture();
+  let id = 91;
+  f.github.rest.actions.createWorkflowDispatch = async () => ({data: {workflow_run_id: id}});
+  await f.call();
+  f.comment.id = 18; id = 92;
+  await f.call();
+  assert.equal(f.statuses.at(-1).target_url, 'https://github.com/acme/project/actions/runs/92');
+  assert.equal(f.checks.at(-1).status, 'queued');
+});
