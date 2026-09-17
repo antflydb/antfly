@@ -125,3 +125,122 @@ Remaining measured candidates include the wide external-vector reopen test
 uses 131,073 scores to cross real routing/footer boundaries. Preserve those
 boundaries when separating small correctness fixtures from full-size cases.
 Measure with allocator traces disabled before identifying production bottlenecks.
+
+## Follow-up after the GLiNER2.5 main merge
+
+The September 16 local reassessment uses `ec74554b7f` (macOS ARM64, Debug,
+Metal/CUDA disabled). The SDK CI failure was the Python formatter rejecting
+`test_finetune_command_checks.py`; the exact repository formatting check and
+all five Python regression tests pass after formatting. The restarted SDK job
+also passed.
+
+The expanded inference executable now selects 4,294 tests: 3,907 passed and
+387 skipped. Three runs took 478, 481, and 480 seconds. The older 75-second
+measurement predates the new training tests and is not the current baseline.
+Compilation peaked at 7.2 GiB, above its old 7 GiB estimate; the build now
+reserves 9 GiB for this artifact. The inference gate passed with that estimate.
+
+### Next batch: training test diagnostics
+
+Controlled experiments replaced the allocator in the following fixtures with
+`DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false })`,
+asserting leak-free deinitialization. Dimensions, iterations, ownership checks,
+failure-injection loops, cancellation checks, and resume assertions stayed the
+same. These experimental source edits were reverted after measuring; they are
+recommendations for the next change, not optimizations already shipped here.
+
+| Test | Current full-suite profile | Traces disabled, focused run |
+| --- | ---: | ---: |
+| Native trainer regional recomputation / cancellation / partial resume | 70.37 s | 0.844 s |
+| Native trainer full and heads / cancellation / durable resume | 55.60 s | 0.568 s |
+| Native trainer replay attention / partial resume identity | 54.62 s | 0.518 s |
+| Recomputed training runtime allocation failures / retry | 51.98 s | 0.430 s |
+| Recomputed training compilation at every allocation failure | 22.97 s | 0.254 s |
+| Recomputed head admission compilation allocation failures | 2.25 s | 0.036 s |
+
+The focused executables all passed. The first five cases account for about
+256 seconds in the full inference run and 2.6 seconds in the experiments.
+That suggests roughly four minutes of avoidable diagnostic overhead; it is
+not a measured new whole-suite time or a production throughput improvement.
+Sampling the runtime-failure test confirmed repeated graph compilation and
+allocator stack unwinding on its hot path.
+
+Start by applying the existing opt-in allocation-backtrace convention to these
+fixtures, preserving their exhaustive failure coverage. Then profile remaining
+training ownership and manifest tests: regional/staged-head ownership failure
+coverage took 36.64 seconds, inactive-adapter accumulation/resume 29.35 seconds,
+and GLiNER boundary manifest loading/listing 24.80 seconds. Do not remove
+allocation failures or shrink the integration scenarios before measuring the
+same diagnostics change.
+
+### Other completed measurements
+
+All 35 finetuning command groups and the finetuning gate passed. Their compile
+steps summed to 647 seconds in this cache-reusing run; this is not a cold-build
+comparison against the earlier 1,077-second baseline.
+
+The library gate passed. The full PDF executable took 18.99 seconds (463 tests),
+HTTP 11.38 seconds (586 tests), and image decode 9.87 seconds (269 tests).
+Serverless took 195.35 seconds, including exact workflow replay at 49.47 seconds
+and graph-routing fixtures at 28.99 and 17.29 seconds. Vector payload tests took
+74.33 seconds; publication allocation failures account for 13.13 seconds and
+mark-workspace admission for 10.57 seconds. These remain separate candidates
+for allocator-diagnostics comparisons and boundary-preserving fixture work.
+
+The graph release-blocker gate passed in 227.17 seconds, versus 417.62 seconds
+in the earlier local baseline. Its vector-chunk boundary case now takes about
+1 second. The remaining HITS paired-worker fixture takes 23.73 seconds; a sample
+caught setup adding edges individually and committing/flushing LSM state.
+Measure tracing separately before changing the setup to batches, and retain
+the multi-page/paired-worker boundary.
+
+Storage support passed in 866.23 seconds (2,173 passed, 3 skipped), versus
+1,090.90 seconds in the older baseline. Storage engine passed in 301.62 seconds
+(1,065 passed, 23 skipped). The TTL and transaction-recovery borrowed-VoprIo
+tests pass without the temporary profiling exclusions used before main's
+fiber-unwinding fix.
+
+Two further allocator experiments, also reverted after passing, clarify the
+next storage work:
+
+| Fixture, unchanged workload | Current profile | Traces disabled |
+| --- | ---: | ---: |
+| Relational deferred-discovery scheduler, 8,192 rows | 55.70 s | 1.408 s |
+| Wide external-vector updates and reopen, 4,096 vectors x 1,536 dimensions | 68.28 s | 20.820 s |
+
+The scheduler belongs in the diagnostic-overhead batch; its boundary need not
+be reduced to recover most of the time. The vector case still has substantial
+work after diagnostics are removed. Keep that representative workload in a
+scale/performance suite, preserve a smaller regression that crosses the actual
+tree/cache/update boundaries, and profile the remaining work before promising
+a production optimization. The existing narrow-vector variant does not by
+itself prove the wide-vector regression is covered.
+
+### Completed broad validation and CI status
+
+The fresh local four-gate run completed with **422/422 build steps succeeded**.
+DB-core's two partitions passed in 873.05 seconds (1,322 passed, 8 skipped),
+versus 1,045.96 seconds in the earlier profile. All five previously excluded
+borrowed-VoprIo cases now pass; this run added no test exclusions. The timing
+log contains 11,094 Antfly test executions, with 3,238.30 seconds of summed
+per-test time (not parallel gate wall time). Inference's separate per-test
+profile covers all 4,294 selected tests.
+
+The correct PR #774 follow-up CI run is
+https://github.com/antflydb/antfly/actions/runs/35168448026. Its unit step passed
+in **35 minutes 16 seconds**; SDKs, both architecture jobs, and base E2E passed.
+The overall run did not pass: required VOPR qualification was canceled before
+receiving a runner, and the optional >1M-chunk scale job exhausted its 60-minute
+job timeout while still building E2E binaries. These are distinct from unit-test
+assertion failures. The reusable VOPR workflow keys concurrency by `github.ref`,
+which is `refs/heads/main` for these approved-PR dispatches, so unrelated PRs
+share its pending queue. PR #691 entered that queue at the same time #774's
+pending qualification was canceled.
+
+The workflow-only timing setting did not reach PR CI because reusable workflow
+definitions are loaded from main. The checked-out `make unit-test` command now
+defaults `ANTFLY_TEST_TIMINGS` to 1 in CI, while preserving an explicit override
+and leaving local timing output opt-in. Its environment selection was checked
+for local, CI, explicit-on, and explicit-off invocations. The current PR's CI
+log therefore cannot yet provide the new per-test records; do not substitute
+the unrelated PR #773 run's 52-minute unit measurement for this PR's result.
