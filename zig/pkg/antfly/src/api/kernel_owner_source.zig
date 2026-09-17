@@ -5191,6 +5191,7 @@ test "scheduled repair admission yields to readers and reuses exact configured g
         .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
         .schema_json = @constCast("schema"),
         .indexes_json = @constCast("indexes"),
+        .restore_bootstrap_json = @constCast(""),
         .owner = undefined,
         .active_users = 1,
         .resident = true,

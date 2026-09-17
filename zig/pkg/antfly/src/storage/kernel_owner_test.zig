@@ -1996,6 +1996,21 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     defer std.testing.allocator.free(sibling_changed);
     _ = try owner.reconcile("docs", "", sibling_changed, "full_text_index_v0", false);
 
+    // Configuration and the no-repair target check above do not build the
+    // replacement text index. Drive its bounded initial-build lifecycle before
+    // asserting query visibility; bulk finish drains writes, not DDL backfills.
+    var text_reconciled = false;
+    for (0..64) |_| {
+        const result = try owner.reconcile("docs", "", replacement_indexes_json, "full_text_index_v0", true);
+        try std.testing.expect(result.state != .degraded);
+        if (result.state == .complete) {
+            try std.testing.expectEqual(@as(u32, 0), result.repair_remaining);
+            text_reconciled = true;
+            break;
+        }
+    }
+    try std.testing.expect(text_reconciled);
+
     var indexed_batch = try owner.batchJson(
         "docs",
         "{\"inserts\":{\"doc:artifact\":{\"title\":\"artifact\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"},\"doc:c\":{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[1,0,0]}},\"doc:d\":{\"title\":\"delta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}},\"sync_level\":\"full_index\"}",
@@ -2134,6 +2149,9 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(std.mem.indexOf(u8, repaired.bytes(), "\"scanned\":0") != null);
 
     try std.testing.expectError(error.InvalidArgument, owner.beginBulkIngest("articles"));
+    var before_bulk_query = try owner.queryJson("docs", query_json);
+    defer before_bulk_query.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, before_bulk_query.bytes(), "doc:a") != null);
     try owner.beginBulkIngest("docs");
     var bulk_batch = try owner.batchJson(
         "docs",
@@ -2149,6 +2167,9 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         "{\"query\":{\"match_all\":{}},\"limit\":10}",
     );
     defer bulk_query.deinit();
+    var bulk_lookup = try owner.lookupJson("docs", "{\"key\":\"doc:bulk\",\"include_all_fields\":true}");
+    defer bulk_lookup.deinit();
+    try std.testing.expectEqualStrings("{\"title\":\"bulk\"}", bulk_lookup.bytes());
     try std.testing.expect(std.mem.indexOf(u8, bulk_query.bytes(), "doc:bulk") != null);
 
     try owner.beginBulkIngest("docs");
