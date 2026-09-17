@@ -2193,6 +2193,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "metadata storage module compiles",
         "metadata cluster incarnation has one canonical JSON representation",
         "metadata authority retry classification is fail closed",
+        "restore leadership preparation retries ambiguity without permitting mutation replay",
         "table workflow can build desired topology through the control loop seam",
         "table workflow doc identity guards reject active transition intents",
         "table workflow can remove a table topology from desired state",

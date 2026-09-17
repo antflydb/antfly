@@ -4421,7 +4421,7 @@ pub fn storageOwnerOpen(
             owns_restore_io = true;
             break :io restore_io_impl.io();
         };
-        restore_lease = @import("../storage/restore_admission.zig").acquire(alloc, io, path, request.group_id, .{
+        restore_lease = antfly.restore_admission.acquire(alloc, io, path, request.group_id, .{
             .backup_id = request.restore.backup_id.slice(),
             .location = request.restore.location.slice(),
             .snapshot_path = request.restore.snapshot_path.slice(),

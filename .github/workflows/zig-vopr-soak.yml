@@ -385,10 +385,11 @@ jobs:
               assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
           for profile in ("normal", "constrained"):
               reports = list((Path(os.environ["RUNNER_TEMP"]) / "production-e2e-soak/cluster-restore" / profile).glob("*.xml"))
-              assert len(reports) == 50, ("cluster-restore", profile, len(reports))
+              assert len(reports) == 100, ("cluster-restore", profile, len(reports))
               cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
               assert Counter(case.attrib["name"] for case in cases) == {
                   "test_three_by_three_cluster_backup_restore_through_metadata_public_api": 50,
+                  "test_backup_restore_discovers_leader_past_stalled_status": 50,
               }, profile
               assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
           PY

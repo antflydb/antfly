@@ -15,6 +15,7 @@ export ANTFLY_E2E_REGRESSION_REPEATS="${ANTFLY_E2E_REGRESSION_REPEATS:-25}"
 export ANTFLY_E2E_NATIVE_STACKS=1
 tests=(
   e2e/antfly/test_backup_restore.py::test_three_by_three_cluster_backup_restore_through_metadata_public_api
+  e2e/antfly/test_metadata_mutation_discovery.py::test_backup_restore_discovers_leader_past_stalled_status
 )
 result=0
 for profile in normal constrained; do

@@ -4,6 +4,84 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-17: standby drain stalled behind status-protocol probing
+
+Both standby-scaling shards in [run 35247508165](https://github.com/antflydb/antfly/actions/runs/35247508165)
+failed `ProductionStandbyBaselineDrainTimeout`. Seed `2713408769` reproduced locally:
+store reports remained at approximately 2.277 seconds while drain reconciliation
+continued. The simulated metadata endpoint exercises compatibility with a peer
+that does not yet support `/status/update`. Its 60-second capability-probe delay
+shared the worker's publication retry timer, suppressing supported full reports
+and leaving drain observations stale.
+
+The worker now separates capability probing from publication retries. Full reports
+continue while the newer protocol is unavailable; actual transport failures and
+pending baselines retain their existing backoff. The borrowed-`VoprIo` regression
+verifies three consecutive full reports, one unsupported probe, and adoption of
+the current protocol when the peer upgrades. All nine runtime VOPR tests pass.
+With the capability timer fixed, seed `2713408769` completed promotion, split,
+merge, scale-in, and exact replay. Seed `11400714822036607254` then exposed a
+second defect: full publication carried a `maxInt(u64)` deadline into HTTP.
+Three socket timeouts advanced virtual time by approximately 149 days before the
+next control round returned `Timeout`. The finding replayed exactly.
+
+Collection now checks cancellation separately and starts a fresh two-second
+network budget after the snapshot is ready. Discovery and publication share a
+bounded allocation for each remaining metadata endpoint, allowing a later healthy
+peer to respond even when the first endpoint stalls. The borrowed-I/O regression
+checks the timeout bound and both stalled-head and stalled-publication failover.
+Schema progress retains its separate bounded quantum after a successful report,
+so slow publication cannot repeatedly exhaust the schema checkpoint budget.
+Failure diagnostics also retain the drain catalog snapshot. On the final macOS
+ARM64 ReleaseSafe executable, both retained seeds completed promotion, split,
+merge, scale-in, and exact replay: 721,262 transitions, two clean histories, zero
+failures, replay divergences, or harness errors. Both histories verified quiet
+teardown with no live tasks, open files, or open sockets. The executable SHA-256 is
+`1f0d8f180d853864057578a5431507f294e62d74bfb7a704d2f9526148d4cb3f`.
+Fresh recordings were required after rebuilding because task identities include
+compiled function offsets; replaying the previous executable's traces stopped
+at the first task identity mismatch, before workload execution. All 48 final
+build steps and all 34 runtime VOPR tests pass. Full Linux CI and the scheduled
+soak remain separate qualification gates.
+
+The same PR's [x86 unit build](https://github.com/antflydb/antfly/actions/runs/35247545305/job/105292308708)
+exposed a separate C API module-root violation: the restore admission helper was
+imported via `../storage` from a module rooted at `capi/db.zig`. Export it from the
+owning C API root and use the existing `antfly` module dependency. The production
+build and all 12 focused C API tests pass with that ownership corrected.
+
+## 2026-09-17: restore leadership recovery lost proposal error identity
+
+The production E2E job in [run 35247508165](https://github.com/antflydb/antfly/actions/runs/35247508165/job/105291344795)
+recorded repeated restore ownership changes and 120-second completion failures.
+The final 100-case run had 16 failures: 11 restore completion timeouts and five
+seed-write failures. Retained metadata logs
+show `MetadataProposalSuperseded`, `MetadataProposalApplyTimeout`, and WAL commits
+around 600 ms. The native 3x3 fixture forced 5 ms Raft and control ticks; it now uses
+the executable's production cadence instead of election deadlines shorter than
+observed storage latency. This does not change any API completion deadline or
+acknowledged-data assertion. Fast virtual schedules remain covered by VOPR.
+
+Proposal supersession and apply-timeout errors were absent from the stable runtime
+error ABI. During restore leadership preparation they could become generic
+persistence failures and HTTP 500. Preserve their exact identity across archives.
+Before public dispatch, leadership preparation may return 503 and rebuild from
+committed rows on the next request, including after an unknown write outcome.
+This broader recovery classification does not apply to an already dispatched
+mutation and does not authorize replay of ambiguous client writes. Restore workers
+also recover their exact durable attempt after these outcomes instead of terminally
+failing a partially published restore.
+
+The deterministic leadership-rebuild regression injects each outcome through the
+real persistence ABI, then verifies successful FIFO recovery. All 29 restore-store
+tests, 19 error-boundary/authority tests, and 46 compiled backup/restore tests pass.
+The latter require local networking; the sandboxed run was not a valid pass.
+A native macOS ARM64 soak of the production recovery changes passed 20/20 cases
+across both variants and descriptor profiles. The subsequent publication-budget
+change is validated separately by the runtime VOPR tests and retained histories.
+See the E2E record for the separate
+stalled-discovery HTTP 500, original-log limitations, and production soak coverage.
+
 ## 2026-09-16: 3x3 restore owner admission blocked its own bootstrap
 
 [PR #771's base E2E job](https://github.com/antflydb/antfly/actions/runs/35163796459/job/105028671150)

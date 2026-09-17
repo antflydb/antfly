@@ -100,8 +100,8 @@ class RegressionEvidenceTests(unittest.TestCase):
     def test_cluster_restore_profiles_retain_every_case_and_constrain_descriptors(self):
         result, reports = self.run_loop(cluster_restore=True, workers=2, repeats=2)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(len(reports), 8)
-        self.assertEqual(sum(path.startswith("normal/") for path in reports), 4)
+        self.assertEqual(len(reports), 16)
+        self.assertEqual(sum(path.startswith("normal/") for path in reports), 8)
         for path, body in reports.items():
             if path.startswith("constrained/"):
                 self.assertIn('nofile="256"', body)
@@ -109,7 +109,7 @@ class RegressionEvidenceTests(unittest.TestCase):
     def test_cluster_restore_runs_both_profiles_but_keeps_first_failure(self):
         result, reports = self.run_loop(cluster_restore=True, mode="normal-skip")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(len(reports), 2)
+        self.assertEqual(len(reports), 4)
 
 
 if __name__ == "__main__":

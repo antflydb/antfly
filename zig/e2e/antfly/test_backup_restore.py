@@ -630,6 +630,8 @@ def test_metadata_quorum_leader_discovery_requires_self_confirmation() -> None:
 
 
 class ThreeByThreeBackupCluster:
+    # Use the executable's production Raft/control cadence. A 5 ms Raft tick
+    # makes real disk sync latency exceed the election budget on CI storage.
     def __init__(self, binary: str):
         self.binary = binary
         self.host = "127.0.0.1"
@@ -747,10 +749,6 @@ class ThreeByThreeBackupCluster:
             str(self.metadata_admin_ports[node_id - 1]),
             "--health",
             "false",
-            "--raft-tick-ms",
-            "5",
-            "--control-tick-ms",
-            "5",
             "--data-dir",
             str(self.root / f"metadata-{node_id}"),
             "--replica-root-dir",
@@ -784,10 +782,6 @@ class ThreeByThreeBackupCluster:
             "data",
             "--health",
             "false",
-            "--raft-tick-ms",
-            "5",
-            "--control-tick-ms",
-            "5",
             "--data-dir",
             str(self.root / f"data-{node_id}"),
             "--replica-root-dir",
@@ -1820,7 +1814,14 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
                 continue
             if response.status_code == 503:
                 continue
-            job = _check_response(response)
+            try:
+                job = _check_response(response)
+            except AssertionError as exc:
+                cluster.metadata_snapshots()
+                raise AssertionError(
+                    f"restore job poll failed: {exc}; last_jobs={last_jobs!r}\n"
+                    f"{cluster.debug_logs()}"
+                ) from exc
             last_jobs[api_url] = job
             if job.get("phase") in {"succeeded", "failed", "cancelled"}:
                 return job
