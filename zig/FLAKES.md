@@ -4,6 +4,69 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-16: replay-retention fixture timed out on a checkpoint proxy
+
+PR #691's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35176786855/job/105060523520)
+at `37b9910520` failed only
+`db async replay truncation retains journal behind generated enrichment`.
+`waitForAppliedSequenceAdvance` timed out waiting for `ft_v1` to persist a
+checkpoint within 100 ten-millisecond polls. The production E2E job passed,
+including the prior shutdown regression. Twenty fresh local Debug processes,
+with four running concurrently, did not reproduce this Linux timeout.
+
+The retention fixture used checkpoint appearance as a proxy for a truncation
+attempt, then watched the journal for another half second. Neither established
+that the truncation callback had finished. A delayed checkpoint is not evidence
+of replay loss, and the trace alone does not establish a stuck production worker.
+The test now observes the real provider rejection through an event, requests
+truncation through the captured source tail, and compares every retained record's
+sequence and payload after that call returns. It then permits provider recovery,
+drains the production pipeline, checks both durable index checkpoints, and
+queries the generated vectors for both documents. This covers retention and
+recovery without requiring autonomous checkpoint publication within one second.
+
+The revised case passed 40/40 fresh Debug processes with four concurrent workers.
+As a negative control, temporarily removing only the generated-enrichment clamp
+in `truncateReplaySequenceAsync` made it fail at the record-count assertion
+(`expected 1, found 0`). Restoring the clamp restores the passing test; the
+committed change modifies only the fixture and this investigation record. All
+five related replay-retention, provider-restart, and index-worker cases pass.
+
+## 2026-09-16: source quiescence freed activity borrowed by transaction callbacks
+
+PR #691's [base Antfly E2E job](https://github.com/antflydb/antfly/actions/runs/35168905132/job/105044672774)
+tested `19ffc3c820` and passed the body of
+`test_multinode_exact_candidates_follow_redirects_across_entity_shards`, then
+failed teardown when data node 101 exited with `SIGSEGV`. The uploaded build
+artifact contained only the executable; the failure-log upload glob omitted
+multinode roots. CI now retains their node logs, failure diagnostics, and any
+captured native stacks as well as standalone logs.
+
+A local Debug repetition failed on the fourteenth run, again during node 101
+teardown. This time `endGroupOperationLocked` asserted because a
+`ResolveFollowerFanoutTask` finishing `txnResolveGroupLocalWithCancellation`
+could no longer find its activity record. `ProvisionedTableWriteSource.quiesce`
+freed those records after joining source-owned jobs, before the data server
+joined DB-owned promotion workers that could still call the transaction source.
+The same premature destruction exists on main. Without a Linux stack, the local
+assertion establishes a concrete lifecycle defect but cannot prove the exact
+instruction behind CI's segmentation fault.
+
+Source quiescence must close its own job admission and drain those jobs while
+retaining bookkeeping borrowed by external callbacks. Final source destruction
+releases that state after the caller has joined the DB workers. The regression
+holds a real transaction-resolution operation across source quiescence and
+requires normal activity release on both success and cancellation; production
+E2E keeps its crash-rejecting teardown assertion.
+The deterministic regression fails before the fix in `endGroupOperationLocked`
+and passes afterwards. The full writer lifecycle target passes all 228 tests;
+the merged error-ABI suites pass all 17 tests.
+On macOS ARM64, the rebuilt Debug and ReleaseSafe production executables each
+pass all 35 resolution/Autograph module cases (including data-node restart) and
+20 fresh-cluster repetitions of the originally failing exact-candidate case.
+That is 40/40 additional shutdown repetitions with the crash assertion enabled.
+Linux CI must still confirm the original platform.
+
 ## 2026-09-16: constrained Autograph restart lost retryable owner admission
 
 The second retained-corpus qualification of PR #704 at `81ab94c8b1` failed its

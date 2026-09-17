@@ -6,7 +6,7 @@
 //! This is not a retained snapshot or an authorization capability.
 const std = @import("std");
 pub const identity_len = 48;
-pub const max_key_bytes = 64 * 1024;
+pub const max_key_bytes = @import("relational_index_limits.zig").max_cursor_key_bytes;
 
 pub fn identity(schema_version: u32, index_name: []const u8, fingerprint: [32]u8) [identity_len]u8 {
     var result: [identity_len]u8 = undefined;

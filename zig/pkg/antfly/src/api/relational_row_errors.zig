@@ -9,6 +9,7 @@ pub const Error = @import("../schema/relational_expression_errors.zig").Error ||
     UnsupportedRelationalIndexColumn,
     RelationalRowsOutputBudgetExceeded,
     RelationalRowResultTooLarge,
+    RelationalIndexKeyTooLarge,
     RelationalIndexColumnTypeMismatch,
     RelationalTableRequired,
     InvalidRelationalRowsRequest,
@@ -32,7 +33,7 @@ pub fn decode(bytes: []const u8) ?Error {
 pub fn status(err: Error) u16 {
     return switch (err) {
         error.RelationalIndexNotReady, error.PreparedGenerationChanged, error.PreparedSchemaChanged, error.SchemaVersionChanged, error.RelationalIndexColumnTypeMismatch, error.GeneratedColumnRewriteRequired => 409,
-        error.RelationalRowsOutputBudgetExceeded, error.RelationalRowResultTooLarge => 413,
+        error.RelationalRowsOutputBudgetExceeded, error.RelationalRowResultTooLarge, error.RelationalIndexKeyTooLarge => 413,
         error.IndexNotFound => 404,
         else => 400,
     };

@@ -17,6 +17,7 @@
 import json
 import math
 import random
+import shutil
 import subprocess
 import time
 
@@ -219,6 +220,7 @@ def test_vector_migration_preserves_native_ann_neighbors(stateful_api, mode):
                     "0",
                 ],
                 capture_output=True,
+                check=False,
                 text=True,
                 timeout=180,
             )
@@ -408,6 +410,7 @@ def test_online_vector_migration_cancellation_reopens_inline_authority(stateful_
             "0",
         ],
         capture_output=True,
+        check=False,
         text=True,
         timeout=180,
     )
@@ -464,7 +467,7 @@ def test_cancelled_vector_migration_allows_backup_without_restart(
     assert nearest(api, table, "model_a", [1, 0, 0]) == ["a", "b"]
 
 
-def test_offline_vector_migration_cancels_before_copy_fence(stateful_api):
+def test_offline_vector_migration_cancels_before_copy_fence(stateful_api, tmp_path):
     api = stateful_api
     table = f"offline_cancel_admission_{time.time_ns()}"
     api.create_table(table, storage={"dense_embeddings": "primary_lsm"})
@@ -494,22 +497,25 @@ def test_offline_vector_migration_cancels_before_copy_fence(stateful_api):
             ],
             text=True,
             capture_output=True,
+            check=False,
             timeout=60,
         )
 
     def record():
-        return next(
-            t
-            for t in json.loads(catalog_path.read_text())["tables"]
-            if t["name"] == table
+        status = invoke(
+            server.replica_root, "cancel-before-fence", "--action", "status"
         )
+        assert status.returncode == 0, status.stderr
+        return json.loads(status.stderr)
 
     try:
         rejected = invoke(
             server.root / "wrong-replica-root", "cancel-before-fence", "--once"
         )
         assert rejected.returncode != 0 and "FileNotFound" in rejected.stderr
-        admitted_catalog = catalog_path.read_text()
+        catalog_store = catalog_path.with_suffix(catalog_path.suffix + ".store")
+        admitted_catalog = tmp_path / "admitted-catalog.store"
+        shutil.copytree(catalog_store, admitted_catalog)
         assert (
             record()["storage_migration"]["request"]["job_id"] == "cancel-before-fence"
         )
@@ -517,7 +523,8 @@ def test_offline_vector_migration_cancels_before_copy_fence(stateful_api):
         assert cancelled.returncode == 0, cancelled.stderr
         assert record().get("storage_migration") is None
         # Model a lost catalog publication after the durable DB cancellation.
-        catalog_path.write_text(admitted_catalog)
+        shutil.rmtree(catalog_store)
+        shutil.copytree(admitted_catalog, catalog_store)
         cancelled = invoke(server.replica_root, "cancel-before-fence", "--cancel")
         assert cancelled.returncode == 0, cancelled.stderr
         assert record().get("storage_migration") is None
@@ -561,25 +568,45 @@ def test_offline_vector_migration_lock_resume_catalog_and_native_queries(statefu
         "--disk-reserve-bytes",
         "0",
     ]
-    locked = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    locked = subprocess.run(
+        argv, capture_output=True, check=False, text=True, timeout=30
+    )
     assert locked.returncode != 0 and "VectorMigrationCatalogInUse" in locked.stderr
     api.pause_server()
     try:
         pending = subprocess.run(
-            argv + ["--once"], capture_output=True, text=True, timeout=60
+            argv + ["--once"], capture_output=True, check=False, text=True, timeout=60
         )
         assert pending.returncode == 0, pending.stderr
-        catalog = json.loads((server.root / "metadata/local-metadata.json").read_text())
-        record = next(t for t in catalog["tables"] if t["name"] == table)
+        observed = subprocess.run(
+            argv + ["--action", "status"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+        assert observed.returncode == 0, observed.stderr
+        record = json.loads(observed.stderr)
         assert record["storage"]["dense_embeddings"] == "primary_lsm"
         assert record["storage_migration"]["request"]["job_id"] == "offline"
-        complete = subprocess.run(argv, capture_output=True, text=True, timeout=180)
+        complete = subprocess.run(
+            argv, capture_output=True, check=False, text=True, timeout=180
+        )
         assert complete.returncode == 0, complete.stderr
         assert "migration complete" in complete.stderr
-        retry = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        retry = subprocess.run(
+            argv, capture_output=True, check=False, text=True, timeout=30
+        )
         assert retry.returncode == 0, retry.stderr
-        catalog = json.loads((server.root / "metadata/local-metadata.json").read_text())
-        record = next(t for t in catalog["tables"] if t["name"] == table)
+        observed = subprocess.run(
+            argv + ["--action", "status"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+        assert observed.returncode == 0, observed.stderr
+        record = json.loads(observed.stderr)
         assert record["storage"]["dense_embeddings"] == "vector_store"
         assert record.get("storage_migration") is None
     finally:

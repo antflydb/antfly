@@ -33,7 +33,7 @@ const Allocator = std.mem.Allocator;
 const Digest = [32]u8;
 pub const progress_prefix = "\x00\x00__metadata__:relational_index_progress:";
 const header_len = 140;
-const max_cursor_bytes = 1024 * 1024;
+const max_cursor_bytes = @import("relational_index_limits.zig").max_cursor_key_bytes;
 const full_range = [_]u8{0} ** 8;
 
 fn digest(bytes: []const u8) Digest {
@@ -56,7 +56,7 @@ fn prefixEnd(alloc: Allocator, prefix: []const u8) ![]const u8 {
 }
 
 pub const State = enum(u8) { building = 0, ready = 1, failed = 2 };
-pub const Failure = enum(u8) { none = 0, incompatible_schema = 1, invalid_row = 2 };
+pub const Failure = enum(u8) { none = 0, incompatible_schema = 1, invalid_row = 2, key_too_large = 3 };
 
 /// Deterministic row failures are durable job outcomes, shared by primary
 /// construction and forward/reverse repair. Resource failures must propagate
@@ -64,6 +64,7 @@ pub const Failure = enum(u8) { none = 0, incompatible_schema = 1, invalid_row = 
 pub fn classifyRowFailure(err: anyerror) ?Failure {
     if (@import("../../schema/relational_expression_errors.zig").isInvalidInput(err)) return .invalid_row;
     return switch (err) {
+        error.RelationalIndexKeyTooLarge => .key_too_large,
         error.UnknownSchemaVersion, error.RelationalIndexColumnNotFound, error.RelationalIndexColumnTypeMismatch, error.RelationalRowSchemaMismatch => .incompatible_schema,
         error.InvalidRelationalRow, error.UnsupportedRelationalRowVersion, error.RelationalRowChecksumMismatch, error.InvalidColumnValue => .invalid_row,
         else => null,
@@ -127,6 +128,7 @@ pub const Progress = struct {
             0 => .none,
             1 => .incompatible_schema,
             2 => .invalid_row,
+            3 => .key_too_large,
             else => return error.InvalidRelationalIndexProgress,
         };
         if ((state == .failed) != (failure != .none)) return error.InvalidRelationalIndexProgress;
@@ -259,7 +261,7 @@ pub const Page = struct {
     };
     const FailedSource = struct { primary: []const u8, hash: Digest };
 
-    fn prepareTuple(alloc: Allocator, payload_alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, value: []const u8, source: *?registry.SchemaView, projected: *?tuples.TuplePlan, projected_cover: *?@import("relational_index_cover.zig").Source, projected_predicate: *?@import("relational_index_predicate.zig").Source, encoded: *std.ArrayList(u8)) !?[]const u8 {
+    fn prepareTuple(alloc: Allocator, payload_alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, value: []const u8, document: []const u8, source: *?registry.SchemaView, projected: *?tuples.TuplePlan, projected_cover: *?@import("relational_index_cover.zig").Source, projected_predicate: *?@import("relational_index_predicate.zig").Source, encoded: *std.ArrayList(u8)) !?[]const u8 {
         const version = try row_store.rowSchemaVersion(value);
         if (source.* == null or source.*.?.version() != version) {
             if (projected.*) |*tuple| tuple.deinit();
@@ -285,6 +287,7 @@ pub const Page = struct {
             if (index.cover) |cover| projected_cover.* = try cover.projectSource(alloc, source.*.?.tableSchema().*, source.*.?.physicalLayout());
         }
         _ = try projected.*.?.append(alloc, encoded, typed);
+        try records.admitForwardKey(encoded.items.len, document.len +| std.mem.count(u8, document, "\x00") +| 2);
         return if (index.cover) |cover| try cover.encodeSource(payload_alloc, typed, &projected_cover.*.?) else "";
     }
 
@@ -360,7 +363,7 @@ pub const Page = struct {
             const row = if (std.mem.eql(u8, kv.key, primary)) kv.value else try getOptional(&read, primary);
             if (row) |raw| {
                 bytes +|= raw.len;
-                const payload = prepareTuple(alloc, page_alloc, core, pinned, index, raw, &source, &projected, &projected_cover, &projected_predicate, &encoded) catch |err| {
+                const payload = prepareTuple(alloc, page_alloc, core, pinned, index, raw, document, &source, &projected, &projected_cover, &projected_predicate, &encoded) catch |err| {
                     progress.failure = classifyRowFailure(err) orelse return err;
                     progress.state = .failed;
                     failed_source = .{ .primary = primary, .hash = digest(raw) };
@@ -483,7 +486,7 @@ pub const Page = struct {
                 if (row) |raw| {
                     bytes +|= raw.len;
                     candidate.hash = digest(raw);
-                    const payload = prepareTuple(alloc, page_alloc, core, pinned, index, raw, &source, &projected, &projected_cover, &projected_predicate, &encoded) catch |err| {
+                    const payload = prepareTuple(alloc, page_alloc, core, pinned, index, raw, document, &source, &projected, &projected_cover, &projected_predicate, &encoded) catch |err| {
                         progress.failure = classifyRowFailure(err) orelse return err;
                         progress.state = .failed;
                         failed_source = .{ .primary = primary, .hash = candidate.hash.? };

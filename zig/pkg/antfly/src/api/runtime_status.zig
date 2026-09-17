@@ -12228,3 +12228,17 @@ fn consumerTests() type {
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
 }
+
+test "system catalog runtime status clones retain status names after JSON is released" {
+    const alloc = std.testing.allocator;
+    const body = try alloc.dupe(u8, "{\"enrichment\":{\"projection_checkpoint_status\":\"repair_required\",\"stall_reason\":\"publishing_overdue\",\"active_phase\":\"publishing\"}}");
+    var parsed = try std.json.parseFromSlice(db_mod.types.DBStats, alloc, body, .{});
+    const cloned = try cloneDBStats(alloc, parsed.value);
+    defer db_mod.types.freeDBStats(alloc, cloned);
+    parsed.deinit();
+    @memset(body, 0xaa);
+    alloc.free(body);
+    try std.testing.expectEqualStrings("repair_required", cloned.enrichment.projection_checkpoint_status);
+    try std.testing.expectEqualStrings("publishing_overdue", cloned.enrichment.stall_reason);
+    try std.testing.expectEqualStrings("publishing", cloned.enrichment.active_phase);
+}

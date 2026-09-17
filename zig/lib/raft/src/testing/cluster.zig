@@ -346,13 +346,18 @@ pub const Cluster = struct {
             try self.persistStableReady(idx, rd);
             try self.queueReadStates(idx, rd.read_states);
 
-            if (rd.messages.len > 0) {
-                try self.network.ensureUnusedCapacity(self.alloc, rd.messages.len);
-                for (rd.messages) |msg| self.network.appendAssumeCapacity(try msg.clone(self.alloc));
-            }
+            // Applying configuration entries can append Raft messages and
+            // invalidate Ready's borrowed message slice. Capture this batch
+            // first, but publish it after membership changes drop older queued
+            // traffic. The batch may carry the final commit to a removed peer.
+            const messages = try message.cloneMessages(self.alloc, rd.messages);
+            defer self.alloc.free(messages);
+            errdefer for (messages) |*msg| msg.deinit(self.alloc);
 
             try self.queueCommittedAndApply(idx, rd.committed_entries);
             try self.persistConfState(idx);
+            // Ownership of each message transfers to the network on success.
+            try self.network.appendSlice(self.alloc, messages);
             return;
         }
 
@@ -661,14 +666,20 @@ pub const Cluster = struct {
         for (entries) |entry| {
             switch (entry.entry_type) {
                 .conf_change => {
-                    const before = self.nodes[idx].status().conf_state;
+                    // Applying a configuration replaces and frees its borrowed slices.
+                    // Retain the old membership until routing/activity changes finish.
+                    var before = try self.nodes[idx].status().conf_state.clone(self.alloc);
+                    defer before.deinit(self.alloc);
                     const conf_change = try core.types.ConfChange.decode(entry.data);
                     const after = try self.nodes[idx].applyConfChange(conf_change);
                     try self.syncNodeActivity(before, after);
                     self.dropRemovedConfStateMessages(before, after);
                 },
                 .conf_change_v2 => {
-                    const before = self.nodes[idx].status().conf_state;
+                    // Applying a configuration replaces and frees its borrowed slices.
+                    // Retain the old membership until routing/activity changes finish.
+                    var before = try self.nodes[idx].status().conf_state.clone(self.alloc);
+                    defer before.deinit(self.alloc);
                     var conf_change = try core.types.ConfChangeV2.decode(entry.data, self.alloc);
                     defer conf_change.deinit(self.alloc);
                     const after = try self.nodes[idx].applyConfChangeV2(conf_change);

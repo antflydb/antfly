@@ -24,26 +24,22 @@ const std = @import("std");
 /// Version 5 adds conditional restore admission; ordinary job updates retain
 /// their existing wire format.
 /// Version 6 adds digest-conditional restore expiry.
-/// Version 7 adds relational integrity topology capability/floor and the
-/// immutable active/read schema contract on distributed split/merge records,
-/// shared backup/restore lifecycle commands, and retirement table extensions.
-/// Version 8 binds integrity-bearing immutable sources and staged rewrite
-/// intents/final cuts. Every metadata voter/learner must decode these before
-/// admission, independently of data-owner Raft protocol 11.
-/// Version 9 carries explicit Scope-v2 source authority in online transitions
-/// and rewrite plans. Registration, admission, and final append share this
-/// capability; a v8 metadata follower cannot interpret the new cut identity.
-/// Version 10 preserves table storage settings and storage migration admission
-/// in the authoritative table-record codec, including standby replay.
-pub const current_version: u16 = 10;
-// Registration/topology admission and the final append must acquire the same
-// decoder proof. A v8 preflight cannot satisfy the v9 coordinated append gate.
+/// Versions 7–10 add system catalog publication, sparse store reports,
+/// membership-bound protocol activation, and resumable store inventories.
+/// Version 11 additionally requires relational topology, coordinated
+/// backup/restore/retirement, Scope-v2 sources, staged rewrite final cuts, and
+/// table storage metadata. Main's v10 decoders do not understand these commands.
+pub const current_version: u16 = 11;
+pub const durable_activation_version: u16 = 9;
+pub const store_report_update_version: u16 = 8;
+// Preflight and final append require the same complete decoder capability.
 pub const relational_integrity_topology_version: u16 = coordinated_lifecycle_version;
-pub const coordinated_lifecycle_version: u16 = table_storage_metadata_version;
-pub const table_storage_metadata_version: u16 = 10;
-pub const source_scope_version: u16 = 9;
+pub const coordinated_lifecycle_version: u16 = 11;
+pub const table_storage_metadata_version: u16 = 11;
+pub const source_scope_version: u16 = 11;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;
+pub const system_catalog_version: u16 = 7;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
 /// when a membership change temporarily includes a lower-capability peer.
@@ -182,3 +178,24 @@ test "range membership is order independent and table scoped" {
     try rhs.add(303);
     try std.testing.expect(!lhs.finish(7).eql(rhs.finish(7)));
 }
+
+/// Replicated proof that this exact incarnation and membership can decode a
+/// protocol. Terms are deliberately excluded: elections do not undo activation.
+pub const Activation = struct {
+    version: u16,
+    incarnation: @import("incarnation.zig").MetadataClusterIncarnation,
+    member_count: u32,
+    membership_fingerprint: @import("reallocation_request.zig").MembershipFingerprint,
+
+    pub fn satisfies(self: @This(), required: @This()) bool {
+        return self.version >= required.version and self.member_count == required.member_count and
+            std.meta.eql(self.incarnation, required.incarnation) and
+            std.meta.eql(self.membership_fingerprint, required.membership_fingerprint);
+    }
+};
+
+/// Resumable report generations and bounded retired-page collection.
+pub const store_report_baseline_version: u16 = 10;
+
+/// Atomic, bounded acknowledgements for local schema migration readiness.
+pub const schema_progress_batch_version: u16 = 10;

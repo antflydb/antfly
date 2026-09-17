@@ -520,13 +520,44 @@ pub const ExtensionCatalog = struct {
     packages: std.ArrayListUnmanaged(PackageManifest) = .empty,
     installed: std.ArrayListUnmanaged(InstalledExtension) = .empty,
     members: std.ArrayListUnmanaged(ExtensionMember) = .empty,
+    data_shapes_by_table: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
+    data_shapes_index_valid: bool = false,
     dependencies: std.ArrayListUnmanaged(ExtensionDependency) = .empty,
+
+    fn invalidateDataShapes(self: *ExtensionCatalog) void {
+        var it = self.data_shapes_by_table.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(self.alloc);
+        self.data_shapes_by_table.clearRetainingCapacity();
+        self.data_shapes_index_valid = false;
+    }
+
+    /// Borrowed immutable schemas, indexed once per membership generation.
+    /// Mutation invalidates before freeing any borrowed member storage.
+    pub fn tableDataShapes(self: *ExtensionCatalog, name: []const u8) ![]const []const u8 {
+        if (!self.data_shapes_index_valid) {
+            self.invalidateDataShapes();
+            errdefer self.invalidateDataShapes();
+            for (self.members.items) |member| {
+                if (member.object_kind != .data_shape) continue;
+                const kind = member.shape_kind orelse continue;
+                if (kind != .document and kind != .row) continue;
+                const table = if (member.table_name.len != 0) member.table_name else if (member.scope.kind == .table) member.scope.table_name else continue;
+                const entry = try self.data_shapes_by_table.getOrPut(self.alloc, table);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(self.alloc, member.owner_metadata_json);
+            }
+            self.data_shapes_index_valid = true;
+        }
+        return if (self.data_shapes_by_table.get(name)) |shapes| shapes.items else &.{};
+    }
 
     pub fn init(alloc: std.mem.Allocator) ExtensionCatalog {
         return .{ .alloc = alloc };
     }
 
     pub fn deinit(self: *ExtensionCatalog) void {
+        self.invalidateDataShapes();
+        self.data_shapes_by_table.deinit(self.alloc);
         for (self.packages.items) |package| freePackageManifest(self.alloc, package);
         self.packages.deinit(self.alloc);
         for (self.installed.items) |extension| freeInstalledExtension(self.alloc, extension);
@@ -563,6 +594,7 @@ pub const ExtensionCatalog = struct {
     }
 
     pub fn upsertMember(self: *ExtensionCatalog, member: ExtensionMember) !void {
+        self.invalidateDataShapes();
         try member.validate();
         const owned = try cloneExtensionMember(self.alloc, member);
         errdefer freeExtensionMember(self.alloc, owned);
@@ -593,6 +625,7 @@ pub const ExtensionCatalog = struct {
         members: []const ExtensionMember,
         dependencies: []const ExtensionDependency,
     ) !void {
+        self.invalidateDataShapes();
         for (packages) |package| try self.registerPackage(package);
         for (installed) |extension| {
             try extension.validate();
@@ -615,6 +648,7 @@ pub const ExtensionCatalog = struct {
         request: InstallExtensionRequest,
         installed_at_epoch_ms: i64,
     ) !InstalledExtension {
+        self.invalidateDataShapes();
         if (request.dry_run) return error.DryRunRequiresPlan;
         if (self.findInstalledIndex(extension_name) != null) return error.ExtensionAlreadyInstalled;
         const package = self.findPackage(package_name, request.version) orelse return error.PackageNotFound;
@@ -662,6 +696,7 @@ pub const ExtensionCatalog = struct {
     }
 
     pub fn dropInstalledWithMode(self: *ExtensionCatalog, extension_name: []const u8, request: DropExtensionRequest) !void {
+        self.invalidateDataShapes();
         try request.validate();
         if (request.dry_run) return error.DryRunRequiresPlan;
         _ = self.findInstalledIndex(extension_name) orelse return error.ExtensionNotInstalled;
@@ -712,6 +747,7 @@ pub const ExtensionCatalog = struct {
         extension_name: []const u8,
         request: UpdateExtensionRequest,
     ) !InstalledExtension {
+        self.invalidateDataShapes();
         try request.validate();
         if (request.dry_run) return error.DryRunRequiresPlan;
         const installed_idx = self.findInstalledIndex(extension_name) orelse return error.ExtensionNotInstalled;
@@ -1011,6 +1047,7 @@ pub const ExtensionCatalog = struct {
     }
 
     fn removeMembersForExtension(self: *ExtensionCatalog, extension_name: []const u8) void {
+        self.invalidateDataShapes();
         var i: usize = 0;
         while (i < self.members.items.len) {
             if (std.mem.eql(u8, self.members.items[i].extension_name, extension_name)) {

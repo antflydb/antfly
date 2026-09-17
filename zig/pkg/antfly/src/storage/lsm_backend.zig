@@ -22613,6 +22613,68 @@ fn implementationTests() type {
             }
         }
 
+        test "lsm monotone prefix seeks retain unaffected sources after churn" {
+            const alloc = std.testing.allocator;
+            for ([_]usize{ 0, 8, 32 }) |companions| {
+                var backing = storage_io.MemoryStorage.init(alloc);
+                defer backing.deinit();
+                var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+                defer cache.deinit();
+                var backend = try Backend.open(alloc, "/lsm-monotone-prefix", .{ .storage = backing.storage(), .cache = &cache, .compact_threshold_runs = 10000 });
+                defer backend.close();
+                // One cold level plus 32 overlapping update runs. Each prefix
+                // skip should reposition only the level and affected L0 run.
+                for (0..33) |run_number| {
+                    var state: State = .{};
+                    errdefer state.deinit(alloc);
+                    for (0..512) |row| {
+                        if (run_number != 0 and row % 32 != run_number - 1) continue;
+                        var key_buf: [64]u8 = undefined;
+                        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>5}:0", .{row});
+                        try state.upsert(alloc, .{ .name = "docs" }, key, if (run_number == 0) "old" else "new", false);
+                        if (run_number != 0) for (0..companions) |companion| {
+                            const child = try std.fmt.bufPrint(&key_buf, "doc:{d:0>5}:1:{d:0>3}", .{ row, companion });
+                            try state.upsert(alloc, .{ .name = "docs" }, child, "index", false);
+                        };
+                    }
+                    var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, if (run_number == 0) 1 else 0);
+                    state = .{};
+                    errdefer run.deinit(alloc);
+                    try backend.runs.append(alloc, run);
+                }
+                try backend.runs.reindexForTest(alloc);
+                try backend.persistManifest();
+                var read = try backend.beginRead();
+                defer read.abort();
+                var counts: [2]usize = undefined;
+                var elapsed: [2]u64 = undefined;
+                for ([_]bool{ true, false }, 0..) |restart, mode| {
+                    var cursor = try read.openCursor(.{ .name = "docs" });
+                    defer cursor.close();
+                    cursor.test_full_forward_seek = restart;
+                    const started = @import("antfly_platform").time.monotonicNs();
+                    for (0..512) |row| {
+                        var key_buf: [64]u8 = undefined;
+                        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>5}:0", .{row});
+                        const entry = (try cursor.seekAtOrAfter(key)) orelse return error.TestUnexpectedResult;
+                        try std.testing.expectEqualStrings(key, entry.key);
+                        try std.testing.expectEqualStrings("new", entry.value);
+                    }
+                    elapsed[mode] = @intCast(@import("antfly_platform").time.monotonicNs() - started);
+                    counts[mode] = cursor.test_seek_sources;
+                    // Equal borrowed-key seeks, reverse movement, exhaustion,
+                    // and reseeking after exhaustion retain public semantics.
+                    const borrowed = cursor.current_key.?;
+                    try std.testing.expectEqualStrings(borrowed, (try cursor.seekAtOrAfter(borrowed)).?.key);
+                    try std.testing.expectEqualStrings("doc:00000:0", (try cursor.seekAtOrAfter("doc:00000:0")).?.key);
+                    try std.testing.expect((try cursor.seekAtOrAfter("z")) == null);
+                    try std.testing.expectEqualStrings("doc:00000:0", (try cursor.seekAtOrAfter("doc:00000:0")).?.key);
+                }
+                try std.testing.expect(counts[1] * 8 < counts[0]);
+                std.debug.print("lsm-prefix-seek companions={d} rows=512 full_sources={d} incremental_sources={d} full_ns={d} incremental_ns={d}\n", .{ companions, counts[0], counts[1], elapsed[0], elapsed[1] });
+            }
+        }
+
         test "lsm lazy level cursor bounds sources and IO across forward reverse and namespace boundaries" {
             const alloc = std.testing.allocator;
             var backing = storage_io.MemoryStorage.init(alloc);

@@ -2018,7 +2018,7 @@ components:
       enum: [building, ready, failed]
     RelationalIndexBuildFailure:
       type: string
-      enum: [incompatible_schema, invalid_row]
+      enum: [incompatible_schema, invalid_row, key_too_large]
     RelationalIndexRangeStatus:
       type: object
       required: [group_id, generation, slot, owner, comparison, progress_digest, maintenance_epoch, state, rows_scanned]

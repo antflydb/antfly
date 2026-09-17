@@ -49,7 +49,7 @@ pub const OwnerBootstrap = struct {
     }
     pub fn validate(self: @This()) !void {
         try self.scope.validate();
-        if (self.table_name.len == 0 or self.table_name.len > 255 or std.mem.indexOfAny(u8, self.table_name, "/\\\x00") != null or std.mem.eql(u8, self.table_name, ".") or std.mem.eql(u8, self.table_name, "..") or
+        if (self.table_name.len == 0 or (self.table_name.len > 255 and !(try @import("../../system_catalog/domain.zig").isRestoreTarget(self.table_name))) or std.mem.indexOfAny(u8, self.table_name, "/\\\x00") != null or std.mem.eql(u8, self.table_name, ".") or std.mem.eql(u8, self.table_name, "..") or
             self.schema_json.len +| self.read_schema_json.len > 4 * 1024 * 1024 or self.indexes_json.len == 0 or self.indexes_json.len > 4 * 1024 * 1024 or
             !std.unicode.utf8ValidateSlice(self.table_name) or !std.unicode.utf8ValidateSlice(self.schema_json) or !std.unicode.utf8ValidateSlice(self.read_schema_json) or !std.unicode.utf8ValidateSlice(self.indexes_json) or
             self.byte_range.start.len > 1024 * 1024 or self.byte_range.end.len > 1024 * 1024 or (self.byte_range.end.len != 0 and std.mem.order(u8, self.byte_range.start, self.byte_range.end) != .lt)) return error.InvalidRestoreStagingCommand;

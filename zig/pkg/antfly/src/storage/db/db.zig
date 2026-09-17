@@ -1550,6 +1550,19 @@ const IndexRepairSchedulerDirectory = struct {
             .wake = self.wake(),
         };
     }
+
+    fn summaryForIndex(self: *@This(), target_index_name: ?[]const u8) DB.IndexRepairIntentSummary {
+        const name = target_index_name orelse return self.summary();
+        const index = self.by_name.get(name) orelse return .{};
+        const record = self.records.items[index];
+        return .{
+            .runnable = @intFromBool(record.class == .runnable),
+            .paused = @intFromBool(record.class == .paused),
+            .terminal = @intFromBool(record.class == .terminal),
+            .earliest_retry_at_ms = if (record.class == .runnable) record.next_retry_at_ms else 0,
+            .wake = if (record.class != .runnable) .empty else if (record.next_retry_at_ms == 0) .immediate else .{ .at_realtime_ms = record.next_retry_at_ms },
+        };
+    }
 };
 
 const AsyncDenseCatchUpSession = struct {
@@ -1694,6 +1707,13 @@ const TargetAdvanceMaintenanceDebt = struct {
     config_hash: u64,
     generation: u64,
 };
+
+fn indexRepairSupportsSnapshotCursor(kind: types.IndexKind) bool {
+    return switch (kind) {
+        .dense_vector, .algebraic, .full_text => true,
+        else => false,
+    };
+}
 
 fn checkArtifactRepairCancelled(options: types.ArtifactRepairRunOptions) !void {
     if (options.cancelled()) return error.Canceled;
@@ -16419,11 +16439,15 @@ pub const DB = struct {
     }
 
     pub fn indexRepairIntentSummary(self: *DB, alloc: Allocator) !IndexRepairIntentSummary {
+        return self.indexRepairIntentSummaryForIndex(alloc, null);
+    }
+
+    pub fn indexRepairIntentSummaryForIndex(self: *DB, alloc: Allocator, target_index_name: ?[]const u8) !IndexRepairIntentSummary {
         if (self.managedAdmissionMaterializationPending()) try self.drainManagedIndexAdmissions(alloc);
         try self.ensureIndexRepairSchedulerDirectory(alloc);
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
         defer self.async_context.index_repair_scheduler_mutex.unlock();
-        return self.async_context.index_repair_scheduler.summary();
+        return self.async_context.index_repair_scheduler.summaryForIndex(target_index_name);
     }
 
     pub fn loadIndexRepairState(self: *const DB, alloc: Allocator) !index_repair_state.State {
@@ -20446,17 +20470,24 @@ pub const DB = struct {
         alloc: Allocator,
         execution_limit: usize,
     ) !IndexRepairSchedulerSelection {
+        return self.selectIndexRepairSchedulerQuantumForIndex(alloc, execution_limit, null);
+    }
+
+    fn selectIndexRepairSchedulerQuantumForIndex(self: *DB, alloc: Allocator, execution_limit: usize, target_index_name: ?[]const u8) !IndexRepairSchedulerSelection {
         try self.ensureIndexRepairSchedulerDirectory(alloc);
         var selection: IndexRepairSchedulerSelection = .{};
         errdefer selection.deinit(alloc);
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
         defer self.async_context.index_repair_scheduler_mutex.unlock();
         const directory = &self.async_context.index_repair_scheduler;
-        selection.terminal = directory.terminal;
-        selection.deferred = directory.paused;
-        selection.remaining = directory.records.items.len;
-        selection.next_retry_at_ms = directory.earliestRetryDeadline();
-        const inspection = indexRepairInspectionWindow(
+        const summary = directory.summaryForIndex(target_index_name);
+        selection.terminal = summary.terminal;
+        selection.deferred = summary.paused;
+        selection.remaining = summary.runnable + summary.paused + summary.terminal;
+        selection.next_retry_at_ms = summary.earliest_retry_at_ms;
+        const target_index = if (target_index_name) |name| directory.by_name.get(name) else null;
+        if (target_index_name != null and target_index == null) return selection;
+        const inspection = if (target_index) |index| IndexRepairInspectionWindow{ .start = index, .budget = @min(execution_limit, 1) } else indexRepairInspectionWindow(
             directory.records.items.len,
             execution_limit,
             @intCast(directory.cursor),
@@ -20466,7 +20497,7 @@ pub const DB = struct {
         while (selection.inspected < inspection.budget) : (selection.inspected += 1) {
             const record_index = (inspection.start + selection.inspected) % directory.records.items.len;
             const record = directory.records.items[record_index];
-            directory.cursor = (record_index + 1) % directory.records.items.len;
+            if (target_index_name == null) directory.cursor = (record_index + 1) % directory.records.items.len;
             if (record.class != .runnable) continue;
             if (record.next_retry_at_ms > now_ms) {
                 selection.deferred += 1;
@@ -20513,9 +20544,9 @@ pub const DB = struct {
         // Existing terminal intents are counted from the durable state below.
         // Discovery contributes only terminal load failures for which no intent
         // exists, avoiding double-counting checkpointed failures.
-        result.terminal = discovery.terminal - discovery.existing_terminal;
+        result.terminal = if (options.target_index_name == null) discovery.terminal - discovery.existing_terminal else 0;
 
-        var selection = try self.selectIndexRepairSchedulerQuantum(alloc, limit);
+        var selection = try self.selectIndexRepairSchedulerQuantumForIndex(alloc, limit, options.target_index_name);
         defer selection.deinit(alloc);
         result.terminal += selection.terminal;
         result.deferred += selection.deferred;
@@ -20555,8 +20586,9 @@ pub const DB = struct {
         try self.ensureIndexRepairSchedulerDirectory(alloc);
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
         const directory = &self.async_context.index_repair_scheduler;
-        result.remaining = directory.records.items.len;
-        result.wake = directory.wake();
+        const summary = directory.summaryForIndex(options.target_index_name);
+        result.remaining = summary.runnable + summary.paused + summary.terminal;
+        result.wake = summary.wake;
         result.next_retry_at_ms = result.wake.retryAtMs();
         self.async_context.index_repair_scheduler_mutex.unlock();
         return result;
@@ -20956,7 +20988,7 @@ pub const DB = struct {
             defer durable_entry.deinit(alloc);
             const resumable = durable_entry.intent.candidate_relative_path != null and switch (durable_entry.intent.phase) {
                 .building => durable_entry.intent.build_resume_key != null and
-                    (cfg.kind == .dense_vector or cfg.kind == .algebraic),
+                    indexRepairSupportsSnapshotCursor(cfg.kind),
                 .catching_up, .ready, .waiting_for_convergence => true,
                 else => false,
             };
@@ -21200,7 +21232,7 @@ pub const DB = struct {
             defer entry.deinit(alloc);
             const resumable_phase = switch (entry.intent.phase) {
                 .building => entry.intent.build_resume_key != null and
-                    (cfg.kind == .dense_vector or cfg.kind == .algebraic),
+                    indexRepairSupportsSnapshotCursor(cfg.kind),
                 .catching_up, .ready, .waiting_for_convergence => true,
                 else => false,
             };
@@ -21339,7 +21371,7 @@ pub const DB = struct {
         var effective_options = options;
         if (durable_repair_id == null) effective_options.yield_check = null;
         const cooperative_snapshot_build =
-            (cfg.kind == .dense_vector or cfg.kind == .algebraic) and
+            indexRepairSupportsSnapshotCursor(cfg.kind) and
             effective_options.yield_check != null;
         var repair_issue_counter: AtomicU64 = .init(0);
         defer yield_progress.unresolved_artifacts = repair_issue_counter.load(.monotonic);
@@ -21449,13 +21481,24 @@ pub const DB = struct {
                         cfg.name,
                         graph_repair_rebuild_batch_size,
                     )),
-                    .full_text => try shadow_manager.resetFullTextIndexForArtifactRebuildFromReadTxn(
-                        self.core.store,
-                        snapshot_txn,
-                        cfg.name,
-                        options.cancel_check,
-                        options.capacity_check,
-                    ),
+                    .full_text => count_blk: {
+                        var slice = try shadow_manager.rebuildFullTextIndexFromReadTxnSlice(self.core.store, snapshot_txn, cfg.name, build_resume_key, effective_options);
+                        defer slice.deinit(shadow_manager.alloc);
+                        if (slice.resume_key) |cursor| {
+                            if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
+                                .phase = .building,
+                                .build_resume_key = cursor,
+                                .replace_build_resume_key = true,
+                                .build_reprocessed = slice.rebuilt,
+                                .failure_streak = 0,
+                                .next_retry_at_ms = 0,
+                                .replace_last_error = true,
+                            });
+                            candidate_reopenable = durable_repair_id != null;
+                            return .{ .reprocessed = @intCast(slice.rebuilt -| persisted_build_reprocessed), .yielded = true };
+                        }
+                        break :count_blk slice.rebuilt;
+                    },
                     .algebraic => count_blk: {
                         var slice = try rebuildAlgebraicIndexFromSnapshotSliceContext(
                             &shadow_ctx,
@@ -21494,7 +21537,7 @@ pub const DB = struct {
         // meanings separate prevents the final resumed slice from recounting
         // every vector processed by earlier turns.
         const reprocessed_this_pass = if (resume_building and
-            (cfg.kind == .dense_vector or cfg.kind == .algebraic))
+            indexRepairSupportsSnapshotCursor(cfg.kind))
             rebuilt -| persisted_build_reprocessed
         else
             rebuilt;
@@ -22557,6 +22600,7 @@ pub const DB = struct {
                         .none => .none,
                         .incompatible_schema => .incompatible_schema,
                         .invalid_row => .invalid_row,
+                        .key_too_large => .key_too_large,
                     },
                 };
                 try statuses.append(temporary, .{ .name = try temporary.dupe(u8, index.name), .status = value });
@@ -25241,27 +25285,6 @@ pub const DB = struct {
                 try native_generation.invalidateProjection(projection.name, .checkpoint_mismatch);
                 continue;
             }
-            const checkpoint = try self.core.loadProjectionCheckpoint(alloc, projection.name);
-            if (checkpoint.status != .clean or
-                checkpoint.config_hash != projection.config_hash or
-                checkpoint.generation != projection.checkpoint_generation or
-                checkpoint.applied_sequence != projection.applied_sequence or
-                checkpoint.applied_sequence != projection.target_sequence)
-            {
-                std.log.err("native backup projection checkpoint mismatch index={s} status={s} checkpoint_hash={d} manifest_hash={d} checkpoint_generation={d} manifest_generation={d} checkpoint_applied={d} manifest_applied={d} manifest_target={d}", .{
-                    projection.name,
-                    @tagName(checkpoint.status),
-                    checkpoint.config_hash,
-                    projection.config_hash,
-                    checkpoint.generation,
-                    projection.checkpoint_generation,
-                    checkpoint.applied_sequence,
-                    projection.applied_sequence,
-                    projection.target_sequence,
-                });
-                try native_generation.invalidateProjection(projection.name, .checkpoint_mismatch);
-                continue;
-            }
         }
     }
 
@@ -25290,6 +25313,30 @@ pub const DB = struct {
                 // tree intact so the asynchronous restore job can retry.
                 std.log.warn("native backup projection validation deferred index={s} err={s}", .{ projection.name, err_name });
                 return error.NativeBackupProjectionValidationIndeterminate;
+            }
+            // The primary-only transfer plan cannot validate a dense checkpoint:
+            // its authoritative sequence lives in the still-unrestored posting
+            // generation. Validate physical coverage only after installation.
+            const checkpoint = try self.core.loadProjectionCheckpoint(alloc, projection.name);
+            if (checkpoint.status != .clean or
+                checkpoint.config_hash != projection.config_hash or
+                checkpoint.generation != projection.checkpoint_generation or
+                checkpoint.applied_sequence != projection.applied_sequence or
+                checkpoint.applied_sequence != projection.target_sequence)
+            {
+                std.log.err("native backup projection checkpoint mismatch index={s} status={s} checkpoint_hash={d} manifest_hash={d} checkpoint_generation={d} manifest_generation={d} checkpoint_applied={d} manifest_applied={d} manifest_target={d}", .{
+                    projection.name,
+                    @tagName(checkpoint.status),
+                    checkpoint.config_hash,
+                    projection.config_hash,
+                    checkpoint.generation,
+                    projection.checkpoint_generation,
+                    checkpoint.applied_sequence,
+                    projection.applied_sequence,
+                    projection.target_sequence,
+                });
+                try native_generation.invalidateProjection(projection.name, .checkpoint_mismatch);
+                continue;
             }
             if (cfg.kind == .dense_vector) {
                 const dense = self.core.index_manager.denseIndex(projection.name) orelse {
@@ -35265,10 +35312,7 @@ pub const DB = struct {
     fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
         // These bytes enter compressed durable tables, so even a diagnostic
         // timestamp can change disk usage and subsequent placement decisions.
-        const now = if (index_manager.io) |io|
-            @as(u64, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds)))
-        else
-            platform_time.monotonicNs();
+        const now: u64 = @intCast(@max(0, std.Io.Clock.awake.now(index_manager.checkpointIo()).nanoseconds));
         if (index_manager.textIndex(index_name)) |entry| {
             // Applied-sequence persistence runs outside the DB apply lock; keep this
             // snapshot cheap and avoid walking full-text segment internals here.
@@ -36181,7 +36225,23 @@ pub const DB = struct {
         if (self.open_mode == .status_only) return error.UnsupportedOperation;
         lockApply(self);
         defer self.core.unlockApply();
-        try doc_identity.reassignNamespaceAlloc(self.alloc, self.core.store, namespace);
+        var migration = try vector_migration.load(self.alloc, self.core.store);
+        defer if (migration) |*job| job.deinit();
+        var migration_update: ?[]u8 = null;
+        defer if (migration_update) |raw| self.alloc.free(raw);
+        if (migration) |job| {
+            try self.validateVectorMigrationIdentity(job.value);
+            if (job.value.active()) return error.VectorMigrationActive;
+            var rebound = job.value;
+            const identity = try std.json.Stringify.valueAlloc(self.alloc, namespace, .{});
+            defer self.alloc.free(identity);
+            rebound.table_identity = identity;
+            migration_update = try std.json.Stringify.valueAlloc(self.alloc, rebound, .{});
+        }
+        try doc_identity.reassignNamespaceWithMetadataAlloc(self.alloc, self.core.store, namespace, if (migration_update) |raw|
+            &.{.{ .key = vector_migration.contract.job_key, .value = raw }}
+        else
+            &.{});
         self.core.identity_namespace = namespace;
         // Coverage is bound to the durable namespace even when bounds stay
         // unchanged. Wake an idle worker after the new identity commits.
@@ -69334,6 +69394,7 @@ const GateDenseEmbedder = struct {
     total_requests: std.atomic.Value(usize) = .init(0),
     blocked_requests: std.atomic.Value(usize) = .init(0),
     blocked_error: anyerror = error.EmbedRateLimited,
+    blocked_event: ?*std.Io.Event = null,
 
     fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (needle.len == 0) return true;
@@ -69372,6 +69433,7 @@ const GateDenseEmbedder = struct {
         if (previous_successes >= self.allowed_successes.load(.acquire)) {
             _ = self.successful_requests.fetchSub(1, .acq_rel);
             _ = self.blocked_requests.fetchAdd(1, .monotonic);
+            if (self.blocked_event) |event| event.set(std.testing.io);
             return self.blocked_error;
         }
         if (dims != 3) return error.InvalidVectorDimensions;
@@ -71256,6 +71318,17 @@ test "db implicit batch timestamps use the borrowed runtime clock" {
     try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), try db.getTimestamp(alloc, "doc:b"));
     try db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = "{}" }}, .timestamp_ns = 99, .sync_level = .write });
     try std.testing.expectEqual(@as(u64, 99), try db.getTimestamp(alloc, "doc:c"));
+    // Persisted advisory status affects compression and disk-usage reports too;
+    // its timestamp must remain in the same runtime as the owning DB.
+    vopr_io.monotonic_ns = 123 * std.time.ns_per_ms;
+    try db.addIndex(.{ .name = "clock_graph", .kind = .graph, .config_json = "{}" });
+    try db.saveAllLiveIndexStatusSnapshots(alloc);
+    const status = (try db.loadIndexStatusSnapshot(alloc, "clock_graph")).?;
+    try std.testing.expectEqual(@as(u64, 123 * std.time.ns_per_ms), status.updated_at_ns);
+    vopr_io.monotonic_ns = 456 * std.time.ns_per_ms;
+    try db.saveAllLiveIndexStatusSnapshots(alloc);
+    const later = (try db.loadIndexStatusSnapshot(alloc, "clock_graph")).?;
+    try std.testing.expectEqual(@as(u64, 456 * std.time.ns_per_ms), later.updated_at_ns);
 }
 
 test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
@@ -71287,7 +71360,8 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
                 closed.* = true;
             }
             try database.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-            const initial_status = (try database.loadIndexStatusSnapshot(std.testing.allocator, "g")) orelse return error.TestUnexpectedResult;
+            try database.saveAllLiveIndexStatusSnapshots(database.alloc);
+            const initial_status = (try database.loadIndexStatusSnapshot(database.alloc, "g")) orelse return error.GraphStatusSnapshotMissing;
             try std.testing.expectEqual(@as(u64, 200 * std.time.ns_per_day), initial_status.updated_at_ns);
             try database.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "a", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
             try database.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
@@ -71304,18 +71378,18 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
             try std.testing.expectError(error.RaftApplyWriterUnavailable, database.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(@as(u64, 1), (try database.raftAppliedEntry()).?.index);
             database.startResidentBackgroundWorkersIfNeeded();
-            try std.testing.expect(database.artifact_repair_metadata_future != null);
+            if (database.artifact_repair_metadata_future == null) return error.GraphMaintenanceWorkerMissing;
             const graph = &database.core.index_manager.graphIndex("g").?.index;
             for (0..100) |_| {
                 if (!graph.ownershipTransitionPending()) break;
                 try io.sleep(.fromMilliseconds(100), .awake);
             }
-            try std.testing.expect(!graph.ownershipTransitionPending());
+            if (graph.ownershipTransitionPending()) return error.GraphOwnershipCleanupTimedOut;
             try database.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 });
             try std.testing.expectEqual(@as(u64, 2), (try database.raftAppliedEntry()).?.index);
             try std.testing.expectEqualStrings("", database.getRange().end);
-            const retired = try database.getEdges(std.testing.allocator, "g", "a", "link", .in);
-            defer graph_mod.GraphIndex.freeEdges(std.testing.allocator, retired);
+            const retired = try database.getEdges(database.alloc, "g", "a", "link", .in);
+            defer graph_mod.GraphIndex.freeEdges(database.alloc, retired);
             try std.testing.expectEqual(@as(usize, 0), retired.len);
         }
     };
@@ -71331,7 +71405,17 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
         try scheduler.enumerateReady(&enabled, alloc);
         try enabled.canonicalize();
         try std.testing.expect(enabled.items.items.len != 0);
-        try scheduler.executeReady(enabled.items.items[0].id, &events, alloc);
+        // This is a bounded liveness check: run ready work before advancing
+        // time. Canonical ID order alone may repeatedly pick the observer's
+        // timer while starving the maintenance worker it is waiting for.
+        var selected = enabled.items.items[0];
+        for (enabled.items.items) |candidate| {
+            if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
+                selected = candidate;
+                break;
+            }
+        }
+        try scheduler.executeReady(selected.id, &events, alloc);
     }
     try std.testing.expect(scheduler.quiescent());
     try future.await(runtime_io.io());
@@ -100687,7 +100771,8 @@ test "db async replay truncation retains journal behind generated enrichment" {
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    var gated = GateDenseEmbedder{};
+    var provider_failed: std.Io.Event = .unset;
+    var gated = GateDenseEmbedder{ .blocked_event = &provider_failed };
     gated.allowed_successes.store(0, .release);
     var db = try DB.open(alloc, std.mem.span(path), .{
         .executor = .{ .backend = .io_threaded },
@@ -100716,32 +100801,64 @@ test "db async replay truncation retains journal behind generated enrichment" {
         .sync_level = .write,
     });
 
-    _ = try waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
-    _ = try waitForAppliedSequenceAdvance(alloc, &db, "semantic_idx", 0);
-    var attempts: usize = 0;
-    while (attempts < default_test_wait_attempts and gated.snapshot().blocked_requests == 0) : (attempts += 1) {
-        sleepPollInterval();
+    const target_sequence = db.core.nextDerivedSequence();
+    try std.testing.expect(target_sequence > 0);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .raw = .fromSeconds(5),
+        .clock = .awake,
+    });
+    while (!provider_failed.isSet()) {
+        provider_failed.waitTimeout(std.testing.io, .{ .deadline = deadline }) catch |err| switch (err) {
+            error.Timeout => {
+                if (std.Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline))
+                    return error.ProviderFailureNotObserved;
+            },
+            error.Canceled => return err,
+        };
     }
-    try std.testing.expect(gated.snapshot().blocked_requests > 0);
     try std.testing.expectEqual(
         @as(u64, 0),
         try enrichment_state.loadAppliedSequence(alloc, db.core.store, enrichment_runtime_mod.scope_name),
     );
 
-    var retained_count: usize = 0;
-    var retention_attempts: usize = 0;
-    while (retention_attempts < 50) : (retention_attempts += 1) {
-        const retained = try db.core.store.iterateReplayFrom(alloc, 1);
-        defer {
-            for (retained) |*entry| entry.deinit(alloc);
-            alloc.free(retained);
-        }
-        retained_count = retained.len;
-        if (retained_count == 0) break;
-        sleepPollInterval();
+    const expected = try db.core.store.iterateReplayFrom(alloc, 1);
+    defer {
+        for (expected) |*entry| entry.deinit(alloc);
+        alloc.free(expected);
     }
-    try std.testing.expect(retained_count > 0);
+    try std.testing.expect(expected.len > 0);
+    try std.testing.expectEqual(target_sequence, expected[expected.len - 1].sequence);
+
+    // Exercise the worst-case consumer ordering directly: request truncation
+    // through the entire source tail while the real provider is failing.
+    // A checkpoint appearing within a short wall-clock window is neither the
+    // retention contract nor evidence that truncation has actually run.
+    try truncateReplaySequenceAsync(db.async_context, target_sequence);
+    const retained = try db.core.store.iterateReplayFrom(alloc, 1);
+    defer {
+        for (retained) |*entry| entry.deinit(alloc);
+        alloc.free(retained);
+    }
+    try std.testing.expectEqual(expected.len, retained.len);
+    for (expected, retained) |before, after| {
+        try std.testing.expectEqual(before.sequence, after.sequence);
+        try std.testing.expectEqualStrings(before.payload, after.payload);
+    }
     gated.allowAll();
+    try db.runUntilIdle();
+    const recovered = db.enrichment_runtime.?.stats();
+    try std.testing.expect(recovered.applied_sequence >= target_sequence);
+    try std.testing.expectEqual(recovered.target_sequence, recovered.applied_sequence);
+    for ([_][]const u8{ "ft_v1", "semantic_idx" }) |index_name| {
+        try std.testing.expect((try db.core.loadAppliedSequence(alloc, index_name)) >= target_sequence);
+    }
+    var result = try db.search(alloc, .{
+        .index_name = "semantic_idx",
+        .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 2 },
+        .limit = 2,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
 }
 
 test "db io_threaded executor processes indexed writes" {
@@ -110431,6 +110548,31 @@ test "resident index repair scheduler skips deferred prefixes with bounded fair 
         }
     }
 
+    // Exact migration repair bypasses unrelated paused prefixes without
+    // consuming the ordinary scheduler's fairness cursor.
+    const cursor_before = db.async_context.index_repair_scheduler.cursor;
+    var targeted = try db.selectIndexRepairSchedulerQuantumForIndex(alloc, 1, "repair-17");
+    defer targeted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), targeted.inspected);
+    try std.testing.expectEqual(@as(usize, 1), targeted.repairs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), targeted.remaining);
+    try std.testing.expectEqual(@as(usize, 0), targeted.deferred);
+    try std.testing.expectEqual(@as(u128, 18), targeted.repairs.items[0].repair_id);
+    try std.testing.expectEqual(cursor_before, db.async_context.index_repair_scheduler.cursor);
+    var paused_target = try db.selectIndexRepairSchedulerQuantumForIndex(alloc, 1, "repair-0");
+    defer paused_target.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), paused_target.repairs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), paused_target.deferred);
+    var absent_target = try db.selectIndexRepairSchedulerQuantumForIndex(alloc, 1, "absent");
+    defer absent_target.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), absent_target.inspected);
+    try std.testing.expectEqual(@as(usize, 0), absent_target.remaining);
+    const target_summary = try db.indexRepairIntentSummaryForIndex(alloc, "repair-17");
+    try std.testing.expectEqual(@as(usize, 1), target_summary.runnable);
+    try std.testing.expectEqual(@as(usize, 0), target_summary.paused);
+    try std.testing.expectEqual(@as(usize, 1), (try db.indexRepairIntentSummaryForIndex(alloc, "repair-0")).paused);
+    try std.testing.expectEqual(@as(usize, 0), (try db.indexRepairIntentSummaryForIndex(alloc, "absent")).runnable);
+
     var first = try db.selectIndexRepairSchedulerQuantum(alloc, 1);
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 8), first.inspected);
@@ -112410,6 +112552,158 @@ test "db managed full text admission survives restart without in-place backfill"
     });
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+}
+
+test "db full text repair page replay is idempotent without compaction" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("full-text-page-replay");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const cfg: types.IndexConfig = .{ .name = "full_text_index_v1", .kind = .full_text, .config_json = "{}" };
+    index_manager_mod.test_text_backfill_batch_size = 1;
+    defer index_manager_mod.test_text_backfill_batch_size = null;
+    const Yield = struct {
+        fn requested(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var token: u8 = 0;
+    var options = repair_completion_test_options;
+    options.yield_check = .{ .ptr = &token, .is_requested = Yield.requested };
+    var repair_id: u128 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+        defer db.close();
+        try db.batch(.{ .writes = &.{
+            .{ .key = "a", .value = "{\"body\":\"original\"}" },
+            .{ .key = "b", .value = "{\"body\":\"original\"}" },
+            .{ .key = "c", .value = "{\"body\":\"original\"}" },
+        }, .sync_level = .write });
+        repair_id = (try db.admitManagedFullTextIndex(cfg)).?;
+        const first = try db.advanceIndexRepairIntent(alloc, repair_id, options);
+        try std.testing.expect(first.busy and !first.repaired);
+        var checkpoint = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer checkpoint.deinit(alloc);
+        const second = try db.advanceIndexRepairIntent(alloc, repair_id, options);
+        try std.testing.expect(second.busy and !second.repaired);
+        // Persist the state left by a crash between page durability and its
+        // intent cursor. No later source mutations or merges may hide repeats.
+        try db.updateIndexRepairIntent(alloc, repair_id, .{
+            .phase = .building,
+            .build_resume_key = checkpoint.intent.build_resume_key.?,
+            .replace_build_resume_key = true,
+            .build_reprocessed = checkpoint.intent.build_reprocessed,
+        });
+    }
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer reopened.close();
+    // Restart policy may change; the durable page format still owns resume.
+    options.yield_check = null;
+    var complete = false;
+    for (0..32) |_| {
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, options);
+        try std.testing.expect(!step.terminal);
+        if (step.repaired) {
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    try std.testing.expectEqual(@as(u32, 3), reopened.core.index_manager.textIndex(cfg.name).?.snapshot().liveDocCount());
+    var all = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match_all = {} }, .limit = 1 });
+    defer all.deinit();
+    try std.testing.expectEqual(@as(u32, 3), all.total_hits);
+}
+
+test "db full text repair yields resumes after reopen and catches writes behind its cursor" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("full-text-repair-slices");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const cfg: types.IndexConfig = .{ .name = "full_text_index_v1", .kind = .full_text, .config_json = "{}" };
+    index_manager_mod.test_text_backfill_batch_size = 1;
+    defer index_manager_mod.test_text_backfill_batch_size = null;
+    const Yield = struct {
+        fn requested(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var token: u8 = 0;
+    var options = repair_completion_test_options;
+    options.yield_check = .{ .ptr = &token, .is_requested = Yield.requested };
+    var repair_id: u128 = 0;
+    var candidate: []u8 = undefined;
+    var first_cursor: []u8 = undefined;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+        defer db.close();
+        try db.batch(.{ .writes = &.{
+            .{ .key = "a", .value = "{\"body\":\"original\"}" },
+            .{ .key = "b", .value = "{\"body\":\"original\"}" },
+            .{ .key = "c", .value = "{\"body\":\"original\"}" },
+        }, .sync_level = .write });
+        repair_id = (try db.admitManagedFullTextIndex(cfg)).?;
+        const first = try db.advanceIndexRepairIntent(alloc, repair_id, options);
+        try std.testing.expect(first.attempted and first.busy and !first.repaired);
+        try std.testing.expectEqual(@as(u64, 1), first.documents_reprocessed);
+        var entry = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer entry.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Phase.building, entry.intent.phase);
+        try std.testing.expect(entry.intent.build_resume_key != null);
+        candidate = try alloc.dupe(u8, entry.intent.candidate_relative_path.?);
+        first_cursor = try alloc.dupe(u8, entry.intent.build_resume_key.?);
+        // These mutations cross the saved cursor in both directions. Replay
+        // from the pinned build floor must repair the mixed snapshot slices.
+        try db.batch(.{ .writes = &.{
+            .{ .key = "a", .value = "{\"body\":\"changed\"}" },
+            .{ .key = "0", .value = "{\"body\":\"inserted\"}" },
+        }, .deletes = &.{"c"}, .sync_level = .write });
+    }
+    defer alloc.free(candidate);
+    defer alloc.free(first_cursor);
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer reopened.close();
+    {
+        var entry = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+        defer entry.deinit(alloc);
+        try std.testing.expectEqualStrings(candidate, entry.intent.candidate_relative_path.?);
+    }
+    // Model a crash/cancellation after the second page is durable but before
+    // its separate repair-intent cursor commits. Reopening the private index
+    // must replay that page as an upsert, not append duplicate live documents.
+    const second = try reopened.advanceIndexRepairIntent(alloc, repair_id, options);
+    try std.testing.expect(second.attempted and second.busy and !second.repaired);
+    try reopened.updateIndexRepairIntent(alloc, repair_id, .{
+        .phase = .building,
+        .build_resume_key = first_cursor,
+        .replace_build_resume_key = true,
+        .build_reprocessed = 1,
+    });
+    var complete = false;
+    for (0..32) |_| {
+        const step = try reopened.advanceIndexRepairIntent(alloc, repair_id, options);
+        try std.testing.expect(!step.terminal);
+        if (step.repaired) {
+            complete = true;
+            break;
+        }
+    }
+    if (!complete) {
+        var remaining = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+        defer remaining.deinit(alloc);
+        std.debug.print("full text resume incomplete phase={s} error={?s} retry={} cursor_present={} count={}\n", .{ @tagName(remaining.intent.phase), remaining.intent.last_error, remaining.intent.next_retry_at_ms, remaining.intent.build_resume_key != null, remaining.intent.build_reprocessed });
+    }
+    try std.testing.expect(complete);
+    var all = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match_all = {} } });
+    defer all.deinit();
+    try std.testing.expectEqual(@as(u32, 3), all.total_hits);
+    for ([_][]const u8{ "changed", "inserted", "original" }) |word| {
+        var result = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match = .{ .field = "body", .text = word } } });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    }
 }
 
 test "db named repair advances managed full text admission without force" {
@@ -135373,6 +135667,53 @@ test "source vector migration budget rejection is retryable and cancellation sur
     var status = (try vector_migration.load(alloc, db.core.store)).?;
     defer status.deinit();
     try std.testing.expectEqual(@as(u64, 2), status.value.ownership_epoch);
+}
+
+test "source vector migration namespace reassignment preserves terminal receipts across reopen" {
+    const alloc = std.testing.allocator;
+    inline for (.{ false, true }) |complete| {
+        var tmp = try TestDirectory.init("migration-identity-transition");
+        defer tmp.cleanup();
+        const path = std.mem.span(tmp.path().ptr);
+        const original: doc_identity.Namespace = .{ .table_id = 10, .shard_id = 20 };
+        const target: doc_identity.Namespace = .{ .table_id = 30, .shard_id = 40 };
+        const options: OpenOptions = .{ .identity_namespace = original, .start_index_workers = false, .start_optional_runtimes = false };
+        const request: vector_migration.contract.Request = .{ .job_id = "identity", .mode = .online, .budget = .{ .disk_reserve_bytes = 0 } };
+        {
+            var db = try DB.open(alloc, path, options);
+            defer db.close();
+            try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write });
+            try db.startVectorMigration(request);
+            try std.testing.expectError(error.VectorMigrationActive, db.reassignIdentityNamespaceForInternalTransition(target));
+            try std.testing.expect((try doc_identity.loadNamespaceFromStore(db.core.store)).?.eql(original));
+            if (complete) {
+                for (0..256) |_| {
+                    var job = (try vector_migration.load(alloc, db.core.store)).?;
+                    defer job.deinit();
+                    if (job.value.phase == .complete) break;
+                    if (job.value.phase == .ready) try db.publishVectorMigration(request.job_id) else try db.advanceVectorMigration(request.job_id);
+                } else return error.VectorMigrationDidNotFinish;
+            } else {
+                try db.cancelVectorMigration(request.job_id);
+                for (0..256) |_| {
+                    var job = (try vector_migration.load(alloc, db.core.store)).?;
+                    defer job.deinit();
+                    if (job.value.phase == .cancelled) break;
+                    try db.advanceVectorMigration(request.job_id);
+                } else return error.VectorMigrationDidNotFinish;
+            }
+            try db.reassignIdentityNamespaceForInternalTransition(target);
+        }
+        var reopened_options = options;
+        reopened_options.identity_namespace = target;
+        var reopened = try DB.open(alloc, path, reopened_options);
+        defer reopened.close();
+        var receipt = (try vector_migration.load(alloc, reopened.core.store)).?;
+        defer receipt.deinit();
+        try reopened.validateVectorMigrationIdentity(receipt.value);
+        try std.testing.expectEqualStrings(request.job_id, receipt.value.job_id);
+        try std.testing.expectEqual(if (complete) vector_migration.contract.Phase.complete else .cancelled, receipt.value.phase);
+    }
 }
 
 test "source vector migration cancelled snapshot preserves old readers and rejects a replacement" {

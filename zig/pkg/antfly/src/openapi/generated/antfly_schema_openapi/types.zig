@@ -747,6 +747,7 @@ pub const RelationalExpressionType = enum {
 pub const RelationalForeignKeyConstraint = struct {
     name: []const u8,
     child_columns: []const []const u8,
+    /// Literal parent table name in the child table's database and namespace. Resolved to an immutable table identity when the constraint is declared; renaming a parent preserves the reference. Public schemas show its current name.
     parent_table: []const u8,
     parent_columns: []const []const u8,
     on_delete: ?ForeignKeyAction = null,
@@ -1218,7 +1219,7 @@ pub const RelationalUniqueConstraint = struct {
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
-    version: ?i64 = null,
+    version: ?u32 = null,
     storage_mode: ?TableStorageMode = null,
     /// Immutable typed expressions applied only to absent columns on new writes, never explicit null. Defaults cannot reference columns. A column cannot have both a default and a generated expression. Omission or [] declares none. Relational tables only.
     column_defaults: ?[]const RelationalColumnExpression = null,

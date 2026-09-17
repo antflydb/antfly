@@ -131,8 +131,13 @@ pub fn reverseTuple(reverse_key: []const u8, value: []const u8) ![]const u8 {
     return value[1..end];
 }
 
+pub fn admitForwardKey(tuple_bytes: usize, document_component_bytes: usize) !void {
+    try @import("relational_index_limits.zig").admit(forward_prefix_len +| tuple_bytes +| document_component_bytes +| 4);
+}
+
 fn appendForwardEncoded(alloc: Allocator, out: *std.ArrayList(u8), id: Id, tuple: []const u8, document_component: []const u8) !void {
     if (tuple.len == 0) return error.InvalidRelationalIndexTuple;
+    try admitForwardKey(tuple.len, document_component.len);
     const start = out.items.len;
     errdefer out.shrinkRetainingCapacity(start);
     try out.appendSlice(alloc, &(try forwardPrefix(id)));

@@ -117,6 +117,9 @@ pub const SourceArtifact = @import("restore_provisioning_contract.zig").SourceAr
 pub const Target = struct {
     source_table_id: u64,
     table: records.TableRecord,
+    /// Logical publication is part of the same transaction as the new owner
+    /// generation. The namespace ID is pinned, not reinterpreted by name.
+    catalog_binding: ?@import("../system_catalog/domain.zig").Resource = null,
     ranges: []const records.RangeRecord,
     /// Native owner reservations bind these authenticated source identities
     /// before accepting an import RPC. No full-plan transfer per row page.
@@ -178,6 +181,14 @@ pub const Plan = struct {
         };
         for (self.targets, 0..) |target, index| {
             const table = target.table;
+            if (target.catalog_binding) |binding| {
+                if (binding.kind != .table or binding.id != table.table_id or binding.parent_id == 0 or
+                    !std.mem.eql(u8, binding.storage_name, table.name)) return error.InvalidRestoreStaging;
+                try @import("../system_catalog/domain.zig").validateTableName(binding.name);
+                for (self.targets[0..index]) |previous| if (previous.catalog_binding) |other| {
+                    if (binding.parent_id == other.parent_id and std.mem.eql(u8, binding.name, other.name)) return error.InvalidRestoreStaging;
+                };
+            }
             if (target.rewrite) |rewrite| {
                 try rewrite.validate();
                 if (!std.mem.eql(u8, rewrite.target_schema, table.schema_json) or !std.mem.eql(u8, rewrite.target_read_schema, table.read_schema_json) or target.replace == null or
@@ -221,7 +232,7 @@ pub const Plan = struct {
                 return error.InvalidRestoreStaging;
             }
             if (target.source_table_id == 0 or table.table_id == 0 or table.table_id == target.source_table_id or
-                table.name.len == 0 or table.name.len > 255 or table.relational_retirement_json.len != 0 or
+                table.name.len == 0 or (table.name.len > 255 and !(try @import("../system_catalog/domain.zig").isRestoreTarget(table.name))) or table.relational_retirement_json.len != 0 or
                 target.ranges.len == 0 or target.ranges.len != table.min_ranges) return error.InvalidRestoreStaging;
             for (table.name) |byte| if (std.ascii.isControl(byte)) return error.InvalidRestoreStaging;
             for (self.targets[0..index]) |previous| {
@@ -229,7 +240,7 @@ pub const Plan = struct {
                     std.mem.eql(u8, previous.table.name, table.name)) return error.InvalidRestoreStaging;
             }
             if (target.replace) |old| {
-                if (old.table.table_id == 0 or old.table.table_id == table.table_id or !std.mem.eql(u8, old.table.name, table.name) or
+                if (old.table.table_id == 0 or old.table.table_id == table.table_id or (target.catalog_binding == null and !std.mem.eql(u8, old.table.name, table.name)) or
                     old.table.relational_retirement_json.len != 0 or old.table.restore_backup_id.len != 0) return error.InvalidRestoreStaging;
                 tables.validateCompleteKeyspaceRanges(old.ranges) catch return error.InvalidRestoreStaging;
                 old_range_count += old.ranges.len;

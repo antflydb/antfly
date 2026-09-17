@@ -81,6 +81,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageSystemWriteGet, "antfly_storage_system_write_get");
     exportInternal(&storage_kernel_exports.storageSystemWritePut, "antfly_storage_system_write_put");
     exportInternal(&storage_kernel_exports.storageSystemWriteDelete, "antfly_storage_system_write_delete");
+    exportInternal(&storage_kernel_exports.storageSystemWriteOpenCursor, "antfly_storage_system_write_open_cursor");
     exportInternal(&storage_kernel_exports.storageSystemWriteCommit, "antfly_storage_system_write_commit");
     exportInternal(&storage_kernel_exports.storageSystemWriteAbort, "antfly_storage_system_write_abort");
     exportInternal(&storage_kernel_exports.storageSystemCursorMove, "antfly_storage_system_cursor_move");

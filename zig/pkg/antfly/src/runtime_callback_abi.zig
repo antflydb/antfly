@@ -90,6 +90,7 @@ fn BoundaryImpl(comptime VTable: type) type {
             args: *const anyopaque,
             output: ?*anyopaque,
         ) callconv(.c) error_abi.Status {
+            @setEvalBranchQuota(64 * std.meta.fields(VTable).len);
             if (contract.version != native_abi.abi_version)
                 return error_abi.statusFromError(error.UnsupportedVersion);
             inline for (std.meta.fields(VTable)) |field| {

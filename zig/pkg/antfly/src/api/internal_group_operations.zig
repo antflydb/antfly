@@ -151,33 +151,33 @@ pub const RoutedRaftBatchWriter = struct {
             []const u8,
             db_mod.types.BatchRequest,
             internal_batch_forwarding.Context,
-            CancellationToken,
+            operation.RequestContext,
         ) anyerror!?void,
     };
     const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
 
-    pub fn write(self: @This(), alloc: std.mem.Allocator, authority: RoutedBatchAuthority, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, cancellation: CancellationToken) !?void {
+    pub fn write(self: @This(), alloc: std.mem.Allocator, authority: RoutedBatchAuthority, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, request: operation.RequestContext) !?void {
         // The data runtime supplies this callback to the separately compiled
         // API runtime. Native error integers are private to each archive.
-        return BoundaryAbi.call("write", self.boundary_dispatch, self.write_fn, .{ self.ptr, alloc, authority, group_id, table_name, input, forwarding, cancellation });
+        return BoundaryAbi.call("write", self.boundary_dispatch, self.write_fn, .{ self.ptr, alloc, authority, group_id, table_name, input, forwarding, request });
     }
 };
 
 pub const BatchValidator = struct {
     ptr: *anyopaque,
-    validate_fn: *const fn (*anyopaque, []const u8, []const db_mod.types.BatchWrite) anyerror!void,
+    validate_fn: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.BatchWrite) anyerror!void,
 
-    fn validate(self: BatchValidator, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
-        return self.validate_fn(self.ptr, table_name, writes);
+    fn validate(self: BatchValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
+        return self.validate_fn(self.ptr, request, table_name, writes);
     }
 };
 
 pub const TxnValidator = struct {
     ptr: *anyopaque,
-    validate_fn: *const fn (*anyopaque, []const u8, []const db_mod.types.TransactionWrite) anyerror!void,
+    validate_fn: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.TransactionWrite) anyerror!void,
 
-    fn validate(self: TxnValidator, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
-        return self.validate_fn(self.ptr, table_name, writes);
+    fn validate(self: TxnValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
+        return self.validate_fn(self.ptr, request, table_name, writes);
     }
 };
 
@@ -371,8 +371,12 @@ pub const Operations = struct {
         if (self.reject_unrouted_batch) return error.Unsupported;
         const writes = self.writes orelse return error.NotFound;
         const validator = self.batch_validator orelse return error.Unavailable;
-        validator.validate(table_name, input.writes) catch |err| switch (err) {
+        validator.validate(request, table_name, input.writes) catch |err| switch (err) {
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+            error.TableNotFound => return error.NotFound,
+            error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
+            error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.Canceled, error.Cancelled => return error.Canceled,
             else => {
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("group-local Raft batch validation failed group_id={} table={s} err={s}", .{
@@ -425,12 +429,17 @@ pub const Operations = struct {
     ) Error!batch_api.BatchResult {
         try request.ensureActive();
         const validator = self.batch_validator orelse return error.Unavailable;
-        validator.validate(table_name, input.writes) catch |err| switch (err) {
+        validator.validate(request, table_name, input.writes) catch |err| switch (err) {
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
             // The sender's catalog can lead this replica's projection during
             // provisioning/restart. Validation has not called the writer, so
             // preserve the explicit not-proposed availability response.
             error.TableNotFound, error.MetadataSnapshotUnavailable => return error.Unavailable,
+            // Validation precedes writer admission. Preserve its explicit
+            // not-proposed outcome when the catalog's bounded capacity is busy.
+            error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
+            error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.Canceled, error.Cancelled => return error.Canceled,
             else => {
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("routed Raft batch validation failed group_id={} table={s} err={s}", .{
@@ -441,6 +450,7 @@ pub const Operations = struct {
                 return error.Internal;
             },
         };
+        try request.ensureActive();
         const writer = self.routed_raft_batch_writer orelse return error.Unavailable;
         var parsed_fence: ?std.json.Parsed(metadata_api.CatalogRouteFence) = null;
         defer if (parsed_fence) |*fence| fence.deinit();
@@ -551,7 +561,7 @@ pub const Operations = struct {
             }
             break :merge .merge_replication;
         } else return error.Unavailable;
-        _ = (writer.write(alloc, authority, group_id, table_name, input, forwarding, request.cancellation) catch |err| switch (err) {
+        _ = (writer.write(alloc, authority, group_id, table_name, input, forwarding, request) catch |err| switch (err) {
             error.OnlineSourcePinPending => return error.RaftBatchWriteOutcomeUnknown,
             error.RetainedEffectsFull => return retainedBatchPressure(input),
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
@@ -634,14 +644,19 @@ pub const Operations = struct {
         // native prepare still validates every command against its own catalog.
         if (input.req.restore_staging_scope == null) {
             const validator = self.txn_validator orelse return error.Unavailable;
-            validator.validate(table_name, input.req.writes) catch |err| switch (err) {
+            validator.validate(request, table_name, input.req.writes) catch |err| switch (err) {
                 error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
+                error.TableNotFound => return error.NotFound,
+                error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return error.Unavailable,
+                error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.PreDecisionDeadlineExceeded,
+                error.Canceled, error.Cancelled => return error.Canceled,
                 else => {
                     if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                     return error.Internal;
                 },
             };
         }
+        try ensurePreDecisionRequestActive(request);
         _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, .{
             .deadline_ns = request.deadline_ns,
             .deadline_io = request.deadline_io,
@@ -1547,7 +1562,7 @@ fn consumerTests() type {
             };
 
             const Validator = struct {
-                fn validate(_: *anyopaque, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
+                fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
             };
 
             const operations = Operations{
@@ -1571,6 +1586,32 @@ fn consumerTests() type {
                 "docs",
                 .{ .txn_id = txn_id, .req = .{} },
             ));
+
+            const AdmissionValidator = struct {
+                fn validate(ptr: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {
+                    const failure: *const anyerror = @ptrCast(@alignCast(ptr));
+                    return failure.*;
+                }
+            };
+            for ([_]anyerror{ error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded, error.CatalogRoutingUnavailable, error.TableNotFound }) |failure| {
+                var injected = failure;
+                var admission_operations = operations;
+                admission_operations.txn_validator = .{ .ptr = &injected, .validate_fn = AdmissionValidator.validate };
+                const expected = switch (failure) {
+                    error.CatalogRoutingUnavailable => error.Unavailable,
+                    error.TableNotFound => error.NotFound,
+                    else => error.PreDecisionDeadlineExceeded,
+                };
+                // The writer fixture would return GroupLeaderUnavailable if
+                // called. Validation failure must retain its pre-proposal result.
+                try std.testing.expectError(expected, admission_operations.txnPrepare(
+                    std.testing.allocator,
+                    .{},
+                    7,
+                    "docs",
+                    .{ .txn_id = txn_id, .req = .{} },
+                ));
+            }
 
             const legacy_deadline_operations = Operations{
                 .reads = null,
@@ -1652,14 +1693,14 @@ fn consumerTests() type {
                 cancellation_signal: *const std.atomic.Value(bool),
                 calls: usize = 0,
                 fail_identity: bool = false,
-                visibility_error: ?anyerror = null,
                 validation_error: ?anyerror = null,
+                visibility_error: ?anyerror = null,
                 saw_unfenced_split: bool = false,
                 saw_unfenced_merge: bool = false,
                 saw_unfenced_transaction: bool = false,
                 saw_unfenced_source: bool = false,
 
-                fn validate(ptr: *anyopaque, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
+                fn validate(ptr: *anyopaque, _: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.validation_error) |err| return err;
                     try std.testing.expectEqualStrings("documents", table_name);
@@ -1674,8 +1715,9 @@ fn consumerTests() type {
                     table_name: []const u8,
                     _: db_mod.types.BatchRequest,
                     forwarding: internal_batch_forwarding.Context,
-                    cancellation: CancellationToken,
+                    request: operation.RequestContext,
                 ) !?void {
+                    const cancellation = request.cancellation;
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.calls += 1;
                     try std.testing.expectEqual(@as(u64, 17), group_id);
@@ -1731,6 +1773,26 @@ fn consumerTests() type {
                 forwarding,
             );
             try std.testing.expectEqual(@as(u32, 0), result.inserted);
+            try std.testing.expectEqual(@as(usize, 1), state.calls);
+
+            state.validation_error = error.ResourceTemporarilyUnavailable;
+            try std.testing.expectError(error.Unavailable, operations.routedBatch(std.testing.allocator, request, 17, "documents", .{}, forwarding));
+            try std.testing.expectEqual(@as(usize, 1), state.calls);
+            state.validation_error = null;
+            for ([_]anyerror{ error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded, error.Canceled, error.CatalogRoutingUnavailable }) |failure| {
+                state.validation_error = failure;
+                const expected = switch (failure) {
+                    error.Canceled => error.Canceled,
+                    error.CatalogRoutingUnavailable => error.Unavailable,
+                    else => error.DeadlineExceeded,
+                };
+                try std.testing.expectError(expected, operations.routedBatch(std.testing.allocator, request, 17, "documents", .{}, forwarding));
+                try std.testing.expectEqual(@as(usize, 1), state.calls);
+            }
+            state.validation_error = null;
+            var expired = request;
+            expired.deadline_ns = 0;
+            try std.testing.expectError(error.DeadlineExceeded, operations.routedBatch(std.testing.allocator, expired, 17, "documents", .{}, forwarding));
             try std.testing.expectEqual(@as(usize, 1), state.calls);
 
             state.fail_identity = true;

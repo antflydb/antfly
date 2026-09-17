@@ -243,6 +243,28 @@ describe("AntflyClient", () => {
   });
 
   describe("tables", () => {
+    it("rejects bodyless listing failures instead of returning undefined", async () => {
+      mockGet.mockResolvedValueOnce({
+        data: undefined,
+        error: undefined,
+        response: new Response(null, { status: 409 }),
+      });
+      await expect(client.tables.list()).rejects.toThrow("HTTP 409");
+    });
+
+    it("preserves an empty successful table inventory", async () => {
+      mockGet.mockResolvedValueOnce({ data: [], response: new Response("[]") });
+      await expect(client.tables.list()).resolves.toEqual([]);
+    });
+
+    it("reports structured pagination conflicts", async () => {
+      mockGet.mockResolvedValueOnce({
+        error: { error: "catalog changed; restart pagination" },
+        response: new Response(null, { status: 409 }),
+      });
+      await expect(client.tables.list()).rejects.toThrow("catalog changed; restart pagination");
+    });
+
     it("should list tables", async () => {
       const mockTables: TableStatus[] = [
         {

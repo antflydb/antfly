@@ -188,6 +188,7 @@ fn collectSelected(alloc: std.mem.Allocator, source: anytype, reader: reads.Tabl
                     .none => null,
                     .incompatible_schema => .incompatible_schema,
                     .invalid_row => .invalid_row,
+                    .key_too_large => .key_too_large,
                 },
             };
             if (value.state == .failed) status.state = .failed else if (value.state == .building and status.state != .failed) status.state = .building;

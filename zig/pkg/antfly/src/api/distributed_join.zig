@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+const join_planning = @import("join_planning.zig");
+const RouteBudget = @import("table_router.zig").RouteBudget;
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const platform_sync = @import("antfly_platform").sync;
 const table_reads = @import("table_read_source.zig");
@@ -124,6 +126,16 @@ pub const LifecycleHook = struct {
 // ---------------------------------------------------------------------------
 
 pub const JoinContext = struct {
+    /// Borrowed synchronous query state. Background jobs retain only the
+    /// ordinary server context; request bindings never escape their owner.
+    query_execution: ?QueryExecution = null,
+    planning_scope: ?*PlanningScope = null,
+    routing_session: ?*table_catalog.RoutingSession = null,
+    require_authoritative_routing: bool = true,
+    fanout_io: ?@import("../runtime_io_abi.zig").Borrow = null,
+
+    response_label: ?[]const u8 = null,
+
     ptr: *anyopaque,
     vtable: *const VTable,
     /// Absolute deadline in monotonicNowNs(), not the native query clock.
@@ -131,9 +143,21 @@ pub const JoinContext = struct {
     cancellation: ?CancellationToken = null,
     lifecycle_hook: ?LifecycleHook = null,
 
+    pub const QueryExecution = struct {
+        ptr: *anyopaque,
+        plain: @FieldType(VTable, "execute_plain_query"),
+        dispatch: @FieldType(VTable, "execute_query_dispatch"),
+        build: @FieldType(VTable, "build_owned_search_request"),
+    };
+
+    pub fn withResponseLabel(self: @This(), label: ?[]const u8) @This() {
+        var out = self;
+        out.response_label = label;
+        return out;
+    }
+
     pub const VTable = struct {
-        admin_snapshot: *const fn (*anyopaque) anyerror!?metadata_api.AdminSnapshot,
-        free_admin_snapshot: *const fn (*anyopaque, *metadata_api.AdminSnapshot) void,
+        acquire_planning: *const fn (*anyopaque, std.mem.Allocator, RouteBudget) anyerror!?*join_planning.Generation,
         local_table_stats: ?*const fn (
             *anyopaque,
             []const u8,
@@ -212,12 +236,53 @@ pub const JoinContext = struct {
         if (self.monotonicNowNs() >= deadline_ns) return error.Timeout;
     }
 
-    pub fn adminSnapshot(self: JoinContext) !?metadata_api.AdminSnapshot {
-        return try self.vtable.admin_snapshot(self.ptr);
+    /// One retained observation per synchronous join, including all planning,
+    /// lookup/broadcast selection, and shuffle worker selection. Background
+    /// jobs deliberately acquire a fresh observation in their own scope.
+    pub const PlanningScope = struct {
+        acquired: bool = false,
+        generation: ?*join_planning.Generation = null,
+
+        pub fn deinit(self: *PlanningScope) void {
+            if (self.generation) |generation| generation.release();
+            self.* = .{};
+        }
+    };
+
+    pub fn acquirePlanning(self: JoinContext, alloc: std.mem.Allocator) !?*join_planning.Generation {
+        try self.ensureExecutionDeadline();
+        if (self.planning_scope) |scope| if (scope.acquired)
+            return if (scope.generation) |generation| generation.retain() else null;
+        const result = self.vtable.acquire_planning(self.ptr, alloc, .{
+            .clock = .{ .deadline_ns = self.nativeExecutionDeadline() },
+            .cancellation = self.cancellation,
+        }) catch |err| switch (err) {
+            error.CatalogRoutingSnapshotTimeout => return error.Timeout,
+            else => return err,
+        };
+        errdefer if (result) |generation| generation.release();
+        try self.ensureExecutionDeadline();
+        if (self.planning_scope) |scope| {
+            scope.acquired = true;
+            scope.generation = if (result) |generation| generation.retain() else null;
+        }
+        return result;
     }
 
-    pub fn freeAdminSnapshot(self: JoinContext, snapshot: *metadata_api.AdminSnapshot) void {
-        self.vtable.free_admin_snapshot(self.ptr, snapshot);
+    fn localPlanningTableStats(self: JoinContext, table: join_planning.Table) !?JoinTableStats {
+        // The local runtime-status adapter only needs this table and ranges.
+        // Never capture a diagnostic snapshot to fill missing estimates.
+        var records = [_]metadata_table_manager.TableRecord{.{ .table_id = table.table_id, .name = table.name }};
+        const view: metadata_api.AdminSnapshot = .{
+            .status = .{ .metadata_group_id = 0, .metrics = .{} },
+            .tables = &records,
+            .ranges = table.ranges,
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+        return self.localTableStats(table.name, &view);
     }
 
     pub fn localTableStats(
@@ -247,8 +312,9 @@ pub const JoinContext = struct {
     }
 
     pub fn executePlainQuery(self: JoinContext, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) !query_api.QueryResponse {
-        return try self.vtable.execute_plain_query(
-            self.ptr,
+        const execute = if (self.query_execution) |q| q.plain else self.vtable.execute_plain_query;
+        return try execute(
+            if (self.query_execution) |q| q.ptr else self.ptr,
             alloc,
             source,
             table_name,
@@ -260,8 +326,9 @@ pub const JoinContext = struct {
     }
 
     pub fn executeQueryDispatch(self: JoinContext, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) ![]u8 {
-        return try self.vtable.execute_query_dispatch(
-            self.ptr,
+        const execute = if (self.query_execution) |q| q.dispatch else self.vtable.execute_query_dispatch;
+        return try execute(
+            if (self.query_execution) |q| q.ptr else self.ptr,
             alloc,
             source,
             table_name,
@@ -273,8 +340,9 @@ pub const JoinContext = struct {
     }
 
     pub fn buildOwnedSearchRequest(self: JoinContext, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value) !query_api.OwnedQueryRequest {
-        return try self.vtable.build_owned_search_request(
-            self.ptr,
+        const execute = if (self.query_execution) |q| q.build else self.vtable.build_owned_search_request;
+        return try execute(
+            if (self.query_execution) |q| q.ptr else self.ptr,
             alloc,
             table_name,
             query_value,
@@ -423,6 +491,61 @@ pub const JoinShuffleResumeState = struct {
     }
 };
 
+/// Internal worker envelope. Public admission replaces native names before
+/// constructing this representation; labels never participate in routing.
+const BoundJoinClause = struct {
+    right_table: ?[]const u8 = null,
+    right_target: ?metadata_openapi.CatalogTableTarget = null,
+    right_label: ?[]const u8 = null,
+    join_type: ?metadata_openapi.JoinType = null,
+    on: metadata_openapi.JoinCondition,
+    right_filters: ?metadata_openapi.JoinFilters = null,
+    right_fields: ?[]const []const u8 = null,
+    strategy_hint: ?metadata_openapi.JoinStrategy = null,
+    nested_join: @FieldType(metadata_openapi.JoinClause, "nested_join") = .absent,
+};
+
+fn supportedBoundJoinFromWire(alloc: std.mem.Allocator, wire: BoundJoinClause) !SupportedJoinRequest {
+    if (wire.right_target != null) return error.InvalidQueryRequest;
+    const physical = wire.right_table orelse return error.InvalidQueryRequest;
+    try tables_api.validateInternalTableMutationName(physical);
+    var result = try supportedJoinRequestFromOpenApi(alloc, .{
+        .right_table = "__bound__",
+        .join_type = wire.join_type,
+        .on = wire.on,
+        .right_filters = wire.right_filters,
+        .right_fields = wire.right_fields,
+        .strategy_hint = wire.strategy_hint,
+    });
+    errdefer result.deinit(alloc);
+    const owned_physical = try alloc.dupe(u8, physical);
+    alloc.free(result.right_table);
+    result.right_table = owned_physical;
+    if (wire.right_label) |label| result.right_label = try alloc.dupe(u8, label);
+    if (wire.nested_join.valueOrNull()) |value| {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        defer alloc.free(encoded);
+        const parsed = try std.json.parseFromSlice(BoundJoinClause, alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const nested = try alloc.create(SupportedJoinRequest);
+        errdefer alloc.destroy(nested);
+        nested.* = try supportedBoundJoinFromWire(alloc, parsed.value);
+        result.nested_join = nested;
+    }
+    return result;
+}
+
+pub fn parseBoundJoinRequestWithSecrets(alloc: std.mem.Allocator, body: []const u8, secrets: ?*@import("../common/secrets.zig").FileStore) !?ParsedSupportedJoinRequest {
+    const parsed = try std.json.parseFromSlice(struct { join: ?BoundJoinClause = null }, alloc, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const wire = parsed.value.join orelse return null;
+    var bound = try supportedBoundJoinFromWire(alloc, wire);
+    errdefer bound.deinit(alloc);
+    var envelope = try metadata_openapi.server.parseQueryTableBody(alloc, body);
+    defer envelope.deinit();
+    return .{ .join = bound, .foreign_sources = try foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(alloc, envelope.value.foreign_sources, secrets) };
+}
+
 pub const SupportedJoinRequest = struct {
     pub const JoinType = enum {
         inner,
@@ -431,6 +554,7 @@ pub const SupportedJoinRequest = struct {
     };
 
     right_table: []u8,
+    right_label: ?[]u8 = null,
     join_type: JoinType = .inner,
     left_field: []u8,
     right_field: []u8,
@@ -442,6 +566,7 @@ pub const SupportedJoinRequest = struct {
 
     pub fn deinit(self: *SupportedJoinRequest, alloc: std.mem.Allocator) void {
         alloc.free(self.right_table);
+        if (self.right_label) |label| alloc.free(label);
         alloc.free(self.left_field);
         alloc.free(self.right_field);
         if (self.right_filters) |*filters| filters.deinit(alloc);
@@ -548,23 +673,7 @@ pub const JoinedQueryStats = struct {
     rows_unmatched_right: i64 = 0,
 };
 
-pub const JoinTableStats = struct {
-    row_count: u64 = 0,
-    size_bytes: u64 = 0,
-    shard_count: usize = 0,
-    row_count_known: bool = false,
-    size_bytes_known: bool = false,
-
-    pub fn hasAny(self: JoinTableStats) bool {
-        return self.row_count_known or self.size_bytes_known;
-    }
-
-    pub fn estimatedSizeBytes(self: JoinTableStats) u64 {
-        if (self.size_bytes_known and (self.size_bytes != 0 or !self.row_count_known or self.row_count == 0)) return self.size_bytes;
-        if (!self.row_count_known) return 0;
-        return std.math.mul(u64, self.row_count, join_model.join_estimated_row_bytes) catch std.math.maxInt(u64);
-    }
-};
+pub const JoinTableStats = join_planning.TableStats;
 
 pub const PlannedJoinExecution = struct {
     strategy: RightJoinQueryResult.StrategyUsed = .broadcast,
@@ -767,7 +876,7 @@ pub const JoinFinalizeRequest = struct {
 
 pub const EncodedJoinPartitionRequest = struct {
     job_id: ?u64 = null,
-    join: metadata_openapi.JoinClause,
+    join: BoundJoinClause,
     left_hits: []const std.json.Value,
     appended_left_field: ?bool = null,
     partition_index: ?u64 = null,
@@ -778,14 +887,14 @@ pub const EncodedJoinPartitionRequest = struct {
 
 pub const EncodedJoinRowsRequest = struct {
     job_id: ?u64 = null,
-    join: metadata_openapi.JoinClause,
+    join: BoundJoinClause,
     partition_index: ?u64 = null,
     partition_count: ?u64 = null,
     remaining_timeout_ms: ?u64 = null,
 };
 
 pub const EncodedJoinUnmatchedRequest = struct {
-    join: metadata_openapi.JoinClause,
+    join: BoundJoinClause,
     left_hit_count: ?u64 = null,
     left_fields: ?[]const []const u8 = null,
     appended_left_field: ?bool = null,
@@ -796,7 +905,7 @@ pub const EncodedJoinUnmatchedRequest = struct {
 pub const EncodedJoinFinalizeRequest = struct {
     job_id: ?u64 = null,
     handoff_owner_group_id: ?u64 = null,
-    join: metadata_openapi.JoinClause,
+    join: BoundJoinClause,
     left_hits: []const std.json.Value,
     left_fields: ?[]const std.json.Value = null,
     appended_left_field: ?bool = null,
@@ -925,6 +1034,12 @@ pub const JoinJobStore = struct {
 
     pub fn setContext(self: *JoinJobStore, ctx: JoinContext) void {
         self.ctx = ctx;
+        self.ctx.?.query_execution = null;
+        self.ctx.?.planning_scope = null;
+        self.ctx.?.routing_session = null;
+        self.ctx.?.execution_deadline_ns = null;
+        self.ctx.?.cancellation = null;
+        self.ctx.?.response_label = null;
     }
 
     pub fn hasDurableStore(self: *const JoinJobStore) bool {
@@ -1602,16 +1717,23 @@ pub const JoinJobStore = struct {
 // ---------------------------------------------------------------------------
 
 pub fn executeSupportedJoinedPublicTableQueryRequest(
-    ctx: JoinContext,
+    unbound_ctx: JoinContext,
     job_store: *JoinJobStore,
     alloc: std.mem.Allocator,
-    source: table_reads.TableReadSource,
+    unbound_source: table_reads.TableReadSource,
     table_name: []const u8,
     body: []const u8,
     row_filter_json: ?[]const u8,
     join: SupportedJoinRequest,
     foreign_sources: foreign_mod.PostgresSourceMap,
 ) (public_table_http.TableApi.ExecuteQueryError || error{ OutOfMemory, DocIdentityNamespaceMismatch, Timeout, Cancelled })![]u8 {
+    var scope: JoinContext.PlanningScope = .{};
+    defer scope.deinit();
+    var binding = JoinReadBinding.init(unbound_ctx, alloc, unbound_source) catch |err| return normalizeDistributedJoinBindingError(err);
+    defer binding.deinit();
+    var ctx = binding.ctx;
+    const source = binding.source;
+    if (ctx.planning_scope == null) ctx.planning_scope = &scope;
     // This is a public core entry point, not only an ApiHttpServer wrapper.
     // Install the production context before durable eligibility and lease
     // operations inspect the store. Requiring every transport caller to do
@@ -1657,9 +1779,17 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
 
     var owned_response = json_helpers.parseOwnedJsonValueAlloc(alloc, primary_result.json) catch return error.InternalFailure;
     defer deinitJsonValue(alloc, &owned_response);
+    if (ctx.response_label) |label| {
+        if (owned_response.object.getPtr("responses")) |responses| for (responses.array.items) |*response| {
+            if (response.object.getPtr("table")) |name| {
+                deinitJsonValue(alloc, name);
+                name.* = .{ .string = try alloc.dupe(u8, label) };
+            }
+        };
+    }
     const hits_ptr = queryHitsArrayPtr(&owned_response) catch return error.InternalFailure;
     if (hits_ptr.items.len == 0) {
-        const empty_response = alloc.dupe(u8, primary_result.json) catch return error.InternalFailure;
+        const empty_response = std.json.Stringify.valueAlloc(alloc, owned_response, .{}) catch return error.InternalFailure;
         errdefer alloc.free(empty_response);
         try ctx.ensureExecutionDeadline();
         return empty_response;
@@ -1744,16 +1874,20 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
 }
 
 pub fn executeSupportedDistributedJoinFinalized(
-    ctx: JoinContext,
+    unbound_ctx: JoinContext,
     job_store: *JoinJobStore,
     alloc: std.mem.Allocator,
-    source: table_reads.TableReadSource,
+    unbound_source: table_reads.TableReadSource,
     join: SupportedJoinRequest,
     left_hits: []const std.json.Value,
     left_fields: []const std.json.Value,
     appended_left_field: bool,
     plan: PlannedJoinExecution,
 ) !?JoinPartitionExecutionResult {
+    var binding = try JoinReadBinding.init(unbound_ctx, alloc, unbound_source);
+    defer binding.deinit();
+    const ctx = binding.ctx;
+    const source = binding.source;
     const engine: StatefulDistributedShuffleEngine = .{
         .ctx = ctx,
         .job_store = job_store,
@@ -2037,72 +2171,130 @@ const DistributedJoinPartitionDispatch = struct {
     retry_delta: usize = 0,
 };
 
-const DistributedRightJoinGroups = struct {
+fn normalizeDistributedJoinBindingError(err: anyerror) (public_table_http.TableApi.ExecuteQueryError || error{ OutOfMemory, DocIdentityNamespaceMismatch, Timeout, Cancelled }) {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Timeout, error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded => error.Timeout,
+        error.Canceled, error.Cancelled => error.Cancelled,
+        error.TopologyChanged, error.CatalogProjectionRefreshRequired => error.TopologyChanged,
+        else => error.DistributedQueryUnavailable,
+    };
+}
+
+const JoinReadBinding = struct {
+    view: ?*table_reads.JoinReadView = null,
+    cancellation_scope: ?*CancellationScope = null,
     ctx: JoinContext,
-    alloc: std.mem.Allocator,
-    snapshot: metadata_api.AdminSnapshot,
-    table_id: u64,
-    group_ids: []u64,
+    source: table_reads.TableReadSource,
 
-    fn init(
-        ctx: JoinContext,
+    const CancellationScope = struct {
         alloc: std.mem.Allocator,
-        table_name: []const u8,
-        min_group_count: usize,
-    ) !?DistributedRightJoinGroups {
-        var snapshot = (try ctx.adminSnapshot()) orelse return null;
-        errdefer ctx.freeAdminSnapshot(&snapshot);
-        const right_table = tables_api.findTableByName(&snapshot, table_name) orelse {
-            ctx.freeAdminSnapshot(&snapshot);
-            return null;
-        };
-        const group_ids = try rightJoinGroupIdsFromSnapshot(alloc, &snapshot, right_table.table_id);
-        errdefer alloc.free(group_ids);
-        if (group_ids.len < min_group_count) {
-            alloc.free(group_ids);
-            ctx.freeAdminSnapshot(&snapshot);
-            return null;
+        request: CancellationToken,
+        admission: CancellationToken,
+        fn check(ptr: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            try self.request.check();
+            try self.admission.check();
         }
-        try validateDistributedJoinDocIdentityReady(&snapshot, right_table.table_id);
-        return .{
-            .ctx = ctx,
-            .alloc = alloc,
-            .snapshot = snapshot,
-            .table_id = right_table.table_id,
-            .group_ids = group_ids,
-        };
-    }
+    };
 
-    fn deinit(self: *DistributedRightJoinGroups) void {
-        self.alloc.free(self.group_ids);
-        self.ctx.freeAdminSnapshot(&self.snapshot);
-        self.* = undefined;
+    fn init(ctx: JoinContext, alloc: std.mem.Allocator, source: table_reads.TableReadSource) !JoinReadBinding {
+        var result = JoinReadBinding{ .ctx = ctx, .source = source };
+        errdefer result.deinit();
+        if (source.route_fence) |fence| if (fence.admission_cancellation.ptr != null) {
+            if (ctx.cancellation) |request| {
+                const scope = try alloc.create(CancellationScope);
+                scope.* = .{ .alloc = alloc, .request = request, .admission = fence.admission_cancellation };
+                result.cancellation_scope = scope;
+                result.ctx.cancellation = .{ .ptr = scope, .check_fn = CancellationScope.check };
+            } else result.ctx.cancellation = fence.admission_cancellation;
+        };
+        if (source.route_fence) |fence| if (fence.admission_deadline_ns != null) {
+            const admitted = ctx.withDeadlineFrom(.{ .deadline_ns = fence.admission_deadline_ns, .io = fence.admission_deadline_io }).execution_deadline_ns.?;
+            result.ctx.execution_deadline_ns = if (ctx.execution_deadline_ns) |current| @min(current, admitted) else admitted;
+        };
+        try result.ctx.ensureExecutionDeadline();
+        if (ctx.routing_session != null) return result;
+        if (try source.acquireJoinView(alloc, .{ .clock = .{ .deadline_ns = result.ctx.nativeExecutionDeadline() }, .cancellation = result.ctx.cancellation })) |view| {
+            errdefer view.deinit();
+            // A finalizer may fan out further, but cannot upgrade the topology
+            // admitted by its coordinator to a newer split/rename generation.
+            if (source.route_fence) |expected| {
+                const catalog = view.session.catalog();
+                const actual = (try catalog.vtable.route_fence.?(catalog.ptr, expected.route.group_id)) orelse return error.TopologyChanged;
+                if (actual.metadata_group_id != expected.metadata_group_id or
+                    !std.meta.eql(actual.metadata_incarnation, expected.metadata_incarnation) or
+                    actual.table_id != expected.table_id or actual.topology_epoch != expected.topology_epoch or
+                    !std.meta.eql(actual.route, expected.route)) return error.TopologyChanged;
+            }
+            result.view = view;
+            result.ctx.routing_session = &view.session;
+            result.source = view.source;
+        }
+        return result;
+    }
+    fn deinit(self: *JoinReadBinding) void {
+        if (self.view) |view| view.deinit();
+        if (self.cancellation_scope) |scope| scope.alloc.destroy(scope);
     }
 };
 
-fn validateDistributedJoinDocIdentityReady(
-    snapshot: *const metadata_api.AdminSnapshot,
-    table_id: u64,
-) !void {
-    for (snapshot.ranges) |range| {
-        if (range.table_id != table_id) continue;
-        const status = findJoinMergedGroupStatus(snapshot.merged_group_statuses, range.group_id) orelse continue;
-        if (status.doc_identity_reassignment_active) return error.DocIdentityNamespaceMismatch;
-        if (status.doc_identity_namespace_conflict) return error.DocIdentityNamespaceMismatch;
-        if (status.doc_identity.rebuild_required) return error.DocIdentityNamespaceMismatch;
-        if (!joinRuntimeDocIdentityMatchesRange(status.doc_identity, range)) return error.DocIdentityNamespaceMismatch;
-    }
-}
+const DistributedRightJoinGroups = struct {
+    planning: ?*join_planning.Generation = null,
+    table: join_planning.Table,
+    alloc: ?std.mem.Allocator = null,
+    routing: ?*table_catalog.RoutingSession = null,
+    group_ids: []const u64,
 
-fn findJoinMergedGroupStatus(
-    statuses: []const metadata_reconciler.MergedGroupStatus,
-    group_id: u64,
-) ?metadata_reconciler.MergedGroupStatus {
-    for (statuses) |status| {
-        if (status.group_id == group_id) return status;
+    fn init(ctx: JoinContext, alloc: std.mem.Allocator, table_name: []const u8, min_group_count: usize) !?DistributedRightJoinGroups {
+        if (ctx.routing_session) |session| {
+            try ctx.ensureExecutionDeadline();
+            const index = session.table_indexes.get(table_name) orelse return error.TableNotFound;
+            const record = session.snapshot.value.tables[index];
+            const refs = session.table_range_refs.get(record.table_id) orelse return null;
+            if (refs.len < min_group_count) return null;
+            const ids = try alloc.alloc(u64, refs.len);
+            for (refs, ids) |range, *id| id.* = range.group_id;
+            return .{ .table = .{ .table_id = record.table_id, .name = record.name }, .group_ids = ids, .alloc = alloc, .routing = session };
+        }
+        // Backends without an authoritative routing capability use their
+        // ordinary table query path. Advisory observations cannot select shards.
+        if (ctx.require_authoritative_routing) return null;
+        const planning = (try ctx.acquirePlanning(alloc)) orelse return null;
+        errdefer planning.release();
+        const table = planning.findTable(table_name) orelse {
+            planning.release();
+            return null;
+        };
+        if (table.group_ids.len < min_group_count) {
+            planning.release();
+            return null;
+        }
+        try table.validateIdentity();
+        return .{ .planning = planning, .table = table, .group_ids = table.group_ids };
     }
-    return null;
-}
+
+    fn deinit(self: *DistributedRightJoinGroups) void {
+        if (self.planning) |planning| planning.release();
+        if (self.alloc) |alloc| alloc.free(self.group_ids);
+        self.* = undefined;
+    }
+
+    fn groupForKey(self: @This(), key: []const u8) ?u64 {
+        const session = self.routing orelse return self.table.groupForKey(key);
+        const refs = session.table_range_refs.get(self.table.table_id) orelse return null;
+        var low: usize = 0;
+        var high = refs.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (std.mem.order(u8, refs[mid].start_key, key) != .gt) low = mid + 1 else high = mid;
+        }
+        if (low == 0) return null;
+        const range = refs[low - 1];
+        if (range.end_key) |end| if (std.mem.order(u8, key, end) != .lt) return null;
+        return range.group_id;
+    }
+};
 
 fn joinRuntimeDocIdentityMatchesRange(
     stats: metadata_table_manager.RuntimeDocIdentityStatusReport,
@@ -2316,17 +2508,9 @@ const StatefulDistributedShuffleEngine = struct {
     plan: PlannedJoinExecution,
 
     fn loadWorkerGroupIdsAlloc(self: StatefulDistributedShuffleEngine) !?[]u64 {
-        var snapshot = (try self.ctx.adminSnapshot()) orelse return null;
-        defer self.ctx.freeAdminSnapshot(&snapshot);
-        const right_table = tables_api.findTableByName(&snapshot, self.join.right_table) orelse return error.TableNotFound;
-        const worker_group_ids = try rightJoinGroupIdsFromSnapshot(self.alloc, &snapshot, right_table.table_id);
-        errdefer self.alloc.free(worker_group_ids);
-        if (worker_group_ids.len <= 1) {
-            self.alloc.free(worker_group_ids);
-            return null;
-        }
-        try validateDistributedJoinDocIdentityReady(&snapshot, right_table.table_id);
-        return worker_group_ids;
+        var groups = (try DistributedRightJoinGroups.init(self.ctx, self.alloc, self.join.right_table, 2)) orelse return null;
+        defer groups.deinit();
+        return try self.alloc.dupe(u64, groups.group_ids);
     }
 
     fn stableJobIdAlloc(self: StatefulDistributedShuffleEngine) !u64 {
@@ -2713,15 +2897,19 @@ const StatefulDistributedShuffleEngine = struct {
 };
 
 pub fn executeSupportedRightJoinQuery(
-    ctx: JoinContext,
+    unbound_ctx: JoinContext,
     job_store: *JoinJobStore,
     alloc: std.mem.Allocator,
-    source: table_reads.TableReadSource,
+    unbound_source: table_reads.TableReadSource,
     join: SupportedJoinRequest,
     left_hits: []const std.json.Value,
     plan: PlannedJoinExecution,
     foreign_sources: foreign_mod.PostgresSourceMap,
 ) !RightJoinQueryResult {
+    var binding = try JoinReadBinding.init(unbound_ctx, alloc, unbound_source);
+    defer binding.deinit();
+    const ctx = binding.ctx;
+    const source = binding.source;
     try ctx.ensureExecutionDeadline();
     if (foreign_sources.get(join.right_table)) |foreign_source| {
         return try executeForeignRightJoinQuery(ctx, job_store, alloc, source, foreign_source, join, left_hits, foreign_sources);
@@ -2740,15 +2928,19 @@ pub fn executeSupportedRightJoinQuery(
 }
 
 pub fn executeSupportedRightJoinQueryCoordinatorOnly(
-    ctx: JoinContext,
+    unbound_ctx: JoinContext,
     job_store: *JoinJobStore,
     alloc: std.mem.Allocator,
-    source: table_reads.TableReadSource,
+    unbound_source: table_reads.TableReadSource,
     join: SupportedJoinRequest,
     left_hits: []const std.json.Value,
     plan: PlannedJoinExecution,
     foreign_sources: foreign_mod.PostgresSourceMap,
 ) !RightJoinQueryResult {
+    var binding = try JoinReadBinding.init(unbound_ctx, alloc, unbound_source);
+    defer binding.deinit();
+    const ctx = binding.ctx;
+    const source = binding.source;
     try ctx.ensureExecutionDeadline();
     if (foreign_sources.get(join.right_table)) |foreign_source| {
         return try executeForeignRightJoinQuery(ctx, job_store, alloc, source, foreign_source, join, left_hits, foreign_sources);
@@ -2938,10 +3130,10 @@ fn executeRightJoinBroadcastQueryLocal(
 }
 
 pub fn executeSupportedDistributedJoinPartitions(
-    ctx: JoinContext,
+    unbound_ctx: JoinContext,
     job_store: *JoinJobStore,
     alloc: std.mem.Allocator,
-    source: table_reads.TableReadSource,
+    unbound_source: table_reads.TableReadSource,
     job_id: ?u64,
     join: SupportedJoinRequest,
     left_hits: []const std.json.Value,
@@ -2949,6 +3141,10 @@ pub fn executeSupportedDistributedJoinPartitions(
     plan: PlannedJoinExecution,
     resume_state: ?JoinShuffleResumeState,
 ) !?JoinPartitionExecutionResult {
+    var binding = try JoinReadBinding.init(unbound_ctx, alloc, unbound_source);
+    defer binding.deinit();
+    const ctx = binding.ctx;
+    const source = binding.source;
     const engine: StatefulDistributedShuffleEngine = .{
         .ctx = ctx,
         .job_store = job_store,
@@ -3049,12 +3245,15 @@ pub fn executeJoinFinalizeWorkerLocalTyped(
     ctx: JoinContext,
     job_store: *JoinJobStore,
     alloc: std.mem.Allocator,
-    source: table_reads.TableReadSource,
+    unbound_source: table_reads.TableReadSource,
     finalizer_group_id: u64,
     table_name: []const u8,
     req: JoinFinalizeRequest,
 ) !JoinPartitionExecutionResult {
-    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    var binding = try JoinReadBinding.init(try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms), alloc, unbound_source);
+    defer binding.deinit();
+    const worker_ctx = binding.ctx;
+    const source = binding.source;
     // Typed, transport-neutral callers do not pass through ApiHttpServer's
     // convenience wrappers. Bind the effective request context here so lease
     // and retention timestamps use the borrowed runtime clock as well.
@@ -3907,7 +4106,7 @@ pub fn planSupportedJoinExecution(
         null;
     try ctx.ensureExecutionDeadline();
 
-    var snapshot = (try ctx.adminSnapshot()) orelse {
+    const planning = (try ctx.acquirePlanning(alloc)) orelse {
         try ctx.ensureExecutionDeadline();
         const right_stats = foreign_right_stats orelse JoinTableStats{};
         plan.used_stats = right_stats.hasAny();
@@ -3919,20 +4118,22 @@ pub fn planSupportedJoinExecution(
         estimateJoinPlanCosts(&plan, plan.strategy, left_rows, right_stats.row_count, right_stats.estimatedSizeBytes());
         return plan;
     };
-    defer ctx.freeAdminSnapshot(&snapshot);
+    defer planning.release();
     try ctx.ensureExecutionDeadline();
 
-    var left_stats = estimateJoinTableStatsFromSnapshot(&snapshot, left_table_name);
+    const left_table = planning.findTable(left_table_name);
+    var left_stats: JoinTableStats = if (left_table) |table| table.stats else .{};
     if (!left_stats.hasAny()) {
-        if (ctx.localTableStats(left_table_name, &snapshot) catch null) |local_stats| {
-            left_stats = local_stats;
-        }
+        if (left_table) |table| if (ctx.localPlanningTableStats(table) catch null) |stats| {
+            left_stats = stats;
+        };
     }
-    var right_stats = foreign_right_stats orelse estimateJoinTableStatsFromSnapshot(&snapshot, join.right_table);
+    const right_table = planning.findTable(join.right_table);
+    var right_stats = foreign_right_stats orelse if (right_table) |table| table.stats else JoinTableStats{};
     if (foreign_right_stats == null and !right_stats.hasAny()) {
-        if (ctx.localTableStats(join.right_table, &snapshot) catch null) |local_stats| {
-            right_stats = local_stats;
-        }
+        if (right_table) |table| if (ctx.localPlanningTableStats(table) catch null) |stats| {
+            right_stats = stats;
+        };
     }
     plan.used_stats = left_stats.hasAny() or right_stats.hasAny();
 
@@ -3974,39 +4175,40 @@ fn executeRightJoinDistributedLookupQuery(
     defer groups.deinit();
 
     var owned_hits = std.json.Array.init(alloc);
-    errdefer {
+    defer {
         for (owned_hits.items) |*item| deinitJsonValue(alloc, item);
         owned_hits.deinit();
     }
 
-    var groups_queried: usize = 0;
-    var saw_unresolved_key = false;
-    for (groups.group_ids) |group_id| {
-        var partition_left_hits = std.json.Array.init(alloc);
-        defer partition_left_hits.deinit();
-        for (left_hits) |hit| {
-            const left_value = extractJoinValueFromHit(hit, join.left_field) orelse continue;
-            if (left_value != .string) {
-                saw_unresolved_key = true;
-                continue;
-            }
-            const resolved_group_id = rightJoinGroupForKey(&groups.snapshot, groups.table_id, left_value.string) orelse {
-                saw_unresolved_key = true;
-                continue;
-            };
-            if (resolved_group_id != group_id) continue;
-            try partition_left_hits.append(hit);
-        }
-        if (partition_left_hits.items.len == 0) continue;
-        groups_queried += 1;
-        var query_value = try buildRightJoinQueryValue(alloc, join, partition_left_hits.items);
+    // Classify each left row once. Resolve all keys before dispatch so an
+    // unsupported key falls back without performing a discarded partial join.
+    const buckets = try partitionLookupJoinHits(ctx, alloc, groups, join.left_field, left_hits) orelse return null;
+    defer {
+        for (buckets) |*bucket| bucket.deinit();
+        alloc.free(buckets);
+    }
+    var requests: std.ArrayListUnmanaged(query_api.OwnedQueryRequest) = .empty;
+    defer {
+        for (requests.items) |*request| request.deinit(alloc);
+        requests.deinit(alloc);
+    }
+    var jobs: std.ArrayListUnmanaged(JoinReadJob) = .empty;
+    defer jobs.deinit(alloc);
+    for (groups.group_ids, buckets) |group_id, bucket| {
+        if (bucket.items.len == 0) continue;
+        try ctx.ensureExecutionDeadline();
+        var query_value = try buildRightJoinQueryValue(alloc, join, bucket.items);
         defer deinitJsonValue(alloc, &query_value);
         var owned_req = try ctx.buildOwnedSearchRequest(alloc, join.right_table, query_value);
-        defer owned_req.deinit(alloc);
-        if (!try appendGroupLocalJoinHits(alloc, source, group_id, join.right_table, owned_req.req, false, &owned_hits)) return null;
+        requests.append(alloc, owned_req) catch |err| {
+            owned_req.deinit(alloc);
+            return err;
+        };
+        try jobs.append(alloc, .{ .group_id = group_id, .req = owned_req.req });
     }
-
-    if (groups_queried == 0 or saw_unresolved_key) return null;
+    const groups_queried = jobs.items.len;
+    if (groups_queried == 0) return null;
+    if (!try appendJoinReadJobs(ctx, alloc, source, join.right_table, jobs.items, &owned_hits)) return null;
     const owned_slice = try owned_hits.toOwnedSlice();
     return .{
         .owned_hits = owned_slice,
@@ -4037,12 +4239,13 @@ fn executeRightJoinDistributedBroadcastQuery(
     defer owned_req.deinit(alloc);
 
     var owned_hits = std.json.Array.init(alloc);
-    errdefer {
+    defer {
         for (owned_hits.items) |*item| deinitJsonValue(alloc, item);
         owned_hits.deinit();
     }
 
     const groups_queried = try appendJoinHitsAcrossGroups(
+        ctx,
         alloc,
         source,
         groups.group_ids,
@@ -4157,6 +4360,7 @@ fn appendDistributedShufflePartitionHits(
     var owned_req = try partition_context.ctx.buildOwnedSearchRequest(alloc, partition_context.join.right_table, query_value);
     defer owned_req.deinit(alloc);
     return try appendJoinHitsAcrossGroups(
+        partition_context.ctx,
         alloc,
         partition_context.source,
         partition_context.group_ids,
@@ -4444,8 +4648,10 @@ pub fn parseSupportedJoinRequestWithSecrets(
     var parsed_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
     defer parsed_request.deinit();
     const join = parsed_request.value.join orelse return null;
+    var owned_join = try supportedJoinRequestFromOpenApi(alloc, join);
+    errdefer owned_join.deinit(alloc);
     return .{
-        .join = try supportedJoinRequestFromOpenApi(alloc, join),
+        .join = owned_join,
         .foreign_sources = foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(alloc, parsed_request.value.foreign_sources, secret_store) catch |err| switch (err) {
             error.UnsupportedSourceKind => return error.UnsupportedQueryRequest,
             else => return err,
@@ -4470,10 +4676,17 @@ pub fn supportedJoinRequestFromOpenApi(
     alloc: std.mem.Allocator,
     join: metadata_openapi.JoinClause,
 ) !SupportedJoinRequest {
-    if (join.right_table.len == 0 or join.on.left_field.len == 0 or join.on.right_field.len == 0) {
+    if ((join.right_table == null) == (join.right_target == null) or join.on.left_field.len == 0 or join.on.right_field.len == 0) {
         return error.InvalidQueryRequest;
     }
-    const right_table = try alloc.dupe(u8, join.right_table);
+    const catalog = @import("../system_catalog/domain.zig");
+    const target: catalog.Target = if (join.right_target) |target| .{
+        .database = target.database orelse catalog.default_database_name,
+        .namespace = target.namespace orelse catalog.default_namespace_name,
+        .table = target.table,
+    } else try catalog.Target.literal(join.right_table.?);
+    try target.validate();
+    const right_table = if (join.right_target != null) try target.resourceNameAlloc(alloc) else try alloc.dupe(u8, join.right_table.?);
     errdefer alloc.free(right_table);
     const left_field = try alloc.dupe(u8, join.on.left_field);
     errdefer alloc.free(left_field);
@@ -4674,7 +4887,7 @@ pub fn parseJoinPartitionRequest(
     errdefer parsed.deinit();
     return .{
         .job_id = parsed.value.job_id,
-        .join = try supportedJoinRequestFromOpenApi(alloc, parsed.value.join),
+        .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .left_hits = parsed.value.left_hits,
         .appended_left_field = parsed.value.appended_left_field orelse false,
         .partition_index = if (parsed.value.partition_index) |value|
@@ -4785,7 +4998,7 @@ pub fn parseJoinRowsRequest(
     errdefer parsed.deinit();
     return .{
         .job_id = parsed.value.job_id,
-        .join = try supportedJoinRequestFromOpenApi(alloc, parsed.value.join),
+        .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .partition_index = if (parsed.value.partition_index) |value|
             std.math.cast(usize, value) orelse return error.InvalidQueryRequest
         else
@@ -4811,7 +5024,7 @@ pub fn parseJoinUnmatchedRequest(
     });
     errdefer parsed.deinit();
     return .{
-        .join = try supportedJoinRequestFromOpenApi(alloc, parsed.value.join),
+        .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .left_hit_count = if (parsed.value.left_hit_count) |value|
             std.math.cast(usize, value) orelse return error.InvalidQueryRequest
         else
@@ -4835,7 +5048,7 @@ pub fn parseJoinFinalizeRequest(
     return .{
         .job_id = parsed.value.job_id,
         .handoff_owner_group_id = parsed.value.handoff_owner_group_id,
-        .join = try supportedJoinRequestFromOpenApi(alloc, parsed.value.join),
+        .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .left_hits = parsed.value.left_hits,
         .left_fields = parsed.value.left_fields orelse &.{},
         .appended_left_field = parsed.value.appended_left_field orelse false,
@@ -5515,34 +5728,6 @@ fn chooseStatefulShuffleStrategyOrForcedBroadcast(
     };
 }
 
-fn estimateJoinTableStatsFromSnapshot(
-    snapshot: *const metadata_api.AdminSnapshot,
-    table_name: []const u8,
-) JoinTableStats {
-    const table = tables_api.findTableByName(snapshot, table_name) orelse return .{};
-    var stats: JoinTableStats = .{};
-    var reported_shards: usize = 0;
-    var all_sizes_known = true;
-    for (snapshot.ranges) |range| {
-        if (range.table_id != table.table_id) continue;
-        stats.shard_count += 1;
-        for (snapshot.merged_group_statuses) |status| {
-            if (status.group_id != range.group_id) continue;
-            stats.row_count +|= status.doc_count;
-            reported_shards += 1;
-            if (status.disk_bytes_known) {
-                stats.size_bytes +|= status.disk_bytes;
-            } else {
-                all_sizes_known = false;
-            }
-            break;
-        }
-    }
-    stats.row_count_known = stats.shard_count > 0 and reported_shards == stats.shard_count;
-    stats.size_bytes_known = stats.row_count_known and all_sizes_known;
-    return stats;
-}
-
 fn estimateJoinPlanCosts(
     plan: *PlannedJoinExecution,
     strategy: RightJoinQueryResult.StrategyUsed,
@@ -5786,6 +5971,7 @@ fn buildSupportedJoinClauseValue(
 ) !std.json.Value {
     var join_obj = std.json.ObjectMap.empty;
     try join_obj.put(alloc, try alloc.dupe(u8, "right_table"), .{ .string = try alloc.dupe(u8, join.right_table) });
+    if (join.right_label) |label| try join_obj.put(alloc, try alloc.dupe(u8, "right_label"), .{ .string = try alloc.dupe(u8, label) });
     try join_obj.put(alloc, try alloc.dupe(u8, "join_type"), .{ .string = try alloc.dupe(u8, switch (join.join_type) {
         .inner => "inner",
         .left => "left",
@@ -6055,8 +6241,7 @@ test "distributed join translates native and borrowed deadline boundaries" {
     };
     var now: u64 = platform_time.monotonicNs() + 1000 * std.time.ns_per_s;
     const ctx = JoinContext{ .ptr = &now, .vtable = &.{
-        .admin_snapshot = undefined,
-        .free_admin_snapshot = undefined,
+        .acquire_planning = undefined,
         .execute_plain_query = Clock.plain,
         .execute_query_dispatch = Clock.dispatch,
         .build_owned_search_request = Clock.build,
@@ -6142,8 +6327,7 @@ test "distributed join context forwards one absolute deadline to every query cal
         }
 
         const vtable: JoinContext.VTable = .{
-            .admin_snapshot = adminSnapshot,
-            .free_admin_snapshot = freeAdminSnapshot,
+            .acquire_planning = planningFixture(adminSnapshot, freeAdminSnapshot),
             .execute_plain_query = executePlainQuery,
             .execute_query_dispatch = executeQueryDispatch,
             .build_owned_search_request = buildOwnedSearchRequest,
@@ -6176,7 +6360,7 @@ test "distributed join transports relative budgets and rejects exhausted handoff
     var state: u8 = 0;
     const ctx = JoinContext{
         .ptr = &state,
-        .vtable = undefined,
+        .vtable = &.{ .acquire_planning = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
         .execution_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
     };
     const remaining_ms = (try ctx.remainingExecutionBudgetMs()).?;
@@ -6209,7 +6393,7 @@ test "distributed join transports relative budgets and rejects exhausted handoff
     try std.testing.expectEqual(@as(?u64, remaining_ms), parsed.remaining_timeout_ms);
     const worker_ctx = try (JoinContext{
         .ptr = &state,
-        .vtable = undefined,
+        .vtable = &.{ .acquire_planning = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
     }).withRemainingExecutionBudgetMs(parsed.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
 }
@@ -6488,7 +6672,93 @@ fn requireStampedJoinFollowupRequest(req: db_mod.types.SearchRequest) !void {
     if (req.identity_read_generation == null) return error.UnsupportedQueryRequest;
 }
 
+const JoinReadJob = struct {
+    group_id: u64,
+    req: db_mod.types.SearchRequest,
+};
+
+/// Bounded fanout owns isolated result arenas. Request preparation and output
+/// publication stay on the caller, in catalog order; all launched I/O is drained
+/// before any arena or request-scoped routing lease can be released.
+fn appendJoinReadJobs(ctx: JoinContext, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, jobs: []const JoinReadJob, hits: *std.json.Array) !bool {
+    // Match ordinary query fanout: graph phases share request-wide retained
+    // state budgets and need completion-aware admission before parallelizing.
+    const has_graph = for (jobs) |job| {
+        if (job.req.graph_queries.len > 0 or job.req.graph_query_transport != null) break true;
+    } else false;
+    if (ctx.fanout_io == null or jobs.len < 2 or has_graph) {
+        for (jobs) |job| {
+            try ctx.ensureExecutionDeadline();
+            if (!try appendGroupLocalJoinHits(alloc, source, job.group_id, table_name, job.req, false, hits)) return false;
+        }
+        try ctx.ensureExecutionDeadline();
+        return true;
+    }
+    const Slot = struct {
+        arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+        hits: ?std.json.Array = null,
+        failure: ?anyerror = null,
+        supported: bool = false,
+        fn run(slot: *@This(), src: table_reads.TableReadSource, table: []const u8, job: JoinReadJob) void {
+            const owned = slot.arena.allocator();
+            slot.hits = std.json.Array.init(owned);
+            slot.supported = appendGroupLocalJoinHits(owned, src, job.group_id, table, job.req, false, &slot.hits.?) catch |err| {
+                slot.failure = err;
+                return;
+            };
+        }
+    };
+    var receiver = try ctx.fanout_io.?.receive();
+    const io = receiver.io();
+    const width = 8;
+    var start: usize = 0;
+    while (start < jobs.len) : (start += width) {
+        try ctx.ensureExecutionDeadline();
+        var slots: [width]Slot = @splat(.{});
+        defer for (&slots) |*slot| slot.arena.deinit();
+        const batch = jobs[start..@min(start + width, jobs.len)];
+        var tasks: std.Io.Group = .init;
+        for (batch, 0..) |job, index| tasks.async(io, Slot.run, .{ &slots[index], source, table_name, job });
+        tasks.await(io) catch return error.Cancelled;
+        try ctx.ensureExecutionDeadline();
+        for (slots[0..batch.len]) |slot| if (slot.failure) |err| {
+            return err;
+        };
+        for (slots[0..batch.len]) |slot| if (!slot.supported) {
+            return false;
+        };
+        for (slots[0..batch.len]) |slot| try appendClonedJsonHitsToArray(alloc, hits, slot.hits.?.items);
+    }
+    try ctx.ensureExecutionDeadline();
+    return true;
+}
+
+fn partitionLookupJoinHits(ctx: JoinContext, alloc: std.mem.Allocator, groups: DistributedRightJoinGroups, field: []const u8, left_hits: []const std.json.Value) !?[]std.json.Array {
+    const buckets = try alloc.alloc(std.json.Array, groups.group_ids.len);
+    for (buckets) |*bucket| bucket.* = std.json.Array.init(alloc);
+    var transferred = false;
+    defer if (!transferred) {
+        for (buckets) |*bucket| bucket.deinit();
+        alloc.free(buckets);
+    };
+    var indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    defer indexes.deinit(alloc);
+    try indexes.ensureTotalCapacity(alloc, @intCast(groups.group_ids.len));
+    for (groups.group_ids, 0..) |id, index| indexes.putAssumeCapacity(id, index);
+    for (left_hits, 0..) |hit, row_index| {
+        if (row_index % 256 == 0) try ctx.ensureExecutionDeadline();
+        const value = extractJoinValueFromHit(hit, field) orelse continue;
+        if (value != .string) return null;
+        const group_id = groups.groupForKey(value.string) orelse return null;
+        const index = indexes.get(group_id) orelse return error.InvalidCatalogProjection;
+        try buckets[index].append(hit);
+    }
+    transferred = true;
+    return buckets;
+}
+
 fn appendJoinHitsAcrossGroups(
+    ctx: JoinContext,
     alloc: std.mem.Allocator,
     source: table_reads.TableReadSource,
     group_ids: []const u64,
@@ -6496,46 +6766,11 @@ fn appendJoinHitsAcrossGroups(
     req: db_mod.types.SearchRequest,
     hits: *std.json.Array,
 ) !?usize {
-    var groups_queried: usize = 0;
-    for (group_ids) |group_id| {
-        groups_queried += 1;
-        if (!try appendGroupLocalJoinHits(alloc, source, group_id, table_name, req, false, hits)) return null;
-    }
-    return groups_queried;
-}
-
-fn rightJoinGroupIdsFromSnapshot(
-    alloc: std.mem.Allocator,
-    snapshot: *const metadata_api.AdminSnapshot,
-    table_id: u64,
-) ![]u64 {
-    var group_ids: std.ArrayList(u64) = .empty;
-    errdefer group_ids.deinit(alloc);
-    for (snapshot.ranges) |range| {
-        if (range.table_id != table_id) continue;
-        try group_ids.append(alloc, range.group_id);
-    }
-    return try group_ids.toOwnedSlice(alloc);
-}
-
-fn rightJoinGroupForKey(
-    snapshot: *const metadata_api.AdminSnapshot,
-    table_id: u64,
-    key: []const u8,
-) ?u64 {
-    for (snapshot.ranges) |range| {
-        if (range.table_id != table_id) continue;
-        if (rightJoinRangeContainsKey(range, key)) return range.group_id;
-    }
-    return null;
-}
-
-fn rightJoinRangeContainsKey(range: metadata_table_manager.RangeRecord, key: []const u8) bool {
-    if (std.mem.order(u8, key, range.start_key) == .lt) return false;
-    if (range.end_key) |end_key| {
-        if (std.mem.order(u8, key, end_key) != .lt) return false;
-    }
-    return true;
+    const jobs = try alloc.alloc(JoinReadJob, group_ids.len);
+    defer alloc.free(jobs);
+    for (group_ids, jobs) |id, *job| job.* = .{ .group_id = id, .req = req };
+    if (!try appendJoinReadJobs(ctx, alloc, source, table_name, jobs, hits)) return null;
+    return jobs.len;
 }
 
 // -- response metadata helpers --
@@ -7217,10 +7452,10 @@ test "distributed join unmatched worker returns only unmatched synthetic hits" {
 
         fn ctx(self: *@This()) JoinContext {
             return .{
+                .require_authoritative_routing = false,
                 .ptr = self,
                 .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                    .acquire_planning = comptime planningFixture(adminSnapshot, freeAdminSnapshot),
                     .get_join_shuffle_lease = getJoinShuffleLease,
                     .upsert_join_shuffle_lease = upsertJoinShuffleLease,
                     .remove_join_shuffle_lease = removeJoinShuffleLease,
@@ -7326,10 +7561,10 @@ test "distributed join unmatched worker pages group-local right hits" {
 
         fn ctx(self: *@This()) JoinContext {
             return .{
+                .require_authoritative_routing = false,
                 .ptr = self,
                 .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                    .acquire_planning = comptime planningFixture(adminSnapshot, freeAdminSnapshot),
                     .get_join_shuffle_lease = getJoinShuffleLease,
                     .upsert_join_shuffle_lease = upsertJoinShuffleLease,
                     .remove_join_shuffle_lease = removeJoinShuffleLease,
@@ -7628,10 +7863,10 @@ test "distributed join unmatched worker prefers local search results over query 
 
         fn ctx(self: *@This()) JoinContext {
             return .{
+                .require_authoritative_routing = false,
                 .ptr = self,
                 .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                    .acquire_planning = comptime planningFixture(adminSnapshot, freeAdminSnapshot),
                     .get_join_shuffle_lease = getJoinShuffleLease,
                     .upsert_join_shuffle_lease = upsertJoinShuffleLease,
                     .remove_join_shuffle_lease = removeJoinShuffleLease,
@@ -7790,10 +8025,10 @@ test "distributed join rejects doc identity rebuild before right-table fanout" {
 
         fn ctx(self: *@This()) JoinContext {
             return .{
+                .require_authoritative_routing = false,
                 .ptr = self,
                 .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                    .acquire_planning = comptime planningFixture(adminSnapshot, freeAdminSnapshot),
                     .execute_plain_query = executePlainQuery,
                     .execute_query_dispatch = executeQueryDispatch,
                     .build_owned_search_request = buildOwnedSearchRequest,
@@ -7922,10 +8157,10 @@ test "distributed join stateful shuffle rejects doc identity rebuild before work
 
         fn ctx(self: *@This()) JoinContext {
             return .{
+                .require_authoritative_routing = false,
                 .ptr = self,
                 .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                    .acquire_planning = comptime planningFixture(adminSnapshot, freeAdminSnapshot),
                     .execute_plain_query = executePlainQuery,
                     .execute_query_dispatch = executeQueryDispatch,
                     .build_owned_search_request = buildOwnedSearchRequest,
@@ -8550,10 +8785,10 @@ test "distributed join shared finalizer start index prefers live lease owner and
 
         fn ctx(self: *@This()) JoinContext {
             return .{
+                .require_authoritative_routing = false,
                 .ptr = self,
                 .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                    .acquire_planning = comptime planningFixture(adminSnapshot, freeAdminSnapshot),
                     .get_join_shuffle_lease = getJoinShuffleLease,
                     .upsert_join_shuffle_lease = upsertJoinShuffleLease,
                     .remove_join_shuffle_lease = removeJoinShuffleLease,
@@ -8630,10 +8865,10 @@ test "distributed join durable finalizer state init reuses prior owner lease" {
 
         fn ctx(self: *@This()) JoinContext {
             return .{
+                .require_authoritative_routing = false,
                 .ptr = self,
                 .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                    .acquire_planning = comptime planningFixture(adminSnapshot, freeAdminSnapshot),
                     .get_join_shuffle_lease = getJoinShuffleLease,
                     .upsert_join_shuffle_lease = upsertJoinShuffleLease,
                     .remove_join_shuffle_lease = removeJoinShuffleLease,
@@ -8709,10 +8944,10 @@ test "distributed join durable threshold checks require shuffle shared leases an
 
         fn ctx(self: *@This()) JoinContext {
             return .{
+                .require_authoritative_routing = false,
                 .ptr = self,
                 .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                    .acquire_planning = comptime planningFixture(adminSnapshot, freeAdminSnapshot),
                     .get_join_shuffle_lease = getJoinShuffleLease,
                     .upsert_join_shuffle_lease = upsertJoinShuffleLease,
                     .remove_join_shuffle_lease = removeJoinShuffleLease,
@@ -8790,10 +9025,10 @@ test "distributed join finalizer start index falls back without usable shared le
 
         fn ctx(self: *@This()) JoinContext {
             return .{
+                .require_authoritative_routing = false,
                 .ptr = self,
                 .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
+                    .acquire_planning = comptime planningFixture(adminSnapshot, freeAdminSnapshot),
                     .get_join_shuffle_lease = getJoinShuffleLease,
                     .upsert_join_shuffle_lease = upsertJoinShuffleLease,
                     .remove_join_shuffle_lease = removeJoinShuffleLease,
@@ -9177,4 +9412,309 @@ fn testJoinHitAlloc(
     try hit.object.put(alloc, try alloc.dupe(u8, "_source"), source);
     source = undefined;
     return hit;
+}
+
+// Adapt existing in-memory test observations at the fixture boundary. The
+// production JoinContext exposes only the budgeted planning capability.
+fn planningFixture(comptime capture: anytype, comptime free: anytype) *const fn (*anyopaque, std.mem.Allocator, RouteBudget) anyerror!?*join_planning.Generation {
+    return struct {
+        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, budget: RouteBudget) anyerror!?*join_planning.Generation {
+            try budget.check();
+            var snapshot = (try capture(ptr)) orelse return null;
+            defer free(ptr, &snapshot);
+            return try join_planning.Generation.create(alloc, snapshot, budget);
+        }
+    }.call;
+}
+
+test "join planning scope pins one generation and checks cancellation before reuse" {
+    const Fixture = struct {
+        calls: usize = 0,
+        fn acquire(ptr: *anyopaque, alloc: std.mem.Allocator, budget: RouteBudget) !?*join_planning.Generation {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return join_planning.Generation.create(alloc, .{
+                .tables = @as([]const metadata_table_manager.TableRecord, &.{.{ .table_id = 1, .name = "docs" }}),
+                .ranges = @as([]const metadata_table_manager.RangeRecord, &.{}),
+                .merged_group_statuses = @as([]const metadata_reconciler.MergedGroupStatus, &.{}),
+            }, budget);
+        }
+    };
+    var fixture: Fixture = .{};
+    var scope: JoinContext.PlanningScope = .{};
+    defer scope.deinit();
+    var cancelled = std.atomic.Value(bool).init(false);
+    const ctx: JoinContext = .{
+        .ptr = &fixture,
+        .planning_scope = &scope,
+        .cancellation = .fromAtomic(&cancelled),
+        .vtable = &.{ .acquire_planning = Fixture.acquire, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
+    };
+    const first = (try ctx.acquirePlanning(std.testing.allocator)).?;
+    defer first.release();
+    const second = (try ctx.acquirePlanning(std.testing.allocator)).?;
+    second.release();
+    try std.testing.expect(first == second);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    cancelled.store(true, .release);
+    try std.testing.expectError(error.Cancelled, ctx.acquirePlanning(std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "distributed join authoritative topology includes a split hidden by cached planning" {
+    const a = std.testing.allocator;
+    const tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 1, .name = "customers" }};
+    const before = [_]metadata_table_manager.RangeRecord{.{ .table_id = 1, .group_id = 11, .start_key = "" }};
+    const after = [_]metadata_table_manager.RangeRecord{
+        .{ .table_id = 1, .group_id = 11, .start_key = "", .end_key = "m" },
+        .{ .table_id = 1, .group_id = 12, .start_key = "m" },
+    };
+    const old = try join_planning.Generation.create(a, .{ .tables = &tables, .ranges = &before, .merged_group_statuses = @as([]const metadata_reconciler.MergedGroupStatus, &.{}) }, .{});
+    defer old.release();
+    const authoritative = try table_catalog.RoutingGeneration.create(a, .{ .metadata_group_id = 91, .metadata_incarnation = null, .catalog_revision = 2, .tables = @constCast(&tables), .ranges = @constCast(&after) }, .{});
+    var session = authoritative.session(a, undefined, true);
+    defer session.deinit();
+    const Fixture = struct {
+        generation: *join_planning.Generation,
+        fn acquire(ptr: *anyopaque, _: std.mem.Allocator, _: RouteBudget) !?*join_planning.Generation {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.generation.retain();
+        }
+        fn build(_: *anyopaque, alloc: std.mem.Allocator, table: []const u8, query_value: std.json.Value, _: ?u64, _: ?CancellationToken) !query_api.OwnedQueryRequest {
+            const body = try stringifyJsonValueAlloc(alloc, query_value);
+            defer alloc.free(body);
+            return query_api.parseQueryRequest(alloc, null, table, body);
+        }
+        fn query(_: *anyopaque, alloc: std.mem.Allocator, group: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return .{ .json = try alloc.dupe(u8, if (group == 12)
+                "{\"responses\":[{\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"z\",\"_source\":{}}]}}]}"
+            else
+                "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"hits\":[]}}]}") };
+        }
+    };
+    var fixture = Fixture{ .generation = old };
+    var ctx = JoinContext{ .routing_session = &session, .require_authoritative_routing = true, .ptr = &fixture, .vtable = &.{ .acquire_planning = Fixture.acquire, .build_owned_search_request = Fixture.build, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .ensure_foreign_registry = undefined } };
+    const source = table_reads.TableReadSource{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .query_group_local = Fixture.query } };
+    var join = try testSupportedJoinRequestAlloc(a);
+    defer join.deinit(a);
+    var left = try std.json.parseFromSlice(std.json.Value, a, "[{\"_id\":\"left\",\"_source\":{\"customer_id\":\"z\"}}]", .{});
+    defer left.deinit();
+    var result = (try executeRightJoinDistributedLookupQuery(ctx, a, source, join, left.value.array.items)).?;
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("z", result.hits[0].object.get("_id").?.string);
+    // Production cannot silently use advisory group ownership without a route lease.
+    ctx.routing_session = null;
+    try std.testing.expect(try executeRightJoinDistributedLookupQuery(ctx, a, source, join, left.value.array.items) == null);
+}
+
+test "distributed join fanout bounds concurrency drains errors and preserves group order" {
+    const Fixture = struct {
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        calls: std.atomic.Value(usize) = .init(0),
+        fail: bool = false,
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(active, .acq_rel);
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            // Complete out of order to test deterministic publication.
+            try std.Io.sleep(std.Options.debug_io, .fromMilliseconds(@intCast(10 - group % 8)), .awake);
+            if (self.fail and group == 2) return error.TopologyChanged;
+            return .{ .json = try std.fmt.allocPrint(alloc, "{{\"responses\":[{{\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{d}\",\"_source\":{{}}}}]}}}}]}}", .{group}) };
+        }
+    };
+    var fixture: Fixture = .{};
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(8) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ctx = JoinContext{ .ptr = &fixture, .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io), .vtable = undefined };
+    const source = table_reads.TableReadSource{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .query_group_local = Fixture.query } };
+    const alloc = std.testing.allocator;
+    var hits = std.json.Array.init(alloc);
+    defer {
+        for (hits.items) |*hit| deinitJsonValue(alloc, hit);
+        hits.deinit();
+    }
+    var jobs: [19]JoinReadJob = undefined;
+    for (&jobs, 0..) |*job, i| job.* = .{ .group_id = i, .req = .{} };
+    try std.testing.expect(try appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
+    try std.testing.expectEqual(@as(usize, 19), hits.items.len);
+    try std.testing.expect(fixture.peak.load(.acquire) > 1);
+    try std.testing.expect(fixture.peak.load(.acquire) <= 8);
+    for (hits.items, 0..) |hit, i| try std.testing.expectEqual(i, try std.fmt.parseInt(usize, hit.object.get("_id").?.string, 10));
+    const published = hits.items.len;
+    fixture.fail = true;
+    fixture.calls.store(0, .release);
+    try std.testing.expectError(error.TopologyChanged, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
+    try std.testing.expectEqual(@as(usize, 0), fixture.active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 8), fixture.calls.load(.acquire));
+    try std.testing.expectEqual(published, hits.items.len);
+    var cancelled = std.atomic.Value(bool).init(true);
+    ctx.cancellation = CancellationToken.fromAtomic(&cancelled);
+    try std.testing.expectError(error.Cancelled, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
+    try std.testing.expectEqual(@as(usize, 8), fixture.calls.load(.acquire));
+    ctx.cancellation = null;
+    fixture.fail = false;
+    fixture.peak.store(0, .release);
+    jobs[0].req.graph_query_transport = .{ .dialect = .canonical, .operations_json = "{}", .admitted_operations_ptr = &fixture, .admitted_operations_len = 0 };
+    try std.testing.expect(try appendJoinReadJobs(ctx, alloc, source, "customers", jobs[0..2], &hits));
+    try std.testing.expectEqual(@as(usize, 1), fixture.peak.load(.acquire));
+}
+
+test "distributed join finalizer refuses to replace an admitted split topology" {
+    const alloc = std.testing.allocator;
+    const tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 1, .name = "customers" }};
+    const before = [_]metadata_table_manager.RangeRecord{.{ .table_id = 1, .group_id = 11, .start_key = "" }};
+    const after = [_]metadata_table_manager.RangeRecord{
+        .{ .table_id = 1, .group_id = 11, .start_key = "", .end_key = "m" },
+        .{ .table_id = 1, .group_id = 12, .start_key = "m" },
+    };
+    const previous = try table_catalog.RoutingGeneration.create(alloc, .{ .metadata_group_id = 91, .metadata_incarnation = null, .catalog_revision = 1, .tables = @constCast(&tables), .ranges = @constCast(&before) }, .{});
+    var session = previous.session(alloc, undefined, true);
+    defer session.deinit();
+    const fresh = try table_catalog.RoutingGeneration.create(alloc, .{ .metadata_group_id = 91, .metadata_incarnation = null, .catalog_revision = 2, .tables = @constCast(&tables), .ranges = @constCast(&after) }, .{});
+    defer fresh.release();
+    const Fixture = struct {
+        generation: *table_catalog.RoutingGeneration,
+        released: usize = 0,
+        const Holder = struct {
+            view: table_reads.JoinReadView,
+            owner: *ThisFixture,
+            allocator: std.mem.Allocator,
+        };
+        const ThisFixture = @This();
+        fn acquire(ptr: *anyopaque, a: std.mem.Allocator, budget: RouteBudget) !*table_reads.JoinReadView {
+            try budget.check();
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const holder = try a.create(Holder);
+            self.generation.retain();
+            holder.* = .{ .owner = self, .allocator = a, .view = .{ .session = self.generation.session(a, undefined, true), .source = undefined, .destroy = destroy } };
+            return &holder.view;
+        }
+        fn destroy(view: *table_reads.JoinReadView) void {
+            const holder: *Holder = @fieldParentPtr("view", view);
+            view.session.deinit();
+            holder.owner.released += 1;
+            holder.allocator.destroy(holder);
+        }
+    };
+    var fixture = Fixture{ .generation = fresh };
+    const pinned = session.catalog();
+    const source = table_reads.TableReadSource{ .ptr = &fixture, .route_fence = (try pinned.vtable.route_fence.?(pinned.ptr, 11)).?, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .acquire_join_view = Fixture.acquire } };
+    const ctx = JoinContext{ .ptr = &fixture, .vtable = undefined };
+    try std.testing.expectError(error.TopologyChanged, JoinReadBinding.init(ctx, alloc, source));
+    try std.testing.expectEqual(@as(usize, 1), fixture.released);
+}
+
+test "distributed join binding preserves deadline and cancellation scopes" {
+    var state: u8 = 0;
+    const now = platform_time.monotonicNs();
+    const deadline = now + 30 * std.time.ns_per_s;
+    const ctx = JoinContext{ .ptr = &state, .execution_deadline_ns = deadline, .vtable = &.{
+        .acquire_planning = undefined,
+        .execute_plain_query = undefined,
+        .execute_query_dispatch = undefined,
+        .build_owned_search_request = undefined,
+        .ensure_foreign_registry = undefined,
+    } };
+    var source = table_reads.TableReadSource{ .ptr = &state, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined }, .route_fence = .{
+        .metadata_group_id = 1,
+        .catalog_revision = 1,
+        .table_id = 1,
+        .topology_epoch = 1,
+        .route = .{ .group_id = 1, .range_id = 1, .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 } },
+    } };
+    for ([_]?u64{ null, deadline + std.time.ns_per_s, deadline - std.time.ns_per_s }) |admitted| {
+        source.route_fence.?.admission_deadline_ns = admitted;
+        var binding = try JoinReadBinding.init(ctx, std.testing.allocator, source);
+        defer binding.deinit();
+        try std.testing.expectEqual(@min(deadline, admitted orelse deadline), binding.ctx.execution_deadline_ns.?);
+    }
+    source.route_fence.?.admission_deadline_ns = now;
+    try std.testing.expectError(error.Timeout, JoinReadBinding.init(ctx, std.testing.allocator, source));
+    source.route_fence.?.admission_deadline_ns = null;
+    var request_cancelled: std.atomic.Value(bool) = .init(false);
+    var admission_cancelled: std.atomic.Value(bool) = .init(false);
+    source.route_fence.?.admission_cancellation = CancellationToken.fromAtomic(&admission_cancelled);
+    var binding = try JoinReadBinding.init(ctx.withCancellation(CancellationToken.fromAtomic(&request_cancelled)), std.testing.allocator, source);
+    defer binding.deinit();
+    try binding.ctx.ensureExecutionDeadline();
+    admission_cancelled.store(true, .release);
+    try std.testing.expectError(error.Cancelled, binding.ctx.ensureExecutionDeadline());
+    admission_cancelled.store(false, .release);
+    request_cancelled.store(true, .release);
+    try std.testing.expectError(error.Cancelled, binding.ctx.ensureExecutionDeadline());
+    var store = JoinJobStore.init(std.testing.allocator, .{});
+    defer store.deinit();
+    store.setContext(binding.ctx);
+    try std.testing.expect(store.ctx.?.cancellation == null);
+    try std.testing.expect(store.ctx.?.execution_deadline_ns == null);
+    try std.testing.expect(store.ctx.?.routing_session == null);
+}
+
+test "distributed join lookup partition benchmark" {
+    if (std.c.getenv("ANTFLY_CATALOG_JOIN_PARTITION_BENCH") == null) return;
+    const alloc = std.heap.c_allocator;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const setup = arena.allocator();
+    const group_count = 64;
+    const row_count = 20_000;
+    var ranges: [group_count]metadata_table_manager.RangeRecord = undefined;
+    var ids: [group_count]u64 = undefined;
+    for (&ranges, &ids, 0..) |*range, *id, i| {
+        id.* = i + 1;
+        range.* = .{ .table_id = 1, .group_id = id.*, .start_key = try std.fmt.allocPrint(setup, "{d:0>4}", .{i}) };
+    }
+    for (ranges[0 .. ranges.len - 1], 1..) |*range, i| range.end_key = ranges[i].start_key;
+    var tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 1, .name = "customers" }};
+    const generation = try table_catalog.RoutingGeneration.create(alloc, .{ .metadata_group_id = 91, .metadata_incarnation = null, .catalog_revision = 1, .tables = &tables, .ranges = &ranges }, .{});
+    var session = generation.session(alloc, undefined, true);
+    defer session.deinit();
+    const groups = DistributedRightJoinGroups{ .table = .{ .table_id = 1, .name = "customers" }, .group_ids = &ids, .routing = &session };
+    const ctx = JoinContext{ .ptr = &session, .vtable = undefined };
+    var hits = std.json.Array.init(setup);
+    for (0..row_count) |i| {
+        var source: std.json.ObjectMap = .{};
+        try source.put(setup, "customer_id", .{ .string = try std.fmt.allocPrint(setup, "{d:0>4}:customer:{d}", .{ i % group_count, i % 1000 }) });
+        var hit: std.json.ObjectMap = .{};
+        try hit.put(setup, "_source", .{ .object = source });
+        try hits.append(.{ .object = hit });
+    }
+    var repeated_ns: [7]u64 = undefined;
+    var partitioned_ns: [7]u64 = undefined;
+    for (0..8) |sample| {
+        const start = platform_time.monotonicNs();
+        var classified: usize = 0;
+        for (ids) |id| {
+            var bucket = std.json.Array.init(alloc);
+            defer bucket.deinit();
+            for (hits.items) |hit| {
+                const key = extractJoinValueFromHit(hit, "customer_id").?.string;
+                if (groups.groupForKey(key) == id) try bucket.append(hit);
+            }
+            classified += bucket.items.len;
+        }
+        const repeated_elapsed = platform_time.monotonicNs() - start;
+        try std.testing.expectEqual(row_count, classified);
+        const next = platform_time.monotonicNs();
+        const buckets = (try partitionLookupJoinHits(ctx, alloc, groups, "customer_id", hits.items)).?;
+        classified = 0;
+        for (buckets, 0..) |*bucket, index| {
+            try std.testing.expectEqual((row_count + group_count - 1 - index) / group_count, bucket.items.len);
+            classified += bucket.items.len;
+            bucket.deinit();
+        }
+        alloc.free(buckets);
+        const partitioned_elapsed = platform_time.monotonicNs() - next;
+        try std.testing.expectEqual(row_count, classified);
+        if (sample > 0) {
+            repeated_ns[sample - 1] = repeated_elapsed;
+            partitioned_ns[sample - 1] = partitioned_elapsed;
+        }
+    }
+    std.debug.print("JOIN_PARTITION_BENCH rows={d} groups={d} repeated_ns={any} partitioned_ns={any}\n", .{ row_count, group_count, repeated_ns, partitioned_ns });
 }

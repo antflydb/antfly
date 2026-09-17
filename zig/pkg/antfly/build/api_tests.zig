@@ -20,6 +20,7 @@ const addFilteredTestRunArtifactWithRuntimeFilters = @import("test_support.zig")
 const addFilteredTestRunArtifact = @import("test_support.zig").addFilteredTestRunArtifact;
 
 pub const AddTestsOptions = struct {
+    api_http_runtime_test_mod: *std.Build.Module,
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
     optimize: std.builtin.OptimizeMode,
@@ -65,6 +66,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server authenticates bounded online merge owner routes",
         "online merge private port fences owners cancellation and deadlines before dispatch",
         "online merge private port preserves source recovery errors through foreign runtime dispatch",
+        "join planning",
         "public openapi contract module is generated and wired",
         "admin openapi contract module is generated and wired",
         "internal openapi contract module is generated and wired",
@@ -295,9 +297,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
 
     const lib_resolution_source_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = options.api_http_runtime_test_mod,
         .filters = &.{
             "DistributedCandidateSource",
+            "SourceCandidateProvider",
             "prefixUpperBoundAlloc",
             "DistributedEntitySink",
         },
@@ -962,6 +965,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api http client preserves group doc identity conflicts",
             "api http client transports txn resolve cancellation and visibility reason",
             "resolve group routes uses one router-owned snapshot callback for fanout",
+            "system catalog parallel hosted candidate fanout sends only owned keys",
             "api http client preserves public batch retry safety classifications",
             "api http client forwards bounded raft batch routing context without allocation",
             "api http client preserves committed visibility outcomes for forwarded raft batches",
@@ -1131,6 +1135,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "provisioned reads reject a group removed from the table topology",
             "provisioned table read source falls back from read_index to stale on not leader",
             "catalog backed router skips non-serving relocation placements",
+            "resolve group routes uses one router-owned snapshot callback for fanout",
+            "system catalog parallel hosted candidate fanout sends only owned keys",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -1499,6 +1505,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_api_table_writes_docid_tests = @import("linked_tests.zig").runPair(b, api_table_writes_docid_tests, write_implementation_tests);
     const run_api_table_reads_docid_tests = @import("linked_tests.zig").runPair(b, api_table_reads_linked_tests, write_implementation_tests);
+    b.step("antfly-api-table-read-test", "Run table-read routing and internal group contracts").dependOn(&run_api_table_reads_docid_tests.step);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private" },
@@ -1659,6 +1666,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "structural reconcile fences incarnation initialization and discards empty topology",
             "provisioned structural reconcile blocks table write admission",
             "provisioned source quiesce closes cleanup admission and drains accepted owner jobs",
+            "provisioned source quiesce retains activity until borrowed transaction callbacks drain",
             "provisioned schema reconcile keeps reads and status available",
             "busy startup open preserves fresh writer runtime status",
             "managed startup catch-up marks FileNotFound index open terminal degraded",

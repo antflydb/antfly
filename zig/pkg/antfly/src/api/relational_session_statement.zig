@@ -63,7 +63,7 @@ pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const ses
     defer original.deinit(alloc);
     const incoming = try original.distributedTables(alloc);
     defer alloc.free(incoming);
-    try server.validateCommitTablesAgainstSchema(incoming);
+    try server.validateCommitTablesAgainstSchema(context, incoming);
     var snapshot = (try server.source.adminSnapshot()) orelse {
         _ = try integrity.metadataRequiresCoordination(alloc, null, incoming);
         return;
@@ -76,8 +76,8 @@ pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const ses
     defer alloc.free(staged);
     var prepared = try integrity.prepareSessionStatement(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context);
     defer prepared.deinit();
-    try integrity.authorizePrimaryMutations(context, server.cfg.auth_enabled, prepared.tables);
-    try server.validateCommitTablesAgainstSchema(prepared.tables);
+    try server.authorizeIntegrityMutations(context, prepared.tables);
+    try server.validateCommitTablesAgainstSchema(context, prepared.tables);
     try apply(alloc, candidate, prepared.tables);
 }
 

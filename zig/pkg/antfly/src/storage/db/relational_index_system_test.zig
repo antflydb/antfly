@@ -182,7 +182,7 @@ test "relational index system expression keys fence declarations dependency chan
     var output = std.ArrayList(u8).empty;
     defer output.deinit(alloc);
     try output.appendSlice(alloc, "prefix");
-    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.append(alloc, &output, try prepared.typedView(table, &layout)));
+    try std.testing.expectError(error.RelationalIndexKeyTooLarge, plan.append(alloc, &output, try prepared.typedView(table, &layout)));
     try std.testing.expectEqualStrings("prefix", output.items);
 }
 
@@ -1328,6 +1328,57 @@ test "relational index system status pins exact epoch and retired corruption can
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectError(error.NotFound, read.get(forward));
+}
+
+test "relational index system large keys paginate and oversize backfills fail durably" {
+    for ([_]bool{ false, true }) |backfill| {
+        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("large-index-key");
+        defer directory.cleanup();
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+        defer db.close();
+        const plain = "{\"version\":0,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"s\":{\"type\":\"string\"}},\"additionalProperties\":false}}}}";
+        const indexed = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"relational_indexes\":[{\"name\":\"by_s\",\"keys\":[{\"column\":\"s\"}]}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"s\":{\"type\":\"string\"}},\"additionalProperties\":false}}}}";
+        try db.setSchemaJson(alloc, if (backfill) plain else indexed);
+        const wide = try alloc.alloc(u8, if (backfill) @import("relational_index_limits.zig").max_stored_key_bytes else 70000);
+        defer alloc.free(wide);
+        @memset(wide, 'x');
+        const json = try std.json.Stringify.valueAlloc(alloc, .{ .s = wide }, .{});
+        defer alloc.free(json);
+        try db.batch(.{ .writes = &.{ .{ .key = "a", .value = json }, .{ .key = "b", .value = json } } });
+        if (backfill) {
+            try db.setSchemaJson(alloc, indexed);
+            _ = try db.runRelationalIndexMaintenancePass();
+            const status = try db.relationalIndexBuildStatus("by_s");
+            try std.testing.expectEqual(.failed, status.state);
+            try std.testing.expectEqual(.key_too_large, status.failure);
+            _ = try db.runRelationalIndexMaintenancePass();
+            try std.testing.expectEqual(.failed, (try db.relationalIndexBuildStatus("by_s")).state);
+        } else {
+            _ = try readyIndex(&db, "by_s");
+            var first = try db.scan(alloc, "", "", .{ .include_documents = true, .limit = 1, .relational_query_json = "{\"schema_version\":1,\"index\":\"by_s\",\"fields\":[]}" });
+            defer first.deinit(alloc);
+            try std.testing.expectEqualStrings("a", first.hashes[0].id);
+            const cursor = first.hashes[0].relational_cursor.?;
+            try std.testing.expect(cursor.len > 128 * 1024);
+            const continuation = try std.json.Stringify.valueAlloc(alloc, .{ .schema_version = 1, .index = "by_s", .fields = @as([]const []const u8, &.{}), .after = cursor }, .{});
+            defer alloc.free(continuation);
+            var next = try db.scan(alloc, "", "", .{ .include_documents = true, .limit = 1, .relational_query_json = continuation });
+            defer next.deinit(alloc);
+            try std.testing.expectEqualStrings("b", next.hashes[0].id);
+            const huge = try alloc.alloc(u8, @import("relational_index_limits.zig").max_stored_key_bytes);
+            defer alloc.free(huge);
+            @memset(huge, 'x');
+            const rejected = try std.json.Stringify.valueAlloc(alloc, .{ .s = huge }, .{});
+            defer alloc.free(rejected);
+            try std.testing.expectError(error.RelationalIndexKeyTooLarge, db.batch(.{ .writes = &.{.{ .key = "c", .value = rejected }} }));
+            var result = try db.scan(alloc, "", "", .{ .include_documents = true, .limit = 10, .relational_query_json = "{\"schema_version\":1,\"index\":\"by_s\",\"fields\":[]}" });
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), result.hashes.len);
+        }
+    }
+    const max = @import("relational_index_limits.zig").max_stored_key_bytes;
+    try records.admitForwardKey(max - records.forward_prefix_len - 7, 3);
+    try std.testing.expectError(error.RelationalIndexKeyTooLarge, records.admitForwardKey(max - records.forward_prefix_len - 6, 3));
 }
 
 test "relational index system public typed bounds cursor auth and cross-owner order" {

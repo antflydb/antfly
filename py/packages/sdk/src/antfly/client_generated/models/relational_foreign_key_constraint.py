@@ -27,7 +27,9 @@ class RelationalForeignKeyConstraint:
         Attributes:
             name (str):
             child_columns (list[str]):
-            parent_table (str):
+            parent_table (str): Literal parent table name in the child table's database and namespace.
+                Resolved to an immutable table identity when the constraint is declared;
+                renaming a parent preserves the reference. Public schemas show its current name.
             parent_columns (list[str]):
             on_delete (ForeignKeyAction | Unset): Action on referencing rows when a referenced row is changed or removed.
             on_update (ForeignKeyAction | Unset): Action on referencing rows when a referenced row is changed or removed.

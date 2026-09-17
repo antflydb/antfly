@@ -24,6 +24,9 @@ const group_ids = @import("../common/group_ids.zig");
 pub const SourceTable = struct {
     source_table_id: u64,
     manifest: *const backup.TableBackupManifest,
+    catalog_binding: ?@import("../system_catalog/domain.zig").Resource = null,
+    existing_name: ?[]const u8 = null,
+    destination_name: ?[]const u8 = null,
     /// Exact primary identities from the authenticated cohort, in manifest
     /// shard order. They are not inferred from potentially historical group IDs.
     namespaces: []const @import("../storage/db/doc_identity.zig").Namespace = &.{},
@@ -126,7 +129,7 @@ pub fn buildPlan(arena: std.mem.Allocator, id: staging.Id, cohort_digest: stagin
         if (source.source_table_id == 0 or manifest.shards.len == 0 or manifest.shards.len > 4096) return error.InvalidRestoreStaging;
         try @import("../schema/restore_migration.zig").validate(arena, manifest.schema_json, manifest.read_schema_json);
         const existing: ?metadata.TableRecord = for (current_tables) |table| {
-            if (std.mem.eql(u8, table.name, manifest.table_name)) break table;
+            if (std.mem.eql(u8, table.name, source.existing_name orelse manifest.table_name)) break table;
         } else null;
         if (existing != null) {
             if (std.mem.eql(u8, mode, "fail_if_exists")) return error.TableAlreadyExists;
@@ -156,10 +159,15 @@ pub fn buildPlan(arena: std.mem.Allocator, id: staging.Id, cohort_digest: stagin
         metadata.sortKeyspaceRanges(metadata.RangeRecord, ranges);
         var target: staging.Target = .{
             .source_table_id = source.source_table_id,
-            .table = .{ .table_id = table_id, .name = manifest.table_name, .description = manifest.description, .schema_json = manifest.schema_json, .read_schema_json = manifest.read_schema_json, .indexes_json = manifest.indexes_json, .replication_sources_json = if (manifest.replication_sources_json.len == 0) "[]" else manifest.replication_sources_json, .placement_role = if (existing) |table| table.placement_role else "data", .desired_replica_count = if (existing) |table| table.desired_replica_count else 3, .min_ranges = @intCast(ranges.len) },
+            .table = .{ .table_id = table_id, .name = source.destination_name orelse manifest.table_name, .description = manifest.description, .schema_json = manifest.schema_json, .read_schema_json = manifest.read_schema_json, .indexes_json = manifest.indexes_json, .replication_sources_json = if (manifest.replication_sources_json.len == 0) "[]" else manifest.replication_sources_json, .placement_role = if (existing) |table| table.placement_role else "data", .desired_replica_count = if (existing) |table| table.desired_replica_count else 3, .min_ranges = @intCast(ranges.len) },
             .ranges = ranges,
             .source_artifacts = artifacts,
         };
+        if (source.catalog_binding) |binding| {
+            target.catalog_binding = binding;
+            target.catalog_binding.?.id = table_id;
+            target.catalog_binding.?.storage_name = target.table.name;
+        }
         if (existing) |old| {
             var old_ranges = std.ArrayListUnmanaged(metadata.RangeRecord).empty;
             for (current_ranges) |range| if (range.table_id == old.table_id) try old_ranges.append(arena, range);
@@ -185,6 +193,49 @@ test "restore staging driver shares stable identities and existing destination m
     const retry = try buildPlan(a, id, @splat(3), &sources, &.{}, &.{}, "fail_if_exists");
     try std.testing.expectEqual(first.plan.?.targets[0].table.table_id, retry.plan.?.targets[0].table.table_id);
     try std.testing.expect(first.plan.?.targets[0].table.table_id != 9);
+    const copied = try buildPlan(a, id, @splat(3), &.{.{
+        .source_table_id = 9,
+        .manifest = &manifest,
+        .existing_name = "copy",
+        .destination_name = "copy",
+        .catalog_binding = .{ .kind = .table, .id = 0, .parent_id = 2, .name = "copy", .storage_name = "copy" },
+    }}, &.{.{ .table_id = 9, .name = "docs", .schema_json = "{}" }}, &.{}, "fail_if_exists");
+    try std.testing.expectEqualStrings("copy", copied.plan.?.targets[0].table.name);
+    try std.testing.expectEqualStrings("docs", manifest.table_name);
+    try std.testing.expect(copied.plan.?.targets[0].replace == null);
+    const catalog = @import("../system_catalog/domain.zig");
+    const qualified = try catalog.restoreStorageNameAlloc(a, "table:" ++ "a" ** 32, .{
+        .database = "d" ** 128,
+        .namespace = "n" ** 128,
+        .table = "t" ** 255,
+    });
+    const long_copy = try buildPlan(a, id, @splat(3), &.{.{
+        .source_table_id = 9,
+        .manifest = &manifest,
+        .existing_name = qualified,
+        .destination_name = qualified,
+        .catalog_binding = .{ .kind = .table, .id = 0, .parent_id = 2, .name = "t" ** 255, .storage_name = qualified },
+    }}, &.{}, &.{}, "fail_if_exists");
+    const long_plan = long_copy.plan.?;
+    const long_target = long_plan.targets[0];
+    const bootstrap: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap = .{
+        .scope = .{
+            .plan_id = id,
+            .plan_digest = try long_plan.digest(a),
+            .source_artifact_digest = @splat(3),
+            .source_namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 },
+            .target_namespace = .{ .table_id = long_target.table.table_id, .shard_id = long_target.ranges[0].group_id, .range_id = long_target.ranges[0].group_id },
+            .target_schema_digest = @splat(4),
+        },
+        .table_name = long_target.table.name,
+        .schema_json = "{}",
+        .read_schema_json = "",
+        .indexes_json = "{}",
+        .byte_range = .{ .start = "", .end = "" },
+    };
+    try bootstrap.validate();
+    var name_key: [2048]u8 = undefined;
+    _ = try staging.nameKey(&name_key, 1, qualified);
     const old: metadata.TableRecord = .{ .table_id = 99, .name = "docs", .schema_json = "{}" };
     const old_ranges = [_]metadata.RangeRecord{.{ .table_id = 99, .group_id = 401, .start_key = "" }};
     try std.testing.expectError(error.TableAlreadyExists, buildPlan(a, id, @splat(3), &sources, &.{old}, &old_ranges, "fail_if_exists"));

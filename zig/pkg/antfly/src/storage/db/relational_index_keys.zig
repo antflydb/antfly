@@ -259,7 +259,7 @@ pub const TuplePlan = struct {
         var has_null = false;
         for (values, self.keys[0..values.len]) |value, key| {
             if (value == .null) has_null = true;
-            try appendValue(alloc, out, key, value);
+            try appendValue(alloc, out, start, key, value);
         }
         return has_null;
     }
@@ -296,17 +296,17 @@ pub const TuplePlan = struct {
                 if (encoded_bound > expression_budget) return error.RelationalExpressionBudgetExceeded;
                 expression_budget -= encoded_bound;
                 has_null = has_null or value == .null;
-                try appendValue(alloc, out, key, value);
+                try appendValue(alloc, out, start, key, value);
                 continue;
             }
             const cell = try row.findCell(key.ordinal);
             if (cell == null or cell.?.is_null) {
                 has_null = true;
-                try appendValue(alloc, out, key, .null);
+                try appendValue(alloc, out, start, key, .null);
                 continue;
             }
             const value = cell.?.value;
-            try appendValue(alloc, out, key, switch (key.column_type) {
+            try appendValue(alloc, out, start, key, switch (key.column_type) {
                 .string => .{ .string = value.bytes_val },
                 .blob => .{ .blob = value.bytes_val },
                 .boolean => .{ .boolean = value.bool_val },
@@ -353,7 +353,17 @@ pub const TuplePlan = struct {
     }
 };
 
-fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), key: BoundKey, value: Value) !void {
+fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, key: BoundKey, value: Value) !void {
+    const encoded_size: usize = switch (value) {
+        .null => 1,
+        .boolean => 2,
+        .string, .blob => |bytes| blk: {
+            try @import("relational_index_limits.zig").admit(bytes.len);
+            break :blk 3 + bytes.len + std.mem.count(u8, bytes, "\x00");
+        },
+        else => 9,
+    };
+    try @import("relational_index_limits.zig").admit(out.items.len - tuple_start +| encoded_size);
     if (value == .null) {
         try out.append(alloc, if (key.nulls_first) @as(u8, 0) else 0xff);
         return;

@@ -22,7 +22,7 @@ pub const Status = struct {
     range_end: []const u8,
     state: enum { building, ready, failed },
     rows_scanned: u64,
-    failure: enum { none, incompatible_schema, invalid_row },
+    failure: enum { none, incompatible_schema, invalid_row, key_too_large },
     progress_digest: [32]u8,
     maintenance_epoch: u64,
     last_maintenance_request: [32]u8,

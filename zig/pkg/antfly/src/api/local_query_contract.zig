@@ -5009,7 +5009,7 @@ pub fn parseRemoteGraphResults(
     return results;
 }
 
-pub fn remoteGraphReturnedItemsMatch(value: i64, actual: usize) bool {
+pub fn remoteGraphReturnedItemsMatch(value: anytype, actual: usize) bool {
     const parsed = std.math.cast(usize, value) orelse return false;
     return parsed == actual;
 }

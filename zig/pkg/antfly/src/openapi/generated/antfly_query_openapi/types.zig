@@ -218,7 +218,7 @@ pub const DisjunctionQuery = struct {
     disjuncts: []const Query,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     /// Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
-    min: ?i64 = null,
+    min: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{

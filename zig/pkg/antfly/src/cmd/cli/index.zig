@@ -512,16 +512,16 @@ const IndexSummary = struct {
     index_type: []const u8 = "unknown",
     state: []const u8,
     progress: ?f64 = null,
-    source_covered: ?i64 = null,
-    source_total: ?i64 = null,
-    source_pending: ?i64 = null,
-    source_skipped: ?i64 = null,
-    source_failed: ?i64 = null,
+    source_covered: ?u64 = null,
+    source_total: ?u64 = null,
+    source_pending: ?u64 = null,
+    source_skipped: ?u64 = null,
+    source_failed: ?u64 = null,
     source_observation_complete: bool = false,
-    indexed: ?i64 = null,
-    visible: ?i64 = null,
-    publication_target: ?i64 = null,
-    publication_visible: ?i64 = null,
+    indexed: ?u64 = null,
+    visible: ?u64 = null,
+    publication_target: ?u64 = null,
+    publication_visible: ?u64 = null,
     publication_complete: ?bool = null,
     complete: bool = false,
     queryable: bool = false,
@@ -533,9 +533,9 @@ const IndexSummary = struct {
     incarnation: ?[]const u8 = null,
     activity_epoch: ?[]const u8 = null,
     activity_phase: ?[]const u8 = null,
-    chunks_created: ?i64 = null,
-    embeddings_computed: ?i64 = null,
-    active_batch_size: ?i64 = null,
+    chunks_created: ?u64 = null,
+    embeddings_computed: ?u64 = null,
+    active_batch_size: ?u64 = null,
     error_text: ?[]const u8 = null,
     repair_state: ?[]const u8 = null,
     repair_action_required: ?bool = null,
@@ -595,8 +595,8 @@ fn summarizeStats(stats: anytype) IndexSummary {
         "unknown";
     const source_coverage = if (@hasField(Stats, "source_coverage")) stats.source_coverage else null;
     const legacy_coverage = if (@hasField(Stats, "coverage")) stats.coverage else null;
-    const source_pending: ?i64 = if (source_coverage) |coverage| coverage.pending else null;
-    const source_total: ?i64 = if (source_coverage) |coverage|
+    const source_pending: ?u64 = if (source_coverage) |coverage| coverage.pending else null;
+    const source_total: ?u64 = if (source_coverage) |coverage|
         coverage.total
     else if (legacy_coverage) |coverage|
         coverage.source_total
@@ -610,19 +610,19 @@ fn summarizeStats(stats: anytype) IndexSummary {
         stats.backfill_progress
     else
         null;
-    const source_covered: ?i64 = if (source_coverage) |coverage|
+    const source_covered: ?u64 = if (source_coverage) |coverage|
         coverage.covered
     else if (@hasField(Stats, "coverage")) blk: {
         const coverage = stats.coverage orelse break :blk null;
         break :blk coverage.produced;
     } else null;
-    const indexed: ?i64 = if (@hasField(Stats, "total_indexed"))
+    const indexed: ?u64 = if (@hasField(Stats, "total_indexed"))
         stats.total_indexed
     else if (@hasField(Stats, "doc_count"))
         stats.doc_count
     else
         null;
-    const visible: ?i64 = if (@hasField(Stats, "searchable_vectors"))
+    const visible: ?u64 = if (@hasField(Stats, "searchable_vectors"))
         if (stats.searchable_vectors != null) stats.searchable_vectors else if (@hasField(Stats, "query_visible_doc_count")) stats.query_visible_doc_count else stats.doc_count
     else if (@hasField(Stats, "query_visible_doc_count"))
         stats.query_visible_doc_count
@@ -706,8 +706,8 @@ const WaitProgressReporter = struct {
     last_state: ?[]const u8 = null,
     last_report_ns: ?u64 = null,
     activity_epoch_hash: ?u64 = null,
-    embeddings_computed: i64 = 0,
-    baseline_embeddings_computed: i64 = 0,
+    embeddings_computed: u64 = 0,
+    baseline_embeddings_computed: u64 = 0,
     activity_sample_ns: ?u64 = null,
 
     fn shouldReport(self: *@This(), state: []const u8, now_ns: u64) bool {
@@ -902,11 +902,10 @@ const WaitThreshold = union(enum) {
     count: u64,
     percent_basis_points: u32,
 
-    fn reached(self: @This(), value: ?i64, total: ?i64) bool {
+    fn reached(self: @This(), value: ?u64, total: ?u64) bool {
         const observed = value orelse return false;
-        if (observed < 0) return false;
         return switch (self) {
-            .count => |minimum| @as(u64, @intCast(observed)) >= minimum,
+            .count => |minimum| observed >= minimum,
             .percent_basis_points => |minimum| blk: {
                 const denominator = total orelse break :blk false;
                 if (denominator <= 0) break :blk false;
@@ -946,15 +945,14 @@ fn waitDisposition(summary: IndexSummary, target: WaitTarget) WaitDisposition {
 // Unexamined sources may still be intentional skips. Never advertise the
 // upper bound as an exact denominator or turn an incomplete observation into
 // a readiness proof. Failures remain eligible: they are not successful skips.
-fn sourceCoverageDenominator(summary: IndexSummary) ?i64 {
+fn sourceCoverageDenominator(summary: IndexSummary) ?u64 {
     if (!summary.source_observation_complete) return null;
     const total = summary.source_total orelse return null;
     const covered = summary.source_covered orelse return null;
     const skipped = summary.source_skipped orelse return null;
     const failed = summary.source_failed orelse return null;
     const pending = summary.source_pending orelse return null;
-    if (total < 0 or covered < 0 or skipped < 0 or failed < 0 or pending < 0) return null;
-    const sum = @as(i128, covered) + skipped + failed + pending;
+    const sum = @as(u128, covered) + skipped + failed + pending;
     if (sum != total) return null;
     return total - skipped;
 }
@@ -988,7 +986,7 @@ fn waitFailureBlocksTarget(summary: IndexSummary, target: WaitTarget) bool {
         .searchable_artifacts => false,
         .source_covered => |threshold| blk: {
             const covered = summary.source_covered orelse break :blk true;
-            const possible = std.math.add(i64, covered, pending) catch std.math.maxInt(i64);
+            const possible = covered +| pending;
             const denominator = sourceCoverageDenominator(summary);
             if (denominator == null and threshold == .percent_basis_points) break :blk false;
             break :blk !threshold.reached(possible, denominator);
@@ -1183,13 +1181,13 @@ test "source coverage excludes skips but retains pending and failed sources" {
         .publication_complete = true,
     };
     const target = try parseWaitTarget("source-covered=10%");
-    try std.testing.expectEqual(@as(?i64, 8760), sourceCoverageDenominator(summary));
+    try std.testing.expectEqual(@as(?u64, 8760), sourceCoverageDenominator(summary));
     // The actual eligible count might be 2,446, but the pending corpus has
     // not established that fact yet. Do not turn it into a false exact ratio.
     try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, target));
     summary.source_skipped = 7554;
     summary.source_pending = 2161;
-    try std.testing.expectEqual(@as(?i64, 2446), sourceCoverageDenominator(summary));
+    try std.testing.expectEqual(@as(?u64, 2446), sourceCoverageDenominator(summary));
     try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, target));
     try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, try parseWaitTarget("source-covered=286")));
     summary.queryable = false;
@@ -1200,12 +1198,12 @@ test "source coverage excludes skips but retains pending and failed sources" {
     try std.testing.expect(waitTargetUnreachable(summary, try parseWaitTarget("source-covered=2447")));
     try std.testing.expect(!waitTargetUnreachable(summary, try parseWaitTarget("source-covered=10%")));
     summary.source_observation_complete = false;
-    try std.testing.expectEqual(@as(?i64, null), sourceCoverageDenominator(summary));
+    try std.testing.expectEqual(@as(?u64, null), sourceCoverageDenominator(summary));
     try std.testing.expect(!waitTargetUnreachable(summary, try parseWaitTarget("source-covered=2447")));
     try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, target));
     summary.source_observation_complete = true;
-    summary.source_pending = -1;
-    try std.testing.expectEqual(@as(?i64, null), sourceCoverageDenominator(summary));
+    summary.source_pending = null;
+    try std.testing.expectEqual(@as(?u64, null), sourceCoverageDenominator(summary));
     summary.source_pending = 0;
     summary.source_covered = 0;
     summary.source_skipped = 10000;
@@ -1214,14 +1212,14 @@ test "source coverage excludes skips but retains pending and failed sources" {
     try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, target));
     summary.source_skipped = 9990;
     summary.source_failed = 10;
-    try std.testing.expectEqual(@as(?i64, 10), sourceCoverageDenominator(summary));
+    try std.testing.expectEqual(@as(?u64, 10), sourceCoverageDenominator(summary));
     try std.testing.expect(waitTargetUnreachable(summary, target));
     summary.source_covered = 1;
     summary.source_failed = 9;
     try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, target));
     try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, try parseWaitTarget("source-covered=100%")));
     summary.source_failed = 0;
-    try std.testing.expectEqual(@as(?i64, null), sourceCoverageDenominator(summary));
+    try std.testing.expectEqual(@as(?u64, null), sourceCoverageDenominator(summary));
     summary.source_skipped = 9999;
     try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, try parseWaitTarget("source-covered=100%")));
 }
@@ -2066,11 +2064,11 @@ test "index summary prefers typed embedding milestones coverage and activity" {
     try std.testing.expect(summary.queryable);
     try std.testing.expect(!summary.complete);
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), summary.progress.?, 0.0001);
-    try std.testing.expectEqual(@as(?i64, 20), summary.source_covered);
-    try std.testing.expectEqual(@as(?i64, 75), summary.source_pending);
-    try std.testing.expectEqual(@as(?i64, 44), summary.visible);
-    try std.testing.expectEqual(@as(?i64, 50), summary.publication_target);
-    try std.testing.expectEqual(@as(?i64, 44), summary.publication_visible);
+    try std.testing.expectEqual(@as(?u64, 20), summary.source_covered);
+    try std.testing.expectEqual(@as(?u64, 75), summary.source_pending);
+    try std.testing.expectEqual(@as(?u64, 44), summary.visible);
+    try std.testing.expectEqual(@as(?u64, 50), summary.publication_target);
+    try std.testing.expectEqual(@as(?u64, 44), summary.publication_visible);
     try std.testing.expectEqual(@as(?bool, false), summary.publication_complete);
     var publication_buffer: [64]u8 = undefined;
     var publication_writer = std.Io.Writer.fixed(&publication_buffer);

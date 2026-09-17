@@ -24,7 +24,7 @@ const Options = struct {
     cursor: ?[]const u8 = null,
     repair_id: ?[]const u8 = null,
     recovery_file: ?[]const u8 = null,
-    limit: ?i64 = null,
+    limit: ?u32 = null,
     once: bool = false,
 
     fn target(self: Options) types.RepairTarget {
@@ -116,8 +116,8 @@ fn parse(resource: Resource, args: anytype) !Options {
     }
     if (kind) |value| result.kind = std.meta.stringToEnum(types.ArtifactRepairKind, value) orelse return error.InvalidArtifactKind;
     if (limit) |value| {
-        result.limit = std.fmt.parseInt(i64, value, 10) catch return error.InvalidLimit;
-        const maximum: i64 = if (result.action == .issues) 500 else 1000;
+        result.limit = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidLimit;
+        const maximum: u32 = if (result.action == .issues) 500 else 1000;
         if (result.limit.? < 1 or result.limit.? > maximum) return error.InvalidLimit;
     }
     if (resource == .artifact and (result.metric != null or result.repair_id != null)) return error.UnsupportedMaintenanceAction;
@@ -402,7 +402,7 @@ test "maintenance keeps graph actions and artifact repair capabilities distinct"
     const artifact = try parseText(.artifact, "repair --table docs --cursor next --limit 12 --once");
     try std.testing.expectEqual(types.RepairTarget.artifact, artifact.repairRequest().target.?);
     try std.testing.expectEqualStrings("next", artifact.repairRequest().cursor.?);
-    try std.testing.expectEqual(@as(i64, 12), artifact.repairRequest().limit.?);
+    try std.testing.expectEqual(@as(u32, 12), artifact.repairRequest().limit.?);
     try std.testing.expectError(error.UnsupportedMaintenanceAction, parseText(.artifact, "rebuild --table docs"));
     try std.testing.expectError(error.UnsupportedMaintenanceAction, parseText(.index, "repair --table docs --index graph --metric rank"));
     try std.testing.expectError(error.UnexpectedArgument, parseText(.index, "refresh --table docs --index graph --metric rank --once"));
@@ -417,7 +417,7 @@ test "maintenance rejects ambiguous scopes invalid bounds and ignored options" {
     try std.testing.expectError(error.UnexpectedArgument, parseText(.index, "status --table docs --job j --index x"));
     const continued = try parseText(.index, "pause --table docs --index x --cursor 65: --limit 4 --once");
     try std.testing.expectEqualStrings("65:", continued.repairRequest().cursor.?);
-    try std.testing.expectEqual(@as(i64, 4), continued.repairRequest().limit.?);
+    try std.testing.expectEqual(@as(u32, 4), continued.repairRequest().limit.?);
     const control = try parseText(.index, "pause --table docs --index x --repair-id 17");
     try std.testing.expectEqualStrings("pause_automatic", control.repairRequest().control.?);
     try std.testing.expectEqualStrings("17", control.controlJobRequest().repair_id.?);
@@ -590,9 +590,9 @@ test "maintenance repair job responses retain handles and cursors and reject mal
             var response = try fetched;
             defer response.deinit();
             const data = response.data orelse return error.MissingJobResponse;
-            try std.testing.expectEqual(@as(i64, 17), data.value.job_id);
+            try std.testing.expectEqual(@as(u64, 17), data.value.job_id);
             try std.testing.expectEqualStrings("65:", data.value.cursor.value);
-            try std.testing.expectEqual(@as(i64, 5000), data.value.next_retry_at_millis.?);
+            try std.testing.expectEqual(@as(u64, 5000), data.value.next_retry_at_millis.?);
             try std.testing.expectEqualStrings("91", data.value.repair_id.?);
             try std.testing.expectEqualStrings("65:", data.value.result.next_cursor.value);
         }

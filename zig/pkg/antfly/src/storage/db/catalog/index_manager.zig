@@ -6396,17 +6396,46 @@ pub const IndexManager = struct {
         cancel_check: ?types.RepairCancelCheck,
         capacity_check: ?types.RepairCapacityCheck,
     ) !u64 {
+        var slice = try self.rebuildFullTextIndexFromReadTxnSlice(store, read_txn, index_name, null, .{
+            .cancel_check = cancel_check,
+            .capacity_check = capacity_check,
+        });
+        defer slice.deinit(self.alloc);
+        std.debug.assert(slice.resume_key == null);
+        return slice.rebuilt;
+    }
+
+    pub const FullTextRebuildSlice = struct {
+        rebuilt: u64,
+        resume_key: ?[]u8 = null,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.resume_key) |key| alloc.free(key);
+        }
+    };
+
+    /// The candidate is private. Sync its page before returning a cursor that
+    /// the durable repair intent can publish; reopening never resets a prefix.
+    pub fn rebuildFullTextIndexFromReadTxnSlice(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        read_txn: *docstore_mod.DocStore.Txn,
+        index_name: []const u8,
+        resume_from: ?[]const u8,
+        options: types.ArtifactRepairRunOptions,
+    ) !FullTextRebuildSlice {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
-
-        try checkRepairCancelled(cancel_check);
-        try entry.persistent.resetAllForRebuild();
-        try rebuild_state.updateWithIo(self.checkpointIo(), "");
-        try self.backfillTextIndexFromReadTxn(store, read_txn, entry, null, cancel_check, capacity_check);
-        try checkRepairCancelled(cancel_check);
+        try checkRepairCancelled(options.cancel_check);
+        if (resume_from == null) {
+            try entry.persistent.resetAllForRebuild();
+            try rebuild_state.updateWithIo(self.checkpointIo(), "");
+        }
+        const cursor = try self.backfillTextIndexFromReadTxn(store, read_txn, entry, resume_from, options.cancel_check, options.capacity_check, options.yield_check);
+        errdefer if (cursor) |key| self.alloc.free(key);
+        try checkRepairCancelled(options.cancel_check);
         try entry.persistent.sync(true);
-
-        return entry.persistent.snapshot().liveDocCount();
+        return .{ .rebuilt = entry.persistent.snapshot().liveDocCount(), .resume_key = cursor };
     }
 
     pub fn clearDenseHbcCaches(self: *IndexManager) void {
@@ -18685,7 +18714,8 @@ pub const IndexManager = struct {
         resume_from: ?[]const u8,
         cancel_check: ?types.RepairCancelCheck,
         capacity_check: ?types.RepairCapacityCheck,
-    ) !void {
+        yield_check: ?types.RepairYieldCheck,
+    ) !?[]u8 {
         self.beginTextBackfill();
         defer self.endTextBackfill();
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
@@ -18727,6 +18757,7 @@ pub const IndexManager = struct {
                 identity_txn: *docstore_mod.DocStore.Txn,
                 check: ?types.RepairCancelCheck,
                 capacity: ?types.RepairCapacityCheck,
+                resumable: bool,
             ) !void {
                 try checkRepairCancelled(check);
                 if (capacity) |admission| try admission.boundary();
@@ -18740,12 +18771,20 @@ pub const IndexManager = struct {
                 defer manager.alloc.free(ordinals);
                 for (docs_buf.items, ordinals) |*doc, ordinal| doc.doc_ordinal = ordinal;
 
+                var page = @import("../../persistent.zig").PersistentIndex.RebuildPage{
+                    .index = &text_entry.persistent,
+                    .cursor = last_doc_key,
+                };
+                if (resumable) try page.begin();
+                defer page.deinit();
                 const stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
+                if (resumable) try page.commit();
                 try manager.finalizeTextBatchMutations(text_entry, .{
                     .compact_text = false,
-                    .compact_text_segment_threshold = text_backfill_compact_segment_threshold,
+                    .compact_text_segment_threshold = if (resumable) null else text_backfill_compact_segment_threshold,
+                    .defer_text_compaction = resumable,
                 }, stats);
-                try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
+                if (!resumable) try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
                     manager.alloc.free(@constCast(doc.value));
@@ -18764,10 +18803,22 @@ pub const IndexManager = struct {
             }
         }.run;
 
-        var scan_lower_buf: ?[]u8 = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else null;
+        const durable_cursor = try entry.persistent.rebuildCursorAlloc(self.alloc);
+        const resumable = yield_check != null or durable_cursor != null;
+        defer if (durable_cursor) |cursor| self.alloc.free(cursor);
+        // The candidate page transaction is authoritative if the separate
+        // primary repair-intent cursor was not persisted before a crash.
+        const effective_resume = if (durable_cursor) |cursor|
+            if (resume_from == null or std.mem.order(u8, cursor, resume_from.?) == .gt) cursor else resume_from
+        else
+            resume_from;
+        var scan_lower_buf: ?[]u8 = if (effective_resume) |buf| try self.alloc.dupe(u8, buf) else null;
         defer if (scan_lower_buf) |buf| self.alloc.free(buf);
-        const backfill_doc_limit = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
-        const backfill_source_target_bytes = textProjectionSourceBuildTargetBytes();
+        const configured_doc_limit = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
+        // Bulk throughput settings are not scheduler quanta. Bound both rows
+        // and retained source bytes before checking the repair deadline.
+        const backfill_doc_limit = if (yield_check != null) @min(configured_doc_limit, 256) else configured_doc_limit;
+        const backfill_source_target_bytes = if (yield_check != null) @min(textProjectionSourceBuildTargetBytes(), 256 * 1024) else textProjectionSourceBuildTargetBytes();
         const scan_budget_per_page = @max(backfill_doc_limit * 2, 256);
         var reached_end = false;
 
@@ -18896,15 +18947,26 @@ pub const IndexManager = struct {
                     read_txn,
                     cancel_check,
                     capacity_check,
+                    resumable,
                 );
                 if (batch_last_doc_key) |old| self.alloc.free(old);
                 batch_last_doc_key = null;
             }
+            if (!reached_end) if (yield_check) |check| {
+                if (check.requested()) {
+                    try entry.persistent.sync(true);
+                    try entry.persistent.checkpointLsmWalAfterDurableBoundary();
+                    return try self.alloc.dupe(u8, scan_lower_buf.?);
+                }
+            };
         }
 
-        if (flushed_batches > 0) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
+        // Cooperative builds leave merging to the normal bounded text merge
+        // scheduler instead of adding a whole-index compaction to their tail.
+        if (flushed_batches > 0 and !resumable) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
+        return null;
     }
 
     fn indexPath(self: *const IndexManager, name: []const u8) ![]u8 {

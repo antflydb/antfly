@@ -17,14 +17,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
-
 from test_standby import (
-    HACluster,
     DB_API_ROOT,
+    HACluster,
     _primary_lsn,
     _promotion_fence_request,
     _wait_for_standby_applied,
@@ -96,11 +96,11 @@ def _bootstrap_empty(cluster: HACluster) -> None:
         **binding,
     }
     identity = {
-        "ha_cluster_id": 100,
+        "ha_cluster_id": cluster.primary.cluster_id,
         "ha_shard_id": 0,
         "ha_table_id": 0,
-        "ha_timeline_id": 1,
-        "ha_epoch": 1,
+        "ha_timeline_id": cluster.primary.timeline_id,
+        "ha_epoch": cluster.primary.epoch,
     }
 
     def artifact(action, **values):
@@ -112,6 +112,7 @@ def _bootstrap_empty(cluster: HACluster) -> None:
                 action,
                 *flags({**common, **values}),
             ],
+            check=False,
             capture_output=True,
             text=True,
             timeout=90,
