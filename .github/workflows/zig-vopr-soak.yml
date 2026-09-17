@@ -44,6 +44,11 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    # Explicit bash enables pipefail, including production soaks piped to tee.
+    shell: bash
+
 concurrency:
   # Approved PR callers all have github.ref == refs/heads/main. Give each
   # qualification its own group: cancel-in-progress:false still lets a newer
