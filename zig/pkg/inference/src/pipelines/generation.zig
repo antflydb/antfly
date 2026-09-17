@@ -5769,33 +5769,98 @@ pub const NativeGenerationPipeline = struct {
             _ = try decode_runtime.preparePrefill(seq_len, seq_len);
         }
 
-        const input_embeddings = prepared.input_embeddings orelse return error.InvalidPreparedPrompt;
+        const host_embeddings = prepared.input_embeddings orelse return error.InvalidPreparedPrompt;
         prepared.input_embeddings = null;
+        // The prompt embeddings were assembled on the host. The layer stack
+        // takes its fast, framed prefill route only for device-resident
+        // input, so upload once here instead of per op below.
+        const input_embeddings = blk: {
+            if (try self.cb.ensureDeviceResident(host_embeddings)) |device| {
+                self.cb.free(host_embeddings);
+                break :blk device;
+            }
+            break :blk host_embeddings;
+        };
         // Match text prefill/decode lock order: scheduler turn, then model.
         // Both stay held until the backend forward and result copy complete.
         const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
         if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
         defer if (direct_execution_mutex) |mutex| mutex.unlock();
         const ple_token_ids = prepared.ple_token_ids orelse prepared.token_ids;
-        const ple_vectors = try gpt_arch.computePleVectors(&self.cb, self.allocator, self.gpt_config, ple_token_ids, input_embeddings, seq_len);
-        defer if (ple_vectors) |vectors| self.cb.free(vectors);
         var decode_context = decode_runtime.makeDecodeContext(seq_len, seq_len);
         decode_context.attn_or_mask = prepared.attn_or_mask;
-        const logits = try gpt_arch.forwardFromEmbeddings(
+        if (try self.tryMetalPreparedMultimodalPrefill(input_embeddings, ple_token_ids, seq_len, &decode_context)) |logits| {
+            if (self.scheduler) |scheduler| {
+                if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, seq_len, seq_len);
+            }
+            return logits;
+        }
+        const ple_vectors = try gpt_arch.computePleVectors(&self.cb, self.allocator, self.gpt_config, ple_token_ids, input_embeddings, seq_len);
+        defer if (ple_vectors) |vectors| self.cb.free(vectors);
+        // Only the last row feeds sampling: projecting every prompt row
+        // through the vocabulary and softcapping it on the host cost more
+        // than the layer stack for a media prompt.
+        const logits = try gpt_arch.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
             &self.cb,
             self.allocator,
             self.gpt_config,
             input_embeddings,
+            .{},
             1,
             seq_len,
             &decode_context,
             ple_vectors,
         );
-        defer self.allocator.free(logits);
+        errdefer self.allocator.free(logits);
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, seq_len, seq_len);
         }
-        return try self.allocator.dupe(f32, logits[(seq_len - 1) * self.gpt_config.vocab_size ..][0..self.gpt_config.vocab_size]);
+        return logits;
+    }
+
+    /// The planned Gemma prefill frame for a media prompt: the same route
+    /// the token-id prefill takes, fed with the prepared embeddings, so the
+    /// whole layer stack runs as one command buffer instead of one
+    /// submission per op. Null leaves the embeddings untouched for the
+    /// generic forward.
+    fn tryMetalPreparedMultimodalPrefill(
+        self: *NativeGenerationPipeline,
+        input_embeddings: ops.CT,
+        ple_token_ids: []const i64,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) !?[]f32 {
+        if (self.cb.kind() != .metal) return null;
+        if (decode_context.attention_mode != .paged_prefill or decode_context.attn_or_mask != null) return null;
+        if (!metalPreparedTailOwnsWholePrefill(ple_token_ids.len, seq_len, decode_context)) return null;
+        const prepared = self.cb.decoderRuntimePrepareOrReuseFamily(
+            self.allocator,
+            self.gpt_config,
+            seq_len,
+            self.gpt_config.num_hidden_layers,
+        ) catch return null;
+        if (!prepared.prepared) return null;
+        var rows = (try decoder_gated_runtime.forwardFinalHiddenRowsFromEmbeddings(
+            &self.cb,
+            self.allocator,
+            self.gpt_config,
+            self.gpt_config.num_hidden_layers,
+            input_embeddings,
+            ple_token_ids,
+            seq_len,
+            decode_context,
+        )) orelse return null;
+        defer rows.deinit(&self.cb);
+        const last_hidden = try self.cb.sliceRows2D(self.allocator, rows.final_hidden, rows.rows - 1, 1, self.gpt_config.hidden_size);
+        defer self.cb.free(last_hidden);
+        const lm_w = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
+        defer self.cb.free(lm_w);
+        const last_logits_device = try self.cb.linearNoBias(last_hidden, lm_w, 1, self.gpt_config.hidden_size, self.gpt_config.vocab_size);
+        defer self.cb.free(last_logits_device);
+        const last_logits = try self.cb.toFloat32(last_logits_device, self.allocator);
+        gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, last_logits);
+        debugGenerationStage("multimodal prefill metal_prepared_frame rows={d}", .{rows.rows});
+        return last_logits;
     }
 
     fn executePreparedQwen3VlPrefill(

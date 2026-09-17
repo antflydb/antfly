@@ -1952,6 +1952,21 @@ fn createGpuHostedSessionWithTaskOverride(
                     .prefer_dense = shouldKeepGpuHostedLazyWeightDense(backend_type, arch_config, key),
                 });
             }
+            // Gemma 4 audio encoder tensors live in the projector GGUF. Keyed
+            // by their own names they load lazily on first use and stay
+            // resident like any other weight, so a media request no longer
+            // reads and dequantizes the encoder from disk.
+            if (try tensor_store_mod.projectorAudioTensorNames(tensor_store.?, allocator)) |projector_names| {
+                defer allocator.free(projector_names);
+                for (projector_names) |name| {
+                    if (lazy_weights.contains(name)) continue;
+                    const tensor_ref = try tensor_store.?.describeTensor(allocator, name);
+                    try lazy_weights.put(allocator, try allocator.dupe(u8, name), .{
+                        .tensor_ref = tensor_ref,
+                        .placement = runtime.tier.planner.planForContext(plan_context, name, tensor_ref.byte_len),
+                    });
+                }
+            }
             if (tensor_store.?.kind() != .gguf) {
                 try refineArchConfigFromStore(allocator, tensor_store.?, all_names, &arch_config);
             }

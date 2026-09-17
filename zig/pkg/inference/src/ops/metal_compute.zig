@@ -12981,6 +12981,135 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(result);
     }
 
+    /// Dense f32 operand for the Gemma 4 audio encoder kernels: device
+    /// tensors are retained, host tensors are uploaded. Null for quantized
+    /// storage or when the upload cannot land on the device.
+    fn gemma4AudioDeviceOperand(self: *MetalCompute, tensor: CT) !?MetalTensor {
+        if (bufHasAnyQuantizedStorage(toBuf(tensor))) return null;
+        var metal_tensor = try self.ownedDeviceMetalTensorFromCt(tensor);
+        if (!metal_tensor.isDevice()) {
+            metal_tensor.deinit();
+            return null;
+        }
+        return metal_tensor;
+    }
+
+    fn multiplyScalarOp(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        const input_buf = toBuf(input);
+        if (bufHasAnyQuantizedStorage(input_buf)) return null;
+        const input_metal = input_buf.metal_tensor orelse return null;
+        if (!input_metal.isDevice() or hasHostView(input_buf)) return null;
+        var retained = try input_metal.retainedCopy();
+        defer retained.deinit();
+        if (try metal_runtime.decoderRuntimeApplyScale(self.provider_impl, retained, scale)) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn clampScalarOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        var input_mt = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer input_mt.deinit();
+        if (try metal_runtime.decoderRuntimeGemma4AudioClamp(self.provider_impl, input_mt, min_value, max_value)) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn gluRowsOp(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        var input_mt = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer input_mt.deinit();
+        if (try metal_runtime.decoderRuntimeGemma4AudioGlu(self.provider_impl, input_mt, rows, dim)) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn depthwiseCausalConv1dOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        var input_mt = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer input_mt.deinit();
+        var weight_mt = (try self.gemma4AudioDeviceOperand(weight)) orelse return null;
+        defer weight_mt.deinit();
+        if (try metal_runtime.decoderRuntimeGemma4AudioDepthwiseConv(self.provider_impl, input_mt, weight_mt, rows, dim, kernel_size)) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn flattenChannelsTimeFreqOp(ctx: *anyopaque, input: CT, time_steps: usize, freq_bins: usize, channels: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        var input_mt = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer input_mt.deinit();
+        if (try metal_runtime.decoderRuntimeGemma4AudioFlatten(self.provider_impl, input_mt, time_steps, freq_bins, channels)) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn channelLayerNormReluOp(ctx: *anyopaque, input: CT, weight: CT, channels: usize, positions: usize, eps: f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        var input_mt = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
+        defer input_mt.deinit();
+        var weight_mt = (try self.gemma4AudioDeviceOperand(weight)) orelse return null;
+        defer weight_mt.deinit();
+        if (try metal_runtime.decoderRuntimeGemma4AudioChannelNormRelu(self.provider_impl, input_mt, weight_mt, channels, positions, eps)) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn gemma4AudioLocalAttentionOp(
+        ctx: *anyopaque,
+        q: CT,
+        k: CT,
+        v: CT,
+        rel: CT,
+        q_dim_scales: CT,
+        valid: CT,
+        params: ops.Gemma4AudioLocalAttentionParams,
+    ) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (disableRuntimeElementwise()) return null;
+        var q_mt = (try self.gemma4AudioDeviceOperand(q)) orelse return null;
+        defer q_mt.deinit();
+        var k_mt = (try self.gemma4AudioDeviceOperand(k)) orelse return null;
+        defer k_mt.deinit();
+        var v_mt = (try self.gemma4AudioDeviceOperand(v)) orelse return null;
+        defer v_mt.deinit();
+        var rel_mt = (try self.gemma4AudioDeviceOperand(rel)) orelse return null;
+        defer rel_mt.deinit();
+        var scales_mt = (try self.gemma4AudioDeviceOperand(q_dim_scales)) orelse return null;
+        defer scales_mt.deinit();
+        var valid_mt = (try self.gemma4AudioDeviceOperand(valid)) orelse return null;
+        defer valid_mt.deinit();
+        const raw = metal_runtime.RawGemma4AudioAttentionParams{
+            .rows = std.math.cast(u32, params.rows) orelse return null,
+            .hidden = std.math.cast(u32, params.hidden) orelse return null,
+            .heads = std.math.cast(u32, params.heads) orelse return null,
+            .head_dim = std.math.cast(u32, params.head_dim) orelse return null,
+            .chunk = std.math.cast(u32, params.chunk) orelse return null,
+            .context_left = std.math.cast(u32, params.context_left) orelse return null,
+            .context = std.math.cast(u32, params.context) orelse return null,
+            .k_scale = params.k_scale,
+            .logit_cap = params.logit_cap,
+            .invalid_value = params.invalid_value,
+        };
+        if (try metal_runtime.decoderRuntimeGemma4AudioLocalAttention(self.provider_impl, q_mt, k_mt, v_mt, rel_mt, scales_mt, valid_mt, raw)) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
     fn addScalarOp(ctx: *anyopaque, input: CT, scalar: f32) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!(a4bHighMemoryFastPathEnabled() or
@@ -28869,6 +28998,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.rmsNormTriple = rmsNormTripleOp;
         vt.parallelFfnPostResidual = parallelFfnPostResidualOp;
         vt.addScalar = addScalarOp;
+        vt.multiplyScalar = multiplyScalarOp;
+        vt.clampScalar = clampScalarOp;
+        vt.gluRows = gluRowsOp;
+        vt.depthwiseCausalConv1d = depthwiseCausalConv1dOp;
+        vt.flattenChannelsTimeFreq = flattenChannelsTimeFreqOp;
+        vt.channelLayerNormRelu = channelLayerNormReluOp;
+        vt.gemma4AudioLocalAttention = gemma4AudioLocalAttentionOp;
         vt.rmsNormAddTensor = rmsNormAddTensorOp;
         vt.layerNorm = layerNormOp;
         vt.layerNormBackward = layerNormBackwardOp;

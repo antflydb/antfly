@@ -8877,6 +8877,166 @@ pub fn decoderRuntimeApplyScale(
     return finishDeviceOutput(&output_device, rc);
 }
 
+/// Gemma 4 audio encoder device ops. Each takes device-resident f32 inputs,
+/// allocates the output and returns null when the runtime cannot run the
+/// kernel so the caller keeps its host path.
+pub fn decoderRuntimeGemma4AudioClamp(self: anytype, input: MetalTensor, min_value: ?f32, max_value: ?f32) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice()) return null;
+    const total = input.elemCount();
+    if (total == 0) return null;
+    var flags: u32 = 0;
+    if (min_value != null) flags |= 1;
+    if (max_value != null) flags |= 2;
+    if (flags == 0) return null;
+    var output_device = try MetalTensor.deviceAllocate(runtime, total * @sizeOf(f32), .private, input.shape());
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_gemma4_audio_clamp_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        total,
+        flags,
+        min_value orelse 0.0,
+        max_value orelse 0.0,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    return finishDeviceOutput(&output_device, rc);
+}
+
+pub fn decoderRuntimeGemma4AudioGlu(self: anytype, input: MetalTensor, rows: usize, dim: usize) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice() or rows == 0 or dim == 0) return null;
+    if (input.elemCount() != rows * dim * 2) return null;
+    const shape = [_]i32{ @intCast(rows), @intCast(dim) };
+    var output_device = try MetalTensor.deviceAllocate(runtime, rows * dim * @sizeOf(f32), .private, &shape);
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_gemma4_audio_glu_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        rows,
+        dim,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    return finishDeviceOutput(&output_device, rc);
+}
+
+pub fn decoderRuntimeGemma4AudioDepthwiseConv(self: anytype, input: MetalTensor, weight: MetalTensor, rows: usize, dim: usize, kernel_size: usize) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice() or !weight.isDevice() or rows == 0 or dim == 0 or kernel_size == 0) return null;
+    if (input.elemCount() != rows * dim or weight.elemCount() != kernel_size * dim) return null;
+    const shape = [_]i32{ @intCast(rows), @intCast(dim) };
+    var output_device = try MetalTensor.deviceAllocate(runtime, rows * dim * @sizeOf(f32), .private, &shape);
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_gemma4_audio_dwconv_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        weight.deviceHandle(),
+        weight.deviceByteOffset(),
+        rows,
+        dim,
+        kernel_size,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    return finishDeviceOutput(&output_device, rc);
+}
+
+pub fn decoderRuntimeGemma4AudioFlatten(self: anytype, input: MetalTensor, time_steps: usize, freq_bins: usize, channels: usize) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice() or time_steps == 0 or freq_bins == 0 or channels == 0) return null;
+    const elems = time_steps * freq_bins * channels;
+    if (input.elemCount() != elems) return null;
+    const shape = [_]i32{ @intCast(time_steps), @intCast(freq_bins * channels) };
+    var output_device = try MetalTensor.deviceAllocate(runtime, elems * @sizeOf(f32), .private, &shape);
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_gemma4_audio_flatten_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        time_steps,
+        freq_bins,
+        channels,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    return finishDeviceOutput(&output_device, rc);
+}
+
+pub fn decoderRuntimeGemma4AudioChannelNormRelu(self: anytype, input: MetalTensor, weight: MetalTensor, channels: usize, positions: usize, eps: f32) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice() or !weight.isDevice() or channels == 0 or positions == 0) return null;
+    if (input.elemCount() != channels * positions or weight.elemCount() != channels) return null;
+    var output_device = try MetalTensor.deviceAllocate(runtime, channels * positions * @sizeOf(f32), .private, input.shape());
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_gemma4_audio_channel_norm_relu_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        weight.deviceHandle(),
+        weight.deviceByteOffset(),
+        channels,
+        positions,
+        eps,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    return finishDeviceOutput(&output_device, rc);
+}
+
+pub fn decoderRuntimeGemma4AudioLocalAttention(
+    self: anytype,
+    q: MetalTensor,
+    k: MetalTensor,
+    v: MetalTensor,
+    rel: MetalTensor,
+    q_scales: MetalTensor,
+    valid: MetalTensor,
+    params: RawGemma4AudioAttentionParams,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!q.isDevice() or !k.isDevice() or !v.isDevice() or !rel.isDevice() or !q_scales.isDevice() or !valid.isDevice()) return null;
+    const rows: usize = params.rows;
+    const hidden: usize = params.hidden;
+    if (rows == 0 or hidden == 0) return null;
+    const elems = rows * hidden;
+    if (q.elemCount() != elems or k.elemCount() != elems or v.elemCount() != elems) return null;
+    if (rel.elemCount() != @as(usize, params.context_left) * hidden) return null;
+    if (q_scales.elemCount() != params.head_dim or valid.elemCount() != rows) return null;
+    const shape = [_]i32{ @intCast(rows), @intCast(hidden) };
+    var output_device = try MetalTensor.deviceAllocate(runtime, elems * @sizeOf(f32), .private, &shape);
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_gemma4_audio_local_attention_device(
+        runtime,
+        q.deviceHandle(),
+        q.deviceByteOffset(),
+        k.deviceHandle(),
+        k.deviceByteOffset(),
+        v.deviceHandle(),
+        v.deviceByteOffset(),
+        rel.deviceHandle(),
+        rel.deviceByteOffset(),
+        q_scales.deviceHandle(),
+        q_scales.deviceByteOffset(),
+        valid.deviceHandle(),
+        valid.deviceByteOffset(),
+        &params,
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+    );
+    return finishDeviceOutput(&output_device, rc);
+}
+
 pub fn decoderRuntimeApplyLinearActivationLinearResidual(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -9479,11 +9639,12 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             if (self.raw_linear_slot_dense_biases[request.slot]) |*bias_tensor| bias_tensor.deinit();
             self.raw_linear_slot_dense_biases[request.slot] = null;
         }
-        if (termite_metal_decode_runtime_prepare_linear_bias(
+        if (prepareLinearSlotBias(
             runtime,
             request.slot,
             bias_base,
             request.out_dim,
+            bias_is_zero,
         ) != 0) return false;
 
         const dense_values = std.math.mul(usize, request.in_dim, request.out_dim) catch return false;
@@ -9751,11 +9912,12 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                 break :q8;
             };
             self.raw_linear_slot_dense_biases[request.slot] = bias_tensor;
-            if (termite_metal_decode_runtime_prepare_linear_bias(
+            if (prepareLinearSlotBias(
                 runtime,
                 request.slot,
                 bias_base,
                 request.out_dim,
+                bias_is_zero,
             ) != 0) {
                 if (self.raw_linear_slot_dense_biases[request.slot]) |*stored_bias| stored_bias.deinit();
                 self.raw_linear_slot_dense_biases[request.slot] = null;
@@ -9885,11 +10047,12 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                 if (self.raw_linear_slot_dense_biases[request.slot]) |*bias_tensor| bias_tensor.deinit();
                 self.raw_linear_slot_dense_biases[request.slot] = null;
             }
-            if (termite_metal_decode_runtime_prepare_linear_bias(
+            if (prepareLinearSlotBias(
                 runtime,
                 request.slot,
                 bias_base,
                 request.out_dim,
+                bias_is_zero,
             ) != 0) return false;
             if (request_prefers_q8) {
                 std.log.info(
@@ -18863,6 +19026,21 @@ pub extern fn termite_metal_decode_runtime_prepare_linear_bias(
     bias: [*c]const f32,
     out_dim: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_linear_zero_bias(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    out_dim: usize,
+) c_int;
+
+/// Binds the slot's bias: an all-zero bias shares the runtime's per-length
+/// zero buffer instead of uploading its own (dynamic slots for no-bias
+/// linears are prepared per request, and the upload dominated that cost).
+fn prepareLinearSlotBias(runtime: *RawMetalDecodeRuntime, slot: usize, bias: [*c]const f32, out_dim: usize, bias_is_zero: bool) c_int {
+    if (bias_is_zero) {
+        return termite_metal_decode_runtime_prepare_linear_zero_bias(runtime, slot, out_dim);
+    }
+    return termite_metal_decode_runtime_prepare_linear_bias(runtime, slot, bias, out_dim);
+}
 pub extern fn termite_metal_decode_runtime_prepare_quantized_linear_slot(
     runtime: ?*RawMetalDecodeRuntime,
     format: u32,
@@ -20935,6 +21113,92 @@ pub extern fn termite_metal_decode_runtime_apply_scale_device(
     input_offset: usize,
     dim: usize,
     scale: f32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub const RawGemma4AudioAttentionParams = extern struct {
+    rows: u32,
+    hidden: u32,
+    heads: u32,
+    head_dim: u32,
+    chunk: u32,
+    context_left: u32,
+    context: u32,
+    reserved: u32 = 0,
+    k_scale: f32,
+    logit_cap: f32,
+    invalid_value: f32,
+    reserved_f: f32 = 0,
+};
+pub extern fn termite_metal_decode_runtime_gemma4_audio_clamp_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    total: usize,
+    flags: u32,
+    min_value: f32,
+    max_value: f32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_gemma4_audio_glu_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    rows: usize,
+    dim: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_gemma4_audio_dwconv_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    weight_handle: ?*anyopaque,
+    weight_offset: usize,
+    rows: usize,
+    dim: usize,
+    kernel_size: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_gemma4_audio_flatten_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    time_steps: usize,
+    freq_bins: usize,
+    channels: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_gemma4_audio_channel_norm_relu_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    weight_handle: ?*anyopaque,
+    weight_offset: usize,
+    channels: usize,
+    positions: usize,
+    eps: f32,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_gemma4_audio_local_attention_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    q_handle: ?*anyopaque,
+    q_offset: usize,
+    k_handle: ?*anyopaque,
+    k_offset: usize,
+    v_handle: ?*anyopaque,
+    v_offset: usize,
+    rel_handle: ?*anyopaque,
+    rel_offset: usize,
+    scales_handle: ?*anyopaque,
+    scales_offset: usize,
+    valid_handle: ?*anyopaque,
+    valid_offset: usize,
+    params: *const RawGemma4AudioAttentionParams,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
@@ -32179,6 +32443,207 @@ fn testQ4Value(raw: []const u8, row: usize, col: usize) f32 {
     const byte = raw[row * 18 + 2 + (col % 16)];
     const nibble: i16 = if (col < 16) @intCast(byte & 0x0F) else @intCast(byte >> 4);
     return @floatFromInt(nibble - 8);
+}
+
+test "metal gemma4 audio encoder kernels match the host references" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    const gemma4_projector = @import("../architectures/gemma4_projector.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var prng = std.Random.DefaultPrng.init(0x6a5d);
+    const random = prng.random();
+    const rows: usize = 29;
+    const hidden: usize = 24;
+    const heads: usize = 3;
+    const head_dim: usize = hidden / heads;
+    const chunk: usize = 4;
+    const context_left: usize = 5;
+    const context = chunk + context_left - 1;
+    const kernel_size: usize = 5;
+
+    const glu_in = try allocator.alloc(f32, rows * hidden * 2);
+    defer allocator.free(glu_in);
+    for (glu_in) |*value| value.* = random.float(f32) * 8.0 - 4.0;
+    const x = try allocator.alloc(f32, rows * hidden);
+    defer allocator.free(x);
+    for (x) |*value| value.* = random.float(f32) * 4.0 - 2.0;
+    const weight = try allocator.alloc(f32, kernel_size * hidden);
+    defer allocator.free(weight);
+    for (weight) |*value| value.* = random.float(f32) - 0.5;
+
+    // Scalar clamp.
+    {
+        var input = try testDeviceTensorFromSlice(runtime, x, &[_]i32{ @intCast(rows), @intCast(hidden) });
+        defer input.deinit();
+        var clamped = (try decoderRuntimeGemma4AudioClamp(&provider, input, -0.75, null)) orelse return error.UnexpectedNull;
+        defer clamped.deinit();
+        const host = try tensorHostSlice(&clamped);
+        for (x, 0..) |value, i| try std.testing.expectEqual(@max(value, -0.75), host[i]);
+        var both = (try decoderRuntimeGemma4AudioClamp(&provider, input, -0.75, 0.5)) orelse return error.UnexpectedNull;
+        defer both.deinit();
+        const both_host = try tensorHostSlice(&both);
+        for (x, 0..) |value, i| try std.testing.expectEqual(@min(@max(value, -0.75), 0.5), both_host[i]);
+    }
+
+    // GLU over the last dim.
+    {
+        var input = try testDeviceTensorFromSlice(runtime, glu_in, &[_]i32{ @intCast(rows), @intCast(hidden * 2) });
+        defer input.deinit();
+        var glu = (try decoderRuntimeGemma4AudioGlu(&provider, input, rows, hidden)) orelse return error.UnexpectedNull;
+        defer glu.deinit();
+        const host = try tensorHostSlice(&glu);
+        try std.testing.expectEqual(rows * hidden, host.len);
+        for (0..rows) |row| {
+            for (0..hidden) |col| {
+                const a = glu_in[row * hidden * 2 + col];
+                const g = glu_in[row * hidden * 2 + hidden + col];
+                const expected = a / (1.0 + @exp(-g));
+                try std.testing.expectApproxEqAbs(expected, host[row * hidden + col], 1e-5);
+            }
+        }
+    }
+
+    // Depthwise causal conv1d.
+    {
+        var input = try testDeviceTensorFromSlice(runtime, x, &[_]i32{ @intCast(rows), @intCast(hidden) });
+        defer input.deinit();
+        var w = try testDeviceTensorFromSlice(runtime, weight, &[_]i32{ @intCast(kernel_size), @intCast(hidden) });
+        defer w.deinit();
+        var conv = (try decoderRuntimeGemma4AudioDepthwiseConv(&provider, input, w, rows, hidden, kernel_size)) orelse return error.UnexpectedNull;
+        defer conv.deinit();
+        const host = try tensorHostSlice(&conv);
+        for (0..rows) |t| {
+            for (0..hidden) |h| {
+                var expected: f32 = 0.0;
+                for (0..kernel_size) |k| {
+                    if (t + k < kernel_size - 1) continue;
+                    expected += x[(t + k - (kernel_size - 1)) * hidden + h] * weight[k * hidden + h];
+                }
+                try std.testing.expectApproxEqAbs(expected, host[t * hidden + h], 1e-5);
+            }
+        }
+    }
+
+    // Conv-stack flatten `[C, T, F]` -> `[T, F * C]`.
+    {
+        const channels: usize = 3;
+        const time_steps: usize = 4;
+        const freq_bins: usize = 2;
+        var data: [channels * time_steps * freq_bins]f32 = undefined;
+        for (&data, 0..) |*value, i| value.* = @floatFromInt(i);
+        var input = try testDeviceTensorFromSlice(runtime, &data, &[_]i32{ 1, channels, time_steps, freq_bins });
+        defer input.deinit();
+        var flat = (try decoderRuntimeGemma4AudioFlatten(&provider, input, time_steps, freq_bins, channels)) orelse return error.UnexpectedNull;
+        defer flat.deinit();
+        const host = try tensorHostSlice(&flat);
+        for (0..time_steps) |t| for (0..freq_bins) |f| for (0..channels) |ch| {
+            try std.testing.expectEqual(data[(ch * time_steps + t) * freq_bins + f], host[(t * freq_bins + f) * channels + ch]);
+        };
+    }
+
+    // Channel layer norm + relu.
+    {
+        const channels: usize = 6;
+        const positions: usize = rows * hidden / channels;
+        const norm_w = [_]f32{ 1.0, 0.5, -1.0, 2.0, 0.25, 1.5 };
+        var input = try testDeviceTensorFromSlice(runtime, x, &[_]i32{ 1, channels, @intCast(positions), 1 });
+        defer input.deinit();
+        var w = try testDeviceTensorFromSlice(runtime, &norm_w, &[_]i32{channels});
+        defer w.deinit();
+        var normed = (try decoderRuntimeGemma4AudioChannelNormRelu(&provider, input, w, channels, positions, 1e-5)) orelse return error.UnexpectedNull;
+        defer normed.deinit();
+        const host = try tensorHostSlice(&normed);
+        for (0..positions) |p| {
+            var mean: f32 = 0.0;
+            for (0..channels) |ch| mean += x[ch * positions + p];
+            mean /= @floatFromInt(channels);
+            var variance: f32 = 0.0;
+            for (0..channels) |ch| {
+                const d = x[ch * positions + p] - mean;
+                variance += d * d;
+            }
+            variance /= @floatFromInt(channels);
+            const scale = 1.0 / @sqrt(variance + 1e-5);
+            for (0..channels) |ch| {
+                const expected = @max((x[ch * positions + p] - mean) * scale * norm_w[ch], 0.0);
+                try std.testing.expectApproxEqAbs(expected, host[ch * positions + p], 1e-4);
+            }
+        }
+    }
+
+    // Chunked local attention with relative position bias and a masked tail.
+    {
+        const k_data = try allocator.alloc(f32, rows * hidden);
+        defer allocator.free(k_data);
+        for (k_data) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+        const v_data = try allocator.alloc(f32, rows * hidden);
+        defer allocator.free(v_data);
+        for (v_data) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+        const rel_data = try allocator.alloc(f32, context_left * hidden);
+        defer allocator.free(rel_data);
+        for (rel_data) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+        var scales: [head_dim]f32 = undefined;
+        for (&scales, 0..) |*value, i| value.* = 0.3 + 0.05 * @as(f32, @floatFromInt(i));
+        var valid_mask: [rows]bool = undefined;
+        var valid_f32: [rows]f32 = undefined;
+        for (0..rows) |i| {
+            valid_mask[i] = i < rows - 3 and i != 7;
+            valid_f32[i] = if (valid_mask[i]) 1.0 else 0.0;
+        }
+        const params = ops.Gemma4AudioLocalAttentionParams{
+            .rows = rows,
+            .hidden = hidden,
+            .heads = heads,
+            .head_dim = head_dim,
+            .chunk = chunk,
+            .context_left = context_left,
+            .context = context,
+            .k_scale = 1.442695,
+            .logit_cap = 50.0,
+            .invalid_value = -1.0e9,
+        };
+        const expected = try gemma4_projector.audioLocalAttentionReference(allocator, params, x, k_data, v_data, rel_data, &scales, &valid_mask);
+        defer allocator.free(expected);
+
+        const shape_2d = [_]i32{ @intCast(rows), @intCast(hidden) };
+        var q = try testDeviceTensorFromSlice(runtime, x, &shape_2d);
+        defer q.deinit();
+        var k = try testDeviceTensorFromSlice(runtime, k_data, &shape_2d);
+        defer k.deinit();
+        var v = try testDeviceTensorFromSlice(runtime, v_data, &shape_2d);
+        defer v.deinit();
+        var rel = try testDeviceTensorFromSlice(runtime, rel_data, &[_]i32{ @intCast(context_left), @intCast(hidden) });
+        defer rel.deinit();
+        var scales_t = try testDeviceTensorFromSlice(runtime, &scales, &[_]i32{@intCast(head_dim)});
+        defer scales_t.deinit();
+        var valid_t = try testDeviceTensorFromSlice(runtime, &valid_f32, &[_]i32{@intCast(rows)});
+        defer valid_t.deinit();
+        var out = (try decoderRuntimeGemma4AudioLocalAttention(&provider, q, k, v, rel, scales_t, valid_t, .{
+            .rows = @intCast(rows),
+            .hidden = @intCast(hidden),
+            .heads = @intCast(heads),
+            .head_dim = @intCast(head_dim),
+            .chunk = @intCast(chunk),
+            .context_left = @intCast(context_left),
+            .context = @intCast(context),
+            .k_scale = params.k_scale,
+            .logit_cap = params.logit_cap,
+            .invalid_value = params.invalid_value,
+        })) orelse return error.UnexpectedNull;
+        defer out.deinit();
+        const host = try tensorHostSlice(&out);
+        try std.testing.expectEqual(expected.len, host.len);
+        for (expected, 0..) |value, i| try std.testing.expectApproxEqAbs(value, host[i], 1e-4);
+        // Masked and out-of-context rows stay zero.
+        for (0..hidden) |col| try std.testing.expectEqual(@as(f32, 0.0), host[7 * hidden + col]);
+    }
 }
 
 test "metal native quantized projections write in place into slab rows" {
