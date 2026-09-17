@@ -3617,6 +3617,36 @@ test "storage query wire preserves empty projection and decoded sort profile lif
     }.decode, .{allocation_wire.json});
 }
 
+test "storage and shard query contracts preserve search effort" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../api/local_query_contract.zig");
+    const query = @import("../api/query_contract.zig");
+    // Start at the public request parser, as the benchmark adapter does.
+    // Both the in-process storage boundary and shard forwarding re-encode it.
+    for ([_]?f32{ null, 0, 0.35, 0.5, 1 }) |effort| {
+        const public_wire = try std.json.Stringify.valueAlloc(alloc, .{
+            .embeddings = .{ .vec = [_]f32{ 1, 0 } },
+            .limit = @as(u32, 100),
+            .fields = [_][]const u8{},
+            .search_effort = effort,
+        }, .{ .emit_null_optional_fields = false });
+        defer alloc.free(public_wire);
+        var original = try query.parsePublicQueryRequest(alloc, null, "docs", public_wire);
+        defer original.deinit(alloc);
+        try std.testing.expectEqual(effort, original.req.search_effort);
+        inline for (.{ contract.encodeStorageKernelQueryRequest, contract.encodeQueryRequest }) |encode| {
+            const wire = try encode(alloc, original.req);
+            defer alloc.free(wire);
+            var restored = try query.parseQueryRequest(alloc, null, "docs", wire);
+            defer restored.deinit(alloc);
+            try std.testing.expectEqual(effort, restored.req.search_effort);
+            try std.testing.expectEqual(@as(u32, 100), restored.req.limit);
+            try std.testing.expectEqual(@as(usize, 1), restored.req.dense_queries.len);
+            if (effort == null) try std.testing.expect(std.mem.indexOf(u8, wire, "search_effort") == null);
+        }
+    }
+}
+
 test "storage query contract preserves each vector candidate budget" {
     const alloc = std.testing.allocator;
     const contract = @import("../api/local_query_contract.zig");

@@ -3284,6 +3284,9 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.profile) {
         try appendJsonFieldBool(alloc, &out, &first, "profile", true);
     }
+    if (req.search_effort) |value| {
+        try appendJsonFieldF32(alloc, &out, &first, "search_effort", value);
+    }
     if (req.index_name) |index_name| {
         // The public `indexes` selector does not reconstruct the legacy
         // singleton binding for every query family. Carry the exact resolved

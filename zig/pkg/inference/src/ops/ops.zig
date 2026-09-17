@@ -592,6 +592,25 @@ pub const DecoderRuntimeApplyLinearArgmaxRequest = backend_contracts.DecoderRunt
 pub const DecoderRuntimeApplyLinearPairRequest = backend_contracts.DecoderRuntimeApplyLinearPairRequest;
 pub const DecoderRuntimeApplyLinearQkvRequest = backend_contracts.DecoderRuntimeApplyLinearQkvRequest;
 pub const DecoderRuntimeActivationKind = backend_contracts.DecoderRuntimeActivationKind;
+
+/// Gemma 4 audio conformer local attention. Queries attend inside their
+/// `chunk`-sized block plus `context_left - 1` past keys; every query/key pair
+/// adds a relative position bias row (`rel`, `[context_left, hidden]`), the
+/// query is scaled per head dim (`q_dim_scales`, `[head_dim]`) and keys by
+/// `k_scale`, logits are tanh-capped and masked keys take `invalid_value`.
+/// `valid` is a `[rows]` 0/1 float mask.
+pub const Gemma4AudioLocalAttentionParams = struct {
+    rows: usize,
+    hidden: usize,
+    heads: usize,
+    head_dim: usize,
+    chunk: usize,
+    context_left: usize,
+    context: usize,
+    k_scale: f32,
+    logit_cap: f32,
+    invalid_value: f32,
+};
 pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntimeApplyActivationRequest;
 pub const DecoderRuntimeApplyGeluBackwardRequest = backend_contracts.DecoderRuntimeApplyGeluBackwardRequest;
 pub const DecoderRuntimeFfnGeluBackwardChainRequest = backend_contracts.DecoderRuntimeFfnGeluBackwardChainRequest;
@@ -1723,6 +1742,30 @@ pub const ComputeBackend = struct {
         /// Y = X * scale. Backends may keep scalar multiplies on device;
         /// callers fall back to creating a broadcast scalar tensor.
         multiplyScalar: ?*const fn (ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT = null,
+
+        /// Y = clamp(X, min, max) with scalar bounds; either bound may be
+        /// absent. Callers fall back to a host clamp.
+        clampScalar: ?*const fn (ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT = null,
+
+        /// Gated linear unit over the last dim: X is `[rows, 2 * dim]` and
+        /// Y[r, c] = X[r, c] * sigmoid(X[r, dim + c]).
+        gluRows: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror!?CT = null,
+
+        /// Depthwise causal conv1d over `[rows, dim]` with a `[kernel_size, dim]`
+        /// weight and `kernel_size - 1` implicit left padding.
+        depthwiseCausalConv1d: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
+
+        /// `[channels, time_steps, freq_bins]` -> `[time_steps, freq_bins * channels]`
+        /// (the Gemma 4 audio conv-stack flatten).
+        flattenChannelsTimeFreq: ?*const fn (ctx: *anyopaque, input: CT, time_steps: usize, freq_bins: usize, channels: usize) anyerror!?CT = null,
+
+        /// Layer norm over the channel axis of `[channels, positions]` (biasless,
+        /// per-channel weight) followed by relu.
+        channelLayerNormRelu: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, channels: usize, positions: usize, eps: f32) anyerror!?CT = null,
+
+        /// Gemma 4 audio conformer chunked local attention with relative
+        /// position bias; see `Gemma4AudioLocalAttentionParams`.
+        gemma4AudioLocalAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
 
         /// Y = X + value. Backends may keep scalar adds on device; callers
         /// fall back to host materialization or a broadcast scalar tensor.
@@ -3586,6 +3629,20 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    /// `ensureDeviceResident` for a tensor this call owns. A successful
+    /// upload releases the host copy and returns the device tensor; a
+    /// backend that keeps host tensors returns the input unchanged; an
+    /// upload error releases the input before propagating. Callers hand
+    /// over ownership at the call and never hold a tensor that may be gone.
+    pub fn ensureDeviceResidentOwned(self: *const ComputeBackend, tensor: CT) !CT {
+        errdefer self.free(tensor);
+        if (try self.ensureDeviceResident(tensor)) |device| {
+            self.free(tensor);
+            return device;
+        }
+        return tensor;
+    }
+
     /// Fused residual add and layer norm returning both the sum (the new
     /// residual stream) and the normalized tensor. Null when the backend has
     /// no fused kernel or an input is not device resident.
@@ -4050,6 +4107,36 @@ pub const ComputeBackend = struct {
     pub fn multiplyScalar(self: *const ComputeBackend, input: CT, scale: f32) !?CT {
         const op = self.vtable.multiplyScalar orelse return null;
         return op(self.ptr, input, scale);
+    }
+
+    pub fn clampScalar(self: *const ComputeBackend, input: CT, min_value: ?f32, max_value: ?f32) !?CT {
+        const op = self.vtable.clampScalar orelse return null;
+        return op(self.ptr, input, min_value, max_value);
+    }
+
+    pub fn gluRows(self: *const ComputeBackend, input: CT, rows: usize, dim: usize) !?CT {
+        const op = self.vtable.gluRows orelse return null;
+        return op(self.ptr, input, rows, dim);
+    }
+
+    pub fn depthwiseCausalConv1d(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, dim: usize, kernel_size: usize) !?CT {
+        const op = self.vtable.depthwiseCausalConv1d orelse return null;
+        return op(self.ptr, input, weight, rows, dim, kernel_size);
+    }
+
+    pub fn flattenChannelsTimeFreq(self: *const ComputeBackend, input: CT, time_steps: usize, freq_bins: usize, channels: usize) !?CT {
+        const op = self.vtable.flattenChannelsTimeFreq orelse return null;
+        return op(self.ptr, input, time_steps, freq_bins, channels);
+    }
+
+    pub fn channelLayerNormRelu(self: *const ComputeBackend, input: CT, weight: CT, channels: usize, positions: usize, eps: f32) !?CT {
+        const op = self.vtable.channelLayerNormRelu orelse return null;
+        return op(self.ptr, input, weight, channels, positions, eps);
+    }
+
+    pub fn gemma4AudioLocalAttention(self: *const ComputeBackend, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) !?CT {
+        const op = self.vtable.gemma4AudioLocalAttention orelse return null;
+        return op(self.ptr, q, k, v, rel, q_dim_scales, valid, params);
     }
 
     pub fn addScalar(self: *const ComputeBackend, input: CT, value: f32) !?CT {
