@@ -124,6 +124,12 @@ pub const Server = struct {
         }
     };
 
+    // Called before taking state_mutex; catalog writers may acquire that mutex.
+    pub const CatalogEmptySource = struct {
+        ptr: *anyopaque,
+        read_fn: *const fn (ptr: *anyopaque) anyerror!bool,
+    };
+
     pub const SeedCaptureHook = struct {
         ptr: *anyopaque,
         run_fn: *const fn (
@@ -225,6 +231,7 @@ pub const Server = struct {
         standby_status_extras: ?StandbyStatusExtras = null,
         state_mutex: ?*std.atomic.Mutex = null,
         seed_capture: ?SeedCaptureHook = null,
+        catalog_empty: ?CatalogEmptySource = null,
         standby_upstream: ?StandbyUpstreamHook = null,
         lifecycle_receipts: ?LifecycleReceipts = null,
         lease_watchdog_proof: ?LeaseWatchdogProofSource = null,
@@ -303,6 +310,15 @@ pub const Server = struct {
             if (req.method != .get) return try textResponse(self.alloc, 405, "method not allowed");
             return try self.handleAdminWatchdogProof();
         }
+        // Catalog writers acquire the catalog lock before the HA state lock.
+        // Observe readiness before taking state_mutex to avoid reversing that
+        // order. This is an advisory observation; the primary role and HA
+        // snapshot are still checked under state_mutex below.
+        const waiting_for_tables: ?bool = if (req.method == .get and
+            std.mem.eql(u8, path, admin_api.routes.ha_primary_status))
+        blk: {
+            break :blk if (self.auth.catalog_empty) |source| try source.read_fn(source.ptr) else null;
+        } else null;
         var primary_fence_lease: ?mutation_barrier.MutationBarrier.ExclusiveLease = null;
         if (req.method == .post and std.mem.eql(u8, path, admin_api.routes.ha_fence)) {
             if (self.auth.primary_fence_barrier) |barrier| {
@@ -327,7 +343,7 @@ pub const Server = struct {
                     return try textResponse(self.alloc, 503, "not ready");
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_primary_status)) {
-                    return try self.handleAdminPrimaryStatus(req);
+                    return try self.handleAdminPrimaryStatus(req, waiting_for_tables);
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_standby_status)) {
                     return try self.handleAdminStandbyStatus(req);
@@ -445,7 +461,7 @@ pub const Server = struct {
         return try admin_api.routes.replicationSlotNameFromPathAlloc(self.alloc, path, suffix);
     }
 
-    fn handleAdminPrimaryStatus(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
+    fn handleAdminPrimaryStatus(self: *Server, req: http_operation.Request, waiting_for_tables: ?bool) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         const query = requestQuery(req.target);
         const max_lag_lsn = if (queryValue(query, "max_lag_lsn")) |raw|
@@ -481,6 +497,7 @@ pub const Server = struct {
             .snapshot = blk: {
                 var result = try adminPrimarySnapshot(self.alloc, snapshot, node_id);
                 result.lease_watchdog = watchdog_proof;
+                result.waiting_for_tables = waiting_for_tables;
                 break :blk result;
             },
         };
@@ -5060,4 +5077,38 @@ test "storage.ha HTTP identities preserve the full unsigned range" {
     defer parsed.deinit();
     try std.testing.expectEqualDeep(identity, try adminIdentityFromOpenApi(parsed.value));
     try std.testing.expectError(error.Overflow, std.json.parseFromSlice(admin_api.HAIdentity, alloc, "{\"cluster_id\":-1,\"shard_id\":0,\"table_id\":0,\"timeline_id\":1,\"epoch\":1}", .{}));
+}
+
+test "storage.hot_standby primary status observes catalog outside the HA lock without creating slots" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "catalog-readiness");
+    defer paths.deinit(alloc);
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    const Catalog = struct {
+        empty: bool = true,
+        state_mutex: std.atomic.Mutex = .unlocked,
+        fn read(ptr: *anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Model a catalog writer acquiring HA state while the catalog is
+            // observed. Fail deterministically instead of hanging on inversion.
+            if (!self.state_mutex.tryLock()) return error.CatalogReadUnderHAStateLock;
+            defer self.state_mutex.unlock();
+            return self.empty;
+        }
+    };
+    var catalog = Catalog{};
+    var server = Server.initWithOptions(alloc, .{ .primary = &primary, .primary_node_id = "primary-a" }, .{
+        .catalog_empty = .{ .ptr = &catalog, .read_fn = Catalog.read },
+        .state_mutex = &catalog.state_mutex,
+    });
+    defer server.deinit();
+    for ([_]bool{ true, false, true }) |empty| {
+        catalog.empty = empty;
+        var response = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        try expectContains(response.body, if (empty) "\"waiting_for_tables\":true" else "\"waiting_for_tables\":false");
+        try expectContains(response.body, "\"slots\":[]");
+    }
 }

@@ -656,6 +656,13 @@ const (
 
 // HighAvailabilitySpec configures hot-standby HA for an AntflyCluster.
 type HighAvailabilitySpec struct {
+	// ActivationPolicy controls initial standby seeding. OnFirstTable defers
+	// seeding until the runtime reports a table and is supported only for Async
+	// durability. Eager preserves protection of synchronous table creation.
+	// +kubebuilder:validation:Enum=Eager;OnFirstTable
+	// +optional
+	ActivationPolicy string `json:"activationPolicy,omitempty"`
+
 	// Mode selects whether hot standby is managed.
 	// +kubebuilder:validation:Enum=Disabled;HotStandby
 	// +kubebuilder:default=Disabled
@@ -1966,6 +1973,19 @@ type HAStatus struct {
 	// +kubebuilder:validation:Enum=ha;standby
 	// +optional
 	DataLayout HADataLayout `json:"dataLayout,omitempty"`
+
+	// CatalogObserved means the current primary explicitly reported catalog readiness.
+	// +optional
+	CatalogObserved bool `json:"catalogObserved,omitempty"`
+
+	// WaitingForTables reports an empty catalog before initial HA activation.
+	// +optional
+	WaitingForTables bool `json:"waitingForTables,omitempty"`
+
+	// ActivationStarted latches once a nonempty catalog or existing HA work
+	// is observed. Deleting the last table must never disable established HA.
+	// +optional
+	ActivationStarted bool `json:"activationStarted,omitempty"`
 
 	// PrimaryLSN is the current primary replication LSN.
 	// +optional

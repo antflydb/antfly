@@ -11089,6 +11089,7 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 			haStatus.PrimaryAdminConsecutiveFailures++
 		}
 		haStatus.PrimaryAdminReachable = false
+		haStatus.CatalogObserved = false
 		haStatus.PrimaryAdminLastError = err.Error()
 		if statusCode, ok := adminsdk.HAStatusCode(err); ok {
 			haStatus.PrimaryAdminStatusCode = statusCode
@@ -11110,6 +11111,11 @@ func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Contex
 	cluster.Status.HAStatus.PrimaryAdminUnreachableSince = nil
 	cluster.Status.HAStatus.PrimaryAdminFailureThresholdMet = false
 	cluster.Status.HAStatus.PrimaryLSN = status.PrimaryLSN
+	if (status.WaitingForTables != nil && !*status.WaitingForTables) || haActivationHasStarted(cluster.Status.HAStatus) || len(status.Standbys) > 0 {
+		cluster.Status.HAStatus.ActivationStarted = true
+	}
+	cluster.Status.HAStatus.CatalogObserved = status.WaitingForTables != nil
+	cluster.Status.HAStatus.WaitingForTables = status.WaitingForTables != nil && *status.WaitingForTables && !cluster.Status.HAStatus.ActivationStarted
 	cluster.Status.HAStatus.Retention = status.Retention
 	if status.WatchdogProof != nil {
 		cluster.Status.HAStatus.PrimaryWatchdogProof = status.WatchdogProof.DeepCopy()
@@ -11291,6 +11297,7 @@ func haAdminSyncFailureParam(policy antflyv1.HAFailurePolicy) adminsdk.HAPrimary
 }
 
 type haObservedPrimaryStatus struct {
+	WaitingForTables *bool
 	NodeID           string
 	PrimaryLSN       uint64
 	Retention        antflyv1.HARetentionStatus
@@ -11335,9 +11342,10 @@ func parseHAPrimaryStatusJSON(raw []byte) (haObservedPrimaryStatus, error) {
 func haObservedPrimaryStatusFromAdminSDK(parsed adminsdk.ParsedHAPrimaryStatus) haObservedPrimaryStatus {
 	snapshot := parsed.Response.Snapshot
 	status := haObservedPrimaryStatus{
-		NodeID:     strings.TrimSpace(snapshot.NodeId),
-		Identity:   haObservedIdentityFromAdminSDK(snapshot.Identity),
-		PrimaryLSN: snapshot.CurrentLsn,
+		NodeID:           strings.TrimSpace(snapshot.NodeId),
+		WaitingForTables: snapshot.WaitingForTables,
+		Identity:         haObservedIdentityFromAdminSDK(snapshot.Identity),
+		PrimaryLSN:       snapshot.CurrentLsn,
 		Retention: antflyv1.HARetentionStatus{
 			OldestRestartLSN:  snapshot.Retention.OldestRestartLsn,
 			RetainedLSNCount:  snapshot.Retention.RetainedLsnCount,

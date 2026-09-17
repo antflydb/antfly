@@ -5,6 +5,27 @@ clusters running in Standalone mode. It is separate from the Raft metadata HA pa
 hot standby is a single-primary data-plane strategy with one or more standby
 processes receiving and applying HA WAL records.
 
+## Optional activation after the first table
+
+Configure `spec.highAvailability.activationPolicy: OnFirstTable` to retain the
+HA topology without planning initial slot, seed, or promotion work until the
+primary reports a table. This policy supports asynchronous durability only;
+`RemoteWrite` and `RemoteApply` require the default `Eager` activation because
+table creation itself participates in synchronous replication.
+
+While waiting, `HAAvailable=False` and `HAAutomaticFailoverReady=False` have the
+reason `WaitingForTables`. The primary's authenticated status must explicitly
+report catalog readiness; an older runtime or unavailable observation cannot
+activate this opt-in policy. `status.haStatus.activationStarted` persists the
+transition. Existing slots, executed actions, and promotion receipts also prove
+activation, so adopting an existing topology or deleting its last table does not
+turn protection off. Normal initialization and protection conditions take over
+when seeding starts. Primary WAL capture, fencing, and configured write policy
+remain enabled throughout. This policy defers operator HA actions; it does not
+scale down separately declared cluster pods or PVCs.
+
+The default remains eager activation, including empty whole-instance seeds.
+
 ## Control Surfaces
 
 Use the typed admin API for normal automation:

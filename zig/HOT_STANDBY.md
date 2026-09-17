@@ -18,6 +18,13 @@ then replicate new tables before subsequent document mutations. The operator
 must preserve these explicit zero arguments; omitted identities retain the
 legacy catalog-bootstrap behavior.
 
+The authenticated primary status snapshot optionally includes
+`waiting_for_tables`, derived from the runtime catalog. It does not create
+slots, capture seeds, or alter durability. The operator can use this signal for
+opt-in asynchronous `OnFirstTable` activation; established HA remains active
+when the last table is deleted. Eager empty-instance seeding remains the default,
+and synchronous configurations must use eager activation.
+
 Table creation uses version 3 JSON metadata records at stream identity `0/0`.
 The payload carries the resolved table definition and initial ranges. The
 standby persists those records before advancing applied progress. The primary
