@@ -591,14 +591,22 @@ ordering and passes after reordering, so it guards the dependency directly.
 
 Supplemental startup validation exposed a separate obsolete-file fixture
 self-deadlock: it called `persistManifest` while already holding the backend
-mutex. It now calls `persistManifestLocked`, waits only until the captured
-retention deadline, and verifies persisted reclamation through a read-only
-reopen. Retired startup owners do not guarantee optional live storage metrics
-in their cached status.
+mutex. Review then reproduced a retention race by pausing setup for 500 ms:
+normal publication/close could reclaim the fixture before startup ran.
+The fixture now models a crash after publication and before reclamation. It
+preserves the provisioned primary runs, publishes an already-due obsolete entry
+through the native manifest journal, and uses `abandonAfterCrash` to release the
+backend without shutdown maintenance. A read-only reopen verifies the persisted
+expired entry before startup, and another verifies reclamation afterward. There
+is no sleep or dependency on setup finishing within the retention window.
+Retired startup owners do not guarantee optional live storage metrics in their
+cached status.
 
 Validation completed for nine distinct regressions: the original four, legacy
 artifact repair, native publication contention, terminal restore debt,
 counterless incomplete-generation repair, and obsolete-file reclamation. All
-passed with no leaks; the fixed reclamation fixture took about 0.37 seconds.
+passed with no leaks. After the deterministic fixture change, reclamation took
+about 0.16 seconds and also passed with a 500 ms debugger pause immediately
+before journal publication; both runs reported no leaks.
 Formatting and whitespace checks pass. This focused validation does not claim
 the entire latest CI gate is green.

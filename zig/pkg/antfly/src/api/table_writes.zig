@@ -42273,32 +42273,42 @@ fn implementationTests() type {
             defer alloc.free(path);
             const indexes_json = "{\"indexes\":[]}";
 
-            var obsolete_path: []u8 = undefined;
-            var reclaim_after_ns: u64 = undefined;
-            {
+            const primary_root = blk: {
                 var seeded = try openManagedDbWithIndexesJsonAndCacheMode(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null, .default);
                 defer seeded.close();
-
                 const primary_backend = seeded.core.primary_store_owner.lsmBackend() orelse return error.SkipZigTest;
-                const primary_root = primary_backend.root_dir orelse return error.TestUnexpectedResult;
-                obsolete_path = try lsm_backend.repository.runPath(alloc, primary_root, 777_777);
-                errdefer alloc.free(obsolete_path);
-                try lsm_backend.repository.writeFileAbsoluteWithStorage(primary_backend.storage.?, obsolete_path, "obsolete");
-                {
-                    const locked = lsm_backend.runtime.lockBackend(lsm_backend.Backend, primary_backend);
-                    defer lsm_backend.runtime.unlockBackend(lsm_backend.Backend, primary_backend, locked);
-                    try primary_backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
-                    reclaim_after_ns = primary_backend.nowNs() +| primary_backend.options.obsolete_retention_ns;
-                    try primary_backend.persistManifestLocked();
-                }
-            }
+                break :blk try alloc.dupe(u8, primary_backend.root_dir orelse return error.TestUnexpectedResult);
+            };
+            defer alloc.free(primary_root);
+            const obsolete_path = try lsm_backend.repository.runPath(alloc, primary_root, 777_777);
             defer alloc.free(obsolete_path);
-
+            {
+                // Model a crash after publication but before reclamation. Persist
+                // an already-due entry through the native journal, without the
+                // normal persist/close maintenance that would reclaim it here.
+                // No elapsed-time assumption is needed during fixture setup.
+                var backend = try lsm_backend.Backend.open(alloc, primary_root, .{});
+                defer backend.abandonAfterCrash();
+                try lsm_backend.repository.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
+                const locked = lsm_backend.runtime.lockBackend(lsm_backend.Backend, &backend);
+                defer lsm_backend.runtime.unlockBackend(lsm_backend.Backend, &backend, locked);
+                try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+                backend.obsolete_paths.setDeadlinePrepared(obsolete_path, 0);
+                var turn = try backend.beginManifestTurn();
+                defer turn.deinit();
+                const runs = try alloc.alloc(lsm_backend.repository.Run, backend.runs.count());
+                defer alloc.free(runs);
+                var cursor = backend.runs.cursor();
+                for (runs) |*run| run.* = cursor.next().?.*;
+                _ = try backend.manifest_journal.persist(&backend, primary_root, runs);
+            }
             try std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{});
-            // Startup only reclaims due files. Wait out this fixture's actual
-            // retention boundary instead of relying on setup taking long enough.
-            const now_ns: u64 = @intCast(std.Io.Timestamp.now(std.testing.io, .awake).toNanoseconds());
-            if (reclaim_after_ns > now_ns) sleepNs(reclaim_after_ns - now_ns);
+            {
+                var persisted = try lsm_backend.Backend.open(alloc, primary_root, .{ .backend = .{ .read_only = true } });
+                defer persisted.close();
+                const obsolete = persisted.obsolete_paths.get(obsolete_path) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(u64, 0), obsolete.delete_after_ns);
+            }
 
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
