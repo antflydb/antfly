@@ -38,6 +38,7 @@ const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const gguf_writer = @import("../gguf/writer.zig");
 const clipclap_format_mod = @import("../architectures/clipclap_format.zig");
 const projector_format_mod = @import("../architectures/projector_format.zig");
+const gemma4_projector = @import("../architectures/gemma4_projector.zig");
 const qwen3vl_reranker = @import("../architectures/qwen3vl_reranker.zig");
 const florence_arch = @import("../architectures/florence.zig");
 const hf_tokenizer = @import("inference_hf_tokenizer");
@@ -2328,6 +2329,10 @@ pub const LoadedModel = struct {
     native_generation_graph_cache: graph_mod.cache.GraphCache,
     // ponytail: model-wide safety lock; replace with per-request backend state only when continuous batching is proven safe.
     native_generate_lock: std.atomic.Mutex = .unlocked,
+    /// The GGUF projector kept open for Gemma media prompts, opened on the
+    /// first request that needs it and closed with the model.
+    projector_store: ?*gemma4_projector.ProjectorStore = null,
+    projector_store_mutex: std.atomic.Mutex = .unlocked,
     // Multimodal sessions (CLIP/CLAP/CLIPCLAP). The gate protects session
     // lifetime during execution; the mutex protects short slot mutations.
     embedding_asset_gate: EmbeddingAssetGate = .{},
@@ -2960,7 +2965,23 @@ pub const LoadedModel = struct {
         return head;
     }
 
+    /// The model's open projector file, opened on first use. Null when the
+    /// manifest has no GGUF projector.
+    pub fn ensureProjectorStore(self: *LoadedModel) !?*gemma4_projector.ProjectorStore {
+        const path = self.manifest.gguf_projector_path orelse return null;
+        platform.sync.lockYielding(&self.projector_store_mutex);
+        defer self.projector_store_mutex.unlock();
+        if (self.projector_store) |store| return store;
+        const store = try gemma4_projector.ProjectorStore.open(self.allocator, path);
+        self.projector_store = store;
+        return store;
+    }
+
     pub fn deinit(self: *LoadedModel) void {
+        if (self.projector_store) |store| {
+            store.close();
+            self.projector_store = null;
+        }
         // Cache destruction may enter a driver before Session.close. Protect
         // every retained component first, without borrowing request controls.
         var close_scopes: [6]backends.Session.CloseScope = @splat(.{});
