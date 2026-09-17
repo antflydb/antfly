@@ -470,12 +470,15 @@ work includes centroid reconstruction; changing that needs separate routing
 and previous-vector correctness analysis, not simply skipping refreshes.
 
 The broader `antfly-storage-test` target also runs storage-owner executables.
-Before these production changes, its `opaque storage owner performs coarse
-batch and query on one live DB` test failed at the `doc:bulk` query assertion;
-it failed again with a fresh dedicated cache. The focused vector regressions
-are validated independently using the compiler command emitted by the build.
-That separate storage-owner failure remains unresolved by this performance
-change; the broader target is not claimed green.
+Its `opaque storage owner performs coarse batch and query on one live DB`
+failure was traced separately: the fixture installed a replacement text index
+with repair advancement disabled, then expected indexed query visibility.
+Direct lookup found `doc:bulk`, while queries were empty even before bulk
+ingestion. The fixture now explicitly completes bounded targeted repair and
+checks that the replacement index finds an existing document before proceeding.
+The original bulk query assertion is retained; no production query behavior
+or synchronization guarantees were changed. The complete storage-owner suite
+passed all 27 tests with no leaks (32/32 build steps).
 
 Final code without phase instrumentation passed all 23 selected vector test
 executions (including import-only roots), covering deferred rebuilds, narrow
