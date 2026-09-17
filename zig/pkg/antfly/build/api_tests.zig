@@ -1591,6 +1591,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "structural reconcile fences incarnation initialization and discards empty topology",
             "provisioned structural reconcile blocks table write admission",
             "provisioned source quiesce closes cleanup admission and drains accepted owner jobs",
+            "provisioned source quiesce retains activity until borrowed transaction callbacks drain",
             "provisioned schema reconcile keeps reads and status available",
             "busy startup open preserves fresh writer runtime status",
             "managed startup catch-up marks FileNotFound index open terminal degraded",

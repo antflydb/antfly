@@ -8969,9 +8969,11 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     /// Stop every source-owned worker before an attached storage owner begins
-    /// closing cached DBs. This is deliberately separate from `deinit`: cache
-    /// pointers are borrowed, so a standalone source must remain safe to
-    /// destroy after its optional cache owner has already gone away.
+    /// closing cached DBs. DB-owned promotion/recovery workers may still
+    /// borrow this source until their owner joins them. Retain callback state
+    /// here; `deinit` releases it only after those external users have drained.
+    /// Cache pointers are borrowed, so final destruction must also remain safe
+    /// after the optional cache owner has already gone away.
     pub fn quiesce(self: *ProvisionedTableWriteSource) void {
         lockAtomic(&self.dropped_table_job_owner_mutex);
         if (self.lifecycle.load(.acquire) != .open) {
@@ -8999,7 +9001,29 @@ pub const ProvisionedTableWriteSource = struct {
         self.structural_reconcile_work_group.await(io) catch {};
         self.restore_repair_completion_group.await(io) catch {};
         self.freeRestoreRepairCompletions();
+        // Release queued source-owned reservations before DB callbacks drain;
+        // retaining these fences could strand a borrower waiting for admission.
         self.freeStructuralReconcileTables();
+        self.lifecycle.store(.closed, .release);
+    }
+
+    /// Publish cached DB worker shutdown before a borrowed deterministic
+    /// scheduler is drained. This deliberately does not await work groups or
+    /// destroy cache entries.
+    pub fn beginTeardown(self: *ProvisionedTableWriteSource) void {
+        self.restore_repair_shutdown.store(true, .release);
+        if (self.write_cache) |cache| cache.beginTeardown();
+        if (self.startup_write_cache) |cache| {
+            if (self.write_cache != cache) cache.beginTeardown();
+        }
+    }
+
+    /// The caller must first join every external owner that can invoke this
+    /// source (including DB-owned promotion and transaction recovery workers).
+    /// Quiescence alone only drains source-owned jobs, not those borrowers.
+    pub fn deinit(self: *ProvisionedTableWriteSource) void {
+        self.quiesce();
+        const io = self.tableActivityIo();
         self.freeWriteCoalesceQueues();
         lockAtomic(&self.startup_catch_up_backoff_mutex);
         self.startup_catch_up_backoffs.deinit(self.startup_catch_up_backoff_alloc);
@@ -9022,22 +9046,6 @@ pub const ProvisionedTableWriteSource = struct {
         self.recovering_replica_retirement_intents.deinit(std.heap.page_allocator);
         self.recovering_replica_retirement_intents = .empty;
         self.replica_retirement_intent_mutex.unlock();
-        self.lifecycle.store(.closed, .release);
-    }
-
-    /// Publish cached DB worker shutdown before a borrowed deterministic
-    /// scheduler is drained. This deliberately does not await work groups or
-    /// destroy cache entries.
-    pub fn beginTeardown(self: *ProvisionedTableWriteSource) void {
-        self.restore_repair_shutdown.store(true, .release);
-        if (self.write_cache) |cache| cache.beginTeardown();
-        if (self.startup_write_cache) |cache| {
-            if (self.write_cache != cache) cache.beginTeardown();
-        }
-    }
-
-    pub fn deinit(self: *ProvisionedTableWriteSource) void {
-        self.quiesce();
         lockAtomic(&self.dirty_write_tables_mutex);
         self.clearAllDirtyWriteTablesLocked();
         self.dirty_write_tables.deinit(std.heap.page_allocator);
@@ -38925,6 +38933,55 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 0), status.pending_epochs);
             try std.testing.expectEqual(@as(u32, 0), status.consecutive_enqueue_failures);
             try std.testing.expect(!status.worker_scheduled);
+        }
+
+        test "provisioned source quiesce retains activity until borrowed transaction callbacks drain" {
+            const Probe = struct {
+                source: *ProvisionedTableWriteSource,
+                cancel: bool,
+                entered: bool = false,
+
+                fn batch(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.entered = true;
+                    // A DB-owned promotion can be inside participant resolution
+                    // when the source stops its own workers. The DB is joined
+                    // afterwards, while this callback still borrows the source.
+                    self.source.quiesce();
+                    if (self.cancel) return error.Canceled;
+                }
+            };
+            for ([_]bool{ false, true }) |cancel| {
+                var source = ProvisionedTableWriteSource.init("unused", table_catalog.emptyCatalogSource());
+                defer source.deinit();
+                var probe = Probe{ .source = &source, .cancel = cancel };
+                _ = source.withRaftBatcher(.{ .ptr = &probe, .vtable = &.{
+                    .batch_group = Probe.batch,
+                    .batch_group_local = Probe.batch,
+                } });
+                const result = source.source().txnResolveGroupLocalWithCancellation(
+                    std.testing.allocator,
+                    7001,
+                    "entities",
+                    [_]u8{1} ** 16,
+                    .committed,
+                    1,
+                    0,
+                    .write,
+                    .none,
+                );
+                if (cancel) {
+                    try std.testing.expectError(error.Canceled, result);
+                } else {
+                    try std.testing.expect((try result) != null);
+                }
+                try std.testing.expect(probe.entered);
+                try std.testing.expect(!source.isOpen());
+                // Releasing the last borrowed operation must still find its
+                // activity and prune it normally, including on cancellation.
+                try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
+                source.quiesce();
+            }
         }
 
         test "provisioned source quiesce closes cleanup admission and drains accepted owner jobs" {
