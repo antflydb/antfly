@@ -100,6 +100,25 @@ const SyncWaitCancellation = struct {
         return state.upstream.isCancelled() or platform_time.monotonicNs() >= state.deadline_ns;
     }
 };
+
+/// Query execution checkpoints retain the deadline captured before admission.
+/// This borrowed scope ends only after synchronous execution and helpers join.
+const QueryDeadlineCancellation = struct {
+    upstream: CancellationToken,
+    deadline_ns: ?u64,
+
+    fn token(self: *const @This()) CancellationToken {
+        return .{ .ptr = self, .check_fn = check };
+    }
+
+    fn check(ptr: *const anyopaque) !void {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        try self.upstream.check();
+        if (self.deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        }
+    }
+};
 const json_helpers = @import("../../api/json_helpers.zig");
 const ParsedJsonPathValue = json_helpers.ParsedJsonPathValue;
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
@@ -274,10 +293,21 @@ pub const HttpHandler = struct {
         self.graph_execution_limits = limits;
     }
 
-    pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
+    pub fn handle(self: *HttpHandler, incoming: HttpRequest) !HttpResponse {
+        var req = incoming;
         req.ensureActive() catch |err| return admissionFailureResponse(self.alloc, err);
         const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
-        const admission: ?*RequestAdmission = switch (http_routes.admissionClass(route)) {
+        const admission_class = http_routes.admissionClass(route);
+        if (admission_class == .query) {
+            const RoutingBudget = @import("../../api/table_catalog.zig").RoutingBudget;
+            req.deadline_ns = RoutingBudget.init(null).deadlineFrom(RoutingBudget.initIo(req.deadline_ns, req.deadline_io));
+            req.deadline_io = null;
+            if (route == .table_query_request) {
+                req.deadline_ns = query_contract.publicQueryDeadline(self.alloc, req.body, false, req.deadline_ns) catch
+                    return textResponse(self.alloc, 400, "invalid query request");
+            }
+        }
+        const admission: ?*RequestAdmission = switch (admission_class) {
             .none => null,
             .query => &self.query_admission,
             .write => &self.write_admission,
@@ -303,7 +333,26 @@ pub const HttpHandler = struct {
         defer if (admission_lease) |*lease| lease.release();
         req.ensureActive() catch |err| return admissionFailureResponse(self.alloc, err);
 
-        var response = switch (route) {
+        const query_deadline: QueryDeadlineCancellation = .{ .upstream = req.cancellation, .deadline_ns = req.deadline_ns };
+        if (admission_class == .query) req.cancellation = query_deadline.token();
+        var response = self.dispatchAdmitted(req, route) catch |err| {
+            if (admission_class == .query) {
+                // Some operators expose only boolean cancellation and translate
+                // it into Canceled. The outer scope preserves the timeout cause.
+                req.ensureActive() catch |cause| return executionFailureResponse(self.alloc, cause);
+                return executionFailureResponse(self.alloc, err);
+            }
+            return err;
+        };
+        req.ensureActive() catch |err| {
+            response.deinit(self.alloc);
+            return executionFailureResponse(self.alloc, err);
+        };
+        return response;
+    }
+
+    fn dispatchAdmitted(self: *HttpHandler, req: HttpRequest, route: http_routes.Route) !HttpResponse {
+        return switch (route) {
             .health => try self.handleHealth(),
             .healthz => try self.handleHealthz(),
             .readyz => try self.handleReadyz(),
@@ -361,9 +410,6 @@ pub const HttpHandler = struct {
             .query_head_artifact => |value| try self.handleQueryHeadArtifact(value.namespace, value.artifact_index, req.cancellation),
             .query_version_artifact => |value| try self.handleQueryVersionArtifact(value.namespace, value.version.?, value.artifact_index, req.cancellation),
         };
-        errdefer response.deinit(self.alloc);
-        try req.ensureActive();
-        return response;
     }
 
     pub fn configureAdmission(self: *HttpHandler, query_capacity: usize, write_capacity: usize) void {
@@ -9977,6 +10023,16 @@ fn admissionFailureResponse(alloc: Allocator, err: anyerror) !HttpResponse {
     return response;
 }
 
+fn executionFailureResponse(alloc: Allocator, err: anyerror) !HttpResponse {
+    if (err != error.DeadlineExceeded) return err;
+    return jsonResponse(alloc, 504, .{
+        .@"error" = @errorName(err),
+        .reason = "deadline_exceeded",
+        .stage = "execution",
+        .execution_started = true,
+    });
+}
+
 fn jsonResponse(alloc: Allocator, status: u16, value: anytype) !HttpResponse {
     return .{
         .status = status,
@@ -10504,6 +10560,16 @@ test "serverless http handler serves internal namespace lifecycle, admission, an
     defer expired_admission.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 504), expired_admission.status);
     try std.testing.expect(std.mem.indexOf(u8, expired_admission.body, "deadline_exceeded") != null);
+    try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().in_flight);
+
+    var expired_body = try handler.handle(.{
+        .method = .post,
+        .path = "/tables/docs/query",
+        .body = "{\"timeout_ms\":0}",
+    });
+    defer expired_body.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 504), expired_body.status);
+    try std.testing.expect(std.mem.indexOf(u8, expired_body.body, "\"execution_started\":false") != null);
     try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().in_flight);
 
     var create = try handler.handle(.{

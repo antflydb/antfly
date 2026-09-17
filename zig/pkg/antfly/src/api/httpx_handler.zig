@@ -1563,8 +1563,21 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    fn establishPublicQueryDeadline(ctx: *httpx.Context, body: []const u8) !?httpx.Response {
+        const incoming = requestCancellation(ctx).query_deadline_ns;
+        const deadline = query_contract.publicQueryDeadline(ctx.allocator, body, isNdjsonContentType(ctx.header("content-type")), incoming) catch
+            return try textResponse(ctx, 400, "invalid query request");
+        ctx.application_deadline_ns = deadline;
+        ctx.application_deadline_io = null; // publicQueryDeadline uses native monotonic time.
+        return null;
+    }
+
     fn requestCancellation(ctx: *const httpx.Context) http_common.RequestCancellation {
         return .{
+            .query_deadline_ns = @import("table_catalog.zig").RoutingBudget.init(null).deadlineFrom(.{
+                .deadline_ns = ctx.application_deadline_ns,
+                .io = if (ctx.application_deadline_io) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null,
+            }),
             .borrowed = ctx.cancellation,
             .borrowed_context = if (ctx.cancellation_probe != null) ctx else null,
             .borrowed_is_cancelled = if (ctx.cancellation_probe != null) struct {
@@ -4679,6 +4692,7 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("missing body");
             };
         };
+        if (try establishPublicQueryDeadline(ctx, body_data)) |response| return response;
         // Body admission is released before expensive execution starts so
         // slow ingress and query compute cannot starve one another.
         var admission_lease: ?RequestAdmission.Lease = null;
@@ -5809,6 +5823,7 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("missing body");
             };
         };
+        if (try establishPublicQueryDeadline(ctx, body_data)) |response| return response;
         var admission_lease: ?RequestAdmission.Lease = null;
         if (try self.acquirePublicOperation(ctx, "queryTable", &admission_lease)) |response| return response;
         defer self.releasePublicOperation("queryTable", &admission_lease);

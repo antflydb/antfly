@@ -11406,7 +11406,8 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
         try ensureTableOperationActive(request);
-        const response = self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation, null, null, null) catch |err| switch (err) {
+        const native_deadline = table_catalog.RoutingBudget.init(null).deadlineFrom(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io });
+        const response = self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation, null, null, null, native_deadline) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -11512,6 +11513,7 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
         catalog_resolver: ?*CatalogQueryResolver,
+        incoming_deadline_ns: ?u64,
     ) !query_api.QueryResponse {
         var catalog_arena = std.heap.ArenaAllocator.init(alloc);
         defer catalog_arena.deinit();
@@ -11522,7 +11524,7 @@ pub const ApiHttpServer = struct {
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const retry_io = self.sharedApiIo();
         const start_ns = retryMonotonicNs(retry_io);
-        const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(alloc, body) catch return error.InvalidQueryRequest;
+        const request_deadline_ns = query_contract.publicQueryDeadline(alloc, body, false, incoming_deadline_ns) catch return error.InvalidQueryRequest;
         const retry_deadline_ns = retryDeadlineFromNative(retry_io, request_deadline_ns);
         while (true) {
             try ensureRequestActive(cancellation);
@@ -15346,7 +15348,8 @@ pub const ApiHttpServer = struct {
         defer diagnostic_scope.deinit();
 
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.query) == .query);
-        var admission_lease = self.acquireQuery(body.len, .{}) catch |err| switch (err) {
+        const deadline = try query_contract.publicQueryDeadline(self.alloc, body, false, null);
+        var admission_lease = self.acquireQuery(body.len, .{ .deadline_ns = deadline }) catch |err| switch (err) {
             error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionWaitTimeout => return error.RequestAdmissionExhausted,
             else => return err,
         };
@@ -15367,6 +15370,7 @@ pub const ApiHttpServer = struct {
             null,
             null,
             null,
+            deadline,
         );
         defer query_response.deinit(self.alloc);
         return try result_alloc.dupe(u8, query_response.json);
@@ -16096,7 +16100,10 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
-        var admission_lease = self.acquireQuery(body.len, .{ .cancellation = if (cancellation) |signal| signal.token() else .none }) catch |err|
+        var scoped = http_common.RequestCancellation.fromToken(if (cancellation) |signal| signal.token() else .none);
+        scoped.query_deadline_ns = query_contract.publicQueryDeadline(self.alloc, body, isNdjsonContentType(content_type), if (cancellation) |signal| signal.query_deadline_ns else null) catch
+            return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
+        var admission_lease = self.acquireQuery(body.len, .{ .cancellation = scoped.token(), .deadline_ns = scoped.query_deadline_ns }) catch |err|
             return self.foregroundAdmissionFailure(err);
         defer admission_lease.release();
         return try self.handleAdmittedPublicTableQueryWithContentTypeCancellation(
@@ -16104,7 +16111,7 @@ pub const ApiHttpServer = struct {
             body,
             content_type,
             authenticated_identity,
-            cancellation,
+            &scoped,
         );
     }
 
@@ -16122,13 +16129,15 @@ pub const ApiHttpServer = struct {
         if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithCancellation(table_name, body, borrowed_identity, cancellation, null, null);
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*owned| owned.deinit(self.alloc);
-        const deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
+        const deadline = query_contract.publicQueryDeadline(self.alloc, body, false, if (cancellation) |signal| signal.query_deadline_ns else null) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
+        var scoped = http_common.RequestCancellation.fromToken(if (cancellation) |signal| signal.token() else .none);
+        scoped.query_deadline_ns = deadline;
         var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer catalog_arena.deinit();
         var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
         var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer binding.deinit();
-        return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver);
+        return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, &scoped, binding.label, if (binding.join) |*value| value else null, &resolver);
     }
 
     pub fn handleAdmittedResolvedTableQueryWithContentTypeCancellation(
@@ -16161,10 +16170,13 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
-        var admission_lease = self.acquireQuery(body.len, .{ .cancellation = if (cancellation) |signal| signal.token() else .none }) catch |err|
+        var scoped = http_common.RequestCancellation.fromToken(if (cancellation) |signal| signal.token() else .none);
+        scoped.query_deadline_ns = query_contract.publicQueryDeadline(self.alloc, body, true, if (cancellation) |signal| signal.query_deadline_ns else null) catch
+            return self.publicQueryOperationErrorResponse("", body, error.InvalidQueryRequest);
+        var admission_lease = self.acquireQuery(body.len, .{ .cancellation = scoped.token(), .deadline_ns = scoped.query_deadline_ns }) catch |err|
             return self.foregroundAdmissionFailure(err);
         defer admission_lease.release();
-        return try self.handleAdmittedPublicGlobalMultiQueryWithCancellation(body, authenticated_identity, cancellation);
+        return try self.handleAdmittedPublicGlobalMultiQueryWithCancellation(body, authenticated_identity, &scoped);
     }
 
     pub fn handleAdmittedPublicGlobalMultiQueryWithCancellation(
@@ -16343,6 +16355,7 @@ pub const ApiHttpServer = struct {
             response_label,
             bound_join,
             catalog_resolver,
+            if (cancellation) |signal| signal.query_deadline_ns else null,
         ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
         self.reachQueryResultLifecycle("public.table.query", table_name, query_response.json.len) catch |err| {
             query_response.deinit(self.alloc);
@@ -16372,6 +16385,9 @@ pub const ApiHttpServer = struct {
         var diagnostic_context: query_request_diagnostics.Context = .{};
         const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
+
+        const batch_deadline = query_contract.publicQueryDeadline(self.alloc, body, true, if (cancellation) |signal| signal.query_deadline_ns else null) catch
+            return self.publicQueryOperationErrorResponse(route_table_name orelse "", body, error.InvalidQueryRequest);
 
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
@@ -16411,7 +16427,7 @@ pub const ApiHttpServer = struct {
 
             var line_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
             defer if (line_identity) |*identity| identity.deinit(self.alloc);
-            const deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, line) catch return self.publicQueryOperationErrorResponse(logical_table_name, line, error.InvalidQueryRequest);
+            const deadline = batch_deadline;
             var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, logical_table_name, line, &line_identity, &catalog_resolver) catch |err| return self.publicQueryOperationErrorResponse(logical_table_name, line, err);
             defer binding.deinit();
             const table_name = binding.physical;
@@ -16439,6 +16455,7 @@ pub const ApiHttpServer = struct {
                 line_label,
                 if (binding.join) |*value| value else bound_join,
                 &catalog_resolver,
+                deadline,
             ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
             defer query_response.deinit(self.alloc);
             try self.reachQueryResultLifecycle(
@@ -25516,7 +25533,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     ));
 }
 
-test "api http plain public query preserves outer absolute request deadline" {
+test "api http plain public query preserves outer absolute request deadline through workload admission" {
     const alloc = std.testing.allocator;
     const outer_deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
 
@@ -25630,6 +25647,25 @@ test "api http plain public query preserves outer absolute request deadline" {
     );
     defer response.deinit(alloc);
     try std.testing.expectEqualStrings("{\"hits\":[],\"total\":0}", response.json);
+    var retried = try server.executePublicTableQueryDispatchWithReadinessRetry(
+        alloc,
+        reads.source(),
+        "docs",
+        body,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        outer_deadline_ns,
+    );
+    defer retried.deinit(alloc);
+    var expired: http_common.RequestCancellation = .{ .query_deadline_ns = 0 };
+    var rejected = try server.handlePublicTableQueryWithContentTypeCancellation("docs", body, null, null, &expired);
+    defer rejected.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 504), rejected.status);
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
 }
 
 test "api http hierarchy traversal preserves policy and cursor across remote hydration seam" {
@@ -49705,7 +49741,7 @@ test "system catalog plain retries and joined graph reads reuse request identity
             "}",
         });
         defer alloc.free(body);
-        var response = try server.executePublicTableQueryDispatchWithReadinessRetry(alloc, reads, "docs", body, null, null, null, null, null, &resolver);
+        var response = try server.executePublicTableQueryDispatchWithReadinessRetry(alloc, reads, "docs", body, null, null, null, null, null, &resolver, null);
         defer response.deinit(alloc);
         try std.testing.expectEqual(@as(usize, if (joined) 1 else 2), fake.queries);
         try std.testing.expectEqual(@as(usize, 1), fake.bindings);

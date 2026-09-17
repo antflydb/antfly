@@ -236,10 +236,12 @@ class StatefulQueryRequest:
                 it when a reranker is configured: Antfly retrieves a bounded candidate
                 window and applies offset after coordinator-owned reranking.
             timeout_ms (int | Unset): Optional query execution deadline in milliseconds. The server applies this as a
-                cooperative deadline across query planning, search execution, aggregation reruns,
+                cooperative deadline across admission waiting, query planning, search execution, aggregation reruns,
                 sorting, and response post-processing. If the deadline expires before the query
                 completes, the HTTP API returns 504. When omitted, semantic query embedding planning
                 and provider I/O use a 30-second default deadline.
+                NDJSON batches share their submission time and use the shortest explicit timeout
+                in the batch. Waiting, retries, and later batch lines do not reset this budget.
                  Example: 5000.
             order_by (list[SortField] | Unset): Sort order for results. Array of sort fields with direction.
                 Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
