@@ -3629,6 +3629,20 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    /// `ensureDeviceResident` for a tensor this call owns. A successful
+    /// upload releases the host copy and returns the device tensor; a
+    /// backend that keeps host tensors returns the input unchanged; an
+    /// upload error releases the input before propagating. Callers hand
+    /// over ownership at the call and never hold a tensor that may be gone.
+    pub fn ensureDeviceResidentOwned(self: *const ComputeBackend, tensor: CT) !CT {
+        errdefer self.free(tensor);
+        if (try self.ensureDeviceResident(tensor)) |device| {
+            self.free(tensor);
+            return device;
+        }
+        return tensor;
+    }
+
     /// Fused residual add and layer norm returning both the sum (the new
     /// residual stream) and the normalized tensor. Null when the backend has
     /// no fused kernel or an input is not device resident.

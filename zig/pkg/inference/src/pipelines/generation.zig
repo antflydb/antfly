@@ -5783,13 +5783,7 @@ pub const NativeGenerationPipeline = struct {
         // The prompt embeddings were assembled on the host. The layer stack
         // takes its fast, framed prefill route only for device-resident
         // input, so upload once here instead of per op below.
-        const input_embeddings = blk: {
-            if (try self.cb.ensureDeviceResident(host_embeddings)) |device| {
-                self.cb.free(host_embeddings);
-                break :blk device;
-            }
-            break :blk host_embeddings;
-        };
+        const input_embeddings = try self.cb.ensureDeviceResidentOwned(host_embeddings);
         // This owner keeps the rows only until the forward takes them.
         var owns_input_embeddings = true;
         errdefer if (owns_input_embeddings) self.cb.free(input_embeddings);

@@ -1402,11 +1402,7 @@ const AudioLayerInputs = struct {
 /// consumer, so nothing uploads inside the encoder frame.
 fn deviceResidentFromFloat32(cb: *const ComputeBackend, data: []const f32, shape: []const i32) !CT {
     const host = try cb.fromFloat32Shape(data, shape);
-    if (try cb.ensureDeviceResident(host)) |resident| {
-        cb.free(host);
-        return resident;
-    }
-    return host;
+    return cb.ensureDeviceResidentOwned(host);
 }
 
 /// Per-stage accounting for one clip, printed with
@@ -1787,11 +1783,7 @@ fn projectorConv2dWeightCt(
         out_channels: usize,
         fn call(self: @This()) !CT {
             const host = try loadConv2dWeightCt(self.cb, self.allocator, self.store.gguf, self.name, self.kernel_h, self.kernel_w, self.in_channels, self.out_channels);
-            if (try self.cb.ensureDeviceResident(host)) |resident| {
-                self.cb.free(host);
-                return resident;
-            }
-            return host;
+            return self.cb.ensureDeviceResidentOwned(host);
         }
     };
     return store.cached(name, Load{ .cb = cb, .allocator = allocator, .store = store, .name = name, .kernel_h = kernel_h, .kernel_w = kernel_w, .in_channels = in_channels, .out_channels = out_channels });
@@ -3491,4 +3483,43 @@ test "audio layer inputs survive allocation failures without leaks or double fre
         initAudioLayerInputsUnderAllocationFaults,
         .{ cfg, @as([]const bool, &valid_mask), @as([]const []const f32, &per_dim) },
     );
+}
+
+const FailingUploadBackend = struct {
+    const native_compute = @import("../ops/native_compute.zig");
+
+    fn ensureDeviceResident(_: *anyopaque, _: CT) anyerror!?CT {
+        return error.OutOfMemory;
+    }
+
+    fn vtable() ComputeBackend.VTable {
+        var table = native_compute.vtable_impl;
+        table.ensureDeviceResident = ensureDeviceResident;
+        return table;
+    }
+};
+
+// A failed upload must release the host tensor it was handed; the testing
+// allocator reports the leak otherwise.
+test "device residency helper releases the host tensor when the upload fails" {
+    const native_compute = @import("../ops/native_compute.zig");
+    const allocator = std.testing.allocator;
+    var store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer native_compute.deinitPrefetchQueue(&store);
+    var compute = native_compute.NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const table = FailingUploadBackend.vtable();
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &table };
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const shape = [_]i32{ 2, 2 };
+    try std.testing.expectError(error.OutOfMemory, deviceResidentFromFloat32(&cb, &data, &shape));
+
+    // A backend without device residency hands the host tensor back to the caller.
+    const plain = compute.computeBackend();
+    const kept = try deviceResidentFromFloat32(&plain, &data, &shape);
+    defer plain.free(kept);
+    const readback = try plain.toFloat32(kept, allocator);
+    defer allocator.free(readback);
+    try std.testing.expectEqualSlices(f32, &data, readback);
 }
