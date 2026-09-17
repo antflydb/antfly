@@ -505,8 +505,14 @@ pub const SessionDetails = struct {
     tables: []SessionTableDetail,
     read_snapshots: []SessionReadSnapshot,
     savepoint_ids: []u64,
+    catalog_bindings: []CatalogBinding = &.{},
 
     pub fn deinit(self: *SessionDetails, alloc: std.mem.Allocator) void {
+        for (self.catalog_bindings) |binding| {
+            alloc.free(binding.logical);
+            alloc.free(binding.physical);
+        }
+        alloc.free(self.catalog_bindings);
         for (self.tables) |*table| table.deinit(alloc);
         if (self.tables.len > 0) alloc.free(self.tables);
         for (self.read_snapshots) |*snapshot| snapshot.deinit(alloc);
@@ -2105,12 +2111,35 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
         var session = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return null;
         defer session.deinit(alloc);
-        return .{
+        var details: SessionDetails = .{
             .status = try sessionStatusFromSession(self, alloc, &session),
-            .tables = try sessionTableDetails(alloc, session.staged),
-            .read_snapshots = try sessionReadSnapshots(alloc, &session),
-            .savepoint_ids = try sessionSavepointIds(alloc, &session),
+            .tables = &.{},
+            .read_snapshots = &.{},
+            .savepoint_ids = &.{},
         };
+        errdefer details.deinit(alloc);
+        details.tables = try sessionTableDetails(alloc, session.staged);
+        details.read_snapshots = try sessionReadSnapshots(alloc, &session);
+        details.savepoint_ids = try sessionSavepointIds(alloc, &session);
+        if (session.staged) |*staged| {
+            var bindings = std.ArrayList(CatalogBinding).empty;
+            errdefer {
+                for (bindings.items) |binding| {
+                    alloc.free(binding.logical);
+                    alloc.free(binding.physical);
+                }
+                bindings.deinit(alloc);
+            }
+            for (staged.catalog_bindings.items) |binding| {
+                const logical = try alloc.dupe(u8, binding.logical);
+                errdefer alloc.free(logical);
+                const physical = try alloc.dupe(u8, binding.physical);
+                errdefer alloc.free(physical);
+                try bindings.append(alloc, .{ .logical = logical, .physical = physical });
+            }
+            details.catalog_bindings = try bindings.toOwnedSlice(alloc);
+        }
+        return details;
     }
 
     pub fn listStatuses(self: *SessionRegistry, alloc: std.mem.Allocator) ![]SessionStatus {

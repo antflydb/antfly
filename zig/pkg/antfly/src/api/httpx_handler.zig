@@ -4348,6 +4348,7 @@ pub const AntflyApiHandler = struct {
             error.UniqueConstraintViolation,
             error.ForeignKeyMatchFullViolation,
             error.ForeignKeyActionInProgress,
+            error.ForeignKeyActionConflict,
             error.PreparedReadSetChanged,
             error.VersionConflict,
             error.PreparedGenerationChanged,

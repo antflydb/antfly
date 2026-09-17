@@ -1472,7 +1472,7 @@ pub const TxnManager = struct {
 
         var next = try self.alloc.alloc([]u8, resolved.len + 1);
         var initialized: usize = 0;
-        errdefer {
+        defer {
             for (next[0..initialized]) |entry| self.alloc.free(entry);
             self.alloc.free(next);
         }
@@ -1482,7 +1482,6 @@ pub const TxnManager = struct {
         }
         next[resolved.len] = try self.alloc.dupe(u8, participant);
         initialized += 1;
-        defer freeParticipantList(self.alloc, next);
         const key = makeSidecarKey(resolved_participants_prefix, txn_id);
         const encoded = try encodeParticipantList(self.alloc, next);
         defer self.alloc.free(encoded);
@@ -4077,6 +4076,27 @@ test "recoverTransactions cleans aborted orphaned intents and old record" {
         try std.testing.expect(err == error.NotFound);
     };
     try std.testing.expectError(TxnError.TxnNotFound, mgr.getTransactionStatus(txn_id));
+}
+
+test "transaction participant resolution releases allocations once on every failure" {
+    const Check = struct {
+        fn run(failing: Allocator) !void {
+            const alloc = std.testing.allocator;
+            var backend = mem_backend.Backend.init(alloc, .{});
+            defer backend.close();
+            var runtime = try backend.runtimeStore(alloc, .{});
+            defer runtime.deinit();
+            var mgr = try TxnManager.init(alloc, &runtime);
+            defer mgr.deinit();
+            const txn: TxnId = @splat(38);
+            try mgr.initTransactionWithParticipants(txn, 100, &.{ "first", "second" });
+            try mgr.markParticipantResolved(txn, "first");
+            mgr.alloc = failing;
+            defer mgr.alloc = alloc;
+            try mgr.markParticipantResolved(txn, "second");
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "transaction participants track unresolved members" {

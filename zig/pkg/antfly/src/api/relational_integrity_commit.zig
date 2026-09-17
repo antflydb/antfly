@@ -117,6 +117,7 @@ const Loaded = struct {
     catalog: catalog.Catalog,
     uniques: []const native.UniqueConstraint,
     foreign: []const native.ForeignKey,
+    plan: ?planner.Plan = null,
 };
 
 const Work = struct {
@@ -128,7 +129,42 @@ const Work = struct {
     queued: bool = false,
     dirty: bool = false,
     explicit: bool = false,
+    expansion: ?planner.Expansion = null,
 };
+
+// Use the same scalar coercions as row preparation. JSON spelling is not
+// equality (notably timestamps and exact integer number strings).
+fn assignmentEqual(table: *const Loaded, name: []const u8, a: std.json.Value, b: std.json.Value) !bool {
+    const columns = table.view.tableSchema().relational_columns;
+    const ordinal = table.view.physicalLayout().ordinalForName(columns, name) orelse return error.InvalidIntegrityRecord;
+    return scalarAssignmentEqual(columns[ordinal].column_type, a, b);
+}
+
+fn scalarAssignmentEqual(kind: schema.RelationalColumnType, a: std.json.Value, b: std.json.Value) !bool {
+    if (a == .null or b == .null) return a == .null and b == .null;
+    return switch (kind) {
+        .datetime => (schema_api.documentDateTimeToNs(a) orelse return error.InvalidIntegrityRecord) ==
+            (schema_api.documentDateTimeToNs(b) orelse return error.InvalidIntegrityRecord),
+        .integer => (schema_api.documentIntegerToI64(a) orelse return error.InvalidIntegrityRecord) ==
+            (schema_api.documentIntegerToI64(b) orelse return error.InvalidIntegrityRecord),
+        .number => (schema_api.documentNumberToF64(a) orelse return error.InvalidIntegrityRecord) ==
+            (schema_api.documentNumberToF64(b) orelse return error.InvalidIntegrityRecord),
+        .boolean => if (a == .bool and b == .bool) a.bool == b.bool else error.InvalidIntegrityRecord,
+        .string, .blob => if (a == .string and b == .string) std.mem.eql(u8, a.string, b.string) else error.InvalidIntegrityRecord,
+        else => error.InvalidIntegrityRecord,
+    };
+}
+
+test "distributed txn cascade scalar equality uses row coercions without losing integer precision" {
+    try std.testing.expect(try scalarAssignmentEqual(.datetime, .{ .string = "2026-01-02T00:00:00Z" }, .{ .string = "2026-01-02T00:00:00.000Z" }));
+    try std.testing.expect(try scalarAssignmentEqual(.integer, .{ .number_string = "9007199254740993.0" }, .{ .integer = 9007199254740993 }));
+    try std.testing.expect(!try scalarAssignmentEqual(.integer, .{ .number_string = "9007199254740993.0" }, .{ .integer = 9007199254740992 }));
+    try std.testing.expect(try scalarAssignmentEqual(.number, .{ .integer = 1 }, .{ .float = 1.0 }));
+    try std.testing.expect(!try scalarAssignmentEqual(.number, .{ .integer = 1 }, .{ .integer = 2 }));
+    try std.testing.expect(try scalarAssignmentEqual(.integer, .null, .null));
+    try std.testing.expect(!try scalarAssignmentEqual(.integer, .null, .{ .integer = 0 }));
+    try std.testing.expectError(error.InvalidIntegrityRecord, scalarAssignmentEqual(.datetime, .{ .string = "invalid" }, .{ .integer = 0 }));
+}
 
 const Builder = struct {
     const FinalReference = struct { child: *Work, definition: native.ForeignKey, address: planner.storage.Address, reference: planner.storage.Reference };
@@ -338,6 +374,9 @@ const Builder = struct {
     }
 
     fn enqueue(self: *Builder, item: *Work) !void {
+        // Prior expansions may still be traversed by a cyclic cascade. Their
+        // storage lives in the request arena; only invalidate the cache here.
+        item.expansion = null;
         item.dirty = true;
         if (item.queued) return;
         try self.queue.append(self.alloc, item);
@@ -346,8 +385,8 @@ const Builder = struct {
     }
 
     fn expandWork(self: *Builder, item: *Work) !planner.Expansion {
-        var plan = try self.bindingPlan(item.table);
-        defer plan.deinit();
+        if (item.expansion) |expansion| return expansion;
+        const plan = try self.bindingPlan(item.table);
         const view = item.table.view;
         var before: ?mapper.PreparedRelationalWrite = if (item.before) |row| try mapper.PreparedRelationalWrite.init(self.alloc, item.key, row.json, null, view.tableSchema().*, view.physicalLayout()) else null;
         defer if (before) |*row| row.deinit(self.alloc);
@@ -360,7 +399,9 @@ const Builder = struct {
             try self.charge(normalized.len);
             item.after = normalized;
         };
-        return plan.expand(self.alloc, &.{.{ .key = item.key, .before = if (before) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .after = if (after) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .repair = self.repairing(item.table.name) }});
+        item.expansion = try plan.expand(self.alloc, &.{.{ .key = item.key, .before = if (before) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .after = if (after) |*row| try row.typedView(view.tableSchema().*, view.physicalLayout()) else null, .repair = self.repairing(item.table.name) }});
+        try self.charge(item.expansion.?.arena.queryCapacity());
+        return item.expansion.?;
     }
 
     fn childStillReferences(self: *Builder, item: *Work, definition: native.ForeignKey, address: planner.storage.Address, final_row: bool) !bool {
@@ -442,32 +483,27 @@ const Builder = struct {
             try self.enqueue(child);
             return;
         }
-        var child_json = try std.json.parseFromSlice(std.json.Value, self.alloc, child.after.?, .{ .allocate = .alloc_always, .parse_numbers = false });
+        var child_json = try std.json.parseFromSliceLeaky(std.json.Value, self.alloc, child.after.?, .{ .allocate = .alloc_always, .parse_numbers = false });
         // Parsed values are retained in the shared request arena by assignments.
-        const object = &child_json.value.object;
-        var parent_json: ?std.json.Parsed(std.json.Value) = if (parent.after) |json| try std.json.parseFromSlice(std.json.Value, self.alloc, json, .{ .parse_numbers = false }) else null;
-        defer if (parent_json) |*value| value.deinit();
+        const object = &child_json.object;
+        const parent_json: ?std.json.Value = if (parent.after) |json| try std.json.parseFromSliceLeaky(std.json.Value, self.alloc, json, .{ .allocate = .alloc_always, .parse_numbers = false }) else null;
         var changed = false;
         for (definition.child_columns, definition.parent_columns) |child_column, parent_column| {
             // MATCH PARTIAL's NULL components are wildcards, not assignments.
             // CASCADE only transports components the child actually supplies.
             if (definition.match == .partial and action == .cascade and (object.get(child_column) orelse .null) == .null) continue;
-            const next: std.json.Value = if (action == .set_null) .null else parent_json.?.value.object.get(parent_column) orelse return error.InvalidIntegrityRecord;
-            const encoded_next = try std.json.Stringify.valueAlloc(self.alloc, next, .{});
-            const copied = try std.json.parseFromSlice(std.json.Value, self.alloc, encoded_next, .{ .allocate = .alloc_always, .parse_numbers = false });
+            const next: std.json.Value = if (action == .set_null) .null else parent_json.?.object.get(parent_column) orelse return error.InvalidIntegrityRecord;
             if (child.assignments.get(child_column)) |prior| {
-                const encoded_prior = try std.json.Stringify.valueAlloc(self.alloc, prior, .{});
-                if (!std.mem.eql(u8, encoded_prior, encoded_next)) return error.ForeignKeyActionConflict;
+                if (!try assignmentEqual(child.table, child_column, prior, next)) return error.ForeignKeyActionConflict;
             }
             const existing = object.get(child_column) orelse .null;
-            const encoded_existing = try std.json.Stringify.valueAlloc(self.alloc, existing, .{});
-            if (std.mem.eql(u8, encoded_existing, encoded_next)) continue;
-            try child.assignments.put(self.alloc, try self.alloc.dupe(u8, child_column), copied.value);
-            try object.put(self.alloc, child_column, copied.value);
+            if (try assignmentEqual(child.table, child_column, existing, next)) continue;
+            try child.assignments.put(self.alloc, try self.alloc.dupe(u8, child_column), next);
+            try object.put(self.alloc, child_column, next);
             changed = true;
         }
         if (changed) {
-            child.after = try std.json.Stringify.valueAlloc(self.alloc, child_json.value, .{});
+            child.after = try std.json.Stringify.valueAlloc(self.alloc, child_json, .{});
             try self.charge(child.after.?.len);
             try self.enqueue(child);
         }
@@ -607,6 +643,7 @@ const Builder = struct {
 
     fn deinit(self: *Builder) void {
         for (self.loaded.items) |table| {
+            if (table.plan) |*plan| plan.deinit();
             table.view.release();
             table.catalog.deinit();
         }
@@ -670,8 +707,9 @@ const Builder = struct {
         return table;
     }
 
-    fn bindingPlan(self: *Builder, table: *Loaded) !planner.Plan {
-        return self.bindingPlanSelected(table, true, true);
+    fn bindingPlan(self: *Builder, table: *Loaded) !*planner.Plan {
+        if (table.plan == null) table.plan = try self.bindingPlanSelected(table, true, true);
+        return &table.plan.?;
     }
 
     fn bindingPlanSelected(self: *Builder, table: *Loaded, with_unique: bool, with_foreign: bool) !planner.Plan {
@@ -821,8 +859,7 @@ fn prepareModeInternal(alloc: Allocator, source: reads.TableReadSource, metadata
         try builder.control.ensureActive();
         const item = builder.queue.items[queue_index];
         item.queued = false;
-        var expansion = try builder.expandWork(item);
-        defer expansion.deinit();
+        const expansion = try builder.expandWork(item);
         for (expansion.parents) |transition| try builder.expandParent(item, transition);
     }
     // Replace only coordinated primary tables with their final row work set.
@@ -1582,6 +1619,28 @@ test "distributed txn public integrity adapter enlists generated parent commands
     var stale = request[0];
     stale.relational_schema_version = 2;
     try std.testing.expectError(error.PreparedGenerationChanged, prepare(alloc, source, &metadata, &.{stale}));
+
+    // Closure traversal and command emission share the exact expansion. A
+    // changed row invalidates only that expansion, not immutable table plans.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = &metadata };
+    defer builder.deinit();
+    const loaded = try builder.load("children");
+    var work: Work = .{ .table = loaded, .key = "child-1", .before = null, .after = request[0].writes[0].value };
+    const first = try builder.expandWork(&work);
+    const bytes = builder.prepared_bytes;
+    for (0..1000) |_| {
+        const cached = try builder.expandWork(&work);
+        try std.testing.expectEqual(first.commands.ptr, cached.commands.ptr);
+    }
+    try std.testing.expectEqual(bytes, builder.prepared_bytes);
+    const plan = try builder.bindingPlan(loaded);
+    work.after = "{\"tenant\":\"Acme\",\"id\":2,\"payload\":\"changed\"}";
+    try builder.enqueue(&work);
+    const changed = try builder.expandWork(&work);
+    try std.testing.expect(first.commands.ptr != changed.commands.ptr);
+    try std.testing.expectEqual(plan, try builder.bindingPlan(loaded));
 }
 
 test "distributed txn atomic cascade closure handles delete cycles update cycles and set null" {

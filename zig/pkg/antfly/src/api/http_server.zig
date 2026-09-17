@@ -11481,22 +11481,58 @@ pub const ApiHttpServer = struct {
         return try authorized.toOwnedSlice(self.alloc);
     }
 
+    /// Public labels identify the original statement, not its current authority.
+    /// Resolve pinned storage identities once under a revision fence, including
+    /// read-only sessions and tables that do not need FK coordination.
+    fn currentTransactionResources(self: *ApiHttpServer, alloc: std.mem.Allocator, bindings: []const transactions_api.CatalogBinding) !std.StringHashMapUnmanaged([]const u8) {
+        var result: std.StringHashMapUnmanaged([]const u8) = .empty;
+        if (self.source.vtable.system_catalog == null) return result;
+        var names: std.ArrayList([]const u8) = .empty;
+        var positions: std.StringHashMapUnmanaged(usize) = .empty;
+        for (bindings) |binding| {
+            const entry = try positions.getOrPut(alloc, binding.physical);
+            if (entry.found_existing) continue;
+            entry.value_ptr.* = names.items.len;
+            try names.append(alloc, binding.physical);
+        }
+        const resources = try alloc.alloc([]const u8, names.items.len);
+        var revision: ?u64 = null;
+        var start: usize = 0;
+        while (start < names.items.len) {
+            const end = @min(names.items.len, start + 256);
+            const bytes = try self.source.systemCatalog(alloc, .{}, .{ .resolve_many = .{ .storage_names = names.items[start..end], .expected_revision = revision } });
+            const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{});
+            if (resolved.logical_names.len != end - start) return error.CatalogRoutingUnavailable;
+            revision = resolved.revision;
+            for (resolved.logical_names, resources[start..end]) |name, *resource| resource.* = name orelse "";
+            start = end;
+        }
+        for (bindings) |binding| try result.put(alloc, binding.logical, resources[positions.get(binding.physical).?]);
+        return result;
+    }
+
     fn transactionSessionDetailsAuthorized(
         self: *ApiHttpServer,
         authenticated_identity: ?AuthenticatedIdentity,
         details: transactions_api.SessionDetails,
     ) !bool {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const resources = try self.currentTransactionResources(arena.allocator(), details.catalog_bindings);
         for (details.tables) |table| {
+            const resource = resources.get(table.table_name) orelse table.table_name;
+            if (resource.len == 0) return false;
             if ((table.staged_read_count > 0 or table.staged_predicate_count > 0) and
-                !admittedTablePermissionAllowed(authenticated_identity, table.table_name, .read)) return false;
+                !admittedTablePermissionAllowed(authenticated_identity, resource, .read)) return false;
             if ((table.staged_write_count > 0 or table.staged_delete_count > 0) and
-                !admittedTablePermissionAllowed(authenticated_identity, table.table_name, .write)) return false;
+                !admittedTablePermissionAllowed(authenticated_identity, resource, .write)) return false;
         }
         for (details.read_snapshots) |snapshot| {
-            if (!admittedTablePermissionAllowed(authenticated_identity, snapshot.table_name, .read)) return false;
+            const resource = resources.get(snapshot.table_name) orelse snapshot.table_name;
+            if (resource.len == 0 or !admittedTablePermissionAllowed(authenticated_identity, resource, .read)) return false;
             if (!(try self.transactionReadSnapshotVisible(
                 authenticated_identity,
-                snapshot.table_name,
+                resource,
                 snapshot.key,
                 snapshot.document_json,
             ))) return false;
@@ -11509,16 +11545,22 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         request: transactions_api.OwnedTransactionCommitRequest,
     ) !bool {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const resources = try self.currentTransactionResources(arena.allocator(), request.catalog_bindings.items);
         for (request.read_set) |read| {
+            const resource = resources.get(read.table_name) orelse read.table_name;
+            if (resource.len == 0) return false;
             if (!(try self.transactionReadKeyAuthorized(
                 authenticated_identity,
-                read.table_name,
+                resource,
                 read.key,
                 request.physicalName(read.table_name),
             ))) return false;
         }
         for (request.tables) |table| {
-            if (!admittedTablePermissionAllowed(authenticated_identity, table.table_name, .write)) return false;
+            const resource = resources.get(table.table_name) orelse table.table_name;
+            if (resource.len == 0 or !admittedTablePermissionAllowed(authenticated_identity, resource, .write)) return false;
         }
         return true;
     }
