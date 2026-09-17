@@ -40,10 +40,47 @@ retained bytes, expirations, cancellations, and draining are observable through
 the shared admission metrics. Explicit zero execution capacity retains its legacy
 unlimited meaning; explicit byte ceilings still apply to contextual leases.
 
-The Go SDK has an optional shared client pool. It bounds active operations and
-waiting, observes context cancellation before dispatch, and holds a slot through
-response EOF/Close. It preserves unknown write outcomes and does not add automatic
-write retries. Other SDK pooling work remains outstanding.
+The Go, TypeScript, Python, and Rust SDKs have optional shared client pools. They bound active operations and
+waiting, observe context cancellation before dispatch, and hold a slot through
+response EOF/Close. They preserve unknown write outcomes and do not add automatic
+write retries. TypeScript shares pools across database/inference clients; Python
+shares a FIFO across synchronous threads and generated asyncio calls. Python's
+canceled stream cleanup retains a slot until its separately owned cleanup task
+finishes. Rust's `PooledClient` constructs the request future after admission and
+retains capacity in an `Admitted<T>` wrapper through stream ownership. Safe read
+retries remain outstanding.
+
+Public query timeouts are captured before admission and retained through catalog
+binding, execution, and readiness retries. Native and runtime clock domains are
+translated by remaining duration without extending the deadline. NDJSON batches
+use one submission time and the shortest explicit timeout; later lines cannot
+restart the budget. Deadline extraction skips unrelated JSON fields rather than
+allocating a full vector/document tree before admission.
+Serverless execution carries the captured deadline through a scoped cancellation
+token. HTTP token adapters preserve fallible checkpoints and their timeout cause.
+
+## Execution ownership core (not enabled for operators)
+
+`common/workload_resources.zig` implements typed, generation-checked leases over
+a fixed metadata pool. Atomic count/byte/working-set grants preserve protected
+floors for each lane. Queue, runnable, retained state, resume queue, local I/O,
+remote attempts, and recovery credits have distinct ownership. A request cannot
+release live children; detached state transfers ownership without changing global
+charges. Policy reductions preserve live reservations while rejecting growth.
+
+`common/workload_scheduler.zig` supplies weighted service accounting corrected by
+measured work, bounded resource-fit backfill, and deterministic large-request
+barriers. Timer polling does not earn service credit. Existing continuations
+reuse their reserved metadata and state when queueing for resumption, so full
+start queues cannot prevent their progress. They precede new starts in their lane.
+Grant/cancel races restore retained state to its caller, and resume cannot reduce
+the charge below the state still owned. Transfers reject active execution or
+queued ownership so scheduling identity cannot change underneath a waiter.
+
+These modules are tested foundations. Their credit ledger is not a replacement
+for resource-manager allocation reservations, worker fencing, or durable write
+recovery. Production operators do not use this scheduler yet. Their integration
+must supply audited completion bundles and separately charged actual allocations.
 
 ## Configuration
 
@@ -95,6 +132,14 @@ zig build antfly-common-config-test -j2
 zig build antfly-workload-admission-test -j2
 cd ../go/pkg/sdk
 go test -race ./...
+cd ../../../ts
+pnpm --filter @antfly/sdk test
+pnpm --filter @antfly/sdk typecheck
+cd ../py/packages/sdk
+uv run pytest
+uv run pyright
+cd ../../../rs
+cargo test -p antfly-sdk
 ```
 
 The dedicated Zig target covers FIFO pressure, count/byte bounds, deadline/grant
@@ -116,10 +161,12 @@ Network tests need permission to bind local listening sockets.
   resource-fit backfill, bounded/general lane isolation, measured service debt,
   demotion transfers, helper/fan-out accounting, remote uncertainty fencing,
   and recovery handoff.
-- Implement Phase 3 remaining SDK pooling and safe read retries, Cloud diagnostics
+- Implement Phase 3 safe read retries, Cloud diagnostics
   and policy integration, adaptive control behind an explicit mode, and deployment
   qualification. Select numerical acceptance thresholds before measurements and
   retain both open-loop and closed-loop results before changing defaults.
 
 Passing queue correctness tests does not satisfy the full design's release gates.
 Automatic/adaptive modes and new default waiting policies remain unavailable.
+The [qualification matrix](WORKLOAD_SCHEDULING_QUALIFICATION.md) records actual
+Cloud package sizes and numerical release thresholds selected before measurement.

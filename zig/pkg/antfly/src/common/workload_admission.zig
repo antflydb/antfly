@@ -33,12 +33,12 @@ pub const Options = struct {
     cancellation: CancellationToken = .none,
     retained_bytes: usize = 0,
 
-    fn now(self: Options) u64 {
+    pub fn now(self: Options) u64 {
         if (self.native_now_ns) |native| return native();
         return @intCast(@max(0, std.Io.Clock.now(.awake, self.clock_io orelse self.io).nanoseconds));
     }
 
-    fn check(self: Options) !void {
+    pub fn check(self: Options) !void {
         try self.cancellation.check();
         if (self.deadline_ns) |deadline| if (self.now() >= deadline) return error.DeadlineExceeded;
     }
