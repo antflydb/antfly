@@ -1517,9 +1517,15 @@ fn shouldAutoUseMetalWholeModelGenerate(
     deepseek_compressed_cache: bool,
     prompt_cache_requested: bool,
     speculation_requested: bool,
+    has_multimodal_input: bool,
     selection: GenerateBackendSelection,
 ) bool {
     if (!build_options.enable_metal) return false;
+    // The whole-model executor prefills from token ids into its own KV
+    // storage. Image and audio prompts are prefilled from projected
+    // embeddings on the eager decode state instead, so the executor would
+    // start decoding with an empty cache and fail its position check.
+    if (has_multimodal_input) return false;
     // An eligible cache request must stay on the eager paged-KV route. Silently
     // auto-selecting whole-model compiled execution would ignore an explicit
     // prompt_cache_key and make the opt-in cache appear enabled but inert.
@@ -1536,6 +1542,14 @@ fn shouldAutoUseMetalWholeModelGenerate(
     if (selection.compiled_partition_backend != null) return false;
     if (selection.native_choice == .native) return false;
     return loaded_backend == .metal and metal_executor_supported and !deepseek_compressed_cache;
+}
+
+fn generateMessagesHaveMedia(messages: []const generation.Message) bool {
+    for (messages) |message| {
+        if (message.image_bytes) |images| if (images.len > 0) return true;
+        if (message.audio_bytes) |clips| if (clips.len > 0) return true;
+    }
+    return false;
 }
 
 fn validatePromptCacheExecutionMode(
@@ -11666,6 +11680,7 @@ pub const Node = struct {
             generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
             config.prompt_cache_enabled,
             config.speculation_requested,
+            generateMessagesHaveMedia(messages.items),
             backend_selection,
         );
         const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
@@ -27443,12 +27458,14 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expect(auto_compiled.graph_mode_requested);
 
     const auto_default = try parseGenerateBackendSelection(null, null, null);
-    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, true, auto_default));
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, true, false, auto_default));
+    // Image and audio prompts stay on the eager route (see the function).
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, true, auto_default));
     try validatePromptCacheExecutionMode(true, auto_default);
 
     const explicit_compiled = try parseGenerateBackendSelection(null, "compiled", null);
@@ -27461,7 +27478,7 @@ test "generate backend selection keeps compiled mode explicit" {
     if (build_options.enable_metal) {
         const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
         try std.testing.expect(metal_eager.eager_mode_requested);
-        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, metal_eager));
+        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, false, metal_eager));
     } else {
         try std.testing.expectError(
             error.BackendUnavailable,
