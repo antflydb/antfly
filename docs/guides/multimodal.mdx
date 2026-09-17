@@ -49,8 +49,8 @@ ClipClap embeds text, images, and audio into one vector space. Install it once:
 antfly inference pull antflydb/clipclap:gguf:Q4_K
 ```
 
-Restart `antfly standalone` if the running inference service does not discover
-the newly installed model.
+The running service discovers the newly installed model on its next model-list
+or inference request; no restart is needed.
 
 ### Define the Source Field
 
