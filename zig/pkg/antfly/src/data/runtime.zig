@@ -37079,7 +37079,7 @@ fn implementationTests() type {
             }
         }
 
-        test "DataServer store status retries leadership changes on borrowed VoprIo" {
+        test "DataServer store status retries leadership and socket failures on borrowed VoprIo" {
             const alloc = std.testing.allocator;
 
             var tmp = std.testing.tmpDir(.{});
@@ -37243,35 +37243,37 @@ fn implementationTests() type {
             // would already have elapsed, for both publication and registration.
             server.setRemoteMetadataFetchErrorForTest(null);
             for ([_]bool{ true, false }) |registered| {
-                server.clearMetadataBootstrapRetry();
-                server.store_registration_confirmed = registered;
-                server.store_status_dirty.store(true, .release);
-                remote_metadata.cached_snapshot_at_ms = remote_metadata.awakeMs();
-                metadata_transport.delayed_error = error.NotLeader;
-                const started_at_ms = server.backgroundMonotonicMs();
-                const requests_before = metadata_transport.requests;
-                try server.runStoreStatusRoundOnly();
-                const failed_at_ms = server.backgroundMonotonicMs();
-                try std.testing.expectEqual(started_at_ms + 2000, failed_at_ms);
-                try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
-                try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
-                const delayed_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
-                try std.testing.expect(delayed_retry_at_ms >= failed_at_ms + metadata_bootstrap_retry_base_ms);
-                try std.testing.expect(delayed_retry_at_ms <= failed_at_ms + metadata_bootstrap_retry_base_ms + metadata_bootstrap_retry_jitter_ms);
-                try std.testing.expect(server.store_status_dirty.load(.acquire));
+                for ([_]anyerror{ error.NotLeader, error.ConnectionResetByPeer }) |transport_error| {
+                    server.clearMetadataBootstrapRetry();
+                    server.store_registration_confirmed = registered;
+                    server.store_status_dirty.store(true, .release);
+                    remote_metadata.cached_snapshot_at_ms = remote_metadata.awakeMs();
+                    metadata_transport.delayed_error = transport_error;
+                    const started_at_ms = server.backgroundMonotonicMs();
+                    const requests_before = metadata_transport.requests;
+                    try server.runStoreStatusRoundOnly();
+                    const failed_at_ms = server.backgroundMonotonicMs();
+                    try std.testing.expectEqual(started_at_ms + 2000, failed_at_ms);
+                    try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
+                    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+                    const delayed_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
+                    try std.testing.expect(delayed_retry_at_ms >= failed_at_ms + metadata_bootstrap_retry_base_ms);
+                    try std.testing.expect(delayed_retry_at_ms <= failed_at_ms + metadata_bootstrap_retry_base_ms + metadata_bootstrap_retry_jitter_ms);
+                    try std.testing.expect(server.store_status_dirty.load(.acquire));
 
-                // No new transport call may start until the delay after completion
-                // expires. A permanent failure at that boundary must still escape.
-                metadata_transport.delayed_error = error.MetadataIncarnationMismatch;
-                try server.runStoreStatusRoundOnly();
-                vopr_io.monotonic_ns = @as(i96, delayed_retry_at_ms - 1) * std.time.ns_per_ms;
-                try server.runStoreStatusRoundOnly();
-                try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
-                vopr_io.monotonic_ns += std.time.ns_per_ms;
-                try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
-                try std.testing.expectEqual(requests_before + 2, metadata_transport.requests);
-                try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
-                try std.testing.expectEqual(delayed_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
+                    // No new transport call may start until the delay after completion
+                    // expires. A permanent failure at that boundary must still escape.
+                    metadata_transport.delayed_error = error.MetadataIncarnationMismatch;
+                    try server.runStoreStatusRoundOnly();
+                    vopr_io.monotonic_ns = @as(i96, delayed_retry_at_ms - 1) * std.time.ns_per_ms;
+                    try server.runStoreStatusRoundOnly();
+                    try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
+                    vopr_io.monotonic_ns += std.time.ns_per_ms;
+                    try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
+                    try std.testing.expectEqual(requests_before + 2, metadata_transport.requests);
+                    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+                    try std.testing.expectEqual(delayed_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
+                }
             }
             try vopr_io.ensureNoCapabilityViolation();
         }

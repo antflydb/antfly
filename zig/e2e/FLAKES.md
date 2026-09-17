@@ -15,6 +15,10 @@ soak runs this exact E2E 50 times with normal limits and 50 times with 256 descr
 The test preserves one restore idempotency key across uncertain admission, accepts
 only documented committed delete outcomes, and retains the original 120-second
 completion assertion. Timeout diagnostics include fresh metadata and observed jobs.
+Run profiles sequentially at the scheduled two-cluster limit: a four-cluster local
+experiment exhausted TCP ports. Its fatal generic HTTP write error also led to a
+deterministic socket-reset regression and transport-identity fix; see the runtime
+record for the failed experiment and its limits.
 
 ## 2026-09-16: constrained Autograph restart exited during teardown
 

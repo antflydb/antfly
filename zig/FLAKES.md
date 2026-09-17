@@ -57,6 +57,24 @@ both failure formats so the existing HTTP 503 retry path remains available. The
 create harness recognizes the documented text rejections only with explicit
 non-admission headers; uncertain/committed outcomes still fail without replay.
 
+A first post-fix experiment ran both profiles concurrently (four six-process
+clusters), exceeding the scheduled two-cluster concurrency. It was stopped after
+20 completed cases (15 passed, five failed) when the host reached 48,342 TCP sockets
+in `TIME_WAIT`, matching the previously recorded local socket-pressure failure.
+Failures included lost seed connections, replication/election deadlines, a batch
+conflict, and a data control-loop exit with `WriteFailed`; none reproduced the
+original restore admission stall. These results do not qualify the native soak.
+
+The fatal write error exposed a separate HTTP boundary defect. A deterministic
+injected socket reset returned generic `WriteFailed` instead of
+`ConnectionResetByPeer`. The direct HTTP send path now unwraps the network writer's
+stored error and retires the failed connection. It preserves uncertain delivery
+and makes no automatic mutation retry. Generic non-network writer errors retain
+their identity. Executor tests cover GET/POST, one write attempt, delivery state,
+and pool retirement; the VOPR status test covers delayed socket failures and the
+existing backoff/deadline rules. The injected regression establishes this transport
+bug, although the retained process log cannot identify the original socket errno.
+
 ## 2026-09-16: constrained Autograph restart lost retryable owner admission
 
 The second retained-corpus qualification of PR #704 at `81ab94c8b1` failed its
