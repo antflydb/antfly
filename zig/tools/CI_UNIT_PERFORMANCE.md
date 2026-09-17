@@ -487,3 +487,61 @@ delete, and merge ownership cleanup. The final HITS build passed 19/19 steps;
 its clean test took 0.903 s. Formatting and whitespace checks also passed.
 The final HITS case and narrow/wide native reopen plus the new relocation
 contract also passed with allocator backtraces enabled, with no leaks.
+
+## Follow-up: remaining centroid reconstruction work
+
+A fresh Debug sample and a two-second ReleaseFast sample confirmed that source
+leaf removal still spends substantial time reconstructing centroids. The
+optimized sample exposed raw-vector staging copies as well as the required
+centroid/radius arithmetic. The point-loader fallback first loaded all raw
+vectors into a second leaf-sized matrix, then transformed them into the
+caller's destination matrix.
+
+The fallback now loads and transforms one vector at a time using the existing
+single-vector scratch. It retains `getVectorInto`'s cache/invalidation behavior,
+all centroid and covering-radius arithmetic, and the specialized batch-loader
+paths. It retains no transformed-vector cache across mutations. For 168 members
+and 1,536 dimensions, the removed raw staging allocation is 1,032,192 bytes per
+reconstruction; generally it is `members × dimensions × sizeof(f32)`.
+
+Three alternating ReleaseFast runs of matching instrumented before/after
+binaries, with the original 4,096-vector fixture and backtraces disabled, gave:
+
+| Median duration | Before | After |
+| --- | ---: | ---: |
+| Eight update batches | 1.571 s | 1.495 s |
+| Complete test process | 2.283 s | 2.176 s |
+
+This is a modest local improvement (about 5%), with one after-run slower than
+its paired before-run. The deterministic benefit is removal of the extra raw
+matrix. The ordinary DB index manager already installs a transformed batch
+loader, so these measurements do not establish a speedup for that path.
+
+The new regression covers L2, cosine, and inner-product transforms, nontrivial
+ID order, a vector revision after cache invalidation, and no raw batch staging
+in the apply-workspace high-water mark. Against the original implementation,
+it fails with `expected 0, found 24` bytes for three two-dimensional vectors.
+The initial focused validation passed 25 executions with no leaks, including
+narrow/wide reopen, deferred publication, coalesced centroids, external previous
+vectors, deletion/merge cleanup, and the existing bulk split workspace contract.
+
+Further reducing full centroid passes is a separate algorithm change: a
+normalized cosine centroid does not retain the magnitude of its vector sum,
+so subtracting the removed vector from it cannot recover the exact mean.
+Maintaining authoritative unnormalized sums would need explicit handling of
+external current/previous revisions, coalesced updates, split/merge transitions,
+and reopen. This change preserves the existing arithmetic and routing instead.
+
+Expanded diagnostic selection (`external` plus the focused vector filters)
+ran 139 executions: 134 passed, one skipped, four failed, with no leaks. All
+27 selected `storage.hbc_adapter` tests passed. The four imported API failures
+were then run against the pre-change implementation and reproduced identically:
+
+- Hosted profiled dense query after an external write-sync batch: `StoredDocMissing`.
+- Cold profiled dense query after external write-sync batches: `IndexNotFound`.
+- Managed startup catch-up of external dense gaps: `result.had_debt` assertion.
+- Public dense projection readiness: expected progress `0.999`, got `0`.
+
+These are separate follow-ups from the centroid change. This manually broadened
+diagnostic selection does not establish the status of their owning CI targets;
+the latest full gate is not claimed green.
