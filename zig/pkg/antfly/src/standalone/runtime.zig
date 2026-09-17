@@ -761,6 +761,8 @@ const LocalStandaloneMetadata = struct {
 
     system_catalog_state: ?system_catalog.MutableState = null,
     routing_generation: ?*antfly.public_api.table_catalog.RoutingGeneration = null,
+    join_planning_generation: ?*antfly.public_api.join_planning.Generation = null,
+    join_planning_epoch: u64 = 0,
     const CatalogCreate = struct {
         schema_version: u32 = 4,
         kind: enum { table_create } = .table_create,
@@ -940,6 +942,7 @@ const LocalStandaloneMetadata = struct {
             self.alloc.destroy(cache);
         }
         if (self.routing_generation) |generation| generation.release();
+        if (self.join_planning_generation) |generation| generation.release();
         if (self.system_catalog_state) |*state| state.deinit();
         self.vector_migration_commands.deinit(self.alloc);
         if (self.operator_lock) |file| file.close(self.backend_runtime.filesystemIo().?);
@@ -985,6 +988,7 @@ const LocalStandaloneMetadata = struct {
                 .status = status,
                 .system_catalog = systemCatalog,
                 .supports_query_definitions = true,
+                .acquire_join_planning = acquireJoinPlanning,
                 .admin_snapshot = catalogAdminSnapshot,
                 .cached_admin_snapshot = cachedAdminSnapshot,
                 .linearizable_snapshot = linearizableSnapshot,
@@ -1175,6 +1179,51 @@ const LocalStandaloneMetadata = struct {
         }
         self.mutex.unlock();
         if (previous) |generation| generation.release();
+        return next;
+    }
+
+    fn acquireJoinPlanning(ptr: *anyopaque, budget: antfly.public_api.table_router.RouteBudget) !?*antfly.public_api.join_planning.Generation {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        try budget.check();
+        const deadline_ns = (antfly.public_api.table_catalog.RoutingBudget{}).deadlineFrom(budget.clock);
+        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        if (self.catalog_durability_failed) {
+            self.mutex.unlock();
+            return error.MetadataMutationOutcomeUnknown;
+        }
+        if (self.join_planning_generation) |generation| {
+            if (self.join_planning_epoch == self.epoch) {
+                const retained = generation.retain();
+                self.mutex.unlock();
+                errdefer retained.release();
+                try budget.check();
+                return retained;
+            }
+        }
+        self.mutex.unlock();
+        // Reuse the compact, coherently captured tables and ranges. Building
+        // planning indexes never requires an administrative snapshot.
+        const routing = try acquireRoutingGeneration(ptr, deadline_ns, false);
+        defer routing.release();
+        const snapshot = routing.indexed.snapshot.value;
+        const next = try antfly.public_api.join_planning.Generation.create(self.alloc, .{
+            .tables = snapshot.tables,
+            .ranges = snapshot.ranges,
+            .merged_group_statuses = @as([]const antfly.metadata.reconciler.MergedGroupStatus, &.{}),
+        }, budget);
+        errdefer next.release();
+        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        var previous: ?*antfly.public_api.join_planning.Generation = null;
+        if (!self.catalog_durability_failed and self.epoch == snapshot.catalog_revision) {
+            previous = self.join_planning_generation;
+            self.join_planning_generation = next.retain();
+            self.join_planning_epoch = snapshot.catalog_revision;
+        }
+        const durability_failed = self.catalog_durability_failed;
+        self.mutex.unlock();
+        if (previous) |generation| generation.release();
+        if (durability_failed) return error.MetadataMutationOutcomeUnknown;
+        try budget.check();
         return next;
     }
 
@@ -10270,6 +10319,38 @@ test "runtime lease watchdog publishes active self-fenced proof from exact expir
 test "standalone metadata catalog source provides compact routing" {
     var metadata: LocalStandaloneMetadata = undefined;
     _ = try metadata.catalogSource().routingSource();
+}
+
+test "system catalog standalone join planning retains and replaces compact generations" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    try metadata.manager.upsertTable(.{ .table_id = 77, .name = "docs" });
+    try metadata.manager.upsertRange(.{ .table_id = 77, .group_id = 101, .range_id = 1, .start_key = "" });
+    const source = metadata.statusSource();
+    const first = (try source.acquireJoinPlanning(.{})).?;
+    defer first.release();
+    const reused = (try source.acquireJoinPlanning(.{})).?;
+    defer reused.release();
+    try std.testing.expect(first == reused);
+    try std.testing.expectEqualSlices(u64, &.{101}, first.findTable("docs").?.group_ids);
+
+    try std.testing.expect(metadata.manager.removeRange(101));
+    try metadata.manager.upsertRange(.{ .table_id = 77, .group_id = 102, .range_id = 1, .start_key = "" });
+    metadata.epoch += 1;
+    const replaced = (try source.acquireJoinPlanning(.{})).?;
+    defer replaced.release();
+    try std.testing.expect(first != replaced);
+    try std.testing.expectEqualSlices(u64, &.{102}, replaced.findTable("docs").?.group_ids);
+    try std.testing.expectEqualSlices(u64, &.{101}, first.findTable("docs").?.group_ids);
+    metadata.catalog_durability_failed = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.acquireJoinPlanning(.{}));
 }
 
 test "runtime lease watchdog fetch and validation failures publish no bootstrap capability" {

@@ -33365,7 +33365,23 @@ pub const DB = struct {
         if (self.open_mode == .status_only) return error.UnsupportedOperation;
         lockApply(self);
         defer self.core.unlockApply();
-        try doc_identity.reassignNamespaceAlloc(self.alloc, self.core.store, namespace);
+        var migration = try vector_migration.load(self.alloc, self.core.store);
+        defer if (migration) |*job| job.deinit();
+        var migration_update: ?[]u8 = null;
+        defer if (migration_update) |raw| self.alloc.free(raw);
+        if (migration) |job| {
+            try self.validateVectorMigrationIdentity(job.value);
+            if (job.value.active()) return error.VectorMigrationActive;
+            var rebound = job.value;
+            const identity = try std.json.Stringify.valueAlloc(self.alloc, namespace, .{});
+            defer self.alloc.free(identity);
+            rebound.table_identity = identity;
+            migration_update = try std.json.Stringify.valueAlloc(self.alloc, rebound, .{});
+        }
+        try doc_identity.reassignNamespaceWithMetadataAlloc(self.alloc, self.core.store, namespace, if (migration_update) |raw|
+            &.{.{ .key = vector_migration.contract.job_key, .value = raw }}
+        else
+            &.{});
         self.core.identity_namespace = namespace;
         if (self.transaction_recovery_identity_context) |ctx| ctx.updateIdentityNamespace(namespace);
     }
@@ -67324,7 +67340,7 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
             }
             try database.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
             try database.saveAllLiveIndexStatusSnapshots(database.alloc);
-            const initial_status = (try database.loadIndexStatusSnapshot(database.alloc, "g")) orelse return error.TestUnexpectedResult;
+            const initial_status = (try database.loadIndexStatusSnapshot(database.alloc, "g")) orelse return error.GraphStatusSnapshotMissing;
             try std.testing.expectEqual(@as(u64, 200 * std.time.ns_per_day), initial_status.updated_at_ns);
             try database.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "a", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
             try database.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
@@ -67341,13 +67357,13 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
             try std.testing.expectError(error.RaftApplyWriterUnavailable, database.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(@as(u64, 1), (try database.raftAppliedEntry()).?.index);
             database.startResidentBackgroundWorkersIfNeeded();
-            try std.testing.expect(database.artifact_repair_metadata_future != null);
+            if (database.artifact_repair_metadata_future == null) return error.GraphMaintenanceWorkerMissing;
             const graph = &database.core.index_manager.graphIndex("g").?.index;
             for (0..100) |_| {
                 if (!graph.ownershipTransitionPending()) break;
                 try io.sleep(.fromMilliseconds(100), .awake);
             }
-            try std.testing.expect(!graph.ownershipTransitionPending());
+            if (graph.ownershipTransitionPending()) return error.GraphOwnershipCleanupTimedOut;
             try database.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 });
             try std.testing.expectEqual(@as(u64, 2), (try database.raftAppliedEntry()).?.index);
             try std.testing.expectEqualStrings("", database.getRange().end);
@@ -67368,7 +67384,17 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
         try scheduler.enumerateReady(&enabled, alloc);
         try enabled.canonicalize();
         try std.testing.expect(enabled.items.items.len != 0);
-        try scheduler.executeReady(enabled.items.items[0].id, &events, alloc);
+        // This is a bounded liveness check: run ready work before advancing
+        // time. Canonical ID order alone may repeatedly pick the observer's
+        // timer while starving the maintenance worker it is waiting for.
+        var selected = enabled.items.items[0];
+        for (enabled.items.items) |candidate| {
+            if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
+                selected = candidate;
+                break;
+            }
+        }
+        try scheduler.executeReady(selected.id, &events, alloc);
     }
     try std.testing.expect(scheduler.quiescent());
     try future.await(runtime_io.io());
@@ -130555,6 +130581,53 @@ test "source vector migration budget rejection is retryable and cancellation sur
     var status = (try vector_migration.load(alloc, db.core.store)).?;
     defer status.deinit();
     try std.testing.expectEqual(@as(u64, 2), status.value.ownership_epoch);
+}
+
+test "source vector migration namespace reassignment preserves terminal receipts across reopen" {
+    const alloc = std.testing.allocator;
+    inline for (.{ false, true }) |complete| {
+        var tmp = try TestDirectory.init("migration-identity-transition");
+        defer tmp.cleanup();
+        const path = std.mem.span(tmp.path().ptr);
+        const original: doc_identity.Namespace = .{ .table_id = 10, .shard_id = 20 };
+        const target: doc_identity.Namespace = .{ .table_id = 30, .shard_id = 40 };
+        const options: OpenOptions = .{ .identity_namespace = original, .start_index_workers = false, .start_optional_runtimes = false };
+        const request: vector_migration.contract.Request = .{ .job_id = "identity", .mode = .online, .budget = .{ .disk_reserve_bytes = 0 } };
+        {
+            var db = try DB.open(alloc, path, options);
+            defer db.close();
+            try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write });
+            try db.startVectorMigration(request);
+            try std.testing.expectError(error.VectorMigrationActive, db.reassignIdentityNamespaceForInternalTransition(target));
+            try std.testing.expect((try doc_identity.loadNamespaceFromStore(db.core.store)).?.eql(original));
+            if (complete) {
+                for (0..256) |_| {
+                    var job = (try vector_migration.load(alloc, db.core.store)).?;
+                    defer job.deinit();
+                    if (job.value.phase == .complete) break;
+                    if (job.value.phase == .ready) try db.publishVectorMigration(request.job_id) else try db.advanceVectorMigration(request.job_id);
+                } else return error.VectorMigrationDidNotFinish;
+            } else {
+                try db.cancelVectorMigration(request.job_id);
+                for (0..256) |_| {
+                    var job = (try vector_migration.load(alloc, db.core.store)).?;
+                    defer job.deinit();
+                    if (job.value.phase == .cancelled) break;
+                    try db.advanceVectorMigration(request.job_id);
+                } else return error.VectorMigrationDidNotFinish;
+            }
+            try db.reassignIdentityNamespaceForInternalTransition(target);
+        }
+        var reopened_options = options;
+        reopened_options.identity_namespace = target;
+        var reopened = try DB.open(alloc, path, reopened_options);
+        defer reopened.close();
+        var receipt = (try vector_migration.load(alloc, reopened.core.store)).?;
+        defer receipt.deinit();
+        try reopened.validateVectorMigrationIdentity(receipt.value);
+        try std.testing.expectEqualStrings(request.job_id, receipt.value.job_id);
+        try std.testing.expectEqual(if (complete) vector_migration.contract.Phase.complete else .cancelled, receipt.value.phase);
+    }
 }
 
 test "source vector migration cancelled snapshot preserves old readers and rejects a replacement" {
