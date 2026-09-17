@@ -1784,7 +1784,12 @@ test "relational index system LSM build work is linear in rows times indexes" {
         const declaration = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
         defer alloc.free(declaration);
         try db.setSchemaJson(alloc, declaration);
-        for (0..count) |i| try write(&db, i, i % 4);
+        const edge_keys = [_][]const u8{ "a", "a\x00", "a\x00\xff", "aa" };
+        for (0..count) |i| {
+            if (i < edge_keys.len) {
+                try db.batch(.{ .writes = &.{.{ .key = edge_keys[i], .value = "{\"tenant\":1,\"id\":1}" }} });
+            } else try write(&db, i, i % 4);
+        }
         // Reopen against persisted LSM data. Every unrelated generation is
         // populated before measuring even the first target's verification.
         db.close();

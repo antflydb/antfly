@@ -1305,7 +1305,7 @@ pub const Client = struct {
         return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Repair version-conditional rows after failed constraint activation
+    /// Repair version-conditional rows after failed or diagnosed constraint activation
     /// POST /db/v1/tables/{tableName}/constraints/repair
     pub fn repairRelationalConstraints(self: *@This(), table_name: []const u8, body: types.RelationalRowMutationRequest) !ApiResponse(types.BatchResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);

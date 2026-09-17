@@ -92,13 +92,15 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: RelationalRowMutationRequest,
 ) -> Response[Any | BatchResponse | Error]:
-    """Repair version-conditional rows after failed constraint activation
+    """Repair version-conditional rows after failed or diagnosed constraint activation
 
      Requires table administrator permission. Each affected target range must
-    have failed UNIQUE/FK/CHECK activation. Replacement values still satisfy all
+    have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+    missing-parent diagnostic. Replacement values still satisfy all
     constraints, and referential actions require write permission on every
     affected table. Existing dependencies remain protected. Repairs do not
-    mark historical coverage valid; invoke constraint retry after repairs.
+    mark historical coverage valid. Invoke constraint retry after repairing
+    failed activation; validating diagnostics resume validation automatically.
 
     Args:
         table_name (str):
@@ -131,13 +133,15 @@ def sync(
     client: AuthenticatedClient,
     body: RelationalRowMutationRequest,
 ) -> Any | BatchResponse | Error | None:
-    """Repair version-conditional rows after failed constraint activation
+    """Repair version-conditional rows after failed or diagnosed constraint activation
 
      Requires table administrator permission. Each affected target range must
-    have failed UNIQUE/FK/CHECK activation. Replacement values still satisfy all
+    have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+    missing-parent diagnostic. Replacement values still satisfy all
     constraints, and referential actions require write permission on every
     affected table. Existing dependencies remain protected. Repairs do not
-    mark historical coverage valid; invoke constraint retry after repairs.
+    mark historical coverage valid. Invoke constraint retry after repairing
+    failed activation; validating diagnostics resume validation automatically.
 
     Args:
         table_name (str):
@@ -165,13 +169,15 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: RelationalRowMutationRequest,
 ) -> Response[Any | BatchResponse | Error]:
-    """Repair version-conditional rows after failed constraint activation
+    """Repair version-conditional rows after failed or diagnosed constraint activation
 
      Requires table administrator permission. Each affected target range must
-    have failed UNIQUE/FK/CHECK activation. Replacement values still satisfy all
+    have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+    missing-parent diagnostic. Replacement values still satisfy all
     constraints, and referential actions require write permission on every
     affected table. Existing dependencies remain protected. Repairs do not
-    mark historical coverage valid; invoke constraint retry after repairs.
+    mark historical coverage valid. Invoke constraint retry after repairing
+    failed activation; validating diagnostics resume validation automatically.
 
     Args:
         table_name (str):
@@ -202,13 +208,15 @@ async def asyncio(
     client: AuthenticatedClient,
     body: RelationalRowMutationRequest,
 ) -> Any | BatchResponse | Error | None:
-    """Repair version-conditional rows after failed constraint activation
+    """Repair version-conditional rows after failed or diagnosed constraint activation
 
      Requires table administrator permission. Each affected target range must
-    have failed UNIQUE/FK/CHECK activation. Replacement values still satisfy all
+    have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+    missing-parent diagnostic. Replacement values still satisfy all
     constraints, and referential actions require write permission on every
     affected table. Existing dependencies remain protected. Repairs do not
-    mark historical coverage valid; invoke constraint retry after repairs.
+    mark historical coverage valid. Invoke constraint retry after repairing
+    failed activation; validating diagnostics resume validation automatically.
 
     Args:
         table_name (str):

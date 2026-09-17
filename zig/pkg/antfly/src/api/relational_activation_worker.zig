@@ -495,6 +495,15 @@ test "distributed txn MATCH PARTIAL diagnostic admits guarded deletion and corre
                 const txn = try self.db.beginTransactionWithId(@splat(self.sequence), stamp);
                 errdefer self.db.abortTransaction(txn, stamp + 1) catch {};
                 try self.db.writeTransaction(txn, .{ .relational_schema_version = request.relational_schema_version, .relational_integrity_generation_set = request.relational_integrity_generation_set, .relational_repair = request.relational_repair, .writes = request.writes, .deletes = request.deletes, .predicates = request.predicates, .integrity = request.integrity, .integrity_commands = request.integrity_commands, .relational_activation = request.relational_activation });
+                if (request.relational_repair) {
+                    // A concurrent diagnostic/checkpoint publication cannot
+                    // move the scan cut while this row repair is prepared.
+                    const raw = (try self.db.core.getStoreValue(std.testing.allocator, activation.key)).?;
+                    defer std.testing.allocator.free(raw);
+                    const concurrent = try self.db.beginTransactionWithId(@splat(200 + self.sequence), stamp + 1);
+                    defer self.db.abortTransaction(concurrent, stamp + 2) catch {};
+                    try std.testing.expectError(error.IntentConflict, self.db.writeTransaction(concurrent, .{ .relational_schema_version = request.relational_schema_version, .relational_integrity_generation_set = request.relational_integrity_generation_set, .relational_activation = .{ .routing_key = "", .expected = raw, .next = raw, .diagnostic = true } }));
+                }
                 try self.db.commitTransaction(txn, stamp + 1);
                 return .{ .committed = .{ .participant_count = 1 } };
             }

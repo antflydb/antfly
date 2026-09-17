@@ -976,12 +976,14 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Repair version-conditional rows after failed constraint activation
+         * Repair version-conditional rows after failed or diagnosed constraint activation
          * @description Requires table administrator permission. Each affected target range must
-         *     have failed UNIQUE/FK/CHECK activation. Replacement values still satisfy all
+         *     have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+         *     missing-parent diagnostic. Replacement values still satisfy all
          *     constraints, and referential actions require write permission on every
          *     affected table. Existing dependencies remain protected. Repairs do not
-         *     mark historical coverage valid; invoke constraint retry after repairs.
+         *     mark historical coverage valid. Invoke constraint retry after repairing
+         *     failed activation; validating diagnostics resume validation automatically.
          */
         post: operations["repairRelationalConstraints"];
         delete?: never;

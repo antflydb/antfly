@@ -432,7 +432,7 @@ pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Repair version-conditional rows after failed constraint activation
+/// Repair version-conditional rows after failed or diagnosed constraint activation
 pub const RepairRelationalConstraintsPathParams = struct {
     table_name: []const u8,
 };
