@@ -1,5 +1,28 @@
 # Antfly Python SDK
 
+### Bounded client admission
+
+```python
+from antfly import AdmissionPool, AntflyClient, ClientAdmission
+
+pool = AdmissionPool(ClientAdmission(max_in_flight=16, max_queued=32, max_wait=0.1))
+client = AntflyClient("http://localhost:8080", admission=pool)
+```
+
+These limits are examples. Reuse clients and share a pool to bound aggregate
+database/inference requests. Synchronous threads and generated asyncio calls
+share the same bound. Queued asyncio task cancellation retires the request before
+dispatch. `ClientBusyError` means this attempt was not sent. Read or close
+response streams to release their slots. The optional HTTPX request extension
+`antfly_deadline` is an absolute `time.monotonic()` deadline for local admission;
+ordinary HTTPX network timeouts still apply after dispatch. No automatic write
+retry is added, and a connection failure can leave a write's outcome unknown.
+
+For direct HTTPX usage, `AdmissionHTTPClient` and `AdmissionAsyncHTTPClient` accept
+the pool plus normal HTTPX constructor options, preserving connection reuse,
+proxy configuration, authentication, and custom transports. Async pooling uses
+asyncio. Close the underlying synchronous/asynchronous clients when done.
+
 [![PyPI version](https://badge.fury.io/py/antfly-sdk.svg)](https://badge.fury.io/py/antfly-sdk)
 [![Python](https://img.shields.io/pypi/pyversions/antfly.svg)](https://pypi.org/project/antfly-sdk/)
 

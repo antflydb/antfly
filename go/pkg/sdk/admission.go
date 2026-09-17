@@ -74,11 +74,19 @@ func (t *admissionTransport) RoundTrip(req *http.Request) (*http.Response, error
 		if t.maxWait == 0 {
 			return nil, ErrClientBusy
 		}
+		waitDeadline := time.Now().Add(t.maxWait)
 		timer := time.NewTimer(t.maxWait)
 		defer timer.Stop()
 		select {
 		case t.active <- struct{}{}:
 			acquired = true
+			// A ready timer and a grant can win the same select. Expired
+			// waiters return both reservations without reaching the network.
+			if !time.Now().Before(waitDeadline) {
+				<-t.active
+				acquired = false
+				return nil, ErrClientBusy
+			}
 		case <-req.Context().Done():
 			return nil, req.Context().Err()
 		case <-timer.C:

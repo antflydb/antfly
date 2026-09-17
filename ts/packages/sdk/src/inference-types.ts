@@ -85,6 +85,8 @@ export type ResponseData<T extends keyof operations> = operations[T]["responses"
 
 // Client configuration
 export interface InferenceConfig {
+  /** Share an AdmissionPool with database clients to bound aggregate requests. */
+  admission?: import("./admission.js").ClientAdmission | import("./admission.js").AdmissionPool;
   /** Base URL of the Inference API server (e.g., "http://localhost:8080/api") */
   baseUrl: string;
   /** Additional headers to include in requests */

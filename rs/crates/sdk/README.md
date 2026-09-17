@@ -51,6 +51,42 @@ generated method (e.g. `query_table`, `batch_write`) builds its own
 completed result or a pending commit decode into `MutationOutcome<T>`
 (`Completed(T)` or `Committed(types::CommittedMutationOutcome)`).
 
+## Bounded client admission
+
+Reuse a client and an optional admission pool across tasks. These example limits
+are application policy, not server defaults:
+
+```rust
+use antfly_sdk::{AdmissionConfig, AdmissionPool, Client, PooledClient};
+use std::time::Duration;
+use tokio::time::Instant;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let pool = AdmissionPool::new(AdmissionConfig {
+    max_in_flight: 16,
+    max_queued: 32,
+    max_wait: Duration::from_millis(100),
+})?;
+let client = PooledClient::new(Client::new("http://localhost:8080"), pool);
+let deadline = Instant::now() + Duration::from_secs(2);
+let status = client.run(Some(deadline), |client| client.get_status()).await?;
+println!("{:?}", *status);
+drop(status);
+# Ok(())
+# }
+```
+
+Cloning `PooledClient` shares its pool. Queued futures retire on cancellation, and
+the same absolute deadline covers local admission and the request future. A
+returned `Admitted<T>` holds its slot until dropped; use its `map` method when
+converting a response to a stream so the stream retains the reservation. Bound
+subsequent stream reads by the original deadline as well. Consume or drop
+responses promptly.
+
+`AdmissionError` means the operation was never dispatched. A request deadline or
+transport error after dispatch may leave a write's outcome unknown. The pool
+does not retry writes or turn an ambiguous outcome into a definite failure.
+
 ## Used by
 
 [`rs/crates/pgaf`](../pgaf) depends on `antfly-sdk` for its generated types

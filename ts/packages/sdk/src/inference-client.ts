@@ -4,6 +4,7 @@
  */
 
 import createClient, { type Client } from "openapi-fetch";
+import { admissionFetch } from "./admission.js";
 import { readLimitedResponseBytes, readLimitedResponseText } from "./client.js";
 import { deserializeEmbeddings } from "./inference-codec.js";
 import type {
@@ -93,8 +94,10 @@ export class InferenceClient {
   private baseUrl: string;
   private headers: Record<string, string>;
   private maxBinaryResponseBytes: number;
+  private readonly fetch: typeof globalThis.fetch;
 
   constructor(config: InferenceConfig) {
+    this.fetch = admissionFetch(config.admission);
     this.baseUrl = normalizeBaseUrl(config.baseUrl);
     this.headers = {
       "Content-Type": "application/json",
@@ -112,7 +115,8 @@ export class InferenceClient {
         ...this.headers,
         Accept: "application/json",
       },
-      fetch: (request) => fetchLimitedInferenceResponse(request, this.maxBinaryResponseBytes),
+      fetch: (request) =>
+        fetchLimitedInferenceResponse(request, this.maxBinaryResponseBytes, this.fetch),
     });
   }
 
@@ -121,7 +125,7 @@ export class InferenceClient {
     request: Omit<GenerateRequest, "stream">,
     options?: RequestOptions
   ): Promise<GenerateResponse> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/generate`, {
+    const response = await this.fetch(`${this.baseUrl}/ai/v1/generate`, {
       method: "POST",
       headers: {
         ...this.headers,
@@ -151,7 +155,7 @@ export class InferenceClient {
     request: Omit<GenerateRequest, "stream">,
     options?: RequestOptions
   ): AsyncGenerator<GenerateChunk, void, void> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/generate`, {
+    const response = await this.fetch(`${this.baseUrl}/ai/v1/generate`, {
       method: "POST",
       headers: {
         ...this.headers,
@@ -257,7 +261,7 @@ export class InferenceClient {
     input: EmbedInput,
     options?: { truncate?: boolean }
   ): Promise<number[][]> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/embed`, {
+    const response = await this.fetch(`${this.baseUrl}/ai/v1/embed`, {
       method: "POST",
       headers: {
         ...this.headers,
@@ -713,9 +717,10 @@ function requestAcceptsEventStream(request: Request): boolean {
 
 async function fetchLimitedInferenceResponse(
   request: Request,
-  maxBinaryResponseBytes: number
+  maxBinaryResponseBytes: number,
+  fetch: typeof globalThis.fetch
 ): Promise<Response> {
-  const response = await globalThis.fetch(request);
+  const response = await fetch(request);
   if (!response.body) return response;
 
   const mediaType = responseMediaType(response);

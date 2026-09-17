@@ -469,6 +469,7 @@ export interface AntflyConfig {
   baseUrl: string;
   headers?: Record<string, string>;
   auth?: AntflyAuth;
+  admission?: import("./admission.js").ClientAdmission | import("./admission.js").AdmissionPool;
 }
 
 // Retrieval Agent types

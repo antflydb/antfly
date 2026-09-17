@@ -1,5 +1,23 @@
 # Antfly TypeScript SDK
 
+### Bounded client admission
+
+Reuse a client and optionally bound active requests and local waiting:
+
+```typescript
+import { AdmissionPool, AntflyClient, InferenceClient } from "@antfly/sdk";
+
+const admission = new AdmissionPool({ maxInFlight: 16, maxQueued: 32, maxWaitMs: 100 });
+const database = new AntflyClient({ baseUrl: "http://localhost:8080", admission });
+const inference = new InferenceClient({ baseUrl: "http://localhost:8080", admission });
+```
+
+These limits are examples. Sharing the pool bounds both clients together. A
+queued request observes its `AbortSignal` and wait ceiling; `ClientBusyError`
+means that attempt was not dispatched. Consume or cancel response streams to
+release their slots. Pooling is opt-in and adds no automatic write retries;
+a transport failure after dispatch may leave a write's outcome unknown.
+
 A TypeScript SDK for interacting with the Antfly API, suitable for both frontend and backend applications.
 
 ## Installation
