@@ -137,6 +137,8 @@ pub const CommandSpec = struct {
 };
 
 pub const TestSpec = struct {
+    /// This import-only root is completely covered by the full inference unit gate.
+    covered_by_inference: bool = false,
     step_name: []const u8,
     root_source_file: []const u8,
     description: []const u8,

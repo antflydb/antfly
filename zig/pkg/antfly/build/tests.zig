@@ -4030,13 +4030,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     unit_test_step.dependOn(&run_api_http_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
-    unit_test_step.dependOn(&run_raft_read_gate_tests.step);
+    // raft. already discovers the read-gate contracts; retain their focused target.
     unit_test_step.dependOn(&run_usermgr_abi_tests.step);
 
     unit_test_step.dependOn(&run_embedded_tests.step);
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     unit_test_step.dependOn(&run_capi_tests.step);
-    unit_test_step.dependOn(&run_lite_native_tests.step);
+    // The storage engine artifact owns Lite native tests; keep lite-native-test focused.
     unit_test_step.dependOn(&run_cmd_tests.step);
     unit_test_step.dependOn(&run_lite_cmd_tests.step);
     unit_test_step.dependOn(&run_introducer_tests.step);
@@ -4048,12 +4048,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
     unit_test_step.dependOn(&run_lib_api_docid_tests.step);
     unit_test_step.dependOn(&run_lib_db_result_shape_tests.step);
-    unit_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
+    // The Raft unit artifact owns this transition regression; its focused target remains.
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_algebraic_dynamic_template_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
     unit_test_step.dependOn(&run_api_restore_jobs_tests.step);
-    unit_test_step.dependOn(&run_portable_backup_tests.step);
+    // The storage support artifact owns portable backup; keep its focused target.
     unit_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
@@ -4164,7 +4164,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_vector_payload_tests = b.addRunArtifact(vector_payload_tests);
     const vector_payload_test_step = b.step("vector-payload-test", "Run source vector payload ownership and recovery tests");
     vector_payload_test_step.dependOn(&run_vector_payload_tests.step);
-    unit_test_step.dependOn(&run_vector_payload_tests.step);
+    // The storage support artifact owns vector payload tests; keep their focused target.
 
     const native_vector_store_test_mod = makeLmdbModule(b, "pkg/antfly/src/native_vector_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     native_vector_store_test_mod.addImport("bloom", bloom_mod);

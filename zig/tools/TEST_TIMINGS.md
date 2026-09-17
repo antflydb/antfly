@@ -141,3 +141,12 @@ optimization mode and fixtures fixed. Maintenance can also react to elapsed
 time, so this is a comparison of instrumentation configurations rather than
 an exact accounting of time spent only in stack capture. A leak in the default
 mode still fails the test; rerun with tracing for allocation-site diagnostics.
+
+## Ownership audit
+
+`make unit-test` also runs `unit-test-inventory`. It queries the actual selected
+inventories of all four unit gates, checks that aggregate exclusions preserve
+the original named-test union, and fails on repeated names. Inspect
+`zig-out/unit-test-inventory.json` for each test's owner. Anonymous `.test_0`
+reachability probes are preserved but excluded from name-based comparisons.
+The audit queries metadata/listing modes; it does not execute test bodies.

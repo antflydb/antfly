@@ -508,6 +508,7 @@ jobs:
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
+          tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
@@ -854,6 +855,7 @@ jobs:
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
+          tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py

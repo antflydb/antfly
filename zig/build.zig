@@ -949,7 +949,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     const run_httpx_client_lifecycle_tests = b.addRunArtifact(httpx_client_lifecycle_tests);
     b.step("lib-httpx-client-lifecycle-test", "Run HTTP client admission, release, and shutdown contracts").dependOn(&run_httpx_client_lifecycle_tests.step);
-    lib_httpx_test_step.dependOn(&run_httpx_client_lifecycle_tests.step);
+    // The complete HTTP library artifact already owns these lifecycle tests.
 
     const objectstore_tests = b.addTest(.{
         .root_module = objectstore_mod,
@@ -1213,7 +1213,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
     unit_test_step.dependOn(&pdf_integration.run.step);
-    unit_test_step.dependOn(&run_httpx_client_lifecycle_tests.step);
+    // HTTP client lifecycle tests belong to lib-test; keep their focused target.
     const vopr_test_step = owner_tests.vopr_test_step;
     const integration_test_step = owner_tests.integration_test_step;
     const chaos_test_step = owner_tests.chaos_test_step;
@@ -1571,5 +1571,11 @@ pub fn create(b: *std.Build) ?Artifacts {
         antfly_tests_build.labelTestRuns(b, lib_test_step);
     }
     @import("pkg/antfly/build/test_support.zig").configureSimpleTestRuns(b, test_step);
+    const unit_ownership_baseline = @import("pkg/antfly/build/unit_test_ownership.zig").apply(b, unit_test_step);
+    @import("pkg/antfly/build/unit_test_inventory.zig").add(b, unit_test_step, unit_ownership_baseline, &.{
+        lib_test_step,
+        &b.top_level_steps.get("inference-test").?.step,
+        &b.top_level_steps.get("inference-finetune-test").?.step,
+    });
     return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact };
 }

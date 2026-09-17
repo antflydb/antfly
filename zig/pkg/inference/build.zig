@@ -1502,7 +1502,7 @@ pub fn build(b: *std.Build) void {
     const finetune_ctx = finetune_common.fromWorkflow(workflow_ctx);
     _ = finetune_tools.register(finetune_ctx);
     _ = finetune_workflows.register(finetune_ctx);
-    const finetune_test_step = finetune_tests.addTests(finetune_ctx, "test-finetune");
+    const finetune_test_step = finetune_tests.addTests(finetune_ctx, "test-finetune", false);
     finetune_test_step.dependOn(finetune_common.addCommandChecks(finetune_ctx, &(finetune_tools.specs ++ finetune_workflows.specs)));
 
     const run_quant_kernel_compiler_tests = b.addRunArtifact(tests);

@@ -38,7 +38,7 @@ test: ## Run the default Zig test aggregate with bounded scheduler memory.
 
 # PR CI uses reusable workflows from main; enable timings in the checked-out command too.
 unit-test: ## Run the existing repository unit gate across libraries, Antfly, and inference.
-	ANTFLY_TEST_TIMINGS="$${ANTFLY_TEST_TIMINGS:-$${CI:+1}}" python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build lib-test antfly-unit-test inference-test inference-finetune-test $(ZIG_BUILD_FLAGS)
+	ANTFLY_TEST_TIMINGS="$${ANTFLY_TEST_TIMINGS:-$${CI:+1}}" python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build lib-test antfly-unit-test inference-test inference-finetune-test unit-test-inventory $(ZIG_BUILD_FLAGS)
 
 antfly-unit-test: ## Run hermetic Antfly unit tests with bounded scheduler memory.
 	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build antfly-unit-test $(ZIG_BUILD_FLAGS)

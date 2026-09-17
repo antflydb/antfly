@@ -245,6 +245,49 @@ for local, CI, explicit-on, and explicit-off invocations. The current PR's CI
 log therefore cannot yet provide the new per-test records; do not substitute
 the unrelated PR #773 run's 52-minute unit measurement for this PR's result.
 
+## Unique ownership across the default unit gate
+
+The compiled inventory audit now covers `lib-test`, `antfly-unit-test`,
+`inference-test`, and `inference-finetune-test`, including linked consumer
+executables, standard Zig protocol runners, inference runtime filters, and
+both DB-core partitions. With CPU backends on macOS Debug, the before/after
+comparison is **17,613 named executions → 16,357**, preserving exactly the same
+**16,357 distinct named tests**: **1,256 repeated executions removed**, zero
+missing or additional names. Namespace exclusions leave anonymous `.test_0`
+reachability probes in the remaining artifacts. They are excluded from
+name-based ownership claims because their names can refer to different files.
+
+The aggregate no longer schedules the focused Lite, portable-backup,
+vector-payload, Raft transition/read-gate, or HTTP client artifacts whose
+coverage already has an owner. Four import-only finetuning roots are owned by
+`inference-test` in the combined gate; standalone package finetuning still
+includes them. This removes another 55 executions, including repeated data
+and pipeline imports within those roots. Backend and consumer/provider
+coverage remains: consumer and implementation test namespaces are distinct,
+and the finetuning wrappers use the same selected backend configuration.
+
+The remaining overlaps use explicit aggregate-only exclusions in
+`pkg/antfly/build/unit_test_ownership_rules.zig`. Focused targets retain their
+original selections. Run nodes share compiler artifacts and preserve their
+environment, output checks, memory reservations, and ordering dependencies.
+The audit compares original and reduced runtime selections and rejects lost,
+added, or multiply-owned named tests. It runs alongside tests, so it adds no
+compile-all barrier before test execution. DB inventory output is emitted as
+complete records instead of interleaved progress chunks.
+
+`make unit-test` includes the audit, even while approved PR workflows still
+load their definitions from main. To inspect ownership without executing test
+bodies, run:
+
+```sh
+zig build unit-test-inventory -Dmetal=false -Dcuda=false
+```
+
+The report is `zig-out/unit-test-inventory.json`. New overlap is a build failure;
+`-Dunit-test-inventory-allow-overlap=true` is available for diagnosis. The full
+before/after comparison also included the removed focused artifacts, rather
+than assuming that identical executable names imply identical coverage.
+
 ## Ranked remaining work
 
 1. **Allocator diagnostics, preserving test coverage.** The five largest
@@ -255,17 +298,12 @@ the unrelated PR #773 run's 52-minute unit measurement for this PR's result.
    This is about five minutes of local test work, not a promised CI wall-time
    reduction. Continue the same comparison for the remaining training and
    storage failure-injection tests before changing their fixtures.
-2. **Assign one aggregate owner per test.** The Antfly timing records contain
-   11,094 executions of 9,893 distinct names: 1,201 repeated executions.
-   Keeping the longest observation of each name leaves about 211 seconds of
-   repeated measured work. That is an audit estimate, not permission to delete
-   cases: inspect runner arguments/configurations and preserve the union of
-   selected tests when assigning ownership. Examples include portable backup
-   history (standalone and storage support), vector-payload publication and
-   admission (standalone and storage support), Lite namespace deltas
-   (standalone and storage engine), and graph reverse-rebuild recovery
-   (release-blocker and DB-core). Keep focused targets available without
-   scheduling identical cases twice in the same aggregate gate.
+2. **Keep aggregate ownership enforced.** The compiled audit above removes
+   1,256 repeated named executions across all four gates and rejects new
+   overlap. The earlier Antfly timing sample estimated about 211 seconds of
+   duplicate process work; that is not a promised CI wall-time saving. Focused
+   targets remain available, with correctness and configuration coverage
+   preserved in the aggregate.
 3. **Separate scale from correctness boundaries.** The wide-vector case still
    takes 20.8 seconds without backtraces. Remaining large Antfly observations
    include dense-filter pagination (41.5 s), physical-churn benchmark (38.3 s),
