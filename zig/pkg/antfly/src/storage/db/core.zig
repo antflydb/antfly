@@ -1535,7 +1535,11 @@ pub const DBCore = struct {
                 if (participants.prepared.relational_indexes) |*indexes| _ = try indexes.metadata.stage(txn);
                 if (participants.prepared.integrity_catalog) |*catalog| {
                     const retirement_mod = @import("relational_integrity_retirement.zig");
-                    if (try retirement_mod.current(txn)) |retirement| {
+                    // Reopening the exact durable catalog is not DDL. Keep
+                    // the retirement proof intact so its worker can resume;
+                    // only a changed catalog may consume a ready target proof.
+                    // catalog.stage below still verifies the exact CAS base.
+                    if (catalog.changed) if (try retirement_mod.current(txn)) |retirement| {
                         if (retirement.phase != .ready or !std.mem.eql(u8, &retirement.target_schema_digest, &catalog.catalog.schema_digest)) return error.ConstraintRetirementInProgress;
                         for (retirement.generations) |generation| {
                             const binding = catalog.catalog.findGeneration(generation) orelse return error.IntegrityCatalogChanged;
@@ -1544,7 +1548,7 @@ pub const DBCore = struct {
                         // Consume only inside the atomic schema/catalog/outbox
                         // transaction. Failed publication leaves admission shut.
                         try txn.delete(retirement_mod.key);
-                    }
+                    };
                     if (try doc_identity.loadNamespaceTxn(txn)) |stored| {
                         if (!stored.eql(participants.namespace)) return error.IdentityNamespaceMismatch;
                     } else {

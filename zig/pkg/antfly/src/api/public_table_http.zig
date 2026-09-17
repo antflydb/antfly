@@ -1628,7 +1628,7 @@ pub fn handleRelationalConstraintRetirement(alloc: std.mem.Allocator, table_name
     // The generated public contract owns these fields. Preserve target_schema
     // as exact JSON here: generated optional/default normalization must not
     // turn an omitted property into a new property in subtract-only DDL.
-    var parsed = std.json.parseFromSlice(struct { schema_version: u32, target_schema: ?std.json.Value = null, drop: bool = false }, alloc, body, .{ .allocate = .alloc_always }) catch
+    var parsed = std.json.parseFromSlice(struct { schema_version: u32, target_schema: ?std.json.Value = null, drop: bool = false }, alloc, body, .{ .allocate = .alloc_always, .parse_numbers = false }) catch
         return .{ .status = 400, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"invalid retirement request\"}") };
     defer parsed.deinit();
     if (parsed.value.drop == (parsed.value.target_schema != null)) return .{ .status = 400, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"provide target_schema or drop=true, and schema_version\"}") };

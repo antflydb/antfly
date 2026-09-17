@@ -11640,8 +11640,16 @@ pub const ApiHttpServer = struct {
     /// Reverse bindings are point-indexed and revision-fenced across chunks;
     /// physical identifiers never become public authorization resources.
     pub fn authorizeIntegrityMutations(self: *ApiHttpServer, request: api_operation.RequestContext, tables: []const distributed_txn.TableCommitRequest) !void {
+        return self.authorizeAndBindIntegrityMutations(self.alloc, request, tables, null);
+    }
+
+    /// Resolve and authorize new cascade participants in one catalog pass.
+    /// Bindings become owned session state; existing physical identities keep
+    /// their pinned public labels even if the catalog has since renamed them.
+    pub fn authorizeAndBindIntegrityMutations(self: *ApiHttpServer, alloc: std.mem.Allocator, request: api_operation.RequestContext, tables: []const distributed_txn.TableCommitRequest, candidate: ?*transactions_api.OwnedTransactionCommitRequest) !void {
         const integrity = @import("relational_integrity_commit.zig");
-        if (self.source.vtable.system_catalog == null or (!self.cfg.auth_enabled and request.principal == null))
+        const authorize = self.cfg.auth_enabled or request.principal != null;
+        if (self.source.vtable.system_catalog == null or (!authorize and candidate == null))
             return integrity.authorizePrimaryMutations(request, self.cfg.auth_enabled, tables);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -11661,8 +11669,15 @@ pub const ApiHttpServer = struct {
             revision = resolved.revision;
             for (chunk, resolved.logical_names) |physical, logical| {
                 const name = logical orelse if (std.mem.startsWith(u8, physical, "table:")) return error.TableNotFound else physical;
-                const authority = request.table_write_authorization orelse return error.Forbidden;
-                if (!authority.allows(authority.ptr, name)) return error.Forbidden;
+                if (authorize) {
+                    const authority = request.table_write_authorization orelse return error.Forbidden;
+                    if (!authority.allows(authority.ptr, name)) return error.Forbidden;
+                }
+                if (candidate) |session| {
+                    for (session.catalog_bindings.items) |binding| {
+                        if (std.mem.eql(u8, binding.physical, physical)) break;
+                    } else try session.bind(alloc, name, physical);
+                }
             }
             start += chunk.len;
         }
@@ -11707,8 +11722,19 @@ pub const ApiHttpServer = struct {
         };
         defer self.source.freeAdminSnapshot(&snapshot);
         const coordinated = try integrity.metadataRequiresCoordination(alloc, snapshot.tables, tables);
-        if (request.relational_recovery != .none and (!coordinated or tables.len != 1)) return error.InvalidBatchRequest;
-        if (!coordinated) return source.commitBatchWithCancellation(alloc, tables, sync_level, request.cancellation);
+        if (request.relational_recovery != .none) {
+            if (tables.len != 1) return error.InvalidBatchRequest;
+            const table = for (snapshot.tables) |table| {
+                if (std.mem.eql(u8, table.name, tables[0].table_name)) break table;
+            } else return error.TableNotFound;
+            // Recovery is administrative all-owner work, including historical
+            // CHECK coverage. Ordinary CHECK writes still stay row-local.
+            const eligible = if (request.relational_recovery == .retire)
+                coordinated
+            else
+                table.relational_retirement_json.len != 0 or try integrity.requiresActivation(alloc, table.schema_json);
+            if (!eligible) return error.InvalidBatchRequest;
+        } else if (!coordinated) return source.commitBatchWithCancellation(alloc, tables, sync_level, request.cancellation);
         ensureTableOperationActive(request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err;
         const reader = self.table_reads orelse return error.IntegrityCatalogUnavailable;
         if (request.relational_recovery == .retire) {
@@ -11719,7 +11745,7 @@ pub const ApiHttpServer = struct {
             defer if (owned_target) |bytes| alloc.free(bytes);
             const target = request.relational_retirement_target orelse target: {
                 if (!request.relational_retirement_drop) return error.InvalidBatchRequest;
-                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, table.schema_json, .{ .allocate = .alloc_always });
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, table.schema_json, .{ .allocate = .alloc_always, .parse_numbers = false });
                 defer parsed.deinit();
                 if (parsed.value != .object) return error.InvalidBatchRequest;
                 _ = parsed.value.object.swapRemove("unique_constraints");
@@ -11832,6 +11858,7 @@ pub const ApiHttpServer = struct {
             error.TopologyChanged,
             error.TableTransitionActive,
             error.TableGenerationChanged,
+            error.TableLifecycleConflict,
             error.SchemaVersionExhausted,
             error.DecisionConflict,
             error.TxnNotFound,

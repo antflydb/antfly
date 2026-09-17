@@ -81,7 +81,7 @@ pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const ses
     defer alloc.free(staged);
     var prepared = try integrity.prepareSessionStatement(alloc, server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, staged, incoming, context);
     defer prepared.deinit();
-    try server.authorizeIntegrityMutations(context, prepared.tables);
+    try server.authorizeAndBindIntegrityMutations(alloc, context, prepared.tables, candidate);
     try server.validateCommitTablesAgainstSchema(context, prepared.tables);
     try apply(alloc, candidate, prepared.tables);
 }

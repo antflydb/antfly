@@ -30,27 +30,24 @@ const schema = @import("../storage/schema.zig");
 const Allocator = std.mem.Allocator;
 const Control = @import("operation.zig").RequestContext;
 
-fn equivalent(a: std.json.Value, b: std.json.Value, depth: usize) bool {
-    if (depth > 128 or std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-    return switch (a) {
-        .null => true,
-        .bool => |value| value == b.bool,
-        .integer => |value| value == b.integer,
-        .float => |value| value == b.float,
-        .number_string => |value| std.mem.eql(u8, value, b.number_string),
-        .string => |value| std.mem.eql(u8, value, b.string),
-        .array => |value| blk: {
-            if (value.items.len != b.array.items.len) break :blk false;
-            for (value.items, b.array.items) |left, right| if (!equivalent(left, right, depth + 1)) break :blk false;
-            break :blk true;
-        },
-        .object => |value| blk: {
-            if (value.count() != b.object.count()) break :blk false;
-            var iterator = value.iterator();
-            while (iterator.next()) |entry| if (!equivalent(entry.value_ptr.*, b.object.get(entry.key_ptr.*) orelse break :blk false, depth + 1)) break :blk false;
-            break :blk true;
-        },
-    };
+fn retainedSchemaEqual(alloc: Allocator, source: []const u8, target: []const u8) !bool {
+    var before = try std.json.parseFromSlice(std.json.Value, alloc, source, .{ .parse_numbers = false });
+    defer before.deinit();
+    var after = try std.json.parseFromSlice(std.json.Value, alloc, target, .{ .parse_numbers = false });
+    defer after.deinit();
+    if (before.value != .object or after.value != .object) return false;
+    for ([_][]const u8{ "version", "unique_constraints", "foreign_keys" }) |field| {
+        _ = before.value.object.swapRemove(field);
+        _ = after.value.object.swapRemove(field);
+    }
+    // Exact decimal canonicalization accepts equivalent numeric spellings
+    // without rounding large integers/decimals or losing small nonzero values.
+    const canonical = @import("../storage/db/document_content_hash.zig").canonicalJsonValueAlloc;
+    const left = try canonical(alloc, before.value);
+    defer alloc.free(left);
+    const right = try canonical(alloc, after.value);
+    defer alloc.free(right);
+    return std.mem.eql(u8, left, right);
 }
 
 const Status = struct { catalog: []const u8, progress: ?[]const u8, owner: [32]u8, range_start: []const u8, range_end: []const u8 };
@@ -86,13 +83,7 @@ pub fn begin(alloc: Allocator, reader: reads.TableReadSource, tables: []const re
     const normalized = try @import("tables.zig").applySchemaUpdateRecord(owned, &table, target_input);
     const target_json = normalized.schema_json;
     const target = try schema_api.parseValidatedTableSchema(owned, target_json);
-    var source_value = try std.json.parseFromSlice(std.json.Value, owned, table.schema_json, .{ .allocate = .alloc_always });
-    var target_value = try std.json.parseFromSlice(std.json.Value, owned, target_json, .{ .allocate = .alloc_always });
-    for ([_][]const u8{ "version", "unique_constraints", "foreign_keys" }) |field| {
-        _ = source_value.value.object.swapRemove(field);
-        _ = target_value.value.object.swapRemove(field);
-    }
-    if (!equivalent(source_value.value, target_value.value, 0)) return error.InvalidConstraintRetirement;
+    if (!try retainedSchemaEqual(owned, table.schema_json, target_json)) return error.InvalidConstraintRetirement;
     const target_runtime = try schema_api.deriveRuntimeTableSchema(owned, target);
     const target_bytes = try schema.serializeSchema(owned, target_runtime);
     const target_digest = metadata.digest(target_bytes);
@@ -362,6 +353,22 @@ fn runPageAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: write
     return .{ .arena = arena, .table = replacement };
 }
 
+test "distributed txn retirement compares retained schema numbers without rounding" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try retainedSchemaEqual(alloc,
+        \\{"version":0,"unique_constraints":[{}],"default":1.0,"nested":{"x":9007199254740993.0}}
+    ,
+        \\{"nested":{"x":90071992547409930e-1},"default":1,"version":1}
+    ));
+    try std.testing.expect(!try retainedSchemaEqual(alloc,
+        \\{"default":9007199254740993.0}
+    ,
+        \\{"default":9007199254740992}
+    ));
+    try std.testing.expect(!try retainedSchemaEqual(alloc, "{\"default\":1e-999}", "{\"default\":0}"));
+    try std.testing.expect(!try retainedSchemaEqual(alloc, "{\"checks\":[{}]}", "{\"checks\":[]}"));
+}
+
 test "distributed txn retirement drains self foreign keys before unique claims with durable checkpoints" {
     try testRetirementDrain(.none);
 }
@@ -480,8 +487,10 @@ fn testRetirementDrain(pressure: RetirementPressure) !void {
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/retirement", .{tmp.sub_path});
-    var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 400, .shard_id = 401, .range_id = 401 }, .primary_backend = .{ .lsm = .{} } });
-    defer db.close();
+    const open_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 400, .shard_id = 401, .range_id = 401 }, .primary_backend = .{ .lsm = .{} } };
+    var db = try db_mod.DB.open(alloc, path, open_options);
+    var db_open = true;
+    defer if (db_open) db.close();
     const declaration =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
     ;
@@ -562,9 +571,23 @@ fn testRetirementDrain(pressure: RetirementPressure) !void {
         owned_updates.deinit(alloc);
     }
     var failure_retried = false;
+    var reopened = false;
     for (0..32) |_| {
         var state = try metadata.parse(alloc, tables[0].relational_retirement_json);
         defer state.deinit();
+        if (state.value.phase == .foreign_keys and !reopened) {
+            const before = (try db.core.getStoreValue(alloc, native.key)).?;
+            defer alloc.free(before);
+            db.close();
+            db_open = false;
+            db = try db_mod.DB.open(alloc, path, open_options);
+            db_open = true;
+            try db.setSchemaJson(alloc, declaration);
+            const after = (try db.core.getStoreValue(alloc, native.key)).?;
+            defer alloc.free(after);
+            try std.testing.expectEqualStrings(before, after);
+            reopened = true;
+        }
         if (state.value.failure.len != 0) {
             try std.testing.expectEqual(RetirementPressure.singleton, pressure);
             try std.testing.expect(!failure_retried);
@@ -601,6 +624,7 @@ fn testRetirementDrain(pressure: RetirementPressure) !void {
     defer alloc.free(row.json);
     try std.testing.expect(std.mem.indexOf(u8, row.json, "parent") != null);
     try std.testing.expectError(error.ConstraintRetirementInProgress, commit(alloc, writer, initial.tables, .{}));
+    try std.testing.expect(reopened);
     var finalized = try finalize(alloc, tables[0]);
     defer finalized.deinit();
     try std.testing.expect(finalized.table.read_schema_json.len != 0);

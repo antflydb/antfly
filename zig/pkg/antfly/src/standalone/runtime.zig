@@ -801,6 +801,7 @@ const LocalStandaloneMetadata = struct {
         previous_tables: std.AutoHashMapUnmanaged(u64, ?antfly.metadata.TableRecord) = .empty,
         previous_ranges: std.AutoHashMapUnmanaged(u64, ?antfly.metadata.RangeRecord) = .empty,
         previous_extensions: ?antfly.extensions.ExtensionCatalog = null,
+        compare_and_replace_table: ?u64 = null,
         catalog_change: ?system_catalog.MutableState.Change = null,
         previous_epoch: u64,
         committed: bool = false,
@@ -2471,6 +2472,7 @@ const LocalStandaloneMetadata = struct {
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try mutation.upsertTable(self, replacement);
+        mutation.compare_and_replace_table = replacement.table_id;
         self.epoch +|= 1;
         try mutation.commit(self);
     }
@@ -3408,17 +3410,26 @@ const LocalStandaloneMetadata = struct {
         var ranges: std.ArrayList(antfly.metadata.RangeRecord) = .empty;
         var remove_tables: std.ArrayList(u64) = .empty;
         var remove_ranges: std.ArrayList(u64) = .empty;
+        const Update = @import("../metadata/storage/raft_apply_contract.zig").StandaloneCatalogUpdate;
+        var replacements: std.ArrayList(Update.TableReplacement) = .empty;
         var changed_tables = mutation.previous_tables.keyIterator();
         while (changed_tables.next()) |id| {
+            if (mutation.compare_and_replace_table == id.*) {
+                try replacements.append(a, .{
+                    .expected = mutation.previous_tables.get(id.*).? orelse return error.InvalidStandaloneCatalog,
+                    .replacement = self.manager.tables.get(id.*) orelse return error.InvalidStandaloneCatalog,
+                });
+                continue;
+            }
             if (self.manager.tables.get(id.*)) |row| try tables.append(a, row) else try remove_tables.append(a, id.*);
         }
         var changed_ranges = mutation.previous_ranges.keyIterator();
         while (changed_ranges.next()) |id| {
             if (self.manager.ranges.get(id.*)) |row| try ranges.append(a, row) else try remove_ranges.append(a, id.*);
         }
-        const Update = @import("../metadata/storage/raft_apply_contract.zig").StandaloneCatalogUpdate;
         const update: Update = .{
             .tables = tables.items,
+            .table_replacements = replacements.items,
             .ranges = ranges.items,
             .remove_tables = remove_tables.items,
             .remove_ranges = remove_ranges.items,

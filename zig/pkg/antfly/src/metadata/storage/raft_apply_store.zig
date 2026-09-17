@@ -933,6 +933,55 @@ test "distributed txn owned witness cleanup metadata CAS fences both child admis
     try std.testing.expectError(error.NotFound, txn.get(child_key));
 }
 
+test "system catalog standalone retirement CAS is atomic and survives reopen" {
+    const alloc = std.testing.allocator;
+    const lifecycle = @import("../relational_retirement.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standalone-retirement", .{tmp.sub_path});
+    defer alloc.free(root);
+    const group = group_ids.main_metadata_group_id;
+    const parent: metadata.TableRecord = .{ .table_id = 7, .name = "parents", .schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    };
+    const target =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var job: lifecycle.Job = .{ .id = @splat(1), .source_schema_digest = lifecycle.digest(parent.schema_json), .target_schema_digest = @splat(2), .generation_set = @splat(3), .generations = &.{@splat(4)}, .target_schema_json = target, .owners = &.{.{ .group_id = 71, .range_id = 71, .start = "", .end = "" }} };
+    var admitted = parent;
+    admitted.relational_retirement_json = try std.json.Stringify.valueAlloc(arena.allocator(), job, .{});
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        try store.replaceStandaloneCatalog(group, 0, &.{parent}, &.{.{ .table_id = 7, .group_id = 71, .range_id = 71, .start_key = "" }}, "{}");
+        // An ordinary upsert still cannot forge a lifecycle admission.
+        try std.testing.expectError(error.TableLifecycleConflict, store.updateStandaloneCatalog(group, 1, .{ .tables = &.{admitted} }));
+        try store.updateStandaloneCatalog(group, 1, .{ .table_replacements = &.{.{ .expected = parent, .replacement = admitted }} });
+        var skipped = admitted;
+        job.phase = .ready;
+        skipped.relational_retirement_json = try std.json.Stringify.valueAlloc(arena.allocator(), job, .{});
+        try std.testing.expectError(error.TableLifecycleConflict, store.updateStandaloneCatalog(group, 2, .{
+            .tables = &.{.{ .table_id = 8, .name = "must-rollback" }},
+            .table_replacements = &.{.{ .expected = admitted, .replacement = skipped }},
+        }));
+        try std.testing.expectError(error.TableGenerationChanged, store.updateStandaloneCatalog(group, 2, .{ .table_replacements = &.{.{ .expected = parent, .replacement = admitted }} }));
+    }
+    var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer reopened.deinit();
+    const records = try reopened.listTables(alloc, group);
+    defer reopened.freeTables(alloc, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(admitted, records[0]));
+    // Rejections did not advance the revision, and the exact durable owner
+    // proof can resume through the same CAS path after process replacement.
+    job.phase = .foreign_keys;
+    var next = admitted;
+    next.relational_retirement_json = try std.json.Stringify.valueAlloc(arena.allocator(), job, .{});
+    try reopened.updateStandaloneCatalog(group, 2, .{ .table_replacements = &.{.{ .expected = admitted, .replacement = next }} });
+}
+
 test "distributed txn retirement metadata persists identity barriers and rejects phase skipping" {
     const lifecycle = @import("../relational_retirement.zig");
     const alloc = std.testing.allocator;
@@ -4474,6 +4523,21 @@ pub const RaftApplyStore = struct {
             const actual = try decodeTableRecord(self.alloc, (try stagingGet(&txn, key)) orelse return error.TableLifecycleConflict);
             defer metadata_table_manager.freeTable(self.alloc, actual);
             if (!metadata_table_manager.tableDefinitionsEqual(actual, record)) return error.TableLifecycleConflict;
+        }
+        for (update.table_replacements) |change| {
+            if (bootstrap or update.replace or change.expected.table_id != change.replacement.table_id) return error.InvalidStandaloneCatalog;
+            var key_buf: [160]u8 = undefined;
+            const key = try tableKeyForGroup(&key_buf, group_id, change.expected.table_id);
+            const before = try decodeTableRecord(self.alloc, (try stagingGet(&txn, key)) orelse return error.TableGenerationChanged);
+            defer metadata_table_manager.freeTable(self.alloc, before);
+            if (!metadata_table_manager.tableDefinitionsEqual(before, change.expected)) return error.TableGenerationChanged;
+            // Reuse replicated lifecycle admission, including owner coverage,
+            // dependencies and topology fences. A rejected CAS aborts the whole
+            // local transaction, including its logical delta and standby record.
+            try self.applyTableCompareAndReplaceTxn(&txn, group_id, change.expected, change.replacement);
+            const actual = try decodeTableRecord(self.alloc, (try stagingGet(&txn, key)) orelse return error.TableLifecycleConflict);
+            defer metadata_table_manager.freeTable(self.alloc, actual);
+            if (!metadata_table_manager.tableDefinitionsEqual(actual, change.replacement)) return error.TableLifecycleConflict;
         }
         for (ranges) |record| {
             var key_buf: [160]u8 = undefined;

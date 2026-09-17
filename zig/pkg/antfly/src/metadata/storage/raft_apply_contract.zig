@@ -81,8 +81,15 @@ pub const CatalogCursor = struct {
 /// metadata, and the standby outbox share the same revision and durability fence.
 /// Replacement/import is reserved for bootstrap; normal DDL sends touched rows.
 pub const StandaloneCatalogUpdate = struct {
+    pub const TableReplacement = struct {
+        expected: metadata.TableRecord,
+        replacement: metadata.TableRecord,
+    };
+
     replace: bool = false,
     tables: []const metadata.TableRecord = &.{},
+    /// Explicit lifecycle CAS commands, not ordinary definition upserts.
+    table_replacements: []const TableReplacement = &.{},
     ranges: []const metadata.RangeRecord = &.{},
     remove_tables: []const u64 = &.{},
     remove_ranges: []const u64 = &.{},

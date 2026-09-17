@@ -623,6 +623,7 @@ pub const Detail = enum(c_int) {
     merge_page_required,
     invalid_response,
     relational_index_key_too_large,
+    table_lifecycle_conflict,
 };
 
 pub const Status = extern struct {
@@ -931,6 +932,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.IdentityReadGenerationChanged => status(.conflict, .identity_read_generation_changed),
         error.DocIdentityNamespaceMismatch => status(.conflict, .doc_identity_namespace_mismatch),
         error.TableGenerationChanged => status(.conflict, .table_generation_changed),
+        error.TableLifecycleConflict => status(.conflict, .table_lifecycle_conflict),
         error.GenerationDurabilityUncertain => status(.retryable, .generation_durability_uncertain),
         error.GenerationTransitionActive => status(.retryable, .generation_transition_active),
         error.IndexRebuilding => status(.retryable, .index_rebuilding),
@@ -1561,6 +1563,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .identity_read_generation_changed => "IdentityReadGenerationChanged",
         .doc_identity_namespace_mismatch => "DocIdentityNamespaceMismatch",
         .table_generation_changed => "TableGenerationChanged",
+        .table_lifecycle_conflict => "TableLifecycleConflict",
         .generation_durability_uncertain => "GenerationDurabilityUncertain",
         .generation_transition_active => "GenerationTransitionActive",
         .index_rebuilding => "IndexRebuilding",
