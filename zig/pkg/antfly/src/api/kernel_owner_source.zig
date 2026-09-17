@@ -1015,10 +1015,17 @@ pub const ProvisionedKernelOwnerSource = struct {
             group_id,
         });
         defer alloc.free(path);
+        // The Raft progress driver owns the committed entry and its retry
+        // checkpoint. Yield admission conflicts to it immediately: waiting for
+        // another owner lease here stalls unrelated groups and can deadlock a
+        // maintenance callback waiting for this same progress driver.
+        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident) catch |err| switch (err) {
+            error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
+            else => return err,
+        };
+        defer lease.deinit();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
-        var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor);
-        defer lease.deinit();
         var response = try lease.owner().replicatedBatchAtRaftEntryJson(
             table_name,
             request_json,
@@ -4162,6 +4169,69 @@ test "storage owner quiesce drains leases and promotion callbacks before context
     try std.testing.expectEqual(@as(usize, 0), source.ownerCountForTest());
     try source.quiesce(std.testing.io);
     try std.testing.expectError(error.Canceled, source.acquireDescriptor(7001, "docs", path, descriptor));
+}
+
+test "committed owner apply yields admission conflicts and retries the exact entry once" {
+    const alloc = std.testing.allocator;
+    const Source = ProvisionedKernelOwnerSource;
+    for ([_]enum { registry, exclusive, publication }{ .registry, .exclusive, .publication }) |history| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer alloc.free(root);
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+        defer alloc.free(path);
+        var source = Source.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer source.deinit();
+        const descriptor: descriptor_contract.Descriptor = .{
+            .lsm_root_generation = table_reads.backend_current_root_generation,
+            .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        };
+        try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, .{
+            .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }},
+        }, 1, 1);
+        const increment: db_types.BatchRequest = .{ .transforms = &.{.{
+            .key = "doc:counter",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+        }} };
+        {
+            var exclusive: ?Source.Lease = null;
+            var publication: ?*Source.PendingPublication = null;
+            switch (history) {
+                .registry => Source.lock(&source.mutex),
+                .exclusive => exclusive = try source.acquireDescriptorExclusive(1, "docs", path, descriptor, .resident),
+                .publication => publication = try source.registerPublication(1, "docs"),
+            }
+            defer switch (history) {
+                .registry => source.mutex.unlock(),
+                .exclusive => exclusive.?.deinit(),
+                .publication => Source.endPublication(&source, publication.?),
+            };
+            const started = platform_time.monotonicNs();
+            try std.testing.expectError(
+                if (history == .publication) error.StorageReadTemporarilyUnavailable else error.StorageBusy,
+                source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, increment, 1, 2),
+            );
+            // The gate stays held by this test. Waiting for the five-second
+            // foreground admission timeout would strand the Raft progress lane.
+            try std.testing.expect(platform_time.monotonicNs() - started < std.time.ns_per_s);
+        }
+        // Publication may first retire the old owner. Bounded progress retries
+        // reopen it without abandoning the original term/index identity.
+        for (0..4) |_| {
+            source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, increment, 1, 2) catch |err| switch (err) {
+                error.StorageBusy => continue,
+                else => return err,
+            };
+            break;
+        } else return error.TestOwnerAdmissionDidNotRecover;
+        try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, increment, 1, 2);
+        var reader = try source.acquireDescriptor(1, "docs", path, descriptor);
+        defer reader.deinit();
+        var value = try reader.owner().lookupJson("docs", "{\"key\":\"doc:counter\",\"include_all_fields\":true}");
+        defer value.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, value.bytes(), "\"count\":1") != null);
+    }
 }
 
 test "pending exclusive storage owner lease blocks new readers until drain" {
