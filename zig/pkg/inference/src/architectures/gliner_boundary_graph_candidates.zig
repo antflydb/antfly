@@ -79,10 +79,10 @@ fn checkedPool(g: *G, input: PoolInput) !void {
 
 /// Prefix table [B*(W+1),D] and absolute boundary indices. No source or
 /// projection activation is detached; gather VJPs accumulate reused spans.
-pub fn meanPool(g: *G, prefix: Id, starts: Id, ends: Id, lengths: Id, rows: u32, dim: u32) !Id {
+pub fn meanPool(g: *G, prefix: Id, starts: Id, ends: Id, lengths: Id, rows: u32, dim: u32, reduction: core.GatherProfile) !Id {
     try g.require(lengths, Shape.init(.f32, &.{ rows, 1 }));
-    const start = try g.gather(prefix, starts, rows, dim);
-    const end = try g.gather(prefix, ends, rows, dim);
+    const start = try g.gatherWithReduction(prefix, starts, rows, dim, reduction);
+    const end = try g.gatherWithReduction(prefix, ends, rows, dim, reduction);
     const width = try g.expand(lengths, &.{ rows, dim }, &.{ 0, 1 });
     return g.builder.div(try g.builder.sub(end, start), width);
 }
@@ -97,7 +97,7 @@ fn contentPool(g: *G, stage1: core.Proposals, starts: Id, ends: Id, lengths: Id,
     var values = try g.linear(stage1.input.text, h, dim, try std.fmt.bufPrint(&name, "{s}.value_projection", .{prefix}));
     values = try g.rowMask(values, stage1.input.text_mask, try mul(b, w), dim);
     const table = try g.prefixSum(values, b, w, dim);
-    const pooled = try meanPool(g, table, starts, ends, lengths, rows, dim);
+    const pooled = try meanPool(g, table, starts, ends, lengths, rows, dim, g.gather_profile);
     const normed = try g.norm(pooled, dim, try std.fmt.bufPrint(&name, "{s}.layer_norm", .{prefix}));
     return g.dropout(normed, prefix, .candidates);
 }
@@ -119,8 +119,25 @@ fn insidePrefix(g: *G, stage1: core.Proposals, detached_mean: Id) !Id {
     const keep = try g.builder.mul(try g.expand(stage1.input.text_mask, &dims, &.{ 0, 2 }), try g.expand(stage1.input.query_mask, &dims, &.{ 0, 1 }));
     const centered = try g.builder.sub(stage1.inside_logits, try g.expand(detached_mean, &dims, &.{ 0, 1, 2 }));
     const valid = try g.maskFill(centered, keep, 0);
-    const prefix = try g.prefixSum(try g.reshape(valid, &.{ try mul(try mul(b, q), w), 1 }), try mul(b, q), w, 1);
+    const prefix = try g.prefixSumWithReference(try g.reshape(valid, &.{ try mul(try mul(b, q), w), 1 }), try mul(b, q), w, 1, .inner);
     return g.reshape(prefix, &.{ b, q, w + 1 });
+}
+
+fn wordCounts(g: *G, stage1: core.Proposals) !Id {
+    const counts = try g.builder.reduceSum(stage1.input.text_mask, &.{1});
+    // Binary prefix masks make nonzero counts positive; empty samples use one.
+    return g.maskFill(counts, counts, 1);
+}
+
+fn detachedInsideMean(g: *G, stage1: core.Proposals, counts: Id) !Id {
+    const b = g.layout.batch;
+    const q = g.layout.queries;
+    const dims = [_]i64{ b, q, g.layout.words };
+    const keep = try g.builder.mul(try g.expand(stage1.input.text_mask, &dims, &.{ 0, 2 }), try g.expand(stage1.input.query_mask, &dims, &.{ 0, 1 }));
+    const valid = try g.maskFill(stage1.inside_logits, keep, 0);
+    const sum = try g.builder.reduceSum(valid, &.{2});
+    const mean = try g.builder.div(sum, try g.expand(counts, &.{ b, q, 1 }, &.{ 0, 2 }));
+    return g.builder.stopGradient(mean);
 }
 
 pub fn buildSharedPool(g: *G, stage1: core.Proposals, input: PoolInput) !PoolOutput {
@@ -138,19 +155,26 @@ pub fn buildSharedPool(g: *G, stage1: core.Proposals, input: PoolInput) !PoolOut
     const rows = try mul(b, c);
     const score_rows = try mul(rows, q);
     try admit(g, &.{ score_rows, @max(p, 64) });
-    const gs = try g.gather(stage1.pool_start, input.starts, rows, d);
-    const ge = try g.gather(stage1.pool_end, input.ends, rows, d);
+    const cuda_features = g.candidate_feature_profile == .cuda_pytorch_v1;
+    const counts = if (cuda_features) try wordCounts(g, stage1) else null;
+    const length_features = if (counts) |count| try g.builder.frozenSpanFeaturesV1(input.lengths, count, .{ .batch = b, .capacity = c }) else input.length_features;
+    const gs = try g.gatherTensor(stage1.pool_start, input.starts, rows, d);
+    const ge = try g.gatherTensor(stage1.pool_end, input.ends, rows, d);
     var compatibility = try g.scale(try g.builder.reduceSum(try g.builder.mul(gs, ge), &.{1}), 1 / @sqrt(@as(f32, @floatFromInt(d))));
     compatibility = try g.maskFill(compatibility, try g.reshape(input.valid, &.{ rows, 1 }), 0);
     const union_start = try g.reshape(try g.builder.reduceMax(stage1.start_logits, &.{1}), &.{ try mul(b, n), 1 });
     const union_end = try g.reshape(try g.builder.reduceMax(stage1.end_logits, &.{1}), &.{ try mul(b, n), 1 });
-    const union_s = try g.gather(union_start, input.starts, rows, 1);
-    const union_e = try g.gather(union_end, input.ends, rows, 1);
-    const proposal_logits = try g.maskFill(try g.builder.add(compatibility, try g.builder.add(union_s, union_e)), try g.reshape(input.valid, &.{ rows, 1 }), -10000);
+    const union_s = try g.gatherTensor(union_start, input.starts, rows, 1);
+    const union_e = try g.gatherTensor(union_end, input.ends, rows, 1);
+    const proposal_sum = switch (g.score_profile) {
+        .grouped_v1 => try g.builder.add(compatibility, try g.builder.add(union_s, union_e)),
+        .pytorch_sequential_v1 => try g.builder.add(try g.builder.add(compatibility, union_s), union_e),
+    };
+    const proposal_logits = try g.maskFill(proposal_sum, try g.reshape(input.valid, &.{ rows, 1 }), -10000);
     const start_all = try g.linear(stage1.boundary_states, d, p, "boundary_head.shared_pool_scorer.start_projection");
     const end_all = try g.linear(stage1.boundary_states, d, p, "boundary_head.shared_pool_scorer.end_projection");
-    var candidates = try g.builder.add(try g.gather(start_all, input.starts, rows, p), try g.gather(end_all, input.ends, rows, p));
-    candidates = try g.builder.add(candidates, try g.linear(input.length_features, 3, p, "boundary_head.shared_pool_scorer.length_projection"));
+    var candidates = try g.builder.add(try g.gatherTensor(start_all, input.starts, rows, p), try g.gatherTensor(end_all, input.ends, rows, p));
+    candidates = try g.builder.add(candidates, try g.linear(length_features, 3, p, "boundary_head.shared_pool_scorer.length_projection"));
     candidates = try g.builder.add(candidates, try g.linear(compatibility, 1, p, "boundary_head.shared_pool_scorer.prior_projection"));
     if (g.config.head.enable_span_content) {
         const content = try contentPool(g, stage1, input.starts, input.ends, input.lengths, rows, "boundary_head.shared_pool_scorer.content_pooler");
@@ -170,13 +194,16 @@ pub fn buildSharedPool(g: *G, stage1: core.Proposals, input: PoolInput) !PoolOut
     hidden = try g.dropout(try g.builder.geluExact(hidden), "shared_pool.film_hidden", .candidates);
     const film_score = try g.reshape(try g.linear(hidden, 64, 1, "boundary_head.shared_pool_scorer.film_output.3"), &.{ b, c, q });
     scores = try g.builder.add(scores, film_score);
-    const start_logits = try g.gather(try transposedMarginals(g, stage1.start_logits), input.starts, rows, q);
-    const end_logits = try g.gather(try transposedMarginals(g, stage1.end_logits), input.ends, rows, q);
-    scores = try g.builder.add(scores, try g.reshape(try g.builder.add(start_logits, end_logits), &.{ b, c, q }));
+    const start_logits = try g.gatherTensor(try transposedMarginals(g, stage1.start_logits), input.starts, rows, q);
+    const end_logits = try g.gatherTensor(try transposedMarginals(g, stage1.end_logits), input.ends, rows, q);
+    scores = switch (g.score_profile) {
+        .grouped_v1 => try g.builder.add(scores, try g.reshape(try g.builder.add(start_logits, end_logits), &.{ b, c, q })),
+        .pytorch_sequential_v1 => try g.builder.add(try g.builder.add(scores, try g.reshape(start_logits, &.{ b, c, q })), try g.reshape(end_logits, &.{ b, c, q })),
+    };
     if (g.config.head.use_inside_evidence) {
-        const mean = input.inside_mean.?;
+        const mean = if (counts) |count| try detachedInsideMean(g, stage1, count) else input.inside_mean.?;
         const prefix = try transposedMarginals(g, try insidePrefix(g, stage1, mean));
-        const interval = try g.builder.sub(try g.gather(prefix, input.ends, rows, q), try g.gather(prefix, input.starts, rows, q));
+        const interval = try g.builder.sub(try g.gatherTensor(prefix, input.ends, rows, q), try g.gatherTensor(prefix, input.starts, rows, q));
         const mean3 = try g.expand(try g.reshape(mean, &.{ b, q }), &.{ b, c, q }, &.{ 0, 2 });
         const widths = try g.expand(input.lengths, &.{ rows, q }, &.{ 0, 1 });
         const restored = try g.builder.add(interval, try g.builder.mul(try g.reshape(mean3, &.{ rows, q }), widths));
@@ -186,7 +213,7 @@ pub fn buildSharedPool(g: *G, stage1: core.Proposals, input: PoolInput) !PoolOut
     const keep = try g.builder.mul(try g.expand(input.valid, &.{ b, c, q }, &.{ 0, 1 }), try g.expand(stage1.input.query_mask, &.{ b, c, q }, &.{ 0, 2 }));
     scores = try g.maskFill(scores, keep, -10000);
     const candidate_states: ?Id = if (g.config.head.enable_records) blk: {
-        const endpoints = try g.builder.concat(try g.gather(stage1.boundary_states, input.starts, rows, d), try g.gather(stage1.boundary_states, input.ends, rows, d), 1);
+        const endpoints = try g.builder.concat(try g.gatherTensor(stage1.boundary_states, input.starts, rows, d), try g.gatherTensor(stage1.boundary_states, input.ends, rows, d), 1);
         break :blk try g.rowMask(try g.linear(endpoints, try mul(2, d), h, "boundary_head.candidate_encoder"), input.valid, rows, h);
     } else null;
     const result = PoolOutput{ .pair_logits = try g.builder.transpose(scores, &.{ 0, 2, 1 }), .shared_logits = scores, .proposal_logits = try g.reshape(proposal_logits, &.{ b, c }), .proposal_compat = try g.reshape(compatibility, &.{ b, c }), .candidate_features = candidates, .candidate_states = candidate_states };
@@ -250,7 +277,7 @@ fn rotate(g: *G, values: Id, dim: u32) !Id {
 fn queryGate(g: *G, queries: Id, dim: u32, prefix: []const u8) !Id {
     const qrows = try mul(g.layout.batch, g.layout.queries);
     const width = if (g.config.head.enable_rotary_endpoints) dim / 2 else dim;
-    const gate = try g.builder.sigmoid(try g.linear(queries, g.config.encoder.hidden_size, width, prefix));
+    const gate = try g.sigmoid(try g.linear(queries, g.config.encoder.hidden_size, width, prefix));
     if (!g.config.head.enable_rotary_endpoints) return gate;
     return g.reshape(try g.expand(gate, &.{ qrows, width, 2 }, &.{ 0, 1 }), &.{ qrows, dim });
 }
@@ -280,14 +307,14 @@ pub fn buildExplicitSpans(g: *G, stage1: core.Proposals, input: ExplicitInput) !
     const projected_start = try rotate(g, try g.linear(stage1.boundary_states, d, d, "boundary_head.boundary_proposer.start_pair_projection"), d);
     const projected_end = try rotate(g, try g.linear(stage1.boundary_states, d, d, "boundary_head.boundary_proposer.end_key_projection"), d);
     const gate = try g.gather(try queryGate(g, stage1.input.queries, d, "boundary_head.boundary_proposer.start_query_projection"), query_indices, rows, d);
-    const start = try g.gather(projected_start, input.starts, rows, d);
-    const end = try g.gather(projected_end, input.ends, rows, d);
+    const start = try g.gatherTensor(projected_start, input.starts, rows, d);
+    const end = try g.gatherTensor(projected_end, input.ends, rows, d);
     const prior_raw = try g.scale(try g.builder.reduceSum(try g.builder.mul(try g.builder.mul(start, gate), end), &.{1}), 1 / @sqrt(@as(f32, @floatFromInt(d))));
     const prior = try g.maskFill(prior_raw, keep, 0);
     const scorer_start_all = try rotate(g, try g.linear(stage1.boundary_states, d, p, "boundary_head.pair_scorer.start_endpoint_projection"), p);
     const scorer_end_all = try rotate(g, try g.linear(stage1.boundary_states, d, p, "boundary_head.pair_scorer.end_endpoint_projection"), p);
-    const scorer_start = try g.dropout(try g.gather(scorer_start_all, input.starts, rows, p), "explicit.start", .candidates);
-    const scorer_end = try g.dropout(try g.gather(scorer_end_all, input.ends, rows, p), "explicit.end", .candidates);
+    const scorer_start = try g.dropout(try g.gatherTensor(scorer_start_all, input.starts, rows, p), "explicit.start", .candidates);
+    const scorer_end = try g.dropout(try g.gatherTensor(scorer_end_all, input.ends, rows, p), "explicit.end", .candidates);
     const scorer_gate = try g.gather(try queryGate(g, stage1.input.queries, p, "boundary_head.pair_scorer.query_gate"), query_indices, rows, p);
     var compatibility = if (g.config.head.reranker_endpoint_compat) blk: {
         const heads = g.config.head.multihead_pair_compat_heads;
@@ -301,8 +328,8 @@ pub fn buildExplicitSpans(g: *G, stage1: core.Proposals, input: ExplicitInput) !
         const joined = try g.builder.concat(difference, try g.builder.absOp(difference), 1);
         compatibility = try g.builder.add(compatibility, try g.linear(joined, try mul(2, p), 1, "boundary_head.pair_scorer.endpoint_difference_projection"));
     }
-    const a = try g.gather(try g.reshape(stage1.start_logits, &.{ try mul(qrows, n), 1 }), input.marginal_starts, rows, 1);
-    const e = try g.gather(try g.reshape(stage1.end_logits, &.{ try mul(qrows, n), 1 }), input.marginal_ends, rows, 1);
+    const a = try g.gatherTensor(try g.reshape(stage1.start_logits, &.{ try mul(qrows, n), 1 }), input.marginal_starts, rows, 1);
+    const e = try g.gatherTensor(try g.reshape(stage1.end_logits, &.{ try mul(qrows, n), 1 }), input.marginal_ends, rows, 1);
     var scores = try g.builder.add(try g.builder.add(try g.builder.add(compatibility, a), e), prior);
     if (g.config.head.enable_span_content) {
         const content = try contentPool(g, stage1, input.starts, input.ends, input.lengths, rows, "boundary_head.pair_scorer.content_pooler");
@@ -314,7 +341,7 @@ pub fn buildExplicitSpans(g: *G, stage1: core.Proposals, input: ExplicitInput) !
     if (g.config.head.use_inside_evidence) {
         const mean = input.inside_mean orelse return error.MissingBoundaryTrainingInsideMean;
         const prefix = try g.reshape(try insidePrefix(g, stage1, mean), &.{ try mul(qrows, n), 1 });
-        const interval = try g.builder.sub(try g.gather(prefix, input.marginal_ends, rows, 1), try g.gather(prefix, input.marginal_starts, rows, 1));
+        const interval = try g.builder.sub(try g.gatherTensor(prefix, input.marginal_ends, rows, 1), try g.gatherTensor(prefix, input.marginal_starts, rows, 1));
         const means = try g.gather(try g.reshape(mean, &.{ qrows, 1 }), query_indices, rows, 1);
         const restored = try g.builder.add(interval, try g.builder.mul(means, input.lengths));
         const weight = if (g.config.head.query_conditioned_inside_weight) try g.gather(try g.linear(stage1.input.queries, h, 1, "boundary_head.pair_scorer.inside_weight"), query_indices, rows, 1) else try g.weight("boundary_head.pair_scorer.inside_weight", &.{});

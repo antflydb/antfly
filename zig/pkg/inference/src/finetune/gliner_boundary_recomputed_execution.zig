@@ -270,7 +270,7 @@ pub fn merge(a: Allocator, backend: *const ops.ComputeBackend, built: *const gra
     try cb.checkExecutionControl();
     switch (execution) {
         .native => if (cb.kind() != .native or cb.vtable.reshapeOp == null) return error.UnsupportedSeededTrainingBackend,
-        .resident_metal => if (cb.kind() != .metal or cb.vtable.residentTrainingInstruction == null) return error.UnsupportedSeededTrainingBackend,
+        .resident_metal, .resident_cuda => if (cb.kind() != execution.backendKind() or cb.vtable.residentTrainingInstruction == null) return error.UnsupportedSeededTrainingBackend,
     }
     var prepared = try prepare(a, built, execution, primitive, combined);
     defer prepared.deinit();
@@ -311,11 +311,11 @@ pub fn merge(a: Allocator, backend: *const ops.ComputeBackend, built: *const gra
         const incoming = route.head_tensor orelse route.encoder_tensor.?;
         const output = if (route.head_tensor != null and route.encoder_tensor != null) sum: {
             const instruction = ops.resident_program.Instruction{ .op = .add, .output = route.shape, .inputs = .{ route.shape, route.shape, .{}, .{} }, .num_inputs = 2 };
-            break :sum if (execution == .resident_metal)
+            break :sum if (execution != .native)
                 try cb.residentTrainingInstruction(&instruction, &.{ route.head_tensor.?, route.encoder_tensor.? }, .{ .primitive = primitive })
             else
                 try cb.add(route.head_tensor.?, route.encoder_tensor.?);
-        } else if (execution == .resident_metal)
+        } else if (execution != .native)
             try resident.lease(&cb, incoming, route.shape, .{ .program = .{ .instruction = .{ .primitive = primitive } } })
         else
             try cb.primReshape(incoming, route.shape.dims[0..route.shape.rank_]);

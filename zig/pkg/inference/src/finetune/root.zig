@@ -92,6 +92,7 @@ test {
     _ = gliner2;
     _ = gliner_boundary_losses;
     _ = @import("seeded_device_transaction_test.zig");
+    _ = @import("seeded_device_transaction.zig");
     _ = @import("gliner_boundary_training_backend_test.zig");
     _ = gliner_boundary_targets;
     _ = gliner_boundary_selection;

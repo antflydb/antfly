@@ -22,6 +22,7 @@ pub const Mode = enum { eval, train };
 /// Arithmetic and replay semantics are separate from resource ceilings.
 /// Checkpoint owners must bind this profile into their durable run identity.
 pub const AttentionProfile = enum { materialized_v1, replay_tiled_v1 };
+pub const AttentionArithmetic = deberta.AttentionArithmetic;
 pub const ActivationProfile = enum { retained_v1, layer_recompute_v1 };
 pub const Layout = struct {
     batch: u32,
@@ -113,6 +114,7 @@ pub const Built = struct {
     directional_relations: bool,
     mode: Mode,
     attention_profile: AttentionProfile = .materialized_v1,
+    attention_arithmetic: AttentionArithmetic = .scale_after_sum,
     activation_profile: ActivationProfile = .retained_v1,
     limits: Limits,
     admission: Plan,
@@ -316,6 +318,14 @@ pub fn buildWithProfile(bld: *Builder, config: *const boundary.Config, layout: L
 }
 
 pub fn buildWithProfiles(bld: *Builder, config: *const boundary.Config, layout: Layout, mode: Mode, profile: AttentionProfile, activation: ActivationProfile, limits: Limits) !Built {
+    return buildWithArithmetic(bld, config, layout, mode, profile, activation, .scale_after_sum, limits);
+}
+
+pub fn buildWithArithmetic(bld: *Builder, config: *const boundary.Config, layout: Layout, mode: Mode, profile: AttentionProfile, activation: ActivationProfile, arithmetic: AttentionArithmetic, limits: Limits) !Built {
+    return buildWithEmbeddingArithmetic(bld, config, layout, mode, profile, activation, arithmetic, .serial_v1, limits);
+}
+pub fn buildWithEmbeddingArithmetic(bld: *Builder, config: *const boundary.Config, layout: Layout, mode: Mode, profile: AttentionProfile, activation: ActivationProfile, arithmetic: AttentionArithmetic, embedding_arithmetic: ml.graph.node.ScatterReduction, limits: Limits) !Built {
+    if (arithmetic == .pytorch_fp32 and profile != .materialized_v1) return error.InvalidTrainingAttentionPlan;
     const admission = try planWithProfiles(config, layout, mode, profile, activation, limits);
     const e = config.encoder;
     const bs = try rows(layout.batch, layout.sequence);
@@ -355,6 +365,9 @@ pub fn buildWithProfiles(bld: *Builder, config: *const boundary.Config, layout: 
         .layer_norm_eps = e.layer_norm_eps,
     }, inputs.input_ids, inputs.attention_bias, inputs.embedding_valid, layout.batch, layout.sequence, .{
         .attention = if (profile == .materialized_v1) .materialized else .training_replay_v1,
+        .attention_arithmetic = arithmetic,
+        .word_embedding_backward = embedding_arithmetic,
+        .word_embedding_padding_index = if (embedding_arithmetic == .pytorch_embedding_v1) e.pad_token_id else null,
         .attention_score_mask = if (profile == .materialized_v1) inputs.attention_valid else null,
         .training_attention_v1 = if (profile == .replay_tiled_v1) .{ .control = inputs.attention_control, .probability = if (mode == .train) e.attention_probs_dropout_prob else 0 } else null,
         .project_relative_before_gather = true,
@@ -380,6 +393,7 @@ pub fn buildWithProfiles(bld: *Builder, config: *const boundary.Config, layout: 
         .directional_relations = config.head.directional_relation_states,
         .mode = mode,
         .attention_profile = profile,
+        .attention_arithmetic = arithmetic,
         .activation_profile = activation,
         .limits = limits,
         .admission = admission,
@@ -869,4 +883,40 @@ test "GLiNER2.5 regional recomputation planning retains boundaries and admits fo
     limits.max_forward_tensor_bytes = regional.forward_tensor_upper_bound_bytes;
     _ = try planWithProfiles(&config, layout, .train, .replay_tiled_v1, .layer_recompute_v1, limits);
     try std.testing.expectError(error.ResourceLimitExceeded, planWithProfiles(&config, layout, .train, .replay_tiled_v1, .retained_v1, limits));
+}
+
+test "GLiNER2.5 CUDA attention arithmetic is explicit and within encoder admission" {
+    const a = std.testing.allocator;
+    const config = testConfig();
+    for ([_]AttentionArithmetic{ .scale_after_sum, .pytorch_fp32 }) |arithmetic| {
+        for ([_]u32{ 1, 2 }) |batch| {
+            for ([_]u32{ 7, 59 }) |sequence| {
+                const layout = Layout{ .batch = batch, .sequence = sequence, .words = 3, .queries = 2, .classifications = 0, .groups = 0, .relations = 0 };
+                var graph = ml.graph.Graph.init(a);
+                defer graph.deinit();
+                var builder = Builder.init(&graph);
+                var built = try buildWithArithmetic(&builder, &config, layout, .train, .materialized_v1, .retained_v1, arithmetic, .{});
+                defer built.deinit();
+                try std.testing.expectEqual(arithmetic, built.attention_arithmetic);
+                var transposed_rhs: usize = 0;
+                var scaled_content: usize = 0;
+                var forward_bytes: u64 = 0;
+                for (graph.nodes.items) |node| {
+                    if (node.op != .parameter) forward_bytes += @as(u64, @intCast(node.output_shape.numElements().?)) * 4;
+                    if (node.op != .dot_general or node.op.dot_general.num_batch != 1 or node.op.dot_general.rhs_contracting[0] != 2) continue;
+                    transposed_rhs += 1;
+                    if (graph.node(node.inputs[1]).op == .mul) scaled_content += 1;
+                }
+                try std.testing.expectEqual(if (arithmetic == .pytorch_fp32) @as(usize, config.encoder.num_hidden_layers) * 3 else 0, transposed_rhs);
+                try std.testing.expectEqual(if (arithmetic == .pytorch_fp32) @as(usize, config.encoder.num_hidden_layers) else 0, scaled_content);
+                try std.testing.expect(forward_bytes <= built.admission.forward_tensor_upper_bound_bytes);
+                try std.testing.expect(graph.constant_pool.items.len <= built.admission.constant_bytes);
+            }
+        }
+    }
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const layout = Layout{ .batch = 1, .sequence = 7, .words = 3, .queries = 2, .classifications = 0, .groups = 0, .relations = 0 };
+    try std.testing.expectError(error.InvalidTrainingAttentionPlan, buildWithArithmetic(&builder, &config, layout, .train, .replay_tiled_v1, .retained_v1, .pytorch_fp32, .{}));
 }

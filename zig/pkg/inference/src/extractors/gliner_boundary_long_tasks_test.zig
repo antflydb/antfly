@@ -275,28 +275,35 @@ fn one(cb: *const @import("../ops/ops.zig").ComputeBackend, a: Allocator, config
     options.limits.plan.max_memory_bytes = 4 * mib;
     options.limits.merge.max_input_candidates = 2048;
     options.pipeline.max_output_values = output_cap;
-    return if (cb.kind() == .metal)
+    return if (cb.kind() != .native)
         executor.executeDevice(cb, a, config, tokenizer, &request.items[0], options)
     else
         executor.executeNative(cb, a, config, tokenizer, &request.items[0], options);
 }
 
-fn runBackend(comptime metal: bool, directory: []const u8, corpus: *const Corpus) !*Captures {
+const Backend = enum { native, metal, cuda };
+
+fn runBackend(comptime backend: Backend, directory: []const u8, corpus: *const Corpus) !*Captures {
+    const on_device = backend != .native;
     const a = std.testing.allocator;
     const captures = try Captures.create(a);
     errdefer captures.destroy();
     const output = captures.budget.allocator();
-    const watchdog: ?*Watchdog = if (metal) try Watchdog.create(a) else null;
+    const watchdog: ?*Watchdog = if (on_device) try Watchdog.create(a) else null;
     defer if (watchdog) |value| value.destroy();
     if (watchdog) |value| try value.start(std.testing.io);
     const lifetime = Control{ .io = std.testing.io, .deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s, .hard_cancellation = if (watchdog) |value| value.boundary() else null };
     // This independent guard spans constructor and physical close. The
     // deliberate cancellation is cooperative at a completed-window cut, and
     // is never installed as a fatal watchdog callback.
-    var lifetime_guard = try lifetime.enterUninterruptible(if (metal) .process_required else .cooperative);
+    var lifetime_guard = try lifetime.enterUninterruptible(if (on_device) .process_required else .cooperative);
     defer lifetime_guard.deinit();
     try pinnedFiles(a, directory, corpus.reference.model_files, lifetime);
-    const session = if (metal) try factory.createMetalSession(a, directory) else try factory.createNativeSession(a, directory);
+    const session = switch (backend) {
+        .native => try factory.createNativeSession(a, directory),
+        .metal => try factory.createMetalSession(a, directory),
+        .cuda => try factory.createCudaSession(a, directory),
+    };
     defer session.close();
     const identity = try factory.getGlinerBoundaryIdentity(session);
     try pinnedIdentity(corpus.reference.model_files, identity);
@@ -318,7 +325,7 @@ fn runBackend(comptime metal: bool, directory: []const u8, corpus: *const Corpus
     controlled.ptr = &progress;
     controlled.check_fn = Progress.check;
     for (corpus.cases, &captures.results, 0..) |case, *result, index| {
-        errdefer std.debug.print("learned multi-window backend={s} case={s} completed={d} merges={d}\n", .{ if (metal) "metal" else "native", case.spec.id, progress.windows, progress.merges });
+        errdefer std.debug.print("learned multi-window backend={s} case={s} completed={d} merges={d}\n", .{ @tagName(backend), case.spec.id, progress.windows, progress.merges });
         progress = .{};
         result.* = try one(&managed.backend, output, &config, tokenizer.tokenizer(), identity, case, controlled, &progress, 256);
         captures.initialized += 1;
@@ -742,7 +749,7 @@ test "gliner boundary learned multi window native pinned small task ownership an
     const directory = platform.env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
     const corpus = try Corpus.create(std.testing.allocator);
     defer corpus.destroy();
-    const captures = try runBackend(false, directory, corpus);
+    const captures = try runBackend(.native, directory, corpus);
     defer captures.destroy();
     for (corpus.cases, captures.results) |case, result| try validateCase(std.testing.allocator, case, result);
 }
@@ -750,16 +757,29 @@ test "gliner boundary learned multi window native pinned small task ownership an
 test "gliner boundary learned multi window Metal pinned small semantic task parity and retry" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const directory = platform.env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
+    try compareDevice(.metal, directory);
+}
+
+test "gliner boundary learned multi window CUDA pinned small semantic task parity and retry" {
+    try @import("../graph/resident_training_fixture.zig").CudaDevice.requireAvailable();
+    const directory = platform.env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse {
+        if (platform.env.getenvBoolDefault("TERMITE_REQUIRE_CUDA_TESTS", false)) return error.RequiredCudaModelUnavailable;
+        return error.SkipZigTest;
+    };
+    try compareDevice(.cuda, directory);
+}
+
+fn compareDevice(comptime backend: Backend, directory: []const u8) !void {
     const corpus = try Corpus.create(std.testing.allocator);
     defer corpus.destroy();
     // runBackend closes its physical model owner before returning. Only owned
     // scalar outputs remain while the next backend opens the same five pins.
-    const native = try runBackend(false, directory, corpus);
+    const native = try runBackend(.native, directory, corpus);
     defer native.destroy();
-    const metal = try runBackend(true, directory, corpus);
-    defer metal.destroy();
-    for (corpus.cases, native.results, metal.results) |case, cpu, gpu| {
-        errdefer std.debug.print("learned multi-window CPU/Metal mismatch: {s}\n", .{case.spec.id});
+    const accelerated = try runBackend(backend, directory, corpus);
+    defer accelerated.destroy();
+    for (corpus.cases, native.results, accelerated.results) |case, cpu, gpu| {
+        errdefer std.debug.print("learned multi-window CPU/{s} mismatch: {s}\n", .{ @tagName(backend), case.spec.id });
         try validateCase(std.testing.allocator, case, cpu);
         try validateCase(std.testing.allocator, case, gpu);
         try std.testing.expectEqual(cpu.prompt_tokens, gpu.prompt_tokens);

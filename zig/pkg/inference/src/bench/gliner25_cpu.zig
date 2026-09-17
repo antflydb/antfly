@@ -15,12 +15,13 @@ const pipeline = inference.pipelines.gliner_boundary_pipeline;
 const engine = inference.architectures.gliner_boundary_engine;
 const native = inference.native_compute.native;
 const Allocator = std.mem.Allocator;
-const scope = "gliner25_direct_core_cpu_fp32";
+const on_cuda = build_options.enable_cuda;
+const scope = if (on_cuda) "gliner25_direct_core_cuda_comparison_v1" else "gliner25_direct_core_cpu_fp32";
 const timing_boundary = "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup";
 
 comptime {
     if (builtin.mode != .ReleaseFast) @compileError("GLiNER2.5 benchmark requires -Doptimize=ReleaseFast for the complete dependency graph");
-    if (build_options.enable_metal or build_options.enable_cuda or build_options.enable_onnx or build_options.enable_pjrt)
+    if (build_options.enable_metal or build_options.enable_onnx or build_options.enable_pjrt)
         @compileError("GLiNER2.5 CPU benchmark requires -Dmetal=false -Dcuda=false -Donnx=false -Dpjrt=false");
 }
 
@@ -34,11 +35,12 @@ const Files = struct {
 };
 const Case = struct { id: []const u8, text: []const u8, schema: std.json.Value };
 const Fixture = struct { format_version: u32, source_commit: []const u8, model: []const u8, model_id: []const u8, revision: []const u8, model_files: Files, cases: []const Case };
-const Options = struct { model_dir: []const u8 = "", cases_path: []const u8 = "", threads: usize = 1, timeout_ms: u64 = 30000, max_commands: usize = 2048 };
+const Options = struct { model_dir: []const u8 = "", cases_path: []const u8 = "", threads: usize = 1, batch_size: usize = 1, timeout_ms: u64 = 30000, max_commands: usize = 2048 };
 const Command = struct { request_id: u32, op: enum { validate, run, stop }, case_id: []const u8 = "" };
 const Extraction = struct {
     output: pipeline.Result,
     input_ids: ?[]i64 = null,
+    encoder_shape: [2]usize,
     fn deinit(self: *Extraction, a: Allocator) void {
         self.output.deinit();
         if (self.input_ids) |ids| a.free(ids);
@@ -91,21 +93,38 @@ fn loadWeights(a: Allocator, reader: *const inference.models.safetensors.MMapRea
     }
     return store;
 }
-fn extract(a: Allocator, cb: *const inference.ops.ComputeBackend, config: *const model.Config, tokenizer: inference.tokenizer.Tokenizer, text: []const u8, schema_json: []const u8, capture_tokens: bool, timeout_ms: u64) !Extraction {
+fn extract(a: Allocator, cb: *const inference.ops.ComputeBackend, config: *const model.Config, tokenizer: inference.tokenizer.Tokenizer, text: []const u8, schema_json: []const u8, capture_tokens: bool, timeout_ms: u64, batch_size: usize) !Extraction {
     const deadline = try std.math.add(u64, try nowNs(), try std.math.mul(u64, timeout_ms, std.time.ns_per_ms));
     const control = inference.InferenceExecutionControl{ .deadline_ns = deadline };
     var schema = try schema_mod.compile(a, schema_json, .{});
     defer schema.deinit();
-    var prepared = try processor.prepare(a, tokenizer, &.{.{ .text = text, .schema = &schema }}, .{ .max_batch_items = 1, .max_text_words = 128, .max_sequence_tokens = 512, .max_queries = 64, .control = control });
+    const items = try a.alloc(processor.Item, batch_size);
+    defer a.free(items);
+    const batch_schemas = try a.alloc(*const schema_mod.CompiledSchema, batch_size);
+    defer a.free(batch_schemas);
+    for (items, batch_schemas) |*item, *compiled| {
+        item.* = .{ .text = text, .schema = &schema };
+        compiled.* = &schema;
+    }
+    var prepared = try processor.prepare(a, tokenizer, items, .{ .max_batch_items = batch_size, .max_text_words = 128, .max_sequence_tokens = 512, .max_queries = 64, .control = control });
     defer prepared.deinit();
     const tokens = if (capture_tokens) try a.dupe(i64, prepared.input_ids) else null;
     errdefer if (tokens) |ids| a.free(ids);
+    if (comptime on_cuda) {
+        var result = try inference.architectures.gliner_boundary_request_device.run(cb, a, config, &prepared, batch_schemas, .{
+            .pipeline = .{ .offset_unit = .unicode_codepoints, .control = control, .head_limits = .{ .max_batch = batch_size }, .task_limits = .{ .math = .{ .max_batch = batch_size } } },
+            .limits = .{ .encoder = .{ .max_batch = batch_size }, .head = .{ .max_batch = batch_size } },
+        });
+        errdefer result.deinit();
+        try control.check();
+        return .{ .output = result.outputs, .input_ids = tokens, .encoder_shape = .{ batch_size, prepared.input_ids.len / batch_size } };
+    }
     var encoded = try engine.encodeNative(cb, a, config, &prepared, .{ .control = control });
     defer encoded.deinit();
-    var output = try pipeline.runNative(cb, a, config, &prepared, &.{&schema}, .{ .text_states = encoded.text_states, .query_states = encoded.query_states, .classification_states = encoded.classification_states, .text_lengths = encoded.text_lengths }, .{ .offset_unit = .unicode_codepoints, .control = control });
+    var output = try pipeline.runNative(cb, a, config, &prepared, batch_schemas, .{ .text_states = encoded.text_states, .query_states = encoded.query_states, .classification_states = encoded.classification_states, .text_lengths = encoded.text_lengths }, .{ .offset_unit = .unicode_codepoints, .control = control });
     errdefer output.deinit();
     try control.check();
-    return .{ .output = output, .input_ids = tokens };
+    return .{ .output = output, .input_ids = tokens, .encoder_shape = .{ batch_size, prepared.input_ids.len / batch_size } };
 }
 fn emit(a: Allocator, writer: *std.Io.Writer, value: anytype) !void {
     const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
@@ -121,9 +140,10 @@ fn parseArgs(init: std.process.Init) !Options {
     _ = args.next();
     while (args.next()) |arg| {
         const next = args.next() orelse return error.MissingBenchmarkArgument;
-        if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = next else if (std.mem.eql(u8, arg, "--cases")) options.cases_path = next else if (std.mem.eql(u8, arg, "--threads")) options.threads = try std.fmt.parseInt(usize, next, 10) else if (std.mem.eql(u8, arg, "--timeout-ms")) options.timeout_ms = try std.fmt.parseInt(u64, next, 10) else if (std.mem.eql(u8, arg, "--max-commands")) options.max_commands = try std.fmt.parseInt(usize, next, 10) else return error.UnknownBenchmarkArgument;
+        if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = next else if (std.mem.eql(u8, arg, "--cases")) options.cases_path = next else if (std.mem.eql(u8, arg, "--threads")) options.threads = try std.fmt.parseInt(usize, next, 10) else if (std.mem.eql(u8, arg, "--batch-size")) options.batch_size = try std.fmt.parseInt(usize, next, 10) else if (std.mem.eql(u8, arg, "--timeout-ms")) options.timeout_ms = try std.fmt.parseInt(u64, next, 10) else if (std.mem.eql(u8, arg, "--max-commands")) options.max_commands = try std.fmt.parseInt(usize, next, 10) else return error.UnknownBenchmarkArgument;
     }
     if (options.model_dir.len == 0 or options.cases_path.len == 0 or options.threads == 0 or options.threads > 32 or options.timeout_ms == 0 or options.timeout_ms > 60000 or options.max_commands == 0 or options.max_commands > 4096) return error.InvalidBenchmarkOptions;
+    if (options.batch_size == 0 or options.batch_size > 64 or (!on_cuda and options.batch_size != 1)) return error.InvalidBenchmarkOptions;
     if (!build_options.enable_system_blas and options.threads != 1) return error.BenchmarkThreadControlUnavailable;
     return options;
 }
@@ -178,13 +198,24 @@ pub fn main(init: std.process.Init) !void {
     // Avoid a second native worker pool: BLAS alone owns the requested dense
     // math thread budget. Without BLAS only the explicit one-thread profile is
     // admitted. Default Io otherwise creates platform-dependent parallelism.
-    var backend = native.NativeCompute.initWithIo(a, &store, null, std.Io.Threaded.global_single_threaded.io());
+    var backend = if (on_cuda) try inference.native_compute.cuda.CudaCompute.init(a) else native.NativeCompute.initWithIo(a, &store, null, std.Io.Threaded.global_single_threaded.io());
     defer backend.deinit();
+    if (comptime on_cuda) {
+        if (backend.kernels.gliner25_boundary_f32 == null) return error.CudaKernelUnavailable;
+        var it = store.resident_weights.iterator();
+        while (it.next()) |entry| {
+            const name = try a.dupe(u8, entry.key_ptr.*);
+            backend.insertWeightFromLoaded(name, entry.value_ptr) catch |err| {
+                a.free(name);
+                return err;
+            };
+        }
+    }
     const cb = backend.computeBackend();
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const cases_digest = hash(bytes);
-    try emit(a, &stdout.interface, .{ .event = "ready", .arm = "native", .scope = scope, .timing_boundary = timing_boundary, .model = fixture.model, .model_id = fixture.model_id, .revision = fixture.revision, .model_files = fixture.model_files, .cases_sha256 = cases_digest[0..], .build_mode = @tagName(builtin.mode), .zig_version = builtin.zig_version_string, .threads = options.threads, .scheduler = "serial_io", .system_blas = build_options.enable_system_blas, .dtype = "float32", .qualification = false });
+    try emit(a, &stdout.interface, .{ .event = "ready", .batch_size = options.batch_size, .arm = "native", .scope = scope, .cuda_runtime = if (on_cuda) .{ .device_name = backend.ctx.info.nameSlice(), .driver_version = backend.ctx.info.driver_version, .compute_major = backend.ctx.info.compute_major, .compute_minor = backend.ctx.info.compute_minor } else null, .backend = if (on_cuda) "cuda" else "native", .synchronization_policy = if (on_cuda) "cuda_stream_before_start_and_after_extract_v1" else "synchronous_cpu_v1", .timing_boundary = timing_boundary, .model = fixture.model, .model_id = fixture.model_id, .revision = fixture.revision, .model_files = fixture.model_files, .cases_sha256 = cases_digest[0..], .build_mode = @tagName(builtin.mode), .zig_version = builtin.zig_version_string, .threads = options.threads, .scheduler = "serial_io", .system_blas = build_options.enable_system_blas, .dtype = "float32", .qualification = false });
     var stdin_buffer: [4096]u8 = undefined;
     var stdin = std.Io.File.stdin().readerStreaming(init.io, &stdin_buffer);
     var count: usize = 0;
@@ -205,12 +236,18 @@ pub fn main(init: std.process.Init) !void {
             break;
         };
         const i = case_index orelse return error.UnknownBenchmarkCase;
+        if (comptime on_cuda) try inference.native_compute.cuda.gliner25_api.synchronizeAndDrainDeferredDeviceFrees(&backend);
+        const stats_before = cb.trainingRuntimeStats();
         const started = try nowNs();
-        var result = try extract(a, &cb, &config, tokenizer.tokenizer(), fixture.cases[i].text, schemas[i], cmd.op == .validate, options.timeout_ms);
+        var result = try extract(a, &cb, &config, tokenizer.tokenizer(), fixture.cases[i].text, schemas[i], cmd.op == .validate, options.timeout_ms, options.batch_size);
+        if (comptime on_cuda) try inference.native_compute.cuda.gliner25_api.synchronizeAndDrainDeferredDeviceFrees(&backend);
         const elapsed = (try nowNs()) - started;
+        const stats_after = cb.trainingRuntimeStats();
+        if (on_cuda and (stats_after.to_float32_calls != stats_before.to_float32_calls or stats_after.download_alloc_calls != stats_before.download_alloc_calls))
+            return error.BenchmarkUnexpectedHostFallback;
         defer result.deinit(a);
-        if (elapsed == 0 or result.output.samples.len != 1) return error.InvalidBenchmarkResult;
-        try emit(a, &stdout.interface, .{ .event = "result", .arm = "native", .request_id = cmd.request_id, .case_id = cmd.case_id, .duration_ns = elapsed, .input_ids = result.input_ids, .output = result.output.samples[0] });
+        if (elapsed == 0 or result.output.samples.len != options.batch_size) return error.InvalidBenchmarkResult;
+        try emit(a, &stdout.interface, .{ .event = "result", .arm = "native", .request_id = cmd.request_id, .case_id = cmd.case_id, .duration_ns = elapsed, .cuda_transfers = if (on_cuda) .{ .h2d_bytes = stats_after.h2d_bytes - stats_before.h2d_bytes, .d2h_bytes = stats_after.d2h_bytes - stats_before.d2h_bytes, .kernel_launches = stats_after.kernel_launches - stats_before.kernel_launches, .host_fallback_calls = stats_after.to_float32_calls - stats_before.to_float32_calls } else null, .batch_size = options.batch_size, .encoder_shape = result.encoder_shape, .input_ids = result.input_ids, .output = result.output.samples[0], .outputs = if (options.batch_size > 1) result.output.samples else null });
     }
     return error.BenchmarkProtocolEndedWithoutStop;
 }

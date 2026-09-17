@@ -1,12 +1,13 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stable managed CPU/resident-Metal training backend. The verified Source
+//! Stable managed CPU/resident-GPU training backend. The verified Source
 //! outlives this owner. Only unselected original parameters are uploaded here;
 //! the optimizer remains the sole owner of every selected parameter/state.
 const std = @import("std");
 const build_options = @import("build_options");
 const ml = @import("ml").graph;
+const cuda = @import("../ops/cuda/cuda_compute.zig");
 const native = @import("../ops/native_compute.zig");
 const metal = @import("../ops/metal_compute.zig");
 const gpu_store = @import("../ops/gpu_hosted_store.zig");
@@ -30,6 +31,9 @@ pub const Limits = struct {
     /// optimizer, activation/tape, and transaction limits are admitted by the
     /// enclosing run. Backend/driver allocations use its backend allocator.
     max_combined_bytes: usize = 4 * 1024 * mib,
+    /// Physical CUDA payload ceiling, including cached buffers and workspaces.
+    /// The enclosing trainer subtracts its reserved backend host metadata.
+    max_device_allocation_bytes: usize = 4 * 1024 * mib,
     primitive: ops.resident_training.Limits = .{},
 };
 pub const Admission = struct {
@@ -78,12 +82,13 @@ fn validateShape(dimensions: []const i32, values: []const f32, limits: Limits) !
 
 /// No allocation or device dispatch. A full frozen inventory, its largest
 /// synchronous host upload staging, and bounded name/shape/lease metadata are
-/// admitted before creating the Metal provider or reading learned values.
+/// admitted before creating the device provider or reading learned values.
 pub fn estimate(originals: []const run.Parameter, selected: []const controller.Parameter, execution: Execution, limits: Limits) !Admission {
     if (limits.max_parameters == 0 or limits.max_parameters > 4096 or limits.max_host_metadata_bytes <= @sizeOf(Owner) or
         limits.max_combined_bytes == 0 or originals.len == 0 or originals.len > limits.max_parameters or selected.len > limits.max_parameters)
         return error.InvalidBoundaryTrainingBackendLimits;
     if (comptime !build_options.enable_metal) if (execution == .resident_metal) return error.UnsupportedBoundaryTrainingBackend;
+    if (comptime !build_options.enable_cuda) if (execution == .resident_cuda) return error.UnsupportedBoundaryTrainingBackend;
     var frozen_count: usize = 0;
     var payload: usize = 0;
     var largest: usize = 0;
@@ -119,7 +124,7 @@ pub fn estimate(originals: []const run.Parameter, selected: []const controller.P
         return .{ .execution = execution, .original_parameters = originals.len, .selected_parameters = selected.len, .frozen_parameters = frozen_count, .frozen_device_bytes = 0, .upload_staging_bytes = 0, .host_metadata_upper_bound_bytes = metadata, .initialize_upper_bound_bytes = metadata, .binding_metadata_upper_bound_bytes = 0 };
     }
     const bindings = try mul(frozen_count, @sizeOf(interpreter.RuntimeInput) + 2048);
-    const metadata = try add(try add(@sizeOf(Owner), @sizeOf(MetalOwner)), try add(strings, try add(bindings, try mul(try add(originals.len, selected.len), 4096))));
+    const metadata = try add(try add(@sizeOf(Owner), (if (execution == .resident_cuda) @sizeOf(cuda.CudaCompute) else @sizeOf(MetalOwner))), try add(strings, try add(bindings, try mul(try add(originals.len, selected.len), 4096))));
     const combined = try add(payload, try add(largest, metadata));
     if (payload > limits.max_frozen_device_bytes or largest > limits.max_upload_staging_bytes or
         metadata > limits.max_host_metadata_bytes or combined > limits.max_combined_bytes)
@@ -137,6 +142,7 @@ pub const Owner = struct {
     receipt: Receipt = .{},
     native_backend: ?*native.NativeCompute = null,
     metal_backend: ?*MetalOwner = null,
+    cuda_backend: ?*cuda.CudaCompute = null,
     frozen: []Frozen = &.{},
     selected: []Selected = &.{},
     initialized_frozen: usize = 0,
@@ -147,8 +153,9 @@ pub const Owner = struct {
     pub fn init(a: Allocator, source_store: *native.WeightStore, originals: []const run.Parameter, selected: []const controller.Parameter, execution: Execution, limits: Limits, control: ?Control) !*Owner {
         try check(control);
         if (comptime !build_options.enable_metal) if (execution == .resident_metal) return error.UnsupportedBoundaryTrainingBackend;
+        if (comptime !build_options.enable_cuda) if (execution == .resident_cuda) return error.UnsupportedBoundaryTrainingBackend;
         const admission = try estimate(originals, selected, execution, limits);
-        if (execution == .resident_metal) {
+        if (execution != .native) {
             // Reject invalid source payloads before any uploads. Selected
             // values are independently validated by the optimizer owner.
             for (originals) |parameter| {
@@ -171,9 +178,29 @@ pub const Owner = struct {
             try check(control);
             return self;
         }
-        if (comptime build_options.enable_metal) {
-            self.metal_backend = try createMetal(a);
-            self.cb = self.metal_backend.?.backend.computeBackend();
+        {
+            switch (execution) {
+                .native => unreachable,
+                .resident_metal => if (comptime build_options.enable_metal) {
+                    self.metal_backend = try createMetal(a);
+                    self.cb = self.metal_backend.?.backend.computeBackend();
+                } else return error.UnsupportedBoundaryTrainingBackend,
+                .resident_cuda => if (comptime build_options.enable_cuda) {
+                    const backend = try a.create(cuda.CudaCompute);
+                    backend.* = cuda.CudaCompute.initWithDeviceMemoryLimit(a, limits.max_device_allocation_bytes) catch |err| {
+                        a.destroy(backend);
+                        return err;
+                    };
+                    self.cuda_backend = backend;
+                    backend.resident_training_cache = true;
+                    if (backend.kernels.gliner25_boundary_f32 == null or backend.kernels.gliner25_layer_norm_f32 == null or backend.kernels.gliner25_softmax_f32 == null or
+                        backend.kernels.training_validate_f32 == null or backend.kernels.training_validate_finish == null or !backend.kernels.hasGliner25Attention()) return error.CudaKernelUnavailable;
+                    try backend.enableResidentTrainingBlas();
+                    try backend.enableResidentTrainingMath();
+                    try backend.enableResidentBoundaryAttention();
+                    self.cb = backend.computeBackend();
+                } else return error.UnsupportedBoundaryTrainingBackend,
+            }
             const scratch = self.metadata.allocator();
             self.frozen = try scratch.alloc(Frozen, admission.frozen_parameters);
             self.selected = try scratch.alloc(Selected, selected.len);
@@ -205,7 +232,7 @@ pub const Owner = struct {
             try check(control);
             std.debug.assert(self.receipt.upload_bytes == admission.frozen_device_bytes);
             return self;
-        } else return error.UnsupportedBoundaryTrainingBackend;
+        }
     }
 
     /// An immutable source/provider lease must cover the owner and every
@@ -239,6 +266,10 @@ pub const Owner = struct {
             backend.store.lazy_weights.deinit(self.backing);
             self.backing.destroy(backend);
         };
+        if (self.cuda_backend) |backend| {
+            backend.deinit();
+            self.backing.destroy(backend);
+        }
         std.debug.assert(self.metadata.live == 0);
         self.backing.destroy(self);
     }

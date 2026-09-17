@@ -229,6 +229,10 @@ test {
         _ = native_compute.cuda;
         _ = @import("ops/cuda/a4b_prepared_pack.zig");
         _ = @import("ops/cuda/kernels.zig");
+        // Keep focused boundary-kernel tests discoverable without relying on
+        // an unrelated device test to instantiate the resident adapter.
+        _ = @import("ops/cuda/gliner25.zig");
+        _ = @import("ops/resident_program_ops.zig");
     }
     _ = @import("ml");
 }

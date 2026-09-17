@@ -41,8 +41,12 @@ pub fn nextObserved(owner: *trainer.Trainer) !?trainer.Report {
     try std.testing.expectEqual(report.optimizer.identity.microbatch_step, receipt.identity.microbatch_step);
     try std.testing.expectEqual(report.optimizer.optimizer_stepped, receipt.optimizer_stepped);
     try std.testing.expectEqual(@as(usize, 0), receipt.scalar_upload_bytes % 4);
-    try std.testing.expectEqual(@as(usize, 0), receipt.scalar_download_bytes % 12);
-    try std.testing.expect(receipt.scalar_upload_bytes + receipt.scalar_download_bytes <= receipt.selected_slots * 144 + 64);
+    const clipping_bytes: usize = if (owner.optimizer.pytorch_clip_order != null) 4 else 0;
+    if (owner.options.execution == .resident_cuda) {
+        // CUDA boolean validation reads one flags word per bounded batch.
+        try std.testing.expectEqual(@as(usize, 0), receipt.scalar_download_bytes % 4);
+    } else try std.testing.expectEqual(clipping_bytes, receipt.scalar_download_bytes % 12);
+    try std.testing.expect(receipt.scalar_upload_bytes + receipt.scalar_download_bytes <= receipt.selected_slots * 144 + 64 + clipping_bytes);
     try std.testing.expectEqual(@as(usize, 0), report.resident_gradient_control_bytes % 12);
     return report;
 }
@@ -92,10 +96,19 @@ fn exercise(a: std.mem.Allocator, execution: controller.Execution, attention_pro
 }
 
 fn exerciseWithActivation(a: std.mem.Allocator, execution: controller.Execution, attention_profile: step.AttentionProfile, activation_profile: step.ActivationProfile) !void {
+    return exerciseWithBoundaryAttention(a, execution, attention_profile, activation_profile, false);
+}
+
+fn exerciseWithBoundaryAttention(a: std.mem.Allocator, execution: controller.Execution, attention_profile: step.AttentionProfile, activation_profile: step.ActivationProfile, fused_boundary: bool) !void {
     var samples = try dataset(a);
     defer samples.deinit();
     var tokenizer = helper.TestTokenizer{};
     var config = helper.config();
+    if (fused_boundary) {
+        config.head.boundary_dim = 32;
+        config.head.boundary_attention_heads = 1;
+        config.head.dropout = 0;
+    }
     if (activation_profile == .layer_recompute_v1) config.encoder.num_hidden_layers = 2;
     var first = try samples.sample(0, null, null);
     defer first.deinit();
@@ -125,7 +138,9 @@ fn exerciseWithActivation(a: std.mem.Allocator, execution: controller.Execution,
         enrolled = true;
         const dims = try scratch.alloc(i32, shape.rank_);
         for (dims, shape.dims[0..shape.rank_]) |*dim, size| dim.* = @intCast(size);
-        const canonical = if (std.mem.startsWith(u8, name, "embeddings.") or std.mem.startsWith(u8, name, "encoder.")) try std.fmt.allocPrint(scratch, "encoder.{s}", .{name}) else name;
+        // The zero-dropout classifier removes Sequential index two. Preserve
+        // the released canonical name, as the real source/benchmark loader does.
+        const canonical = if (std.mem.eql(u8, name, "classifier.2.weight")) "classifier.3.weight" else if (std.mem.eql(u8, name, "classifier.2.bias")) "classifier.3.bias" else if (std.mem.startsWith(u8, name, "embeddings.") or std.mem.startsWith(u8, name, "encoder.")) try std.fmt.allocPrint(scratch, "encoder.{s}", .{name}) else name;
         try parameters.append(scratch, .{ .name = name, .canonical_name = canonical, .dimensions = dims, .values = tensor.asFloat32(), .kind = .original });
     }
     const source = bundle.Identity{ .backbone = config.backbone, .precision = .fp32, .weight = bundle.Digest.of("immutable tiny test weights"), .sidecars = .{ bundle.Digest.of("model"), bundle.Digest.of("encoder"), bundle.Digest.of("tokenizer"), bundle.Digest.of("tokenizer config") } };
@@ -144,13 +159,27 @@ fn exerciseWithActivation(a: std.mem.Allocator, execution: controller.Execution,
         }
         var expected = try trainer.Trainer.init(a, &store, tokenizer.tokenizer(), source, config, &samples, parameters.items, options, null);
         defer expected.deinit();
-        if (execution == .resident_metal) {
+        if (execution != .native) {
             try std.testing.expectEqual(@as(usize, if (mode == .full) 0 else expected.backend.admission.frozen_parameters), expected.backend.receipt.upload_tensors);
             if (mode == .heads) try std.testing.expect(expected.backend.receipt.upload_bytes > 0);
         }
         var reports = std.ArrayListUnmanaged(trainer.Report).empty;
         defer reports.deinit(a);
         while (try nextObserved(expected)) |report| {
+            if (fused_boundary and report.terms != null) {
+                var found = false;
+                for (expected.plan.?.graph.nodes.items) |node| {
+                    if (node.op == .fused_boundary_training_attention_v1) found = true;
+                }
+                try std.testing.expect(found);
+            }
+            if (execution == .resident_cuda and report.terms != null) {
+                var found_scan = false;
+                for (expected.plan.?.graph.nodes.items) |node| {
+                    if (node.op == .fused_prefix_scan_v1) found_scan = true;
+                }
+                try std.testing.expect(found_scan);
+            }
             try expectOrder(a, expected, report);
             try reports.append(a, report);
         }
@@ -494,4 +523,21 @@ test "boundary native trainer resident restored partial flush enforces combined 
     const before = metal_tensor.memoryStatsSnapshot();
     try restoredFlushAdmission(std.testing.allocator);
     try std.testing.expectEqual(before.device_owned_live_bytes, metal_tensor.memoryStatsSnapshot().device_owned_live_bytes);
+}
+
+test "boundary native trainer CUDA full and heads materialized and replay preserve durable resume" {
+    try @import("../graph/resident_training_fixture.zig").CudaDevice.requireAvailable();
+    try exercise(std.testing.allocator, .resident_cuda, .materialized_v1);
+    try exercise(std.testing.allocator, .resident_cuda, .replay_tiled_v1);
+}
+
+test "boundary native trainer CUDA layer recomputation preserves durable resume" {
+    try @import("../graph/resident_training_fixture.zig").CudaDevice.requireAvailable();
+    try exerciseWithActivation(std.testing.allocator, .resident_cuda, .replay_tiled_v1, .layer_recompute_v1);
+}
+
+test "boundary native trainer CUDA fused boundary attention preserves durable resume and recomputation" {
+    try @import("../graph/resident_training_fixture.zig").CudaDevice.requireAvailable();
+    try exerciseWithBoundaryAttention(std.testing.allocator, .resident_cuda, .materialized_v1, .retained_v1, true);
+    try exerciseWithBoundaryAttention(std.testing.allocator, .resident_cuda, .replay_tiled_v1, .layer_recompute_v1, true);
 }

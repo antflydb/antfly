@@ -432,7 +432,7 @@ pub fn executeNative(cb: *const compute.ComputeBackend, allocator: Allocator, co
 }
 
 pub fn executeDevice(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options) !Result {
-    if (cb.kind() != .metal) return error.UnsupportedGlinerBoundaryBackend;
+    if ((cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     if (cb.decoderRuntimeHasActiveFrame()) return error.GlinerBoundaryExternalFrame;
     return execute(cb, allocator, config, tokenizer, item, supplied);
 }
@@ -495,7 +495,7 @@ fn admitWindows(backend: compute.BackendKind, allocator: Allocator, config: *con
         try receiver.observe(item.text.len, document.words.len, document.windows.len, &prepared);
         const attention_per_layer = switch (backend) {
             .native => (try engine.plan(config, &prepared, engine_options)).attention_work_items,
-            .metal => (try device_request.plan(config, &prepared, &.{&item.compiled}, device_options)).encoder.native.attention_work_items,
+            .metal, .cuda => (try device_request.plan(config, &prepared, &.{&item.compiled}, device_options)).encoder.native.attention_work_items,
             else => return error.UnsupportedGlinerBoundaryBackend,
         };
         // Count attention score elements across every encoder layer. This is
@@ -519,7 +519,7 @@ pub fn qualifyGeometry(cb: *const compute.ComputeBackend, allocator: Allocator, 
 /// Host planning can run before acquiring an accelerator execution mutex.
 /// This explicit backend tag permits no dispatch or backend construction.
 pub fn planGeometry(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options, receiver: anytype) !GeometryUsage {
-    if (backend != .native and backend != .metal) return error.UnsupportedGlinerBoundaryBackend;
+    if (backend != .native and (backend != .metal and backend != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     var quiet = supplied;
     quiet.observer = null;
     var planned = try prepareDocument(backend, allocator, config, item, quiet);
@@ -530,7 +530,7 @@ pub fn planGeometry(backend: compute.BackendKind, allocator: Allocator, config: 
 }
 
 pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options, gate: *qualification.Gate) !Result {
-    if (cb.kind() != .native and cb.kind() != .metal) return error.UnsupportedGlinerBoundaryBackend;
+    if (cb.kind() != .native and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame()) return error.GlinerBoundaryExternalFrame;
     return executeChecked(cb, allocator, config, tokenizer, item, supplied, gate);
 }
@@ -588,7 +588,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
                 var scorer = pipeline.scoring.NativeContext{ .cb = cb, .config = config, .prepared = &prepared, .core = .{ .text_states = encoded.text_states, .query_states = encoded.query_states, .classification_states = encoded.classification_states, .text_lengths = encoded.text_lengths }, .scores = if (headed) |*value| value else null };
                 break :native pipeline.runScoredWindows(budget.allocator(), config, &prepared, &.{&item.compiled}, if (headed) |*value| pipeline.scoring.CandidateScoreView.fromNative(value) else null, scorer.scorer(), pipeline_options, &.{}) catch |err| return evidenceAllocationError(terminal, err);
             },
-            .metal => (device_request.runWindowsWithOutputAllocator(cb, allocator, budget.allocator(), config, &prepared, &.{&item.compiled}, device_options) catch |err| return evidenceAllocationError(terminal, err)).outputs,
+            .metal, .cuda => (device_request.runWindowsWithOutputAllocator(cb, allocator, budget.allocator(), config, &prepared, &.{&item.compiled}, device_options) catch |err| return evidenceAllocationError(terminal, err)).outputs,
             else => return error.UnsupportedGlinerBoundaryBackend,
         };
         errdefer result.deinit();

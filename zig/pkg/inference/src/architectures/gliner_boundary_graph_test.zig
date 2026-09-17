@@ -76,6 +76,70 @@ fn allocationLifecycle(a: Allocator) !void {
 test "boundary training graph releases descriptors and graph on allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
 }
+
+test "boundary training input gradients preserve independent shift accumulation" {
+    const a = std.testing.allocator;
+    for ([_]graph_mod.InputGradientProfile{ .grouped_v1, .pytorch_v2 }) |profile| {
+        var graph = ml.Graph.init(a);
+        defer graph.deinit();
+        var builder = ml.Builder.init(&graph);
+        var g = try graph_mod.GraphBuilder.init(a, &builder, config(), .{ .batch = 2, .words = 3, .queries = 2, .classifications = 3 }, .training, .{});
+        defer g.deinit();
+        g.input_gradient_profile = profile;
+        const built = try build(&g);
+        var shifted: [2]ml.NodeId = .{ ml.null_node, ml.null_node };
+        for (graph.nodes.items) |node| {
+            if (node.op != .fused_linear) continue;
+            const weight = graph.node(node.inputs[1]);
+            if (weight.op != .parameter) continue;
+            const name = graph.parameterName(weight);
+            if (std.mem.eql(u8, name, "boundary_head.boundary_encoder.left_projection.weight")) shifted[0] = node.inputs[0];
+            if (std.mem.eql(u8, name, "boundary_head.boundary_encoder.right_projection.weight")) shifted[1] = node.inputs[0];
+        }
+        for (shifted) |node| try std.testing.expect(node != ml.null_node);
+        // Seed the real shifted views, plus a later text consumer. Independent
+        // PyTorch FP32 views yield (-2^24 + 2^24) + 1 == 1; a shared shift view
+        // instead yields -2^24 + (2^24 + 1) == 0. This observes VJP arithmetic,
+        // including BOS/EOS routing, rather than asserting graph node counts.
+        const side = try builder.mul(built.inputs[0], try builder.scalarConst(.f32, 1));
+        var seeds: [3]ml.autodiff.Seed = undefined;
+        for (shifted ++ .{side}, &seeds, 0..) |output, *seed, i| {
+            var name: [32]u8 = undefined;
+            seed.* = .{ .output = output, .cotangent = try builder.parameter(try std.fmt.bufPrint(&name, "shift_seed_{d}", .{i}), graph.node(output).output_shape) };
+        }
+        var ad = try ml.autodiff.gradientWithSeeds(a, &graph, &seeds, &.{built.inputs[0]}, .{ .require_all_gradients = true });
+        defer ad.deinit();
+        ad.graph.outputs.clearRetainingCapacity();
+        try ad.graph.markOutput(ad.param_grads[0]);
+        var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        var compute = native.NativeCompute.init(a, &store, null);
+        defer compute.deinit();
+        var cb = compute.computeBackend();
+        var bindings: std.ArrayListUnmanaged(interpreter.RuntimeInput) = .empty;
+        defer {
+            for (bindings.items) |binding| cb.free(binding.value);
+            bindings.deinit(a);
+        }
+        for (graph.parameters.items) |id| {
+            if (ad.id_map[id] == ml.null_node) continue;
+            const node = graph.node(id);
+            const values = try a.alloc(f32, @intCast(node.output_shape.numElements().?));
+            defer a.free(values);
+            const fill: f32 = if (id == seeds[0].cotangent) 1 else if (id == seeds[1].cotangent) 16777216 else if (id == seeds[2].cotangent) -16777216 else if (std.mem.endsWith(u8, graph.parameterName(node), "text_mask")) 1 else 0;
+            @memset(values, fill);
+            const value = try cb.fromFloat32(values);
+            errdefer cb.free(value);
+            try bindings.append(a, .{ .node_id = ad.id_map[id], .value = value });
+        }
+        var result = try interpreter.execute(a, &ad.graph, &cb, .{ .runtime_inputs = bindings.items });
+        defer result.deinit(&cb);
+        const actual = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        try std.testing.expectEqual(@as(usize, 24), actual.len);
+        for (actual) |value| try std.testing.expectEqual(@as(f32, if (profile == .pytorch_v2) 1 else 0), value);
+    }
+}
+
 test "boundary training graph validates shape masks index bounds cancellation and budget" {
     const a = std.testing.allocator;
     var graph = ml.Graph.init(a);
@@ -225,4 +289,110 @@ test "boundary training graph candidate construction fails closed at unsupported
     g.limits.max_tensor_elements = 64 * 1024 * 1024;
     g.limits.max_constant_bytes = graph.constant_pool.items.len;
     try std.testing.expectError(error.BoundaryTrainingGraphLimitExceeded, g.prefixSum(built.inputs[0], 2, 3, 4));
+}
+
+// Compare independently constructed per-group and batch graphs with the same
+// weights and cotangents. Uneven group/field counts and an empty sample catch
+// cross-sample routing, padding, and broadcast-adjoint mistakes.
+fn recordBatchParity(batch: u32, candidates: u32) !void {
+    const a = std.testing.allocator;
+    var graph = ml.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.Builder.init(&graph);
+    var cfg = config();
+    cfg.head.record_instance_queries = 2;
+    const instances = @max(candidates, cfg.head.record_instance_queries);
+    var g = try graph_mod.GraphBuilder.init(a, &builder, cfg, .{ .batch = batch, .words = 3, .queries = 2 }, .training, .{});
+    defer g.deinit();
+    const pool = try builder.parameter("pool", ml.Shape.init(.f32, &.{ batch * candidates, 4 }));
+    var groups: [3]task_graph.RecordBatchGroup = undefined;
+    var individual: [3]task_graph.RecordOutput = undefined;
+    for (&groups, &individual, [_]@import("../pipelines/extraction_schema.zig").RecordMode{ .natural, .latent, .anchorless }, 0..) |*group, *out, mode, index| {
+        const sample: u32 = if (batch > 1 and index == 2) 1 else 0;
+        const fields: u32 = if (index == 1) 2 else 1;
+        var name: [32]u8 = undefined;
+        const query = try builder.parameter(try std.fmt.bufPrint(&name, "fields_{d}", .{index}), ml.Shape.init(.f32, &.{ fields, 4 }));
+        const membership = try g.fill(&.{ fields, candidates }, 1);
+        const natural = if (mode == .natural) try builder.parameter("natural", ml.Shape.init(.f32, &.{candidates})) else null;
+        const active = if (mode == .anchorless) cfg.head.record_instance_queries else candidates;
+        const mask = if (active == instances) try g.fill(&.{instances}, 1) else try builder.concat(try g.fill(&.{active}, 1), try g.fill(&.{instances - active}, 0), 0);
+        group.* = .{ .sample = sample, .mode = mode, .fields = fields, .field_queries = query, .field_membership = membership, .instance_mask = mask, .natural_object_logits = natural };
+        const indices = try a.alloc(i32, candidates);
+        defer a.free(indices);
+        for (indices, 0..) |*v, i| v.* = @intCast(sample * candidates + i);
+        const ids = try builder.tensorConstBytes(std.mem.sliceAsBytes(indices), ml.Shape.init(.i32, &.{candidates}));
+        out.* = try task_graph.buildRecordGroupDense(&g, .{ .mode = mode, .candidates = candidates, .fields = fields, .candidate_states = try g.gather(pool, ids, candidates, 4), .field_queries = query, .candidate_mask = try g.fill(&.{candidates}, 1), .field_membership = membership, .instance_mask = mask, .natural_object_logits = natural });
+    }
+    const input = task_graph.RecordBatchInput{ .candidates = candidates, .candidate_states = pool, .candidate_mask = try g.fill(&.{ batch, candidates }, 1), .groups = &groups };
+    const batched = try task_graph.buildRecordBatchDense(&g, input);
+    defer a.free(batched);
+    const trainable_count = graph.parameters.items.len;
+    var seeds: [2][9]ml.autodiff.Seed = undefined;
+    for (individual, batched, 0..) |old, new, index| {
+        const old_nodes = [_]ml.NodeId{ old.instance_states, old.object_logits, old.assignment_logits };
+        const new_nodes = [_]ml.NodeId{ new.instance_states, new.object_logits, new.assignment_logits };
+        for (old_nodes, new_nodes, 0..) |left, right, kind| {
+            const shape = graph.node(left).output_shape;
+            try g.require(right, shape);
+            var name: [32]u8 = undefined;
+            const cotangent = try builder.parameter(try std.fmt.bufPrint(&name, "seed_{d}_{d}", .{ index, kind }), shape);
+            seeds[0][index * 3 + kind] = .{ .output = left, .cotangent = cotangent };
+            seeds[1][index * 3 + kind] = .{ .output = right, .cotangent = cotangent };
+        }
+    }
+    var reference: std.ArrayListUnmanaged([]f32) = .empty;
+    defer {
+        for (reference.items) |values| a.free(values);
+        reference.deinit(a);
+    }
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    for (seeds, 0..) |arm_seeds, arm| {
+        var gradients = try ml.autodiff.gradientWithSeeds(a, &graph, &arm_seeds, graph.parameters.items[0..trainable_count], .{ .require_all_gradients = true });
+        defer gradients.deinit();
+        gradients.graph.outputs.clearRetainingCapacity();
+        for (arm_seeds) |seed| try gradients.graph.markOutput(gradients.id_map[seed.output]);
+        for (gradients.param_grads) |node| try gradients.graph.markOutput(node);
+        var inputs: std.ArrayListUnmanaged(interpreter.RuntimeInput) = .empty;
+        defer {
+            for (inputs.items) |binding| cb.free(binding.value);
+            inputs.deinit(a);
+        }
+        for (graph.parameters.items, 0..) |node, parameter| {
+            const shape = graph.node(node).output_shape;
+            const values = try a.alloc(f32, @intCast(shape.numElements().?));
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + parameter * 3) % 19)) - 9)) / 23;
+            const tensor = try cb.fromFloat32(values);
+            errdefer cb.free(tensor);
+            try inputs.append(a, .{ .node_id = gradients.id_map[node], .value = tensor });
+        }
+        var result = try interpreter.execute(a, &gradients.graph, &cb, .{ .runtime_inputs = inputs.items });
+        defer result.deinit(&cb);
+        for (result.outputs, 0..) |tensor, index| {
+            const values = try cb.toFloat32(tensor, a);
+            if (arm == 0) {
+                errdefer a.free(values);
+                try reference.append(a, values);
+            } else {
+                defer a.free(values);
+                try std.testing.expectEqual(reference.items[index].len, values.len);
+                for (reference.items[index], values) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 5e-5 + 5e-5 * @abs(expected));
+            }
+        }
+    }
+    var invalid = groups;
+    invalid[0].sample = batch;
+    var rejected = input;
+    rejected.groups = &invalid;
+    try std.testing.expectError(error.InvalidBoundaryTrainingGraphLayout, task_graph.buildRecordBatchDense(&g, rejected));
+    g.limits.max_tensor_elements = 1;
+    try std.testing.expectError(error.BoundaryTrainingGraphLimitExceeded, task_graph.buildRecordBatchDense(&g, input));
+}
+
+test "boundary record batch preserves mixed-mode forward and VJPs with uneven padding" {
+    try recordBatchParity(3, 3);
+    try recordBatchParity(1, 1);
 }

@@ -6,6 +6,7 @@
 //! second cursor file that can commit before or after its checkpoint. This is a
 //! native replay protocol, not a claim to reproduce PyTorch's RNG bitstream.
 const std = @import("std");
+const optimizers = @import("ml").graph.optimizers;
 const controller = @import("seeded_gradient_trainer.zig");
 const bundle = @import("../models/gliner_boundary_bundle.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
@@ -19,15 +20,15 @@ pub const Config = struct {
     max_optimizer_steps: ?u32 = null,
     batch_size: u32 = 2,
     accumulation: u32 = 1,
-    encoder_lr: f32 = 1e-5,
-    task_lr: f32 = 5e-4,
-    weight_decay: f32 = 0.01,
-    beta1: f32 = 0.9,
-    beta2: f32 = 0.999,
-    epsilon: f32 = 1e-8,
+    encoder_lr: f64 = 1e-5,
+    task_lr: f64 = 5e-4,
+    weight_decay: f64 = 0.01,
+    beta1: f64 = 0.9,
+    beta2: f64 = 0.999,
+    epsilon: f64 = 1e-8,
     max_grad_norm: f32 = 1,
     scheduler: Scheduler = .linear,
-    num_cycles: f32 = 0.5,
+    num_cycles: f64 = 0.5,
     warmup_steps: ?u32 = null,
     warmup_ratio: f64 = 0.1,
     seed: u64 = 42,
@@ -65,6 +66,33 @@ pub const Parameter = struct {
     kind: enum { original, adapter },
 };
 
+fn schedule(config: Config, rate: f64, warmup: u32, total: u32) optimizers.LearningRateSchedule64 {
+    return switch (config.scheduler) {
+        .linear => .{ .warmup_linear = .{ .initial_lr = rate, .warmup_steps = warmup, .total_steps = total } },
+        .cosine => .{ .warmup_cosine = .{ .initial_lr = rate, .min_lr = 0, .warmup_steps = warmup, .total_steps = total } },
+        .cosine_restarts => .{ .warmup_cosine_restarts = .{ .initial_lr = rate, .warmup_steps = warmup, .total_steps = total, .num_cycles = config.num_cycles } },
+        .constant => .{ .warmup_constant = .{ .initial_lr = rate, .warmup_steps = warmup, .total_steps = total } },
+    };
+}
+
+test "boundary training run retains CUDA optimizer scalar precision across schedules" {
+    const parsed = try std.json.parseFromSlice(Config, std.testing.allocator, "{\"mode\":\"full\",\"beta1\":0.900000000123,\"encoder_lr\":0.0000100000000123}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(f64, 0.900000000123), parsed.value.beta1);
+    inline for (std.meta.tags(Scheduler)) |kind| {
+        var config = parsed.value;
+        config.scheduler = kind;
+        var plan = try Plan.init(config, testSource(), .{ .examples = 4, .train_sha256 = @splat(2), .schema_sha256 = @splat(3) }, .{});
+        try std.testing.expect(plan.groups[0].pytorch_fused == null);
+        const legacy = plan.groups[0];
+        try plan.enableCudaFusedAdamW();
+        try std.testing.expectEqual(legacy.optimizer, plan.groups[0].optimizer);
+        try std.testing.expect(std.meta.eql(legacy.schedule, plan.groups[0].schedule));
+        try std.testing.expectEqual(parsed.value.beta1, plan.groups[0].pytorch_fused.?.optimizer.beta1);
+        try std.testing.expectEqual(parsed.value.encoder_lr, plan.groups[0].pytorch_fused.?.schedule.lr(plan.warmup_steps));
+    }
+}
+
 pub const Plan = struct {
     config: Config,
     source: bundle.Identity,
@@ -83,7 +111,7 @@ pub const Plan = struct {
         if (order_bytes > limits.max_order_bytes) return error.BoundaryTrainingRunLimitExceeded;
         for ([_]f64{ config.encoder_lr, config.task_lr, config.weight_decay, config.max_grad_norm, config.warmup_ratio, config.num_cycles }) |value| if (!std.math.isFinite(value) or value < 0) return error.InvalidBoundaryTrainingRun;
         if (config.warmup_ratio > 1 or !std.math.isFinite(config.epsilon) or config.epsilon <= 0) return error.InvalidBoundaryTrainingRun;
-        for ([_]f32{ config.beta1, config.beta2 }) |value| if (!std.math.isFinite(value) or value < 0 or value >= 1) return error.InvalidBoundaryTrainingRun;
+        for ([_]f64{ config.beta1, config.beta2 }) |value| if (!std.math.isFinite(value) or value < 0 or value >= 1) return error.InvalidBoundaryTrainingRun;
         const adapter = config.mode == .lora or config.mode == .dora;
         if (adapter != (config.adapter_config_sha256 != null)) return error.InvalidBoundaryTrainingRun;
         const batches = (data.examples - 1) / config.batch_size + 1;
@@ -92,15 +120,27 @@ pub const Plan = struct {
         if (total == 0) return error.InvalidBoundaryTrainingRun;
         const warmup = config.warmup_steps orelse @as(u32, @intFromFloat(@floor(@as(f64, @floatFromInt(total)) * config.warmup_ratio)));
         if (warmup > total) return error.InvalidBoundaryTrainingRun;
-        const optimizer = @import("ml").graph.optimizers.AdamWConfig{ .beta1 = config.beta1, .beta2 = config.beta2, .eps = config.epsilon, .weight_decay = config.weight_decay };
+        const precise = optimizers.AdamWConfig64{ .beta1 = config.beta1, .beta2 = config.beta2, .eps = config.epsilon, .weight_decay = config.weight_decay };
+        const optimizer = precise.cast(f32);
         var groups: [2]controller.Group = undefined;
-        for (&groups, [_]f32{ config.encoder_lr, config.task_lr }) |*group, rate| group.* = .{ .optimizer = optimizer, .schedule = switch (config.scheduler) {
-            .linear => .{ .warmup_linear = .{ .initial_lr = rate, .warmup_steps = warmup, .total_steps = total } },
-            .cosine => .{ .warmup_cosine = .{ .initial_lr = rate, .min_lr = 0, .warmup_steps = warmup, .total_steps = total } },
-            .cosine_restarts => .{ .warmup_cosine_restarts = .{ .initial_lr = rate, .warmup_steps = warmup, .total_steps = total, .num_cycles = config.num_cycles } },
-            .constant => .{ .warmup_constant = .{ .initial_lr = rate, .warmup_steps = warmup, .total_steps = total } },
-        } };
+        for (&groups, [_]f64{ config.encoder_lr, config.task_lr }) |*group, rate| {
+            group.* = .{ .optimizer = optimizer, .schedule = schedule(config, rate, warmup, total).cast(f32) };
+            try @import("seeded_device_transaction.zig").validateGroup(group.*);
+        }
         return .{ .config = config, .source = source, .data = data, .limits = limits, .batches_per_epoch = batches, .updates_per_epoch = updates, .total_optimizer_steps = total, .warmup_steps = warmup, .groups = groups };
+    }
+
+    /// Explicit backend profile: preserve source scalar bits for CUDA fused
+    /// AdamW while retaining the shared optimizer owner and legacy defaults.
+    pub fn enableCudaFusedAdamW(self: *Plan) !void {
+        if (self.total_optimizer_steps > 16777216) return error.TrainingEpochOverflow;
+        for (&self.groups, [_]f64{ self.config.encoder_lr, self.config.task_lr }) |*group, rate| {
+            group.pytorch_fused = .{
+                .optimizer = .{ .beta1 = self.config.beta1, .beta2 = self.config.beta2, .eps = self.config.epsilon, .weight_decay = self.config.weight_decay },
+                .schedule = schedule(self.config, rate, self.warmup_steps, self.total_optimizer_steps),
+            };
+            try @import("seeded_device_transaction.zig").validateGroup(group.*);
+        }
     }
 
     pub fn optimizerConfig(self: *const Plan, limits: controller.Limits) controller.Config {
@@ -126,6 +166,33 @@ pub const Plan = struct {
         }
         if (selected.items.len == 0) return error.EmptyBoundaryTrainingParameters;
         return selected.toOwnedSlice(a);
+    }
+
+    /// The released model's named_parameters order controls CUDA norm rounding.
+    /// Resolve through the existing canonical-name map, including encoder/MLP
+    /// native aliases. Adapter registration is a separate PEFT contract.
+    pub fn pytorchClippingOrder(self: *const Plan, a: Allocator, parameters: []const Parameter, selected: []const controller.Parameter) ![]usize {
+        if (self.config.mode == .lora or self.config.mode == .dora) return error.UnsupportedBoundaryClippingOrder;
+        const specs = @import("../models/gliner_boundary_artifact.zig").specs(self.source.backbone);
+        const order = try a.alloc(usize, selected.len);
+        errdefer a.free(order);
+        const ordinals = try a.alloc(u16, selected.len);
+        defer a.free(ordinals);
+        for (selected, 0..) |parameter, i| {
+            const canonical = for (parameters) |source| {
+                if (std.mem.eql(u8, source.name, parameter.name)) break source.canonical_name;
+            } else return error.InvalidBoundaryTrainingParameters;
+            ordinals[i] = for (specs) |spec| {
+                if (std.mem.eql(u8, spec.name, canonical)) break spec.registration_order;
+            } else return error.InvalidBoundaryTrainingParameters;
+            order[i] = i;
+        }
+        std.mem.sort(usize, order, @as([]const u16, ordinals), struct {
+            fn less(keys: []const u16, lhs: usize, rhs: usize) bool {
+                return keys[lhs] < keys[rhs];
+            }
+        }.less);
+        return order;
     }
 
     /// Bind run settings, all artifact bytes, data and schema to the existing
@@ -344,4 +411,19 @@ test "boundary training run bounds memory rejects quantized profiles and replays
 
 test "boundary training run allocation failures reclaim order and fingerprint buffers" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseOrder, .{});
+}
+
+test "boundary training run clipping order resolves canonical aliases" {
+    const a = std.testing.allocator;
+    const plan = try Plan.init(.{ .mode = .full }, testSource(), .{ .examples = 2, .train_sha256 = @splat(1), .schema_sha256 = @splat(2) }, .{});
+    const parameters = [_]Parameter{
+        .{ .name = "classifier.2.weight", .canonical_name = "classifier.3.weight", .dimensions = &.{1}, .values = &.{1}, .kind = .original },
+        .{ .name = "embeddings.LayerNorm.bias", .canonical_name = "encoder.embeddings.LayerNorm.bias", .dimensions = &.{1}, .values = &.{1}, .kind = .original },
+        .{ .name = "embeddings.word_embeddings.weight", .canonical_name = "encoder.embeddings.word_embeddings.weight", .dimensions = &.{1}, .values = &.{1}, .kind = .original },
+    };
+    const selected = try plan.selectParameters(a, &parameters);
+    defer a.free(selected);
+    const order = try plan.pytorchClippingOrder(a, &parameters, selected);
+    defer a.free(order);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, order);
 }

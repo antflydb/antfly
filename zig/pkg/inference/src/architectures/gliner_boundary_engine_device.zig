@@ -234,7 +234,7 @@ pub fn prepareResidentConstants(cb: *const ops.ComputeBackend, allocator: std.me
 }
 
 pub fn encodeDevice(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, config: *const model.Config, prepared: *const processor.PreparedBatch, options: Options) !Result {
-    if (cb.kind() != .metal or cb.vtable.glinerBoundaryDevice == null) return error.UnsupportedGlinerBoundaryDevice;
+    if ((cb.kind() != .metal and cb.kind() != .cuda) or cb.vtable.glinerBoundaryDevice == null) return error.UnsupportedGlinerBoundaryDevice;
     if (cb.decoderRuntimeHasActiveFrame()) return error.GlinerBoundaryExternalFrame;
     try cb.checkExecutionControl();
     if (options.control) |control| try control.check();

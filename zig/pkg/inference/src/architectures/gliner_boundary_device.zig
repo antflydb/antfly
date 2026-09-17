@@ -271,7 +271,7 @@ fn validateInputTensor(cb: *const compute.ComputeBackend, allocator: std.mem.All
 }
 
 pub fn prepare(cb: *const compute.ComputeBackend, allocator: std.mem.Allocator, config: *const boundary.Config, input: Input, limits: Limits) !Prepared {
-    if (cb.kind() != .metal or cb.vtable.glinerBoundaryDevice == null) return error.UnsupportedGlinerBoundaryDevice;
+    if ((cb.kind() != .metal and cb.kind() != .cuda) or cb.vtable.glinerBoundaryDevice == null) return error.UnsupportedGlinerBoundaryDevice;
     try cb.checkExecutionControl();
     if (input.control) |control| try control.check();
     _ = try plan(config, input, limits);

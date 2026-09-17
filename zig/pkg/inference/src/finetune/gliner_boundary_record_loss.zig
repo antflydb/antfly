@@ -9,6 +9,15 @@ const std = @import("std");
 const matching = @import("gliner_boundary_matching.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Allocator = std.mem.Allocator;
+const scalar_math = @import("../ops/record_loss_math.zig");
+const elementwise_math = @import("../ops/elementwise_loss_math.zig");
+pub const Backends = struct {
+    scalar: ?scalar_math.Backend = null,
+    binary: ?elementwise_math.Backend = null,
+    /// CUDA cotangents include this outer weight before differentiation.
+    /// Reported component losses/value remain unweighted by this field.
+    outer_weight: f32 = 1,
+};
 
 pub const Group = struct {
     target: *const matching.TargetMap,
@@ -206,10 +215,132 @@ fn scalarField(work: *Work, row: []const f32, membership: []const bool, gold: []
     return -log_mass;
 }
 
+const GroupSums = struct { objects: f32 = 0, fields: f32 = 0 };
+fn deviceGroup(a: Allocator, group: Group, gradient: Gradients, work: *Work, backends: Backends, object_denom: f32, record_denom: f32) !GroupSums {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const t = group.target;
+    const nc = t.candidate_spans.len;
+    const nf = t.fields.len;
+    const ni = t.instance_mask.len;
+    const width = nc + 1;
+    const rows = ni * nf;
+    const n = group.logits.assignments.len;
+    var result = GroupSums{};
+    // Object normalization is a division by a device tensor denominator.
+    const object_seed = (backends.outer_weight * work.options.object_weight) / object_denom;
+    var any_objects = false;
+    for (group.logits.objects, group.matches.object_mask, group.matches.object_targets, gradient.objects) |value, keep, target, *dy| {
+        try work.tick();
+        if (!keep) continue;
+        any_objects = true;
+        result.objects += bce(value, target == 1);
+        dy.* = object_seed;
+    }
+    if (any_objects) {
+        const request = elementwise_math.Request{ .logits = group.logits.objects, .targets = group.matches.object_targets, .cotangents = gradient.objects, .settings = .{}, .max_elements = work.options.max_elements, .control = work.options.control };
+        try backends.binary.?.apply(backends.binary.?.ptr, &request);
+    }
+    if (group.matches.pairs.len == 0) return result;
+    var has_scalar = false;
+    var has_list = false;
+    for (t.fields) |field| {
+        const scalar = field.cardinality == .required_one or field.cardinality == .optional_one;
+        has_scalar = has_scalar or scalar;
+        has_list = has_list or !scalar;
+    }
+    if (has_list and nc == 0) return error.InvalidBoundaryTrainingRecordLossShape;
+    const values = try scratch.alloc(f32, n);
+    const masks: []i32 = if (has_scalar) try scratch.alloc(i32, n) else &.{};
+    const columns: []i32 = if (has_scalar) try scratch.alloc(i32, rows) else &.{};
+    const seeds: []f32 = if (has_scalar) try scratch.alloc(f32, rows) else &.{};
+    const losses: []f32 = if (has_scalar) try scratch.alloc(f32, rows) else &.{};
+    @memset(columns, -1);
+    @memset(seeds, 0);
+    const list_targets: []f32 = if (has_list) try scratch.alloc(f32, n) else &.{};
+    const list_gradient: []f32 = if (has_list) try scratch.alloc(f32, n) else &.{};
+    @memset(list_targets, 0);
+    @memset(list_gradient, 0);
+    for (group.logits.assignments, values, 0..) |value, *out, index| {
+        try work.tick();
+        const col = index % width;
+        const field = (index / width) % nf;
+        const valid = col == 0 or t.field_membership[field * nc + col - 1];
+        out.* = if (valid) value else -10000;
+        if (has_scalar) masks[index] = if (valid) 1 else 0;
+    }
+    // mean() backward multiplies by an FP32 reciprocal; the subsequent
+    // field-count denominator is a tensor division in the reference graph.
+    const record_reciprocal: f32 = 1 / record_denom;
+    const field_denom: f32 = @floatFromInt(nf);
+    const seed = ((backends.outer_weight * work.options.field_weight) * record_reciprocal) / field_denom;
+    const candidate_reciprocal: f32 = if (nc == 0) 0 else 1 / @as(f32, @floatFromInt(nc));
+    for (group.matches.pairs) |pair| for (t.fields, 0..) |field, f| {
+        try work.tick();
+        const row = pair.instance * nf + f;
+        const base = row * width;
+        const gold = t.gold_indicator[(pair.record * nf + f) * nc ..][0..nc];
+        if (field.cardinality == .required_one or field.cardinality == .optional_one) {
+            var present = false;
+            var selected: usize = 0;
+            for (gold, 0..) |positive, c| {
+                try work.tick();
+                if (!positive) continue;
+                masks[base + c + 1] |= 2;
+                if (!present or values[base + c + 1] > values[base + selected]) selected = c + 1;
+                present = true;
+            }
+            if (!present) masks[base] |= 2;
+            columns[row] = @intCast(selected);
+            seeds[row] = seed;
+        } else {
+            for (gold, 0..) |positive, c| {
+                try work.tick();
+                list_targets[base + c + 1] = if (positive) 1 else 0;
+                if (t.field_membership[f * nc + c]) list_gradient[base + c + 1] = seed * candidate_reciprocal;
+            }
+        }
+    };
+    if (has_scalar) {
+        const request = scalar_math.Request{ .logits = values, .masks = masks, .target_columns = columns, .seeds = seeds, .gradient = gradient.assignments, .losses = losses, .width = width, .max_elements = work.options.max_elements, .control = work.options.control };
+        try backends.scalar.?.apply(backends.scalar.?.ptr, &request);
+    }
+    if (has_list) {
+        const request = elementwise_math.Request{ .logits = values, .targets = list_targets, .cotangents = list_gradient, .settings = .{}, .max_elements = work.options.max_elements, .control = work.options.control };
+        try backends.binary.?.apply(backends.binary.?.ptr, &request);
+    }
+    for (group.matches.pairs) |pair| {
+        var record_sum: f32 = 0;
+        for (t.fields, 0..) |field, f| {
+            try work.tick();
+            const row = pair.instance * nf + f;
+            const base = row * width;
+            if (field.cardinality == .required_one or field.cardinality == .optional_one) {
+                record_sum += losses[row];
+            } else {
+                var list_sum: f32 = 0;
+                for (0..nc) |c| {
+                    try work.tick();
+                    list_sum += bce(values[base + c + 1], list_targets[base + c + 1] == 1);
+                    gradient.assignments[base + c + 1] = list_gradient[base + c + 1];
+                }
+                record_sum += list_sum / @as(f32, @floatFromInt(nc));
+            }
+        }
+        result.fields += record_sum / field_denom;
+    }
+    return result;
+}
+
 /// Groups carry only actual declared fields; a caller omits padded fields.
 /// Global object/record denominators therefore equal the source field/group
 /// masks without introducing a padded tensor or averaging per-group losses.
 pub fn compute(a: Allocator, groups: []const Group, options: Options) !Result {
+    return computeWithBackends(a, groups, options, .{});
+}
+pub fn computeWithBackends(a: Allocator, groups: []const Group, options: Options, backends: Backends) !Result {
+    if ((backends.scalar == null) != (backends.binary == null) or !std.math.isFinite(backends.outer_weight) or backends.outer_weight < 0 or (backends.scalar == null and backends.outer_weight != 1)) return error.InvalidBoundaryTrainingRecordLossOptions;
     var work = Work{ .options = options };
     try work.check();
     if (!std.math.isFinite(options.object_weight) or !std.math.isFinite(options.field_weight) or options.object_weight < 0 or options.field_weight < 0) return error.InvalidBoundaryTrainingRecordLossOptions;
@@ -254,6 +385,12 @@ pub fn compute(a: Allocator, groups: []const Group, options: Options) !Result {
         gradient.assignments = storage[offset..][0..group.logits.assignments.len];
         offset += group.logits.assignments.len;
         if (!group.enabled) continue;
+        if (backends.scalar != null) {
+            const sums = try deviceGroup(a, group, gradient.*, &work, backends, object_denom, record_denom);
+            object_sum += sums.objects;
+            field_sum += sums.fields;
+            continue;
+        }
         const t = group.target;
         const nc = t.candidate_spans.len;
         const nf = t.fields.len;
@@ -385,4 +522,31 @@ test "boundary training record loss bounds cancellation empty batches and weight
     defer weighted.deinit();
     try std.testing.expect(!std.mem.eql(u8, &first.decisions_fingerprint, &weighted.decisions_fingerprint));
     for (weighted.gradients[0].assignments) |value| try std.testing.expectEqual(@as(f32, 0), value);
+}
+
+fn backendAllocationLifecycle(a: Allocator, group: Group) !void {
+    const Probe = struct {
+        fn scalar(_: *anyopaque, request: *const scalar_math.Request) anyerror!void {
+            try request.validate();
+            @memset(request.gradient, 0);
+            @memset(request.losses, 0);
+        }
+        fn binary(_: *anyopaque, request: *const elementwise_math.Request) anyerror!void {
+            try request.validate();
+            @memset(request.cotangents, 0);
+        }
+    };
+    var context: u8 = 0;
+    var list_target = group.target.*;
+    list_target.fields = &.{.{ .query = 0, .cardinality = .zero_or_more }};
+    var list_group = group;
+    list_group.target = &list_target;
+    var result = try computeWithBackends(a, &.{ group, list_group }, .{}, .{ .scalar = .{ .ptr = &context, .apply = Probe.scalar }, .binary = .{ .ptr = &context, .apply = Probe.binary }, .outer_weight = 0.37 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.gradients.len);
+}
+test "boundary training record backend releases scalar list and object staging on allocation failure" {
+    var owner = try testOwner(std.testing.allocator);
+    defer owner.deinit();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, backendAllocationLifecycle, .{owner.group()});
 }

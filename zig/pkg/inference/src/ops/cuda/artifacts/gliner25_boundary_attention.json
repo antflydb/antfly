@@ -1,0 +1,24 @@
+{
+  "artifacts": {
+    "gliner25_boundary_attention_backward.cubin": "3498dce8ef74521c237694773765bbdf224a4a06d07d1fcdea7735dc0f15864f",
+    "gliner25_boundary_attention_backward.sm80.cubin": "8f22b3d143bf87512a8df57b8ac53a0e250f28463f61ff7c25832225f3a4d605",
+    "gliner25_boundary_attention_forward.cubin": "38c8addb7fbb90905df33b835d79a6164076ca79ec79ccfde0d28122b0d99e93",
+    "gliner25_boundary_attention_forward.sm80.cubin": "f7bfd8041d374b755581bc69712838d90cb5e30b67bd60f2df0163d199f62de5"
+  },
+  "compiler": "release 13.2, V13.2.78",
+  "dependency_lock_sha256": "7e16afa8bda58527a5948332a17b2d94baad67bfd09d0ec8fd7953e4c839240b",
+  "options": [
+    "-std=c++17",
+    "-O3",
+    "-DNDEBUG",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda"
+  ],
+  "profile": "gliner25_boundary_attention_cutlass_d32_v1",
+  "random_seed": "translation-unit basename without extension",
+  "source_directory": "/tmp/antfly-gliner25-boundary-attention-build-v1",
+  "source_sha256": {
+    "gliner25_boundary_attention_backward.cu": "d55cf737f0b13d148727cf894a71a1234278ab175442d7d372ff0e94f53911d2",
+    "gliner25_boundary_attention_forward.cu": "d3bddbdc3abc523dc2d71d41ec38892c729cf7e913df0e74cb8c8516c29a6604"
+  }
+}

@@ -36,7 +36,7 @@ fn int(value: usize) !i32 {
 fn validate(math: *math_mod.Context, config: *const model.Config, control: ?Control) !void {
     try math.check();
     if (control) |active| try active.check();
-    if (math.cb.kind() != .metal or math.cb.vtable.glinerBoundaryDevice == null) return error.UnsupportedGlinerBoundaryDevice;
+    if ((math.cb.kind() != .metal and math.cb.kind() != .cuda) or math.cb.vtable.glinerBoundaryDevice == null) return error.UnsupportedGlinerBoundaryDevice;
     if (config.version != model.config_version or config.architecture_version != model.architecture_version) return error.UnsupportedGlinerBoundaryVersion;
     if (config.encoder.hidden_size == 0) return error.InvalidGlinerBoundaryConfig;
     try config.head.validate();

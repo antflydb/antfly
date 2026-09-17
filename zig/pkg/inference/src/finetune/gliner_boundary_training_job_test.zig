@@ -29,6 +29,10 @@ test "boundary training job resident Metal published small heads matches uninter
 }
 
 fn publishedSmallHeads(source_path: []const u8, execution: Execution) !void {
+    return publishedSmall(source_path, execution, .heads);
+}
+
+fn publishedSmall(source_path: []const u8, execution: Execution, mode: @import("gliner_boundary_run.zig").Mode) !void {
     const a = std.testing.allocator;
     const io = compat.io();
     const manifest_bytes = try files.read(a, io, compat.cwd(), "testdata/gliner25/training_job_small_v1/manifest.json", 64 * 1024, null);
@@ -65,16 +69,27 @@ fn publishedSmallHeads(source_path: []const u8, execution: Execution) !void {
         .output_dir = full_path,
         .expected_source = expected,
         .execution = execution,
-        .run = .{ .mode = .heads, .epochs = 2, .batch_size = 1, .accumulation = 2, .scheduler = .constant, .seed = 42, .shuffle = false, .warmup_steps = 0 },
+        .run = .{ .mode = mode, .epochs = 2, .batch_size = 1, .accumulation = 2, .scheduler = .constant, .seed = 42, .shuffle = false, .warmup_steps = 0 },
         .memory = .{ .host_bytes = 512 * mib, .backend_bytes = 512 * mib, .combined_bytes = 2 * 1024 * mib, .optimizer_state_bytes = 256 * mib, .optimizer_transaction_bytes = 256 * mib },
         .source_limits = .{ .max_auxiliary_bytes = 128 * mib },
         .dataset_limits = .{ .max_file_bytes = mib, .max_host_bytes = 32 * mib },
         .timeout_seconds = 600,
     };
-    if (execution == .resident_metal) {
+    if (execution != .native) {
         config.memory.backend_bytes = 1024 * mib;
         config.memory.backend_metadata_bytes = 64 * mib;
         config.memory.combined_bytes = 3 * 1024 * mib;
+    }
+    if (mode == .full) {
+        config.memory = .{};
+        // This fixture is the small model. Keep its host envelope below the
+        // multilingual default, including when checkpoints use a RAM-backed
+        // filesystem. The normal live-memory admission check still applies.
+        // Atomic restore holds current state, staged state and checkpoint
+        // bytes together; its measured host payload exceeds 3 GiB.
+        config.memory.host_bytes = 5 * 1024 * mib;
+        config.training_limits.differentiation.max_tape_bytes = 2 * 1024 * mib;
+        config.training_limits.resident.program.max_working_bytes = 2 * 1024 * mib;
     }
     var admission = memory.AdmissionController{};
     defer admission.deinit();
@@ -84,6 +99,10 @@ fn publishedSmallHeads(source_path: []const u8, execution: Execution) !void {
     try std.testing.expectEqual(@as(u64, 4), uninterrupted.identity.microbatch_step);
     try std.testing.expectEqual(@as(usize, 0), admission.snapshot().hostTotalBytes());
     try std.testing.expectEqual(@as(usize, 0), admission.snapshot().backendTotalBytes());
+    // Only the result's immutable hashes/identity are needed for comparison.
+    // Release the full-model reference files before creating the paused copy,
+    // so RAM-backed checkpoint storage does not compete with atomic restore.
+    if (mode == .full) try compat.cwd().deleteTree(io, full_path);
     config.output_dir = pause_path;
     const paused = try job.execute(a, io, config, &admission, .{ .stop_after_microbatches = 1 }, null);
     try std.testing.expectEqual(.paused, paused.status);
@@ -122,7 +141,7 @@ fn publishedSmallHeads(source_path: []const u8, execution: Execution) !void {
     try std.testing.expectEqual(expected.sidecars, reloaded.identity.sidecars);
     try std.testing.expectEqual(@as(usize, 334), reloaded.parameters.len);
     try std.testing.expect(!std.meta.eql(expected.weight, reloaded.identity.weight));
-    std.debug.print("boundary real small heads job ({s}): four microbatches, two updates; resumed state/model exact; model_sha256={s}; state_sha256={s}\n", .{ @tagName(execution), resumed.portable_model.?.weights.sha256, std.fmt.bytesToHex(resumed.state_sha256, .lower) });
+    std.debug.print("boundary real small {s} job ({s}): four microbatches, two updates; resumed state/model exact; model_sha256={s}; state_sha256={s}\n", .{ @tagName(mode), @tagName(execution), resumed.portable_model.?.weights.sha256, std.fmt.bytesToHex(resumed.state_sha256, .lower) });
 }
 
 test "boundary training job regional numeric limits preserve semantics and enclosing admission" {
@@ -158,4 +177,16 @@ test "boundary training job regional numeric limits preserve semantics and enclo
     try std.testing.expectEqual(admitted, try job.admissionBytes(raised, 512 * mib));
     raised.memory.combined_bytes = admitted - 1;
     try std.testing.expectError(error.BoundaryTrainingRunLimitExceeded, job.admissionBytes(raised, 512 * mib));
+}
+
+test "boundary training job CUDA published small heads durable resume and portable reload" {
+    try @import("../graph/resident_training_fixture.zig").CudaDevice.requireAvailable();
+    const source = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_TRAINING_JOB_CUDA_MODEL_DIR") orelse return error.SkipZigTest;
+    try publishedSmallHeads(source, .resident_cuda);
+}
+
+test "boundary training job CUDA published full small durable resume and portable reload" {
+    try @import("../graph/resident_training_fixture.zig").CudaDevice.requireAvailable();
+    const source = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_TRAINING_JOB_CUDA_FULL_MODEL_DIR") orelse return error.SkipZigTest;
+    try publishedSmall(source, .resident_cuda, .full);
 }

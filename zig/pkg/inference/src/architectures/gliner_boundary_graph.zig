@@ -16,6 +16,15 @@ const Shape = ml.graph.Shape;
 const nil = ml.graph.null_node;
 
 pub const Mode = enum { training, evaluation };
+/// The CUDA profile fuses FP32 D32 attention without probability dropout.
+/// Other dimensions/dropout retain the existing materialized graph.
+pub const AttentionProfile = enum { materialized_v1, cuda_fused_d32_v1 };
+pub const PrefixProfile = enum { tree_v1, cuda_pytorch_v1 };
+pub const ScoreProfile = enum { grouped_v1, pytorch_sequential_v1 };
+pub const CandidateFeatureProfile = enum { host_v1, cuda_pytorch_v1 };
+pub const SigmoidProfile = enum { decomposed_v1, pytorch_saved_v1 };
+pub const InputGradientProfile = enum { grouped_v1, pytorch_v2 };
+pub const GatherProfile = ml.graph.node.ScatterReduction;
 pub const Stage = enum { proposals, candidates };
 pub const BindingKind = enum { values, binary_mask, inverted_dropout, indices };
 pub const Binding = struct {
@@ -71,6 +80,20 @@ pub const GraphBuilder = struct {
     bindings: std.ArrayListUnmanaged(Binding) = .empty,
     checked_nodes: usize,
     graph_elements: usize = 0,
+    attention_profile: AttentionProfile = .materialized_v1,
+    prefix_profile: PrefixProfile = .tree_v1,
+    score_profile: ScoreProfile = .grouped_v1,
+    candidate_feature_profile: CandidateFeatureProfile = .host_v1,
+    gather_profile: GatherProfile = .serial_v1,
+    sigmoid_profile: SigmoidProfile = .decomposed_v1,
+    input_gradient_profile: InputGradientProfile = .grouped_v1,
+
+    pub fn sigmoid(self: *GraphBuilder, x: NodeId) !NodeId {
+        return switch (self.sigmoid_profile) {
+            .decomposed_v1 => self.builder.sigmoid(x),
+            .pytorch_saved_v1 => self.builder.sigmoidRetained(x),
+        };
+    }
 
     pub fn init(a: Allocator, b: *Builder, config: model.Config, layout: Layout, mode: Mode, limits: Limits) !GraphBuilder {
         if (limits.control) |control| try control.check();
@@ -218,18 +241,42 @@ pub const GraphBuilder = struct {
         _ = try self.elements(Shape.init(.f32, &.{ rows, dim }));
         return self.builder.gather(value, indices, Shape.init(.f32, &.{ rows, dim }));
     }
+    pub fn gatherWithReduction(self: *GraphBuilder, value: NodeId, indices: NodeId, rows: u32, dim: u32, reduction: GatherProfile) !NodeId {
+        const result = try self.gather(value, indices, rows, dim);
+        self.builder.graph.nodeMut(result).op.gather.backward_reduction = reduction;
+        return result;
+    }
+    /// Batched Tensor.gather in the Python source, distinct from advanced row
+    /// indexing and embedding lookup even though all flatten to axis zero here.
+    pub fn gatherTensor(self: *GraphBuilder, value: NodeId, indices: NodeId, rows: u32, dim: u32) !NodeId {
+        return self.gatherWithReduction(value, indices, rows, dim, self.gather_profile);
+    }
     pub fn rowMask(self: *GraphBuilder, value: NodeId, mask: NodeId, rows: u32, dim: u32) !NodeId {
         try self.require(value, Shape.init(.f32, &.{ rows, dim }));
         const flat_mask = try self.reshape(mask, &.{rows});
         return self.builder.mul(value, try self.expand(flat_mask, &.{ rows, dim }, &.{0}));
     }
 
-    /// Inclusive prefix scan of [B*W,D], represented by log2(W) sparse gather
-    /// and add stages. Static scan indices are constants, never learned values.
+    /// Padded prefix table shared by content pooling, inside scores and relations.
+    /// Reference layout controls CUDA addition order; ordinary graphs use the tree.
     pub fn prefixSum(self: *GraphBuilder, value: NodeId, batch: u32, width: u32, dim: u32) !NodeId {
-        if (batch == 0 or width == 0 or dim == 0) return error.InvalidBoundaryTrainingGraphShape;
+        return self.prefixSumWithReference(value, batch, width, dim, .outer);
+    }
+
+    pub fn prefixSumWithReference(self: *GraphBuilder, value: NodeId, batch: u32, width: u32, dim: u32, reference: @FieldType(ml.graph.node.PrefixScanAttrs, "reference")) !NodeId {
+        if (batch == 0 or width == 0 or dim == 0 or (reference == .inner and dim != 1)) return error.InvalidBoundaryTrainingGraphShape;
         const rows = try multiply(batch, width);
         try self.require(value, Shape.init(.f32, &.{ rows, dim }));
+        const prefix = if (self.prefix_profile == .cuda_pytorch_v1)
+            try self.builder.prefixScanV1(value, .{ .batch = batch, .width = width, .channels = dim, .reference = reference })
+        else
+            try self.prefixTree(value, rows, width, dim);
+        const zero = try self.fill(&.{ batch, 1, dim }, 0);
+        const padded = try self.builder.concat(zero, try self.reshape(prefix, &.{ batch, width, dim }), 1);
+        return self.reshape(padded, &.{ try multiply(batch, try std.math.add(u32, width, 1)), dim });
+    }
+
+    fn prefixTree(self: *GraphBuilder, value: NodeId, rows: u32, width: u32, dim: u32) !NodeId {
         _ = try self.elements(Shape.init(.i32, &.{rows}));
         try self.constantBytes(try std.math.mul(usize, rows, 8));
         const indices = try self.allocator.alloc(i32, rows);
@@ -251,18 +298,19 @@ pub const GraphBuilder = struct {
             const previous = try self.rowMask(try self.gather(prefix, route, rows, dim), keep, rows, dim);
             prefix = try self.builder.add(prefix, previous);
         }
-        const zero = try self.fill(&.{ batch, 1, dim }, 0);
-        const padded = try self.builder.concat(zero, try self.reshape(prefix, &.{ batch, width, dim }), 1);
-        return self.reshape(padded, &.{ try multiply(batch, try std.math.add(u32, width, 1)), dim });
+        return prefix;
     }
 
     pub fn buildClassification(self: *GraphBuilder, choices: NodeId, count: u32) !NodeId {
+        return self.buildClassificationAtSite(choices, count, "classifier");
+    }
+    pub fn buildClassificationAtSite(self: *GraphBuilder, choices: NodeId, count: u32, dropout_site: []const u8) !NodeId {
         const h = self.config.encoder.hidden_size;
         if (count == 0 or count > self.limits.max_classifications) return error.InvalidBoundaryTrainingGraphLayout;
         try self.require(choices, Shape.init(.f32, &.{ count, h }));
         var hidden = try self.linear(choices, h, try multiply(2, h), "classifier.0");
         hidden = try self.builder.relu(hidden);
-        hidden = try self.dropout(hidden, "classifier", .proposals);
+        hidden = try self.dropout(hidden, dropout_site, .proposals);
         const output = try self.linear(hidden, 2 * h, 1, if (self.config.head.dropout > 0) "classifier.3" else "classifier.2");
         try self.check();
         return self.reshape(output, &.{count});
@@ -271,6 +319,27 @@ pub const GraphBuilder = struct {
     /// Requires at least one query. Classification-only graphs call
     /// buildClassification directly and do not create a dummy boundary task.
     pub fn buildProposals(self: *GraphBuilder, inputs: Input) !Proposals {
+        return self.buildProposalsWithQueryHeads(inputs, true);
+    }
+
+    pub const QueryHeads = struct { null_logits: ?NodeId = null, count_logits: ?NodeId = null };
+
+    /// Kept separate so the staged CUDA graph can construct these consumers
+    /// after pool scoring, preserving the reference query-adjoint order.
+    pub fn buildQueryHeads(self: *GraphBuilder, queries: NodeId) !QueryHeads {
+        const b = self.layout.batch;
+        const q = self.layout.queries;
+        const h = self.config.encoder.hidden_size;
+        try self.require(queries, Shape.init(.f32, &.{ try multiply(b, q), h }));
+        const result = QueryHeads{
+            .null_logits = if (self.config.head.enable_abstention) try self.reshape(try self.linear(queries, h, 1, "boundary_head.null_projection"), &.{ b, q }) else null,
+            .count_logits = if (self.config.head.enable_count_head) try self.reshape(try self.linear(queries, h, 1, "boundary_head.count_head"), &.{ b, q }) else null,
+        };
+        try self.check();
+        return result;
+    }
+
+    pub fn buildProposalsWithQueryHeads(self: *GraphBuilder, inputs: Input, include_query_heads: bool) !Proposals {
         const b = self.layout.batch;
         const w = self.layout.words;
         const q = self.layout.queries;
@@ -289,7 +358,14 @@ pub const GraphBuilder = struct {
         const eos = try self.expand(try self.weight("boundary_head.boundary_encoder.eos_state", &.{h}), &.{ b, 1, h }, &.{2});
         const text = try self.reshape(inputs.text, &.{ b, w, h });
         const left = try self.reshape(try self.builder.concat(bos, text, 1), &.{ try multiply(b, n), h });
-        const right_initial = try self.builder.concat(text, eos, 1);
+        // The reference's two shifts consume the original text independently.
+        // Sharing this reshape would join dleft+dright before other text
+        // consumers, changing FP32 accumulation despite identical forward data.
+        const right_text = if (self.input_gradient_profile == .pytorch_v2)
+            try self.reshape(inputs.text, &.{ b, w, h })
+        else
+            text;
+        const right_initial = try self.builder.concat(right_text, eos, 1);
         const eos_all = try self.expand(try self.reshape(eos, &.{ b, h }), &.{ b, n, h }, &.{ 0, 2 });
         const right_mask = try self.expand(eos_mask, &.{ b, n, h }, &.{ 0, 1 });
         const right = try self.reshape(try self.builder.graph.addNode(.{ .op = .{ .where_select = {} }, .output_shape = Shape.init(.f32, &.{ b, n, h }), .inputs = .{ right_mask, eos_all, right_initial, nil }, .num_inputs = 3 }), &.{ try multiply(b, n), h });
@@ -324,7 +400,7 @@ pub const GraphBuilder = struct {
         const inside_q = try self.linear(inputs.queries, h, d, "boundary_head.boundary_query_head.inside_query_projection");
         const boundary_keep = try self.builder.mul(try self.expand(boundary_mask, &.{ b, q, n }, &.{ 0, 2 }), try self.expand(inputs.query_mask, &.{ b, q, n }, &.{ 0, 1 }));
         const inside_keep = try self.builder.mul(try self.expand(inputs.text_mask, &.{ b, q, w }, &.{ 0, 2 }), try self.expand(inputs.query_mask, &.{ b, q, w }, &.{ 0, 1 }));
-        const out = Proposals{
+        var out = Proposals{
             .input = inputs,
             .boundary_states = states,
             .boundary_mask = boundary_mask,
@@ -333,9 +409,14 @@ pub const GraphBuilder = struct {
             .inside_logits = try self.maskFill(try self.marginals(inside_t, inside_q, w), inside_keep, -10000),
             .pool_start = try self.linear(states, d, d, "boundary_head.shared_pool_builder.start_projection"),
             .pool_end = try self.linear(states, d, d, "boundary_head.shared_pool_builder.end_projection"),
-            .null_logits = if (self.config.head.enable_abstention) try self.reshape(try self.linear(inputs.queries, h, 1, "boundary_head.null_projection"), &.{ b, q }) else null,
-            .count_logits = if (self.config.head.enable_count_head) try self.reshape(try self.linear(inputs.queries, h, 1, "boundary_head.count_head"), &.{ b, q }) else null,
+            .null_logits = null,
+            .count_logits = null,
         };
+        if (include_query_heads) {
+            const auxiliary = try self.buildQueryHeads(inputs.queries);
+            out.null_logits = auxiliary.null_logits;
+            out.count_logits = auxiliary.count_logits;
+        }
         try self.check();
         return out;
     }
@@ -361,6 +442,26 @@ pub const GraphBuilder = struct {
         var name: [256]u8 = undefined;
         const normalized = try self.norm(states, d, try std.fmt.bufPrint(&name, "boundary_head.boundary_encoder.attention_blocks.{d}.norm", .{layer}));
         const projected = try self.linear(normalized, d, try multiply(3, d), try std.fmt.bufPrint(&name, "boundary_head.boundary_encoder.attention_blocks.{d}.qkv_projection", .{layer}));
+        const attended = if (self.attention_profile == .cuda_fused_d32_v1 and hd == 32 and (self.mode == .evaluation or self.config.head.dropout == 0)) blk: {
+            const attrs = ml.graph.node.BoundaryTrainingAttentionAttrs{ .batch = b, .seq_len = n, .num_heads = heads, .window = self.config.head.boundary_attention_window };
+            const saved_layout = try attrs.layout();
+            const saved = try self.builder.boundaryTrainingAttentionV1(projected, mask, attrs);
+            const prefix = try self.builder.sliceLastDim(saved, 0, saved_layout.output_elements);
+            break :blk try self.builder.reshape(prefix, saved_layout.attendedShape());
+        } else try self.materializedBoundaryAttention(projected, mask, layer);
+        var update = try self.linear(attended, d, d, try std.fmt.bufPrint(&name, "boundary_head.boundary_encoder.attention_blocks.{d}.output_projection", .{layer}));
+        update = try self.dropout(update, try std.fmt.bufPrint(&name, "boundary_encoder.attention.{d}.output", .{layer}), .proposals);
+        return self.rowMask(try self.builder.add(states, update), mask, rows, d);
+    }
+    fn materializedBoundaryAttention(self: *GraphBuilder, projected: NodeId, mask: NodeId, layer: u32) !NodeId {
+        const b = self.layout.batch;
+        const n = self.layout.words + 1;
+        const d = self.config.head.boundary_dim;
+        const heads = self.config.head.boundary_attention_heads;
+        const hd = d / heads;
+        const bh = try multiply(b, heads);
+        const rows = try multiply(b, n);
+        var name: [256]u8 = undefined;
         var qkv: [3]NodeId = undefined;
         for (&qkv, 0..) |*part, i| {
             const sliced = try self.builder.sliceLastDim(projected, @intCast(i * d), @intCast((i + 1) * d));
@@ -398,9 +499,7 @@ pub const GraphBuilder = struct {
         var attended = try self.builder.matmul3D(probabilities, qkv[2]);
         attended = try self.reshape(attended, &.{ b, heads, n, hd });
         attended = try self.reshape(try self.builder.transpose(attended, &.{ 0, 2, 1, 3 }), &.{ rows, d });
-        var update = try self.linear(attended, d, d, try std.fmt.bufPrint(&name, "boundary_head.boundary_encoder.attention_blocks.{d}.output_projection", .{layer}));
-        update = try self.dropout(update, try std.fmt.bufPrint(&name, "boundary_encoder.attention.{d}.output", .{layer}), .proposals);
-        return self.rowMask(try self.builder.add(states, update), mask, rows, d);
+        return attended;
     }
 };
 

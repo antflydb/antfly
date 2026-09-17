@@ -160,3 +160,8 @@ test "boundary inactive adapter Metal classifier LoRA DoRA mixed accumulation ze
     if (!metal.metalDeviceAvailable()) return error.SkipZigTest;
     try exercise(std.testing.allocator, .resident_metal);
 }
+
+test "boundary inactive adapter CUDA classifier LoRA DoRA accumulation and durable partial resume" {
+    try @import("../graph/resident_training_fixture.zig").CudaDevice.requireAvailable();
+    try exercise(std.testing.allocator, .resident_cuda);
+}

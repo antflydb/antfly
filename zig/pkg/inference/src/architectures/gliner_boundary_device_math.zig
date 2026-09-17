@@ -228,7 +228,7 @@ pub const Context = struct {
             // Only the fresh request wrapper belongs to the request heap.
             try self.executeStorage(.{ .load_f32_weight = .{ .name = name, .shape = shape } }, 0)
         else blk: {
-            const original = try self.cb.getWeight(name);
+            const original = try self.cb.acquireWeight(name);
             defer self.cb.free(original);
             const actual = try self.cb.tensorShape(original, self.allocator);
             defer self.allocator.free(actual);

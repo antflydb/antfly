@@ -92,7 +92,7 @@ pub fn headAdmission(a: A, base: *const seeded.Session, stages: ?*const staged.S
     result.enclosing.head_gradient_bytes = result.gradient_output_bytes;
     result.pending_merge_backend_bytes = result.largest_gradient_bytes;
     var local: usize = 0;
-    if (base.options.execution == .resident_metal) {
+    if (base.options.execution != .native) {
         const compiled = if (base.resident) |*value| value else return error.InvalidRecomputeAdmission;
         const expected_forwards = if (stages) |value| value.stages.len else 1;
         if (compiled.forward.len != expected_forwards or compiled.admission.retained_capture_bytes != result.retained_tape_bytes or
@@ -170,7 +170,7 @@ fn fixture(a: A, execution: seeded.Execution) !void {
     try std.testing.expectEqual(@as(usize, 48), admission.enclosing.head_gradient_bytes);
     try std.testing.expect(admission.enclosing.head_local_bytes > 24);
     try std.testing.expectEqual(admission.finite_control_readback_upper_bound_bytes + admission.instruction_control_readback_upper_bound_bytes, admission.control_readback_upper_bound_bytes);
-    if (execution == .resident_metal) try std.testing.expect(admission.finite_control_readback_upper_bound_bytes > 0) else try std.testing.expectEqual(@as(usize, 0), admission.control_readback_upper_bound_bytes);
+    if (execution != .native) try std.testing.expect(admission.finite_control_readback_upper_bound_bytes > 0) else try std.testing.expectEqual(@as(usize, 0), admission.control_readback_upper_bound_bytes);
 }
 
 test "boundary recomputed head admission accounts staged programs bindings gradients and pending sums" {

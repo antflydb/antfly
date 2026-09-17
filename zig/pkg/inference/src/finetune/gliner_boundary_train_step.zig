@@ -45,6 +45,18 @@ const nil = ml.null_node;
 
 pub const Mode = graph_mod.Mode;
 pub const AttentionProfile = encoder_graph.AttentionProfile;
+pub const AttentionArithmetic = encoder_graph.AttentionArithmetic;
+pub const TrainingArithmetic = struct {
+    encoder: AttentionArithmetic = .scale_after_sum,
+    boundary: graph_mod.AttentionProfile = .materialized_v1,
+    prefix: graph_mod.PrefixProfile = .tree_v1,
+    score: graph_mod.ScoreProfile = .grouped_v1,
+    candidate_features: graph_mod.CandidateFeatureProfile = .host_v1,
+    input_gradients: graph_mod.InputGradientProfile = .grouped_v1,
+    gather: graph_mod.GatherProfile = .serial_v1,
+    sigmoid: graph_mod.SigmoidProfile = .decomposed_v1,
+    record: task_graph.RecordProfile = .per_group_v1,
+};
 pub const ActivationProfile = encoder_graph.ActivationProfile;
 pub const Capacities = struct {
     /// Explicit overrides must agree with the serialized training head. No
@@ -212,6 +224,7 @@ pub const Plan = struct {
     pool_capacity: u32,
     gold_capacity: u32,
     relation_capacity: u32,
+    input_gradient_profile: graph_mod.InputGradientProfile = .grouped_v1,
     encoder: encoder_graph.Built,
     bindings: []graph_mod.Binding,
     pool_input: ?candidate_graph.PoolInput,
@@ -303,6 +316,45 @@ pub const Plan = struct {
     /// differentiable path that actually reaches a requested parameter.
     pub fn finalize(self: *Plan, wrt: []const Id, options: seeded.Options) !void {
         return self.finalizeWithActivationProfile(wrt, options, .retained_v1);
+    }
+
+    /// Preserve FP32 linear-bias, normalization, SiLU and softmax rounding in the
+    /// CUDA resident adapter. Other plans retain decomposed arithmetic.
+    /// Select before PEFT rewriting or differentiation, and bind the choice to
+    /// replay identity. Non-vector normalization widths retain decomposition.
+    pub fn enableCudaTrainingFusion(self: *Plan) !void {
+        if (self.construction_failed) return error.BoundaryTrainingPlanInvalidated;
+        if (self.session != null or self.peft != null) return error.BoundaryTrainingPlanAlreadyFinalized;
+        var changed = false;
+        for (self.graph.nodes.items, 0..) |*node, index| switch (node.op) {
+            .fused_silu => if (node.output_shape.dtype == .f32 and node.vjp_alternate != nil) {
+                node.vjp_alternate = nil;
+                changed = true;
+            },
+            .fused_linear => |*attrs| if (node.output_shape.dtype == .f32 and (node.vjp_alternate != nil or !attrs.retain_backward_storage)) {
+                node.vjp_alternate = nil;
+                attrs.retain_backward_storage = true;
+                changed = true;
+            },
+            .fused_layer_norm => |attrs| if (node.output_shape.dtype == .f32 and attrs.dim != 0 and attrs.dim % 4 == 0 and node.vjp_alternate != nil) {
+                node.vjp_alternate = nil;
+                changed = true;
+            },
+            .fused_softmax => |*attrs| if (node.output_shape.dtype == .f32 and attrs.dim > 0 and attrs.dim <= 1024 and !attrs.fuse_backward) {
+                attrs.fuse_backward = true;
+                changed = true;
+            },
+            .dot_general => {
+                changed = ml.passes.fuse.retainTrainingDotStorage(self.graph, @intCast(index)) or changed;
+            },
+            else => {},
+        };
+        if (changed) {
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update("antfly.gliner25.cuda-training-fusion.v8\x00");
+            hash.update(&self.fingerprint);
+            hash.final(&self.fingerprint);
+        }
     }
 
     /// Regional execution also requires sealRecomputedAdmission, after the
@@ -438,7 +490,7 @@ pub const Plan = struct {
         head.head_host_metadata_bytes = try std.math.add(usize, head.head_host_metadata_bytes, merging.host_upper_bound_bytes);
         head.head_work = try std.math.add(u64, head.head_work, merging.total_work);
         const transfers = try self.transferAdmission();
-        head.head_local_bytes = try std.math.add(usize, head.head_local_bytes, transfers.largest_upload_bytes);
+        head.head_local_bytes = try std.math.add(usize, head.head_local_bytes, try std.math.add(usize, transfers.largest_upload_bytes, transfers.loss_device_bytes));
         regional.head_admission = head;
         return head;
     }
@@ -487,7 +539,7 @@ pub const Plan = struct {
         try active.check();
         try self.session.?.base().validateBackend(cb);
         const transfer_admission = try self.transferAdmission();
-        if (self.session.?.base().options.execution == .resident_metal and cb.vtable.glinerBoundaryDownload == null) return error.UnsupportedSeededTrainingBackend;
+        if (self.session.?.base().options.execution != .native and cb.vtable.glinerBoundaryDownload == null) return error.UnsupportedSeededTrainingBackend;
         var controlled = cb.*;
         controlled.execution_control = active;
         self.host_owner.resetFailure();
@@ -509,6 +561,76 @@ pub const Plan = struct {
         if (self.session == null) return error.BoundaryTrainingPlanNotFinalized;
         const admission = self.session.?.base().executionAdmission() orelse return 0;
         return std.math.add(usize, admission.instruction_control_readback_upper_bound_bytes, if (self.recomputation) |*regional| regional.graph.regional.regional_admission.instruction_control_readback_upper_bound_bytes else 0);
+    }
+
+    fn admitCudaLossMath(self: *Plan, result: *transfer.Admission) !void {
+        const base = self.session.?.base();
+        if (base.options.execution != .resident_cuda) return;
+        for (self.outputs) |output| switch (output.kind) {
+            .start, .end, .inside, .pair, .classification, .relation, .abstention, .count => {
+                const bytes = try transfer.shapeBytes(self.graph.node(output.node).output_shape);
+                const count: usize = if (output.kind == .pair and self.config.head.soft_iou_aux_weight > 0) 2 else 1;
+                result.upper.upload_bytes = try std.math.add(usize, result.upper.upload_bytes, try std.math.mul(usize, bytes, count * 3));
+                try result.readback(.loss_gradients, try std.math.mul(usize, bytes, count));
+                result.largest_upload_bytes = @max(result.largest_upload_bytes, bytes);
+                result.loss_device_bytes = @max(result.loss_device_bytes, try std.math.mul(usize, bytes, 4));
+            },
+            else => {},
+        };
+        for (self.records) |record| {
+            if (record.mode != .natural) {
+                const bytes = try std.math.mul(usize, record.instances, 4);
+                result.upper.upload_bytes = try std.math.add(usize, result.upper.upload_bytes, try std.math.mul(usize, bytes, 3));
+                try result.readback(.loss_gradients, bytes);
+                result.largest_upload_bytes = @max(result.largest_upload_bytes, bytes);
+                result.loss_device_bytes = @max(result.loss_device_bytes, try std.math.mul(usize, bytes, 4));
+            }
+            var has_scalar = false;
+            var has_list = false;
+            for (record.fields) |field| {
+                const scalar = field.cardinality == .required_one or field.cardinality == .optional_one;
+                has_scalar = has_scalar or scalar;
+                has_list = has_list or !scalar;
+            }
+            const rows = try product(record.instances, record.fields.len);
+            const width = try std.math.add(usize, self.pool_capacity, 1);
+            if (has_scalar) {
+                const device = base.options.resident.program.instruction.cuda_reduction orelse return error.UnsupportedRecordLossMath;
+                const geometry = try @import("../ops/cuda/record_loss_plan.zig").Plan.init(rows, width, device);
+                result.upper.upload_bytes = try std.math.add(usize, result.upper.upload_bytes, geometry.upload_bytes);
+                try result.readback(.loss_gradients, geometry.readback_bytes);
+                result.largest_upload_bytes = @max(result.largest_upload_bytes, geometry.largest_upload_bytes);
+                result.loss_device_bytes = @max(result.loss_device_bytes, geometry.device_bytes);
+            }
+            if (has_list) {
+                const bytes = try product(try product(rows, width), 4);
+                result.upper.upload_bytes = try std.math.add(usize, result.upper.upload_bytes, try std.math.mul(usize, bytes, 3));
+                try result.readback(.loss_gradients, bytes);
+                result.largest_upload_bytes = @max(result.largest_upload_bytes, bytes);
+                result.loss_device_bytes = @max(result.loss_device_bytes, try std.math.mul(usize, bytes, 4));
+            }
+        }
+        if (self.pool_input != null and self.encoder.layout.queries != 0) {
+            if (self.config.head.consistency_loss_weight > 0) {
+                const rows = try product(self.encoder.layout.batch, self.encoder.layout.queries);
+                const margins = try product(rows, try std.math.add(usize, self.encoder.layout.words, 1));
+                const geometry = try primitive.consistency_math.Plan.upper(try product(rows, self.pool_capacity), margins);
+                result.upper.upload_bytes = try std.math.add(usize, result.upper.upload_bytes, geometry.upload_bytes);
+                try result.readback(.loss_gradients, geometry.readback_bytes);
+                result.largest_upload_bytes = @max(result.largest_upload_bytes, geometry.largest_upload_bytes);
+                result.loss_device_bytes = @max(result.loss_device_bytes, geometry.device_bytes);
+            }
+            const device = base.options.resident.program.instruction.cuda_reduction orelse return error.UnsupportedListwiseLossMath;
+            for ([_]bool{ false, true }) |shared| {
+                const weight = if (shared) self.config.head.proposal_loss_weight else self.config.head.rerank_listwise_weight;
+                if (weight <= 0) continue;
+                const geometry = try @import("../ops/cuda/listwise_plan.zig").Plan.init(self.encoder.layout.batch, self.encoder.layout.queries, self.pool_capacity, shared, device);
+                result.upper.upload_bytes = try std.math.add(usize, result.upper.upload_bytes, geometry.upload_bytes);
+                try result.readback(.loss_gradients, geometry.readback_bytes);
+                result.largest_upload_bytes = @max(result.largest_upload_bytes, geometry.largest_upload_bytes);
+                result.loss_device_bytes = @max(result.loss_device_bytes, geometry.device_bytes);
+            }
+        }
     }
 
     pub fn transferAdmission(self: *Plan) !transfer.Admission {
@@ -539,13 +661,14 @@ pub const Plan = struct {
             const pair = self.outputs[try self.outputIndex(.pair, 0)].node;
             try result.readback(.proposal_logits, try transfer.shapeBytes(self.graph.node(pair).output_shape));
         }
+        try self.admitCudaLossMath(&result);
         const execution = base.executionAdmission().?;
         try result.readback(.finite_control, execution.finite_check_readback_bytes);
         try result.readback(.finite_control, execution.instruction_control_readback_upper_bound_bytes);
         result.device_upper_bound_bytes = if (self.recomputation) |*regional|
             if (regional.graph.regional.admission) |aggregate| aggregate.backend_upper_bound_bytes else 0
         else
-            std.math.add(usize, execution.device_upper_bound_bytes, result.largest_upload_bytes) catch return error.BoundaryTrainingTransferLimitExceeded;
+            std.math.add(usize, execution.device_upper_bound_bytes, try std.math.add(usize, result.largest_upload_bytes, result.loss_device_bytes)) catch return error.BoundaryTrainingTransferLimitExceeded;
         if (result.device_upper_bound_bytes > base.options.resident.max_device_bytes) return error.BoundaryTrainingTransferLimitExceeded;
         try result.validate(self.limits.transfers);
         return result;
@@ -677,16 +800,24 @@ pub fn buildWithAttentionProfile(backing: Allocator, config: model.Config, prepa
 }
 
 pub fn buildWithProfiles(backing: Allocator, config: model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema_mod.CompiledSchema, capacities: Capacities, mode: Mode, attention_profile: AttentionProfile, activation_profile: ActivationProfile, limits: Limits) !Plan {
+    return buildWithArithmetic(backing, config, prepared, schemas, capacities, mode, attention_profile, activation_profile, .scale_after_sum, limits);
+}
+
+pub fn buildWithArithmetic(backing: Allocator, config: model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema_mod.CompiledSchema, capacities: Capacities, mode: Mode, attention_profile: AttentionProfile, activation_profile: ActivationProfile, arithmetic: AttentionArithmetic, limits: Limits) !Plan {
+    return buildWithTrainingArithmetic(backing, config, prepared, schemas, capacities, mode, attention_profile, activation_profile, .{ .encoder = arithmetic }, limits);
+}
+
+pub fn buildWithTrainingArithmetic(backing: Allocator, config: model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema_mod.CompiledSchema, capacities: Capacities, mode: Mode, attention_profile: AttentionProfile, activation_profile: ActivationProfile, arithmetic: TrainingArithmetic, limits: Limits) !Plan {
     if (limits.max_total_host_bytes == 0) return error.InvalidBoundaryTrainingStepOptions;
     const owner = try backing.create(HostOwner);
     errdefer backing.destroy(owner);
     owner.init(backing, limits.max_total_host_bytes);
-    return buildOwned(backing, owner, config, prepared, schemas, capacities, mode, attention_profile, activation_profile, limits) catch |err| {
+    return buildOwned(backing, owner, config, prepared, schemas, capacities, mode, attention_profile, activation_profile, arithmetic, limits) catch |err| {
         std.debug.assert(owner.budget.live == 0);
         return owner.translate(err);
     };
 }
-fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema_mod.CompiledSchema, capacities: Capacities, mode: Mode, attention_profile: AttentionProfile, activation_profile: ActivationProfile, limits: Limits) !Plan {
+fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema_mod.CompiledSchema, capacities: Capacities, mode: Mode, attention_profile: AttentionProfile, activation_profile: ActivationProfile, arithmetic: TrainingArithmetic, limits: Limits) !Plan {
     const budget = &owner.budget;
     const a = budget.allocator();
     try check(limits.graph.control);
@@ -709,10 +840,17 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
     graph.* = ml.Graph.init(a);
     errdefer graph.deinit();
     var builder = ml.Builder.init(graph);
-    var encoder = try encoder_graph.buildWithProfiles(&builder, &config, layout, if (mode == .training) .train else .eval, attention_profile, activation_profile, limits.encoder);
+    var encoder = try encoder_graph.buildWithEmbeddingArithmetic(&builder, &config, layout, if (mode == .training) .train else .eval, attention_profile, activation_profile, arithmetic.encoder, if (arithmetic.input_gradients == .pytorch_v2) .pytorch_embedding_v1 else .serial_v1, limits.encoder);
     errdefer encoder.deinit();
     var g = try graph_mod.GraphBuilder.init(a, &builder, config, .{ .batch = layout.batch, .words = layout.words, .queries = layout.queries, .classifications = layout.classifications }, mode, limits.graph);
     defer g.deinit();
+    g.attention_profile = arithmetic.boundary;
+    g.prefix_profile = arithmetic.prefix;
+    g.score_profile = arithmetic.score;
+    g.candidate_feature_profile = arithmetic.candidate_features;
+    g.gather_profile = arithmetic.gather;
+    g.sigmoid_profile = arithmetic.sigmoid;
+    g.input_gradient_profile = arithmetic.input_gradients;
     var outputs = std.ArrayListUnmanaged(Output).empty;
     errdefer outputs.deinit(a);
     var records = std.ArrayListUnmanaged(RecordGroup).empty;
@@ -729,24 +867,36 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
     var relation_capacity: u32 = 0;
     if (layout.classifications != 0) {
         const count = try std.math.mul(u32, layout.batch, layout.classifications);
-        try outputAppend(a, &outputs, limits, .classification, try g.buildClassification(encoder.nodes.classifications, count), 0);
+        const classified = if (arithmetic.input_gradients == .pytorch_v2)
+            try classificationGroups(&g, encoder.nodes.classifications, schemas, layout.classifications)
+        else
+            try g.buildClassification(encoder.nodes.classifications, count);
+        try outputAppend(a, &outputs, limits, .classification, classified, 0);
     }
     if (layout.queries != 0) {
         const input = graph_mod.Input{ .text = encoder.nodes.text, .queries = encoder.nodes.queries, .text_mask = try g.reshape(encoder.inputs.routes[@intFromEnum(encoder_graph.RouteKind.text)].valid, &.{ layout.batch, layout.words }), .query_mask = try g.reshape(encoder.inputs.routes[@intFromEnum(encoder_graph.RouteKind.queries)].valid, &.{ layout.batch, layout.queries }) };
-        const proposals = try g.buildProposals(input);
+        const deferred_query_heads = arithmetic.input_gradients == .pytorch_v2;
+        var proposals = try g.buildProposalsWithQueryHeads(input, !deferred_query_heads);
         try proposal_views.appendSlice(a, &.{ proposals.start_logits, proposals.end_logits, proposals.inside_logits, proposals.pool_start, proposals.pool_end });
         try outputAppend(a, &outputs, limits, .start, proposals.start_logits, 0);
         try outputAppend(a, &outputs, limits, .end, proposals.end_logits, 0);
         try outputAppend(a, &outputs, limits, .inside, proposals.inside_logits, 0);
-        if (proposals.null_logits) |node| if (config.head.abstention_loss_weight > 0) try outputAppend(a, &outputs, limits, .abstention, node, 0);
-        if (proposals.count_logits) |node| if (config.head.count_loss_weight > 0) try outputAppend(a, &outputs, limits, .count, node, 0);
         pool_input = try candidate_graph.poolInputs(&g, pool_capacity);
         const scored = try candidate_graph.buildSharedPool(&g, proposals, pool_input.?);
+        if (deferred_query_heads) {
+            const auxiliary = try g.buildQueryHeads(input.queries);
+            proposals.null_logits = auxiliary.null_logits;
+            proposals.count_logits = auxiliary.count_logits;
+        }
+        if (proposals.null_logits) |node| if (config.head.abstention_loss_weight > 0) try outputAppend(a, &outputs, limits, .abstention, node, 0);
+        if (proposals.count_logits) |node| if (config.head.count_loss_weight > 0) try outputAppend(a, &outputs, limits, .count, node, 0);
         try outputAppend(a, &outputs, limits, .pair, scored.pair_logits, 0);
         try outputAppend(a, &outputs, limits, .proposal, scored.proposal_logits, 0);
         const h = config.encoder.hidden_size;
         const bc = try std.math.mul(u32, layout.batch, pool_capacity);
         const bq = try std.math.mul(u32, layout.batch, layout.queries);
+        var batched_records = std.ArrayListUnmanaged(task_graph.RecordBatchGroup).empty;
+        defer batched_records.deinit(a);
         for (schemas, prepared.samples, 0..) |compiled, sample, b| {
             if (mode == .training) for (compiled.schema.structures, 0..) |structure, s| {
                 const record_mode = structure.mode orelse continue;
@@ -769,10 +919,16 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
                 const instance_mask = if (active_count == instances) active else try builder.concat(active, try g.fill(&.{instances - active_count}, 0), 0);
                 const anchor = if (structure.anchor) |f| fields[f].query else null;
                 const natural: ?Id = if (anchor) |q| try g.reshape(try g.gather(try g.reshape(scored.pair_logits, &.{ try std.math.mul(u32, bq, pool_capacity), 1 }), try consecutive(&g, (b * layout.queries + q) * pool_capacity, pool_capacity, try product(bq, pool_capacity)), pool_capacity, 1), &.{pool_capacity}) else null;
-                const out = try task_graph.buildRecordGroupDense(&g, .{ .mode = record_mode, .candidates = pool_capacity, .fields = @intCast(fields.len), .candidate_states = try g.gather(scored.candidate_states orelse return error.UnsupportedBoundaryTrainingRecordTask, pool_indices, pool_capacity, h), .field_queries = try g.gather(encoder.nodes.queries, try indices(&g, field_indices, bq), @intCast(fields.len), h), .candidate_mask = mask, .field_membership = try g.expand(mask, &.{ @intCast(fields.len), pool_capacity }, &.{1}), .instance_mask = instance_mask, .natural_object_logits = natural });
+                const field_queries = try g.gather(encoder.nodes.queries, try indices(&g, field_indices, bq), @intCast(fields.len), h);
+                const membership = try g.expand(mask, &.{ @intCast(fields.len), pool_capacity }, &.{1});
                 const group = records.items.len;
-                try outputAppend(a, &outputs, limits, .record_object, out.object_logits, group);
-                try outputAppend(a, &outputs, limits, .record_assignment, out.assignment_logits, group);
+                if (arithmetic.record == .pytorch_batch_v1) {
+                    try batched_records.append(a, .{ .sample = @intCast(b), .mode = record_mode, .fields = @intCast(fields.len), .field_queries = field_queries, .field_membership = membership, .instance_mask = instance_mask, .natural_object_logits = natural });
+                } else {
+                    const out = try task_graph.buildRecordGroupDense(&g, .{ .mode = record_mode, .candidates = pool_capacity, .fields = @intCast(fields.len), .candidate_states = try g.gather(scored.candidate_states orelse return error.UnsupportedBoundaryTrainingRecordTask, pool_indices, pool_capacity, h), .field_queries = field_queries, .candidate_mask = mask, .field_membership = membership, .instance_mask = instance_mask, .natural_object_logits = natural });
+                    try outputAppend(a, &outputs, limits, .record_object, out.object_logits, group);
+                    try outputAppend(a, &outputs, limits, .record_assignment, out.assignment_logits, group);
+                }
                 try records.append(a, .{ .sample = b, .structure = s, .group = sample.queries[fields[0].query].group_index, .mode = record_mode, .fields = fields, .anchor_query = anchor, .instances = instances });
             };
             if (mode == .training) {
@@ -786,8 +942,18 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
                 }
             }
         }
+        if (batched_records.items.len != 0) {
+            if (try product(batched_records.items.len, 2) > limits.max_outputs -| outputs.items.len) return error.BoundaryTrainingStepLimitExceeded;
+            const built_records = try task_graph.buildRecordBatchDense(&g, .{ .candidates = pool_capacity, .candidate_states = scored.candidate_states orelse return error.UnsupportedBoundaryTrainingRecordTask, .candidate_mask = pool_input.?.valid, .groups = batched_records.items });
+            defer a.free(built_records);
+            for (built_records, 0..) |record, group| {
+                try outputAppend(a, &outputs, limits, .record_object, record.object_logits, group);
+                try outputAppend(a, &outputs, limits, .record_assignment, record.assignment_logits, group);
+            }
+        }
         if (relations.items.len != 0) {
-            const count = try product(relations.items.len, config.head.relation_pair_cap);
+            const groups = if (arithmetic.input_gradients == .pytorch_v2) try product(layout.batch, layout.relations) else relations.items.len;
+            const count = try product(groups, config.head.relation_pair_cap);
             if (count > limits.max_relation_pairs or count > limits.relation.max_output_pairs) return error.BoundaryTrainingStepLimitExceeded;
             relation_capacity = std.math.cast(u32, count) orelse return error.BoundaryTrainingStepLimitExceeded;
             relation_input = try relationInputs(&g, encoder.nodes, layout.relations, relation_capacity);
@@ -800,6 +966,51 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
     try g.check();
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly.gliner25.training.plan.v1");
+    if (arithmetic.encoder != .scale_after_sum) {
+        hash.update("\x00attention_arithmetic\x00");
+        hash.update(@tagName(arithmetic.encoder));
+        hash.update("\x00");
+    }
+    if (arithmetic.boundary != .materialized_v1) {
+        hash.update("\x00boundary_attention_arithmetic\x00");
+        hash.update(@tagName(arithmetic.boundary));
+        hash.update("\x00");
+    }
+    if (arithmetic.prefix != .tree_v1) {
+        hash.update("\x00prefix_arithmetic\x00");
+        hash.update(@tagName(arithmetic.prefix));
+        hash.update("\x00");
+    }
+    if (arithmetic.score != .grouped_v1) {
+        hash.update("\x00score_arithmetic\x00");
+        hash.update(@tagName(arithmetic.score));
+        hash.update("\x00");
+    }
+    if (arithmetic.input_gradients != .grouped_v1) {
+        hash.update("\x00input_gradient_arithmetic\x00");
+        hash.update(@tagName(arithmetic.input_gradients));
+        hash.update("\x00");
+    }
+    if (arithmetic.candidate_features != .host_v1) {
+        hash.update("\x00candidate_feature_arithmetic\x00");
+        hash.update(@tagName(arithmetic.candidate_features));
+        hash.update("\x00");
+    }
+    if (arithmetic.sigmoid != .decomposed_v1) {
+        hash.update("\x00sigmoid_backward_arithmetic\x00");
+        hash.update(@tagName(arithmetic.sigmoid));
+        hash.update("\x00");
+    }
+    if (arithmetic.record != .per_group_v1) {
+        hash.update("\x00record_batch_arithmetic\x00");
+        hash.update(@tagName(arithmetic.record));
+        hash.update("\x00");
+    }
+    if (arithmetic.gather != .serial_v1) {
+        hash.update("\x00gather_backward_arithmetic\x00");
+        hash.update(@tagName(arithmetic.gather));
+        hash.update("\x00");
+    }
     if (attention_profile != .materialized_v1) {
         hash.update("\x00attention_profile\x00");
         hash.update(@tagName(attention_profile));
@@ -830,7 +1041,7 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
     const owned_relations = try relations.toOwnedSlice(a);
     errdefer a.free(owned_relations);
     const owned_views = try proposal_views.toOwnedSlice(a);
-    return .{ .backing = backing, .host_owner = owner, .budget = budget, .allocator = a, .graph = graph, .config = config, .mode = mode, .limits = limits, .pool_capacity = pool_capacity, .gold_capacity = gold_capacity, .relation_capacity = relation_capacity, .encoder = encoder, .bindings = owned_bindings, .pool_input = pool_input, .relation_input = relation_input, .records = owned_records, .relations = owned_relations, .outputs = owned_outputs, .proposal_views = owned_views, .schema_fingerprints = schema_fingerprints, .fingerprint = hash.finalResult() };
+    return .{ .backing = backing, .host_owner = owner, .budget = budget, .allocator = a, .graph = graph, .config = config, .mode = mode, .limits = limits, .pool_capacity = pool_capacity, .gold_capacity = gold_capacity, .relation_capacity = relation_capacity, .input_gradient_profile = arithmetic.input_gradients, .encoder = encoder, .bindings = owned_bindings, .pool_input = pool_input, .relation_input = relation_input, .records = owned_records, .relations = owned_relations, .outputs = owned_outputs, .proposal_views = owned_views, .schema_fingerprints = schema_fingerprints, .fingerprint = hash.finalResult() };
 }
 
 fn relationInputs(g: *graph_mod.GraphBuilder, nodes: encoder_graph.RoutedNodes, relations: u32, pairs: u32) !task_graph.RelationInput {
@@ -942,8 +1153,9 @@ fn fillHeadDropout(binding: graph_mod.Binding, replay: encoder_graph.Replay, opt
     }
     try graph_mod.validateFloatBinding(binding, output);
 }
-fn hashFloat(hash: *std.crypto.hash.sha2.Sha256, value: f32) void {
-    appendHash(hash, @as(u32, @bitCast(value)));
+fn hashFloat(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
+    const Bits = if (@TypeOf(value) == f64) u64 else u32;
+    appendHash(hash, @as(Bits, @bitCast(value)));
 }
 fn targetFingerprint(a: Allocator, targets: *const targets_mod.Targets) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1052,6 +1264,22 @@ fn validateBinding(binding: graph_mod.Binding, values: encoder_graph.Values) !vo
         .i32 => |items| try graph_mod.validateIndexBinding(binding, items),
     }
 }
+/// Stable [batch, relation, pair] slots, including empty relation groups.
+const RelationPacking = struct {
+    batch: usize,
+    relations: usize,
+    capacity: usize,
+    used: []usize,
+    fn next(self: *RelationPacking, batch: usize, relation: usize) !usize {
+        if (batch >= self.batch or relation >= self.relations or self.capacity == 0 or self.used.len != try product(self.batch, self.relations)) return error.InvalidBoundaryTrainingRouting;
+        const group = try std.math.add(usize, try product(batch, self.relations), relation);
+        if (self.used[group] >= self.capacity) return error.InvalidBoundaryTrainingRouting;
+        const slot = try std.math.add(usize, try product(group, self.capacity), self.used[group]);
+        self.used[group] += 1;
+        return slot;
+    }
+};
+
 const RelationGeometry = struct {
     query_indices: []i32,
     text_indices: [4][]i32,
@@ -1120,7 +1348,18 @@ fn selectRelations(plan: *Plan, a: Allocator, pool: *const decisions.Pool, pairs
     }
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly.gliner25.training.relations.v1");
-    for (proposed, 0..) |proposal, i| {
+    const padded = plan.input_gradient_profile == .pytorch_v2;
+    const group_count = if (padded) try product(b, plan.encoder.layout.relations) else 0;
+    try work.charge(group_count);
+    var packing = RelationPacking{ .batch = b, .relations = plan.encoder.layout.relations, .capacity = options.pair_cap, .used = try zeros(usize, a, group_count, 0) };
+    if (padded) hash.update("\x00padded_batch_relation_slots_v1\x00");
+    for (proposed, 0..) |proposal, compact_index| {
+        const i = if (padded) blk: {
+            const slot = try packing.next(proposal.batch_index, proposal.relation_index);
+            if (slot >= count) return error.InvalidBoundaryTrainingRouting;
+            appendHash(&hash, slot);
+            break :blk slot;
+        } else compact_index;
         try work.charge(targets.samples[proposal.batch_index].relations.len + 1);
         const batch = proposal.batch_index;
         const head = proposal.head_span;
@@ -1166,7 +1405,33 @@ fn selectRelations(plan: *Plan, a: Allocator, pool: *const decisions.Pool, pairs
     return result;
 }
 
-fn recordObjectives(plan: *Plan, a: Allocator, pool: *const decisions.Pool, targets: *const targets_mod.Targets, logits: []const []const f32, work: *StepWork, observer: ?decision_events.Observer) !record_loss.Result {
+/// Keep classifier parameter adjoints grouped by the same per-sample label
+/// sets as the reference. Parameters and the network body remain shared.
+fn classificationGroups(g: *graph_mod.GraphBuilder, choices: Id, schemas: []const *const schema_mod.CompiledSchema, width: u32) !Id {
+    const count = try std.math.mul(u32, g.layout.batch, width);
+    if (schemas.len != g.layout.batch or count == 0 or count > g.limits.max_classifications) return error.InvalidBoundaryTrainingGraphLayout;
+    var output: ?Id = null;
+    for (schemas, 0..) |schema, sample| {
+        var used: u32 = 0;
+        for (schema.schema.classifications, 0..) |group, ordinal| {
+            const labels = std.math.cast(u32, group.task.labels.len) orelse return error.BoundaryTrainingGraphLimitExceeded;
+            if (labels == 0 or labels > width -| used) return error.InvalidBoundaryTrainingGraphLayout;
+            const ids = try consecutive(g, sample * width + used, labels, count);
+            const states = try g.gather(choices, ids, labels, g.config.encoder.hidden_size);
+            var site: [96]u8 = undefined;
+            const logits = try g.buildClassificationAtSite(states, labels, try std.fmt.bufPrint(&site, "classifier.{d}.{d}", .{ sample, ordinal }));
+            output = if (output) |previous| try g.builder.concat(previous, logits, 0) else logits;
+            used += labels;
+        }
+        if (used < width) {
+            const padding = try g.fill(&.{width - used}, 0);
+            output = if (output) |previous| try g.builder.concat(previous, padding, 0) else padding;
+        }
+    }
+    return output orelse error.InvalidBoundaryTrainingGraphLayout;
+}
+
+fn recordObjectives(plan: *Plan, a: Allocator, pool: *const decisions.Pool, targets: *const targets_mod.Targets, logits: []const []const f32, work: *StepWork, observer: ?decision_events.Observer, backends: record_loss.Backends) !record_loss.Result {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -1202,7 +1467,7 @@ fn recordObjectives(plan: *Plan, a: Allocator, pool: *const decisions.Pool, targ
         matches[group_index] = try matching.match(a, &maps[group_index], &costs, options);
         match_count += 1;
         try work.charge(matches[group_index].work);
-        try decision_events.Observer.emit(observer, .{ .record = .{ .group = group_index, .sample = record.sample, .schema_group = record.group, .target = &maps[group_index], .matches = &matches[group_index] } });
+        try decision_events.Observer.emit(observer, .{ .record = .{ .group = group_index, .sample = record.sample, .schema_group = record.group, .target = &maps[group_index], .matches = &matches[group_index], .logits = scores, .loss_weight = plan.config.head.record_loss_weight } });
         groups[group_index] = .{ .target = &maps[group_index], .matches = &matches[group_index], .logits = scores };
     }
     var options = plan.limits.record_loss;
@@ -1210,7 +1475,7 @@ fn recordObjectives(plan: *Plan, a: Allocator, pool: *const decisions.Pool, targ
     options.max_work = work.available(options.max_work);
     options.object_weight = 1;
     options.field_weight = 1;
-    var result = try record_loss.compute(a, groups, options);
+    var result = try record_loss.computeWithBackends(a, groups, options, backends);
     errdefer result.deinit();
     try work.charge(result.work);
     return result;
@@ -1226,6 +1491,9 @@ pub fn isTouchParameter(parameter_name: []const u8, head: model.HeadConfig) bool
         (head.enable_relations and (std.mem.startsWith(u8, name, "relation_scorer.") or std.mem.startsWith(u8, name, "relation_pair_generator.")));
 }
 fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters: []const interpreter.RuntimeInput, prepared: *const processor.PreparedBatch, schemas: []const *const schema_mod.CompiledSchema, annotations: []const targets_mod.Annotations, context: StepContext, control: ?Control, transfer_admission: transfer.Admission) !StepResult {
+    if (plan.recomputation != null) if (context.decision_observer) |observer| {
+        if (observer.retained_values != null) return error.UnsupportedTraceActivationProfile;
+    };
     var work = StepWork{ .limit = plan.limits.max_step_work, .control = control };
     try work.charge(0);
     if (context.identity.optimizer_step != context.progress.optimizer_step or context.identity.microbatch != context.replay.micro_batch) return error.TrainingTapeIdentityMismatch;
@@ -1384,6 +1652,7 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
         .stages => |*session| blk: {
             var prefix = try session.forward(cb, initial.items, identity, control);
             defer prefix.deinit();
+            try decision_events.Observer.retained(context.decision_observer, .{ .graph = plan.graph, .id_map = prefix.session.base.differentiated.id_map, .ids = prefix.session.captures, .values = prefix.values });
             var captured: [5][]f32 = undefined;
             var captured_count: usize = 0;
             defer for (captured[0..captured_count]) |values| a.free(values);
@@ -1409,6 +1678,7 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
             }
             mapHeadInputs(plan, &late);
             try prefix.advance(identity, pool.?.fingerprint, late.items, control);
+            try decision_events.Observer.retained(context.decision_observer, .{ .graph = plan.graph, .id_map = prefix.session.base.differentiated.id_map, .ids = prefix.session.captures, .values = prefix.values });
             if (plan.relation_input != null) {
                 const pair_node = plan.outputs[try plan.outputIndex(.pair, 0)].node;
                 const pair_scores = try io.download(try prefix.logits(0), plan.graph.node(pair_node).output_shape, .proposal_logits);
@@ -1426,6 +1696,7 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
                 }
                 mapHeadInputs(plan, &late);
                 try prefix.advance(identity, relation_geometry.?.fingerprint, late.items, control);
+                try decision_events.Observer.retained(context.decision_observer, .{ .graph = plan.graph, .id_map = prefix.session.base.differentiated.id_map, .ids = prefix.session.captures, .values = prefix.values });
             }
             break :blk try prefix.finish();
         },
@@ -1441,6 +1712,18 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
         try work.charge(values.len);
         for (values.*) |value| if (!std.math.isFinite(value)) return error.NonFiniteBoundaryTraining;
     }
+    const consistency_backend: ?primitive.consistency_math.Backend = if (cb.kind() == .cuda)
+        .{ .ptr = &io, .apply = transfer.IO.consistencyLossGradient }
+    else
+        null;
+    const listwise_backend: ?primitive.listwise_math.Backend = if (cb.kind() == .cuda)
+        .{ .ptr = &io, .apply = transfer.IO.listwiseLossGradient }
+    else
+        null;
+    const binary_backend: ?primitive.elementwise_math.Backend = if (cb.kind() == .cuda)
+        .{ .ptr = &io, .apply = transfer.IO.elementwiseLossGradient }
+    else
+        null;
     var span_loss: ?objectives.Result = null;
     defer if (span_loss) |*value| value.deinit();
     var class_loss: ?primitive.Loss = null;
@@ -1462,10 +1745,12 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
             for (0..w) |word| text_mask[batch * w + word] = word < sample.word_count;
             for (0..w + 1) |word| boundary_mask[batch * (w + 1) + word] = word <= sample.word_count;
         }
-        var options = objectives.Options{ .training = plan.mode == .training, .weights = context.weights, .scales = active_scales, .negative_query_draws = context.negative_query_draws, .limits = plan.limits.losses };
+        var options = objectives.Options{ .gradient_backend = binary_backend, .listwise_backend = listwise_backend, .consistency_backend = consistency_backend, .gradient_precision = if (cb.kind() == .cuda) .tensor_f32 else .reference_f64, .training = plan.mode == .training, .weights = context.weights, .scales = active_scales, .negative_query_draws = context.negative_query_draws, .limits = plan.limits.losses };
         options.limits.control = control;
         options.limits.max_work = work.available(options.limits.max_work);
-        span_loss = try objectives.boundary(a, plan.config.head, .{ .batch = b, .queries = q, .words = w, .capacity = c, .starts = logits[try plan.outputIndex(.start, 0)], .ends = logits[try plan.outputIndex(.end, 0)], .inside = logits[try plan.outputIndex(.inside, 0)], .pairs = logits[try plan.outputIndex(.pair, 0)], .proposals = logits[try plan.outputIndex(.proposal, 0)], .nulls = if (plan.config.head.enable_abstention and plan.config.head.abstention_loss_weight > 0) logits[try plan.outputIndex(.abstention, 0)] else null, .counts = if (plan.config.head.enable_count_head and plan.config.head.count_loss_weight > 0) logits[try plan.outputIndex(.count, 0)] else null, .spans = selected.selection.spans, .pool_mask = selected.selection.valid, .query_mask = targets.query_mask, .text_mask = text_mask, .boundary_mask = boundary_mask, .gold = targets.gold() }, options);
+        const boundary_input = objectives.Input{ .batch = b, .queries = q, .words = w, .capacity = c, .starts = logits[try plan.outputIndex(.start, 0)], .ends = logits[try plan.outputIndex(.end, 0)], .inside = logits[try plan.outputIndex(.inside, 0)], .pairs = logits[try plan.outputIndex(.pair, 0)], .proposals = logits[try plan.outputIndex(.proposal, 0)], .nulls = if (plan.config.head.enable_abstention and plan.config.head.abstention_loss_weight > 0) logits[try plan.outputIndex(.abstention, 0)] else null, .counts = if (plan.config.head.enable_count_head and plan.config.head.count_loss_weight > 0) logits[try plan.outputIndex(.count, 0)] else null, .spans = selected.selection.spans, .pool_mask = selected.selection.valid, .query_mask = targets.query_mask, .text_mask = text_mask, .boundary_mask = boundary_mask, .gold = targets.gold() };
+        try decision_events.Observer.inputs(context.decision_observer, boundary_input);
+        span_loss = try objectives.boundary(a, plan.config.head, boundary_input, options);
         try work.charge(span_loss.?.work);
         try decision_events.Observer.emit(context.decision_observer, .{ .boundary_loss = &span_loss.? });
         terms = span_loss.?.terms;
@@ -1478,13 +1763,13 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
     loss_limits.control = control;
     if (plan.encoder.layout.classifications != 0) {
         loss_limits.max_work = work.available(plan.limits.losses.max_work);
-        class_loss = try objectives.supervisedBce(a, logits[try plan.outputIndex(.classification, 0)], targets.classification_targets, targets.classification_mask, plan.config.head.classification_loss_weight, loss_limits);
+        class_loss = try objectives.supervisedBceWithBackend(a, logits[try plan.outputIndex(.classification, 0)], targets.classification_targets, targets.classification_mask, plan.config.head.classification_loss_weight, loss_limits, if (cb.kind() == .cuda) .tensor_f32 else .reference_f64, binary_backend);
         try work.charge(class_loss.?.work);
         terms.classification = @floatCast(class_loss.?.value);
         terms.total += terms.classification;
     }
     if (plan.records.len != 0) {
-        records_loss = try recordObjectives(plan, a, &pool.?, &targets, logits, &work, context.decision_observer);
+        records_loss = try recordObjectives(plan, a, &pool.?, &targets, logits, &work, context.decision_observer, if (cb.kind() == .cuda) .{ .scalar = .{ .ptr = &io, .apply = transfer.IO.recordLossGradient }, .binary = binary_backend, .outer_weight = plan.config.head.record_loss_weight } else .{});
         terms.record_object = records_loss.?.object_loss;
         terms.record_field = records_loss.?.field_loss;
         terms.total += records_loss.?.value * plan.config.head.record_loss_weight;
@@ -1493,7 +1778,7 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
     }
     if (relation_geometry) |geometry| {
         loss_limits.max_work = work.available(plan.limits.losses.max_work);
-        relations_loss = try objectives.supervisedBce(a, logits[try plan.outputIndex(.relation, 0)], geometry.labels, geometry.mask, plan.config.head.relation_loss_weight, loss_limits);
+        relations_loss = try objectives.supervisedBceWithBackend(a, logits[try plan.outputIndex(.relation, 0)], geometry.labels, geometry.mask, plan.config.head.relation_loss_weight, loss_limits, if (cb.kind() == .cuda) .tensor_f32 else .reference_f64, binary_backend);
         try work.charge(relations_loss.?.work);
         terms.relation = @floatCast(relations_loss.?.value);
         terms.total += terms.relation;
@@ -1517,7 +1802,7 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
             .record_assignment => records_loss.?.gradients[output.group].assignments,
             .relation => relations_loss.?.gradient,
         };
-        if (output.kind == .record_object or output.kind == .record_assignment) for (gradient) |*value| {
+        if (cb.kind() != .cuda and (output.kind == .record_object or output.kind == .record_assignment)) for (gradient) |*value| {
             value.* *= plan.config.head.record_loss_weight;
         };
         try work.charge(gradient.len);
@@ -1833,4 +2118,84 @@ test {
     _ = @import("gliner_boundary_train_step_test.zig");
     _ = objectives;
     _ = decisions;
+}
+
+test "boundary relation padding preserves heterogeneous group slots and rejects overflow" {
+    var used = [_]usize{ 0, 0, 0, 0 };
+    var packing = RelationPacking{ .batch = 2, .relations = 2, .capacity = 2, .used = &used };
+    try std.testing.expectEqual(@as(usize, 4), try packing.next(1, 0));
+    try std.testing.expectEqual(@as(usize, 2), try packing.next(0, 1));
+    try std.testing.expectEqual(@as(usize, 5), try packing.next(1, 0));
+    try std.testing.expectEqual(@as(usize, 0), try packing.next(0, 0));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1, 2, 0 }, &used);
+    try std.testing.expectError(error.InvalidBoundaryTrainingRouting, packing.next(1, 0));
+    try std.testing.expectError(error.InvalidBoundaryTrainingRouting, packing.next(0, 2));
+    try std.testing.expectError(error.InvalidBoundaryTrainingRouting, packing.next(2, 0));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1, 2, 0 }, &used);
+}
+
+test "boundary classification groups preserve heterogeneous outputs gradients and dropout sites" {
+    const fixture = @import("gliner_boundary_train_step_test.zig");
+    const native = @import("../ops/native_compute.zig");
+    const a = std.testing.allocator;
+    var first = try schema_mod.compile(a, "{\"classifications\":[{\"name\":\"a\",\"labels\":[\"x\",\"y\"]},{\"name\":\"b\",\"labels\":[\"z\"]}]}", .{});
+    defer first.deinit();
+    var second = try schema_mod.compile(a, "{\"classifications\":[{\"name\":\"c\",\"labels\":[\"w\"]}]}", .{});
+    defer second.deinit();
+    var third = try schema_mod.compile(a, "{\"entities\":[\"person\"]}", .{});
+    defer third.deinit();
+    var graph = ml.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.Builder.init(&graph);
+    var cfg = fixture.config();
+    cfg.head.dropout = 0.1;
+    var g = try graph_mod.GraphBuilder.init(a, &builder, cfg, .{ .batch = 3, .words = 1, .queries = 1, .classifications = 3 }, .training, .{});
+    defer g.deinit();
+    const choices = try builder.parameter("choices", Shape.init(.f32, &.{ 9, 4 }));
+    const output = try classificationGroups(&g, choices, &.{ &first, &second, &third }, 3);
+    const seed = try builder.parameter("seed", Shape.init(.f32, &.{9}));
+    var ad = try ml.autodiff.gradientWithSeeds(a, &graph, &.{.{ .output = output, .cotangent = seed }}, &.{choices}, .{});
+    defer ad.deinit();
+    ad.graph.outputs.clearRetainingCapacity();
+    try ad.graph.markOutput(ad.id_map[output]);
+    try ad.graph.markOutput(ad.param_grads[0]);
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var bindings: std.ArrayListUnmanaged(interpreter.RuntimeInput) = .empty;
+    defer {
+        for (bindings.items) |binding| cb.free(binding.value);
+        bindings.deinit(a);
+    }
+    var masks: usize = 0;
+    for (graph.parameters.items) |id| {
+        if (ad.id_map[id] == ml.null_node) continue;
+        const node = graph.node(id);
+        const name = graph.parameterName(node);
+        const values = try a.alloc(f32, @intCast(node.output_shape.numElements().?));
+        defer a.free(values);
+        @memset(values, 0);
+        if (id == choices) {
+            for (0..9) |i| values[4 * i] = @floatFromInt(i + 1);
+        } else if (id == seed) {
+            for (values, 0..) |*v, i| v.* = @floatFromInt(i + 1);
+        } else if (std.mem.startsWith(u8, name, "__gliner25.dropout.classifier.")) {
+            masks += 1;
+            @memset(values, 1); // Explicit deterministic replay, no RNG dependency.
+        } else if (std.mem.endsWith(u8, name, ".weight")) values[0] = 1;
+        const value = try cb.fromFloat32(values);
+        errdefer cb.free(value);
+        try bindings.append(a, .{ .node_id = ad.id_map[id], .value = value });
+    }
+    try std.testing.expectEqual(@as(usize, 3), masks);
+    var result = try interpreter.execute(a, &ad.graph, &cb, .{ .runtime_inputs = bindings.items });
+    defer result.deinit(&cb);
+    const actual = try cb.toFloat32(result.outputs[0], a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 0, 0, 0, 0, 0 }, actual);
+    const gradient = try cb.toFloat32(result.outputs[1], a);
+    defer a.free(gradient);
+    for (gradient, 0..) |v, i| try std.testing.expectEqual(@as(f32, if (i < 16 and i % 4 == 0) @floatFromInt(i / 4 + 1) else 0), v);
 }

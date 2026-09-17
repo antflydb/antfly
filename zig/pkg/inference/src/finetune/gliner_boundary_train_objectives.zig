@@ -18,7 +18,7 @@ pub const Progress = struct {
     gold_end: f32 = 0.25,
     gold_hold_fraction: f32 = 0.15,
 };
-pub const Scales = struct { gold_injection: f32, consistency: f32, soft_iou: f32 };
+pub const Scales = struct { gold_injection: f32, consistency: f64, soft_iou: f64 };
 
 /// Pinned trainer schedules use the optimizer step, including accumulation.
 pub fn scales(head: model.HeadConfig, progress: Progress) !Scales {
@@ -30,9 +30,12 @@ pub fn scales(head: model.HeadConfig, progress: Progress) !Scales {
         std.math.clamp((fraction - progress.gold_hold_fraction) / @max(1 - @as(f64, progress.gold_hold_fraction), 1e-12), 0, 1);
     return .{
         .gold_injection = @floatCast(gold),
-        .consistency = if (head.consistency_warmup_steps == 0) 1 else @floatCast(@min(step / @as(f64, @floatFromInt(head.consistency_warmup_steps)), 1)),
-        .soft_iou = if (head.soft_iou_anneal_steps == 0) 0 else @floatCast(@max(1 - step / @as(f64, @floatFromInt(head.soft_iou_anneal_steps)), 0)),
+        .consistency = if (head.consistency_warmup_steps == 0) 1 else @min(step / @as(f64, @floatFromInt(head.consistency_warmup_steps)), 1),
+        .soft_iou = if (head.soft_iou_anneal_steps == 0) 0 else @max(1 - step / @as(f64, @floatFromInt(head.soft_iou_anneal_steps)), 0),
     };
+}
+fn scheduledWeight(weight: f64, scale: f64, tensor_profile: bool) f32 {
+    return if (tensor_profile) @floatCast(weight * scale) else @as(f32, @floatCast(weight)) * @as(f32, @floatCast(scale));
 }
 pub const Terms = struct {
     start: f32 = 0,
@@ -71,6 +74,10 @@ pub const Input = struct {
     gold: primitive.Gold,
 };
 pub const Options = struct {
+    gradient_backend: ?primitive.elementwise_math.Backend = null,
+    listwise_backend: ?primitive.listwise_math.Backend = null,
+    consistency_backend: ?primitive.consistency_math.Backend = null,
+    gradient_precision: primitive.GradientPrecision = .reference_f64,
     training: bool = true,
     weights: Weights = .{},
     scales: Scales = .{ .gold_injection = 1, .consistency = 1, .soft_iou = 1 },
@@ -136,12 +143,15 @@ fn addGradient(destination: []f32, source: []const f32, weight: f32) !void {
         if (!std.math.isFinite(out.*)) return error.NonFiniteBoundaryTraining;
     }
 }
-fn take(term: *f32, total: *f32, destination: []f32, item: primitive.Loss, weight: f32, work: *Work) !void {
+fn take(term: *f32, total: *f32, destination: ?[]f32, item: primitive.Loss, weight: f32, work: *Work) !void {
     try work.charge(item.work);
     term.* = @floatCast(item.value);
     total.* += term.* * weight;
     if (!std.math.isFinite(term.*) or !std.math.isFinite(total.*)) return error.NonFiniteBoundaryTraining;
-    try addGradient(destination, item.gradient, weight);
+    if (item.gradient_cotangent) |seed| {
+        if (seed != weight) return error.InvalidBoundaryTrainingCotangent;
+        if (destination) |out| try addGradient(out, item.gradient, 1);
+    } else if (destination) |out| try addGradient(out, item.gradient, weight);
 }
 
 /// Returns owned cotangents in graph-output order. Query-major iteration is
@@ -151,7 +161,7 @@ pub fn boundary(a: Allocator, head: model.HeadConfig, input: Input, options: Opt
     if (head.candidate_pool != .shared) return error.UnsupportedBoundaryTrainingPool;
     var work = Work{ .limits = options.limits };
     try work.check();
-    for ([_]f32{ options.weights.start, options.weights.end, options.weights.pair, options.weights.inside, options.scales.consistency, options.scales.soft_iou }) |x|
+    for ([_]f64{ options.weights.start, options.weights.end, options.weights.pair, options.weights.inside, options.scales.consistency, options.scales.soft_iou }) |x|
         if (!std.math.isFinite(x) or x < 0) return error.InvalidBoundaryTrainingOptions;
     const bq = try mul(input.batch, input.queries);
     const bc = try mul(input.batch, input.capacity);
@@ -211,7 +221,7 @@ pub fn boundary(a: Allocator, head: model.HeadConfig, input: Input, options: Opt
         const logits = if (comptime std.mem.eql(u8, which, "start")) input.starts else input.ends;
         const targets = if (comptime std.mem.eql(u8, which, "start")) dense.starts else dense.ends;
         const destination = if (comptime std.mem.eql(u8, which, "start")) gradients.starts else gradients.ends;
-        const settings = primitive.BinaryOptions{ .reduction = reduction, .negative_weight = head.boundary_negative_weight, .query_mask = input.query_mask, .limits = work.remaining() };
+        const settings = primitive.BinaryOptions{ .gradient_backend = options.gradient_backend, .cotangent = if (options.gradient_backend != null) @field(options.weights, which) else null, .gradient_precision = options.gradient_precision, .reduction = reduction, .negative_weight = head.boundary_negative_weight, .query_mask = input.query_mask, .limits = work.remaining() };
         var item = if (head.boundary_marginal_loss == .asymmetric_focal)
             try primitive.asymmetricFocal(a, .{ .shape = margin_shape, .values = logits }, targets, keep, .{ .binary = settings, .gamma_positive = head.boundary_focal_gamma_positive, .gamma_negative = head.boundary_focal_gamma_negative, .clip = head.boundary_focal_clip })
         else
@@ -246,57 +256,90 @@ pub fn boundary(a: Allocator, head: model.HeadConfig, input: Input, options: Opt
             pair_mask[best orelse break] = true;
         }
     }
-    const binary_options = primitive.BinaryOptions{ .reduction = reduction, .query_mask = pair_mask, .hard_negative_mask = hard.values, .limits = work.remaining() };
+    // The pinned CUDA graph accumulates listwise, soft-IoU and BCE before
+    // the deeper consistency branch. Preserve that FP32 association, including
+    // after warmup activates consistency (where adding it first loses bits).
+    const reverse_pair = options.gradient_backend != null and options.listwise_backend != null;
+    var pair_parts: [3]?[]const f32 = @splat(null);
+    const binary_options = primitive.BinaryOptions{ .gradient_backend = options.gradient_backend, .cotangent = if (options.gradient_backend != null) options.weights.pair else null, .gradient_precision = options.gradient_precision, .reduction = reduction, .query_mask = pair_mask, .hard_negative_mask = hard.values, .limits = work.remaining() };
     {
         var item = try primitive.candidatePairBce(a, .{ .shape = pair_shape, .values = input.pairs }, labels.values, valid, binary_options);
         defer item.deinit();
-        try take(&terms.pair, &terms.total, gradients.pairs, item, options.weights.pair, &work);
+        try take(&terms.pair, &terms.total, if (reverse_pair) null else gradients.pairs, item, options.weights.pair, &work);
+        if (reverse_pair) {
+            try work.charge(item.gradient.len);
+            pair_parts[0] = try owned.dupe(f32, item.gradient);
+        }
     }
     if (labels.soft_iou) |soft| if (options.scales.soft_iou > 0) {
+        const weight = scheduledWeight(head.soft_iou_aux_weight, options.scales.soft_iou, options.gradient_backend != null);
         const effective = try owned.alloc(bool, bqc);
         for (effective, valid, labels.values, hard.values) |*out, active, label, negative| out.* = active and (label > 0.5 or negative);
-        var item = try primitive.candidatePairBce(a, .{ .shape = pair_shape, .values = input.pairs }, soft, effective, .{ .reduction = reduction, .query_mask = pair_mask, .limits = work.remaining() });
+        var item = try primitive.candidatePairBce(a, .{ .shape = pair_shape, .values = input.pairs }, soft, effective, .{ .gradient_backend = options.gradient_backend, .cotangent = if (options.gradient_backend != null) weight else null, .gradient_precision = options.gradient_precision, .reduction = reduction, .query_mask = pair_mask, .limits = work.remaining() });
         defer item.deinit();
-        try take(&terms.soft_iou, &terms.total, gradients.pairs, item, head.soft_iou_aux_weight * options.scales.soft_iou, &work);
+        try take(&terms.soft_iou, &terms.total, if (reverse_pair) null else gradients.pairs, item, weight, &work);
+        if (reverse_pair) {
+            try work.charge(item.gradient.len);
+            pair_parts[1] = try owned.dupe(f32, item.gradient);
+        }
     };
     const gold_labels = try owned.alloc(bool, bqc);
     for (gold_labels, labels.values) |*out, label| out.* = label > 0.5;
     if (head.rerank_listwise_weight > 0) {
-        var item = try primitive.listwise(a, .{ .shape = pair_shape, .values = input.pairs }, gold_labels, valid, pair_mask, work.remaining());
+        var item = try primitive.listwiseWithBackend(a, .{ .shape = pair_shape, .values = input.pairs }, gold_labels, valid, pair_mask, work.remaining(), options.gradient_precision, .{ .backend = options.listwise_backend, .cotangent = if (options.listwise_backend != null) head.rerank_listwise_weight else null });
         defer item.deinit();
-        try take(&terms.rerank_listwise, &terms.total, gradients.pairs, item, head.rerank_listwise_weight, &work);
+        try take(&terms.rerank_listwise, &terms.total, if (reverse_pair) null else gradients.pairs, item, head.rerank_listwise_weight, &work);
+        if (reverse_pair) {
+            try work.charge(item.gradient.len);
+            pair_parts[2] = try owned.dupe(f32, item.gradient);
+        }
     }
     {
-        var item = try primitive.insideConsistency(a, .{ .shape = .{ .batch = input.batch, .queries = input.queries, .candidates = input.words }, .values = input.inside }, dense.inside, input.text_mask, input.query_mask, .{ .reduction = reduction, .negative_weight = head.boundary_negative_weight, .limits = work.remaining() });
+        var item = try primitive.insideConsistency(a, .{ .shape = .{ .batch = input.batch, .queries = input.queries, .candidates = input.words }, .values = input.inside }, dense.inside, input.text_mask, input.query_mask, .{ .gradient_backend = options.gradient_backend, .cotangent = if (options.gradient_backend != null) options.weights.inside else null, .gradient_precision = options.gradient_precision, .reduction = reduction, .negative_weight = head.boundary_negative_weight, .limits = work.remaining() });
         defer item.deinit();
         try take(&terms.inside, &terms.total, gradients.inside, item, options.weights.inside, &work);
     }
     if (head.proposal_loss_weight > 0) {
         const expanded = try owned.alloc(f32, bqc);
         for (0..input.batch) |b| for (0..input.queries) |q| @memcpy(expanded[(b * input.queries + q) * input.capacity ..][0..input.capacity], input.proposals[b * input.capacity ..][0..input.capacity]);
-        var item = try primitive.listwise(a, .{ .shape = pair_shape, .values = expanded }, gold_labels, valid, input.query_mask, work.remaining());
+        var item = try primitive.listwiseWithBackend(a, .{ .shape = pair_shape, .values = expanded }, gold_labels, valid, input.query_mask, work.remaining(), options.gradient_precision, .{ .backend = options.listwise_backend, .cotangent = if (options.listwise_backend != null) head.proposal_loss_weight else null, .reduce_queries = options.listwise_backend != null });
         defer item.deinit();
         try work.charge(item.work);
         terms.proposal = @floatCast(item.value);
         terms.total += terms.proposal * head.proposal_loss_weight;
-        for (0..input.batch) |b| for (0..input.queries) |q| try addGradient(gradients.proposals[b * input.capacity ..][0..input.capacity], item.gradient[(b * input.queries + q) * input.capacity ..][0..input.capacity], head.proposal_loss_weight);
+        if (item.gradient_cotangent) |seed| {
+            if (seed != head.proposal_loss_weight) return error.InvalidBoundaryTrainingOptions;
+            try addGradient(gradients.proposals, item.gradient, 1);
+        } else {
+            for (0..input.batch) |b| for (0..input.queries) |q| try addGradient(gradients.proposals[b * input.capacity ..][0..input.capacity], item.gradient[(b * input.queries + q) * input.capacity ..][0..input.capacity], head.proposal_loss_weight);
+        }
+    }
+    if (reverse_pair) {
+        var part = pair_parts.len;
+        while (part > 0) {
+            part -= 1;
+            if (pair_parts[part]) |values| try addGradient(gradients.pairs, values, 1);
+        }
     }
     if (head.consistency_loss_weight > 0) {
-        var item = try primitive.marginalConsistency(a, .{ .shape = pair_shape, .values = input.pairs }, expanded_spans, proposal_valid, .{ .shape = margin_shape, .values = input.starts }, input.ends, keep, work.remaining());
+        // Python multiplies configuration/schedule doubles before the tensor
+        // conversion. Preserve the legacy FP32 product outside this profile.
+        const weight = scheduledWeight(head.consistency_loss_weight, options.scales.consistency, options.consistency_backend != null);
+        var item = try primitive.marginalConsistencyWithBackend(a, .{ .shape = pair_shape, .values = input.pairs }, expanded_spans, proposal_valid, .{ .shape = margin_shape, .values = input.starts }, input.ends, keep, work.remaining(), .{ .backend = options.consistency_backend, .cotangent = if (options.consistency_backend != null) weight else null });
         defer item.deinit();
         try work.charge(item.work);
-        const weight = head.consistency_loss_weight * options.scales.consistency;
         terms.consistency = @floatCast(item.value);
         terms.total += terms.consistency * weight;
-        try addGradient(gradients.pairs, item.pair_gradient, weight);
-        try addGradient(gradients.starts, item.start_gradient, weight);
-        try addGradient(gradients.ends, item.end_gradient, weight);
+        const gradient_weight: f32 = if (item.gradient_cotangent != null) 1 else weight;
+        try addGradient(gradients.pairs, item.pair_gradient, gradient_weight);
+        try addGradient(gradients.starts, item.start_gradient, gradient_weight);
+        try addGradient(gradients.ends, item.end_gradient, gradient_weight);
     }
     inline for (.{ "nulls", "counts" }) |name| if (@field(input, name)) |logits| {
         const is_null = comptime std.mem.eql(u8, name, "nulls");
         const weight = if (is_null) head.abstention_loss_weight else head.count_loss_weight;
         if (weight > 0) {
-            var item = try primitive.queryLoss(a, logits, .{ .batch = input.batch, .queries = input.queries, .capacity = input.gold.capacity, .values = input.gold.valid }, input.query_mask, if (is_null) .abstention else .poisson_count, work.remaining());
+            var item = try primitive.queryLossWithBackend(a, logits, .{ .batch = input.batch, .queries = input.queries, .capacity = input.gold.capacity, .values = input.gold.valid }, input.query_mask, if (is_null) .abstention else .poisson_count, work.remaining(), options.gradient_precision, .{ .backend = options.gradient_backend, .cotangent = if (options.gradient_backend != null) weight else null });
             defer item.deinit();
             try take(if (is_null) &terms.abstention else &terms.count, &terms.total, @field(gradients, name).?, item, weight, &work);
         }
@@ -316,14 +359,76 @@ pub fn boundary(a: Allocator, head: model.HeadConfig, input: Input, options: Opt
 /// Classification and relation loss use one global supervised-label/pair
 /// denominator; inactive rows remain exactly zero with no implicit fallback.
 pub fn supervisedBce(a: Allocator, logits: []const f32, labels: []const f32, mask: []const bool, weight: f32, limits: primitive.Limits) !primitive.Loss {
+    return supervisedBceWithPrecision(a, logits, labels, mask, weight, limits, .reference_f64);
+}
+pub fn supervisedBceWithPrecision(a: Allocator, logits: []const f32, labels: []const f32, mask: []const bool, weight: f32, limits: primitive.Limits, precision: primitive.GradientPrecision) !primitive.Loss {
+    return supervisedBceWithBackend(a, logits, labels, mask, weight, limits, precision, null);
+}
+pub fn supervisedBceWithBackend(a: Allocator, logits: []const f32, labels: []const f32, mask: []const bool, weight: f32, limits: primitive.Limits, precision: primitive.GradientPrecision, backend: ?primitive.elementwise_math.Backend) !primitive.Loss {
     if (!std.math.isFinite(weight) or weight < 0) return error.InvalidBoundaryTrainingOptions;
-    var item = try primitive.balancedBce(a, .{ .shape = .{ .batch = 1, .queries = 1, .candidates = logits.len }, .values = logits }, labels, mask, .{ .limits = limits });
+    var item = try primitive.balancedBce(a, .{ .shape = .{ .batch = 1, .queries = 1, .candidates = logits.len }, .values = logits }, labels, mask, .{ .gradient_backend = backend, .cotangent = if (backend != null) weight else null, .gradient_precision = precision, .limits = limits });
     errdefer item.deinit();
     item.value *= weight;
-    for (item.gradient) |*gradient| gradient.* *= weight;
+    if (item.gradient_cotangent == null) for (item.gradient) |*gradient| {
+        gradient.* *= weight;
+    };
+    item.gradient_cotangent = null;
     if (!std.math.isFinite(item.value)) return error.NonFiniteBoundaryTraining;
     try finite(item.gradient);
     return item;
+}
+
+test "binary backend applies supervised scalar weight before VJP exactly once" {
+    const Probe = struct {
+        fn apply(_: *anyopaque, request: *const primitive.elementwise_math.Request) !void {
+            try request.validate();
+            try std.testing.expectEqualSlices(f32, &.{ 1.5, 1.5, 0 }, request.cotangents);
+            for (request.targets, request.cotangents) |target, *seed|
+                seed.* = if (seed.* == 0) 0 else seed.* * (0.5 - target);
+        }
+    };
+    var context: u8 = 0;
+    var result = try supervisedBceWithBackend(std.testing.allocator, &.{ 0, 0, 0 }, &.{ 0, 1, 0 }, &.{ true, true, false }, 3, .{}, .tensor_f32, .{ .ptr = &context, .apply = Probe.apply });
+    defer result.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 0.75, -0.75, 0 }, result.gradient);
+    try std.testing.expect(result.gradient_cotangent == null);
+    try std.testing.expectApproxEqAbs(@as(f64, 3 * @log(@as(f64, 2))), result.value, 1e-12);
+}
+
+test "CUDA boundary mixed objectives propagate FP32 precision to inside supervision" {
+    const head = model.HeadConfig{
+        .candidate_pool = .shared,
+        .enable_abstention = false,
+        .enable_count_head = false,
+        .negative_query_ratio = 0,
+        .soft_iou_aux_weight = 0,
+        .rerank_listwise_weight = 0,
+        .proposal_loss_weight = 0,
+        .consistency_loss_weight = 0,
+    };
+    const input = Input{
+        .batch = 1,
+        .queries = 1,
+        .words = 1,
+        .capacity = 1,
+        .starts = &.{ 0, 0 },
+        .ends = &.{ 0, 0 },
+        .inside = &.{17},
+        .pairs = &.{0},
+        .proposals = &.{0},
+        .spans = &.{.{ .start = 0, .end = 1 }},
+        .pool_mask = &.{true},
+        .query_mask = &.{true},
+        .text_mask = &.{true},
+        .boundary_mask = &.{ true, true },
+        .gold = .{ .batch = 1, .queries = 1, .capacity = 1, .spans = &.{.{ .start = 0, .end = 1 }}, .valid = &.{true} },
+    };
+    var cuda = try boundary(std.testing.allocator, head, input, .{ .gradient_precision = .tensor_f32 });
+    defer cuda.deinit();
+    try std.testing.expectEqual(@as(f32, 0), cuda.gradients.inside[0]);
+    var reference = try boundary(std.testing.allocator, head, input, .{});
+    defer reference.deinit();
+    try std.testing.expect(reference.gradients.inside[0] < 0);
 }
 
 test "boundary training objectives schedules match pinned hold warmup and anneal endpoints" {
@@ -336,7 +441,80 @@ test "boundary training objectives schedules match pinned hold warmup and anneal
     disabled.consistency_warmup_steps = 0;
     disabled.soft_iou_anneal_steps = 0;
     const result = try scales(disabled, .{ .optimizer_step = 300, .total_optimizer_steps = 100 });
-    try std.testing.expectEqual(@as(f32, 1), result.consistency);
-    try std.testing.expectEqual(@as(f32, 0), result.soft_iou);
+    try std.testing.expectEqual(@as(f64, 1), result.consistency);
+    try std.testing.expectEqual(@as(f64, 0), result.soft_iou);
     try std.testing.expectError(error.InvalidBoundaryTrainingSchedule, scales(head, .{ .optimizer_step = 0, .total_optimizer_steps = 1, .gold_hold_fraction = 1.1 }));
+}
+
+test "CUDA boundary pair loss accumulation preserves the active consistency contribution" {
+    const Probe = struct {
+        fn binary(_: *anyopaque, request: *const primitive.elementwise_math.Request) !void {
+            try request.validate();
+            for (request.cotangents) |*seed| seed.* = if (seed.* == 0) 0 else 1e8;
+        }
+        fn listwise(_: *anyopaque, request: *const primitive.listwise_math.Request) !void {
+            try request.validate();
+            @memset(request.gradient, -1e8);
+        }
+    };
+    const head = model.HeadConfig{
+        .candidate_pool = .shared,
+        .enable_abstention = false,
+        .enable_count_head = false,
+        .negative_query_ratio = 0,
+        .soft_iou_aux_weight = 0,
+        .rerank_listwise_weight = 1,
+        .proposal_loss_weight = 0,
+        .consistency_loss_weight = 0.1,
+    };
+    const input = Input{
+        .batch = 1,
+        .queries = 1,
+        .words = 1,
+        .capacity = 1,
+        .starts = &.{ 2, 2 },
+        .ends = &.{ 2, 2 },
+        .inside = &.{0},
+        .pairs = &.{0},
+        .proposals = &.{0},
+        .spans = &.{.{ .start = 0, .end = 1 }},
+        .pool_mask = &.{true},
+        .query_mask = &.{true},
+        .text_mask = &.{true},
+        .boundary_mask = &.{ true, true },
+        .gold = .{ .batch = 1, .queries = 1, .capacity = 1, .spans = &.{.{ .start = 0, .end = 1 }}, .valid = &.{true} },
+    };
+    var context: u8 = 0;
+    const options = Options{
+        .gradient_precision = .tensor_f32,
+        .gradient_backend = .{ .ptr = &context, .apply = Probe.binary },
+        .listwise_backend = .{ .ptr = &context, .apply = Probe.listwise },
+    };
+    var result = try boundary(std.testing.allocator, head, input, options);
+    defer result.deinit();
+    var consistency = try primitive.marginalConsistency(std.testing.allocator, .{ .shape = .{ .batch = 1, .queries = 1, .candidates = 1 }, .values = input.pairs }, input.spans, input.pool_mask, .{ .shape = .{ .batch = 1, .queries = 1, .candidates = 2 }, .values = input.starts }, input.ends, input.boundary_mask, .{});
+    defer consistency.deinit();
+    const expected = consistency.pair_gradient[0] * @as(f32, @floatCast(head.consistency_loss_weight));
+    try std.testing.expect(expected != 0);
+    // The equal and opposite large branch seeds cancel before this small
+    // contribution arrives; placing it first would silently round it away.
+    try std.testing.expectEqual(expected, result.gradients.pairs[0]);
+}
+
+test "boundary consistency schedule preserves Python scalar multiplication" {
+    const head = model.HeadConfig{};
+    const scheduled = try scales(head, .{ .optimizer_step = 2, .total_optimizer_steps = 100 });
+    const precise: f32 = @floatCast(head.consistency_loss_weight * scheduled.consistency);
+    const legacy = @as(f32, @floatCast(head.consistency_loss_weight)) * @as(f32, @floatCast(scheduled.consistency));
+    try std.testing.expectEqual(@as(f32, 0.0001), precise);
+    try std.testing.expect(precise != legacy);
+}
+
+test "boundary soft IoU schedule retains the final scalar rounding boundary" {
+    const head = model.HeadConfig{};
+    const scheduled = try scales(head, .{ .optimizer_step = 3, .total_optimizer_steps = 100 });
+    const precise = scheduledWeight(head.soft_iou_aux_weight, scheduled.soft_iou, true);
+    const legacy = scheduledWeight(head.soft_iou_aux_weight, scheduled.soft_iou, false);
+    try std.testing.expectEqual(@as(f32, 0.19997000694274902), precise);
+    try std.testing.expectEqual(@as(f32, 0.19996999204158783), legacy);
 }

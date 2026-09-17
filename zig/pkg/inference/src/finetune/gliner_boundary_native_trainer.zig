@@ -50,7 +50,10 @@ pub const Limits = struct {
     peft: peft.Limits = .{},
     differentiation: seeded.Options = .{},
 };
+pub const DecisionEvents = @import("gliner_boundary_training_decisions.zig");
 pub const Options = struct {
+    /// Borrowed diagnostics over decisions already produced by the step.
+    decision_observer: ?DecisionEvents.Observer = null,
     run: run.Config,
     execution: controller.Execution = .native,
     attention_profile: step.AttentionProfile = .materialized_v1,
@@ -234,8 +237,8 @@ pub const Trainer = struct {
         for (original) |parameter| if (parameter.kind != .original) return error.InvalidBoundaryTrainingParameters;
         const self = try a.create(Trainer);
         errdefer a.destroy(self);
-        if (options.execution == .resident_metal and (options.limits.max_backend_host_bytes == 0 or options.limits.max_backend_host_bytes >= options.limits.max_backend_bytes)) return error.BoundaryTrainingRunLimitExceeded;
-        self.* = .{ .backing = a, .host_budget = .{ .backing = a, .limit = options.limits.max_host_bytes }, .backend_budget = .{ .backing = a, .limit = if (options.execution == .resident_metal) options.limits.max_backend_host_bytes else options.limits.max_backend_bytes }, .backend = undefined, .cb = undefined, .optimizer = undefined, .validators = undefined, .model_config = config, .options = options, .run_plan = undefined, .dataset = dataset, .tokenizer = tokenizer, .fingerprint = undefined };
+        if (options.execution != .native and (options.limits.max_backend_host_bytes == 0 or options.limits.max_backend_host_bytes >= options.limits.max_backend_bytes)) return error.BoundaryTrainingRunLimitExceeded;
+        self.* = .{ .backing = a, .host_budget = .{ .backing = a, .limit = options.limits.max_host_bytes }, .backend_budget = .{ .backing = a, .limit = if (options.execution != .native) options.limits.max_backend_host_bytes else options.limits.max_backend_bytes }, .backend = undefined, .cb = undefined, .optimizer = undefined, .validators = undefined, .model_config = config, .options = options, .run_plan = undefined, .dataset = dataset, .tokenizer = tokenizer, .fingerprint = undefined };
         self.synthetic_fixture = fixture;
         errdefer std.debug.assert(self.host_budget.live == 0 and self.backend_budget.live == 0);
         self.host_observer = .{ .failures = &self.memory_failures, .domain = .host };
@@ -287,9 +290,16 @@ pub const Trainer = struct {
             if (initialized.magnitude) |values| try parameters.append(scratch, .{ .name = descriptor.magnitude_name.?, .canonical_name = descriptor.magnitude_name.?, .dimensions = try scratch.dupe(i32, &.{@intCast(descriptor.target.out_dim)}), .values = values, .kind = .adapter });
         };
         const selected = try self.run_plan.selectParameters(scratch, parameters.items);
-        const backend_limits = backend_mod.Limits{ .max_frozen_device_bytes = options.limits.max_backend_bytes, .max_combined_bytes = options.limits.max_backend_bytes };
+        const backend_limits = backend_mod.Limits{
+            .max_frozen_device_bytes = options.limits.max_backend_bytes,
+            .max_combined_bytes = options.limits.max_backend_bytes,
+            .max_device_allocation_bytes = if (options.execution == .resident_cuda)
+                options.limits.max_backend_bytes - options.limits.max_backend_host_bytes
+            else
+                options.limits.max_backend_bytes,
+        };
         const backend_admission = try backend_mod.estimate(original, selected, options.execution, backend_limits);
-        if (options.execution == .resident_metal) {
+        if (options.execution != .native) {
             var device_state_bytes: usize = 0;
             var upload_bytes = backend_admission.upload_staging_bytes;
             for (selected) |parameter| {
@@ -306,14 +316,40 @@ pub const Trainer = struct {
         self.cb = self.backend.cb;
         self.cb.execution_control = control;
         defer self.cb.execution_control = null;
+        if (options.execution == .resident_cuda) try self.run_plan.enableCudaFusedAdamW();
         var optimizer_config = self.run_plan.optimizerConfig(options.limits.optimizer);
         optimizer_config.execution = options.execution;
+        // Full/heads use the independently captured released-model order.
+        // PEFT retains its existing profile until adapter registration order
+        // has its own pinned CUDA oracle; base parameter order cannot stand in.
+        if (options.execution == .resident_cuda and options.run.mode != .lora and options.run.mode != .dora)
+            optimizer_config.pytorch_clip_order = try self.run_plan.pytorchClippingOrder(scratch, parameters.items, selected);
         self.optimizer = try controller.Trainer.init(host, &self.cb, selected, optimizer_config);
         errdefer self.optimizer.deinit();
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly.boundary-native-trainer.v1\x00");
         hash.update("pinned_all_trainable_zero_loss_fallback_v1\x00");
-        if (options.execution == .resident_metal) hash.update("resident_f32_optimizer_v1\x00");
+        if (options.execution != .native) hash.update("resident_f32_optimizer_v1\x00");
+        if (options.execution == .resident_cuda) {
+            hash.update("cuda_f32_training_v41_blas_identity\x00");
+            // Identical SGEMM operands can follow different reduction orders
+            // across cuBLAS releases. Never resume under an unrecorded runtime.
+            var blas_version: [4]u8 = undefined;
+            std.mem.writeInt(u32, &blas_version, self.backend.cuda_backend.?.training_blas.?.version, .little);
+            hash.update(&blas_version);
+            const math_hash = @import("../ops/cuda/training_math.zig").artifactHash();
+            hash.update(&math_hash);
+            // Scan partitioning and reduction CTA geometry depend on the device.
+            var scan_sms: [4]u8 = undefined;
+            std.mem.writeInt(u32, &scan_sms, self.backend.cuda_backend.?.training_math.?.multiprocessors, .little);
+            hash.update(&scan_sms);
+            std.mem.writeInt(u32, &scan_sms, self.backend.cuda_backend.?.training_math.?.max_threads_per_multiprocessor, .little);
+            hash.update(&scan_sms);
+            std.mem.writeInt(u32, &scan_sms, self.backend.cuda_backend.?.training_math.?.shared_memory_per_block, .little);
+            hash.update(&scan_sms);
+            const attention_hash = @import("../ops/cuda/boundary_attention.zig").artifactHash();
+            hash.update(&attention_hash);
+        }
         if (options.attention_profile != .materialized_v1) {
             hash.update("attention_profile\x00");
             hash.update(@tagName(options.attention_profile));
@@ -382,7 +418,7 @@ pub const Trainer = struct {
     }
 
     fn restorePinnedOwned(self: *Trainer, path: []const u8, expected_state_sha256: ?[32]u8, control: ?Control) !controller.RestoreReceipt {
-        if (self.options.execution == .resident_metal) {
+        if (self.options.execution != .native) {
             var upload: usize = 2 * 1024 * 1024;
             for (self.optimizer.owner.regular_params.items) |slot| upload = @max(upload, try std.math.mul(usize, slot.weights.len, 4));
             try self.admitResident(try std.math.add(usize, self.optimizer.owner.device_trainable_bytes, upload));
@@ -474,7 +510,7 @@ pub const Trainer = struct {
             // A restored epoch-end partial window can flush before a plan has
             // been built. Admit the pending optimizer state independently of
             // the forward/backward admission performed by ensurePlan.
-            if (self.options.execution == .resident_metal) {
+            if (self.options.execution != .native) {
                 const update = try self.optimizer.residentUpdateAdmission(self.host_budget.allocator());
                 try self.admitResident(update.device_upper_bound_bytes);
             }
@@ -538,7 +574,7 @@ pub const Trainer = struct {
         const negative_draws = try scratch.alloc(f32, @as(usize, plan.encoder.layout.batch) * plan.encoder.layout.queries);
         var negative_rng = run.Random.init(self.run_plan.config.seed, identity.microbatch_step, "negative_queries");
         for (negative_draws) |*value| value.* = negative_rng.uniform();
-        const context = step.StepContext{ .identity = .{ .binding = self.fingerprint, .optimizer_step = identity.optimizer_step, .microbatch = identity.microbatch_step }, .replay = .{ .seed = self.run_plan.config.seed, .micro_batch = identity.microbatch_step }, .progress = .{ .optimizer_step = identity.optimizer_step, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = self.options.gold_start, .gold_end = self.options.gold_end, .gold_hold_fraction = self.options.gold_hold_fraction }, .weights = self.options.weights, .injection_draws = draws, .negative_query_draws = negative_draws, .require_gold_relation_coverage = self.options.require_gold_relation_coverage };
+        const context = step.StepContext{ .decision_observer = self.options.decision_observer, .identity = .{ .binding = self.fingerprint, .optimizer_step = identity.optimizer_step, .microbatch = identity.microbatch_step }, .replay = .{ .seed = self.run_plan.config.seed, .micro_batch = identity.microbatch_step }, .progress = .{ .optimizer_step = identity.optimizer_step, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = self.options.gold_start, .gold_end = self.options.gold_end, .gold_hold_fraction = self.options.gold_hold_fraction }, .weights = self.options.weights, .injection_draws = draws, .negative_query_draws = negative_draws, .require_gold_relation_coverage = self.options.require_gold_relation_coverage };
         var result = blk: {
             self.memory_failures.begin(.forward_backward);
             var bindings = try self.optimizer.bind(plan.graph, control);
@@ -667,8 +703,10 @@ pub const Trainer = struct {
         step_limits.targets.validate_value_fn = regex.Context.validateValue;
         step_limits.recomputation.max_backend_bytes = @min(step_limits.recomputation.max_backend_bytes, self.options.limits.max_backend_bytes);
         step_limits.recomputation.max_host_bytes = @min(step_limits.recomputation.max_host_bytes, try std.math.add(usize, self.options.source_reserved_bytes, self.options.limits.max_host_bytes));
-        var plan = try step.buildWithProfiles(a, self.model_config, prepared, schemas, self.options.capacities, .training, self.options.attention_profile, self.options.activation_profile, step_limits);
+        const arithmetic: step.AttentionArithmetic = if (self.options.execution == .resident_cuda and self.options.attention_profile == .materialized_v1) .pytorch_fp32 else .scale_after_sum;
+        var plan = try step.buildWithTrainingArithmetic(a, self.model_config, prepared, schemas, self.options.capacities, .training, self.options.attention_profile, self.options.activation_profile, .{ .encoder = arithmetic, .boundary = if (self.options.execution == .resident_cuda and self.backend.cuda_backend.?.boundary_attention != null) .cuda_fused_d32_v1 else .materialized_v1, .prefix = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .tree_v1, .score = if (self.options.execution == .resident_cuda) .pytorch_sequential_v1 else .grouped_v1, .candidate_features = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .host_v1, .input_gradients = if (self.options.execution == .resident_cuda) .pytorch_v2 else .grouped_v1, .gather = if (self.options.execution == .resident_cuda) .pytorch_gather_v1 else .serial_v1, .sigmoid = if (self.options.execution == .resident_cuda) .pytorch_saved_v1 else .decomposed_v1, .record = if (self.options.execution == .resident_cuda) .pytorch_batch_v1 else .per_group_v1 }, step_limits);
         errdefer plan.deinit();
+        if (self.options.execution == .resident_cuda) try plan.enableCudaTrainingFusion();
         if (self.adapter_layout) |adapter_layout| {
             const selected = try adapter_layout.targetsForGraph(a, plan.graph);
             defer a.free(selected);
@@ -689,12 +727,13 @@ pub const Trainer = struct {
         }
         var differentiation = self.options.limits.differentiation;
         differentiation.allow_no_gradients = true;
-        differentiation.execution = if (self.options.execution == .resident_metal) .resident_metal else .native;
-        if (self.options.execution == .resident_metal) differentiation.resident.max_device_bytes = @min(differentiation.resident.max_device_bytes, self.options.limits.max_backend_bytes);
+        differentiation.execution = self.options.execution;
+        if (self.options.execution == .resident_cuda) differentiation.resident.program.instruction.cuda_reduction = self.backend.cuda_backend.?.training_math.?.reductionDevice();
+        if (self.options.execution != .native) differentiation.resident.max_device_bytes = @min(differentiation.resident.max_device_bytes, self.options.limits.max_backend_bytes);
         try plan.finalizeWithActivationProfile(wrt.items, differentiation, self.options.activation_profile);
         if (self.options.activation_profile == .layer_recompute_v1) {
             try self.admitRecomputed(&plan, control);
-        } else if (self.options.execution == .resident_metal) {
+        } else if (self.options.execution != .native) {
             const execution = try plan.transferAdmission();
             const transaction = try self.optimizer.residentUpdateAdmission(a);
             // Conservatively retain the complete Step bound while staging an
@@ -721,7 +760,7 @@ pub const Trainer = struct {
             .head_host_metadata_bytes = try std.math.add(usize, self.options.limits.step.max_step_host_bytes, self.options.limits.max_recomputed_batch_scratch_bytes),
             .head_work = self.options.limits.step.max_step_work,
         };
-        if (self.options.execution == .resident_metal) {
+        if (self.options.execution != .native) {
             const update = try self.optimizer.residentUpdateAdmission(self.host_budget.allocator());
             owner.fixed_backend_bytes = try std.math.add(usize, self.options.limits.max_backend_host_bytes, try std.math.add(usize, self.backend.admission.frozen_device_bytes, self.optimizer.owner.device_trainable_bytes));
             owner.optimizer_transaction_backend_bytes = update.device_upper_bound_bytes;
@@ -743,7 +782,7 @@ pub const Trainer = struct {
         const local_host = admitted.host_upper_bound_bytes - self.options.source_reserved_bytes;
         if (local_host > self.options.limits.max_host_bytes or local_host < host_live) return error.BoundaryTrainingRunLimitExceeded;
         self.recomputed_future_host_bytes = local_host - host_live;
-        if (self.options.execution == .resident_metal) self.resident_device_upper_bound_bytes = @max(self.resident_device_upper_bound_bytes, admitted.backend_upper_bound_bytes);
+        if (self.options.execution != .native) self.resident_device_upper_bound_bytes = @max(self.resident_device_upper_bound_bytes, admitted.backend_upper_bound_bytes);
         try self.checkRecomputedHost();
         try check(control);
     }
@@ -758,7 +797,7 @@ pub const Trainer = struct {
     /// exists. Its optimizer still requires host and work admission first.
     fn admitRecomputedFlush(self: *Trainer) !void {
         const limits = self.options.limits;
-        const host_bytes, const work = if (self.options.execution == .resident_metal) resident: {
+        const host_bytes, const work = if (self.options.execution != .native) resident: {
             const update = try self.optimizer.residentUpdateAdmission(self.host_budget.allocator());
             break :resident .{ update.host_metadata_upper_bound_bytes, update.total_work };
         } else native_update: {

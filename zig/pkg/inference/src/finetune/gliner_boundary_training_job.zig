@@ -167,7 +167,7 @@ pub fn validate(config: Config) !void {
     }
     if (config.expected_source) |expected| if (expected.precision != .fp32) return error.QuantizedBoundaryTrainingUnsupported;
     if (config.memory.host_bytes == 0 or config.memory.backend_bytes == 0 or config.memory.combined_bytes == 0 or config.memory.optimizer_state_bytes == 0 or config.memory.optimizer_transaction_bytes == 0 or config.dataset_limits.max_host_bytes == 0) return error.InvalidBoundaryTrainingJob;
-    if (config.execution == .resident_metal and (config.memory.backend_metadata_bytes == 0 or config.memory.backend_metadata_bytes >= config.memory.backend_bytes)) return error.InvalidBoundaryTrainingJob;
+    if (config.execution != .native and (config.memory.backend_metadata_bytes == 0 or config.memory.backend_metadata_bytes >= config.memory.backend_bytes)) return error.InvalidBoundaryTrainingJob;
     if (config.run.batch_size == 0 or config.run.batch_size > 64 or config.tokenization.max_text_words == 0 or config.tokenization.max_sequence_tokens == 0 or config.tokenization.max_queries == 0) return error.InvalidBoundaryTrainingJob;
     const input = config.training_limits.encoder.input;
     if (config.run.batch_size > input.max_batch or config.tokenization.max_text_words > input.max_text_words or
@@ -229,6 +229,7 @@ pub fn execute(a: Allocator, io: std.Io, config: Config, admission: *memory.Admi
 fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.AdmissionController, execution: Execution, outer_control: ?Control, budget: *Budget) !Result {
     try validate(config);
     if (comptime !@import("build_options").enable_metal) if (config.execution == .resident_metal) return error.UnsupportedBoundaryTrainingBackend;
+    if (comptime !@import("build_options").enable_cuda) if (config.execution == .resident_cuda) return error.UnsupportedBoundaryTrainingBackend;
     var bounded_control = outer_control orelse Control{};
     bounded_control.io = io;
     const deadline = try std.math.add(u64, platform.time.monotonicNs(), try std.math.mul(u64, config.timeout_seconds, std.time.ns_per_s));
@@ -242,7 +243,7 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
     } else |err| if (err != error.FileNotFound) return err;
     const source_reserved = try source_mod.reservation(io, config.source_dir, config.source_limits, control);
     const combined = try admissionBytes(config, source_reserved);
-    var lease = try admission.tryAcquire(if (config.execution == .resident_metal) .gpu else .cpu, .{ .host_limit_bytes = config.memory.combined_bytes, .backend_limit_bytes = config.memory.backend_bytes, .combined_limit_bytes = config.memory.combined_bytes }, try admissionAmounts(config, source_reserved), true);
+    var lease = try admission.tryAcquire(if (config.execution != .native) .gpu else .cpu, .{ .host_limit_bytes = config.memory.combined_bytes, .backend_limit_bytes = config.memory.backend_bytes, .combined_limit_bytes = config.memory.combined_bytes }, try admissionAmounts(config, source_reserved), true);
     defer lease.release();
     const scratch = budget.allocator();
     var train = try openDataset(a, config.train_file, config.dataset_limits, .train, control);
@@ -322,9 +323,9 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
     try writeJson(scratch, io, manifest_path, .{
         .format = "antfly.gliner25-training-run/v1",
         .config = config,
-        .backend = if (config.execution == .resident_metal) "metal" else "native",
+        .backend = @tagName(config.execution.backendKind()),
         .math_policy = "strict_f32_activations_v1",
-        .training_contract = if (config.execution == .resident_metal) "boundary-resident-training-v1" else "boundary-native-training-v1",
+        .training_contract = if (config.execution != .native) "boundary-resident-training-v1" else "boundary-native-training-v1",
         .observed_executable = .{ .path = executable_path, .digest = executable_digest },
         .zig_version = @import("builtin").zig_version_string,
         .architecture = @tagName(@import("builtin").cpu.arch),

@@ -14,7 +14,18 @@ const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Allocator = std.mem.Allocator;
 const Id = ml.NodeId;
 
-pub const Execution = enum { native, resident_metal };
+pub const Execution = enum {
+    native,
+    resident_metal,
+    resident_cuda,
+    pub fn backendKind(self: Execution) ops.BackendKind {
+        return switch (self) {
+            .native => .native,
+            .resident_metal => .metal,
+            .resident_cuda => .cuda,
+        };
+    }
+};
 pub const Options = struct {
     gradient: ml.autodiff.SeedOptions = .{},
     max_tape_bytes: usize = 256 * 1024 * 1024,
@@ -209,7 +220,7 @@ pub const Session = struct {
     pub fn validateBackend(self: *const Session, cb: *const ops.ComputeBackend) !void {
         switch (self.options.execution) {
             .native => if (cb.kind() != .native) return error.UnsupportedSeededTrainingBackend,
-            .resident_metal => if (cb.kind() != .metal or self.resident == null or cb.vtable.residentTrainingInstruction == null or cb.vtable.residentTrainingPrimitive == null or cb.vtable.residentTrainingNorm == null or cb.vtable.snapshotTensorShape == null) return error.UnsupportedSeededTrainingBackend,
+            .resident_metal, .resident_cuda => if (cb.kind() != self.options.execution.backendKind() or self.resident == null or cb.vtable.residentTrainingInstruction == null or cb.vtable.residentTrainingPrimitive == null or cb.vtable.residentTrainingNorm == null or cb.vtable.snapshotTensorShape == null) return error.UnsupportedSeededTrainingBackend,
         }
     }
 
@@ -220,7 +231,7 @@ pub const Session = struct {
     }
 
     pub fn releaseInputs(self: *const Session, cb: *const ops.ComputeBackend, inputs: []const interpreter.RuntimeInput) void {
-        if (self.options.execution == .resident_metal) for (inputs) |input| cb.free(input.value);
+        if (self.options.execution != .native) for (inputs) |input| cb.free(input.value);
     }
 
     pub fn deinit(self: *Session) void {
@@ -346,15 +357,15 @@ pub const Tape = struct {
             if (!present) try inputs.append(a, .{ .node_id = mapped, .value = value });
         }
         var bytes: usize = 0;
-        const seed_shapes: []ml.Shape = if (session.options.execution == .resident_metal) try a.alloc(ml.Shape, cotangents.len) else &.{};
-        defer if (session.options.execution == .resident_metal) a.free(seed_shapes);
+        const seed_shapes: []ml.Shape = if (session.options.execution != .native) try a.alloc(ml.Shape, cotangents.len) else &.{};
+        defer if (session.options.execution != .native) a.free(seed_shapes);
         for (session.seeds, cotangents, 0..) |seed, value, seed_index| {
             const id = session.differentiated.id_map[seed.cotangent];
             const shape = session.differentiated.graph.node(id).output_shape;
             bytes = std.math.add(usize, bytes, try shapeBytes(shape)) catch return error.TrainingTapeLimitExceeded;
             if (bytes > session.options.max_cotangent_bytes) return error.TrainingTapeLimitExceeded;
             try validateTensor(a, self.cb, value, shape);
-            if (session.options.execution == .resident_metal) {
+            if (session.options.execution != .native) {
                 seed_shapes[seed_index] = shape;
             } else {
                 const checked = try self.cb.toFloat32(value, a);
@@ -370,7 +381,7 @@ pub const Tape = struct {
             };
             if (!duplicate) try inputs.append(a, .{ .node_id = mapped, .value = value });
         }
-        const control_readback_bytes = if (session.options.execution == .resident_metal) try resident_execution.finiteCotangents(a, self.cb, cotangents, seed_shapes, session.options.max_cotangent_bytes, session.options.resident, control) else 0;
+        const control_readback_bytes = if (session.options.execution != .native) try resident_execution.finiteCotangents(a, self.cb, cotangents, seed_shapes, session.options.max_cotangent_bytes, session.options.resident, control) else 0;
         var gradients = if (session.gradient_parameters.len == 0)
             interpreter.ExecutionResult{ .outputs = try a.alloc(ops.CT, 0), .allocator = a }
         else if (session.resident) |*compiled|

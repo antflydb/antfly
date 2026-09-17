@@ -9,6 +9,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
+pub const elementwise_math = @import("../ops/elementwise_loss_math.zig");
+pub const listwise_math = @import("../ops/listwise_loss_math.zig");
+pub const consistency_math = @import("../ops/consistency_loss_math.zig");
 
 pub const Layout = enum { query_candidate, candidate_query };
 pub const Reduction = enum { global, per_query, sum };
@@ -60,6 +63,8 @@ pub const Loss = struct {
     value: f64,
     /// Derivative with respect to the input logits, in the input axis order.
     gradient: []f32,
+    /// When present, gradient already includes this scalar loss cotangent.
+    gradient_cotangent: ?f32 = null,
     work: usize,
     pub fn deinit(self: *Loss) void {
         self.allocator.free(self.gradient);
@@ -77,7 +82,11 @@ pub fn Owned(comptime T: type) type {
         }
     };
 }
+pub const GradientPrecision = enum { reference_f64, tensor_f32 };
 pub const BinaryOptions = struct {
+    gradient_precision: GradientPrecision = .reference_f64,
+    gradient_backend: ?elementwise_math.Backend = null,
+    cotangent: ?f32 = null,
     reduction: Reduction = .global,
     negative_weight: f64 = 1,
     /// Upstream global reduction does not apply this mask. Its caller must
@@ -115,6 +124,16 @@ fn sigmoid(x: f64) f64 {
         break :blk e / (1 + e);
     };
 }
+fn sigmoidF32(x: f32) f32 {
+    return 1 / (1 + @exp(-x));
+}
+fn bceGradientF32(x: f32, y: f32) f32 {
+    // The source model's logits and BCE backward are FP32. In particular,
+    // sigmoid(17) rounds to one BEFORE subtracting a positive target. Doing
+    // that subtraction in FP64 invents a small gradient which Adam can amplify.
+    const p = sigmoidF32(x);
+    return p - y;
+}
 fn bce(x: f64, y: f64) f64 {
     return @max(x, 0) - x * y + std.math.log1p(@exp(-@abs(x)));
 }
@@ -150,6 +169,17 @@ const ReductionPlan = struct {
                 0,
         };
     }
+    fn cotangent(self: ReductionPlan, options: BinaryOptions, row: usize) f32 {
+        const seed = options.cotangent orelse 1;
+        return switch (options.reduction) {
+            .global => seed / @as(f32, @floatFromInt(@max(self.total, 1))),
+            .sum => if (activeQuery(options.query_mask, row)) seed else 0,
+            .per_query => if (activeQuery(options.query_mask, row) and self.counts[row] > 0)
+                (seed / @as(f32, @floatFromInt(@max(self.active, 1)))) / @as(f32, @floatFromInt(self.counts[row]))
+            else
+                0,
+        };
+    }
 };
 fn reductionPlan(a: Allocator, shape: Shape, targets: []const f32, valid: []const bool, options: BinaryOptions, work: *Work) !ReductionPlan {
     const counts = try a.alloc(usize, try multiply(shape.batch, shape.queries));
@@ -172,6 +202,10 @@ fn reductionPlan(a: Allocator, shape: Shape, targets: []const f32, valid: []cons
     return .{ .allocator = a, .counts = counts, .active = active, .total = total };
 }
 fn binary(a: Allocator, logits: Tensor, targets: []const f32, valid: []const bool, options: BinaryOptions, focal: ?FocalOptions) !Loss {
+    if (options.gradient_backend != null and options.gradient_precision != .tensor_f32) return error.InvalidBoundaryTrainingOptions;
+    if (options.cotangent) |seed| {
+        if (options.gradient_backend == null or !std.math.isFinite(seed)) return error.InvalidBoundaryTrainingOptions;
+    }
     var work = Work{ .limits = options.limits };
     try work.check();
     const n = try validateTensor(logits, options.limits);
@@ -206,7 +240,7 @@ fn binary(a: Allocator, logits: Tensor, targets: []const f32, valid: []const boo
             try finite(x);
             try probability(y);
             if (scale == 0) continue;
-            const p = sigmoid(x);
+            const p: f64 = if (options.gradient_precision == .tensor_f32) sigmoidF32(logits.values[i]) else sigmoid(x);
             if (focal) |settings| {
                 const gp = settings.gamma_positive;
                 const gn = settings.gamma_negative;
@@ -220,17 +254,89 @@ fn binary(a: Allocator, logits: Tensor, targets: []const f32, valid: []const boo
                 const negative_derivative = (if (1 - p + settings.clip <= 1 and negative >= 1e-8) -neg_power / negative else 0) +
                     (if (gn == 0) 0 else log_negative * gn * std.math.pow(f64, p, gn - 1));
                 loss -= scale * (y * log_positive * pos_power + (1 - y) * log_negative * neg_power * options.negative_weight);
-                gradient[i] = try scalar32(-scale * (y * positive_derivative + (1 - y) * options.negative_weight * negative_derivative) * p * (1 - p));
+                if (options.gradient_backend == null) gradient[i] = try scalar32(-scale * (y * positive_derivative + (1 - y) * options.negative_weight * negative_derivative) * p * (1 - p));
             } else {
                 const weight: f64 = if (y > 0.5) 1 else options.negative_weight;
                 loss += scale * weight * bce(x, y);
-                gradient[i] = try scalar32(scale * weight * (p - y));
+                const residual: f64 = if (options.gradient_precision == .tensor_f32) bceGradientF32(logits.values[i], targets[i]) else p - y;
+                if (options.gradient_backend == null) gradient[i] = try scalar32(scale * weight * residual);
             }
         }
     };
     try finite(loss);
     try work.check();
-    return .{ .allocator = a, .value = loss, .gradient = gradient, .work = work.steps };
+    if (options.gradient_backend) |backend| {
+        const extra = std.math.mul(usize, n, 64) catch return error.BoundaryTrainingLimitExceeded;
+        if (extra > options.limits.max_work -| work.steps) return error.BoundaryTrainingLimitExceeded;
+        work.steps += extra;
+        @memset(gradient, 0);
+        for (0..logits.shape.batch) |b| for (0..logits.shape.queries) |q| {
+            try work.check();
+            const seed = plan.cotangent(options, b * logits.shape.queries + q);
+            for (0..logits.shape.candidates) |c| {
+                const i = logits.shape.index(b, q, c);
+                if (keepAt(valid, targets, options.hard_negative_mask, i)) gradient[i] = seed;
+            }
+        };
+        var settings = elementwise_math.Settings{ .negative_weight = try scalar32(options.negative_weight) };
+        if (focal) |f| settings = .{
+            .kind = .asymmetric_focal,
+            .gamma_positive = try scalar32(f.gamma_positive),
+            .gamma_negative = try scalar32(f.gamma_negative),
+            .clip = try scalar32(f.clip),
+            .negative_weight = settings.negative_weight,
+            .positive_backward_power = try scalar32(f.gamma_positive - 1),
+            .negative_backward_power = try scalar32(f.gamma_negative - 1),
+        };
+        const request = elementwise_math.Request{ .logits = logits.values, .targets = targets, .cotangents = gradient, .settings = settings, .max_elements = options.limits.max_elements, .control = options.limits.control };
+        try request.validate();
+        if (n != 0) try backend.apply(backend.ptr, &request);
+        for (gradient) |value| try finite(value);
+        try work.check();
+    }
+    return .{ .allocator = a, .value = loss, .gradient = gradient, .gradient_cotangent = options.cotangent, .work = work.steps };
+}
+
+test "binary backend preserves masking seeded reductions and work admission" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn apply(ctx: *anyopaque, request: *const elementwise_math.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try request.validate();
+            self.calls += 1;
+            for (request.targets, request.cotangents) |target, *seed|
+                seed.* = if (seed.* == 0) 0 else seed.* * (0.5 - target);
+        }
+    };
+    const a = std.testing.allocator;
+    var probe = Probe{};
+    const backend = elementwise_math.Backend{ .ptr = &probe, .apply = Probe.apply };
+    const logits = [_]f32{ 0, 0, std.math.nan(f32), 0, 0, 0, 0, 0, 0 };
+    const targets = [_]f32{ 0, 1, std.math.nan(f32), 0, 0, 0, 0, 0, 0 };
+    const valid = [_]bool{ true, true, false, true, false, false, true, true, true };
+    const tensor_ = Tensor{ .shape = .{ .batch = 1, .queries = 3, .candidates = 3 }, .values = &logits };
+    var options = BinaryOptions{ .gradient_precision = .tensor_f32, .gradient_backend = backend, .cotangent = 3, .reduction = .per_query, .query_mask = &.{ true, true, false } };
+    var per_query = try balancedBce(a, tensor_, &targets, &valid, options);
+    defer per_query.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 0.375, -0.375, 0, 0.75, 0, 0, 0, 0, 0 }, per_query.gradient);
+    try std.testing.expectEqual(@as(?f32, 3), per_query.gradient_cotangent);
+    options.limits.max_work = per_query.work - 1;
+    probe.calls = 0;
+    try std.testing.expectError(error.BoundaryTrainingLimitExceeded, balancedBce(a, tensor_, &targets, &valid, options));
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    options.limits.max_work = per_query.work;
+    var exact = try balancedBce(a, tensor_, &targets, &valid, options);
+    defer exact.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    options.limits = .{};
+    options.reduction = .global;
+    var global = try balancedBce(a, tensor_, &targets, &valid, options);
+    defer global.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, -0.25, 0, 0.25, 0, 0, 0.25, 0.25, 0.25 }, global.gradient);
+    options.reduction = .sum;
+    var sum = try balancedBce(a, tensor_, &targets, &valid, options);
+    defer sum.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 1.5, -1.5, 0, 1.5, 0, 0, 0, 0, 0 }, sum.gradient);
 }
 pub fn balancedBce(a: Allocator, logits: Tensor, targets: []const f32, valid: []const bool, options: BinaryOptions) !Loss {
     return binary(a, logits, targets, valid, options, null);
@@ -270,6 +376,26 @@ pub fn insideConsistency(a: Allocator, logits: Tensor, targets: []const f32, tex
 /// Proposal and reranker gold-mass objective. Invalid candidates retain the
 /// upstream finite -1e4 sentinel in logsumexp, and have exactly zero gradient.
 pub fn listwise(a: Allocator, logits: Tensor, gold: []const bool, valid: []const bool, query_mask: []const bool, limits: Limits) !Loss {
+    return listwiseWithPrecision(a, logits, gold, valid, query_mask, limits, .reference_f64);
+}
+pub fn listwiseWithPrecision(a: Allocator, logits: Tensor, gold: []const bool, valid: []const bool, query_mask: []const bool, limits: Limits, precision: GradientPrecision) !Loss {
+    return listwiseWithBackend(a, logits, gold, valid, query_mask, limits, precision, .{});
+}
+pub const ListwiseOptions = struct {
+    backend: ?listwise_math.Backend = null,
+    cotangent: ?f32 = null,
+    reduce_queries: bool = false,
+};
+pub fn listwiseWithBackend(a: Allocator, logits: Tensor, gold: []const bool, valid: []const bool, query_mask: []const bool, limits: Limits, precision: GradientPrecision, options: ListwiseOptions) !Loss {
+    if (options.backend == null and (options.cotangent != null or options.reduce_queries)) return error.InvalidBoundaryTrainingOptions;
+    if (options.backend != null and precision != .tensor_f32) return error.InvalidBoundaryTrainingOptions;
+    if (options.cotangent) |seed| if (!std.math.isFinite(seed)) return error.InvalidBoundaryTrainingOptions;
+    return switch (precision) {
+        .reference_f64 => listwiseImpl(f64, a, logits, gold, valid, query_mask, limits, options),
+        .tensor_f32 => listwiseImpl(f32, a, logits, gold, valid, query_mask, limits, options),
+    };
+}
+fn listwiseImpl(comptime F: type, a: Allocator, logits: Tensor, gold: []const bool, valid: []const bool, query_mask: []const bool, limits: Limits, options: ListwiseOptions) !Loss {
     var work = Work{ .limits = limits };
     try work.check();
     const n = try validateTensor(logits, limits);
@@ -288,47 +414,86 @@ pub fn listwise(a: Allocator, logits: Tensor, gold: []const bool, valid: []const
         }
         if (has_gold and query_mask[b * logits.shape.queries + q]) active += 1;
     };
-    const gradient = try a.alloc(f32, n);
+    const rows = try multiply(logits.shape.batch, logits.shape.queries);
+    const gradient = try a.alloc(f32, if (options.reduce_queries) try multiply(logits.shape.batch, logits.shape.candidates) else n);
     errdefer a.free(gradient);
     @memset(gradient, 0);
+    const maxima = try a.alloc(f32, if (options.backend != null) try multiply(rows, 2) else 0);
+    defer a.free(maxima);
+    @memset(maxima, 0);
+    const seeds = try a.alloc(f32, if (options.backend != null) rows else 0);
+    defer a.free(seeds);
+    @memset(seeds, 0);
+    const masks = try a.alloc(i32, if (options.backend != null) n else 0);
+    defer a.free(masks);
+    if (options.backend != null) for (valid, gold, masks) |v, g, *mask| {
+        try work.tick();
+        mask.* = @as(i32, @intFromBool(v)) + 2 * @as(i32, @intFromBool(g));
+    };
     var value: f64 = 0;
     for (0..logits.shape.batch) |b| for (0..logits.shape.queries) |q| {
         try work.tick();
         if (!query_mask[b * logits.shape.queries + q]) continue;
         var has_gold = false;
-        var max_all: f64 = -std.math.inf(f64);
-        var max_gold: f64 = -std.math.inf(f64);
+        var max_all: F = -std.math.inf(F);
+        var max_gold: F = -std.math.inf(F);
         for (0..logits.shape.candidates) |c| {
             try work.tick();
             const i = logits.shape.index(b, q, c);
-            const x: f64 = if (valid[i]) logits.values[i] else -1e4;
+            const x: F = if (valid[i]) logits.values[i] else -1e4;
             max_all = @max(max_all, x);
             max_gold = @max(max_gold, if (gold[i]) x else -1e4);
             has_gold = has_gold or gold[i];
         }
         if (!has_gold) continue;
-        var sum_all: f64 = 0;
-        var sum_gold: f64 = 0;
+        var sum_all: F = 0;
+        var sum_gold: F = 0;
         for (0..logits.shape.candidates) |c| {
             try work.tick();
             const i = logits.shape.index(b, q, c);
-            const x: f64 = if (valid[i]) logits.values[i] else -1e4;
+            const x: F = if (valid[i]) logits.values[i] else -1e4;
             sum_all += @exp(x - max_all);
             sum_gold += @exp((if (gold[i]) x else -1e4) - max_gold);
         }
-        const divisor: f64 = @floatFromInt(@max(active, 1));
-        value += ((max_all + @log(sum_all)) - (max_gold + @log(sum_gold))) / divisor;
+        if (options.backend != null) {
+            const row = b * logits.shape.queries + q;
+            maxima[row] = @floatCast(max_all);
+            maxima[rows + row] = @floatCast(max_gold);
+            seeds[row] = (options.cotangent orelse 1) / @as(f32, @floatFromInt(@max(active, 1)));
+        }
+        const divisor: F = @floatFromInt(@max(active, 1));
+        const all_lse = max_all + @log(sum_all);
+        const gold_lse = max_gold + @log(sum_gold);
+        value += (all_lse - gold_lse) / divisor;
         for (0..logits.shape.candidates) |c| {
             try work.tick();
             const i = logits.shape.index(b, q, c);
-            if (!valid[i]) continue;
-            const x: f64 = logits.values[i];
-            gradient[i] = try scalar32((@exp(x - max_all) / sum_all - (if (gold[i]) @exp(x - max_gold) / sum_gold else 0)) / divisor);
+            if (!valid[i] or options.backend != null) continue;
+            const x: F = logits.values[i];
+            // Torch's logsumexp backward uses its rounded forward result.
+            // Normalizing in FP64 creates residuals at saturated gold logits
+            // that are exactly zero in FP32 and can be amplified by Adam.
+            gradient[i] = if (F == f32)
+                (@exp(x - all_lse) / divisor) - (if (gold[i]) @exp(x - gold_lse) / divisor else 0)
+            else
+                try scalar32((@exp(x - max_all) / sum_all - (if (gold[i]) @exp(x - max_gold) / sum_gold else 0)) / divisor);
         }
     };
     try finite(value);
     try work.check();
-    return .{ .allocator = a, .value = value, .gradient = gradient, .work = work.steps };
+    if (options.backend) |backend| {
+        // Account for canonicalization, two exponentials/reductions, the VJP
+        // and optional query reduction before dispatching any device work.
+        const extra = try multiply(n, 128);
+        if (extra > limits.max_work -| work.steps) return error.BoundaryTrainingLimitExceeded;
+        work.steps += extra;
+        const request = listwise_math.Request{ .logits = logits.values, .masks = masks, .maxima = maxima, .seeds = seeds, .gradient = gradient, .batch = logits.shape.batch, .queries = logits.shape.queries, .candidates = logits.shape.candidates, .candidate_major = logits.shape.layout == .candidate_query, .reduce_queries = options.reduce_queries, .max_elements = limits.max_elements, .control = limits.control };
+        try request.validate();
+        try backend.apply(backend.ptr, &request);
+        for (gradient) |g| try finite(g);
+        try work.check();
+    }
+    return .{ .allocator = a, .value = value, .gradient = gradient, .work = work.steps, .gradient_cotangent = if (options.backend != null) options.cotangent orelse 1 else null };
 }
 
 pub const MentionMask = struct { batch: usize, queries: usize, capacity: usize, values: []const bool };
@@ -336,11 +501,26 @@ pub const QueryObjective = enum { abstention, poisson_count };
 /// Query-level objectives normalized over active queries. Count is Poisson
 /// NLL with log_input=true/full=false; no factorial constant is added.
 pub fn queryLoss(a: Allocator, logits: []const f32, mentions: MentionMask, query_mask: []const bool, objective: QueryObjective, limits: Limits) !Loss {
+    return queryLossWithPrecision(a, logits, mentions, query_mask, objective, limits, .reference_f64);
+}
+pub fn queryLossWithPrecision(a: Allocator, logits: []const f32, mentions: MentionMask, query_mask: []const bool, objective: QueryObjective, limits: Limits, precision: GradientPrecision) !Loss {
+    return queryLossWithBackend(a, logits, mentions, query_mask, objective, limits, precision, .{});
+}
+pub const QueryOptions = struct {
+    backend: ?elementwise_math.Backend = null,
+    cotangent: ?f32 = null,
+};
+pub fn queryLossWithBackend(a: Allocator, logits: []const f32, mentions: MentionMask, query_mask: []const bool, objective: QueryObjective, limits: Limits, precision: GradientPrecision, options: QueryOptions) !Loss {
+    if (options.backend != null and precision != .tensor_f32) return error.InvalidBoundaryTrainingOptions;
+    if (options.cotangent) |seed| {
+        if (options.backend == null or !std.math.isFinite(seed)) return error.InvalidBoundaryTrainingOptions;
+    }
     var work = Work{ .limits = limits };
     try work.check();
     const shape = Shape{ .batch = mentions.batch, .queries = mentions.queries, .candidates = mentions.capacity };
     const n = try shape.count(limits);
     const rows = try multiply(mentions.batch, mentions.queries);
+    if (rows > limits.max_elements) return error.BoundaryTrainingLimitExceeded;
     if (mentions.values.len != n or logits.len != rows or query_mask.len != rows) return error.InvalidBoundaryTrainingShape;
     if (limits.max_work == 0) return error.BoundaryTrainingLimitExceeded;
     var active: usize = 0;
@@ -352,6 +532,10 @@ pub fn queryLoss(a: Allocator, logits: []const f32, mentions: MentionMask, query
     const gradient = try a.alloc(f32, rows);
     errdefer a.free(gradient);
     @memset(gradient, 0);
+    const targets = if (options.backend != null) try a.alloc(f32, rows) else null;
+    defer if (targets) |values| a.free(values);
+    if (targets) |values| @memset(values, 0);
+    const seed = (options.cotangent orelse 1) / @as(f32, @floatFromInt(@max(active, 1)));
     var value: f64 = 0;
     for (query_mask, logits, 0..) |valid, x32, row| {
         try work.tick();
@@ -367,19 +551,73 @@ pub fn queryLoss(a: Allocator, logits: []const f32, mentions: MentionMask, query
             .abstention => {
                 const target: f64 = if (count == 0) 1 else 0;
                 value += scale * bce(x, target);
-                gradient[row] = try scalar32(scale * (sigmoid(x) - target));
+                if (targets) |values| {
+                    values[row] = @floatCast(target);
+                    gradient[row] = seed;
+                } else {
+                    const residual: f64 = if (precision == .tensor_f32) bceGradientF32(x32, @floatCast(target)) else sigmoid(x) - target;
+                    gradient[row] = try scalar32(scale * residual);
+                }
             },
             .poisson_count => {
                 const target: f64 = @floatFromInt(count);
                 const rate = @exp(x);
                 value += scale * (rate - target * x);
-                gradient[row] = try scalar32(scale * (rate - target));
+                if (targets) |values| {
+                    values[row] = @floatFromInt(count);
+                    gradient[row] = seed;
+                } else gradient[row] = if (precision == .tensor_f32)
+                    @as(f32, @floatCast(scale)) * (@exp(x32) - @as(f32, @floatFromInt(count)))
+                else
+                    try scalar32(scale * (rate - target));
+                try finite(gradient[row]);
             },
         }
     }
     try finite(value);
     try work.check();
-    return .{ .allocator = a, .value = value, .gradient = gradient, .work = work.steps };
+    if (options.backend) |backend| {
+        const extra = std.math.mul(usize, rows, 64) catch return error.BoundaryTrainingLimitExceeded;
+        if (extra > limits.max_work -| work.steps) return error.BoundaryTrainingLimitExceeded;
+        work.steps += extra;
+        const request = elementwise_math.Request{ .logits = logits, .targets = targets.?, .cotangents = gradient, .settings = .{ .kind = if (objective == .abstention) .bce else .poisson_count }, .max_elements = limits.max_elements, .control = limits.control };
+        try request.validate();
+        if (rows != 0) try backend.apply(backend.ptr, &request);
+        for (gradient) |g| try finite(g);
+        try work.check();
+    }
+    return .{ .allocator = a, .value = value, .gradient = gradient, .work = work.steps, .gradient_cotangent = if (options.backend != null) options.cotangent orelse 1 else null };
+}
+
+test "query loss backend preserves targets masking seeded reductions and admission" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn apply(raw: *anyopaque, request: *const elementwise_math.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try request.validate();
+            try std.testing.expectEqualSlices(f32, &.{ 1.5, 1.5, 0 }, request.cotangents);
+            const is_count = request.settings.kind == .poisson_count;
+            try std.testing.expectEqualSlices(f32, if (is_count) &.{ 0, 2, 0 } else &.{ 1, 0, 0 }, request.targets);
+            for (request.targets, request.cotangents) |target, *seed|
+                seed.* = if (seed.* == 0) 0 else seed.* * ((if (is_count) @as(f32, 1) else 0.5) - target);
+        }
+    };
+    var probe = Probe{};
+    const options = QueryOptions{ .backend = .{ .ptr = &probe, .apply = Probe.apply }, .cotangent = 3 };
+    const mentions = MentionMask{ .batch = 1, .queries = 3, .capacity = 2, .values = &.{ false, false, true, true, true, true } };
+    for ([_]QueryObjective{ .abstention, .poisson_count }) |objective| {
+        var result = try queryLossWithBackend(std.testing.allocator, &.{ 0, 0, std.math.nan(f32) }, mentions, &.{ true, true, false }, objective, .{}, .tensor_f32, options);
+        defer result.deinit();
+        try std.testing.expectEqualSlices(f32, if (objective == .abstention) &.{ -0.75, 0.75, 0 } else &.{ 1.5, -1.5, 0 }, result.gradient);
+        try std.testing.expectEqual(@as(?f32, 3), result.gradient_cotangent);
+        const before = probe.calls;
+        try std.testing.expectError(error.BoundaryTrainingLimitExceeded, queryLossWithBackend(std.testing.allocator, &.{ 0, 0, 0 }, mentions, &.{ true, true, false }, objective, .{ .max_work = result.work - 1 }, .tensor_f32, options));
+        try std.testing.expectEqual(before, probe.calls);
+    }
+    try std.testing.expectError(error.InvalidBoundaryTrainingOptions, queryLossWithBackend(std.testing.allocator, &.{ 0, 0, 0 }, mentions, &.{ true, true, false }, .abstention, .{}, .reference_f64, options));
+    try std.testing.expectError(error.InvalidBoundaryTrainingOptions, queryLossWithBackend(std.testing.allocator, &.{ 0, 0, 0 }, mentions, &.{ true, true, false }, .abstention, .{}, .tensor_f32, .{ .cotangent = 1 }));
+    try std.testing.expectError(error.BoundaryTrainingLimitExceeded, queryLossWithBackend(std.testing.allocator, &.{ 0, 0, 0 }, .{ .batch = 1, .queries = 3, .capacity = 0, .values = &.{} }, &.{ true, true, false }, .abstention, .{ .max_elements = 2 }, .tensor_f32, options));
 }
 
 pub const HardNegativeOptions = struct {
@@ -536,6 +774,7 @@ pub const ConsistencyLoss = struct {
     arena: std.heap.ArenaAllocator,
     value: f64,
     pair_gradient: []f32,
+    gradient_cotangent: ?f32 = null,
     start_gradient: []f32,
     end_gradient: []f32,
     work: usize,
@@ -547,6 +786,16 @@ pub const ConsistencyLoss = struct {
 /// Noisy-OR boundary consistency. Gradients flow through both pair and
 /// marginal logits; the discrete candidate boundary indices are detached.
 pub fn marginalConsistency(a: Allocator, pairs: Tensor, spans: []const Span, valid: []const bool, starts: Tensor, ends: []const f32, boundary_keep: []const bool, limits: Limits) !ConsistencyLoss {
+    return marginalConsistencyWithBackend(a, pairs, spans, valid, starts, ends, boundary_keep, limits, .{});
+}
+pub const ConsistencyOptions = struct {
+    backend: ?consistency_math.Backend = null,
+    cotangent: ?f32 = null,
+};
+pub fn marginalConsistencyWithBackend(a: Allocator, pairs: Tensor, spans: []const Span, valid: []const bool, starts: Tensor, ends: []const f32, boundary_keep: []const bool, limits: Limits, options: ConsistencyOptions) !ConsistencyLoss {
+    if ((options.backend != null) != (options.cotangent != null)) return error.InvalidBoundaryTrainingCotangent;
+    if (options.cotangent) |seed| if (!std.math.isFinite(seed) or seed < 0) return error.InvalidBoundaryTrainingCotangent;
+    if (options.backend != null and pairs.shape.layout != .query_candidate) return error.InvalidBoundaryTrainingShape;
     var work = Work{ .limits = limits };
     try work.check();
     const count = try validateTensor(pairs, limits);
@@ -637,7 +886,52 @@ pub fn marginalConsistency(a: Allocator, pairs: Tensor, spans: []const Span, val
     };
     try finite(value);
     try work.check();
-    return .{ .arena = arena, .value = value, .pair_gradient = pair_gradient, .start_gradient = start_gradient, .end_gradient = end_gradient, .work = work.steps };
+    if (options.backend) |backend| {
+        if (count != 0) {
+            const admitted = try consistency_math.Plan.upper(count, boundary_count);
+            if (admitted.work > limits.max_work -| work.steps) return error.BoundaryTrainingLimitExceeded;
+            work.steps += admitted.work;
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const temp = scratch.allocator();
+            const masks = try temp.alloc(i32, count);
+            const indices = [2][]i32{ try temp.alloc(i32, count), try temp.alloc(i32, count) };
+            const keeps = [2][]i32{ try temp.alloc(i32, boundary_count), try temp.alloc(i32, boundary_count) };
+            for (0..count) |i| {
+                if (i % 4096 == 0) try work.check();
+                masks[i] = @intFromBool(valid[i]);
+                const base = (i / pairs.shape.candidates) * starts.shape.candidates;
+                indices[0][i] = @intCast(base + @as(usize, @intCast(std.math.clamp(spans[i].start, 0, @as(i64, @intCast(starts.shape.candidates - 1))))));
+                indices[1][i] = @intCast(base + @as(usize, @intCast(std.math.clamp(spans[i].end, 0, @as(i64, @intCast(starts.shape.candidates - 1))))));
+            }
+            for (0..boundary_count) |i| {
+                keeps[0][i] = @intFromBool(boundary_keep[i] and reached_start[i]);
+                keeps[1][i] = @intFromBool(boundary_keep[i] and reached_end[i]);
+            }
+            var start_groups = try consistency_math.grouping.build(a, indices[0], boundary_count, .{}, limits.control);
+            defer start_groups.deinit();
+            var end_groups = try consistency_math.grouping.build(a, indices[1], boundary_count, .{}, limits.control);
+            defer end_groups.deinit();
+            const request = consistency_math.Request{
+                .pairs = pairs.values,
+                .margins = .{ starts.values, ends },
+                .valid = masks,
+                .indices = .{ indices[0], indices[1] },
+                .keep = .{ keeps[0], keeps[1] },
+                .groups = .{ start_groups, end_groups },
+                .counts = .{ start_count, end_count },
+                .weight = options.cotangent.?,
+                .gradients = .{ pair_gradient, start_gradient, end_gradient },
+                .max_elements = limits.max_elements,
+                .control = limits.control,
+            };
+            try request.validate();
+            try backend.apply(backend.ptr, &request);
+            for (request.gradients) |values| for (values) |v| try finite(v);
+            try work.check();
+        }
+    }
+    return .{ .arena = arena, .value = value, .pair_gradient = pair_gradient, .gradient_cotangent = options.cotangent, .start_gradient = start_gradient, .end_gradient = end_gradient, .work = work.steps };
 }
 
 pub const DenseTargets = struct {
@@ -794,4 +1088,148 @@ fn allocationLifecycle(a: Allocator) !void {
 }
 test "boundary training all kernels release allocations on every failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
+}
+
+test "CUDA boundary Poisson count backward rounds the rate before subtracting the target" {
+    const mentions = MentionMask{ .batch = 1, .queries = 1, .capacity = 2, .values = &.{ true, true } };
+    // exp(float32(log(2))) is exactly 2 in Torch FP32, while evaluating that
+    // same stored logit in FP64 leaves a nonzero residual.
+    const logits = [_]f32{0.6931471824645996};
+    var cuda = try queryLossWithPrecision(std.testing.allocator, &logits, mentions, &.{true}, .poisson_count, .{}, .tensor_f32);
+    defer cuda.deinit();
+    try std.testing.expectEqual(@as(f32, 0), cuda.gradient[0]);
+    var reference = try queryLoss(std.testing.allocator, &logits, mentions, &.{true}, .poisson_count, .{});
+    defer reference.deinit();
+    try std.testing.expect(reference.gradient[0] > 0);
+    try std.testing.expectError(error.NonFiniteBoundaryTraining, queryLossWithPrecision(std.testing.allocator, &.{100}, mentions, &.{true}, .poisson_count, .{}, .tensor_f32));
+}
+
+test "CUDA boundary listwise backward uses rounded FP32 logsumexp" {
+    // Pinned Fastino proposal_listwise_loss, Torch 2.9.1+cu128 on CUDA.
+    // The second row also catches computing normalized probabilities instead
+    // of exp(logit - rounded_logsumexp), even with FP32 intermediates.
+    const inputs = [_][3]f32{ .{ 20, 0, -20 }, .{ 12, -1, 0 }, .{ 1, 2, 3 }, .{ 80, 79, -80 } };
+    const expected = [_][3]f32{
+        .{ 0, 2.061153470123145e-9, 4.24835413113866e-18 },
+        .{ -8.58306884765625e-6, 2.2603101115237223e-6, 6.14415966992965e-6 },
+        .{ -0.9099694490432739, 0.2447284460067749, 0.6652408838272095 },
+        .{ -0.26894235610961914, 0.26894110441207886, 0 },
+    };
+    for (inputs, expected) |values, gradients| {
+        var result = try listwiseWithPrecision(std.testing.allocator, .{ .shape = .{ .batch = 1, .queries = 1, .candidates = 3 }, .values = &values }, &.{ true, false, false }, &.{ true, true, true }, &.{true}, .{}, .tensor_f32);
+        defer result.deinit();
+        for (result.gradient, gradients) |actual, reference| {
+            if (reference == 0) try std.testing.expectEqual(@as(f32, 0), actual) else try std.testing.expectApproxEqRel(reference, actual, 3e-7);
+        }
+    }
+    var reference = try listwise(std.testing.allocator, .{ .shape = .{ .batch = 1, .queries = 1, .candidates = 3 }, .values = &inputs[0] }, &.{ true, false, false }, &.{ true, true, true }, &.{true}, .{});
+    defer reference.deinit();
+    try std.testing.expect(reference.gradient[0] < 0); // CPU/Metal contract retained.
+
+    const batched_logits = [_]f32{ 12, -1, 0, 1, 2, 3, 80, 79, -80, 5, 1, 0 };
+    const batched_expected = [_]f32{ -2.86102294921875e-6, 7.534367227890471e-7, 2.0480533748923335e-6, -0.3033231496810913, 0.0815761536359787, 0.22174696624279022, -0.08964745700359344, 0.08964703977108002, 0, 0, 0, 0 };
+    var batched = try listwiseWithPrecision(std.testing.allocator, .{ .shape = .{ .batch = 1, .queries = 4, .candidates = 3 }, .values = &batched_logits }, &.{ true, false, false, true, false, false, true, false, false, true, false, false }, &@as([12]bool, @splat(true)), &.{ true, true, true, false }, .{}, .tensor_f32);
+    defer batched.deinit();
+    for (batched.gradient, batched_expected) |actual, expected_value| {
+        if (expected_value == 0) try std.testing.expectEqual(@as(f32, 0), actual) else try std.testing.expectApproxEqRel(expected_value, actual, 3e-7);
+    }
+}
+
+test "CUDA boundary BCE gradients round sigmoid before subtraction like pinned Torch FP32" {
+    // torch 2.9.1+cu128, CUDA L4, binary_cross_entropy_with_logits(...,
+    // reduction="sum").backward(), FP32 inputs, 2026-09-15.
+    const logits = [_]f32{ -100, -20, -2, 0, 2, 17, 20 };
+    const labels = [_]f32{ 0, 0, 1, 0, 0, 1, 1 };
+    const expected = [_]f32{ 0, 2.061153470123145e-9, -0.8807970881462097, 0.5, 0.8807970285415649, 0, 0 };
+    const valid = [_]bool{true} ** logits.len;
+    const tensor = Tensor{ .shape = .{ .batch = 1, .queries = 1, .candidates = logits.len }, .values = &logits };
+    var result = try balancedBce(std.testing.allocator, tensor, &labels, &valid, .{ .reduction = .sum, .gradient_precision = .tensor_f32 });
+    defer result.deinit();
+    for (expected, result.gradient) |want, actual| {
+        if (want == 0) try std.testing.expectEqual(want, actual) else try std.testing.expectApproxEqRel(want, actual, 2e-7);
+    }
+    // Preserve the existing CPU/Metal reference contract unless the caller
+    // explicitly selects tensor-precision BCE cotangents.
+    var reference = try balancedBce(std.testing.allocator, tensor, &labels, &valid, .{ .reduction = .sum });
+    defer reference.deinit();
+    try std.testing.expect(reference.gradient[5] < 0);
+    var abstention = try queryLossWithPrecision(std.testing.allocator, &.{17}, .{ .batch = 1, .queries = 1, .capacity = 1, .values = &.{false} }, &.{true}, .abstention, .{}, .tensor_f32);
+    defer abstention.deinit();
+    try std.testing.expectEqual(@as(f32, 0), abstention.gradient[0]);
+    var focal = try asymmetricFocal(std.testing.allocator, .{ .shape = .{ .batch = 1, .queries = 1, .candidates = 1 }, .values = &.{17} }, &.{1}, &.{true}, .{ .binary = .{ .gradient_precision = .tensor_f32 } });
+    defer focal.deinit();
+    try std.testing.expectEqual(@as(f32, 0), focal.gradient[0]);
+}
+
+test "listwise backend preserves masks cotangents and work admission" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn apply(ctx: *anyopaque, request: *const listwise_math.Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            try request.validate();
+            try std.testing.expectEqualSlices(f32, &.{ 0.75, 0.75, 0 }, request.seeds);
+            try std.testing.expectEqualSlices(i32, &.{ 3, 1, 3, 0, 3, 1 }, request.masks);
+            @memset(request.gradient, 0);
+            // Closed-form logits zero: first active row has p=(1/2,1/2),
+            // target=(1,0); the singleton second row contributes zero.
+            request.gradient[0] = -0.375;
+            request.gradient[1] = 0.375;
+        }
+    };
+    var probe = Probe{};
+    const a = std.testing.allocator;
+    const logits = Tensor{ .shape = .{ .batch = 1, .queries = 3, .candidates = 2 }, .values = &.{ 0, 0, 0, std.math.nan(f32), 0, 0 } };
+    const gold = &.{ true, false, true, false, true, false };
+    const valid = &.{ true, true, true, false, true, true };
+    const qm = &.{ true, true, false };
+    var options = ListwiseOptions{ .backend = .{ .ptr = &probe, .apply = Probe.apply }, .cotangent = 1.5 };
+    var loss = try listwiseWithBackend(a, logits, gold, valid, qm, .{}, .tensor_f32, options);
+    defer loss.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ -0.375, 0.375, 0, 0, 0, 0 }, loss.gradient);
+    try std.testing.expectEqual(@as(?f32, 1.5), loss.gradient_cotangent);
+    probe.calls = 0;
+    try std.testing.expectError(error.BoundaryTrainingLimitExceeded, listwiseWithBackend(a, logits, gold, valid, qm, .{ .max_work = loss.work - 1 }, .tensor_f32, options));
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    var exact = try listwiseWithBackend(a, logits, gold, valid, qm, .{ .max_work = loss.work }, .tensor_f32, options);
+    defer exact.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    options.reduce_queries = true;
+    var shared = try listwiseWithBackend(a, logits, gold, valid, qm, .{}, .tensor_f32, options);
+    defer shared.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ -0.375, 0.375 }, shared.gradient);
+    options.backend = null;
+    try std.testing.expectError(error.InvalidBoundaryTrainingOptions, listwiseWithBackend(a, logits, gold, valid, qm, .{}, .tensor_f32, options));
+}
+
+test "consistency backend preserves masked indices weighted cotangents and work admission" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn apply(raw: *anyopaque, request: *const consistency_math.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try request.validate();
+            try std.testing.expectEqualSlices(i32, &.{ 0, 0, 0 }, request.indices[0]);
+            try std.testing.expectEqualSlices(i32, &.{ 1, 2, 2 }, request.indices[1]);
+            try std.testing.expectEqual(@as(usize, 3), request.groups[0].order.len);
+            try std.testing.expectEqual([2]usize{ 1, 1 }, request.counts);
+            for (request.gradients) |values| @memset(values, request.weight);
+        }
+    };
+    var probe = Probe{};
+    const a = std.testing.allocator;
+    const pairs = Tensor{ .shape = .{ .batch = 1, .queries = 1, .candidates = 3 }, .values = &.{ 0.3, std.math.nan(f32), -0.1 } };
+    const spans = [_]Span{ .{ .start = 0, .end = 1 }, .{ .start = -9, .end = 99 }, .{ .start = 0, .end = 2 } };
+    const starts = Tensor{ .shape = pairs.shape, .values = &.{ 0, std.math.nan(f32), 1 } };
+    const ends = [_]f32{ 0, std.math.nan(f32), 1 };
+    const valid = [_]bool{ true, false, true };
+    const keep = [_]bool{ true, false, true };
+    const options = ConsistencyOptions{ .backend = .{ .ptr = &probe, .apply = Probe.apply }, .cotangent = 0.125 };
+    var result = try marginalConsistencyWithBackend(a, pairs, &spans, &valid, starts, &ends, &keep, .{}, options);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(?f32, 0.125), result.gradient_cotangent);
+    try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.125, 0.125 }, result.pair_gradient);
+    try std.testing.expectError(error.BoundaryTrainingLimitExceeded, marginalConsistencyWithBackend(a, pairs, &spans, &valid, starts, &ends, &keep, .{ .max_work = result.work - 1 }, options));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectError(error.InvalidBoundaryTrainingCotangent, marginalConsistencyWithBackend(a, pairs, &spans, &valid, starts, &ends, &keep, .{}, .{ .backend = options.backend }));
 }
