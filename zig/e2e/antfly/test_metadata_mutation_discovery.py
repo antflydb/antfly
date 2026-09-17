@@ -29,25 +29,31 @@ def stalled_metadata_status(monkeypatch):
     stopped = threading.Event()
     observed = threading.Event()
     enabled = threading.Event()
-    upstream = [None]
+    fault_lock = threading.Lock()
+    proxies = []
+    threads = []
 
     class Proxy(BaseHTTPRequestHandler):
         def forward(self):
-            if (
-                enabled.is_set()
-                and self.command == "GET"
-                and self.path == "/metadata/v1/status"
-            ):
-                observed.set()
+            with fault_lock:
+                stall = (
+                    enabled.is_set()
+                    and not observed.is_set()
+                    and self.command == "GET"
+                    and self.path == "/metadata/v1/status"
+                )
+                if stall:
+                    observed.set()
+            if stall:
                 # Keep the request pending beyond the complete mutation budget.
-                # Every direct metadata node address also remains reachable.
+                # All other status routes continue forwarding normally.
                 stopped.wait(30.0)
                 self.close_connection = True
                 return
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             with requests.request(
                 self.command,
-                upstream[0] + self.path,
+                self.server.upstream + self.path,
                 data=body,
                 headers={
                     key: value
@@ -78,23 +84,25 @@ def stalled_metadata_status(monkeypatch):
         def log_message(self, *args):
             pass
 
-    proxy = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
-    proxy.daemon_threads = False
-    thread = threading.Thread(target=proxy.serve_forever, daemon=True)
-    thread.start()
     original_command = backups.ThreeByThreeBackupCluster._data_command
 
     def command_with_stalled_status(cluster, index):
         command = original_command(cluster, index)
         if index != 0:
             return command
-        # Keep every direct node address reachable even if leadership changes.
-        # The first address is an alternate route with a stalled status handler.
-        upstream[0] = cluster.metadata_admin_urls[0]
-        endpoints = [
-            f"http://127.0.0.1:{proxy.server_port}",
-            *cluster.metadata_admin_urls,
-        ]
+        # Wrap every configured route so leader affinity cannot bypass the
+        # fault. Stall exactly the first status request after activation;
+        # discovery must use another healthy route within the mutation budget.
+        endpoints = []
+        for upstream in cluster.metadata_admin_urls:
+            proxy = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+            proxy.upstream = upstream
+            proxy.daemon_threads = False
+            thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+            thread.start()
+            proxies.append(proxy)
+            threads.append(thread)
+            endpoints.append(f"http://127.0.0.1:{proxy.server_port}")
         command = command[: command.index("--metadata-api")]
         for url in endpoints:
             command.extend(["--metadata-api", url])
@@ -107,9 +115,11 @@ def stalled_metadata_status(monkeypatch):
         yield enabled, observed
     finally:
         stopped.set()
-        proxy.shutdown()
-        proxy.server_close()
-        thread.join()
+        for proxy in proxies:
+            proxy.shutdown()
+            proxy.server_close()
+        for thread in threads:
+            thread.join()
 
 
 @pytest.fixture

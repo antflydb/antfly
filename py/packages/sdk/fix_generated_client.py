@@ -10,6 +10,7 @@ from pathlib import Path
 FILES = {
     Path("api/query_operations/global_query.py"): 5,
     Path("api/query_operations/query_table.py"): 5,
+    Path("api/query_operations/query_namespace_table.py"): 5,
 }
 # The public HTTP operations intentionally expose the stateful compatibility
 # envelope, while the SDK's primary QueryRequest model remains canonical.

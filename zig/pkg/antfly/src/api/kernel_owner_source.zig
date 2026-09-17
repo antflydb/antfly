@@ -128,6 +128,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         indexes_json: []u8,
         table_storage: ?@import("../common/table_storage.zig").Settings = null,
         owner: client.Owner,
+        // Exact descriptor/target proof, owned by this physical generation.
+        // Shared repair steps may reuse it until a structural follow-up is due.
+        repair_target: ?[]u8 = null,
+        repair_configuration: ?abi.ReconcileResult = null,
         active_users: usize = 0,
         /// Foreground admission or durable background debt owns residency.
         /// Status and maintenance leases only borrow it until their release.
@@ -151,6 +155,14 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         fn owner(self: *Lease) *client.Owner {
             return &self.entry.owner;
+        }
+
+        fn downgrade(self: *Lease) void {
+            lock(&self.source.mutex);
+            defer self.source.mutex.unlock();
+            std.debug.assert(self.active and self.exclusive and self.entry.active_users == 1);
+            self.entry.exclusive_active = false;
+            self.exclusive = false;
         }
 
         fn retireAfterConfigurationFailure(self: *Lease) void {
@@ -397,6 +409,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .text_memory_attribution_stats_best_effort = textMemoryAttributionStatsBestEffort,
                 .preflight_write_admission_group_local = preflightWriteAdmissionGroupLocal,
                 .prepare_ha_seed_snapshot_group_local = prepareHASeedSnapshotGroupLocal,
+                .capture_ha_seed_snapshot_group_local = captureHASeedSnapshotGroupLocal,
                 .find_median_key_group_local = findMedianKeyGroupLocal,
                 .reconcile_table_group_local = reconcileTableGroupLocal,
                 .reconcile_table_group_local_transient = reconcileTableGroupLocalTransient,
@@ -750,6 +763,16 @@ pub const ProvisionedKernelOwnerSource = struct {
         return {};
     }
 
+    fn captureHASeedSnapshotGroupLocal(ptr: *anyopaque, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        // Preparation opened the owner before the exclusive HA freeze. Never
+        // resolve catalog metadata or open a competing owner inside that freeze.
+        var lease = (try self.acquireIfPresent(group_id, table_name)) orelse return error.StorageKernelOwnerUnavailable;
+        defer lease.deinit();
+        try lease.owner().captureHASeedSnapshot(table_name, token, destination);
+        return {};
+    }
+
     fn prepareHASeedSnapshotGroupLocal(
         ptr: *anyopaque,
         group_id: u64,
@@ -757,7 +780,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         deadline_ns: u64,
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var lease = (try self.acquireIfPresent(group_id, table_name)) orelse return {};
+        var lease = self.acquire(group_id, table_name) catch |err| {
+            std.log.warn("HA seed owner acquisition failed group_id={d} err={s}", .{ group_id, @errorName(err) });
+            return err;
+        };
         defer lease.deinit();
         try lease.owner().prepareHASeedSnapshot(table_name, deadline_ns);
         return {};
@@ -1277,6 +1303,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .repair_repaired = result.repair_repaired,
             .repair_remaining = result.repair_remaining,
             .repair_terminal = result.repair_terminal,
+            .repair_paused = result.repair_paused,
             .repair_busy = result.repair_busy,
             .repair_disk_waits = result.repair_disk_waits,
             .next_retry_at_ms = result.next_retry_at_ms,
@@ -1304,6 +1331,40 @@ pub const ProvisionedKernelOwnerSource = struct {
         return localStructuralReconcileResult(result);
     }
 
+    const RepairControlsBridge = struct {
+        options: db_types.ArtifactRepairRunOptions,
+        deadline_ns: u64 = 0,
+
+        fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            return @intFromBool(self.options.cancelled());
+        }
+        fn yieldRequested(ptr: ?*anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            return @intFromBool(if (self.options.yield_check) |check| check.requested() else platform_time.monotonicNs() >= self.deadline_ns);
+        }
+        fn activationAllowed(ptr: ?*anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            return @intFromBool(if (self.options.activation_check) |check| check.current() catch false else true);
+        }
+        fn wire(self: *@This()) abi.RepairControls {
+            self.deadline_ns = platform_time.monotonicNs() +| 50 * std.time.ns_per_ms;
+            return .{
+                .context = self,
+                .cancelled = cancelled,
+                .yield_requested = yieldRequested,
+                .activation_allowed = activationAllowed,
+                .owner_epoch = self.options.owner_epoch,
+                .capacity_domain_lo = @truncate(self.options.capacity_domain_id),
+                .capacity_domain_hi = @truncate(self.options.capacity_domain_id >> 64),
+                .estimated_candidate_bytes = self.options.estimated_candidate_bytes,
+                .max_activation_gap_sequences = self.options.max_activation_gap_sequences,
+                .max_convergence_rounds = self.options.max_convergence_rounds,
+                .max_activation_pause_ms = self.options.max_activation_pause_ms,
+            };
+        }
+    };
+
     fn reconcileTableGroupLocalObserved(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -1311,32 +1372,71 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         target_index_name: ?[]const u8,
         advance_index_repair: bool,
+        repair_options: db_types.ArtifactRepairRunOptions,
         retain_cold_owner: bool,
     ) !?table_write_source.LocalStructuralReconcileObservation {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
+        if (repair_options.cancelled()) return error.Canceled;
+        if (repair_options.yield_check) |check| if (check.requested()) return .{ .result = .{ .state = .busy } };
+        var descriptor = try self.loadDescriptorWithDeadline(self.alloc, group_id, table_name, repair_options.admission_deadline_ns);
         defer descriptor.deinit(self.alloc);
-        var lease = (try self.acquireDescriptorForReconcile(
+        if (repair_options.cancelled()) return error.Canceled;
+        if (repair_options.yield_check) |check| if (check.requested()) return .{ .result = .{ .state = .busy } };
+        const configured = if (advance_index_repair)
+            self.tryAcquireConfiguredRepair(group_id, table_name, descriptor.view(), target_index_name)
+        else
+            null;
+        var lease = if (configured) |ready| ready.lease else (try self.acquireDescriptorForReconcile(
             group_id,
             table_name,
             descriptor.path,
             descriptor.view(),
-            retain_cold_owner or advance_index_repair,
+            // Only an explicit structural caller may install writer preference.
+            // A scheduled repair returns busy immediately behind live leases.
+            retain_cold_owner,
             if (retain_cold_owner) .resident else .transient,
         )) orelse return .{ .result = .{ .state = .busy } };
         defer lease.deinit();
         errdefer lease.requestTransientRetirement();
 
-        const result = lease.owner().reconcile(
+        var result = if (configured) |ready| ready.result else lease.owner().reconcile(
             table_name,
             descriptor.schema_json,
             descriptor.indexes_json,
             target_index_name,
-            advance_index_repair,
+            false,
         ) catch |err| {
             lease.retireAfterConfigurationFailure();
             return err;
         };
+        if (advance_index_repair and result.restore_repair_pending == 0) {
+            if (configured == null) {
+                const owned_target = if (target_index_name) |target| try self.alloc.dupe(u8, target) else null;
+                lock(&self.mutex);
+                if (lease.entry.repair_target) |old| self.alloc.free(old);
+                lease.entry.repair_target = owned_target;
+                lease.entry.repair_configuration = result;
+                self.mutex.unlock();
+            }
+            if (lease.exclusive) lease.downgrade();
+            var controls = RepairControlsBridge{ .options = repair_options };
+            const repair = try lease.owner().repairIndex(table_name, target_index_name, controls.wire());
+            const added = result.indexes_added;
+            const removed = result.indexes_removed;
+            const pending = result.indexes_pending;
+            result = repair;
+            result.indexes_added = added;
+            result.indexes_removed = removed;
+            result.indexes_pending = pending;
+            if (repair.state == .complete and pending != 0) {
+                // Admission may have left cleanup/activation debt. Verify it
+                // under a new nonblocking structural lease on the next pass.
+                lock(&self.mutex);
+                lease.entry.repair_configuration = null;
+                self.mutex.unlock();
+                result.state = .busy;
+            }
+        }
         var response = lease.owner().runtimeStatusJson(table_name) catch |err| switch (err) {
             // Runtime status is deliberately best effort and returns busy
             // rather than waiting behind a concurrent Raft apply writer. The
@@ -1385,6 +1485,25 @@ pub const ProvisionedKernelOwnerSource = struct {
             .result = localStructuralReconcileResult(result),
             .runtime_status = observed,
         };
+    }
+
+    const ConfiguredRepair = struct { lease: Lease, result: abi.ReconcileResult };
+
+    fn tryAcquireConfiguredRepair(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor, target: ?[]const u8) ?ConfiguredRepair {
+        if (!self.mutex.tryLock()) return null;
+        defer self.mutex.unlock();
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (entry.closing or entry.retired or entry.generation != descriptor.lsm_root_generation or
+                !entry.identity.eql(descriptor.identity) or !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
+                !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or !std.meta.eql(entry.table_storage, descriptor.table_storage)) return null;
+            const result = entry.repair_configuration orelse return null;
+            if ((target == null) != (entry.repair_target == null)) return null;
+            if (target) |name| if (!std.mem.eql(u8, entry.repair_target.?, name)) return null;
+            if (!tryReserveEntryLeaseLocked(entry, .shared)) return null;
+            return .{ .lease = .{ .source = self, .entry = entry }, .result = result };
+        }
+        return null;
     }
 
     fn runtimeStatusNeedsResidentOwner(status: runtime_status.LocalTableRuntimeStatus) bool {
@@ -1470,6 +1589,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.alloc.free(entry.table_name);
         self.alloc.free(entry.schema_json);
         self.alloc.free(entry.indexes_json);
+        if (entry.repair_target) |target| self.alloc.free(target);
         self.alloc.destroy(entry);
     }
 
@@ -1710,12 +1830,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !LoadedDescriptor {
+        return self.loadDescriptorWithDeadline(alloc, group_id, table_name, null);
+    }
+
+    fn loadDescriptorWithDeadline(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        deadline_ns: ?u64,
+    ) !LoadedDescriptor {
         var projection = (try table_catalog.tableGroupDescriptorProjection(
             alloc,
             self.catalog,
             table_name,
             group_id,
-            null,
+            deadline_ns,
         )) orelse return error.TableNotFound;
         errdefer projection.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
@@ -2384,19 +2514,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .execution_deadline_ns = req.execution_deadline_ns,
             .cancellation_ctx = if (cancellation != null) @ptrCast(&cancellation.?) else null,
             .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
-            .execution = .{
-                .enabled = 1,
-                .include_stored = @intFromBool(req.include_stored),
-                .return_mode = switch (req.return_mode) {
-                    .parent => .parent,
-                    .chunk => .chunk,
-                    .parent_with_chunks => .parent_with_chunks,
-                    .unit => .unit,
-                    .unit_with_chunks => .unit_with_chunks,
-                    .member => .member,
-                },
-                .max_chunks_per_parent = req.max_chunks_per_parent,
-            },
+            .execution = @import("../storage/local_query_controls.zig").executionOptions(req),
         });
         errdefer response.deinit();
         try table_reads.checkQueryDeadline(req);
@@ -4237,6 +4355,68 @@ test "transient storage owner retirement drains borrowers and permits foreground
         try std.testing.expectEqual(@as(usize, 1), source.ownerCountForTest());
         try std.testing.expectEqual(@as(u64, if (history == .foreground_adoption or history == .prepared_adoption) 1 else 2), misses);
     }
+}
+
+test "storage repair lease downgrade admits readers while fencing configuration" {
+    const Source = ProvisionedKernelOwnerSource;
+    var source: Source = undefined;
+    source.mutex = .unlocked;
+    var entry: Source.Entry = undefined;
+    entry.active_users = 1;
+    entry.exclusive_active = true;
+    entry.exclusive_pending = false;
+    var lease = Source.Lease{ .source = &source, .entry = &entry, .exclusive = true };
+    try std.testing.expect(!Source.tryReserveEntryLeaseLocked(&entry, .shared));
+    lease.downgrade();
+    try std.testing.expect(!lease.exclusive);
+    try std.testing.expect(Source.tryReserveEntryLeaseLocked(&entry, .shared));
+    try std.testing.expectEqual(@as(usize, 2), entry.active_users);
+    try std.testing.expect(!Source.tryReserveEntryLeaseLocked(&entry, .exclusive));
+}
+
+test "scheduled repair admission yields to readers and reuses exact configured generation" {
+    const Source = ProvisionedKernelOwnerSource;
+    var source = Source.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    var entry: Source.Entry = .{
+        .group_id = 1,
+        .table_name = @constCast("docs"),
+        .generation = 7,
+        .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .schema_json = @constCast("schema"),
+        .indexes_json = @constCast("indexes"),
+        .owner = undefined,
+        .active_users = 1,
+        .resident = true,
+    };
+    try source.entries.append(std.testing.allocator, &entry);
+    const descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = 7,
+        .identity = entry.identity,
+        .schema_json = entry.schema_json,
+        .indexes_json = entry.indexes_json,
+    };
+    try std.testing.expect((try source.acquireDescriptorForReconcile(1, "docs", "/unused", descriptor, false, .transient)) == null);
+    try std.testing.expect(!entry.exclusive_pending);
+    try std.testing.expect(Source.tryReserveEntryLeaseLocked(&entry, .shared));
+    entry.active_users -= 1;
+    entry.repair_target = @constCast("text");
+    entry.repair_configuration = .{ .state = .busy, .repair_remaining = 1 };
+    var repair = source.tryAcquireConfiguredRepair(1, "docs", descriptor, "text").?;
+    try std.testing.expect(!repair.lease.exclusive);
+    try std.testing.expectEqual(@as(usize, 2), entry.active_users);
+    repair.lease.deinit();
+    try std.testing.expect(source.tryAcquireConfiguredRepair(1, "docs", descriptor, "other") == null);
+    var changed = descriptor;
+    changed.schema_json = "new schema";
+    try std.testing.expect(source.tryAcquireConfiguredRepair(1, "docs", changed, "text") == null);
+    entry.repair_target = null;
+    var ordinary = source.tryAcquireConfiguredRepair(1, "docs", descriptor, null).?;
+    try std.testing.expect(!ordinary.lease.exclusive);
+    ordinary.lease.deinit();
+    changed = descriptor;
+    changed.lsm_root_generation += 1;
+    try std.testing.expect(source.tryAcquireConfiguredRepair(1, "docs", changed, null) == null);
 }
 
 // The fake clock controls only the publication wait. Owners below use the real

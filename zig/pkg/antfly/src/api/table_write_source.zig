@@ -50,6 +50,7 @@ pub const LocalStructuralReconcileResult = struct {
     repair_repaired: u64 = 0,
     repair_remaining: u64 = 0,
     repair_terminal: u64 = 0,
+    repair_paused: u64 = 0,
     repair_busy: u64 = 0,
     repair_disk_waits: u64 = 0,
     next_retry_at_ms: u64 = 0,
@@ -450,6 +451,7 @@ pub const TableWriteSource = struct {
             group_id: u64,
             table_name: []const u8,
         ) anyerror!?void = null,
+        capture_ha_seed_snapshot_group_local: ?*const fn (ptr: *anyopaque, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) anyerror!?void = null,
         prepare_ha_seed_snapshot_group_local: ?*const fn (
             ptr: *anyopaque,
             group_id: u64,
@@ -559,6 +561,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             target_index_name: ?[]const u8,
             advance_index_repair: bool,
+            repair_options: db_mod.types.ArtifactRepairRunOptions,
             retain_cold_owner: bool,
         ) anyerror!?LocalStructuralReconcileObservation = null,
         local_runtime_status_group_local: ?*const fn (
@@ -1383,6 +1386,11 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("preflight_write_admission_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name });
     }
 
+    pub fn captureHASeedSnapshotGroupLocal(self: TableWriteSource, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) !?void {
+        const fn_ptr = self.vtable.capture_ha_seed_snapshot_group_local orelse return null;
+        return try BoundaryAbi.call("capture_ha_seed_snapshot_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, token, destination });
+    }
+
     pub fn prepareHASeedSnapshotGroupLocal(
         self: TableWriteSource,
         group_id: u64,
@@ -1450,6 +1458,7 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         target_index_name: ?[]const u8,
         advance_index_repair: bool,
+        repair_options: db_mod.types.ArtifactRepairRunOptions,
         retain_cold_owner: bool,
     ) !?LocalStructuralReconcileObservation {
         const fn_ptr = self.vtable.reconcile_table_group_local_observed orelse return null;
@@ -1460,6 +1469,7 @@ pub const TableWriteSource = struct {
             table_name,
             target_index_name,
             advance_index_repair,
+            repair_options,
             retain_cold_owner,
         });
     }
@@ -1582,12 +1592,26 @@ fn consumerTests() type {
                 source.commitBatchWithCancellation(std.testing.allocator, &.{}, .enrichments, db_mod.types.CancellationToken.fromAtomic(&canceled)),
             );
             try std.testing.expectEqual(@as(usize, 2), fake.calls);
-            fake.failure = error.StorageBusy;
-            try std.testing.expectError(
+            // Exercise the foreign dispatcher used by production archives:
+            // admission failures retain their exact public classification,
+            // while an ambiguous proposal must never become retryable.
+            inline for (.{
                 error.StorageBusy,
-                source.commitBatchWithCancellation(std.testing.allocator, &.{}, .write, db_mod.types.CancellationToken.fromAtomic(&canceled)),
-            );
-            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+                error.CatalogRoutingSnapshotTimeout,
+                error.CatalogRoutingUnavailable,
+                error.CatalogProjectionRefreshRequired,
+                error.RaftBatchWriteOutcomeUnknown,
+                error.CommitDecisionUnknown,
+            }) |failure| {
+                fake.failure = failure;
+                try std.testing.expectError(failure, source.commitBatchWithCancellation(
+                    std.testing.allocator,
+                    &.{},
+                    .write,
+                    .none,
+                ));
+            }
+            fake.failure = error.EnrichmentWorkerFailed;
             canceled.store(true, .release);
             try std.testing.expectError(
                 error.EnrichmentWaitCanceled,

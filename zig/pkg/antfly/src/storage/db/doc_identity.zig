@@ -459,6 +459,19 @@ pub fn reassignNamespaceAlloc(
     store: *docstore_mod.DocStore,
     namespace: Namespace,
 ) !void {
+    return reassignNamespaceWithMetadataAlloc(alloc, store, namespace, &.{});
+}
+
+pub const NamespaceMetadataUpdate = struct { key: []const u8, value: []const u8 };
+
+/// Identity-bound owner metadata must move in the same transaction as the
+/// namespace and canonical mappings, including across crash/reopen.
+pub fn reassignNamespaceWithMetadataAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    namespace: Namespace,
+    metadata: []const NamespaceMetadataUpdate,
+) !void {
     try validateStoreAlloc(alloc, store);
 
     var ordinal_rows = OrdinalDocRows{};
@@ -479,6 +492,7 @@ pub fn reassignNamespaceAlloc(
         try writeCanonicalOrdinalMappingTxn(&txn, state.canonical_doc_id, row.ordinal);
     }
 
+    for (metadata) |update| try txn.put(update.key, update.value);
     try txn.commit();
     try validateStoreAlloc(alloc, store);
 }

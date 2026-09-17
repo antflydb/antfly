@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 55;
+pub const abi_version: u32 = 60;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -249,7 +249,7 @@ pub const LocalQueryReturnMode = enum(u32) {
     member = 5,
 };
 
-/// Scalar execution details that are not losslessly represented by the
+/// Request-local execution details that are not losslessly represented by the
 /// existing public/distributed JSON envelope. They are applied only when
 /// `enabled` is set, after parsing and before DB execution.
 pub const LocalQueryExecutionOptions = extern struct {
@@ -258,6 +258,9 @@ pub const LocalQueryExecutionOptions = extern struct {
     _reserved0: [2]u8 = @splat(0),
     return_mode: LocalQueryReturnMode = .parent,
     max_chunks_per_parent: u32 = 0,
+    /// Presentation only; never used for storage lookup or authorization.
+    /// Borrowed through this synchronous call and response serialization.
+    response_table_name: BorrowedBytes = .{},
 };
 
 /// One complete local query against a DB owned by the storage archive. The DB
@@ -460,7 +463,7 @@ pub const MetadataApplyPrepareSnapshotRequest = extern struct {
 };
 
 pub const MetadataProjectionKind = enum(u32) {
-    latest_batch = 0,
+    latest_checkpoint = 0,
     metadata_incarnation = 1,
     split_transitions = 2,
     placement_intents = 3,
@@ -503,11 +506,12 @@ pub const MetadataProjectionKind = enum(u32) {
     table_create_generation = 37,
     table_restore_admission = 38,
     verify_table_create_projection = 39,
+    system_catalog = 41,
 };
 
 pub const MetadataProjectionRequest = extern struct {
     version: u32 = abi_version,
-    kind: MetadataProjectionKind = .latest_batch,
+    kind: MetadataProjectionKind = .latest_checkpoint,
     group_id: u64 = 0,
     arg0: u64 = 0,
     arg1: u64 = 0,
@@ -531,6 +535,12 @@ pub const MetadataProjectionSignalKind = enum(u32) {
 };
 
 pub const MetadataProjectionSignal = extern struct {
+    store_reports_changed: u8 = 1,
+    store_runtime_changed: u8 = 1,
+    has_store_group_ids: u8 = 0,
+    _report_reserved: u8 = 0,
+    store_group_ids: ?[*]const u64 = null,
+    store_group_ids_len: usize = 0,
     kind: MetadataProjectionSignalKind = .table,
     _reserved0: u32 = 0,
     metadata_group_id: u64 = 0,
@@ -1071,11 +1081,29 @@ pub const ReconcileState = enum(u32) {
 pub const ReconcileRequest = extern struct {
     version: u32 = abi_version,
     advance_index_repair: u8 = 0,
-    _reserved0: [3]u8 = .{ 0, 0, 0 },
+    repair_only: u8 = 0,
+    _reserved0: [2]u8 = .{ 0, 0 },
     table_name: BorrowedBytes = .{},
     schema_json: BorrowedBytes = .{},
     indexes_json: BorrowedBytes = .{},
     target_index_name: BorrowedBytes = .{},
+    repair_controls: RepairControls = .{},
+};
+
+/// Borrowed for one synchronous repair call. Callback state is never retained
+/// by the physical owner; durable progress belongs to the repair intent.
+pub const RepairControls = extern struct {
+    context: ?*anyopaque = null,
+    cancelled: ?CancellationCheckFn = null,
+    yield_requested: ?CancellationCheckFn = null,
+    activation_allowed: ?CancellationCheckFn = null,
+    owner_epoch: u64 = 0,
+    capacity_domain_lo: u64 = 0,
+    capacity_domain_hi: u64 = 0,
+    estimated_candidate_bytes: u64 = 0,
+    max_activation_gap_sequences: u64 = 200,
+    max_convergence_rounds: u32 = 32,
+    max_activation_pause_ms: u64 = 250,
 };
 
 pub const ReconcileResult = extern struct {
@@ -1089,6 +1117,7 @@ pub const ReconcileResult = extern struct {
     repair_repaired: u64 = 0,
     repair_remaining: u64 = 0,
     repair_terminal: u64 = 0,
+    repair_paused: u64 = 0,
     repair_busy: u64 = 0,
     repair_disk_waits: u64 = 0,
     next_retry_at_ms: u64 = 0,
@@ -1114,6 +1143,7 @@ pub const MaintenanceAction = enum(u32) {
     prepare_ha_seed_snapshot = 5,
     publish_dense_checkpoints = 6,
     vector_block_idle = 7,
+    capture_ha_seed_snapshot = 8,
 };
 
 pub const MaintenanceRequest = extern struct {
@@ -1121,6 +1151,8 @@ pub const MaintenanceRequest = extern struct {
     action: u32 = @intFromEnum(MaintenanceAction.inspect),
     table_name: BorrowedBytes = .{},
     deadline_ns: u64 = 0,
+    snapshot_token: BorrowedBytes = .{},
+    destination_root: BorrowedBytes = .{},
 };
 
 pub const MaintenanceResult = extern struct {
@@ -1427,6 +1459,8 @@ pub extern fn antfly_storage_system_current_scan_abort(txn: ?*anyopaque) callcon
 pub extern fn antfly_storage_system_write_get(txn: ?*anyopaque, key: BorrowedBytes, out_value: *BorrowedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_system_write_put(txn: ?*anyopaque, key: BorrowedBytes, value: BorrowedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_system_write_delete(txn: ?*anyopaque, key: BorrowedBytes) callconv(.c) Status;
+/// Cursor borrows the write transaction and must close before commit or abort.
+pub extern fn antfly_storage_system_write_open_cursor(txn: ?*anyopaque, out_cursor: *?*anyopaque) callconv(.c) Status;
 pub extern fn antfly_storage_system_write_commit(txn: ?*anyopaque) callconv(.c) Status;
 pub extern fn antfly_storage_system_write_abort(txn: ?*anyopaque) callconv(.c) void;
 pub extern fn antfly_storage_system_cursor_move(

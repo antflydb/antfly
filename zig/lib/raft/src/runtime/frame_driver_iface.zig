@@ -21,6 +21,24 @@ pub const SendFrameRequest = struct {
     peer_id: u64,
     endpoint: transport_iface.PeerEndpoint,
     frame: codec_iface.EncodedFrame,
+    group_ids: []const u64 = &.{},
+    attempt: u32 = 1,
+};
+
+/// Failed asynchronous delivery transfers ownership back to the transport.
+/// The driver must include completions in its retained-byte budget until polled.
+pub const FailedFrame = struct {
+    alloc: std.mem.Allocator,
+    source_id: ?u64,
+    peer_id: u64,
+    frame: codec_iface.EncodedFrame,
+    attempt: u32,
+
+    pub fn deinit(self: *FailedFrame) void {
+        self.alloc.free(self.frame.bytes);
+        self.alloc.free(self.frame.media_type);
+        self.* = undefined;
+    }
 };
 
 pub const FrameDriver = struct {
@@ -29,10 +47,20 @@ pub const FrameDriver = struct {
 
     pub const VTable = struct {
         send_frame: *const fn (ptr: *anyopaque, req: SendFrameRequest) anyerror!void,
+        poll_failed_frame: ?*const fn (ptr: *anyopaque) ?FailedFrame = null,
+        invalidate_route: ?*const fn (ptr: *anyopaque, group_id: u64, peer_id: u64) void = null,
     };
 
     pub fn sendFrame(self: FrameDriver, req: SendFrameRequest) !void {
         return try self.vtable.send_frame(self.ptr, req);
+    }
+
+    pub fn pollFailedFrame(self: FrameDriver) ?FailedFrame {
+        return if (self.vtable.poll_failed_frame) |poll| poll(self.ptr) else null;
+    }
+
+    pub fn invalidateRoute(self: FrameDriver, group_id: u64, peer_id: u64) void {
+        if (self.vtable.invalidate_route) |invalidate| invalidate(self.ptr, group_id, peer_id);
     }
 };
 

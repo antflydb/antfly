@@ -169,8 +169,12 @@ zig/zig-out/bin/antfly storage migrate \
 Use the actual configured catalog and replica-root paths. The command and the
 new standalone runtime lock the same stable catalog sibling inode. Older
 running binaries do not participate in this new operator lock: stop them first.
-The command preserves unknown catalog fields and extension records. It records
-offline admission before copying; standalone refuses to start while that marker
+Public table names resolve through the system catalog to stable physical identities.
+The command publishes the selected table and epoch atomically in the standalone
+catalog row store, preserving unrelated resources, indexes, and extensions.
+Existing JSON checkpoints remain an import boundary. `--action status` inspects
+the stopped table's persisted catalog record. The command records offline
+admission before copying; standalone refuses to start while that marker
 is present. `--once` executes one bounded unit and leaves a resumable candidate;
 retry the same command and budgets to continue. `--cancel` discards only the
 unpublished candidate, persists a cancellation receipt and clears admission.

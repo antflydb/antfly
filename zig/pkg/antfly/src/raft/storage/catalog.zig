@@ -175,7 +175,19 @@ pub const BackupRestoreBootstrapRecord = struct {
     native_manifest_size_bytes: u64 = 0,
     native_manifest_sha256: []const u8 = "",
 
+    /// Destination binding travels with bootstrap so the first staged import
+    /// uses the new incarnation, before any serving DB can be opened.
+    destination_table_name: []const u8 = "",
+    destination_table_id: u64 = 0,
+    destination_shard_id: u64 = 0,
+    destination_range_id: u64 = 0,
+
     pub fn validate(self: BackupRestoreBootstrapRecord) !void {
+        if (self.destination_table_name.len > 1024 or
+            ((self.destination_table_name.len == 0) != (self.destination_table_id == 0)) or
+            ((self.destination_table_name.len == 0) != (self.destination_shard_id == 0)) or
+            ((self.destination_table_name.len == 0) != (self.destination_range_id == 0))) return error.InvalidBackupRestoreBootstrap;
+        for (self.destination_table_name) |c| if (c < 0x20 or c == 0x7f) return error.InvalidBackupRestoreBootstrap;
         if (self.backup_id.len == 0 or
             self.backup_id.len > 128 or
             self.artifact_backup_id.len == 0 or
@@ -234,6 +246,9 @@ pub const BackupRestoreBootstrapRecord = struct {
 
     pub fn clone(self: BackupRestoreBootstrapRecord, alloc: std.mem.Allocator) !BackupRestoreBootstrapRecord {
         var cloned = BackupRestoreBootstrapRecord{
+            .destination_table_id = self.destination_table_id,
+            .destination_shard_id = self.destination_shard_id,
+            .destination_range_id = self.destination_range_id,
             .backup_id = "",
             .artifact_backup_id = "",
             .location = "",
@@ -257,10 +272,13 @@ pub const BackupRestoreBootstrapRecord = struct {
         cloned.artifact_sha256 = try alloc.dupe(u8, self.artifact_sha256);
         errdefer alloc.free(cloned.artifact_sha256);
         cloned.native_manifest_sha256 = try alloc.dupe(u8, self.native_manifest_sha256);
+        errdefer alloc.free(cloned.native_manifest_sha256);
+        cloned.destination_table_name = try alloc.dupe(u8, self.destination_table_name);
         return cloned;
     }
 
     pub fn deinit(self: *BackupRestoreBootstrapRecord, alloc: std.mem.Allocator) void {
+        alloc.free(self.destination_table_name);
         alloc.free(self.backup_id);
         alloc.free(self.artifact_backup_id);
         alloc.free(self.location);
@@ -347,6 +365,10 @@ pub fn eqlReplicaRecord(left: ReplicaRecord, right: ReplicaRecord) bool {
         if (!std.mem.eql(u8, backup.artifact_sha256, other.artifact_sha256)) return false;
         if (backup.native_manifest_size_bytes != other.native_manifest_size_bytes) return false;
         if (!std.mem.eql(u8, backup.native_manifest_sha256, other.native_manifest_sha256)) return false;
+        if (!std.mem.eql(u8, backup.destination_table_name, other.destination_table_name) or
+            backup.destination_table_id != other.destination_table_id or
+            backup.destination_shard_id != other.destination_shard_id or
+            backup.destination_range_id != other.destination_range_id) return false;
     }
     return true;
 }

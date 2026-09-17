@@ -54,6 +54,7 @@ pub const kernel_owner_source = @import("kernel_owner_source.zig");
 pub const storage_maintenance_source = @import("storage_maintenance_source.zig");
 pub const distributed_candidate_source = @import("distributed_candidate_source.zig");
 pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
+pub const join_planning = @import("join_planning.zig");
 pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");

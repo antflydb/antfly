@@ -59,6 +59,7 @@ import type {
   TableArtifactEnrichmentList,
   TableQueryRequest,
   TableSchema,
+  TableStatus,
   User,
   WriteOptions,
 } from "./types.js";
@@ -434,6 +435,11 @@ export class AntflyClient {
       baseUrl: normalizeBaseUrl(config.baseUrl),
     };
     this.client = this.buildClient();
+  }
+
+  /** Typed access to every generated endpoint, including system catalog lifecycle routes. */
+  get api(): Client<paths> {
+    return this.client;
   }
 
   /**
@@ -1078,11 +1084,15 @@ export class AntflyClient {
     /**
      * List all tables
      */
-    list: async (params?: { prefix?: string; pattern?: string }) => {
-      const { data, error } = await this.client.GET("/db/v1/tables", {
+    list: async (params?: { prefix?: string; pattern?: string }): Promise<TableStatus[]> => {
+      const { data, error, response } = await this.client.GET("/db/v1/tables", {
         params: params ? { query: params } : undefined,
       });
-      if (error) throw new Error(`Failed to list tables: ${error.error}`);
+      if (error || data === undefined || (response && !response.ok)) {
+        throw new Error(
+          `Failed to list tables: ${error?.error ?? `HTTP ${response?.status ?? "unknown"} without table data`}`
+        );
+      }
       return data;
     },
 

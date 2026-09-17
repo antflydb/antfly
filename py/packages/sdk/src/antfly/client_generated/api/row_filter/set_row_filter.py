@@ -9,7 +9,7 @@ from ...client import AuthenticatedClient, Client
 from ...models.error import Error
 from ...models.row_filter_entry import RowFilterEntry
 from ...models.set_row_filter_body import SetRowFilterBody
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -17,8 +17,21 @@ def _get_kwargs(
     table: str,
     *,
     body: SetRowFilterBody,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
+
+    params: dict[str, Any] = {}
+
+    params["database"] = database
+
+    params["namespace"] = namespace
+
+    params["all_tables"] = all_tables
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "put",
@@ -26,6 +39,7 @@ def _get_kwargs(
             user_name=quote(str(user_name), safe=""),
             table=quote(str(table), safe=""),
         ),
+        "params": params,
     }
 
     _kwargs["json"] = body.to_dict()
@@ -80,6 +94,9 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: SetRowFilterBody,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> Response[Error | RowFilterEntry]:
     """Set row filter for a user on a table
 
@@ -89,6 +106,9 @@ def sync_detailed(
     Args:
         user_name (str):  Example: johndoe.
         table (str):  Example: orders.
+        database (str | Unset):
+        namespace (str | Unset):
+        all_tables (bool | Unset):
         body (SetRowFilterBody):
 
     Raises:
@@ -103,6 +123,9 @@ def sync_detailed(
         user_name=user_name,
         table=table,
         body=body,
+        database=database,
+        namespace=namespace,
+        all_tables=all_tables,
     )
 
     response = client.get_httpx_client().request(
@@ -118,6 +141,9 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: SetRowFilterBody,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> Error | RowFilterEntry | None:
     """Set row filter for a user on a table
 
@@ -127,6 +153,9 @@ def sync(
     Args:
         user_name (str):  Example: johndoe.
         table (str):  Example: orders.
+        database (str | Unset):
+        namespace (str | Unset):
+        all_tables (bool | Unset):
         body (SetRowFilterBody):
 
     Raises:
@@ -142,6 +171,9 @@ def sync(
         table=table,
         client=client,
         body=body,
+        database=database,
+        namespace=namespace,
+        all_tables=all_tables,
     ).parsed
 
 
@@ -151,6 +183,9 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: SetRowFilterBody,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> Response[Error | RowFilterEntry]:
     """Set row filter for a user on a table
 
@@ -160,6 +195,9 @@ async def asyncio_detailed(
     Args:
         user_name (str):  Example: johndoe.
         table (str):  Example: orders.
+        database (str | Unset):
+        namespace (str | Unset):
+        all_tables (bool | Unset):
         body (SetRowFilterBody):
 
     Raises:
@@ -174,6 +212,9 @@ async def asyncio_detailed(
         user_name=user_name,
         table=table,
         body=body,
+        database=database,
+        namespace=namespace,
+        all_tables=all_tables,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -187,6 +228,9 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: SetRowFilterBody,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> Error | RowFilterEntry | None:
     """Set row filter for a user on a table
 
@@ -196,6 +240,9 @@ async def asyncio(
     Args:
         user_name (str):  Example: johndoe.
         table (str):  Example: orders.
+        database (str | Unset):
+        namespace (str | Unset):
+        all_tables (bool | Unset):
         body (SetRowFilterBody):
 
     Raises:
@@ -212,5 +259,8 @@ async def asyncio(
             table=table,
             client=client,
             body=body,
+            database=database,
+            namespace=namespace,
+            all_tables=all_tables,
         )
     ).parsed

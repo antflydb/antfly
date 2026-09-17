@@ -44,7 +44,7 @@ pub const transition_driver = @import("transition_driver.zig");
 
 pub const RaftApplyStore = storage.RaftApplyStore;
 pub const RaftApplyStoreConfig = storage.RaftApplyStoreConfig;
-pub const AppliedMetadataBatch = storage.AppliedMetadataBatch;
+pub const AppliedMetadataCheckpoint = storage.AppliedMetadataCheckpoint;
 pub const TransitionCommand = storage.TransitionCommand;
 pub const encodeTransitionCommand = storage.encodeTransitionCommand;
 pub const decodeTransitionCommand = storage.decodeTransitionCommand;

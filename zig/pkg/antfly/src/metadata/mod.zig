@@ -40,7 +40,7 @@ pub const transition_driver = @import("transition_driver.zig");
 
 pub const RaftApplyStore = storage.RaftApplyStore;
 pub const RaftApplyStoreConfig = storage.RaftApplyStoreConfig;
-pub const AppliedMetadataBatch = storage.AppliedMetadataBatch;
+pub const AppliedMetadataCheckpoint = storage.AppliedMetadataCheckpoint;
 pub const TransitionCommand = storage.TransitionCommand;
 pub const encodeTransitionCommand = storage.encodeTransitionCommand;
 pub const decodeTransitionCommand = storage.decodeTransitionCommand;
@@ -163,7 +163,7 @@ test "metadata module compiles" {
     _ = transition_driver;
     _ = RaftApplyStore;
     _ = RaftApplyStoreConfig;
-    _ = AppliedMetadataBatch;
+    _ = AppliedMetadataCheckpoint;
     _ = TransitionCommand;
     _ = encodeTransitionCommand;
     _ = decodeTransitionCommand;

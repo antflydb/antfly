@@ -4060,3 +4060,15 @@ func baseStandaloneCluster() *AntflyCluster {
 		},
 	}
 }
+
+func TestLazyHAActivationRejectsSynchronousPolicy(t *testing.T) {
+	for _, mode := range []HADurabilityMode{HADurabilityModeRemoteWrite, HADurabilityModeRemoteApply} {
+		cluster := &AntflyCluster{Spec: AntflyClusterSpec{HighAvailability: &HighAvailabilitySpec{
+			Mode: HAModeHotStandby, ActivationPolicy: "OnFirstTable", SyncPolicy: &HASyncPolicy{Mode: mode},
+		}}}
+		err := cluster.validateHighAvailabilitySpec()
+		if err == nil || !strings.Contains(err.Error(), "requires Async durability") {
+			t.Fatalf("mode %s: expected synchronous bootstrap validation, got %v", mode, err)
+		}
+	}
+}

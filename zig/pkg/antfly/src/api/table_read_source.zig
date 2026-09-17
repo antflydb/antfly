@@ -107,6 +107,16 @@ pub const ParsedTextStatsHttpResponse = union(enum) {
         self.* = undefined;
     }
 };
+/// Request-owned immutable topology plus a read adapter bound to that topology.
+pub const JoinReadView = struct {
+    session: @import("table_catalog.zig").RoutingSession,
+    source: TableReadSource,
+    destroy: *const fn (*JoinReadView) void,
+    pub fn deinit(self: *JoinReadView) void {
+        self.destroy(self);
+    }
+};
+
 pub const TableReadSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -117,6 +127,8 @@ pub const TableReadSource = struct {
     route_fence: ?metadata_api.CatalogRouteFence = null,
 
     pub const VTable = struct {
+        acquire_join_view: ?*const fn (*anyopaque, std.mem.Allocator, @import("table_router.zig").RouteBudget) anyerror!*JoinReadView = null,
+
         lookup: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -445,6 +457,11 @@ pub const TableReadSource = struct {
         ) void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn acquireJoinView(self: TableReadSource, alloc: std.mem.Allocator, budget: @import("table_router.zig").RouteBudget) !?*JoinReadView {
+        const acquire = self.vtable.acquire_join_view orelse return null;
+        return try BoundaryAbi.call("acquire_join_view", self.boundary_dispatch, acquire, .{ self.ptr, alloc, budget });
+    }
 
     pub fn bindCatalogRouteFenceJson(
         self: *TableReadSource,

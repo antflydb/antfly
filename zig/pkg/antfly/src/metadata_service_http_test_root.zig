@@ -30,3 +30,8 @@ test {
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_physical.zig");
+
+test "system catalog bounded transfer and outbox discovery" {
+    _ = @import("metadata/snapshot_transfer.zig");
+    _ = @import("metadata/store_report_update.zig");
+}

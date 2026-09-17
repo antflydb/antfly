@@ -1149,7 +1149,11 @@ test "virtual http network models route reset burst and queue capacity faults" {
 test "virtual http network bounds queued HTTP delivery and recovers its drain owner" {
     const vopr = @import("vopr");
     const io_http = @import("../common/http/io_http_executor.zig");
-    const alloc = std.testing.allocator;
+    // Native stack unwinding cannot cross VoprIo's switched fiber stacks.
+    // Retain allocation/leak checking without collecting those stack traces.
+    var checked_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer std.debug.assert(checked_allocator.deinit() == .ok);
+    const alloc = checked_allocator.allocator();
     var runtime = try vopr.vopr_io.VoprIo.init(.{});
     defer runtime.deinit();
     const io = runtime.io();
