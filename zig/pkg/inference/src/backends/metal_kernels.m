@@ -1219,6 +1219,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> gemma4_audio_flatten_pipeline;
     id<MTLComputePipelineState> gemma4_audio_channel_norm_pipeline;
     id<MTLComputePipelineState> gemma4_audio_attention_pipeline;
+    id<MTLComputePipelineState> gemma4_audio_attention_tg_pipeline;
     id<MTLComputePipelineState> add_pipeline;
     id<MTLComputePipelineState> add_scale_pipeline;
     id<MTLComputePipelineState> scaled_add_scale_pipeline;
@@ -9658,6 +9659,73 @@ static NSString *termite_metal_shader_source(void) {
            "        }\n"
            "        output[out_base + d] = acc;\n"
            "    }\n"
+           "}\n"
+           // Threadgroup-per-(row, head) variant: one thread per head dim. The
+           // per-key dot products reduce across the simdgroups, thread 0 runs
+           // the softmax over the (at most 64) keys in threadgroup memory, and
+           // every thread then accumulates its own output dim. Same math as
+           // the per-thread kernel, ~head_dim times the parallelism.
+           "kernel void termite_gemma4_audio_local_attention_tg(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *rel [[buffer(3)]], device const float *q_scales [[buffer(4)]], device const float *valid [[buffer(5)]], device float *output [[buffer(6)]], constant termite_metal_gemma4_audio_attention_params &p [[buffer(7)]], uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint sg_count [[simdgroups_per_threadgroup]]) {\n"
+           "    threadgroup float scores[64];\n"
+           "    threadgroup float partial[32];\n"
+           "    uint head = tgid.x; uint q_idx = tgid.y;\n"
+           "    if (head >= p.heads || q_idx >= p.rows || tid >= p.head_dim) return;\n"
+           "    uint head_base = head * p.head_dim;\n"
+           "    uint out_base = q_idx * p.hidden + head_base;\n"
+           "    bool row_valid = valid[q_idx] != 0.0f && p.context <= 64u && sg_count <= 32u;\n"
+           "    if (!row_valid) { output[out_base + tid] = 0.0f; return; }\n"
+           "    uint block_start = (q_idx / p.chunk) * p.chunk;\n"
+           "    uint q_off = q_idx - block_start;\n"
+           "    int past = (int)p.context_left - 1;\n"
+           "    float qv = q[q_idx * p.hidden + head_base + tid] * q_scales[tid];\n"
+           "    for (uint c = 0u; c < p.context; ++c) {\n"
+           "        int rel_idx = (int)c - (int)q_off;\n"
+           "        int k_idx = (int)(block_start + c) - past;\n"
+           "        bool ok = rel_idx >= 0 && rel_idx < (int)p.context_left && k_idx >= 0 && k_idx < (int)p.rows;\n"
+           "        if (ok) ok = valid[k_idx] != 0.0f && k_idx <= (int)q_idx && ((int)q_idx - k_idx) <= past;\n"
+           "        float prod = 0.0f;\n"
+           "        if (ok) {\n"
+           "            uint k_base = (uint)k_idx * p.hidden + head_base;\n"
+           "            uint rel_base = (uint)rel_idx * p.hidden + head_base;\n"
+           "            prod = qv * (k[k_base + tid] * p.k_scale) + qv * rel[rel_base + tid];\n"
+           "        }\n"
+           "        float sum = simd_sum(prod);\n"
+           "        if (lane == 0u) partial[sg] = sum;\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        if (tid == 0u) {\n"
+           "            if (ok) {\n"
+           "                float total = 0.0f;\n"
+           "                for (uint s = 0u; s < sg_count; ++s) total += partial[s];\n"
+           "                float capped_arg = total / p.logit_cap;\n"
+           "                scores[c] = (capped_arg >= 16.0f ? 1.0f : (capped_arg <= -16.0f ? -1.0f : tanh(capped_arg))) * p.logit_cap;\n"
+           "            } else {\n"
+           "                scores[c] = p.invalid_value;\n"
+           "            }\n"
+           "        }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    if (tid == 0u) {\n"
+           "        float max_score = -INFINITY;\n"
+           "        uint valid_count = 0u;\n"
+           "        for (uint c = 0u; c < p.context; ++c) { if (scores[c] != p.invalid_value) { max_score = max(max_score, scores[c]); valid_count += 1u; } }\n"
+           "        if (valid_count == 0u) {\n"
+           "            for (uint c = 0u; c < p.context; ++c) scores[c] = 0.0f;\n"
+           "        } else {\n"
+           "            float sum_exp = 0.0f;\n"
+           "            for (uint c = 0u; c < p.context; ++c) { float e = exp(scores[c] - max_score); scores[c] = e; sum_exp += e; }\n"
+           "            for (uint c = 0u; c < p.context; ++c) scores[c] = sum_exp == 0.0f ? 0.0f : scores[c] / sum_exp;\n"
+           "        }\n"
+           "    }\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    float acc = 0.0f;\n"
+           "    for (uint c = 0u; c < p.context; ++c) {\n"
+           "        float prob = scores[c];\n"
+           "        if (prob == 0.0f) continue;\n"
+           "        int k_idx = (int)(block_start + c) - past;\n"
+           "        if (k_idx < 0 || k_idx >= (int)p.rows) continue;\n"
+           "        acc += prob * v[(uint)k_idx * p.hidden + head_base + tid];\n"
+           "    }\n"
+           "    output[out_base + tid] = acc;\n"
            "}\n"
            "kernel void termite_apply_where_select_1x(device const float *cond [[buffer(0)]], device const float *on_true [[buffer(1)]], device const float *on_false [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_apply_add_params &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.rows * p.dim; if (gid >= total) return;\n"
@@ -25630,6 +25698,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->gemma4_audio_flatten_pipeline = termite_metal_make_pipeline(device, library, @"termite_gemma4_audio_flatten_ctf");
         runtime->gemma4_audio_channel_norm_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_gemma4_audio_channel_norm_relu");
         runtime->gemma4_audio_attention_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_gemma4_audio_local_attention");
+        runtime->gemma4_audio_attention_tg_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_gemma4_audio_local_attention_tg");
         runtime->add_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_add_1x");
         runtime->add_scale_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_add_scale_1x");
         runtime->scaled_add_scale_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_scaled_add_scale_1x");
@@ -26481,6 +26550,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->gemma4_audio_flatten_pipeline = nil;
     runtime->gemma4_audio_channel_norm_pipeline = nil;
     runtime->gemma4_audio_attention_pipeline = nil;
+    runtime->gemma4_audio_attention_tg_pipeline = nil;
     runtime->add_pipeline = nil;
     runtime->add_scale_pipeline = nil;
     runtime->scaled_add_scale_pipeline = nil;
@@ -49346,11 +49416,16 @@ static int termite_metal_decode_runtime_gemma4_audio_dispatch(
     const void *params,
     size_t params_bytes,
     size_t threads,
+    size_t grid_y,
+    size_t threadgroup_width,
     const char *func_name
 ) {
+    // `threadgroup_width == 0`: a flat grid of `threads`. Otherwise a
+    // `threads x grid_y` grid of threadgroups, `threadgroup_width` wide.
     if (runtime == NULL || bindings == NULL || params == NULL) return -1;
     if (pipeline == nil) return -2;
     if (threads == 0 || threads > UINT32_MAX || binding_count == 0 || binding_count > 8) return -3;
+    if (threadgroup_width != 0 && (grid_y == 0 || grid_y > UINT32_MAX || threadgroup_width > pipeline.maxTotalThreadsPerThreadgroup)) return -3;
     @autoreleasepool {
         termite_metal_planned_encoder_range accesses[8];
         for (size_t i = 0; i < binding_count; ++i) {
@@ -49382,7 +49457,11 @@ static int termite_metal_decode_runtime_gemma4_audio_dispatch(
             [encoder setBuffer:bindings[i].buffer offset:bindings[i].offset atIndex:(NSUInteger)i];
         }
         [encoder setBytes:params length:params_bytes atIndex:(NSUInteger)binding_count];
-        [encoder dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, threads), 1, 1)];
+        if (threadgroup_width != 0) {
+            [encoder dispatchThreadgroups:MTLSizeMake(threads, grid_y, 1) threadsPerThreadgroup:MTLSizeMake(threadgroup_width, 1, 1)];
+        } else {
+            [encoder dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, threads), 1, 1)];
+        }
         if (!planned_encoder) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8);
     }
@@ -49407,7 +49486,7 @@ int termite_metal_decode_runtime_gemma4_audio_clamp_device(
         { (__bridge id<MTLBuffer>)output_handle, output_offset, bytes, true },
     };
     const termite_metal_gemma4_audio_clamp_params params = { (uint32_t)total, flags, min_value, max_value };
-    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_clamp_pipeline, bindings, 2, &params, sizeof(params), total, __func__);
+    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_clamp_pipeline, bindings, 2, &params, sizeof(params), total, 0, 0, __func__);
 }
 
 int termite_metal_decode_runtime_gemma4_audio_glu_device(
@@ -49427,7 +49506,7 @@ int termite_metal_decode_runtime_gemma4_audio_glu_device(
         { (__bridge id<MTLBuffer>)output_handle, output_offset, out_elems * sizeof(float), true },
     };
     const termite_metal_gemma4_audio_rows_params params = { (uint32_t)rows, (uint32_t)dim, 0, 0 };
-    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_glu_pipeline, bindings, 2, &params, sizeof(params), out_elems, __func__);
+    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_glu_pipeline, bindings, 2, &params, sizeof(params), out_elems, 0, 0, __func__);
 }
 
 int termite_metal_decode_runtime_gemma4_audio_dwconv_device(
@@ -49451,7 +49530,7 @@ int termite_metal_decode_runtime_gemma4_audio_dwconv_device(
         { (__bridge id<MTLBuffer>)output_handle, output_offset, elems * sizeof(float), true },
     };
     const termite_metal_gemma4_audio_rows_params params = { (uint32_t)rows, (uint32_t)dim, (uint32_t)kernel_size, 0 };
-    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_dwconv_pipeline, bindings, 3, &params, sizeof(params), elems, __func__);
+    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_dwconv_pipeline, bindings, 3, &params, sizeof(params), elems, 0, 0, __func__);
 }
 
 int termite_metal_decode_runtime_gemma4_audio_flatten_device(
@@ -49473,7 +49552,7 @@ int termite_metal_decode_runtime_gemma4_audio_flatten_device(
         { (__bridge id<MTLBuffer>)output_handle, output_offset, elems * sizeof(float), true },
     };
     const termite_metal_gemma4_audio_rows_params params = { (uint32_t)time_steps, (uint32_t)freq_bins, (uint32_t)channels, 0 };
-    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_flatten_pipeline, bindings, 2, &params, sizeof(params), elems, __func__);
+    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_flatten_pipeline, bindings, 2, &params, sizeof(params), elems, 0, 0, __func__);
 }
 
 int termite_metal_decode_runtime_gemma4_audio_channel_norm_relu_device(
@@ -49497,7 +49576,7 @@ int termite_metal_decode_runtime_gemma4_audio_channel_norm_relu_device(
         { (__bridge id<MTLBuffer>)output_handle, output_offset, elems * sizeof(float), true },
     };
     const termite_metal_gemma4_audio_channel_norm_params params = { (uint32_t)channels, (uint32_t)positions, eps, 0 };
-    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_channel_norm_pipeline, bindings, 3, &params, sizeof(params), positions, __func__);
+    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_channel_norm_pipeline, bindings, 3, &params, sizeof(params), positions, 0, 0, __func__);
 }
 
 int termite_metal_decode_runtime_gemma4_audio_local_attention_device(
@@ -49533,8 +49612,14 @@ int termite_metal_decode_runtime_gemma4_audio_local_attention_device(
         { (__bridge id<MTLBuffer>)valid_handle, valid_offset, (size_t)params->rows * sizeof(float), false },
         { (__bridge id<MTLBuffer>)output_handle, output_offset, elems * sizeof(float), true },
     };
+    const bool threadgroup_path = runtime->gemma4_audio_attention_tg_pipeline != nil &&
+        params->head_dim % 32u == 0u && params->head_dim <= 1024u &&
+        params->head_dim <= runtime->gemma4_audio_attention_tg_pipeline.maxTotalThreadsPerThreadgroup;
+    if (threadgroup_path) {
+        return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_attention_tg_pipeline, bindings, 7, params, sizeof(*params), params->heads, params->rows, params->head_dim, __func__);
+    }
     const size_t threads = (size_t)params->rows * (size_t)params->heads;
-    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_attention_pipeline, bindings, 7, params, sizeof(*params), threads, __func__);
+    return termite_metal_decode_runtime_gemma4_audio_dispatch(runtime, runtime->gemma4_audio_attention_pipeline, bindings, 7, params, sizeof(*params), threads, 0, 0, __func__);
 }
 
 static int termite_metal_decode_runtime_encode_attention_quantized_residual_tl1(
