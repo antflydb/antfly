@@ -22293,8 +22293,9 @@ fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure 
         err == error.UnsupportedInferenceModality or
         err == error.InvalidInferenceMedia;
     const invalid_contract = err == error.InvalidInferenceCapabilities;
+    const not_qualified = err == error.UnsupportedGlinerBoundaryRuntime;
     return .{
-        .status = if (invalid_contract) 500 else if (invalid_input) 400 else 413,
+        .status = if (invalid_contract) 500 else if (invalid_input or not_qualified) 400 else 413,
         .batch = .{
             .code = if (invalid_contract)
                 "INVALID_MODEL_CAPABILITIES"
@@ -22304,6 +22305,8 @@ fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure 
                 "UNSUPPORTED_MODALITY"
             else if (err == error.InvalidInferenceMedia)
                 "INVALID_IMAGE"
+            else if (not_qualified)
+                "MODEL_NOT_QUALIFIED"
             else if (err == error.InferenceDecodedPixelsExceeded)
                 "DECODED_PIXELS_EXCEEDED"
             else if (err == error.InferenceEncodedBytesExceeded)
@@ -22328,6 +22331,8 @@ fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure 
                 "the resolved model capability contract is invalid"
             else if (invalid_input)
                 "the request media is not accepted by the resolved model"
+            else if (not_qualified)
+                "model is not qualified for serving on this runtime"
             else
                 "the request exceeds a resolved model capability limit",
             .retryable = false,
@@ -22689,6 +22694,29 @@ test "task-neutral executor contract enforces every resolved resource dimension"
     try std.testing.expectError(error.InferenceCandidateLimitExceeded, validateInferenceExecutorInvocation(contract, .{ .candidates_per_request = 3 }));
     try std.testing.expectError(error.InferenceSchemaBytesExceeded, validateInferenceExecutorInvocation(contract, .{ .schema_bytes = 17 }));
     try std.testing.expectError(error.UnsupportedInferenceModality, validateInferenceExecutorInvocation(contract, .{ .has_audio = true }));
+}
+
+test "generate executor contract error maps unqualified GLiNER boundary runtime to a dedicated response" {
+    const failure = generateExecutorContractError(error.UnsupportedGlinerBoundaryRuntime);
+    try std.testing.expectEqual(@as(u16, 400), failure.status);
+    try std.testing.expectEqualStrings("MODEL_NOT_QUALIFIED", failure.batch.code);
+    try std.testing.expectEqualStrings("model is not qualified for serving on this runtime", failure.batch.message);
+    try std.testing.expectEqual(false, failure.batch.retryable);
+
+    // A genuinely unresolved capability limit still falls back to the
+    // generic resource-limit response rather than being misclassified.
+    const limit_failure = generateExecutorContractError(error.InferenceOutputTokensExceeded);
+    try std.testing.expectEqualStrings("OUTPUT_TOKEN_LIMIT_EXCEEDED", limit_failure.batch.code);
+    try std.testing.expectEqual(@as(u16, 413), limit_failure.status);
+
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try inferenceExecutorContractFailureResponse(&ctx, error.UnsupportedGlinerBoundaryRuntime);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_NOT_QUALIFIED") != null);
 }
 
 test "executor modality resolution uses the shared manifest authority" {

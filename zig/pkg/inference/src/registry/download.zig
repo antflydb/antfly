@@ -216,6 +216,7 @@ const always_files = [_][]const u8{
     "1_LogitScore/config.json",
     "added_tokens.json",
     "gliner_config.json",
+    "encoder_config/config.json", // GLiNER2.5 boundary encoder config
     "termite_bundle.json",
     "antfly_inference_bundle.json",
     "spm.model",
@@ -3333,6 +3334,45 @@ test "gguf selection keeps canonical gliner quantized pairs together" {
     try std.testing.expectEqual(@as(usize, 2), to_download.items.len);
     try std.testing.expectEqualStrings("gliner2-encoder.Q4_K.gguf", to_download.items[0].name);
     try std.testing.expectEqualStrings("gliner2-head.Q4_K.gguf", to_download.items[1].name);
+}
+
+test "always-download files pull the GLiNER2.5 boundary encoder config sidecar" {
+    const allocator = std.testing.allocator;
+
+    var found_in_table = false;
+    for (&always_files) |candidate| {
+        if (std.mem.eql(u8, candidate, "encoder_config/config.json")) found_in_table = true;
+    }
+    try std.testing.expect(found_in_table);
+
+    // Mirror the always-download selection loop in downloadModel: a boundary
+    // repo's nested encoder_config/config.json must be selected alongside the
+    // top-level config.json, or manifest parsing later fails with
+    // error.MissingGlinerBoundaryEncoderConfig.
+    const files = [_]HubFile{
+        .{ .name = "config.json" },
+        .{ .name = "encoder_config/config.json" },
+        .{ .name = "tokenizer.json" },
+        .{ .name = "model.safetensors" },
+    };
+
+    var to_download = std.ArrayListUnmanaged(HubFile).empty;
+    defer to_download.deinit(allocator);
+
+    for (&always_files) |candidate| {
+        for (files) |f| {
+            if (std.mem.eql(u8, f.name, candidate)) {
+                try to_download.append(allocator, f);
+                break;
+            }
+        }
+    }
+
+    var selected = false;
+    for (to_download.items) |f| {
+        if (std.mem.eql(u8, f.name, "encoder_config/config.json")) selected = true;
+    }
+    try std.testing.expect(selected);
 }
 
 test "projector-only selection finds mmproj gguf" {
