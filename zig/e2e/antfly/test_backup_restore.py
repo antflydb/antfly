@@ -456,7 +456,12 @@ def _delete_cluster_table_and_observe(
     )
     known_commit = deleted.status_code == 204 or (
         deleted.status_code == 202
-        and deleted.json().get("status") == "committed_repair_required"
+        and deleted.json().get("status")
+        in {
+            "committed_visibility_pending",
+            "committed_repair_required",
+            "committed_repair_unavailable",
+        }
     )
     unknown = (
         deleted.status_code == 409

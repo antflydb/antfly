@@ -826,3 +826,25 @@ def test_cluster_delete_rejects_unknown_without_outcome_contract(monkeypatch):
     with pytest.raises(AssertionError, match="delete="):
         backups._delete_cluster_table_and_observe(cluster, session, "docs", 7, {71})
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "status,body",
+    [
+        (204, b""),
+        (202, b'{"status":"committed_visibility_pending"}'),
+        (202, b'{"status":"committed_repair_required"}'),
+        (202, b'{"status":"committed_repair_unavailable"}'),
+    ],
+)
+def test_cluster_delete_waits_for_visibility_after_committed_response(
+    monkeypatch, status, body
+):
+    cluster, session, calls = _seed_cluster(monkeypatch, [(status, body)])
+    session.delete = session.post
+    observations = iter([False, True])
+    cluster.table_absent_on_all_metadata_nodes = lambda *_args: next(observations)
+    backups._delete_cluster_table_and_observe(
+        cluster, session, "docs", 7, {71}, timeout_s=1.0
+    )
+    assert len(calls) == 1
