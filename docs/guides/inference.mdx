@@ -112,6 +112,8 @@ antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate
 
 `--projector auto` is the default. Gemma 4's unified projector enables image and audio inputs and is recorded in the generated model manifest. Use `--projector none` for a text-only installation.
 
+On Apple silicon the Gemma 4 audio encoder runs on Metal end to end: the log-mel front end is two BLAS matrix products, and from the convolutional subsampler through the conformer blocks (clamped projections, chunked local attention with relative position bias, gated depthwise convolution) to the output projection every op executes as a device kernel inside one command buffer. The projector's tensors are served from the session's resident copies and the projector file is parsed once per model rather than per request. A 2.5-second clip encodes in about 50 ms on an M-series laptop, and the audio prompt tokens then flow through the same framed prefill as text. Set `TERMITE_SERVER_GENERATE_TIMING=1` to log the `multimodal_prepare`, `prefill` and `decode` split for each request, and `TERMITE_GEMMA4_AUDIO_METAL_PROFILE=1` to print the encoder's per-stage GPU time for each clip.
+
 Verified starting points, one per job:
 
 | Job | Model |
