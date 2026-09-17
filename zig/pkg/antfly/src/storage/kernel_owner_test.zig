@@ -1813,7 +1813,8 @@ test "storage kernel status registry is unique and lossless" {
         };
         try std.testing.expectEqual(expected, received);
         const public_status = runtime_error.statusFromError(received);
-        try std.testing.expectEqual(@intFromEnum(runtime_error.Code.retryable), public_status.code);
+        const expected_code: runtime_error.Code = if (expected == error.TableTopologyProtocolUpgradeRequired) .unavailable else .retryable;
+        try std.testing.expectEqual(@intFromEnum(expected_code), public_status.code);
         try std.testing.expectEqual(expected, runtime_error.errorFromStatus(public_status));
     }
 }
