@@ -167,7 +167,7 @@ pub fn encodeProjectedImages(
 ) !ProjectedImages {
     platform.sync.lockYielding(&projector_store_cache.mutex);
     defer projector_store_cache.mutex.unlock();
-    const store = try projector_store_cache.acquire(allocator, projector_path);
+    const store = try projector_store_cache.acquire(projector_path);
     return encodeProjectedImagesFromStore(cb, allocator, store, images);
 }
 
@@ -176,18 +176,20 @@ pub fn encodeProjectedImages(
 /// share of every audio request. One entry, keyed by path; the lock is held
 /// for the whole encode so a path change can swap the store safely. Callers
 /// that own a store (tests, tools) use the `FromStore` entry points and never
-/// touch the cache. `allocator` must outlive the process-wide cache (the
-/// generation pipeline passes the server allocator).
+/// touch the cache. The cache owns its allocations through a process-lifetime
+/// allocator: request allocators (some handlers pass a stack-scoped one) must
+/// never be retained here.
 const ProjectorStoreCache = struct {
+    const allocator: std.mem.Allocator = std.heap.smp_allocator;
+
     mutex: std.atomic.Mutex = .unlocked,
-    allocator: ?std.mem.Allocator = null,
     path: ?[]u8 = null,
     store: ?*tensor_store_mod.GgufStore = null,
     /// Scalar clamp bounds per linear prefix, resolved on first use.
     clamp_specs: std.StringHashMapUnmanaged(ClampSpec) = .empty,
     clamp_mutex: std.atomic.Mutex = .unlocked,
 
-    fn acquire(self: *ProjectorStoreCache, allocator: std.mem.Allocator, path: []const u8) !*tensor_store_mod.GgufStore {
+    fn acquire(self: *ProjectorStoreCache, path: []const u8) !*tensor_store_mod.GgufStore {
         if (self.store) |store| {
             if (self.path != null and std.mem.eql(u8, self.path.?, path)) return store;
             self.release();
@@ -195,14 +197,12 @@ const ProjectorStoreCache = struct {
         const store = try tensor_store_mod.GgufStore.initAbsolute(allocator, path);
         errdefer store.tensorStore().deinit();
         const owned_path = try allocator.dupe(u8, path);
-        self.allocator = allocator;
         self.path = owned_path;
         self.store = store;
         return store;
     }
 
     fn release(self: *ProjectorStoreCache) void {
-        const allocator = self.allocator orelse return;
         platform.sync.lockYielding(&self.clamp_mutex);
         var it = self.clamp_specs.keyIterator();
         while (it.next()) |key| allocator.free(key.*);
@@ -213,7 +213,6 @@ const ProjectorStoreCache = struct {
         if (self.path) |path| allocator.free(path);
         self.store = null;
         self.path = null;
-        self.allocator = null;
     }
 
     /// Cached scalar clamp bounds for `prefix` when `store` is the cached
@@ -221,7 +220,6 @@ const ProjectorStoreCache = struct {
     /// scalar (those keep the per-call tensor path).
     fn clampSpec(self: *ProjectorStoreCache, store: *tensor_store_mod.GgufStore, prefix: []const u8) !?ClampSpec {
         if (self.store != store) return null;
-        const allocator = self.allocator orelse return null;
         platform.sync.lockYielding(&self.clamp_mutex);
         defer self.clamp_mutex.unlock();
         if (self.clamp_specs.get(prefix)) |spec| return spec;
@@ -396,7 +394,7 @@ pub fn encodeProjectedAudio(
 ) !ProjectedAudio {
     platform.sync.lockYielding(&projector_store_cache.mutex);
     defer projector_store_cache.mutex.unlock();
-    const store = try projector_store_cache.acquire(allocator, projector_path);
+    const store = try projector_store_cache.acquire(projector_path);
     return encodeProjectedAudioFromStore(cb, allocator, store, audio_clips);
 }
 
@@ -3375,4 +3373,40 @@ test "gemma4 real mmproj audio device ops match the host encoder" {
         if (spec.len == 0) worst = max_diff;
     }
     try std.testing.expect(worst < 5e-2);
+}
+
+test "projector store cache outlives the request allocators that use it" {
+    const allocator = std.testing.allocator;
+    var fixture = try tensor_store_mod.writeGemma4AudioProjectorFixture(allocator, "gemma4-projector-cache-lifetime");
+    defer fixture.deinit(allocator);
+    defer releaseCachedProjectorStore();
+
+    // Request one: a scoped allocator that is gone before request two.
+    var first_arena = std.heap.ArenaAllocator.init(allocator);
+    const first_store = blk: {
+        defer first_arena.deinit();
+        platform.sync.lockYielding(&projector_store_cache.mutex);
+        defer projector_store_cache.mutex.unlock();
+        const store = try projector_store_cache.acquire(fixture.projector_path);
+        // The cached store's own allocations never come from the request.
+        try std.testing.expect(store.allocator.ptr != first_arena.allocator().ptr);
+        var tensor = try loadTensorF32(store, "a.blk.0.ffn_up.weight");
+        defer tensor.deinit();
+        try std.testing.expectEqual(@as(usize, 2), tensor.data.len);
+        break :blk store;
+    };
+
+    // Request two reuses the same open store and can still read from it.
+    var second_arena = std.heap.ArenaAllocator.init(allocator);
+    defer second_arena.deinit();
+    platform.sync.lockYielding(&projector_store_cache.mutex);
+    defer projector_store_cache.mutex.unlock();
+    const second_store = try projector_store_cache.acquire(fixture.projector_path);
+    try std.testing.expect(second_store == first_store);
+    var tensor = try loadTensorF32(second_store, "a.blk.0.ffn_up.weight");
+    defer tensor.deinit();
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), tensor.data[0], 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), tensor.data[1], 0.0);
+    const spec = (try projector_store_cache.clampSpec(second_store, "a.blk.0.ffn_up")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!spec.clipsInput() and !spec.clipsOutput());
 }

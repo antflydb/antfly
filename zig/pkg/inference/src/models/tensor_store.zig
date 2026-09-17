@@ -1540,6 +1540,52 @@ fn appendTestGgufF32Tensor(allocator: std.mem.Allocator, data: *std.ArrayListUnm
     try appendLe(u64, allocator, data, offset);
 }
 
+/// A minimal Gemma 4 audio projector GGUF on disk for tests: `clip` with
+/// `gemma4a` audio metadata, one `a.*` tensor (`[5, 6]`) and one `v.*`
+/// tensor (`[7, 8]`), written under a scratch directory the caller removes
+/// through `deinit`.
+pub const Gemma4AudioProjectorFixture = struct {
+    dir_path: []u8,
+    projector_path: []u8,
+
+    pub fn deinit(self: *Gemma4AudioProjectorFixture, allocator: std.mem.Allocator) void {
+        compat.cwd().deleteTree(compat.io(), self.dir_path) catch {};
+        allocator.free(self.projector_path);
+        allocator.free(self.dir_path);
+    }
+};
+
+pub fn writeGemma4AudioProjectorFixture(allocator: std.mem.Allocator, dir_name: []const u8) !Gemma4AudioProjectorFixture {
+    var projector = std.ArrayListUnmanaged(u8).empty;
+    defer projector.deinit(allocator);
+    try appendGemma4AudioProjectorFixtureBytes(allocator, &projector);
+    const dir_path = try testScratchDir(allocator, dir_name);
+    errdefer allocator.free(dir_path);
+    const projector_path = try std.fs.path.join(allocator, &.{ dir_path, "mmproj.gguf" });
+    errdefer allocator.free(projector_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = projector_path, .data = projector.items });
+    return .{ .dir_path = dir_path, .projector_path = projector_path };
+}
+
+fn appendGemma4AudioProjectorFixtureBytes(allocator: std.mem.Allocator, projector: *std.ArrayListUnmanaged(u8)) !void {
+    try projector.appendSlice(allocator, "GGUF");
+    try appendLe(u32, allocator, projector, 3);
+    try appendLe(u64, allocator, projector, 2);
+    try appendLe(u64, allocator, projector, 2);
+    try appendString(allocator, projector, "general.architecture");
+    try appendLe(u32, allocator, projector, 8);
+    try appendString(allocator, projector, "clip");
+    try appendString(allocator, projector, "clip.audio.projector_type");
+    try appendLe(u32, allocator, projector, 8);
+    try appendString(allocator, projector, "gemma4a");
+    try appendTestGgufF32Tensor(allocator, projector, "a.blk.0.ffn_up.weight", 0);
+    try appendTestGgufF32Tensor(allocator, projector, "v.blk.0.attn_q.weight", gguf_mod.format.default_alignment);
+    try padToAlignment(allocator, projector, gguf_mod.format.default_alignment);
+    try projector.appendSlice(allocator, std.mem.asBytes(&[_]f32{ 5.0, 6.0 }));
+    try padToAlignment(allocator, projector, gguf_mod.format.default_alignment);
+    try projector.appendSlice(allocator, std.mem.asBytes(&[_]f32{ 7.0, 8.0 }));
+}
+
 test "open gguf checkpoint with its gemma4 audio projector from manifest" {
     const allocator = std.testing.allocator;
 
@@ -1560,22 +1606,7 @@ test "open gguf checkpoint with its gemma4 audio projector from manifest" {
     // Projector: audio type metadata, one audio tensor and one vision tensor.
     var projector = std.ArrayListUnmanaged(u8).empty;
     defer projector.deinit(allocator);
-    try projector.appendSlice(allocator, "GGUF");
-    try appendLe(u32, allocator, &projector, 3);
-    try appendLe(u64, allocator, &projector, 2);
-    try appendLe(u64, allocator, &projector, 2);
-    try appendString(allocator, &projector, "general.architecture");
-    try appendLe(u32, allocator, &projector, 8);
-    try appendString(allocator, &projector, "clip");
-    try appendString(allocator, &projector, "clip.audio.projector_type");
-    try appendLe(u32, allocator, &projector, 8);
-    try appendString(allocator, &projector, "gemma4a");
-    try appendTestGgufF32Tensor(allocator, &projector, "a.blk.0.ffn_up.weight", 0);
-    try appendTestGgufF32Tensor(allocator, &projector, "v.blk.0.attn_q.weight", gguf_mod.format.default_alignment);
-    try padToAlignment(allocator, &projector, gguf_mod.format.default_alignment);
-    try projector.appendSlice(allocator, std.mem.asBytes(&[_]f32{ 5.0, 6.0 }));
-    try padToAlignment(allocator, &projector, gguf_mod.format.default_alignment);
-    try projector.appendSlice(allocator, std.mem.asBytes(&[_]f32{ 7.0, 8.0 }));
+    try appendGemma4AudioProjectorFixtureBytes(allocator, &projector);
 
     const dir_path = try testScratchDir(allocator, "tensor-store-projector-composite");
     defer {

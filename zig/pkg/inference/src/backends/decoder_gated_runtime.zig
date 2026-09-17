@@ -6199,6 +6199,9 @@ pub fn forwardPrefillLastPreparedTail(
     };
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.prefill_block_nanos += finished_at - started_at;
+    // The embedded rows were borrowed by the block stack (the direct paths
+    // copy them into their own hidden buffers); release them here.
+    if (final_hidden != hidden) cb.free(hidden);
     var owns_final_hidden = true;
     errdefer if (owns_final_hidden) cb.free(final_hidden);
     if (direct_hidden_result != null and compare_hidden_input != null) {
@@ -6338,8 +6341,8 @@ fn forwardFinalHiddenRowsInternal(
 /// (image and audio prompts): the same planned Gemma frame the token-id
 /// prefill takes, with `ple_ids` standing in for the per-layer embedding
 /// lookup. `hidden` must be device-resident `[seq_len, hidden]` scaled
-/// embeddings; it is consumed on success and left to the caller on null,
-/// so the caller can still run the generic forward.
+/// embeddings. It is borrowed: the direct paths copy the rows into their
+/// own hidden buffers, so the caller frees it after either outcome.
 pub fn forwardFinalHiddenRowsFromEmbeddings(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -6423,6 +6426,9 @@ fn forwardFinalHiddenRowsFromHidden(
         return null;
     }
     const hidden_result = direct_hidden_result.?;
+    // The direct paths copy the input rows into their own hidden buffers, so
+    // an owned input is done once they return.
+    if (owns_hidden and hidden_result.hidden != hidden) cb.free(hidden);
     var decoder_frame_active = hidden_result.decoder_frame_active;
     defer finishDecoderRuntimeFrame(cb, &decoder_frame_active);
     finished_at = monotonicNowNs();

@@ -5781,6 +5781,9 @@ pub const NativeGenerationPipeline = struct {
             }
             break :blk host_embeddings;
         };
+        // Both forwards below borrow the prompt rows (the framed one copies
+        // them into its own hidden buffer), so this owner releases them.
+        defer self.cb.free(input_embeddings);
         // Match text prefill/decode lock order: scheduler turn, then model.
         // Both stay held until the backend forward and result copy complete.
         const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
