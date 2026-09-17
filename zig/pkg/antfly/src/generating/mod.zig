@@ -391,7 +391,13 @@ const BackendState = struct {
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .embedded_antfly => |local| blk: {
-                if (local.generate_json != null and (self.cfg.tools_json != null or self.cfg.tool_choice_json != null)) {
+                // A terminal agent turn may omit tool definitions while still
+                // carrying tool calls/results. Keep that conversation on the
+                // JSON path, including for providers with only generate_json.
+                const has_tool_history = for (messages) |message| {
+                    if (message.tool_calls != null or message.tool_call_id != null or message.role == .tool) break true;
+                } else false;
+                if (local.generate_json != null and (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or has_tool_history)) {
                     const body = try inference.types.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .termite_native, .{
                         .tools_json = self.cfg.tools_json,
                         .tool_choice_json = self.cfg.tool_choice_json,
@@ -403,7 +409,7 @@ const BackendState = struct {
                         .presence_penalty = self.cfg.presence_penalty,
                         // Agent tool turns spend the bounded output budget on
                         // calls and answers, not optional private reasoning.
-                        .enable_thinking = if (self.cfg.tools_json != null) false else null,
+                        .enable_thinking = if (self.cfg.tools_json != null or has_tool_history) false else null,
                     });
                     defer alloc.free(body);
                     const response = try local.generateJson(alloc, body, self.request_context);

@@ -946,7 +946,10 @@ test "metadata openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@hasField(metadata_generated.QueryBuilderRequest, "output"));
     try std.testing.expect(@hasField(metadata_generated.QueryBuilderRequest, "constraints"));
     try std.testing.expect(@FieldType(metadata_generated.QueryBuilderResult, "query_request") == ?metadata_generated.QueryRequest);
-    try std.testing.expect(@FieldType(metadata_generated.QueryBuilderResult, "retrieval_query_request") == ?metadata_generated.RetrievalQueryRequest);
+    try std.testing.expect(@FieldType(metadata_generated.QueryBuilderResult, "retrieval_query_request") == ?metadata_generated.QueryRequest);
+    try std.testing.expect(@FieldType(metadata_generated.QueryBuilderResult, "retrieval_navigation") == ?metadata_generated.RetrievalNavigationConfig);
+    try std.testing.expect(!@hasField(metadata_generated.QueryRequest, "tree_search"));
+    try std.testing.expect(!@hasField(metadata_generated.QueryRequest, "graph_navigation"));
     try std.testing.expect(@hasField(metadata_generated.QueryBuilderResult, "specialist"));
     try std.testing.expect(@hasField(metadata_generated.QueryBuilderResult, "plan"));
     try std.testing.expect(@FieldType(metadata_generated.QueryRequest, "reranker") == ?reranking_generated.RerankerConfig);

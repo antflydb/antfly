@@ -404,6 +404,7 @@ export type {
   RetrievalAgentResult,
   RetrievalAgentSteps,
   RetrievalAgentStreamCallbacks,
+  RetrievalNavigationConfig,
   RouteType,
   SemanticQueryMode,
   ShardsProfile,

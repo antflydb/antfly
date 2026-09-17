@@ -1995,21 +1995,25 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     const sibling_changed = try std.mem.replaceOwned(u8, std.testing.allocator, replacement_indexes_json, "\"dimension\":3", "\"dimension\":4");
     defer std.testing.allocator.free(sibling_changed);
     _ = try owner.reconcile("docs", "", sibling_changed, "full_text_index_v0", false);
-
-    // Configuration and the no-repair target check above do not build the
-    // replacement text index. Drive its bounded initial-build lifecycle before
-    // asserting query visibility; bulk finish drains writes, not DDL backfills.
-    var text_reconciled = false;
+    // Installing a replacement index does not backfill it. Complete the
+    // targeted repair before checking query visibility later in this test.
+    var replacement_text_reconciled = false;
     for (0..64) |_| {
-        const result = try owner.reconcile("docs", "", replacement_indexes_json, "full_text_index_v0", true);
+        const result = try owner.reconcile("docs", "", sibling_changed, "full_text_index_v0", true);
         try std.testing.expect(result.state != .degraded);
         if (result.state == .complete) {
             try std.testing.expectEqual(@as(u32, 0), result.repair_remaining);
-            text_reconciled = true;
+            replacement_text_reconciled = true;
             break;
         }
     }
-    try std.testing.expect(text_reconciled);
+    try std.testing.expect(replacement_text_reconciled);
+    var replacement_text_query = try owner.queryJson(
+        "docs",
+        "{\"full_text_search\":{\"match\":\"alpha\",\"field\":\"title\"},\"indexes\":[\"full_text_index_v0\"],\"limit\":10}",
+    );
+    defer replacement_text_query.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, replacement_text_query.bytes(), "doc:a") != null);
 
     var indexed_batch = try owner.batchJson(
         "docs",

@@ -8284,10 +8284,12 @@ export interface components {
             query_request?: components["schemas"]["QueryRequest"];
             /**
              * @description Antfly retrieval query assembled by the coordinator when the requested artifact
-             *     needs retrieval-only features such as tree_search. This is additive to
+             *     is intended for retrieval. Apply retrieval_navigation to steps.retrieval.navigation. This is additive to
              *     query_request for clients that execute through the retrieval agent pipeline.
              */
-            retrieval_query_request?: components["schemas"]["RetrievalQueryRequest"];
+            retrieval_query_request?: components["schemas"]["QueryRequest"];
+            /** @description Optional retrieval-step navigation policy for the returned query at query_index zero. */
+            retrieval_navigation?: components["schemas"]["RetrievalNavigationConfig"];
             /**
              * @description Specialist or strategy used to build the query, such as `full_text`, `filter`, or `hybrid`.
              * @example full_text
@@ -8339,47 +8341,51 @@ export interface components {
          * @enum {string}
          */
         RetrievalStrategy: "semantic" | "bm25" | "metadata" | "tree" | "graph" | "hybrid";
+        /** @enum {string} */
+        RetrievalNavigationStrategy: "tree" | "graph";
+        /** @enum {string} */
+        RetrievalNavigationSelection: "agentic" | "ranked";
         /**
-         * @description Configuration for tree search strategy. Tree search navigates hierarchical
-         *     document structures by evaluating summaries at each level.
+         * @description Retrieval-step navigation targeting one ordinary query. Graph navigation
+         *     follows one path; tree navigation explores a retained branch frontier.
+         *     Agentic selection uses the enclosing model and budgets. Ranked selection
+         *     is supported for trees and uses the existing deterministic tree traversal.
+         *     Agentic selection requires agentic mode and a retrieval generator. Search
+         *     starts exploration; navigation selects only an offered, unvisited node.
+         *     All reads enforce mandatory predicates and authenticated row filters.
          */
-        TreeSearchConfig: {
-            /**
-             * @description Name of the graph index to use for tree navigation
-             * @example doc_hierarchy
-             */
-            index: string;
-            /**
-             * @description Starting nodes for tree search:
-             *     - "$roots" - Query for root nodes (nodes with no parents)
-             *     - Comma-separated explicit node IDs
-             *     When omitted and combined with a QueryRequest in a RetrievalQueryRequest,
-             *     the query results are used as start nodes.
-             * @example $roots
-             */
-            start_nodes?: string;
-            /**
-             * @description Maximum depth to traverse in the tree
-             * @default 5
-             */
+        RetrievalNavigationConfig: {
+            /** @description Zero-based index into the enclosing request queries. */
+            query_index: number;
+            strategy: components["schemas"]["RetrievalNavigationStrategy"];
+            /** @description Ranked selection is supported only with strategy tree. */
+            selection: components["schemas"]["RetrievalNavigationSelection"];
+            /** @description Tree-only maximum depth from the start node (depth zero); defaults to 5. */
             max_depth?: number;
-            /**
-             * @description Number of branches to explore at each level
-             * @default 3
-             */
+            /** @description Tree-only maximum children offered per expansion; defaults to 3. */
             beam_width?: number;
-        };
-        /**
-         * @description A canonical query in the retrieval pipeline with an optional tree search
-         *     configuration. Each query specifies its own table. Deprecated stateful
-         *     graph_searches compatibility is intentionally unavailable here.
-         *
-         *     When both search fields (semantic_search, full_text_search) and tree_search
-         *     are provided, the search results are used as start nodes for tree navigation.
-         */
-        RetrievalQueryRequest: components["schemas"]["QueryRequest"] & {
-            /** @description Optional tree search configuration */
-            tree_search?: components["schemas"]["TreeSearchConfig"];
+            /** @description Graph index used for every neighbor read. */
+            index: string;
+            /** @description Ranked-tree-only seed selector (comma-separated keys, $roots, or a prior-result selector). Mutually exclusive with start_key. */
+            start_nodes?: string;
+            /** @description Literal start document key. Agentic selection defaults to the first query hit; ranked selection defaults to seed results or prior query hits. */
+            start_key?: string;
+            /** @description Direction for every hop; defaults to out. */
+            direction?: components["schemas"]["EdgeDirection"];
+            edge_types?: components["schemas"]["GraphEdgeType"][];
+            /** @description Graph-only maximum moves after the start node (default 8). The enclosing agent's iteration and tool limits also apply. */
+            max_steps?: number;
+            /** @description Graph-only maximum candidate neighbors per node (default 8), further limited by the context budget. */
+            neighbor_limit?: number;
+            /** @description Optional caller-supplied workflow instruction retained in agent history. */
+            instruction?: string;
+            /**
+             * @description Explicitly opt in to following instructions from this top-level string
+             *     field of each visited document. Instructions accumulate in agent history.
+             *     Other document fields and unvisited neighbors remain untrusted evidence.
+             *     The field must be included if the query uses a fields projection.
+             */
+            instruction_field?: string;
         };
         /**
          * @description UI rendering/answer handling hint for a bounded agent question
@@ -8538,6 +8544,8 @@ export interface components {
          *     the top-level request tools policy when both are present.
          */
         RetrievalStepConfig: {
+            /** @description Navigation policy for one query; incompatible with graph_queries on that query. */
+            navigation?: components["schemas"]["RetrievalNavigationConfig"];
             /**
              * @description Tool configuration for the retrieval step. When set, this narrows
              *     the top-level tools policy for retrieval execution.
@@ -8585,7 +8593,8 @@ export interface components {
         };
         /**
          * @description Request for the retrieval agent. Queries define which tables and indexes
-         *     to search, each as a QueryRequest with optional tree search configuration.
+         *     to search, each as an ordinary QueryRequest. Optional tree or graph exploration
+         *     is configured by steps.retrieval.navigation, targeting one query by index.
          *
          *     **Pipeline mode** (default, max_internal_iterations=0): Queries are executed
          *     directly without an LLM tool-calling loop.
@@ -8630,7 +8639,7 @@ export interface components {
              *       }
              *     ]
              */
-            queries: components["schemas"]["RetrievalQueryRequest"][];
+            queries: components["schemas"]["QueryRequest"][];
             /** @description Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions. */
             messages?: components["schemas"]["ChatMessage"][];
             /**
