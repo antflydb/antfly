@@ -4,6 +4,51 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-16: 3x3 restore owner admission blocked its own bootstrap
+
+[PR #771's base E2E job](https://github.com/antflydb/antfly/actions/runs/35163796459/job/105028671150)
+failed `test_three_by_three_cluster_backup_restore_through_metadata_public_api`:
+restore job `3531487279743073036` did not finish within 120 seconds. Data node 4
+repeatedly failed Raft admission for group `51491842878582563` with
+`GenerationTransitionActive`. Other replicas completed runtime repair. The logs
+also contain `CorruptLsmWalIndex` while closing old, deleted groups; that diagnostic
+alone does not establish the cause of the restore admission stall.
+
+A local 20-case, two-worker baseline reproduced the same 120-second stall and
+repeated generation-transition admission errors. A deterministic compiled-owner
+regression then forced catalog visibility before bootstrap import: reconciliation
+incorrectly returned `complete` and retained an empty physical owner. Its generation
+reader prevents bootstrap's exclusive import, so retrying bootstrap cannot heal it.
+The point catalog projection also stripped the restore binding from range records.
+
+Owner descriptors now retain the range's restore identity. Before opening a cold
+owner, the storage kernel verifies that the published generation contains the exact
+primary import proof (backup, location, artifact, native manifest, shard path, and
+destination group). It holds the validated generation lease through `DB.open`,
+preventing a check/open race. Missing or different imports yield retryable
+`StorageReadTemporarilyUnavailable` without creating a resident DB. Matching imports
+remain admissible while runtime repair is pending; requiring completed repair would
+create a second circular dependency. Ordinary owner cache hits do not acquire a new
+proof or read a marker. The internal storage-owner ABI advances to version 56.
+
+`restore-admission-vopr-test` explores 256 seeded interleavings across nine replica
+placements and exact replays each history. It uses the production admission helper,
+generation leases, and durable markers on borrowed `VoprIo`. It checks missing and
+mismatched proofs, incomplete primary import, admission before runtime repair
+completion, lease release after rejection, and pinning through owner handoff.
+The scheduled qualification runs this target. Native scheduled coverage adds
+`zig-e2e-cluster-restore-soak.sh`: 50 fresh 3x3 clusters each under normal and
+256-descriptor limits, with exact JUnit counts and retained failed roots.
+
+The baseline also exposed two incorrect E2E assumptions: committed deletion may
+return `committed_repair_required`, and restore admission may lose its acknowledgement.
+The test still requires catalog absence and successful restore, but recovers admission
+with one explicit idempotency key and verifies that retries retain the same job ID.
+Timeout diagnostics now refresh metadata and retain observed job states. A fifth
+failure was a transient `TableTopologyProtocolUpgradeRequired` losing its identity
+at the compiled callback boundary and becoming HTTP 500. Register that identity in
+both failure formats so the existing HTTP 503 retry path remains available.
+
 ## 2026-09-16: constrained Autograph restart lost retryable owner admission
 
 The second retained-corpus qualification of PR #704 at `81ab94c8b1` failed its

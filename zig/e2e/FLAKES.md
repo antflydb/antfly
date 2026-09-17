@@ -1,5 +1,21 @@
 # Zig E2E flakes
 
+## 2026-09-16: 3x3 backup/delete/restore admission stall
+
+`test_three_by_three_cluster_backup_restore_through_metadata_public_api` timed out
+waiting for restore job `3531487279743073036` in
+[PR #771's E2E job](https://github.com/antflydb/antfly/actions/runs/35163796459/job/105028671150).
+A local two-worker, 20-case baseline reproduced the stall: an owner opened before
+import pinned an empty generation and indefinitely blocked Raft restore bootstrap.
+See [the runtime flake record](../FLAKES.md#2026-09-16-3x3-restore-owner-admission-blocked-its-own-bootstrap)
+for evidence, the compiled-owner regression, and production admission fix.
+
+Scheduled VOPR qualification now runs the seeded admission histories; the production
+soak runs this exact E2E 50 times with normal limits and 50 times with 256 descriptors.
+The test preserves one restore idempotency key across uncertain admission, accepts
+only documented committed delete outcomes, and retains the original 120-second
+completion assertion. Timeout diagnostics include fresh metadata and observed jobs.
+
 ## 2026-09-16: constrained Autograph restart exited during teardown
 
 The [second PR #704 production soak](https://github.com/antflydb/antfly/actions/runs/35126679231/job/104951437450)

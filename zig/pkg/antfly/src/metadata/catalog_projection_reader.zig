@@ -453,7 +453,10 @@ pub const CatalogProjectionReader = struct {
         }
         for (table_ranges) |range| {
             try ensureBeforeDeadline(deadline_ns);
-            ranges[cloned] = try metadata_table_manager.cloneRoutingRange(alloc, range);
+            // A point projection also supplies physical-owner admission.
+            // Restore proof bindings must survive alongside schema/indexes;
+            // compact catalog-wide routing deliberately strips them.
+            ranges[cloned] = try metadata_table_manager.cloneRange(alloc, range);
             cloned += 1;
         }
         try ensureBeforeDeadline(deadline_ns);
@@ -689,6 +692,51 @@ fn freeTables(alloc: std.mem.Allocator, records: []metadata_table_manager.TableR
 fn freeRanges(alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
     for (records) |record| metadata_table_manager.freeRange(alloc, record);
     if (records.len > 0) alloc.free(records);
+}
+
+test "catalog projection point reads retain restore admission identity" {
+    const Source = struct {
+        fn ensureListener(_: *anyopaque) !void {}
+        fn epoch(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn capture(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: ?u64) !metadata_storage.CatalogProjectionSnapshot {
+            const tables = try alloc.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer alloc.free(tables);
+            tables[0] = try metadata_table_manager.cloneTable(alloc, .{ .table_id = 7, .name = "docs", .indexes_json = "{}" });
+            errdefer metadata_table_manager.freeTable(alloc, tables[0]);
+            const ranges = try alloc.alloc(metadata_table_manager.RangeRecord, 1);
+            errdefer alloc.free(ranges);
+            ranges[0] = try metadata_table_manager.cloneRange(alloc, .{
+                .group_id = 7001,
+                .table_id = 7,
+                .start_key = "",
+                .end_key = null,
+                .restore_backup_id = "backup",
+                .restore_location = "file:///backup",
+                .restore_snapshot_path = "groups/1.afb",
+                .restore_artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                .restore_native_manifest_size_bytes = 123,
+                .restore_native_manifest_sha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            });
+            return .{ .metadata_incarnation = null, .catalog_revision = 1, .tables = tables, .ranges = ranges };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var reader: CatalogProjectionReader = .{};
+    defer reader.deinit(alloc);
+    const source: CatalogProjectionReader.Source = .{ .ptr = undefined, .vtable = &.{ .ensure_listener_registered = Source.ensureListener, .catalog_epoch = Source.epoch, .capture_projection = Source.capture } };
+    var point = try reader.tableRoutingSnapshot(alloc, 1, source, "docs", null);
+    defer reader.freeRoutingSnapshot(alloc, &point);
+    try std.testing.expectEqualStrings("backup", point.ranges[0].restore_backup_id);
+    try std.testing.expectEqualStrings("file:///backup", point.ranges[0].restore_location);
+    try std.testing.expectEqualStrings("groups/1.afb", point.ranges[0].restore_snapshot_path);
+    try std.testing.expectEqual(@as(u64, 123), point.ranges[0].restore_native_manifest_size_bytes);
+    try std.testing.expectEqual(@as(usize, 64), point.ranges[0].restore_artifact_sha256.len);
+    try std.testing.expectEqual(@as(usize, 64), point.ranges[0].restore_native_manifest_sha256.len);
+    var compact = try reader.routingSnapshot(alloc, 1, source, null);
+    defer reader.freeRoutingSnapshot(alloc, &compact);
+    try std.testing.expectEqualStrings("", compact.ranges[0].restore_backup_id);
 }
 
 test "catalog projection churn returns coherent snapshots and only caches stable captures" {

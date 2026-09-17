@@ -451,6 +451,7 @@ pub const Status = enum(u32) {
     read_index_timeout = 493,
     incomplete_published_snapshot = 494,
     distributed_query_unavailable = 495,
+    table_topology_protocol_upgrade_required = 496,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

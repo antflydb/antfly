@@ -97,7 +97,7 @@ jobs:
       - name: Test production transport, runtime scheduling, and determinism boundaries
         working-directory: zig
         run: |
-          zig build antfly-raft-transport-test standby-vopr-test vopr-runtime-test vopr-determinism-audit \
+          zig build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test vopr-determinism-audit \
             -Doptimize=ReleaseSafe -j1 --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
 
@@ -341,7 +341,17 @@ jobs:
         run: |
           scripts/ci/zig-e2e-autograph-soak.sh \
             2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/autograph.log"
+      - name: Soak three by three cluster backup delete and restore
+        timeout-minutes: 90
+        if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
+        env:
+          ANTFLY_E2E_REGRESSION_WORKERS: '2'
+          ANTFLY_E2E_REGRESSION_REPORT_DIR: ${{ runner.temp }}/production-e2e-soak/cluster-restore
+        run: |
+          scripts/ci/zig-e2e-cluster-restore-soak.sh \
+            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/cluster-restore.log"
       - name: Verify complete production soak evidence
+        if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
         working-directory: zig
         run: |
           sha256sum -c "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
@@ -366,6 +376,14 @@ jobs:
               assert Counter(case.attrib["name"] for case in cases) == {
                   "test_multinode_autograph_resolves_promotes_and_hydrates_entities": 50,
                   "test_multinode_autograph_recovers_after_data_restart": 50,
+              }, profile
+              assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
+          for profile in ("normal", "constrained"):
+              reports = list((Path(os.environ["RUNNER_TEMP"]) / "production-e2e-soak/cluster-restore" / profile).glob("*.xml"))
+              assert len(reports) == 50, ("cluster-restore", profile, len(reports))
+              cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
+              assert Counter(case.attrib["name"] for case in cases) == {
+                  "test_three_by_three_cluster_backup_restore_through_metadata_public_api": 50,
               }, profile
               assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
           PY

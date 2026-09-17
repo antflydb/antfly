@@ -4257,6 +4257,32 @@ pub fn storageOwnerOpen(
         null;
     const owner_context = asStorageOwnerContext(request.context);
     const alloc = if (owner_context) |context| context.alloc else std.heap.c_allocator;
+    // A metadata restore intent can become visible before Raft bootstrap has
+    // imported this replica. Do not create an empty DB and retain its reader
+    // lease: that would prevent bootstrap from ever publishing the import.
+    // Pin the validated generation until DB.open acquires its own read lease.
+    var restore_io_impl: std.Io.Threaded = undefined;
+    var owns_restore_io = false;
+    defer if (owns_restore_io) restore_io_impl.deinit();
+    var restore_lease: ?db_mod.generation_lifecycle.ReadLease = null;
+    defer if (restore_lease) |*lease| lease.deinit();
+    if (request.restore.required != 0) {
+        const io = if (owner_context) |context|
+            context.backend_runtime.ptr().filesystemIo() orelse return storageOwnerStatusFromError(error.BackendRuntimeIoUnavailable)
+        else io: {
+            restore_io_impl = std.Io.Threaded.init(alloc, .{});
+            owns_restore_io = true;
+            break :io restore_io_impl.io();
+        };
+        restore_lease = @import("../storage/restore_admission.zig").acquire(alloc, io, path, request.group_id, .{
+            .backup_id = request.restore.backup_id.slice(),
+            .location = request.restore.location.slice(),
+            .snapshot_path = request.restore.snapshot_path.slice(),
+            .artifact_sha256 = request.restore.artifact_sha256.slice(),
+            .native_manifest_size_bytes = request.restore.native_manifest_size_bytes,
+            .native_manifest_sha256 = request.restore.native_manifest_sha256.slice(),
+        }) catch |err| return storageOwnerStatusFromError(err);
+    }
     if ((request.target_observer.ctx == null) != (request.target_observer.notify == null))
         return .invalid_argument;
     const recovery_config = request.transaction_recovery;

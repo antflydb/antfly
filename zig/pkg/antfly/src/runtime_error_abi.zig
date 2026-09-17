@@ -393,6 +393,7 @@ pub const Detail = enum(c_int) {
     read_index_timeout,
     incomplete_published_snapshot,
     distributed_query_unavailable,
+    table_topology_protocol_upgrade_required,
 };
 
 pub const Status = extern struct {
@@ -452,6 +453,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.HAReadWaitForMetadata => status(.retryable, .ha_read_wait_for_metadata),
         error.StorageBusy => status(.retryable, .storage_busy),
         error.DistributedQueryUnavailable => status(.retryable, .distributed_query_unavailable),
+        error.TableTopologyProtocolUpgradeRequired => status(.retryable, .table_topology_protocol_upgrade_required),
         error.StorageReadTemporarilyUnavailable => status(.retryable, .storage_read_temporarily_unavailable),
         error.PersistentDescriptorAdmissionExhausted => status(.retryable, .persistent_descriptor_admission_exhausted),
         error.ResourceRequestTooLarge => status(.invalid_argument, .resource_request_too_large),
@@ -878,6 +880,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .read_requires_primary => "ReadRequiresPrimary",
         .storage_busy => "StorageBusy",
         .distributed_query_unavailable => "DistributedQueryUnavailable",
+        .table_topology_protocol_upgrade_required => "TableTopologyProtocolUpgradeRequired",
         .storage_read_temporarily_unavailable => "StorageReadTemporarilyUnavailable",
         .resource_request_too_large => "ResourceRequestTooLarge",
         .resource_temporarily_unavailable => "ResourceTemporarilyUnavailable",
@@ -1171,7 +1174,7 @@ test "transaction capacity rejection retains a permanent public status" {
 }
 
 test "stable status preserves public boundary semantics" {
-    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable }) |err| {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable, error.TableTopologyProtocolUpgradeRequired }) |err| {
         const readiness = statusFromError(err);
         try std.testing.expectEqual(@intFromEnum(Code.retryable), readiness.code);
         try std.testing.expectEqual(err, errorFromStatus(readiness));

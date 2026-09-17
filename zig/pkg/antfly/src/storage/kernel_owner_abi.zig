@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 55;
+pub const abi_version: u32 = 56;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -938,6 +938,17 @@ pub const TargetObserver = extern struct {
     notify: ?TargetAdvanceFn = null,
 };
 
+pub const RestoreAdmission = extern struct {
+    required: u8 = 0,
+    _reserved: [7]u8 = @splat(0),
+    backup_id: BorrowedBytes = .{},
+    location: BorrowedBytes = .{},
+    snapshot_path: BorrowedBytes = .{},
+    artifact_sha256: BorrowedBytes = .{},
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: BorrowedBytes = .{},
+};
+
 pub const OpenRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -957,6 +968,7 @@ pub const OpenRequest = extern struct {
     target_observer: TargetObserver = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},
     runtime_hooks: RuntimeHooksConfig = .{},
+    restore: RestoreAdmission = .{},
 };
 
 pub const JsonOperationRequest = extern struct {

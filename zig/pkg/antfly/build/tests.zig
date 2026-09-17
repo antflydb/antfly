@@ -3470,6 +3470,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const provisioning_startup_vopr_test_step = b.step("provisioning-startup-vopr-test", "Run startup admission, provisioning, retry, and crash histories on VoprIo");
     provisioning_startup_vopr_test_step.dependOn(&run_provisioning_startup_vopr_tests.step);
 
+    const restore_admission_vopr_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "restore admission VOPR exact replays", "catalog projection point reads retain restore admission identity" },
+    });
+    const run_restore_admission_vopr_tests = b.addRunArtifact(restore_admission_vopr_tests);
+    const restore_admission_vopr_test_step = b.step("restore-admission-vopr-test", "Run three by three restore import and owner admission interleavings on VoprIo");
+    restore_admission_vopr_test_step.dependOn(&run_restore_admission_vopr_tests.step);
+
     const generation_lifecycle_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"generation lifecycle VOPR exact replays"},
@@ -3761,6 +3769,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     vopr_test_step.dependOn(&run_distributed_query_vopr_tests.step);
     vopr_test_step.dependOn(&run_parquet_cache_vopr_tests.step);
     vopr_test_step.dependOn(&run_provisioning_startup_vopr_tests.step);
+    vopr_test_step.dependOn(&run_restore_admission_vopr_tests.step);
     vopr_test_step.dependOn(&run_generation_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_backfill_marker_discovery_vopr_tests.step);
     vopr_test_step.dependOn(&run_config_extension_lifecycle_vopr_tests.step);

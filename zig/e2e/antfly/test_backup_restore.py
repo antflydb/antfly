@@ -1660,7 +1660,10 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     assert len(original_group_ids) == 3
 
     deleted = session.delete(f"{data_api_url}/tables/{table_name}", timeout=30)
-    assert deleted.status_code == 204, f"delete={deleted.text}\n{cluster.debug_logs()}"
+    assert deleted.status_code == 204 or (
+        deleted.status_code == 202
+        and deleted.json().get("status") == "committed_repair_required"
+    ), f"delete={deleted.text}\n{cluster.debug_logs()}"
     assert wait_until(
         lambda: (
             cluster.table_absent_on_all_metadata_nodes(
@@ -1681,19 +1684,40 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         "connection": BACKUP_CONNECTION,
         "restore_mode": "fail_if_exists",
     }
-    for _ in range(3):
+    # A lost admission acknowledgement is not a rejected restore. Reuse one
+    # explicit key through leader changes so recovery cannot create two jobs.
+    restore_headers = {"Idempotency-Key": f"restore-{backup_id}"}
+    unknown_job_id = None
+
+    def admit_restore() -> requests.Response | None:
+        nonlocal last_response, restore_coordinator_url, unknown_job_id
         leader_public_url = cluster.metadata_leader_public_url(timeout_s=30.0)
-        response = session.post(
-            f"{leader_public_url}/restore",
-            json=restore_payload,
-            timeout=30,
-        )
+        try:
+            response = session.post(
+                f"{leader_public_url}/restore",
+                json=restore_payload,
+                headers=restore_headers,
+                timeout=10,
+            )
+        except requests.RequestException:
+            return None
+        last_response = response
         if _is_metadata_not_leader_response(response):
-            last_response = response
-            continue
-        restore_response = response
+            return None
+        if response.status_code == 503:
+            body = response.json()
+            assert body.get("admission_outcome") == "unknown", response.text
+            if unknown_job_id is not None:
+                assert body["job_id"] == unknown_job_id, response.text
+            unknown_job_id = body["job_id"]
+            return None
+        assert response.status_code == 202, response.text
+        if unknown_job_id is not None:
+            assert response.json()["job_id"] == unknown_job_id, response.text
         restore_coordinator_url = leader_public_url
-        break
+        return response
+
+    restore_response = wait_until(admit_restore, timeout_s=60.0, interval_s=0.5)
     assert restore_response is not None, (
         "metadata leader stayed unavailable for restore after retries; "
         f"last_response={last_response.text if last_response is not None else None}\n"
@@ -1704,6 +1728,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     accepted = _check_response(restore_response)
     job_id = accepted.get("job_id")
     assert isinstance(job_id, str) and job_id
+    last_jobs = {}
 
     def terminal_restore() -> dict | None:
         cluster.assert_processes_alive()
@@ -1723,16 +1748,17 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
             if response.status_code == 503:
                 continue
             job = _check_response(response)
-            return (
-                job
-                if job.get("phase") in {"succeeded", "failed", "cancelled"}
-                else None
-            )
+            last_jobs[api_url] = job
+            if job.get("phase") in {"succeeded", "failed", "cancelled"}:
+                return job
         return None
 
     restore_job = wait_until(terminal_restore, timeout_s=120.0, interval_s=0.1)
+    if restore_job is None:
+        cluster.metadata_snapshots()
     assert restore_job is not None, (
-        f"restore job {job_id} did not finish\n{cluster.debug_logs()}"
+        f"restore job {job_id} did not finish; last_jobs={last_jobs!r}\n"
+        f"{cluster.debug_logs()}"
     )
     assert restore_job["phase"] == "succeeded", (
         f"restore={restore_job}\n{cluster.debug_logs()}"
