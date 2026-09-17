@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! End-to-end LSM lifecycle and standby contracts, plus reproducible work counts.
 const std = @import("std");
 const db_mod = @import("mod.zig");
@@ -1759,6 +1771,55 @@ test "relational index system standby replays schema churn and rebuilds ready ge
     try std.testing.expectEqual(@as(usize, 3), (try scan(&replica, true)).count);
 }
 
+test "relational index system primary prefix scans preserve snapshots bounds and failed pages" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("primary-prefix-scan");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try install(&db, 1, true);
+    const keys = [_][]const u8{ "a", "a\x00", "a\x00\xff", "aa", "\xff", "\xff\x00" };
+    for (keys) |key| try db.batch(.{ .writes = &.{.{ .key = key, .value = "{\"tenant\":1,\"id\":1}" }} });
+    // A leftover companion with no primary must consume only one work unit.
+    const orphan = try internal.relationalRowKeyAlloc(alloc, "0-orphan");
+    defer alloc.free(orphan);
+    orphan[orphan.len - 1] = internal.relational_row_kind + 1;
+    try db.core.store.put(orphan, "orphan");
+    var reader = try db.beginRelationalRows(alloc, .{ .fields = &.{"id"} });
+    defer reader.deinit();
+    var bounded = try db.beginRelationalRows(alloc, .{ .fields = &.{"id"}, .primary_lower = .{ .key = "a", .inclusive = false }, .primary_upper = .{ .key = "\xff", .inclusive = true } });
+    defer bounded.deinit();
+    try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"tenant\":1,\"id\":2}" }, .{ .key = "z", .value = "{\"tenant\":1,\"id\":3}" } }, .deletes = &.{"aa"} });
+    var none: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&none);
+    try std.testing.expectError(error.OutOfMemory, reader.nextPage(fixed.allocator(), null, .{ .records = 1 }));
+    try std.testing.expectEqual(@as(usize, 0), reader.after.items.len);
+    {
+        var empty = try reader.nextPage(alloc, null, .{ .records = 1 });
+        defer empty.deinit();
+        try std.testing.expect(empty.more and empty.rows.len == 0 and empty.records_examined == 1);
+    }
+    try std.testing.expectError(error.RelationalRowResultTooLarge, reader.nextPage(alloc, null, .{ .output_bytes = 1 }));
+    var count: usize = 0;
+    var examined: usize = 1;
+    while (true) {
+        var page = try reader.nextPage(alloc, null, .{ .records = 1 });
+        defer page.deinit();
+        for (page.rows) |row| {
+            try std.testing.expectEqualStrings(keys[count], row.key);
+            try std.testing.expectEqualStrings("{\"id\":1}", row.json);
+            count += 1;
+        }
+        examined += page.records_examined;
+        if (!page.more) break;
+    }
+    try std.testing.expectEqual(keys.len, count);
+    try std.testing.expectEqual(keys.len + 1, examined);
+    var page = try bounded.nextPage(alloc, null, .{ .time_ns = std.time.ns_per_s });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 4), page.rows.len);
+    for (page.rows, keys[1..5]) |row, key| try std.testing.expectEqualStrings(key, row.key);
+}
+
 test "relational index system LSM build work is linear in rows times indexes" {
     const jobs = @import("relational_index_jobs.zig");
     const count = 64;
@@ -1781,6 +1842,10 @@ test "relational index system LSM build work is linear in rows times indexes" {
             try item.object.put(owned, "name", .{ .string = try std.fmt.allocPrint(owned, "index_{d}", .{i}) });
             try indexes.array.append(item);
         }
+        const checked = try std.json.parseFromSliceLeaky(std.json.Value, owned, "[{\"name\":\"nonnegative\",\"column\":\"id\",\"op\":\"gte\",\"value\":0}]", .{});
+        try parsed.value.object.put(owned, "checks", checked);
+        // object.put can relocate its entries; retain the array value itself.
+        const definitions = parsed.value.object.get("relational_indexes").?.array.items;
         const declaration = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
         defer alloc.free(declaration);
         try db.setSchemaJson(alloc, declaration);
@@ -1796,7 +1861,7 @@ test "relational index system LSM build work is linear in rows times indexes" {
         db = try db_mod.DB.open(alloc, directory.path(), options);
         const started = time.monotonicNs();
         var examined: usize = 0;
-        for (indexes.array.items) |item| {
+        for (definitions) |item| {
             const name = item.object.get("name").?.string;
             var target_examined: usize = 0;
             for (0..256) |_| {
@@ -1810,7 +1875,43 @@ test "relational index system LSM build work is linear in rows times indexes" {
             examined += target_examined;
         }
         try std.testing.expectEqual(3 * count * index_count, examined);
-        std.debug.print("LSM generation-local build indexes={d} rows={d} examined={d} elapsed_us={d}\n", .{ index_count, count, examined, (time.monotonicNs() - started) / 1000 });
+        const build_elapsed = time.monotonicNs() - started;
+        var primary_rows: usize = 0;
+        var primary_records: usize = 0;
+        {
+            var primary_reader = try db.beginRelationalRows(alloc, .{ .fields = &.{"id"} });
+            defer primary_reader.deinit();
+            while (true) {
+                var page = try primary_reader.nextPage(alloc, std.testing.io, .{ .rows = 1, .records = 1 });
+                defer page.deinit();
+                primary_rows += page.rows.len;
+                primary_records += page.records_examined;
+                if (!page.more) break;
+            }
+        }
+        try std.testing.expectEqual(count, primary_rows);
+        try std.testing.expectEqual(count, primary_records);
+        const checks = @import("relational_constraint_jobs.zig");
+        var check_records: usize = 0;
+        while (try checks.Page.prepare(alloc, std.testing.io, db.core, .{ .records = 7 })) |prepared| {
+            {
+                var page = prepared;
+                defer page.deinit();
+                check_records += page.records_examined;
+                try page.commit(db.core);
+            }
+            // CHECK continuation is durable and resumes after the whole family.
+            db.close();
+            db = try db_mod.DB.open(alloc, directory.path(), options);
+        }
+        try std.testing.expectEqual(count, check_records);
+        for (0..256) |_| {
+            _ = try db.runRelationalIndexMaintenancePass();
+            if (!db.relational_index_maintenance_sweep.isPending()) break;
+        } else return error.MaintenanceDidNotBecomeIdle;
+        try std.testing.expect(!try db.runRelationalIndexMaintenancePass() or index_count > 16);
+        std.debug.print("LSM primary/CHECK scans indexes={d} rows={d} primary_records={d} check_records={d}\n", .{ index_count, count, primary_records, check_records });
+        std.debug.print("LSM generation-local build indexes={d} rows={d} examined={d} elapsed_us={d}\n", .{ index_count, count, examined, build_elapsed / 1000 });
     }
 }
 

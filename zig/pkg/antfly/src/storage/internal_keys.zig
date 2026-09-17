@@ -252,6 +252,19 @@ pub fn findComponentTerminator(key: []const u8, start: usize) ?usize {
     return null;
 }
 
+/// Exclusive cut after one document's complete physical key family. The
+/// terminator ends in zero, so incrementing its final byte cannot overflow or
+/// skip a logical key extending this one (including embedded NUL/0xff bytes).
+/// `key` must not alias `out`; callers can reuse the buffer across cursor seeks.
+pub fn documentPrefixSuccessor(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8) ![]const u8 {
+    if (key.len == 0 or key[0] != user_namespace) return error.InvalidInternalUserKey;
+    const end = (findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey) + 2;
+    try out.resize(alloc, end);
+    @memcpy(out.items, key[0..end]);
+    out.items[end - 1] = 1;
+    return out.items;
+}
+
 pub fn decodeBodyAlloc(alloc: Allocator, body: []const u8) ![]u8 {
     var out = try alloc.alloc(u8, maxDecodedLen(body));
     errdefer alloc.free(out);

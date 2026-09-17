@@ -1307,3 +1307,21 @@ so this optimization does not abandon repair after a lost companion. Retired
 generations use their own bounded GC jobs. A persisted-LSM regression with
 64 rows and 1/8/32 populated indexes asserts exactly 192 scan records per index
 across all three phases, independent of unrelated generation count.
+
+Primary typed-row scans and local CHECK validation now share the physical
+document-prefix successor rule as well. Each step visits one document family,
+probes the exact primary if a companion sorts first, and seeks past all remaining
+companions. Logical key extensions (including embedded NUL and 0xff) are not
+skipped. Reader continuation remains failure-atomic and snapshot-local; CHECK
+progress remains durable, with invalid-row publication guarding the exact primary
+bytes. Persisted-LSM work-count tests cover 1/8/32 indexes, single-record pages,
+orphan companions, bounded scans, concurrent mutations, OOM/oversized-page retries,
+and validation restarts.
+
+The index maintenance scheduler retains a catalog/namespace-bound sweep across
+time- and entry-limited slices, rather than treating a catalog larger than one
+slice as perpetual backlog. A complete clean sweep returns to the idle cadence.
+Atomic wake tickets preserve repair requests arriving during clean publication;
+round-robin position survives wakeups and transient failures. Only catalog or
+namespace changes invalidate ordinal position. Concurrent background passes are
+coalesced without waiting, and restore projection work uses an independent cursor.

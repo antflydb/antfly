@@ -116,6 +116,7 @@ pub const Page = struct {
     expected: ?[]const u8,
     next: Progress,
     failed_hash: ?Digest,
+    records_examined: usize = 0,
     consumed: bool = false,
 
     pub fn deinit(self: *Page) void {
@@ -156,20 +157,30 @@ pub const Page = struct {
         var after = std.ArrayList(u8).empty;
         defer after.deinit(alloc);
         try after.appendSlice(alloc, progress.cursor);
+        var successor = std.ArrayList(u8).empty;
+        defer successor.deinit(alloc);
+        var primary = std.ArrayList(u8).empty;
+        defer primary.deinit(alloc);
         var failed_hash: ?Digest = null;
         var exhausted = true;
         const started = time.monotonicNs();
-        var entry = try cursor.seekAtOrAfter(if (progress.cursor.len == 0) lower else progress.cursor);
-        while (entry) |kv| : (entry = try cursor.next()) {
+        var entry = try cursor.seekAtOrAfter(if (progress.cursor.len == 0) lower else try internal.documentPrefixSuccessor(alloc, &successor, progress.cursor));
+        while (entry) |kv| : (entry = try cursor.seekAtOrAfter(try internal.documentPrefixSuccessor(alloc, &successor, after.items))) {
             if (io) |runtime_io| try runtime_io.checkCancel();
             if (progress.cursor.len != 0 and std.mem.order(u8, kv.key, progress.cursor) != .gt) continue;
             if (std.mem.order(u8, kv.key, upper) != .lt) break;
             inspected += 1;
-            bytes +|= kv.key.len +| kv.value.len;
+            bytes +|= kv.key.len;
             after.clearRetainingCapacity();
             try after.appendSlice(alloc, kv.key);
-            if (internal.isRelationalRowKey(kv.key)) {
-                const version = try codec.rowSchemaVersion(kv.value);
+            const end = (internal.findComponentTerminator(kv.key, 1) orelse return error.InvalidInternalUserKey) + 2;
+            try primary.resize(alloc, end + 1);
+            @memcpy(primary.items[0..end], kv.key[0..end]);
+            primary.items[end] = internal.relational_row_kind;
+            const value = if (std.mem.eql(u8, primary.items, kv.key)) kv.value else try optional(&read, primary.items);
+            if (value) |raw| {
+                bytes +|= raw.len;
+                const version = try codec.rowSchemaVersion(raw);
                 if (source == null or source.?.version() != version) {
                     if (source) |*old| old.release();
                     source = null;
@@ -182,12 +193,16 @@ pub const Page = struct {
                         break :historical registry.SchemaView{ .epoch = try registry.Epoch.createOwned(alloc, table) };
                     };
                 }
-                const row = try codec.ordinalRowView(kv.value, source.?.tableSchema().*, source.?.physicalLayout());
+                const row = try codec.ordinalRowView(raw, source.?.tableSchema().*, source.?.physicalLayout());
                 progress.rows_scanned = try std.math.add(u64, progress.rows_scanned, 1);
                 if (try checks.firstFailureRow(alloc, row)) |failure| {
                     progress.state = .invalid;
                     progress.failed_check = @intCast(failure.index);
-                    failed_hash = digest(kv.value);
+                    failed_hash = digest(raw);
+                    // Failure publication guards the primary, not whichever
+                    // companion happened to be first in physical order.
+                    after.clearRetainingCapacity();
+                    try after.appendSlice(alloc, primary.items);
                     break;
                 }
             }
@@ -199,7 +214,7 @@ pub const Page = struct {
         if (failed_hash == null) progress.state = if (exhausted) .enforced else .validating;
         progress.cursor = if (progress.state == .enforced) "" else try page_alloc.dupe(u8, after.items);
         transferred = true;
-        return .{ .arena = arena, .view = view, .namespace_generation = namespace_generation, .expected = expected, .next = progress, .failed_hash = failed_hash };
+        return .{ .arena = arena, .view = view, .namespace_generation = namespace_generation, .expected = expected, .next = progress, .failed_hash = failed_hash, .records_examined = inspected };
     }
 
     /// Caller holds apply-exclusive and snapshot/HA mutation admission.

@@ -5295,7 +5295,7 @@ pub const DB = struct {
     relational_columns_rebuild_requested: std.atomic.Value(bool) = .init(false),
     relational_column_maintenance: relational_columns.Maintenance = .{},
     relational_index_maintenance_cursor: std.atomic.Value(usize) = .init(0),
-    relational_index_maintenance_pending: std.atomic.Value(bool) = .init(false),
+    relational_index_maintenance_sweep: @import("relational_index_maintenance_sweep.zig").Sweep = .{},
     relational_index_retry_after_ns: std.atomic.Value(u64) = .init(0),
     artifact_metadata_retry_after_ns: u64 = 0,
     artifact_repair_metadata_due_ns: u64 = 0,
@@ -5550,7 +5550,7 @@ pub const DB = struct {
         }
         try txn.delete(relational_constraint_jobs.progress_key);
         try txn.commit();
-        self.relational_index_maintenance_pending.store(true, .release);
+        self.relational_index_maintenance_sweep.request();
         self.relational_index_retry_after_ns.store(0, .release);
         return true;
     }
@@ -5643,7 +5643,7 @@ pub const DB = struct {
         defer self.alloc.free(encoded_progress);
         try txn.put(&relational_index_jobs.progressKey(index.id()), encoded_progress);
         try txn.commit();
-        self.relational_index_maintenance_pending.store(true, .release);
+        self.relational_index_maintenance_sweep.request();
         self.relational_index_retry_after_ns.store(0, .release);
         return true;
     }
@@ -10133,7 +10133,7 @@ pub const DB = struct {
         defer if (maintenance_attempted) {
             // Only a scheduling hint: the worker re-reads durable desired state.
             // Also wake on an ambiguous result after the store committed.
-            self.relational_index_maintenance_pending.store(true, .release);
+            self.relational_index_maintenance_sweep.request();
             self.relational_index_retry_after_ns.store(0, .release);
         };
         for (req.writes) |write| if (relational_index_catalog.Controller.isReservedMetadataKey(write.key)) {
@@ -31155,7 +31155,7 @@ pub const DB = struct {
         const artifact_active = self.artifact_repair_metadata_pending or
             (if (self.source_vectors.load(.acquire)) |source| source.collectionPending() else false);
         const active = (self.independentMaintenanceNowNs() >= self.artifact_metadata_retry_after_ns and artifact_active) or
-            (self.relational_index_maintenance_pending.load(.acquire) and platform_time.monotonicNs() >= self.relational_index_retry_after_ns.load(.acquire)) or
+            (self.relational_index_maintenance_sweep.isPending() and platform_time.monotonicNs() >= self.relational_index_retry_after_ns.load(.acquire)) or
             (self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire));
         const scan_pause = if (self.source_vectors.load(.acquire)) |source| source.activeScanPauseNs() else null;
         if (self.source_vectors.load(.acquire)) |source| if (source.background_checkpoint and scan_pause == null and !active) return 50;
@@ -31191,33 +31191,40 @@ pub const DB = struct {
         if (self.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
         const started = platform_time.monotonicNs();
         if (started < self.relational_index_retry_after_ns.load(.acquire)) return false;
-        errdefer self.relational_index_retry_after_ns.store(platform_time.monotonicNs() +| artifact_repair_metadata_poll_ns, .release);
+        const sweep = &self.relational_index_maintenance_sweep;
+        if (!sweep.enter()) return false;
+        defer sweep.leave();
+        errdefer {
+            sweep.failed();
+            self.relational_index_retry_after_ns.store(platform_time.monotonicNs() +| artifact_repair_metadata_poll_ns, .release);
+        }
         const validated = try self.validateConstraintsStep(.{});
         var pinned = self.core.relational_indexes.acquire() orelse {
-            self.relational_index_maintenance_pending.store(validated, .release);
+            sweep.empty(validated);
             return validated;
         };
         defer pinned.deinit();
         const collected = try self.collectRelationalIndexGarbageStep();
         const indexes = pinned.plan.boundIndexes();
+        sweep.begin(pinned.head, self.core.schemaNamespaceGeneration(), indexes.len);
         if (indexes.len == 0) {
-            self.relational_index_maintenance_pending.store(collected or validated, .release);
+            sweep.empty(collected or validated);
             return collected or validated;
         }
         for (0..@min(indexes.len, 16)) |_| {
-            const next = self.relational_index_maintenance_cursor.fetchAdd(1, .monotonic) % indexes.len;
+            const next = sweep.next() orelse break;
             const name = indexes[next].name;
             if ((try self.relationalIndexBuildStatus(name)).state == .building) {
                 try self.buildRelationalIndexStep(name, .{});
-                self.relational_index_maintenance_pending.store(true, .release);
+                sweep.finish(true);
                 return true;
             }
             if (platform_time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) {
-                self.relational_index_maintenance_pending.store(true, .release);
+                sweep.finish(collected or validated);
                 return false;
             }
         }
-        self.relational_index_maintenance_pending.store(collected or validated or indexes.len > 16, .release);
+        sweep.finish(collected or validated);
         return collected or validated;
     }
 
@@ -36178,7 +36185,7 @@ pub const DB = struct {
         self.core.identity_namespace = namespace;
         // Coverage is bound to the durable namespace even when bounds stay
         // unchanged. Wake an idle worker after the new identity commits.
-        self.relational_index_maintenance_pending.store(true, .release);
+        self.relational_index_maintenance_sweep.request();
         self.relational_index_retry_after_ns.store(0, .release);
         if (self.transaction_recovery_identity_context) |ctx| ctx.updateIdentityNamespace(namespace);
     }

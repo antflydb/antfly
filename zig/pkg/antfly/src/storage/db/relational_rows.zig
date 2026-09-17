@@ -447,13 +447,16 @@ pub const Reader = struct {
         var continuation = std.ArrayList(u8).empty;
         defer continuation.deinit(alloc);
         try continuation.appendSlice(alloc, self.after.items);
+        var successor = std.ArrayList(u8).empty;
+        defer successor.deinit(alloc);
         var cursor = try self.read.openCursor();
         defer cursor.close();
         cursor.setUpperBound(self.upper);
-        var entry = try cursor.seekAtOrAfter(if (self.after.items.len == 0) self.lower else self.after.items);
+        const start = if (self.after.items.len == 0) self.lower else if (self.index != null) self.after.items else try internal.documentPrefixSuccessor(alloc, &successor, self.after.items);
+        var entry = try cursor.seekAtOrAfter(start);
         var exhausted = true;
         const started = time.monotonicNs();
-        while (entry) |kv| : (entry = try cursor.next()) {
+        while (entry) |kv| : (entry = if (self.index != null) try cursor.next() else try cursor.seekAtOrAfter(try internal.documentPrefixSuccessor(alloc, &successor, continuation.items))) {
             if (io) |runtime_io| try runtime_io.checkCancel();
             if (self.after.items.len != 0 and std.mem.order(u8, kv.key, self.after.items) != .gt) continue;
             if (std.mem.order(u8, kv.key, self.upper) != .lt) break;
@@ -469,13 +472,33 @@ pub const Reader = struct {
                 try key.append(temporary, internal.relational_row_kind);
                 if (std.mem.order(u8, key.items, self.owned_lower) == .lt or std.mem.order(u8, key.items, self.owned_upper) != .lt) break :blk null;
                 break :blk key.items;
-            } else if (internal.isRelationalRowKey(kv.key)) kv.key else null;
+            } else blk: {
+                // The first companion can sort before the primary row. Probe
+                // the exact primary once, then skip the entire document family.
+                if (internal.isRelationalRowKey(kv.key)) break :blk kv.key;
+                const end = (internal.findComponentTerminator(kv.key, 1) orelse return error.InvalidInternalUserKey) + 2;
+                const key = try temporary.alloc(u8, end + 1);
+                @memcpy(key[0..end], kv.key[0..end]);
+                key[end] = internal.relational_row_kind;
+                break :blk key;
+            };
             if (primary) |key| {
-                if (self.index != null and !self.index_only) result.primary_lookups += 1;
-                const raw = if (self.index_only) kv.value else if (self.index != null) self.read.get(key) catch |err| switch (err) {
-                    error.NotFound => return error.InvalidRelationalIndexForwardKey,
+                if (!self.index_only and !std.mem.eql(u8, key, kv.key)) result.primary_lookups += 1;
+                const raw = if (self.index_only or std.mem.eql(u8, key, kv.key)) kv.value else self.read.get(key) catch |err| switch (err) {
+                    error.NotFound => {
+                        if (self.index != null) return error.InvalidRelationalIndexForwardKey;
+                        // Orphan companions still consume one bounded unit of
+                        // work, but cannot force a scan through every artifact.
+                        continuation.clearRetainingCapacity();
+                        try continuation.appendSlice(alloc, kv.key);
+                        if (result.records_examined >= budget.records or time.monotonicNs() - started >= budget.time_ns) {
+                            exhausted = false;
+                            break;
+                        }
+                        continue;
+                    },
                     else => return err,
-                } else kv.value;
+                };
                 const row = if (self.index_only) try self.coveringView(kv.key, raw) else self.rowView(raw) catch |err| {
                     if (err == error.RelationalIndexColumnTypeMismatch) try self.observeFailedRow(key, raw);
                     return err;
