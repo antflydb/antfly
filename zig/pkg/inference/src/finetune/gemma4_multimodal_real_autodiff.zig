@@ -877,7 +877,7 @@ fn cachedProjectedMedia(
     errdefer allocator.free(owned_key);
     const projected = switch (kind) {
         .image => blk: {
-            var images = try gemma4_projector.encodeProjectedImages(ctx.compute_backend, allocator, ctx.gguf_projector_path, &.{bytes});
+            var images = try gemma4_projector.encodeProjectedImagesFromPath(ctx.compute_backend, allocator, ctx.gguf_projector_path, &.{bytes});
             defer images.deinit();
             if (images.tokens_per_image.len != 1) return error.InvalidPreparedPrompt;
             break :blk CachedProjectedMedia{
@@ -887,7 +887,7 @@ fn cachedProjectedMedia(
             };
         },
         .audio => blk: {
-            var audio = try gemma4_projector.encodeProjectedAudio(ctx.compute_backend, allocator, ctx.gguf_projector_path, &.{bytes});
+            var audio = try gemma4_projector.encodeProjectedAudioFromPath(ctx.compute_backend, allocator, ctx.gguf_projector_path, &.{bytes});
             defer audio.deinit();
             if (audio.tokens_per_audio.len != 1) return error.InvalidPreparedPrompt;
             break :blk CachedProjectedMedia{

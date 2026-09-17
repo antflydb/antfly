@@ -3403,6 +3403,9 @@ pub const NativeGenerationPipeline = struct {
     model_dir: ?[]const u8 = null,
     artifact_dir: ?[]const u8 = null,
     gguf_projector_path: ?[]const u8 = null,
+    /// The model's open projector file for Gemma media prompts. Null makes
+    /// the pipeline open (and parse) the projector for the request.
+    projector_store: ?*gemma4_projector.ProjectorStore = null,
     decode_state: ?*NativeDecodeState = null,
     scheduler: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     scheduler_lease: ?*runtime.scheduler.native_generate.Lease = null,
@@ -3805,13 +3808,19 @@ pub const NativeGenerationPipeline = struct {
                     decode_state.qwen3vl_mrope_position_delta = prepared_qwen3vl_prompt.?.plan.mrope_position_delta;
                     decode_state.qwen3vl_text_only = false;
                 } else {
+                    const request_projector = if (self.projector_store == null)
+                        try gemma4_projector.ProjectorStore.open(allocator, projector_path)
+                    else
+                        null;
+                    defer if (request_projector) |store| store.close();
+                    const projector = self.projector_store orelse request_projector.?;
                     var projected_images = if (images.len > 0)
-                        try gemma4_projector.encodeProjectedImages(&self.cb, allocator, projector_path, images)
+                        try gemma4_projector.encodeProjectedImages(&self.cb, allocator, projector, images)
                     else
                         null;
                     defer if (projected_images) |*projected| projected.deinit();
                     var projected_audio = if (audio_clips.len > 0)
-                        try gemma4_projector.encodeProjectedAudio(&self.cb, allocator, projector_path, audio_clips)
+                        try gemma4_projector.encodeProjectedAudio(&self.cb, allocator, projector, audio_clips)
                     else
                         null;
                     defer if (projected_audio) |*projected| projected.deinit();
@@ -5769,33 +5778,111 @@ pub const NativeGenerationPipeline = struct {
             _ = try decode_runtime.preparePrefill(seq_len, seq_len);
         }
 
-        const input_embeddings = prepared.input_embeddings orelse return error.InvalidPreparedPrompt;
+        const host_embeddings = prepared.input_embeddings orelse return error.InvalidPreparedPrompt;
         prepared.input_embeddings = null;
+        // The prompt embeddings were assembled on the host. The layer stack
+        // takes its fast, framed prefill route only for device-resident
+        // input, so upload once here instead of per op below.
+        const input_embeddings = try self.cb.ensureDeviceResidentOwned(host_embeddings);
+        // This owner keeps the rows only until the forward takes them.
+        var owns_input_embeddings = true;
+        errdefer if (owns_input_embeddings) self.cb.free(input_embeddings);
         // Match text prefill/decode lock order: scheduler turn, then model.
         // Both stay held until the backend forward and result copy complete.
         const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
         if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
         defer if (direct_execution_mutex) |mutex| mutex.unlock();
         const ple_token_ids = prepared.ple_token_ids orelse prepared.token_ids;
-        const ple_vectors = try gpt_arch.computePleVectors(&self.cb, self.allocator, self.gpt_config, ple_token_ids, input_embeddings, seq_len);
-        defer if (ple_vectors) |vectors| self.cb.free(vectors);
         var decode_context = decode_runtime.makeDecodeContext(seq_len, seq_len);
         decode_context.attn_or_mask = prepared.attn_or_mask;
-        const logits = try gpt_arch.forwardFromEmbeddings(
+        owns_input_embeddings = false;
+        const logits = try self.forwardPreparedEmbeddingsLastLogits(input_embeddings, ple_token_ids, seq_len, &decode_context);
+        errdefer self.allocator.free(logits);
+        if (self.scheduler) |scheduler| {
+            if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, seq_len, seq_len);
+        }
+        return logits;
+    }
+
+    /// Runs prepared prompt rows through the layer stack and returns the
+    /// last-row logits. Takes ownership of `input_embeddings`: the framed
+    /// Metal route borrows the rows (it copies them into its own hidden
+    /// buffer) and they are released here, while the generic forward
+    /// consumes them, freeing them on success and on error, so ownership
+    /// moves to it before that call. Only the last row feeds sampling:
+    /// projecting every prompt row through the vocabulary and softcapping it
+    /// on the host cost more than the layer stack for a media prompt.
+    fn forwardPreparedEmbeddingsLastLogits(
+        self: *NativeGenerationPipeline,
+        input_embeddings: ops.CT,
+        ple_token_ids: []const i64,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) ![]f32 {
+        var owns_input = true;
+        defer if (owns_input) self.cb.free(input_embeddings);
+        if (try self.tryMetalPreparedMultimodalPrefill(input_embeddings, ple_token_ids, seq_len, decode_context)) |logits| {
+            return logits;
+        }
+        const ple_vectors = try gpt_arch.computePleVectors(&self.cb, self.allocator, self.gpt_config, ple_token_ids, input_embeddings, seq_len);
+        defer if (ple_vectors) |vectors| self.cb.free(vectors);
+        owns_input = false;
+        return gpt_arch.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
             &self.cb,
             self.allocator,
             self.gpt_config,
             input_embeddings,
+            .{},
             1,
             seq_len,
-            &decode_context,
+            decode_context,
             ple_vectors,
         );
-        defer self.allocator.free(logits);
-        if (self.scheduler) |scheduler| {
-            if (self.scheduler_lease) |lease| scheduler.notePrefillProgress(lease, seq_len, seq_len);
-        }
-        return try self.allocator.dupe(f32, logits[(seq_len - 1) * self.gpt_config.vocab_size ..][0..self.gpt_config.vocab_size]);
+    }
+
+    /// The planned Gemma prefill frame for a media prompt: the same route
+    /// the token-id prefill takes, fed with the prepared embeddings, so the
+    /// whole layer stack runs as one command buffer instead of one
+    /// submission per op. Null leaves the embeddings untouched for the
+    /// generic forward.
+    fn tryMetalPreparedMultimodalPrefill(
+        self: *NativeGenerationPipeline,
+        input_embeddings: ops.CT,
+        ple_token_ids: []const i64,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+    ) !?[]f32 {
+        if (self.cb.kind() != .metal) return null;
+        if (decode_context.attention_mode != .paged_prefill or decode_context.attn_or_mask != null) return null;
+        if (!metalPreparedTailOwnsWholePrefill(ple_token_ids.len, seq_len, decode_context)) return null;
+        const prepared = self.cb.decoderRuntimePrepareOrReuseFamily(
+            self.allocator,
+            self.gpt_config,
+            seq_len,
+            self.gpt_config.num_hidden_layers,
+        ) catch return null;
+        if (!prepared.prepared) return null;
+        var rows = (try decoder_gated_runtime.forwardFinalHiddenRowsFromEmbeddings(
+            &self.cb,
+            self.allocator,
+            self.gpt_config,
+            self.gpt_config.num_hidden_layers,
+            input_embeddings,
+            ple_token_ids,
+            seq_len,
+            decode_context,
+        )) orelse return null;
+        defer rows.deinit(&self.cb);
+        const last_hidden = try self.cb.sliceRows2D(self.allocator, rows.final_hidden, rows.rows - 1, 1, self.gpt_config.hidden_size);
+        defer self.cb.free(last_hidden);
+        const lm_w = try gpt_arch.getLmHeadWeight(&self.cb, self.gpt_config);
+        defer self.cb.free(lm_w);
+        const last_logits_device = try self.cb.linearNoBias(last_hidden, lm_w, 1, self.gpt_config.hidden_size, self.gpt_config.vocab_size);
+        defer self.cb.free(last_logits_device);
+        const last_logits = try self.cb.toFloat32(last_logits_device, self.allocator);
+        gpt_arch.applyFinalLogitSoftcapInPlace(self.gpt_config, last_logits);
+        debugGenerationStage("multimodal prefill metal_prepared_frame rows={d}", .{rows.rows});
+        return last_logits;
     }
 
     fn executePreparedQwen3VlPrefill(
@@ -15235,4 +15322,113 @@ fn isPartitionPjrtEligible(
         if (!partition_mod.supportsPjrt(op)) return false;
     }
     return part.node_ids.len > 0;
+}
+
+const PreparedEmbeddingsTestModel = struct {
+    const native_compute = @import("../ops/native_compute.zig");
+    const tensor_mod = @import("../backends/tensor.zig");
+    const weight_source_mod = @import("../models/weight_source.zig");
+
+    store: native_compute.WeightStore,
+    compute: native_compute.NativeCompute,
+
+    fn init(self: *PreparedEmbeddingsTestModel, allocator: std.mem.Allocator) void {
+        self.store = .{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+        self.compute = native_compute.NativeCompute.init(allocator, &self.store, null);
+    }
+
+    fn deinit(self: *PreparedEmbeddingsTestModel, allocator: std.mem.Allocator) void {
+        self.compute.deinit();
+        native_compute.deinitPrefetchQueue(&self.store);
+        var it = self.store.resident_weights.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        self.store.resident_weights.deinit(allocator);
+        self.store.lazy_weights.deinit(allocator);
+    }
+
+    fn putWeight(self: *PreparedEmbeddingsTestModel, allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const f32) !void {
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+        var tensor = try tensor_mod.Tensor.initFloat32(allocator, owned_name, shape, data);
+        errdefer tensor.deinit();
+        try self.store.resident_weights.put(allocator, owned_name, weight_source_mod.LoadedWeight{ .tensor = tensor });
+    }
+
+    fn pipeline(self: *PreparedEmbeddingsTestModel, allocator: std.mem.Allocator, config: gpt_mod.Config) NativeGenerationPipeline {
+        return .{
+            .allocator = allocator,
+            .cb = self.compute.computeBackend(),
+            .gpt_config = config,
+            .tokenizer = undefined,
+        };
+    }
+};
+
+fn preparedEmbeddingsTestRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, rows: usize, hidden: usize) !ops.CT {
+    const data = try allocator.alloc(f32, rows * hidden);
+    defer allocator.free(data);
+    for (data, 0..) |*value, i| value.* = 0.25 + 0.01 * @as(f32, @floatFromInt(i % 7));
+    const shape = [_]i32{ @intCast(rows), @intCast(hidden) };
+    return cb.fromFloat32Shape(data, &shape);
+}
+
+// Ownership of the prepared rows on the generic (non-Metal) route: the
+// forward takes them, so a failure inside it must not leave the rows to
+// be freed twice, and a success must not leave them behind. The testing
+// allocator reports a leak or a double free either way.
+test "prepared embeddings prefill releases its rows once when the generic forward fails" {
+    const allocator = std.testing.allocator;
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(allocator);
+    defer model.deinit(allocator);
+    // Absolute positions cap the query rows at 2048 before any weight is
+    // touched, after the forward has already taken ownership.
+    var pipeline = model.pipeline(allocator, .{
+        .family = .llama,
+        .hidden_size = 4,
+        .vocab_size = 6,
+        .num_hidden_layers = 0,
+        .position_encoding = .absolute,
+    });
+    const rows: usize = 2049;
+    const input = try preparedEmbeddingsTestRows(&pipeline.cb, allocator, rows, 4);
+    const ids = try allocator.alloc(i64, rows);
+    defer allocator.free(ids);
+    @memset(ids, 1);
+    const decode_context = gpt_arch.DecodeContext{ .attention_mode = .full_recompute, .kv_sequence_len = rows, .total_sequence_len = rows, .query_sequence_len = rows };
+    try std.testing.expectError(error.SequenceTooLong, pipeline.forwardPreparedEmbeddingsLastLogits(input, ids, rows, &decode_context));
+}
+
+test "prepared embeddings prefill releases its rows once when the generic forward succeeds" {
+    const allocator = std.testing.allocator;
+    var model: PreparedEmbeddingsTestModel = undefined;
+    model.init(allocator);
+    defer model.deinit(allocator);
+    try model.putWeight(allocator, "model.norm.weight", &.{4}, &.{ 1.0, 1.0, 1.0, 1.0 });
+    try model.putWeight(allocator, "lm_head.weight", &.{ 6, 4 }, &.{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+        0.5, 0.5, 0.0, 0.0,
+        0.0, 0.0, 0.5, 0.5,
+    });
+    var pipeline = model.pipeline(allocator, .{
+        .family = .llama,
+        .hidden_size = 4,
+        .vocab_size = 6,
+        .num_hidden_layers = 0,
+        .position_encoding = .rope,
+    });
+    const rows: usize = 3;
+    const input = try preparedEmbeddingsTestRows(&pipeline.cb, allocator, rows, 4);
+    const ids = [_]i64{ 1, 2, 3 };
+    const decode_context = gpt_arch.DecodeContext{ .attention_mode = .full_recompute, .kv_sequence_len = rows, .total_sequence_len = rows, .query_sequence_len = rows };
+    const logits = try pipeline.forwardPreparedEmbeddingsLastLogits(input, &ids, rows, &decode_context);
+    defer allocator.free(logits);
+    try std.testing.expectEqual(@as(usize, 6), logits.len);
+    for (logits) |value| try std.testing.expect(std.math.isFinite(value));
 }
