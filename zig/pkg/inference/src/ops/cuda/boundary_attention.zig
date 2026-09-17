@@ -13,8 +13,8 @@ const forward_cubin = @embedFile("artifacts/gliner25_boundary_attention_forward.
 const backward_cubin = @embedFile("artifacts/gliner25_boundary_attention_backward.cubin");
 const forward_sm80 = @embedFile("artifacts/gliner25_boundary_attention_forward.sm80.cubin");
 const backward_sm80 = @embedFile("artifacts/gliner25_boundary_attention_backward.sm80.cubin");
-const forward_shared = 36352;
-const backward_shared = 53504;
+const forward_shared = 0;
+const backward_shared = 0;
 
 /// Hash actual embedded bytes once at trainer startup. Keeping the large
 /// images out of comptime evaluation bounds compiler memory without weakening
@@ -32,6 +32,7 @@ pub const Module = struct {
     backward: driver.CUfunction,
     bias: driver.CUfunction,
     delta: driver.CUfunction,
+    zero: driver.CUfunction,
 
     pub fn init(ctx: *Context) !Module {
         if (ctx.info.compute_major != 8) return error.CudaKernelUnavailable;
@@ -48,8 +49,7 @@ pub const Module = struct {
         const backward = try function(ctx, b, "boundary_backward");
         // The driver validates the device's opt-in shared-memory capacity.
         const set_attribute = ctx.driver.fns.cuFuncSetAttribute orelse return error.CudaSymbolMissing;
-        try ctx.driver.check(set_attribute(backward, 8, backward_shared));
-        return .{ .forward_module = f, .backward_module = b, .forward = forward, .backward = backward, .bias = try function(ctx, f, "boundary_bias"), .delta = try function(ctx, b, "boundary_delta32") };
+        return .{ .forward_module = f, .backward_module = b, .forward = forward, .backward = backward, .bias = try function(ctx, f, "boundary_bias"), .delta = try function(ctx, b, "boundary_delta32"), .zero = try function(ctx, f, "boundary_zero") };
     }
 
     pub fn deinit(self: *Module, ctx: *Context) void {
@@ -106,8 +106,12 @@ pub const Module = struct {
         try launch(ctx, self.bias, &bias_args, .{ @intCast(@divTrunc(layout.bias_elements + 255, 256)), 1, 1 }, .{ 256, 1, 1 }, 0);
         if (!backward) {
             var params = [_]?*anyopaque{ @ptrCast(&out_ptr), @ptrCast(&lse), @ptrCast(&packed_ptr), @ptrCast(&bias), @ptrCast(&batch), @ptrCast(&sequence), @ptrCast(&heads), @ptrCast(&columns) };
-            try launch(ctx, self.forward, &params, .{ (attrs.seq_len + 63) / 64, attrs.num_heads, attrs.batch }, .{ 32, 4, 1 }, forward_shared);
+            try launch(ctx, self.forward, &params, .{ (attrs.seq_len + 127) / 128, attrs.num_heads, attrs.batch }, .{ 128, 1, 1 }, forward_shared);
         } else {
+            var zero_ptr = out_ptr;
+            var zero_count: i32 = @intCast(layout.output_elements * 3);
+            var zero_args = [_]?*anyopaque{ @ptrCast(&zero_ptr), @ptrCast(&zero_count) };
+            try launch(ctx, self.zero, &zero_args, .{ @intCast((layout.output_elements * 3 + 255) / 256), 1, 1 }, .{ 256, 1, 1 }, 0);
             const delta_bytes: usize = @intCast(layout.delta_elements * 4);
             var delta = (try region(scratch, bias_bytes, delta_bytes)).ptr;
             const delta_padded = std.mem.alignForward(usize, delta_bytes, 16);
@@ -118,7 +122,7 @@ pub const Module = struct {
             // num_splits_key=1 and kernel window_size=0 (mask is in bias), so
             // the pinned kernel initializes its own query accumulation tiles.
             var params = [_]?*anyopaque{ @ptrCast(&out_ptr), @ptrCast(&forward_ptr), @ptrCast(&dy), @ptrCast(&lse), @ptrCast(&delta), @ptrCast(&packed_ptr), @ptrCast(&bias), @ptrCast(&workspace), @ptrCast(&batch), @ptrCast(&sequence), @ptrCast(&heads), @ptrCast(&columns) };
-            try launch(ctx, self.backward, &params, .{ 1, attrs.num_heads, attrs.batch }, .{ 128, 1, 1 }, backward_shared);
+            try launch(ctx, self.backward, &params, .{ (attrs.seq_len + 127) / 128, attrs.num_heads, attrs.batch }, .{ 128, 1, 1 }, backward_shared);
         }
     }
 };

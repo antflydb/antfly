@@ -94,10 +94,10 @@ VJP preserves scalar-power and derivative operation order from
 sigmoid forward/backward arithmetic follows
 `aten/src/ATen/native/cuda/UnarySpecialOpsKernel.cu` and
 `aten/src/ATen/native/cuda/BinaryMiscBackwardOpsKernels.cu` from that version.
-The training arithmetic evidence also includes reference copies of
+The training arithmetic was compared with
 `aten/src/ATen/native/cuda/Embedding.cu` and `EmbeddingBackwardKernel.cu`
-from PyTorch v2.9.1 under the same license, used to diagnose embedding-gradient
-accumulation order. The embedding-backward profile in the same CUDA training
+from PyTorch v2.9.1 under the same license to diagnose embedding-gradient
+accumulation order. No PyTorch source is copied into this repository. The embedding-backward profile in the same CUDA training
 artifact adapts their small-input chunk and large-input partial reduction
 orders, reusing native stable integer routing. The profiled fused AdamW kernel
 also adapts `aten/src/ATen/native/cuda/fused_adam_utils.cuh` from that pinned
@@ -192,52 +192,12 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## PyTorch/CUTLASS boundary training attention
+## GLiNER2.5 boundary attention
 
-The generated `gliner25_boundary_attention_{forward,backward}.{cubin,sm80.cubin}`
-artifacts instantiate PyTorch 2.9.1 efficient-attention headers (commit
-`5811a8d7da873dd699ff6687092c225caffcf1bb`) under the PyTorch license reproduced
-above, and NVIDIA CUTLASS commit `e51efbfe18fe4f4cbb66ab814c55bf4aa0185491`.
-The build makes a temporary copy of the PyTorch Philox state header with
-host/device constructor annotations. These are build dependencies only; no
-PyTorch host library is required at runtime. The applicable CUTLASS license is:
-
-```text
-Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: BSD-3-Clause
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-1. Redistributions of source code must retain the above copyright notice, this
-list of conditions and the following disclaimer.
-
-2. Redistributions in binary form must reproduce the above copyright notice,
-this list of conditions and the following disclaimer in the documentation
-and/or other materials provided with the distribution.
-
-3. Neither the name of the copyright holder nor the names of its
-contributors may be used to endorse or promote products derived from
-this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-Certain files within this repository are subject to separate licensing terms:
-
-- The files located in the `python/CuTeDSL` directory are licensed under the
-  NVIDIA End User License Agreement (EULA). Please refer to
-  https://docs.nvidia.com/cutlass/media/docs/pythonDSL/license.html
-  for the full terms.
-```
+The self-contained CUDA boundary-attention kernels are original Antfly code.
+Their FP32 masking, softmax, and gradient results were validated against the
+pinned PyTorch reference during development; no PyTorch, ATen, CUTLASS, or CUB
+source is included or required to build or run them.
 
 ## CUB deterministic scan arithmetic
 

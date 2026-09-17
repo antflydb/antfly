@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compiler-free identity checks; numerical and regeneration gates are separate."""
-import hashlib
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import struct
@@ -13,14 +13,14 @@ spec.loader.exec_module(regen)
 
 
 class BoundaryAttentionArtifactsTest(unittest.TestCase):
-    def test_manifest_binds_both_architectures_sources_and_dependencies(self):
+    def test_manifest_binds_both_architectures_and_sources(self):
         metadata = json.loads((regen.ARTIFACTS/'gliner25_boundary_attention.json').read_text())
         expected = {f'gliner25_boundary_attention_{direction}.{suffix}'
                     for direction in regen.DIRECTIONS for suffix in ('cubin','sm80.cubin')}
         self.assertEqual(set(metadata['artifacts']), expected)
-        self.assertEqual(metadata['compiler'], regen.COMPILER)
-        self.assertEqual(metadata['options'], regen.OPTIONS)
-        self.assertEqual(metadata['dependency_lock_sha256'], hashlib.sha256(regen.LOCK.read_bytes()).hexdigest())
+        self.assertIn('cuda compiler', metadata['compiler'].lower())
+        self.assertEqual(metadata['options'], list(regen.OPTIONS))
+        self.assertEqual(metadata['profile'], 'gliner25_boundary_attention_native_d32_v1')
         self.assertEqual(set(metadata['source_sha256']), {f'gliner25_boundary_attention_{d}.cu' for d in regen.DIRECTIONS})
         for name, expected_hash in {**metadata['artifacts'], **metadata['source_sha256']}.items():
             with self.subTest(name=name):

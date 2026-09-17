@@ -94,7 +94,7 @@ contract suite checks it without requiring NVRTC or a GPU. Regeneration
 verification remains a separate compiler-backed check.
 
 Zero-dropout D32 boundary attention has a separate resident forward/VJP profile
-using pinned PyTorch/CUTLASS efficient-attention kernels. Its ordinary tape
+using self-contained CUDA kernels. Its ordinary tape
 value saves output and log-sum-exp; bounded temporary storage covers padded
 bias, delta and backward accumulation. It requires only the CUDA driver at
 runtime. Compute capability 8.x uses compiled SM89 or SM80 images; other
@@ -102,20 +102,16 @@ architectures, head dimensions and nonzero probability dropout retain the
 existing materialized path. Both images have been checked on L4; that does not
 qualify other GPUs or sustained full-model training.
 
-Regeneration requires CUDA 13.2.78 and the matching build-only header trees:
+Regeneration requires only CUDA 13.2.78 and `nvcc`:
 
 ```sh
 python3 zig/pkg/inference/scripts/regen-cuda-boundary-attention.py --check \
-  --torch-include /path/to/pytorch-2.9.1/include \
-  --cutlass-include /path/to/cutlass-e51efbfe18fe/include \
-  --curand-include /path/to/cuda-12-curand/include
+  --cuda /usr/local/cuda-13.2
 python3 zig/pkg/inference/scripts/test_regen_cuda_boundary_attention.py
 ```
 
-Use `--write` to publish regenerated artifacts. The transitive dependency lock
-also pins host/toolkit headers; `--refresh-lock` is an intentional dependency
-change requiring renewed numerical qualification. The generator serializes a
-private workspace at `/tmp/antfly-gliner25-boundary-attention-build-v1` so NVCC
+Use `--write` to publish regenerated artifacts. The generator serializes a
+private workspace so NVCC
 private symbol names remain stable across checkout locations. It rejects an
 unsafe or foreign workspace. Artifact bytes are hashed at trainer startup and
 bound into checkpoint identity. Licensing is recorded in `THIRD_PARTY_NOTICES.md`.
@@ -198,10 +194,10 @@ Resume deliberately rejects checkpoints from incompatible earlier CUDA arithmeti
 contracts; CPU/Metal contracts are unchanged. CUDA full/heads training uses the
 pinned FP32 clipping norm, authoritative parameter registration order, and
 strict FP32 clipping-coefficient arithmetic. CUDA LoRA/DoRA retain their existing
-clipping profile pending separate adapter-order qualification. See the
-[training arithmetic follow-up](TRAINING_ARITHMETIC_FOLLOWUP.md) for implementation
-and exact evidence; the older [loss investigation](LOSS_PARITY_FOLLOWUP.md)
-records the earlier failures and rounding-sensitivity controls.
+clipping profile pending separate adapter-order qualification. The older
+[loss investigation](LOSS_PARITY_FOLLOWUP.md) records earlier failures and
+rounding-sensitivity controls; detailed campaign evidence is kept outside the
+source tree with the benchmark reports.
 
 The unchanged v36 trainer passes independent 100-update comparisons against
 eager Python CUDA for the small model, heads/full, microbatches two/eight,
@@ -229,8 +225,8 @@ at all 48 sampled states. Full/B2 reaches 18.56 versus 9.10 examples/s and full/
 Heads/B2 and heads/B8 paired speed estimates are 3.62x and 1.80x. The integrated
 suite passes 111 tests (three Metal-only skips), with clean memcheck, initcheck
 and racecheck. These results retain the same synthetic/deterministic scope;
-[the arithmetic follow-up](TRAINING_ARITHMETIC_FOLLOWUP.md) records confidence
-intervals, binary identities and remaining qualification work.
+external benchmark reports record confidence intervals, binary identities and
+remaining qualification work.
 
 The wider heads-training matrix found that cuBLAS runtime selection matters:
 128x768 weight-gradient products at larger batches differ between native cuBLAS
@@ -306,8 +302,8 @@ and does not change production qualification.
 python -m unittest discover -s zig/pkg/inference/scripts/gliner25 -p test_training_cuda_contract.py
 ```
 
-See [the optimization investigation](TRAINING_OPTIMIZATION.md) for the subsequent
-kernel changes, current measurements, numerical diagnosis and validation.
+The benchmark harness and external reports contain the current measurements,
+numerical diagnosis and validation details.
 
 ### L4 training measurements before optimization, 2026-09-15
 
