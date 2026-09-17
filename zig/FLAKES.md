@@ -29,13 +29,19 @@ preventing a check/open race. Missing or different imports yield retryable
 `StorageReadTemporarilyUnavailable` without creating a resident DB. Matching imports
 remain admissible while runtime repair is pending; requiring completed repair would
 create a second circular dependency. Ordinary owner cache hits do not acquire a new
-proof or read a marker. The internal storage-owner ABI advances to version 56.
+proof or read a marker. A cached owner with a different or absent admitted restore
+binding drains before reopening, preventing an earlier catalog view from bypassing
+the check. Register `StorageReadTemporarilyUnavailable` in the compiled failure
+registry so this deferral retains its retryable identity across the storage ABI.
+The internal storage-owner ABI advances to version 56.
 
 `restore-admission-vopr-test` explores 256 seeded interleavings across nine replica
 placements and exact replays each history. It uses the production admission helper,
 generation leases, and durable markers on borrowed `VoprIo`. It checks missing and
 mismatched proofs, incomplete primary import, admission before runtime repair
-completion, lease release after rejection, and pinning through owner handoff.
+completion, lease release after rejection, and pinning until an admitted reader
+releases its lease. The compiled-owner regression covers actual owner admission;
+the native soak covers backup import and atomic generation replacement.
 The scheduled qualification runs this target. Native scheduled coverage adds
 `zig-e2e-cluster-restore-soak.sh`: 50 fresh 3x3 clusters each under normal and
 256-descriptor limits, with exact JUnit counts and retained failed roots.
@@ -47,7 +53,9 @@ with one explicit idempotency key and verifies that retries retain the same job 
 Timeout diagnostics now refresh metadata and retain observed job states. A fifth
 failure was a transient `TableTopologyProtocolUpgradeRequired` losing its identity
 at the compiled callback boundary and becoming HTTP 500. Register that identity in
-both failure formats so the existing HTTP 503 retry path remains available.
+both failure formats so the existing HTTP 503 retry path remains available. The
+create harness recognizes the documented text rejections only with explicit
+non-admission headers; uncertain/committed outcomes still fail without replay.
 
 ## 2026-09-16: constrained Autograph restart lost retryable owner admission
 

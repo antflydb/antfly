@@ -522,11 +522,20 @@ def _create_not_admitted():
 
 
 @pytest.mark.parametrize("success_status", [200, 202])
+@pytest.mark.parametrize(
+    "rejection_body",
+    [
+        _create_not_admitted()[1],
+        b"metadata cluster upgrade in progress; retry later",
+        b"metadata mutation deadline exceeded before admission; retry later",
+    ],
+)
 def test_cluster_create_retries_only_proven_non_admission(
-    monkeypatch, capsys, success_status
+    monkeypatch, capsys, success_status, rejection_body
 ):
     cluster, session, calls = _seed_cluster(
-        monkeypatch, [_create_not_admitted(), (success_status, b"{}")]
+        monkeypatch,
+        [(503, rejection_body, _create_not_admitted()[2]), (success_status, b"{}")],
     )
     definition = {"num_shards": 3, "description": "backup"}
     assert (
@@ -580,6 +589,15 @@ def test_cluster_create_retries_only_proven_non_admission(
             503,
             b'{"code":"different_error","retryable":true}',
             _create_not_admitted()[2],
+        ),
+        (503, b"metadata cluster upgrade in progress; retry later"),
+        (
+            503,
+            b"metadata cluster upgrade in progress; retry later",
+            {
+                **_create_not_admitted()[2],
+                "X-Antfly-Raft-Mutation-Outcome": "unknown-v1",
+            },
         ),
         (503, b"malformed response", _create_not_admitted()[2]),
         (500, b"internal failure"),

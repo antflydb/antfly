@@ -333,7 +333,10 @@ def _create_cluster_table_when_admitted(
                     isinstance(payload, dict)
                     and payload.get("code") == "metadata_leader_unavailable"
                     and payload.get("retryable") is True
-                )
+                ) or last_response.text.strip() in {
+                    "metadata cluster upgrade in progress; retry later",
+                    "metadata mutation deadline exceeded before admission; retry later",
+                }
             if not retryable:
                 result = _check_response(last_response)
                 if attempts > 1:

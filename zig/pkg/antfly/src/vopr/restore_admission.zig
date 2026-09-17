@@ -19,7 +19,7 @@ pub const Scenario = struct {
         .{ .id = complete_id, .name = name ++ ".all-replicas-admitted", .kind = .reachable },
     };
     const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const identity: Identity = .{ .backup_id = "backup", .location = "file:///backup", .snapshot_path = "groups/1.afb", .artifact_sha256 = digest };
+    const identity: Identity = .{ .backup_id = "backup", .location = "file:///backup", .snapshot_path = "groups/1.afb", .artifact_sha256 = digest, .native_manifest_size_bytes = 123, .native_manifest_sha256 = digest };
     const Phase = enum { absent, stale, imported, pinned, released, complete };
     const State = struct {
         io: vopr.vopr_io.VoprIo,
@@ -71,8 +71,8 @@ pub const Scenario = struct {
             .location = if (!exact and replica == 1) "file:///other" else identity.location,
             .snapshot_path = if (!exact and replica == 2) "groups/other.afb" else identity.snapshot_path,
             .artifact_sha256 = if (!exact and replica == 3) "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" else digest,
-            .native_manifest_size_bytes = @as(u64, if (!exact and (replica == 4 or replica == 5)) 123 else 0),
-            .native_manifest_sha256 = if (!exact and (replica == 4 or replica == 5)) digest else "",
+            .native_manifest_size_bytes = @as(u64, if (!exact and replica == 4) 124 else identity.native_manifest_size_bytes),
+            .native_manifest_sha256 = if (!exact and replica == 5) "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" else identity.native_manifest_sha256,
             .group_id = if (!exact and replica == 6) group + 10 else group,
             .primary_restored = exact or (replica != 7 and replica != 8),
             .runtime_repair_complete = false,
