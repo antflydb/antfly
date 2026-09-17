@@ -6853,6 +6853,7 @@ pub const DataServer = struct {
             server.ctx.primary = promoted_primary_handle;
             server.ctx.primary_node_id = promoted_node_id;
             server.ctx.promoted_standby_handoff = handoff;
+            server.auth.catalog_empty = .{ .ptr = self, .read_fn = DataServer.haCatalogEmptyCallback };
             server.auth.seed_capture = if (self.ha_cfg.seed_capture_root != null) .{
                 .ptr = self,
                 .run_fn = DataServer.captureHASeedCallback,
@@ -7723,6 +7724,13 @@ pub const DataServer = struct {
         };
     }
 
+    fn haCatalogEmptyCallback(ptr: *anyopaque) !bool {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
+        return snapshot.tables.len == 0;
+    }
+
     fn captureHASeedCallback(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -7852,6 +7860,7 @@ pub const DataServer = struct {
                     .bearer_token = ha_admin_bearer_token,
                     .require_bearer_token = true,
                     .state_mutex = if (ctx.primary != null or ctx.standby != null) &self.ha_state_mutex else null,
+                    .catalog_empty = .{ .ptr = self, .read_fn = DataServer.haCatalogEmptyCallback },
                     .seed_capture = if (ctx.primary != null and self.ha_cfg.seed_capture_root != null) .{
                         .ptr = self,
                         .run_fn = DataServer.captureHASeedCallback,

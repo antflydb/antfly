@@ -1442,6 +1442,13 @@ func (r *AntflyCluster) validateHighAvailabilitySpec() error {
 		return nil
 	}
 
+	if ha.ActivationPolicy != "" && ha.ActivationPolicy != "Eager" && ha.ActivationPolicy != "OnFirstTable" {
+		return fmt.Errorf("spec.highAvailability.activationPolicy must be Eager or OnFirstTable")
+	}
+	if ha.ActivationPolicy == "OnFirstTable" && ha.SyncPolicy.modeOrDefault() != HADurabilityModeAsync {
+		return fmt.Errorf("spec.highAvailability.activationPolicy OnFirstTable requires Async durability; synchronous table creation requires eager standby activation")
+	}
+
 	var errors []string
 	names := map[string]struct{}{}
 	desiredNames := map[string]struct{}{}
@@ -2254,7 +2261,7 @@ func highAvailabilityHasManagedConfig(ha *HighAvailabilitySpec) bool {
 	if ha == nil {
 		return false
 	}
-	return len(ha.Standbys) > 0 ||
+	return ha.ActivationPolicy != "" || len(ha.Standbys) > 0 ||
 		ha.Identity != nil ||
 		ha.Admin != nil ||
 		ha.Runtime != nil ||

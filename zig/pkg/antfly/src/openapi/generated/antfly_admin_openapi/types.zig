@@ -622,6 +622,8 @@ pub const StandbyOwnerJobDecision = struct {
 };
 
 pub const StandbyPrimarySnapshot = struct {
+    /// The runtime catalog has no tables. Controllers may defer initial standby seeding, but must not dismantle HA that has already started. Omitted by older runtimes.
+    waiting_for_tables: ?bool = null,
     role: []const u8,
     /// Node id for the node-local admin endpoint that produced this status snapshot.
     node_id: StandbyNodeID,
@@ -634,6 +636,7 @@ pub const StandbyPrimarySnapshot = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "waiting_for_tables", "waiting_for_tables", true },
         .{ "role", "role", false },
         .{ "node_id", "node_id", false },
         .{ "identity", "identity", false },
@@ -654,6 +657,10 @@ pub const StandbyPrimarySnapshot = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.waiting_for_tables) |value| {
+            try jw.objectField("waiting_for_tables");
+            try jw.write(value);
+        }
         try jw.objectField("role");
         try jw.write(self.role);
         try jw.objectField("node_id");
