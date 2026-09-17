@@ -41,7 +41,9 @@ The internal storage-owner ABI advances to version 61.
 
 `restore-admission-vopr-test` explores 256 seeded interleavings across nine replica
 placements and exact replays each history. It uses the production admission helper,
-generation leases, and durable markers on borrowed `VoprIo`. It checks missing and
+generation leases, and durable markers on borrowed `VoprIo`. Owner probes compete
+with publication on the same replica, including while its exclusive publication
+lease remains held across scheduler steps. It checks missing and
 mismatched proofs, incomplete primary import, admission before runtime repair
 completion, lease release after rejection, and pinning until an admitted reader
 releases its lease. The compiled-owner regression covers actual owner admission;
@@ -99,6 +101,17 @@ across all three metadata nodes, and avoids the redundant probe. Backup manifest
 must match the captured original groups, and restored documents must still be read
 through every data node. Six harness regressions cover a failed later observation,
 inconsistent identities, missing placement, missing health, and missing snapshots.
+
+The next two-worker macOS run completed 32 cases (31 passed, one unresolved delete)
+under measured host socket exhaustion: Python metadata probes failed with
+`EADDRNOTAVAIL`, data control reported `AddressUnavailable`, metadata nodes lost
+leader visibility, and the host had 51,921 TCP sockets in `TIME_WAIT`. The restore
+had not started. The test correctly failed instead of replaying the uncertain
+delete. These results do not qualify the restore soak. Final local validation uses
+one six-process cluster at a time (`ANTFLY_E2E_REGRESSION_WORKERS=1`,
+`ANTFLY_E2E_REGRESSION_REPEATS=50`) while retaining 100 total cases and both FD
+profiles. Scheduled Linux coverage keeps two workers and 25 repeats per profile;
+local serial results do not establish that parallel macOS runs are reliable.
 
 ## 2026-09-16: replay-retention fixture timed out on a checkpoint proxy
 

@@ -25,6 +25,11 @@ The merged executable also exposed a redundant topology-probe failure after a
 successful restore and replication check. The check now returns the same agreed
 table/group identities it validated across all metadata nodes, removing the second
 optional read while retaining the incarnation and per-data-node content checks.
+A later two-worker macOS run also exhausted local TCP ports (51,921 `TIME_WAIT`
+sockets and explicit `EADDRNOTAVAIL` before restore). For a local 100-case run on
+macOS, set `ANTFLY_E2E_REGRESSION_WORKERS=1` and
+`ANTFLY_E2E_REGRESSION_REPEATS=50`; the scheduled Linux job keeps two workers.
+Neither uncertain mutation failures nor host resource exhaustion count as passes.
 
 ## 2026-09-16: constrained Autograph restart exited during teardown
 

@@ -20,11 +20,13 @@ pub const Scenario = struct {
     };
     const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const identity: Identity = .{ .backup_id = "backup", .location = "file:///backup", .snapshot_path = "groups/1.afb", .artifact_sha256 = digest, .native_manifest_size_bytes = 123, .native_manifest_sha256 = digest };
-    const Phase = enum { absent, stale, imported, pinned, released, complete };
+    const Phase = enum { absent, stale, publishing, imported, pinned, released, complete };
     const State = struct {
         io: vopr.vopr_io.VoprIo,
         phases: [9]Phase = @splat(.absent),
         leases: [9]?lifecycle.ReadLease = @splat(null),
+        publications: [9]?lifecycle.ExclusiveTransition = @splat(null),
+        probes_remaining: [9]u8 = @splat(3),
         progress: u64 = 0,
         sound: bool = true,
     };
@@ -41,6 +43,7 @@ pub const Scenario = struct {
     }
     pub fn deinit(world: *World, alloc: std.mem.Allocator) void {
         for (&world.state.leases) |*lease| if (lease.*) |*value| value.deinit();
+        for (&world.state.publications) |*publication| if (publication.*) |*value| value.deinit();
         world.state.io.deinit();
         alloc.destroy(world.state);
         world.* = undefined;
@@ -48,8 +51,15 @@ pub const Scenario = struct {
     fn stepName(comptime replica: usize, comptime phase: Phase) []const u8 {
         return std.fmt.comptimePrint("restore-admission.replica-{d}.{s}", .{ replica, @tagName(phase) });
     }
+    fn probeName(comptime replica: usize) []const u8 {
+        return std.fmt.comptimePrint("restore-admission.replica-{d}.owner-probe", .{replica});
+    }
     pub fn enumerate(world: *World, list: *vopr.transition.List, alloc: std.mem.Allocator) !void {
         inline for (0..9) |replica| {
+            if (world.state.probes_remaining[replica] > 0) {
+                const step = comptime probeName(replica);
+                try list.append(alloc, .{ .id = vopr.id.stable(name, step), .name = step, .kind = .workload });
+            }
             inline for (comptime std.meta.tags(Phase)) |phase| {
                 if (phase != .complete and world.state.phases[replica] == phase) {
                     const step = comptime stepName(replica, phase);
@@ -61,6 +71,9 @@ pub const Scenario = struct {
     fn publish(alloc: std.mem.Allocator, io: std.Io, path: []const u8, group: u64, replica: usize, exact: bool) !void {
         var transition = try lifecycle.beginProcessExclusiveWithIo(path, io);
         defer transition.deinit();
+        try publishWithLease(alloc, io, &transition, group, replica, exact);
+    }
+    fn publishWithLease(alloc: std.mem.Allocator, io: std.Io, transition: *lifecycle.ExclusiveTransition, group: u64, replica: usize, exact: bool) !void {
         var staged = try transition.beginStaging();
         defer staged.deinit();
         // Every stale marker is well formed but proves a different import (or
@@ -85,6 +98,24 @@ pub const Scenario = struct {
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker_path, .data = marker });
         if (try staged.publish() != .durable) return error.TestUnexpectedResult;
     }
+    fn probe(world: *World, alloc: std.mem.Allocator, replica: usize) !void {
+        const state = world.state;
+        const group: u64 = replica % 3 + 1;
+        const path = try std.fmt.allocPrint(alloc, "/restore/node-{d}/group-{d}/table-db", .{ replica / 3, group });
+        defer alloc.free(path);
+        const ready = switch (state.phases[replica]) {
+            .absent, .stale, .publishing => false,
+            .imported, .pinned, .released, .complete => true,
+        };
+        if (admission.acquire(alloc, state.io.io(), path, group, identity)) |value| {
+            var lease = value;
+            lease.deinit();
+            if (!ready) state.sound = false;
+        } else |err| {
+            if (err != error.StorageReadTemporarilyUnavailable) return err;
+            if (ready) state.sound = false;
+        }
+    }
     fn run(world: *World, alloc: std.mem.Allocator, replica: usize) !void {
         const state = world.state;
         const io = state.io.io();
@@ -106,8 +137,21 @@ pub const Scenario = struct {
                 // replacement is covered by generation/native restore tests.
                 var transition = try lifecycle.beginProcessExclusiveWithIo(probe_path, io);
                 transition.deinit();
-                const exact = state.phases[replica] == .stale;
-                try publish(alloc, io, if (exact) path else stale_path, group, replica, exact);
+                if (state.phases[replica] == .absent) {
+                    try publish(alloc, io, stale_path, group, replica, false);
+                } else {
+                    // Keep publication admission closed across scheduler steps so
+                    // competing owner probes can run during the real write lease.
+                    state.publications[replica] = try lifecycle.beginProcessExclusiveWithIo(path, io);
+                }
+            },
+            .publishing => {
+                // Every history covers the held-lease window, independently of
+                // where its additional scheduler-selected owner probes landed.
+                try probe(world, alloc, replica);
+                try publishWithLease(alloc, io, &state.publications[replica].?, group, replica, true);
+                state.publications[replica].?.deinit();
+                state.publications[replica] = null;
             },
             .imported => state.leases[replica] = try admission.acquire(alloc, io, path, group, identity),
             .pinned => {
@@ -130,6 +174,14 @@ pub const Scenario = struct {
     }
     pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, alloc: std.mem.Allocator) !vopr.outcome.TransitionOutcome {
         inline for (0..9) |replica| {
+            if (selected.id == vopr.id.stable(name, probeName(replica))) {
+                if (world.state.probes_remaining[replica] == 0) return error.InvalidRestoreAdmissionTransition;
+                try probe(world, alloc, replica);
+                world.state.probes_remaining[replica] -= 1;
+                world.state.progress += 1;
+                try events.emitNamed(alloc, .domain, selected.name, world.state.progress);
+                return .applied();
+            }
             inline for (comptime std.meta.tags(Phase)) |phase| {
                 if (phase != .complete and selected.id == vopr.id.stable(name, stepName(replica, phase))) {
                     if (world.state.phases[replica] != phase) return error.InvalidRestoreAdmissionTransition;
@@ -143,7 +195,10 @@ pub const Scenario = struct {
     }
     pub fn observe(world: *World, builder: *vopr.observation.Builder, alloc: std.mem.Allocator) !void {
         try builder.addNamed(alloc, name ++ ".progress", @intCast(world.state.progress));
-        inline for (0..9) |replica| try builder.addNamed(alloc, std.fmt.comptimePrint("replica-{d}", .{replica}), @intFromEnum(world.state.phases[replica]));
+        inline for (0..9) |replica| {
+            try builder.addNamed(alloc, std.fmt.comptimePrint("replica-{d}", .{replica}), @intFromEnum(world.state.phases[replica]));
+            try builder.addNamed(alloc, std.fmt.comptimePrint("probes-{d}", .{replica}), world.state.probes_remaining[replica]);
+        }
     }
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, alloc: std.mem.Allocator) !void {
         try sink.check(alloc, sound_id, world.state.sound);
@@ -154,6 +209,7 @@ pub const Scenario = struct {
     }
     pub fn done(world: *World) bool {
         for (world.state.phases) |phase| if (phase != .complete) return false;
+        for (world.state.probes_remaining) |remaining| if (remaining != 0) return false;
         return true;
     }
 };
@@ -165,7 +221,7 @@ test "restore admission VOPR exact replays three by three publication interleavi
         var artifact = try vopr.runner.run(Scenario, std.testing.allocator, choices.source(), .{
             .system = "antfly",
             .seed = 0x3570_2e + ordinal,
-            .transition_budget = 45,
+            .transition_budget = 81,
             .backend_ids = &backend_ids,
         });
         defer artifact.deinit();
