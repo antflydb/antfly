@@ -2338,6 +2338,10 @@ components:
       required: [role, node_id, identity, current_lsn, slots, retention]
       additionalProperties: false
       properties:
+        waiting_for_tables:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: The runtime catalog has no tables. Controllers may defer initial standby seeding, but must not dismantle HA that has already started. Omitted by older runtimes.
         role:
           type: string
           enum: [primary]
