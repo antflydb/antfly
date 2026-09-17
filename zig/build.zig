@@ -171,7 +171,19 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
         .version = antfly_version,
     });
-    const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse false;
+    // Antfly Lite always links and advertises the embedded local inference
+    // runtime, matching the `antfly` executable (see COMPILATION.md's "C API
+    // composition" section and LITE.md's "Local Embedded Inference" section).
+    // This remains a build option so a caller can still opt out of
+    // advertising the capability; freestanding/wasm builds always disable it
+    // regardless of this flag (see storage/lite/capabilities.zig).
+    // Antfly Lite always links and advertises the embedded local inference
+    // runtime, matching the `antfly` executable (see COMPILATION.md's "C API
+    // composition" section and LITE.md's "Local Embedded Inference" section).
+    // This remains a build option so a caller can still opt out of
+    // advertising the capability; freestanding/wasm builds always disable it
+    // regardless of this flag (see storage/lite/capabilities.zig).
+    const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse true;
     const platform_tests = platform_build.addTests(b, .{
         .root = b.path("lib/platform"),
         .target = target,

@@ -273,6 +273,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_mod.addImport("antfly_source_root", capi_root_mod);
     const capi_options = b.addOptions();
     capi_options.addOption(bool, "linked_storage", false);
+    // The inference runtime is always linked into libantfly (see
+    // link_anchor.zig and addRuntime's storage_kernel unit), so this is
+    // unconditionally true. Unit tests compile the inference call path
+    // directly (no archive/trap boundary either way).
+    capi_options.addOption(bool, "inference_enabled", true);
     capi_mod.addOptions("capi_build_options", capi_options);
     capi_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("antfly_vector", vector_mod);
@@ -280,6 +285,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     // The public C ABI and executable reuse the distributed PIC storage
     // archive, so production builds analyze and optimize that graph once.
+    // libantfly embeds the standalone inference runtime in-process, the same
+    // as the `antfly` executable (see link_anchor.zig and addRuntime's
+    // storage_kernel unit): this is a deliberate product decision
+    // (2026-09-17) so Lite hosts get local inference without a separate
+    // runtime, at the cost of a much larger shared library (see
+    // COMPILATION.md's "C API composition" section).
     const libantfly_link_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/capi/link_anchor.zig"),
         .target = target,
@@ -292,7 +303,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .linkage = .dynamic,
         .name = "antfly",
         .root_module = libantfly_link_mod,
-        .max_rss = 2 * 1024 * 1024 * 1024,
+        .max_rss = 4 * 1024 * 1024 * 1024,
     });
     libantfly.link_gc_sections = true;
     // Homebrew rewrites the dylib ID to its absolute opt/lib path on install.
@@ -404,6 +415,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "packed dense response exposes public ids not doc ordinals",
         "dense response identity generation footer",
         "capi aggregate hits rejects stale identity generation before aggregation materialization",
+        "capi lite local-runtime-configured flag reports local_embedded only when the build links inference",
+        "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_mod,
