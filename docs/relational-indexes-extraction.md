@@ -1261,6 +1261,12 @@ eligible jobs still run, and completion dispatches the retained successor.
 Queue selection is failure-atomic and the ordinary FIFO path advances a head
 cursor rather than shifting the retained queue.
 
+Stable transaction retries consult the authoritative coordinator decision after
+any failed begin, including forwarded errors that lose their original domain
+classification. A durable commit resumes commit-only delivery; an unavailable
+decision remains unknown and never authorizes abort. This adds no probe to the
+successful-begin path and preserves recovery after a lost acknowledgement.
+
 Constraint failure publication retains physical source-row guards, including
 oversized projection failures. UNIQUE/FK rejection is revalidated after the
 failed mutation transaction: terminal failure includes an exact claim guard

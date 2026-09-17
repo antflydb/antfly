@@ -1280,14 +1280,14 @@ fn executeMultiTableCommitOnce(
             .participants = participant_ids,
             .restore_staging_scope = participant.restore_staging_scope,
             .restore_staging_plan_id = participant.restore_staging_plan_id,
-        }) catch |err| switch (err) {
-            error.UnknownGroup, error.PreDecisionNotProposed => {
-                abort_on_error = false;
-                return .{ .conflict = participantUnavailableConflict(participant, .begin) };
-            },
-            error.DecisionConflict => {
+        }) catch |err| {
+            if (options.retain_terminal or err == error.DecisionConflict) {
                 // A stable transaction ID may be retried after the coordinator
                 // durably committed but before the client observed success.
+                // Forwarded Raft apply errors can lose their domain identity;
+                // even a failed/not-proposed BEGIN says nothing about an older
+                // execution of this ID. Probe the authoritative decision before
+                // attempting abort or reporting a terminal conflict.
                 // Resume commit-only propagation instead of treating that
                 // terminal record as a failed fresh begin.
                 const status = worker.statusGroupWithRequest(
@@ -1296,8 +1296,11 @@ fn executeMultiTableCommitOnce(
                     participant.table_name,
                     participant.statusRequest(txn_id),
                     null,
-                ) catch return error.CommitDecisionUnknown;
-                switch (status) {
+                ) catch |status_err| switch (status_err) {
+                    error.TxnNotFound => null,
+                    else => return error.CommitDecisionUnknown,
+                };
+                if (status) |observed| switch (observed) {
                     .committed => {
                         resume_committed = true;
                         abort_on_error = false;
@@ -1308,38 +1311,29 @@ fn executeMultiTableCommitOnce(
                         return .{ .conflict = participantDecisionConflict(participant, .begin) };
                     },
                     .pending => {},
-                }
+                };
+            }
+            if (!options.retain_terminal and (err == error.UnknownGroup or err == error.PreDecisionNotProposed)) {
                 abort_on_error = false;
-                try abortParticipants(
-                    alloc,
-                    worker,
-                    txn_id,
-                    commit_version,
-                    participants.items,
-                    participant_ids,
-                    1,
-                );
-                return error.TransactionBeginFailed;
-            },
-            else => {
-                // The failed call may have applied before its response failed,
-                // so include it in abort delivery. Participants after it were
-                // never contacted and can be acknowledged without an RPC.
-                abort_on_error = false;
-                try abortParticipants(
-                    alloc,
-                    worker,
-                    txn_id,
-                    commit_version,
-                    participants.items,
-                    participant_ids,
-                    1,
-                );
-                std.log.warn("transaction begin failed table={s} group_id={} err={s}", .{
-                    participant.table_name, participant.group_id, @errorName(err),
-                });
-                return error.TransactionBeginFailed;
-            },
+                return .{ .conflict = participantUnavailableConflict(participant, .begin) };
+            }
+            // The failed call may have applied before its response failed,
+            // so include it in abort delivery. Participants after it were
+            // never contacted and can be acknowledged without an RPC.
+            abort_on_error = false;
+            try abortParticipants(
+                alloc,
+                worker,
+                txn_id,
+                commit_version,
+                participants.items,
+                participant_ids,
+                1,
+            );
+            std.log.warn("transaction begin failed table={s} group_id={} err={s}", .{
+                participant.table_name, participant.group_id, @errorName(err),
+            });
+            return error.TransactionBeginFailed;
         };
         begun_count = 1;
     }
@@ -5155,6 +5149,8 @@ fn consumerTests() type {
             };
 
             const Recorder = struct {
+                begin_error: anyerror = error.DecisionConflict,
+                status_error: ?anyerror = null,
                 begin_calls: usize = 0,
                 prepare_calls: usize = 0,
                 resolve_calls: usize = 0,
@@ -5176,7 +5172,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.begin_calls += 1;
                     try std.testing.expect(req.retain_terminal);
-                    return error.DecisionConflict;
+                    return self.begin_error;
                 }
 
                 fn prepare(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
@@ -5194,41 +5190,62 @@ fn consumerTests() type {
                 fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.status_calls += 1;
+                    if (self.status_error) |err| return err;
                     return .committed;
                 }
             };
 
-            var recorder = Recorder{};
-            const txn_id = try parseTxnIdHex("0123456789abcdeffedcba9876543210");
-            const outcome = try executeMultiTableCommitWithOptions(
-                std.testing.allocator,
-                FakeCatalog.iface(),
-                recorder.worker(),
-                txn_id,
-                10_000,
-                10_001,
-                &.{.{
-                    .table_name = "docs",
-                    .transforms = &.{
-                        .{
-                            .key = "doc:a",
-                            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+            for ([_]anyerror{ error.DecisionConflict, error.RaftBatchWriteOutcomeUnknown, error.UnexpectedHttpStatus, error.Timeout, error.UnknownGroup, error.PreDecisionNotProposed }) |begin_error| {
+                var recorder = Recorder{ .begin_error = begin_error };
+                const txn_id = try parseTxnIdHex("0123456789abcdeffedcba9876543210");
+                const outcome = try executeMultiTableCommitWithOptions(
+                    std.testing.allocator,
+                    FakeCatalog.iface(),
+                    recorder.worker(),
+                    txn_id,
+                    10_000,
+                    10_001,
+                    &.{.{
+                        .table_name = "docs",
+                        .transforms = &.{
+                            .{
+                                .key = "doc:a",
+                                .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+                            },
+                            .{
+                                .key = "doc:z",
+                                .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+                            },
                         },
-                        .{
-                            .key = "doc:z",
-                            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
-                        },
-                    },
-                }},
-                .write,
-                null,
-                .{ .retain_terminal = true },
-            );
-            try std.testing.expect(outcome == .committed);
-            try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
-            try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
-            try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
-            try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
+                    }},
+                    .write,
+                    null,
+                    .{ .retain_terminal = true },
+                );
+                try std.testing.expect(outcome == .committed);
+                try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
+                try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
+                try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
+                try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
+                // An unavailable decision is not permission to abort a possibly
+                // committed stable transaction, even if BEGIN was not proposed.
+                recorder = .{ .begin_error = begin_error, .status_error = error.LeaderUnavailable };
+                try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(
+                    std.testing.allocator,
+                    FakeCatalog.iface(),
+                    recorder.worker(),
+                    txn_id,
+                    10_000,
+                    10_001,
+                    &.{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} }},
+                    .write,
+                    null,
+                    .{ .retain_terminal = true },
+                ));
+                try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
+                try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
+                try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
+            }
         }
 
         test "distributed txn coordinator aborts only participants that may have begun" {
