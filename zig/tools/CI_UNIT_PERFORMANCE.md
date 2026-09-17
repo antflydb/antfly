@@ -244,3 +244,53 @@ and leaving local timing output opt-in. Its environment selection was checked
 for local, CI, explicit-on, and explicit-off invocations. The current PR's CI
 log therefore cannot yet provide the new per-test records; do not substitute
 the unrelated PR #773 run's 52-minute unit measurement for this PR's result.
+
+## Ranked remaining work
+
+1. **Allocator diagnostics, preserving test coverage.** The five largest
+   measured training cases plus the relational scheduler sum to 311 seconds
+   with normal test backtraces and about 4 seconds in the no-backtrace
+   experiments. Apply the existing opt-in trace convention first; keep leak
+   checks, exhaustive failure injection, cancellation, and durable resume.
+   This is about five minutes of local test work, not a promised CI wall-time
+   reduction. Continue the same comparison for the remaining training and
+   storage failure-injection tests before changing their fixtures.
+2. **Assign one aggregate owner per test.** The Antfly timing records contain
+   11,094 executions of 9,893 distinct names: 1,201 repeated executions.
+   Keeping the longest observation of each name leaves about 211 seconds of
+   repeated measured work. That is an audit estimate, not permission to delete
+   cases: inspect runner arguments/configurations and preserve the union of
+   selected tests when assigning ownership. Examples include portable backup
+   history (standalone and storage support), vector-payload publication and
+   admission (standalone and storage support), Lite namespace deltas
+   (standalone and storage engine), and graph reverse-rebuild recovery
+   (release-blocker and DB-core). Keep focused targets available without
+   scheduling identical cases twice in the same aggregate gate.
+3. **Separate scale from correctness boundaries.** The wide-vector case still
+   takes 20.8 seconds without backtraces. Remaining large Antfly observations
+   include dense-filter pagination (41.5 s), physical-churn benchmark (38.3 s),
+   canceled compaction staging (35.6 s), sequential relational selection
+   (32.4 s), and graph artifact restore (30.7 s). Compare diagnostics first,
+   then retain representative workloads in `release-scale-test` and exercise
+   the same block/page/threshold transitions with bounded unit fixtures.
+   The optional CI `>1M chunks` job is a different scale suite; removing its
+   PR label does not remove these retained regression cases.
+4. **Optimize demonstrated production work.** Profile the remaining workload
+   after tracing is off. For graph setup, distinguish individual edge commits
+   from metric calculation. For vectors, measure update/quantization/search
+   and reopen separately. For relational maintenance, measure scanned rows,
+   passes, flushes, and manifest publications. Turn confirmed improvements
+   into work-count contracts rather than tight elapsed-time assertions.
+5. **Measure build and scheduling separately.** Command grouping is already
+   implemented. The local grouped compile durations reuse caches and cannot
+   establish cold CI speedups. Use the next CI per-test records alongside
+   compile-step durations and memory observations to identify the critical
+   path. Audit the blanket 6 GiB run reservations before increasing parallelism;
+   do not lower reservations without peak-memory evidence or treat sums of
+   overlapping durations as elapsed time.
+
+The largest local executables are DB-core (873 s), storage support (866 s),
+inference (480 s), storage engine (302 s), graph release-blocker (227 s), and
+serverless (195 s). These are individual process/partition-step observations,
+not additive wall time. The diagnostic and duplicate-work estimates also need
+to be recomputed after each change so overlapping savings are not counted twice.
