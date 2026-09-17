@@ -33,6 +33,7 @@ pub const specs = [_]common.CommandSpec{
     },
     .{
         .name = "gliner2-entity-training-readiness",
+        .shared_check = false,
         .release_metadata = true,
         .root_source_file = "src/finetune/run_gliner2_production_readiness.zig",
         .description = "Run scoped GLiNER2 entity-training checks: dataset checks, training, artifact validation, entity eval, and optional materialization",
@@ -41,6 +42,7 @@ pub const specs = [_]common.CommandSpec{
     },
     .{
         .name = "run-gemma4-lora-pilot-workflow",
+        .shared_check = false,
         .root_source_file = "src/finetune_run_gemma4_lora_pilot_workflow.zig",
         .description = "Run a larger single-device Gemma4 LoRA text or multimodal pilot workflow",
         .imports = workflow_imports,
@@ -48,6 +50,7 @@ pub const specs = [_]common.CommandSpec{
     },
     .{
         .name = "run-gemma4-recursive-lora-smoke-workflow",
+        .shared_check = false,
         .root_source_file = "src/finetune_run_gemma4_recursive_lora_smoke_workflow.zig",
         .description = "Run a bounded Gemma4 recursive LoRA distillation smoke workflow",
         .imports = workflow_imports,
@@ -55,6 +58,7 @@ pub const specs = [_]common.CommandSpec{
     },
     .{
         .name = "run-gemma4-recursive-lora-sweep",
+        .shared_check = false,
         .root_source_file = "src/finetune_run_gemma4_recursive_lora_sweep.zig",
         .description = "Run Gemma4 baseline-vs-recursive LoRA comparison sweep",
         .imports = workflow_imports,
