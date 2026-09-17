@@ -770,6 +770,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "embedded api round-trips batch lookup scan and search over memory-backed durable lsm",
             "embedded api hosted profile drains derived indexing without native runtimes",
             "embedded api hosted profile persists text index across reopen over storage",
+            "embedded api createLite provisions default full text index",
+            "embedded api openLite round-trips batch lookup over aflite file",
+            "embedded api openLite manages index and enrichment definitions over aflite file",
+            "embedded api openLite persists schema json over aflite file",
         },
     });
     const run_embedded_api_tests = addFilteredTestRunArtifact(b, embedded_api_tests);
