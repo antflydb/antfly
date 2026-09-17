@@ -380,6 +380,7 @@ pub const Fixture = struct {
     client: api_http_client.ApiHttpClient = undefined,
     tenant_client: api_http_client.ApiHttpClient = undefined,
     driver_future: ?std.Io.Future(void) = null,
+    metadata_driver_future: ?std.Io.Future(void) = null,
     raft_driver_futures: [node_count]?std.Io.Future(void) = .{null} ** node_count,
     workload_future: ?std.Io.Future(void) = null,
     driver_stop: bool = false,
@@ -2600,6 +2601,36 @@ pub const Fixture = struct {
             1;
     }
 
+    // Metadata consensus must progress while a public request is waiting on
+    // authority, independently of workload-triggered topology reconciliation.
+    // Otherwise losing the metadata leader freezes every catalog retry: the
+    // workload waits for a write, and no owner requests the next control round.
+    fn driveMetadataRaft(self: *Fixture) void {
+        var rounds: usize = 0;
+        while (!self.driver_stop) {
+            self.metadata.?.cluster.stepAll() catch |err| {
+                self.driver_failure = err;
+                self.driver_stop = true;
+                return;
+            };
+            rounds +|= 1;
+            if (rounds % 8 == 0 and self.metadata.?.cluster.currentMetadataLeaderIndex() == null) {
+                self.metadata.?.cluster.campaignBestMetadataCandidate() catch |err| {
+                    self.driver_failure = err;
+                    self.driver_stop = true;
+                    return;
+                };
+                self.metadata_recovery_campaigns +|= 1;
+            }
+            self.sim.io().sleep(.fromMilliseconds(raft_runtime_loop.RuntimeCadence.default_raft_tick_ms), .awake) catch |err| {
+                if (err == error.Canceled and self.driver_stop) return;
+                self.driver_failure = err;
+                self.driver_stop = true;
+                return;
+            };
+        }
+    }
+
     fn driveRaft(self: *Fixture, index: usize) void {
         defer self.raft_driver_done[index] = true;
         // A Raft round advances election/heartbeat ticks, not just queued I/O.
@@ -3130,6 +3161,8 @@ pub const Fixture = struct {
             std.debug.assert(self.raft_driver_futures[index] == null);
             self.raft_driver_futures[index] = self.sim.io().async(driveRaft, .{ self, index });
         }
+        std.debug.assert(self.metadata_driver_future == null);
+        self.metadata_driver_future = self.sim.io().async(driveMetadataRaft, .{self});
         self.driver_future = self.sim.io().async(driveControl, .{self});
         self.workload_future = self.sim.io().async(runWorkload, .{self});
         self.phase = .workload_started;
@@ -3196,6 +3229,12 @@ pub const Fixture = struct {
             self.join_restart_future = null;
         }
         if (self.failure == null) self.failure = self.join_owner_restart_failure;
+        // Recovery is an end-of-workload observation. Initial data elections
+        // can overlap a metadata election; latching that transient absence
+        // forever rejects a history that subsequently commits the split and
+        // completes every post-recovery public read.
+        self.topology_sound = self.metadata.?.cluster.currentMetadataLeaderIndex() != null and
+            (!self.active_split_enabled or self.split_sound);
         self.driver_stop = true;
         if (self.driver_future) |*future| {
             // The driver polls this stop bit at a 1 ms logical cadence. Join
@@ -3208,6 +3247,13 @@ pub const Fixture = struct {
                 future.await(self.sim.io());
             }
             self.driver_future = null;
+        }
+        if (self.metadata_driver_future) |*future| {
+            if (self.teardown_started)
+                future.cancel(self.sim.io())
+            else
+                future.await(self.sim.io());
+            self.metadata_driver_future = null;
         }
         for (&self.raft_driver_futures) |*future| if (future.*) |*live| {
             if (self.teardown_started)
@@ -3271,7 +3317,6 @@ pub const Fixture = struct {
             try self.waitForDataLeader(group_id);
             std.log.debug("production data-plane VOPR elected group leader group={}", .{group_id});
         }
-        self.topology_sound = self.metadata.?.cluster.currentMetadataLeaderIndex() != null;
 
         var left_write = self.sim.io().async(runWrite, .{
             self,
@@ -3556,7 +3601,6 @@ pub const Fixture = struct {
             "production-split",
         );
         self.split_sound = try operationSucceeded(post_split_read_result);
-        self.topology_sound = self.topology_sound and self.split_sound;
         self.phase = .post_split_read_complete;
         if (!self.split_sound) return error.ProductionDataSplitRoundTripFailed;
 
@@ -4740,7 +4784,6 @@ pub const Fixture = struct {
         self.graph_stale_snapshot_recovered = self.split_sound and self.graph_hydration_sound;
         self.post_split_graph_sound = self.graph_stale_snapshot_recovered;
         self.graph_sound = self.graph_sound and self.post_split_graph_sound;
-        self.topology_sound = self.topology_sound and self.split_sound;
         self.phase = .post_split_graph_query_complete;
         return self.graph_stale_snapshot_recovered;
     }
@@ -4940,7 +4983,7 @@ pub const Fixture = struct {
         pending: bool,
         ready: bool,
         replay_converged: bool,
-        total_indexed: i64,
+        total_indexed: ?u64,
     };
 
     fn managedIndexObservationAt(self: *Fixture, node_index: usize) !ManagedIndexObservation {
@@ -4973,7 +5016,7 @@ pub const Fixture = struct {
             stats.coverage.?.summary_ready and
             stats.coverage.?.complete and
             stats.coverage.?.healthy;
-        const total_indexed = stats.total_indexed orelse -1;
+        const total_indexed = stats.total_indexed;
         const ready = readiness.state == .ready and readiness.queryable and
             readiness.complete and coverage_complete and replay_converged and
             !(stats.rebuilding orelse true) and
@@ -6621,6 +6664,10 @@ pub const Fixture = struct {
         if (self.driver_future) |*future| {
             future.cancel(self.sim.io());
             self.driver_future = null;
+        }
+        if (self.metadata_driver_future) |*future| {
+            future.cancel(self.sim.io());
+            self.metadata_driver_future = null;
         }
         for (&self.raft_driver_futures) |*future| if (future.*) |*live| {
             live.cancel(self.sim.io());

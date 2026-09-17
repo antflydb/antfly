@@ -244,6 +244,7 @@ pub const StorageKernelReconcileResult = struct {
     repair_repaired: usize = 0,
     repair_remaining: usize = 0,
     repair_terminal: usize = 0,
+    repair_paused: usize = 0,
     repair_busy: usize = 0,
     repair_disk_waits: usize = 0,
     next_retry_at_ms: u64 = 0,

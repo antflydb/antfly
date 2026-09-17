@@ -1,5 +1,16 @@
 # Zig E2E flakes
 
+## 2026-09-16: constrained Autograph restart exited during teardown
+
+The [second PR #704 production soak](https://github.com/antflydb/antfly/actions/runs/35126679231/job/104951437450)
+failed `test_multinode_autograph_recovers_after_data_restart` at constrained
+worker 2, iteration 16: node 102 exited with `StorageBusy` during committed Raft
+apply. The same root logged lost `DistributedQueryUnavailable` error identity.
+The test body passed; the teardown assertion correctly caught the failed process.
+The workflow's `tee` pipeline hid the script failure until JUnit verification.
+See [the runtime investigation](../FLAKES.md#2026-09-16-constrained-autograph-restart-lost-retryable-owner-admission)
+for the admission/replay fix, error transport, and deterministic regressions.
+
 ## 2026-09-15: Autograph promotion and read-timeout boundary
 
 The first corrected local executable still failed 3/10 data-restart cases and

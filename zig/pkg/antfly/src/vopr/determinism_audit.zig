@@ -90,8 +90,10 @@ const replayable_sources = [_]Source{
     // These production retry/deadline consumers must use the same borrowed
     // clock as their sleeps; host time can change an exact replay's timers.
     .{
-        .path = "raft/transport/http_driver.zig#retry-queue",
-        .bytes = region(@embedFile("../raft/transport/http_driver.zig"), "    fn retryQueuedFrame(", "fn pseudoJitter("),
+        // Failed sends return to Raft for retry. Audit the sender and its
+        // completion/queue paths rather than the removed HTTP retry timer.
+        .path = "raft/transport/http_driver.zig#sender-completion-queue",
+        .bytes = region(@embedFile("../raft/transport/http_driver.zig"), "    fn asyncSenderMain(", "test \"http driver module compiles\""),
     },
     .{
         .path = "raft/transport/http_snapshot.zig#transfer-deadline",

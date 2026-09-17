@@ -1,0 +1,6549 @@
+{
+  "source_commit": "d5af4ffd433d8969884c273101386b59df6d3a9a",
+  "main_commit": "3554f821010a7e4b9ac01b30378322ef79abb53f",
+  "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+  "build_mode": "Debug",
+  "date": "2026-09-14",
+  "commands": [
+    "uv run --project e2e/antfly python tools/benchmark_catalog_control.py --baseline-mode chunked --groups 10000 --samples 5",
+    "uv run --project e2e/antfly python tools/benchmark_catalog_control.py --baseline-mode batched --groups 10000 --samples 5",
+    "uv run --project e2e/antfly python tools/benchmark_catalog_control.py --baseline-mode batched --groups 8 --indexes-per-group 1200 --samples 5"
+  ],
+  "limitations": [
+    "One sequential scenario per configuration, not repeated recovery trials. Five samples plus one warmup for steady workloads.",
+    "Synthetic inventory outside actual data placement on three metadata and three real data nodes.",
+    "Client drives baseline protocol directly without production worker quantum or backoff. Every HTTP attempt, including failed discovery, is retained.",
+    "Interrupted earlier run retained below as incomplete evidence; excluded from comparisons."
+  ],
+  "placement_annotation": {
+    "groups": 10000,
+    "intents": 20001,
+    "warmup": 1,
+    "samples": 5,
+    "nested_ns": [
+      1689553000,
+      1703187000,
+      1689177000,
+      1715683000,
+      1695530000
+    ],
+    "indexed_ns": [
+      5610000,
+      5792000,
+      5825000,
+      5646000,
+      5681000
+    ],
+    "nested_median_ns": 1695530000,
+    "indexed_median_ns": 5681000,
+    "speedup": 298.45625770110894,
+    "includes": "Indexed path includes map build, lookup, applied-index probe (no hosted Raft), and destruction. Equality checks and fixture construction excluded.",
+    "test_executable_sha256": "a361b1f3f0386e83d551f248948a0aebae973c043575d5ee3d6afe51d947678b",
+    "command": "env ANTFLY_CATALOG_REPORT_BENCH=1 <compiled-data-runtime-tests> --test-filter 'system catalog placement annotation'"
+  },
+  "runs": {
+    "sequential": {
+      "binary_sha256": "3be4e30b06c0da2c19c0eeea716cf14d18c1ca504bdcf25df189b917a7da3501",
+      "workload": {
+        "startup_ms": 3474.0785411559045,
+        "groups": 10000,
+        "indexes_per_group": 1,
+        "metadata_nodes": 3,
+        "real_data_nodes": 3,
+        "all_real_data_nodes_alive": true,
+        "samples": 5,
+        "warmup": 1,
+        "initial_readiness": {
+          "elapsed_ms": 3722.750584129244,
+          "attempts": 2,
+          "leader_index": 1,
+          "term": 1
+        },
+        "fixture_retries": [],
+        "baseline": {
+          "full_request_bytes": 46140485,
+          "mode": "chunked",
+          "logical_chunks": 157,
+          "fragment_chunks": 0,
+          "plan_ms": 2238.288583,
+          "attempts": [
+            {
+              "endpoint": 0,
+              "action": "prepare",
+              "request_bytes": 735,
+              "chunk_index": 0,
+              "status": 503,
+              "elapsed_ms": 1.335083,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "prepare",
+              "request_bytes": 735,
+              "chunk_index": 0,
+              "status": 200,
+              "elapsed_ms": 74.066625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 0,
+              "status": 503,
+              "elapsed_ms": 9.442708,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 0,
+              "status": 200,
+              "elapsed_ms": 96.245,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 1,
+              "status": 503,
+              "elapsed_ms": 9.792917,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 1,
+              "status": 200,
+              "elapsed_ms": 95.975208,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 2,
+              "status": 503,
+              "elapsed_ms": 9.472042,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 2,
+              "status": 200,
+              "elapsed_ms": 124.967792,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 3,
+              "status": 503,
+              "elapsed_ms": 177.044333,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 3,
+              "status": 200,
+              "elapsed_ms": 344.095625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 4,
+              "status": 503,
+              "elapsed_ms": 9.447083,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 4,
+              "status": 200,
+              "elapsed_ms": 101.176584,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 5,
+              "status": 503,
+              "elapsed_ms": 9.965583,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 5,
+              "status": 200,
+              "elapsed_ms": 302.332625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 6,
+              "status": 503,
+              "elapsed_ms": 9.928958,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 6,
+              "status": 200,
+              "elapsed_ms": 96.217458,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 7,
+              "status": 503,
+              "elapsed_ms": 232.559291,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 7,
+              "status": 200,
+              "elapsed_ms": 784.34075,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 8,
+              "status": 503,
+              "elapsed_ms": 168.722791,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 8,
+              "status": 200,
+              "elapsed_ms": 118.2325,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 9,
+              "status": 503,
+              "elapsed_ms": 8.855209,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296027,
+              "chunk_index": 9,
+              "status": 200,
+              "elapsed_ms": 93.157167,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 10,
+              "status": 503,
+              "elapsed_ms": 9.90975,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 10,
+              "status": 200,
+              "elapsed_ms": 121.62175,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 11,
+              "status": 503,
+              "elapsed_ms": 202.139875,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 11,
+              "status": 200,
+              "elapsed_ms": 311.889167,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 12,
+              "status": 503,
+              "elapsed_ms": 9.897917,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 12,
+              "status": 200,
+              "elapsed_ms": 90.726166,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 13,
+              "status": 503,
+              "elapsed_ms": 9.746541,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 13,
+              "status": 200,
+              "elapsed_ms": 115.765917,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 14,
+              "status": 503,
+              "elapsed_ms": 10.180333,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 14,
+              "status": 200,
+              "elapsed_ms": 325.084,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 15,
+              "status": 503,
+              "elapsed_ms": 657.665708,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 15,
+              "status": 200,
+              "elapsed_ms": 495.816916,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 16,
+              "status": 503,
+              "elapsed_ms": 8.95025,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 16,
+              "status": 200,
+              "elapsed_ms": 93.724417,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 17,
+              "status": 503,
+              "elapsed_ms": 9.403375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 17,
+              "status": 200,
+              "elapsed_ms": 96.911375,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 18,
+              "status": 503,
+              "elapsed_ms": 9.798875,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 18,
+              "status": 200,
+              "elapsed_ms": 137.333959,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 19,
+              "status": 503,
+              "elapsed_ms": 200.636042,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 19,
+              "status": 200,
+              "elapsed_ms": 325.388209,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 20,
+              "status": 503,
+              "elapsed_ms": 9.463875,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 20,
+              "status": 200,
+              "elapsed_ms": 123.437292,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 21,
+              "status": 503,
+              "elapsed_ms": 9.905625,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 21,
+              "status": 200,
+              "elapsed_ms": 129.555375,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 22,
+              "status": 503,
+              "elapsed_ms": 10.064375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 22,
+              "status": 200,
+              "elapsed_ms": 335.0235,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 23,
+              "status": 503,
+              "elapsed_ms": 434.736375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 23,
+              "status": 200,
+              "elapsed_ms": 306.104708,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 24,
+              "status": 503,
+              "elapsed_ms": 10.063667,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 24,
+              "status": 200,
+              "elapsed_ms": 84.321041,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 25,
+              "status": 503,
+              "elapsed_ms": 10.047125,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 25,
+              "status": 200,
+              "elapsed_ms": 113.729834,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 26,
+              "status": 503,
+              "elapsed_ms": 8.933208,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 26,
+              "status": 200,
+              "elapsed_ms": 104.061875,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 27,
+              "status": 503,
+              "elapsed_ms": 224.209667,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 27,
+              "status": 200,
+              "elapsed_ms": 684.914333,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 28,
+              "status": 503,
+              "elapsed_ms": 11.358167,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 28,
+              "status": 200,
+              "elapsed_ms": 96.333417,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 29,
+              "status": 503,
+              "elapsed_ms": 9.90625,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 29,
+              "status": 200,
+              "elapsed_ms": 141.2935,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 30,
+              "status": 503,
+              "elapsed_ms": 9.021042,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 30,
+              "status": 200,
+              "elapsed_ms": 118.777291,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 31,
+              "status": 503,
+              "elapsed_ms": 235.449583,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 31,
+              "status": 200,
+              "elapsed_ms": 616.699875,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 32,
+              "status": 503,
+              "elapsed_ms": 245.432042,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 32,
+              "status": 200,
+              "elapsed_ms": 322.869958,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 33,
+              "status": 503,
+              "elapsed_ms": 273.282208,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 33,
+              "status": 200,
+              "elapsed_ms": 96.204458,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 34,
+              "status": 503,
+              "elapsed_ms": 9.029209,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 34,
+              "status": 200,
+              "elapsed_ms": 109.930125,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 35,
+              "status": 503,
+              "elapsed_ms": 281.885458,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 35,
+              "status": 200,
+              "elapsed_ms": 375.095583,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 36,
+              "status": 503,
+              "elapsed_ms": 10.237292,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 36,
+              "status": 200,
+              "elapsed_ms": 115.035792,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 37,
+              "status": 503,
+              "elapsed_ms": 9.093958,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 37,
+              "status": 200,
+              "elapsed_ms": 116.507125,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 38,
+              "status": 503,
+              "elapsed_ms": 9.495583,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 38,
+              "status": 200,
+              "elapsed_ms": 121.670125,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 39,
+              "status": 503,
+              "elapsed_ms": 183.370125,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 39,
+              "status": 200,
+              "elapsed_ms": 332.211708,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 40,
+              "status": 503,
+              "elapsed_ms": 9.435333,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 40,
+              "status": 200,
+              "elapsed_ms": 363.535416,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 41,
+              "status": 503,
+              "elapsed_ms": 238.884375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 41,
+              "status": 200,
+              "elapsed_ms": 114.511958,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 42,
+              "status": 503,
+              "elapsed_ms": 9.50875,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 42,
+              "status": 200,
+              "elapsed_ms": 383.444375,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 43,
+              "status": 503,
+              "elapsed_ms": 255.378792,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 43,
+              "status": 200,
+              "elapsed_ms": 402.324792,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 44,
+              "status": 503,
+              "elapsed_ms": 10.278291,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 44,
+              "status": 200,
+              "elapsed_ms": 148.266541,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 45,
+              "status": 503,
+              "elapsed_ms": 13.803583,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 45,
+              "status": 200,
+              "elapsed_ms": 122.122042,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 46,
+              "status": 503,
+              "elapsed_ms": 9.95475,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 46,
+              "status": 200,
+              "elapsed_ms": 121.139334,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 47,
+              "status": 503,
+              "elapsed_ms": 772.552334,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 47,
+              "status": 200,
+              "elapsed_ms": 330.421625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 48,
+              "status": 503,
+              "elapsed_ms": 10.076375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 48,
+              "status": 200,
+              "elapsed_ms": 119.126,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 49,
+              "status": 503,
+              "elapsed_ms": 9.592667,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 49,
+              "status": 200,
+              "elapsed_ms": 400.463292,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 50,
+              "status": 503,
+              "elapsed_ms": 258.01,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 50,
+              "status": 200,
+              "elapsed_ms": 120.192584,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 51,
+              "status": 503,
+              "elapsed_ms": 198.7,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 51,
+              "status": 200,
+              "elapsed_ms": 733.683,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 52,
+              "status": 503,
+              "elapsed_ms": 10.964833,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 52,
+              "status": 200,
+              "elapsed_ms": 99.031083,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 53,
+              "status": 503,
+              "elapsed_ms": 10.012417,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 53,
+              "status": 200,
+              "elapsed_ms": 82.158041,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 54,
+              "status": 503,
+              "elapsed_ms": 10.191125,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 54,
+              "status": 200,
+              "elapsed_ms": 120.187875,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 55,
+              "status": 503,
+              "elapsed_ms": 264.03125,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 55,
+              "status": 200,
+              "elapsed_ms": 369.700958,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 56,
+              "status": 503,
+              "elapsed_ms": 10.031083,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 56,
+              "status": 200,
+              "elapsed_ms": 97.374041,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 57,
+              "status": 503,
+              "elapsed_ms": 10.002958,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 57,
+              "status": 200,
+              "elapsed_ms": 94.134,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 58,
+              "status": 503,
+              "elapsed_ms": 10.301584,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 58,
+              "status": 200,
+              "elapsed_ms": 397.810625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 59,
+              "status": 503,
+              "elapsed_ms": 1051.770208,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 59,
+              "status": 200,
+              "elapsed_ms": 364.000459,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 60,
+              "status": 503,
+              "elapsed_ms": 9.403167,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 60,
+              "status": 200,
+              "elapsed_ms": 110.189625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 61,
+              "status": 503,
+              "elapsed_ms": 10.150875,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 61,
+              "status": 200,
+              "elapsed_ms": 121.840333,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 62,
+              "status": 503,
+              "elapsed_ms": 9.494792,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 62,
+              "status": 200,
+              "elapsed_ms": 377.352333,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 63,
+              "status": 503,
+              "elapsed_ms": 250.981375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 63,
+              "status": 200,
+              "elapsed_ms": 357.730041,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 64,
+              "status": 503,
+              "elapsed_ms": 9.894291,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 64,
+              "status": 200,
+              "elapsed_ms": 92.401875,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 65,
+              "status": 503,
+              "elapsed_ms": 9.090792,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 65,
+              "status": 200,
+              "elapsed_ms": 93.830875,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 66,
+              "status": 503,
+              "elapsed_ms": 9.023667,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 66,
+              "status": 200,
+              "elapsed_ms": 124.711292,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 67,
+              "status": 503,
+              "elapsed_ms": 338.908834,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 67,
+              "status": 200,
+              "elapsed_ms": 694.709916,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 68,
+              "status": 503,
+              "elapsed_ms": 274.3235,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 68,
+              "status": 200,
+              "elapsed_ms": 87.632208,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 69,
+              "status": 503,
+              "elapsed_ms": 9.988416,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 69,
+              "status": 200,
+              "elapsed_ms": 93.144416,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 70,
+              "status": 503,
+              "elapsed_ms": 9.79825,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 70,
+              "status": 200,
+              "elapsed_ms": 122.889125,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 71,
+              "status": 503,
+              "elapsed_ms": 227.049333,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 71,
+              "status": 200,
+              "elapsed_ms": 736.977833,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 72,
+              "status": 503,
+              "elapsed_ms": 10.061333,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 72,
+              "status": 200,
+              "elapsed_ms": 108.106917,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 73,
+              "status": 503,
+              "elapsed_ms": 10.092208,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 73,
+              "status": 200,
+              "elapsed_ms": 125.0795,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 74,
+              "status": 503,
+              "elapsed_ms": 9.248958,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 74,
+              "status": 200,
+              "elapsed_ms": 121.584125,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 75,
+              "status": 503,
+              "elapsed_ms": 892.994709,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 75,
+              "status": 200,
+              "elapsed_ms": 439.51,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 76,
+              "status": 503,
+              "elapsed_ms": 10.154083,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 76,
+              "status": 200,
+              "elapsed_ms": 402.990125,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 77,
+              "status": 503,
+              "elapsed_ms": 292.350333,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 77,
+              "status": 200,
+              "elapsed_ms": 132.884,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 78,
+              "status": 503,
+              "elapsed_ms": 9.976292,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 78,
+              "status": 200,
+              "elapsed_ms": 431.738083,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 79,
+              "status": 503,
+              "elapsed_ms": 238.542625,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 79,
+              "status": 200,
+              "elapsed_ms": 385.686916,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 80,
+              "status": 503,
+              "elapsed_ms": 11.896833,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 80,
+              "status": 200,
+              "elapsed_ms": 115.586708,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 81,
+              "status": 503,
+              "elapsed_ms": 9.688625,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 81,
+              "status": 200,
+              "elapsed_ms": 122.441333,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 82,
+              "status": 503,
+              "elapsed_ms": 10.039417,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 82,
+              "status": 200,
+              "elapsed_ms": 95.835958,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 83,
+              "status": 503,
+              "elapsed_ms": 312.227667,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 83,
+              "status": 200,
+              "elapsed_ms": 406.603125,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 84,
+              "status": 503,
+              "elapsed_ms": 10.255708,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 84,
+              "status": 200,
+              "elapsed_ms": 101.508291,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 85,
+              "status": 503,
+              "elapsed_ms": 9.601084,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 85,
+              "status": 200,
+              "elapsed_ms": 438.95075,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 86,
+              "status": 503,
+              "elapsed_ms": 316.18625,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 86,
+              "status": 200,
+              "elapsed_ms": 754.150167,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 87,
+              "status": 503,
+              "elapsed_ms": 10.18275,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 87,
+              "status": 200,
+              "elapsed_ms": 850.763042,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 88,
+              "status": 503,
+              "elapsed_ms": 10.317583,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 88,
+              "status": 200,
+              "elapsed_ms": 108.00925,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 89,
+              "status": 503,
+              "elapsed_ms": 9.351,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 89,
+              "status": 200,
+              "elapsed_ms": 123.909083,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 90,
+              "status": 503,
+              "elapsed_ms": 9.556417,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 90,
+              "status": 200,
+              "elapsed_ms": 406.470166,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 91,
+              "status": 503,
+              "elapsed_ms": 9.833209,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 91,
+              "status": 200,
+              "elapsed_ms": 496.459083,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 92,
+              "status": 503,
+              "elapsed_ms": 9.954209,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 92,
+              "status": 200,
+              "elapsed_ms": 407.370208,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 93,
+              "status": 503,
+              "elapsed_ms": 334.343166,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 93,
+              "status": 200,
+              "elapsed_ms": 84.89425,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 94,
+              "status": 503,
+              "elapsed_ms": 9.857375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 94,
+              "status": 200,
+              "elapsed_ms": 98.466417,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 95,
+              "status": 503,
+              "elapsed_ms": 320.650458,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 95,
+              "status": 200,
+              "elapsed_ms": 718.832625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 96,
+              "status": 503,
+              "elapsed_ms": 10.142834,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 96,
+              "status": 200,
+              "elapsed_ms": 103.931375,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 97,
+              "status": 503,
+              "elapsed_ms": 9.431625,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 97,
+              "status": 200,
+              "elapsed_ms": 125.69725,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 98,
+              "status": 503,
+              "elapsed_ms": 9.37625,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 98,
+              "status": 200,
+              "elapsed_ms": 519.948917,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 99,
+              "status": 503,
+              "elapsed_ms": 295.176708,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296028,
+              "chunk_index": 99,
+              "status": 200,
+              "elapsed_ms": 395.7395,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 100,
+              "status": 503,
+              "elapsed_ms": 9.559375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 100,
+              "status": 200,
+              "elapsed_ms": 444.265208,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 101,
+              "status": 503,
+              "elapsed_ms": 344.690875,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 101,
+              "status": 200,
+              "elapsed_ms": 116.731542,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 102,
+              "status": 503,
+              "elapsed_ms": 9.011791,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 102,
+              "status": 200,
+              "elapsed_ms": 122.333042,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 103,
+              "status": 503,
+              "elapsed_ms": 324.557875,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 103,
+              "status": 200,
+              "elapsed_ms": 414.971584,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 104,
+              "status": 503,
+              "elapsed_ms": 9.897416,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 104,
+              "status": 200,
+              "elapsed_ms": 92.970542,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 105,
+              "status": 503,
+              "elapsed_ms": 9.793875,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 105,
+              "status": 200,
+              "elapsed_ms": 112.225125,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 106,
+              "status": 503,
+              "elapsed_ms": 9.510208,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 106,
+              "status": 200,
+              "elapsed_ms": 100.611375,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 107,
+              "status": 503,
+              "elapsed_ms": 403.056166,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 107,
+              "status": 200,
+              "elapsed_ms": 773.492917,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 108,
+              "status": 503,
+              "elapsed_ms": 10.081917,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 108,
+              "status": 200,
+              "elapsed_ms": 108.481625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 109,
+              "status": 503,
+              "elapsed_ms": 9.473958,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 109,
+              "status": 200,
+              "elapsed_ms": 472.289459,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 110,
+              "status": 503,
+              "elapsed_ms": 346.558709,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 110,
+              "status": 200,
+              "elapsed_ms": 97.902625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 111,
+              "status": 503,
+              "elapsed_ms": 731.504375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 111,
+              "status": 200,
+              "elapsed_ms": 495.417083,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 112,
+              "status": 503,
+              "elapsed_ms": 10.188167,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 112,
+              "status": 200,
+              "elapsed_ms": 109.505333,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 113,
+              "status": 503,
+              "elapsed_ms": 9.926,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 113,
+              "status": 200,
+              "elapsed_ms": 126.071709,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 114,
+              "status": 503,
+              "elapsed_ms": 9.744416,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 114,
+              "status": 200,
+              "elapsed_ms": 118.916041,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 115,
+              "status": 503,
+              "elapsed_ms": 325.763458,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 115,
+              "status": 200,
+              "elapsed_ms": 789.30975,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 116,
+              "status": 503,
+              "elapsed_ms": 9.056167,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 116,
+              "status": 200,
+              "elapsed_ms": 108.382167,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 117,
+              "status": 503,
+              "elapsed_ms": 9.543708,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 117,
+              "status": 200,
+              "elapsed_ms": 103.963667,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 118,
+              "status": 503,
+              "elapsed_ms": 9.576875,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 118,
+              "status": 200,
+              "elapsed_ms": 464.9855,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 119,
+              "status": 503,
+              "elapsed_ms": 1171.682209,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 119,
+              "status": 200,
+              "elapsed_ms": 552.016791,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 120,
+              "status": 503,
+              "elapsed_ms": 10.084708,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 120,
+              "status": 200,
+              "elapsed_ms": 93.437709,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 121,
+              "status": 503,
+              "elapsed_ms": 9.914583,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 121,
+              "status": 200,
+              "elapsed_ms": 95.457708,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 122,
+              "status": 503,
+              "elapsed_ms": 10.308708,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 122,
+              "status": 200,
+              "elapsed_ms": 118.762417,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 123,
+              "status": 503,
+              "elapsed_ms": 428.419459,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 123,
+              "status": 200,
+              "elapsed_ms": 375.221041,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 124,
+              "status": 503,
+              "elapsed_ms": 11.176083,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 124,
+              "status": 200,
+              "elapsed_ms": 127.778625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 125,
+              "status": 503,
+              "elapsed_ms": 10.13325,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 125,
+              "status": 200,
+              "elapsed_ms": 124.861625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 126,
+              "status": 503,
+              "elapsed_ms": 9.9645,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 126,
+              "status": 200,
+              "elapsed_ms": 112.7945,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 127,
+              "status": 503,
+              "elapsed_ms": 363.871542,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 127,
+              "status": 200,
+              "elapsed_ms": 874.488,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 128,
+              "status": 503,
+              "elapsed_ms": 368.602,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 128,
+              "status": 200,
+              "elapsed_ms": 644.01475,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 129,
+              "status": 503,
+              "elapsed_ms": 10.139125,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 129,
+              "status": 200,
+              "elapsed_ms": 122.100666,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 130,
+              "status": 503,
+              "elapsed_ms": 474.809541,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 130,
+              "status": 200,
+              "elapsed_ms": 106.944834,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 131,
+              "status": 503,
+              "elapsed_ms": 350.649708,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 131,
+              "status": 200,
+              "elapsed_ms": 474.338375,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 132,
+              "status": 503,
+              "elapsed_ms": 11.086208,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 132,
+              "status": 200,
+              "elapsed_ms": 96.552417,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 133,
+              "status": 503,
+              "elapsed_ms": 10.057375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 133,
+              "status": 200,
+              "elapsed_ms": 93.460208,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 134,
+              "status": 503,
+              "elapsed_ms": 9.135375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 134,
+              "status": 200,
+              "elapsed_ms": 102.782167,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 135,
+              "status": 503,
+              "elapsed_ms": 436.8575,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 135,
+              "status": 200,
+              "elapsed_ms": 527.504291,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 136,
+              "status": 503,
+              "elapsed_ms": 9.637917,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 136,
+              "status": 200,
+              "elapsed_ms": 496.178125,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 137,
+              "status": 503,
+              "elapsed_ms": 387.838208,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 137,
+              "status": 200,
+              "elapsed_ms": 538.145625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 138,
+              "status": 503,
+              "elapsed_ms": 13.165083,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 138,
+              "status": 200,
+              "elapsed_ms": 92.715459,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 139,
+              "status": 503,
+              "elapsed_ms": 298.4045,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 139,
+              "status": 200,
+              "elapsed_ms": 498.551958,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 140,
+              "status": 503,
+              "elapsed_ms": 10.049667,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 140,
+              "status": 200,
+              "elapsed_ms": 114.165166,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 141,
+              "status": 503,
+              "elapsed_ms": 9.390333,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 141,
+              "status": 200,
+              "elapsed_ms": 118.361541,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 142,
+              "status": 503,
+              "elapsed_ms": 10.183125,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 142,
+              "status": 200,
+              "elapsed_ms": 119.428708,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 143,
+              "status": 503,
+              "elapsed_ms": 483.525542,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 143,
+              "status": 200,
+              "elapsed_ms": 793.060542,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 144,
+              "status": 503,
+              "elapsed_ms": 10.101834,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 144,
+              "status": 200,
+              "elapsed_ms": 123.964709,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 145,
+              "status": 503,
+              "elapsed_ms": 9.053542,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 145,
+              "status": 200,
+              "elapsed_ms": 512.990209,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 146,
+              "status": 503,
+              "elapsed_ms": 399.923209,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 146,
+              "status": 200,
+              "elapsed_ms": 89.47,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 147,
+              "status": 503,
+              "elapsed_ms": 465.368125,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 147,
+              "status": 200,
+              "elapsed_ms": 856.854083,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 148,
+              "status": 503,
+              "elapsed_ms": 9.871833,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 148,
+              "status": 200,
+              "elapsed_ms": 89.850583,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 149,
+              "status": 503,
+              "elapsed_ms": 9.918,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 149,
+              "status": 200,
+              "elapsed_ms": 121.571708,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 150,
+              "status": 503,
+              "elapsed_ms": 10.120709,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 150,
+              "status": 200,
+              "elapsed_ms": 96.88875,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 151,
+              "status": 503,
+              "elapsed_ms": 322.225875,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 151,
+              "status": 200,
+              "elapsed_ms": 579.464583,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 152,
+              "status": 503,
+              "elapsed_ms": 10.086917,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 152,
+              "status": 200,
+              "elapsed_ms": 77.42225,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 153,
+              "status": 503,
+              "elapsed_ms": 9.456167,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 153,
+              "status": 200,
+              "elapsed_ms": 97.972125,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 154,
+              "status": 503,
+              "elapsed_ms": 10.091458,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 154,
+              "status": 200,
+              "elapsed_ms": 526.688917,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 155,
+              "status": 503,
+              "elapsed_ms": 1476.531917,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 296029,
+              "chunk_index": 155,
+              "status": 200,
+              "elapsed_ms": 467.436834,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "chunk",
+              "request_bytes": 74557,
+              "chunk_index": 156,
+              "status": 503,
+              "elapsed_ms": 3.226792,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "chunk",
+              "request_bytes": 74557,
+              "chunk_index": 156,
+              "status": 200,
+              "elapsed_ms": 53.921625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "activate",
+              "request_bytes": 736,
+              "chunk_index": 0,
+              "status": 503,
+              "elapsed_ms": 1.151666,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "activate",
+              "request_bytes": 736,
+              "chunk_index": 0,
+              "status": 200,
+              "elapsed_ms": 44.323917,
+              "body": ""
+            }
+          ],
+          "status": 200,
+          "delivery_ms": 67770.663833,
+          "requests": 159,
+          "http_attempts": 318,
+          "total_attempt_request_bytes": 92512884,
+          "request_latency": {
+            "samples": 159,
+            "p50_ms": 153.471584,
+            "p95_ms": 1241.070375,
+            "max_ms": 1958.412042
+          },
+          "request_raw_ms": [
+            75.539333,
+            119.784208,
+            120.051209,
+            148.618959,
+            535.610333,
+            124.957875,
+            326.071583,
+            120.282666,
+            1031.04675,
+            301.224375,
+            116.017417,
+            145.745333,
+            528.268416,
+            114.808791,
+            139.497,
+            349.398833,
+            1167.848625,
+            115.916833,
+            120.81575,
+            161.163917,
+            540.32425,
+            146.92825,
+            153.935541,
+            359.465667,
+            755.218375,
+            108.726,
+            137.724709,
+            127.452292,
+            923.581791,
+            122.16975,
+            165.671708,
+            142.050334,
+            866.368291,
+            583.071333,
+            383.816834,
+            132.03075,
+            671.307541,
+            140.125334,
+            140.142375,
+            145.04,
+            530.048583,
+            387.671667,
+            367.988917,
+            407.374583,
+            672.199334,
+            172.534209,
+            153.907958,
+            145.483666,
+            1120.8675,
+            143.563625,
+            424.917166,
+            393.071833,
+            947.330875,
+            124.82675,
+            106.727417,
+            144.984083,
+            648.237,
+            121.865417,
+            119.070291,
+            423.056833,
+            1430.22125,
+            133.69425,
+            146.41475,
+            400.911791,
+            622.980959,
+            116.710292,
+            117.394625,
+            147.36275,
+            1047.61975,
+            376.484125,
+            117.053541,
+            147.021833,
+            978.101458,
+            132.240958,
+            150.144375,
+            145.642542,
+            1346.629125,
+            427.33,
+            439.649666,
+            455.284875,
+            638.568208,
+            141.417792,
+            146.575542,
+            120.212958,
+            733.249583,
+            126.114125,
+            462.151375,
+            1084.683333,
+            875.387583,
+            132.465833,
+            147.574917,
+            430.008291,
+            520.631542,
+            431.678958,
+            433.478584,
+            121.72775,
+            1053.937959,
+            128.670875,
+            149.034334,
+            543.968333,
+            705.285041,
+            467.703709,
+            475.168834,
+            145.766833,
+            752.923417,
+            117.166875,
+            136.528833,
+            124.451,
+            1190.940541,
+            132.079667,
+            495.020542,
+            458.81525,
+            1241.070375,
+            133.5825,
+            150.432208,
+            143.031375,
+            1129.539208,
+            130.185125,
+            126.782625,
+            488.692334,
+            1738.011667,
+            117.890958,
+            119.967167,
+            143.980417,
+            818.161875,
+            153.471584,
+            149.674916,
+            136.635542,
+            1252.806542,
+            1027.12175,
+            146.809333,
+            595.976167,
+            839.694042,
+            122.300792,
+            117.730834,
+            125.298375,
+            978.824542,
+            520.170208,
+            940.453375,
+            120.415209,
+            811.14975,
+            138.5955,
+            142.30225,
+            144.16025,
+            1290.892708,
+            148.423,
+            536.69425,
+            503.716792,
+            1336.306042,
+            113.977084,
+            145.688167,
+            121.124791,
+            915.186542,
+            101.834875,
+            121.668583,
+            550.994084,
+            1958.412042,
+            60.451208,
+            45.589917
+          ],
+          "total_request_bytes": 46256442,
+          "max_request_bytes": 296029,
+          "activation_ms": 45.589917,
+          "elapsed_ms": 70008.99225
+        },
+        "after_baseline_readiness": {
+          "elapsed_ms": 4344.177708029747,
+          "attempts": 5,
+          "leader_index": 1,
+          "term": 1
+        },
+        "idle_control": [
+          {
+            "status": 200,
+            "elapsed_ms": 51.491209,
+            "token": "438",
+            "bytes": "8042",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 46.066708,
+            "token": "448",
+            "bytes": "8042",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 53.402083,
+            "token": "458",
+            "bytes": "8043",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 46.018042,
+            "token": "462",
+            "bytes": "8043",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 47.535375,
+            "token": "466",
+            "bytes": "8043",
+            "error": ""
+          }
+        ],
+        "contended_control": [
+          {
+            "status": 200,
+            "elapsed_ms": 48.248125,
+            "token": "440",
+            "bytes": "8043",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 50.923083,
+            "token": "450",
+            "bytes": "8042",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 50.800041,
+            "token": "460",
+            "bytes": "8042",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 51.793084,
+            "token": "464",
+            "bytes": "8043",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 51.534334,
+            "token": "468",
+            "bytes": "8042",
+            "error": ""
+          }
+        ],
+        "diagnostics": [
+          [
+            {
+              "status": 200,
+              "elapsed_ms": 705.1145,
+              "token": "69",
+              "bytes": "46148040",
+              "error": ""
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 2.042958,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 2.393459,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.431959,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ],
+          [
+            {
+              "status": 503,
+              "elapsed_ms": 1.635667,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 200,
+              "elapsed_ms": 706.011,
+              "token": "71",
+              "bytes": "46148040",
+              "error": ""
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.590583,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.728375,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ],
+          [
+            {
+              "status": 503,
+              "elapsed_ms": 1.914334,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.643209,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.485042,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.843667,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ],
+          [
+            {
+              "status": 503,
+              "elapsed_ms": 1.515084,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.34325,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.177542,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.502459,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ],
+          [
+            {
+              "status": 503,
+              "elapsed_ms": 1.67575,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.7525,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.595334,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.842625,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ]
+        ],
+        "bursts": [
+          {
+            "changed_groups": 32,
+            "raw": [
+              {
+                "publish_ms": 485.276917,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 88.971167,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 148309
+              },
+              {
+                "publish_ms": 64.273125,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 87.771,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 148300
+              },
+              {
+                "publish_ms": 66.655333,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 88.581125,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 148306
+              },
+              {
+                "publish_ms": 96.639333,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 87.481125,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 148314
+              },
+              {
+                "publish_ms": 195.23125,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 88.713333,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 148302
+              }
+            ],
+            "publish": {
+              "samples": 5,
+              "p50_ms": 96.639333,
+              "p95_ms": 485.276917,
+              "max_ms": 485.276917
+            },
+            "control": {
+              "samples": 5,
+              "p50_ms": 88.581125,
+              "p95_ms": 88.971167,
+              "max_ms": 88.971167
+            },
+            "control_failures": 0
+          },
+          {
+            "changed_groups": 33,
+            "raw": [
+              {
+                "publish_ms": 694.831417,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 92.485083,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 152919
+              },
+              {
+                "publish_ms": 883.311833,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 123.295291,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 152957
+              },
+              {
+                "publish_ms": 117.515417,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 92.203125,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 152989
+              },
+              {
+                "publish_ms": 112.586875,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 91.624625,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 152987
+              },
+              {
+                "publish_ms": 83.736875,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 92.089041,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 152990
+              }
+            ],
+            "publish": {
+              "samples": 5,
+              "p50_ms": 117.515417,
+              "p95_ms": 883.311833,
+              "max_ms": 883.311833
+            },
+            "control": {
+              "samples": 5,
+              "p50_ms": 92.203125,
+              "p95_ms": 123.295291,
+              "max_ms": 123.295291
+            },
+            "control_failures": 0
+          },
+          {
+            "changed_groups": 128,
+            "raw": [
+              {
+                "publish_ms": 794.88725,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 192.952583,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 591316
+              },
+              {
+                "publish_ms": 615.581459,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 151.968916,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 591311
+              },
+              {
+                "publish_ms": 1157.290541,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 185.544708,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 591320
+              },
+              {
+                "publish_ms": 370.871542,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 187.085583,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 591317
+              },
+              {
+                "publish_ms": 727.095667,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64773",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 188.340792,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 591310
+              }
+            ],
+            "publish": {
+              "samples": 5,
+              "p50_ms": 727.095667,
+              "p95_ms": 1157.290541,
+              "max_ms": 1157.290541
+            },
+            "control": {
+              "samples": 5,
+              "p50_ms": 187.085583,
+              "p95_ms": 192.952583,
+              "max_ms": 192.952583
+            },
+            "control_failures": 0
+          }
+        ]
+      }
+    },
+    "batched": {
+      "binary_sha256": "3be4e30b06c0da2c19c0eeea716cf14d18c1ca504bdcf25df189b917a7da3501",
+      "workload": {
+        "startup_ms": 3672.557500191033,
+        "groups": 10000,
+        "indexes_per_group": 1,
+        "metadata_nodes": 3,
+        "real_data_nodes": 3,
+        "all_real_data_nodes_alive": true,
+        "samples": 5,
+        "warmup": 1,
+        "initial_readiness": {
+          "elapsed_ms": 4099.717082921416,
+          "attempts": 5,
+          "leader_index": 1,
+          "term": 1
+        },
+        "fixture_retries": [],
+        "baseline": {
+          "full_request_bytes": 46140485,
+          "mode": "batched",
+          "logical_chunks": 157,
+          "fragment_chunks": 0,
+          "plan_ms": 2289.851416,
+          "attempts": [
+            {
+              "endpoint": 0,
+              "action": "prepare",
+              "request_bytes": 735,
+              "chunk_index": 0,
+              "status": 503,
+              "elapsed_ms": 1.281667,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "prepare",
+              "request_bytes": 735,
+              "chunk_index": 0,
+              "status": 200,
+              "elapsed_ms": 43.361209,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480883,
+              "chunk_index": 0,
+              "status": 503,
+              "elapsed_ms": 43.433667,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480883,
+              "chunk_index": 0,
+              "status": 200,
+              "elapsed_ms": 599.782917,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480883,
+              "chunk_index": 5,
+              "status": 503,
+              "elapsed_ms": 75.903167,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480883,
+              "chunk_index": 5,
+              "status": 200,
+              "elapsed_ms": 556.015959,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 10,
+              "status": 503,
+              "elapsed_ms": 248.414209,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 10,
+              "status": 200,
+              "elapsed_ms": 1011.1305,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 15,
+              "status": 503,
+              "elapsed_ms": 145.004667,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 15,
+              "status": 200,
+              "elapsed_ms": 526.633833,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 20,
+              "status": 503,
+              "elapsed_ms": 141.028667,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 20,
+              "status": 200,
+              "elapsed_ms": 617.462166,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 25,
+              "status": 503,
+              "elapsed_ms": 70.417125,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 25,
+              "status": 200,
+              "elapsed_ms": 883.092375,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 30,
+              "status": 503,
+              "elapsed_ms": 43.855583,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 30,
+              "status": 200,
+              "elapsed_ms": 650.039084,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 35,
+              "status": 503,
+              "elapsed_ms": 152.972542,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 35,
+              "status": 200,
+              "elapsed_ms": 827.0705,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 40,
+              "status": 503,
+              "elapsed_ms": 358.904417,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 40,
+              "status": 200,
+              "elapsed_ms": 644.664375,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 45,
+              "status": 503,
+              "elapsed_ms": 702.820792,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 45,
+              "status": 200,
+              "elapsed_ms": 589.082666,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 50,
+              "status": 503,
+              "elapsed_ms": 122.952167,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 50,
+              "status": 200,
+              "elapsed_ms": 604.196583,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 55,
+              "status": 503,
+              "elapsed_ms": 129.209042,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 55,
+              "status": 200,
+              "elapsed_ms": 609.356792,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 60,
+              "status": 503,
+              "elapsed_ms": 140.07475,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 60,
+              "status": 200,
+              "elapsed_ms": 1039.683042,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 65,
+              "status": 503,
+              "elapsed_ms": 235.3415,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 65,
+              "status": 200,
+              "elapsed_ms": 1017.174375,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 70,
+              "status": 503,
+              "elapsed_ms": 190.857709,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 70,
+              "status": 200,
+              "elapsed_ms": 929.453625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 75,
+              "status": 503,
+              "elapsed_ms": 406.895709,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 75,
+              "status": 200,
+              "elapsed_ms": 879.719333,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 80,
+              "status": 503,
+              "elapsed_ms": 937.464375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 80,
+              "status": 200,
+              "elapsed_ms": 626.50275,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 85,
+              "status": 503,
+              "elapsed_ms": 115.945291,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 85,
+              "status": 200,
+              "elapsed_ms": 637.953584,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 90,
+              "status": 503,
+              "elapsed_ms": 297.410292,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 90,
+              "status": 200,
+              "elapsed_ms": 1041.675166,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 95,
+              "status": 503,
+              "elapsed_ms": 142.058708,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480889,
+              "chunk_index": 95,
+              "status": 200,
+              "elapsed_ms": 660.202333,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 100,
+              "status": 503,
+              "elapsed_ms": 224.601334,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 100,
+              "status": 200,
+              "elapsed_ms": 708.6465,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 105,
+              "status": 503,
+              "elapsed_ms": 1031.342833,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 105,
+              "status": 200,
+              "elapsed_ms": 1199.812833,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 110,
+              "status": 503,
+              "elapsed_ms": 131.737375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 110,
+              "status": 200,
+              "elapsed_ms": 1169.01625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 115,
+              "status": 503,
+              "elapsed_ms": 670.528416,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 115,
+              "status": 200,
+              "elapsed_ms": 671.891917,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 120,
+              "status": 503,
+              "elapsed_ms": 188.632916,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 120,
+              "status": 200,
+              "elapsed_ms": 695.803708,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 125,
+              "status": 503,
+              "elapsed_ms": 268.312584,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 125,
+              "status": 200,
+              "elapsed_ms": 729.077,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 130,
+              "status": 503,
+              "elapsed_ms": 291.462375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 130,
+              "status": 200,
+              "elapsed_ms": 1334.911208,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 135,
+              "status": 503,
+              "elapsed_ms": 1100.621709,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 135,
+              "status": 200,
+              "elapsed_ms": 768.991083,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 140,
+              "status": 503,
+              "elapsed_ms": 234.967125,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 140,
+              "status": 200,
+              "elapsed_ms": 790.847917,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 145,
+              "status": 503,
+              "elapsed_ms": 255.046875,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 145,
+              "status": 200,
+              "elapsed_ms": 1057.323792,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 150,
+              "status": 503,
+              "elapsed_ms": 112.493334,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 1480895,
+              "chunk_index": 150,
+              "status": 200,
+              "elapsed_ms": 847.1265,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "batch",
+              "request_bytes": 371333,
+              "chunk_index": 155,
+              "status": 503,
+              "elapsed_ms": 433.316542,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "batch",
+              "request_bytes": 371333,
+              "chunk_index": 155,
+              "status": 200,
+              "elapsed_ms": 963.494292,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "activate",
+              "request_bytes": 736,
+              "chunk_index": 0,
+              "status": 503,
+              "elapsed_ms": 1.040208,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "activate",
+              "request_bytes": 736,
+              "chunk_index": 0,
+              "status": 200,
+              "elapsed_ms": 467.604875,
+              "body": ""
+            }
+          ],
+          "status": 200,
+          "delivery_ms": 40991.326917,
+          "requests": 34,
+          "http_attempts": 68,
+          "total_attempt_request_bytes": 92560834,
+          "request_latency": {
+            "samples": 34,
+            "p50_ms": 1071.9286665,
+            "p95_ms": 1942.583958,
+            "max_ms": 2304.661292
+          },
+          "request_raw_ms": [
+            44.76375,
+            715.867916,
+            703.627875,
+            1330.462084,
+            742.954125,
+            830.677667,
+            1027.561042,
+            764.779917,
+            1052.136958,
+            1074.817708,
+            1362.6475,
+            798.308042,
+            809.425708,
+            1250.791875,
+            1323.922458,
+            1193.202417,
+            1357.781959,
+            1634.570666,
+            824.527792,
+            1409.714333,
+            875.039791,
+            1006.0565,
+            2304.661292,
+            1372.413333,
+            1415.221292,
+            956.553834,
+            1069.039625,
+            1699.155666,
+            1942.583958,
+            1097.8505,
+            1384.891667,
+            1030.968167,
+            1415.126042,
+            468.762458
+          ],
+          "total_request_bytes": 46280417,
+          "max_request_bytes": 1480895,
+          "activation_ms": 468.762458,
+          "elapsed_ms": 43281.204416
+        },
+        "after_baseline_readiness": {
+          "elapsed_ms": 4003.3192080445588,
+          "attempts": 6,
+          "leader_index": 1,
+          "term": 1
+        },
+        "idle_control": [
+          {
+            "status": 200,
+            "elapsed_ms": 52.719292,
+            "token": "292",
+            "bytes": "8039",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 52.032708,
+            "token": "296",
+            "bytes": "8039",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 51.018625,
+            "token": "306",
+            "bytes": "8039",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 50.428166,
+            "token": "312",
+            "bytes": "8039",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 50.258459,
+            "token": "320",
+            "bytes": "8038",
+            "error": ""
+          }
+        ],
+        "contended_control": [
+          {
+            "status": 200,
+            "elapsed_ms": 51.434292,
+            "token": "294",
+            "bytes": "8039",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 53.134,
+            "token": "300",
+            "bytes": "8039",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 48.607833,
+            "token": "310",
+            "bytes": "8039",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 50.898209,
+            "token": "318",
+            "bytes": "8038",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 52.068167,
+            "token": "322",
+            "bytes": "8039",
+            "error": ""
+          }
+        ],
+        "diagnostics": [
+          [
+            {
+              "status": 503,
+              "elapsed_ms": 2.214292,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.913333,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.864166,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 200,
+              "elapsed_ms": 718.881,
+              "token": "51",
+              "bytes": "46148037",
+              "error": ""
+            }
+          ],
+          [
+            {
+              "status": 200,
+              "elapsed_ms": 713.383458,
+              "token": "53",
+              "bytes": "46148037",
+              "error": ""
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.822708,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.455042,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.538375,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ],
+          [
+            {
+              "status": 503,
+              "elapsed_ms": 1.942833,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.7975,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.443958,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.737833,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ],
+          [
+            {
+              "status": 503,
+              "elapsed_ms": 1.955375,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.857375,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.719917,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.294875,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ],
+          [
+            {
+              "status": 503,
+              "elapsed_ms": 1.789083,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.662958,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.822292,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.704083,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ]
+        ],
+        "bursts": [
+          {
+            "changed_groups": 32,
+            "raw": [
+              {
+                "publish_ms": 85.212083,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 90.693,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 148309
+              },
+              {
+                "publish_ms": 86.045875,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 83.327125,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 148300
+              },
+              {
+                "publish_ms": 88.552666,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 87.356917,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 148306
+              },
+              {
+                "publish_ms": 95.111458,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 88.376875,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 148314
+              },
+              {
+                "publish_ms": 392.671292,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 91.853458,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 148302
+              }
+            ],
+            "publish": {
+              "samples": 5,
+              "p50_ms": 88.552666,
+              "p95_ms": 392.671292,
+              "max_ms": 392.671292
+            },
+            "control": {
+              "samples": 5,
+              "p50_ms": 88.376875,
+              "p95_ms": 91.853458,
+              "max_ms": 91.853458
+            },
+            "control_failures": 0
+          },
+          {
+            "changed_groups": 33,
+            "raw": [
+              {
+                "publish_ms": 504.652417,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 93.833708,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 152919
+              },
+              {
+                "publish_ms": 495.383042,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 85.356958,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 152957
+              },
+              {
+                "publish_ms": 87.1925,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 83.804875,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 152989
+              },
+              {
+                "publish_ms": 199.381416,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 89.464042,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 152987
+              },
+              {
+                "publish_ms": 103.462625,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 83.662167,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 152990
+              }
+            ],
+            "publish": {
+              "samples": 5,
+              "p50_ms": 199.381416,
+              "p95_ms": 504.652417,
+              "max_ms": 504.652417
+            },
+            "control": {
+              "samples": 5,
+              "p50_ms": 85.356958,
+              "p95_ms": 93.833708,
+              "max_ms": 93.833708
+            },
+            "control_failures": 0
+          },
+          {
+            "changed_groups": 128,
+            "raw": [
+              {
+                "publish_ms": 338.737,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 183.594333,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 591316
+              },
+              {
+                "publish_ms": 596.845958,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 176.232959,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 591311
+              },
+              {
+                "publish_ms": 299.440167,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 178.396625,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 591320
+              },
+              {
+                "publish_ms": 614.24275,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 205.878959,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 591317
+              },
+              {
+                "publish_ms": 843.939042,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:62038",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 529.95875,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 591310
+              }
+            ],
+            "publish": {
+              "samples": 5,
+              "p50_ms": 596.845958,
+              "p95_ms": 843.939042,
+              "max_ms": 843.939042
+            },
+            "control": {
+              "samples": 5,
+              "p50_ms": 183.594333,
+              "p95_ms": 529.95875,
+              "max_ms": 529.95875
+            },
+            "control_failures": 0
+          }
+        ]
+      }
+    },
+    "wide": {
+      "binary_sha256": "3be4e30b06c0da2c19c0eeea716cf14d18c1ca504bdcf25df189b917a7da3501",
+      "workload": {
+        "startup_ms": 3468.0110830813646,
+        "groups": 8,
+        "indexes_per_group": 1200,
+        "metadata_nodes": 3,
+        "real_data_nodes": 3,
+        "all_real_data_nodes_alive": true,
+        "samples": 5,
+        "warmup": 1,
+        "initial_readiness": {
+          "elapsed_ms": 1034.3651669099927,
+          "attempts": 6,
+          "leader_index": 1,
+          "term": 1
+        },
+        "fixture_retries": [],
+        "baseline": {
+          "full_request_bytes": 9764437,
+          "mode": "batched",
+          "logical_chunks": 24,
+          "fragment_chunks": 24,
+          "plan_ms": 3465.494084,
+          "attempts": [
+            {
+              "endpoint": 0,
+              "action": "prepare",
+              "request_bytes": 737,
+              "chunk_index": 0,
+              "status": 503,
+              "elapsed_ms": 1.229458,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "prepare",
+              "request_bytes": 737,
+              "chunk_index": 0,
+              "status": 200,
+              "elapsed_ms": 21.726625,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699990,
+              "chunk_index": 0,
+              "status": 503,
+              "elapsed_ms": 19.104458,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699990,
+              "chunk_index": 0,
+              "status": 200,
+              "elapsed_ms": 118.894167,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699995,
+              "chunk_index": 1,
+              "status": 503,
+              "elapsed_ms": 47.506334,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699995,
+              "chunk_index": 1,
+              "status": 200,
+              "elapsed_ms": 88.218292,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 230784,
+              "chunk_index": 2,
+              "status": 503,
+              "elapsed_ms": 6.968,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 230784,
+              "chunk_index": 2,
+              "status": 200,
+              "elapsed_ms": 131.466417,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699994,
+              "chunk_index": 3,
+              "status": 503,
+              "elapsed_ms": 60.300167,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699994,
+              "chunk_index": 3,
+              "status": 200,
+              "elapsed_ms": 155.906417,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699999,
+              "chunk_index": 4,
+              "status": 503,
+              "elapsed_ms": 48.590667,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699999,
+              "chunk_index": 4,
+              "status": 200,
+              "elapsed_ms": 170.820167,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 230788,
+              "chunk_index": 5,
+              "status": 503,
+              "elapsed_ms": 6.625208,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 230788,
+              "chunk_index": 5,
+              "status": 200,
+              "elapsed_ms": 153.215375,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699988,
+              "chunk_index": 6,
+              "status": 503,
+              "elapsed_ms": 18.957834,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699988,
+              "chunk_index": 6,
+              "status": 200,
+              "elapsed_ms": 201.604584,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699993,
+              "chunk_index": 7,
+              "status": 503,
+              "elapsed_ms": 24.385416,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699993,
+              "chunk_index": 7,
+              "status": 200,
+              "elapsed_ms": 127.719583,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 230782,
+              "chunk_index": 8,
+              "status": 503,
+              "elapsed_ms": 6.797333,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 230782,
+              "chunk_index": 8,
+              "status": 200,
+              "elapsed_ms": 168.906667,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699992,
+              "chunk_index": 9,
+              "status": 503,
+              "elapsed_ms": 93.287375,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699992,
+              "chunk_index": 9,
+              "status": 200,
+              "elapsed_ms": 220.787875,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699998,
+              "chunk_index": 10,
+              "status": 503,
+              "elapsed_ms": 100.098958,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699998,
+              "chunk_index": 10,
+              "status": 200,
+              "elapsed_ms": 517.749958,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 230787,
+              "chunk_index": 11,
+              "status": 503,
+              "elapsed_ms": 21.434,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 230787,
+              "chunk_index": 11,
+              "status": 200,
+              "elapsed_ms": 116.0285,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699984,
+              "chunk_index": 12,
+              "status": 503,
+              "elapsed_ms": 164.467125,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699984,
+              "chunk_index": 12,
+              "status": 200,
+              "elapsed_ms": 234.837459,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699989,
+              "chunk_index": 13,
+              "status": 503,
+              "elapsed_ms": 23.856791,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699989,
+              "chunk_index": 13,
+              "status": 200,
+              "elapsed_ms": 309.408167,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 230778,
+              "chunk_index": 14,
+              "status": 503,
+              "elapsed_ms": 6.747875,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 230778,
+              "chunk_index": 14,
+              "status": 200,
+              "elapsed_ms": 139.209583,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699988,
+              "chunk_index": 15,
+              "status": 503,
+              "elapsed_ms": 65.347458,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699988,
+              "chunk_index": 15,
+              "status": 200,
+              "elapsed_ms": 289.054541,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699993,
+              "chunk_index": 16,
+              "status": 503,
+              "elapsed_ms": 199.472583,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699993,
+              "chunk_index": 16,
+              "status": 200,
+              "elapsed_ms": 229.311834,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 230782,
+              "chunk_index": 17,
+              "status": 503,
+              "elapsed_ms": 6.920583,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 230782,
+              "chunk_index": 17,
+              "status": 200,
+              "elapsed_ms": 184.208708,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699990,
+              "chunk_index": 18,
+              "status": 503,
+              "elapsed_ms": 53.863625,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699990,
+              "chunk_index": 18,
+              "status": 200,
+              "elapsed_ms": 618.793708,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699995,
+              "chunk_index": 19,
+              "status": 503,
+              "elapsed_ms": 18.475667,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699995,
+              "chunk_index": 19,
+              "status": 200,
+              "elapsed_ms": 631.820875,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 230784,
+              "chunk_index": 20,
+              "status": 503,
+              "elapsed_ms": 6.811541,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 230784,
+              "chunk_index": 20,
+              "status": 200,
+              "elapsed_ms": 183.366166,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699988,
+              "chunk_index": 21,
+              "status": 503,
+              "elapsed_ms": 19.155125,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699988,
+              "chunk_index": 21,
+              "status": 200,
+              "elapsed_ms": 331.08125,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 699993,
+              "chunk_index": 22,
+              "status": 503,
+              "elapsed_ms": 18.999083,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 699993,
+              "chunk_index": 22,
+              "status": 200,
+              "elapsed_ms": 550.159416,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "fragment",
+              "request_bytes": 230782,
+              "chunk_index": 23,
+              "status": 503,
+              "elapsed_ms": 6.858417,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "fragment",
+              "request_bytes": 230782,
+              "chunk_index": 23,
+              "status": 200,
+              "elapsed_ms": 431.102875,
+              "body": ""
+            },
+            {
+              "endpoint": 0,
+              "action": "activate",
+              "request_bytes": 738,
+              "chunk_index": 0,
+              "status": 503,
+              "elapsed_ms": 237.468833,
+              "body": "metadata authority unavailable"
+            },
+            {
+              "endpoint": 1,
+              "action": "activate",
+              "request_bytes": 738,
+              "chunk_index": 0,
+              "status": 200,
+              "elapsed_ms": 34.939584,
+              "body": ""
+            }
+          ],
+          "status": 200,
+          "delivery_ms": 7670.766833,
+          "requests": 26,
+          "http_attempts": 52,
+          "total_attempt_request_bytes": 26095222,
+          "request_latency": {
+            "samples": 26,
+            "p50_ms": 221.238333,
+            "p95_ms": 651.556167,
+            "max_ms": 673.906458
+          },
+          "request_raw_ms": [
+            23.069083,
+            139.705166,
+            136.915625,
+            138.994,
+            217.47225,
+            220.692416,
+            160.611209,
+            221.78425,
+            153.295458,
+            176.379542,
+            315.4665,
+            619.224833,
+            138.116,
+            400.504,
+            334.487083,
+            146.741917,
+            355.901625,
+            430.044875,
+            191.666041,
+            673.906458,
+            651.556167,
+            190.744792,
+            351.731167,
+            570.385375,
+            438.517083,
+            272.549
+          ],
+          "total_request_bytes": 13047611,
+          "max_request_bytes": 699999,
+          "activation_ms": 272.549,
+          "elapsed_ms": 11136.286
+        },
+        "after_baseline_readiness": {
+          "elapsed_ms": 1669.7398745454848,
+          "attempts": 6,
+          "leader_index": 1,
+          "term": 1
+        },
+        "idle_control": [
+          {
+            "status": 200,
+            "elapsed_ms": 11.985583,
+            "token": "90",
+            "bytes": "8035",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 11.403,
+            "token": "94",
+            "bytes": "8036",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 10.752584,
+            "token": "102",
+            "bytes": "8036",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 11.274,
+            "token": "106",
+            "bytes": "8035",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 11.204458,
+            "token": "112",
+            "bytes": "8037",
+            "error": ""
+          }
+        ],
+        "contended_control": [
+          {
+            "status": 200,
+            "elapsed_ms": 11.5095,
+            "token": "92",
+            "bytes": "8036",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 11.893958,
+            "token": "100",
+            "bytes": "8036",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 11.896333,
+            "token": "104",
+            "bytes": "8035",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 12.222791,
+            "token": "110",
+            "bytes": "8037",
+            "error": ""
+          },
+          {
+            "status": 200,
+            "elapsed_ms": 11.208458,
+            "token": "114",
+            "bytes": "8037",
+            "error": ""
+          }
+        ],
+        "diagnostics": [
+          [
+            {
+              "status": 503,
+              "elapsed_ms": 1.545792,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 200,
+              "elapsed_ms": 141.00425,
+              "token": "67",
+              "bytes": "9771985",
+              "error": ""
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.280333,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.97975,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ],
+          [
+            {
+              "status": 200,
+              "elapsed_ms": 141.830625,
+              "token": "69",
+              "bytes": "9771986",
+              "error": ""
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 2.246709,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 2.101959,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.815833,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ],
+          [
+            {
+              "status": 503,
+              "elapsed_ms": 1.924,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.581792,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 2.09,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.5265,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ],
+          [
+            {
+              "status": 200,
+              "elapsed_ms": 141.644792,
+              "token": "73",
+              "bytes": "9771985",
+              "error": ""
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.417292,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.600792,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.540459,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ],
+          [
+            {
+              "status": 503,
+              "elapsed_ms": 1.3915,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 200,
+              "elapsed_ms": 138.3275,
+              "token": "75",
+              "bytes": "9771987",
+              "error": ""
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.385292,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            },
+            {
+              "status": 503,
+              "elapsed_ms": 1.375666,
+              "token": null,
+              "bytes": null,
+              "error": "snapshot transfer capacity exhausted"
+            }
+          ]
+        ],
+        "bursts": [
+          {
+            "changed_groups": 8,
+            "raw": [
+              {
+                "publish_ms": 907.295459,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64001",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 280.917125,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 9764609
+              },
+              {
+                "publish_ms": 980.542083,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64001",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 280.318042,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 9764614
+              },
+              {
+                "publish_ms": 1470.597666,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64001",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 272.415791,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 9764613
+              },
+              {
+                "publish_ms": 1142.265917,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64001",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 278.120042,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 9764611
+              },
+              {
+                "publish_ms": 996.107417,
+                "attempts": [
+                  {
+                    "endpoint": "http://127.0.0.1:64001",
+                    "status": 200,
+                    "body": ""
+                  }
+                ],
+                "control_ms": 277.682542,
+                "control_status": 200,
+                "control_error": "",
+                "request_bytes": 9764606
+              }
+            ],
+            "publish": {
+              "samples": 5,
+              "p50_ms": 996.107417,
+              "p95_ms": 1470.597666,
+              "max_ms": 1470.597666
+            },
+            "control": {
+              "samples": 5,
+              "p50_ms": 278.120042,
+              "p95_ms": 280.917125,
+              "max_ms": 280.917125
+            },
+            "control_failures": 0
+          }
+        ]
+      }
+    }
+  },
+  "interrupted_run": {
+    "binary_sha256": "3be4e30b06c0da2c19c0eeea716cf14d18c1ca504bdcf25df189b917a7da3501",
+    "phase": "baseline",
+    "baseline": {
+      "full_request_bytes": 46140485,
+      "mode": "chunked",
+      "logical_chunks": 157,
+      "fragment_chunks": 0,
+      "plan_ms": 2121.980542,
+      "attempts": [
+        {
+          "endpoint": 0,
+          "action": "prepare",
+          "request_bytes": 735,
+          "chunk_index": 0,
+          "status": 503,
+          "elapsed_ms": 1.271958,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "prepare",
+          "request_bytes": 735,
+          "chunk_index": 0,
+          "status": 200,
+          "elapsed_ms": 32.1605,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 0,
+          "status": 503,
+          "elapsed_ms": 9.35475,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 0,
+          "status": 200,
+          "elapsed_ms": 76.224958,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 1,
+          "status": 503,
+          "elapsed_ms": 9.784583,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 1,
+          "status": 200,
+          "elapsed_ms": 95.881666,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 2,
+          "status": 503,
+          "elapsed_ms": 183.3175,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 2,
+          "status": 200,
+          "elapsed_ms": 91.706417,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 3,
+          "status": 503,
+          "elapsed_ms": 8.780709,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 3,
+          "status": 200,
+          "elapsed_ms": 322.860167,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 4,
+          "status": 503,
+          "elapsed_ms": 9.574791,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 4,
+          "status": 200,
+          "elapsed_ms": 100.336708,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 5,
+          "status": 503,
+          "elapsed_ms": 9.300416,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 5,
+          "status": 200,
+          "elapsed_ms": 219.248,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 6,
+          "status": 503,
+          "elapsed_ms": 81.026333,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 6,
+          "status": 200,
+          "elapsed_ms": 76.742042,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 7,
+          "status": 503,
+          "elapsed_ms": 8.759708,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 7,
+          "status": 200,
+          "elapsed_ms": 421.5755,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 8,
+          "status": 503,
+          "elapsed_ms": 169.273875,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 8,
+          "status": 200,
+          "elapsed_ms": 357.902708,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 9,
+          "status": 503,
+          "elapsed_ms": 8.848041,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296027,
+          "chunk_index": 9,
+          "status": 200,
+          "elapsed_ms": 118.555708,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 10,
+          "status": 503,
+          "elapsed_ms": 149.870083,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 10,
+          "status": 200,
+          "elapsed_ms": 115.607083,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 11,
+          "status": 503,
+          "elapsed_ms": 9.051584,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 11,
+          "status": 200,
+          "elapsed_ms": 288.280209,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 12,
+          "status": 503,
+          "elapsed_ms": 9.105917,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 12,
+          "status": 200,
+          "elapsed_ms": 89.627458,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 13,
+          "status": 503,
+          "elapsed_ms": 8.763584,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 13,
+          "status": 200,
+          "elapsed_ms": 121.398875,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 14,
+          "status": 503,
+          "elapsed_ms": 209.585792,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 14,
+          "status": 200,
+          "elapsed_ms": 294.633042,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 15,
+          "status": 503,
+          "elapsed_ms": 190.84375,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 15,
+          "status": 200,
+          "elapsed_ms": 267.595625,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 16,
+          "status": 503,
+          "elapsed_ms": 273.920625,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 16,
+          "status": 200,
+          "elapsed_ms": 111.575625,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 17,
+          "status": 503,
+          "elapsed_ms": 9.630709,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 17,
+          "status": 200,
+          "elapsed_ms": 95.940542,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 18,
+          "status": 503,
+          "elapsed_ms": 199.775625,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 18,
+          "status": 200,
+          "elapsed_ms": 89.4715,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 19,
+          "status": 503,
+          "elapsed_ms": 9.110792,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 19,
+          "status": 200,
+          "elapsed_ms": 314.536959,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 20,
+          "status": 503,
+          "elapsed_ms": 8.474042,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 20,
+          "status": 200,
+          "elapsed_ms": 100.225417,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 21,
+          "status": 503,
+          "elapsed_ms": 8.890583,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 21,
+          "status": 200,
+          "elapsed_ms": 404.73275,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 22,
+          "status": 503,
+          "elapsed_ms": 196.098708,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 22,
+          "status": 200,
+          "elapsed_ms": 320.631417,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 23,
+          "status": 503,
+          "elapsed_ms": 212.065291,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 23,
+          "status": 200,
+          "elapsed_ms": 290.915709,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 24,
+          "status": 503,
+          "elapsed_ms": 9.7645,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 24,
+          "status": 200,
+          "elapsed_ms": 74.3505,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 25,
+          "status": 503,
+          "elapsed_ms": 8.831959,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 25,
+          "status": 200,
+          "elapsed_ms": 95.410792,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 26,
+          "status": 503,
+          "elapsed_ms": 211.24225,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 26,
+          "status": 200,
+          "elapsed_ms": 87.392958,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 27,
+          "status": 503,
+          "elapsed_ms": 9.631125,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 27,
+          "status": 200,
+          "elapsed_ms": 368.954292,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 28,
+          "status": 503,
+          "elapsed_ms": 9.463375,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 28,
+          "status": 200,
+          "elapsed_ms": 119.201,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 29,
+          "status": 503,
+          "elapsed_ms": 9.230667,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 29,
+          "status": 200,
+          "elapsed_ms": 122.499833,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 30,
+          "status": 503,
+          "elapsed_ms": 606.720291,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 30,
+          "status": 200,
+          "elapsed_ms": 112.587416,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 31,
+          "status": 503,
+          "elapsed_ms": 9.312917,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 31,
+          "status": 200,
+          "elapsed_ms": 859.329292,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 32,
+          "status": 503,
+          "elapsed_ms": 221.139667,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 32,
+          "status": 200,
+          "elapsed_ms": 80.747291,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 33,
+          "status": 503,
+          "elapsed_ms": 8.869083,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 33,
+          "status": 200,
+          "elapsed_ms": 101.228834,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 34,
+          "status": 503,
+          "elapsed_ms": 213.506958,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 34,
+          "status": 200,
+          "elapsed_ms": 116.282375,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 35,
+          "status": 503,
+          "elapsed_ms": 9.756542,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 35,
+          "status": 200,
+          "elapsed_ms": 347.561917,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 36,
+          "status": 503,
+          "elapsed_ms": 10.0125,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 36,
+          "status": 200,
+          "elapsed_ms": 110.944125,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 37,
+          "status": 503,
+          "elapsed_ms": 9.021541,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 37,
+          "status": 200,
+          "elapsed_ms": 96.66425,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 38,
+          "status": 503,
+          "elapsed_ms": 241.387459,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 38,
+          "status": 200,
+          "elapsed_ms": 141.034417,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 39,
+          "status": 503,
+          "elapsed_ms": 9.755792,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 39,
+          "status": 200,
+          "elapsed_ms": 368.670125,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 40,
+          "status": 503,
+          "elapsed_ms": 9.719209,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 40,
+          "status": 200,
+          "elapsed_ms": 367.633625,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 41,
+          "status": 503,
+          "elapsed_ms": 227.339084,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 41,
+          "status": 200,
+          "elapsed_ms": 328.107583,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 42,
+          "status": 503,
+          "elapsed_ms": 241.767875,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 42,
+          "status": 200,
+          "elapsed_ms": 117.855625,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 43,
+          "status": 503,
+          "elapsed_ms": 9.765125,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 43,
+          "status": 200,
+          "elapsed_ms": 337.595584,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 44,
+          "status": 503,
+          "elapsed_ms": 300.993083,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 44,
+          "status": 200,
+          "elapsed_ms": 88.998292,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 45,
+          "status": 503,
+          "elapsed_ms": 9.561417,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 45,
+          "status": 200,
+          "elapsed_ms": 99.694,
+          "body": ""
+        },
+        {
+          "endpoint": 0,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 46,
+          "status": 503,
+          "elapsed_ms": 292.386333,
+          "body": "metadata authority unavailable"
+        },
+        {
+          "endpoint": 1,
+          "action": "chunk",
+          "request_bytes": 296028,
+          "chunk_index": 46,
+          "status": 200,
+          "elapsed_ms": 104.736125,
+          "body": ""
+        }
+      ]
+    },
+    "initial_readiness": {
+      "elapsed_ms": 3388.906416017562,
+      "attempts": 5,
+      "leader_index": 1,
+      "term": 1
+    },
+    "fixture_retries": [],
+    "completed_requests": 48,
+    "next_chunk": 47
+  }
+}

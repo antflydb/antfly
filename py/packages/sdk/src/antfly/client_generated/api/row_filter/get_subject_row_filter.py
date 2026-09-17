@@ -8,13 +8,27 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
 from ...models.row_filter_entry import RowFilterEntry
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     subject: str,
     table: str,
+    *,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> dict[str, Any]:
+
+    params: dict[str, Any] = {}
+
+    params["database"] = database
+
+    params["namespace"] = namespace
+
+    params["all_tables"] = all_tables
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "get",
@@ -22,6 +36,7 @@ def _get_kwargs(
             subject=quote(str(subject), safe=""),
             table=quote(str(table), safe=""),
         ),
+        "params": params,
     }
 
     return _kwargs
@@ -65,6 +80,9 @@ def sync_detailed(
     table: str,
     *,
     client: AuthenticatedClient,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> Response[Error | RowFilterEntry]:
     """Get row filter for an auth subject on a table
 
@@ -73,6 +91,9 @@ def sync_detailed(
     Args:
         subject (str):  Example: role:tenant_reader.
         table (str):  Example: orders.
+        database (str | Unset):
+        namespace (str | Unset):
+        all_tables (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -85,6 +106,9 @@ def sync_detailed(
     kwargs = _get_kwargs(
         subject=subject,
         table=table,
+        database=database,
+        namespace=namespace,
+        all_tables=all_tables,
     )
 
     response = client.get_httpx_client().request(
@@ -99,6 +123,9 @@ def sync(
     table: str,
     *,
     client: AuthenticatedClient,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> Error | RowFilterEntry | None:
     """Get row filter for an auth subject on a table
 
@@ -107,6 +134,9 @@ def sync(
     Args:
         subject (str):  Example: role:tenant_reader.
         table (str):  Example: orders.
+        database (str | Unset):
+        namespace (str | Unset):
+        all_tables (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -120,6 +150,9 @@ def sync(
         subject=subject,
         table=table,
         client=client,
+        database=database,
+        namespace=namespace,
+        all_tables=all_tables,
     ).parsed
 
 
@@ -128,6 +161,9 @@ async def asyncio_detailed(
     table: str,
     *,
     client: AuthenticatedClient,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> Response[Error | RowFilterEntry]:
     """Get row filter for an auth subject on a table
 
@@ -136,6 +172,9 @@ async def asyncio_detailed(
     Args:
         subject (str):  Example: role:tenant_reader.
         table (str):  Example: orders.
+        database (str | Unset):
+        namespace (str | Unset):
+        all_tables (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -148,6 +187,9 @@ async def asyncio_detailed(
     kwargs = _get_kwargs(
         subject=subject,
         table=table,
+        database=database,
+        namespace=namespace,
+        all_tables=all_tables,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -160,6 +202,9 @@ async def asyncio(
     table: str,
     *,
     client: AuthenticatedClient,
+    database: str | Unset = UNSET,
+    namespace: str | Unset = UNSET,
+    all_tables: bool | Unset = UNSET,
 ) -> Error | RowFilterEntry | None:
     """Get row filter for an auth subject on a table
 
@@ -168,6 +213,9 @@ async def asyncio(
     Args:
         subject (str):  Example: role:tenant_reader.
         table (str):  Example: orders.
+        database (str | Unset):
+        namespace (str | Unset):
+        all_tables (bool | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -182,5 +230,8 @@ async def asyncio(
             subject=subject,
             table=table,
             client=client,
+            database=database,
+            namespace=namespace,
+            all_tables=all_tables,
         )
     ).parsed

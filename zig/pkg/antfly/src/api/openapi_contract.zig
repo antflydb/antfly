@@ -540,12 +540,12 @@ test "indexes openapi parses graph metric runtime summary" {
             try std.testing.expect(runtime.enabled.?);
             try std.testing.expect(stats.counts_pending.?);
             try std.testing.expectEqualStrings("worker_pool", runtime.role.?);
-            try std.testing.expectEqual(@as(i64, 17), runtime.owner_id_hash.?);
-            try std.testing.expectEqual(@as(i64, 3), runtime.worker_count.?);
-            try std.testing.expectEqual(@as(i64, 2), runtime.takeover_count.?);
-            try std.testing.expectEqual(@as(i64, 1), runtime.lost_leases.?);
-            try std.testing.expectEqual(@as(i64, 6), runtime.total_pages_claimed.?);
-            try std.testing.expectEqual(@as(i64, 3), runtime.last_pages_completed.?);
+            try std.testing.expectEqual(17, runtime.owner_id_hash.?);
+            try std.testing.expectEqual(3, runtime.worker_count.?);
+            try std.testing.expectEqual(2, runtime.takeover_count.?);
+            try std.testing.expectEqual(1, runtime.lost_leases.?);
+            try std.testing.expectEqual(6, runtime.total_pages_claimed.?);
+            try std.testing.expectEqual(3, runtime.last_pages_completed.?);
         },
         else => return error.UnexpectedOpenApiVariant,
     }
@@ -564,12 +564,12 @@ test "client openapi parses graph metric runtime summary" {
             try std.testing.expect(runtime.enabled.?);
             try std.testing.expect(stats.counts_pending.?);
             try std.testing.expectEqualStrings("coordinator", runtime.role.?);
-            try std.testing.expectEqual(@as(i64, 99), runtime.owner_id_hash.?);
-            try std.testing.expectEqual(@as(i64, 1), runtime.worker_count.?);
-            try std.testing.expectEqual(@as(i64, 2), runtime.takeover_count.?);
-            try std.testing.expectEqual(@as(i64, 1), runtime.lost_leases.?);
-            try std.testing.expectEqual(@as(i64, 6), runtime.total_pages_claimed.?);
-            try std.testing.expectEqual(@as(i64, 3), runtime.last_pages_completed.?);
+            try std.testing.expectEqual(99, runtime.owner_id_hash.?);
+            try std.testing.expectEqual(1, runtime.worker_count.?);
+            try std.testing.expectEqual(2, runtime.takeover_count.?);
+            try std.testing.expectEqual(1, runtime.lost_leases.?);
+            try std.testing.expectEqual(6, runtime.total_pages_claimed.?);
+            try std.testing.expectEqual(3, runtime.last_pages_completed.?);
         },
         else => return error.UnexpectedOpenApiVariant,
     }
@@ -588,21 +588,21 @@ test "indexes openapi parses algebraic status as algebraic stats" {
     switch (parsed.value) {
         .algebraic_index_stats => |stats| {
             try std.testing.expectEqual(indexes_generated.AlgebraicIndexStatsIndexType.algebraic, stats.index_type);
-            try std.testing.expectEqual(@as(i64, 3), stats.total_indexed.?);
+            try std.testing.expectEqual(3, stats.total_indexed.?);
             try std.testing.expect(stats.healthy.?);
             try std.testing.expectEqualStrings("fallback", stats.planner_last_decision.?);
             try std.testing.expectEqualStrings("no_materialization", stats.planner_last_fallback_reason.?);
-            try std.testing.expectEqual(@as(i64, 61), stats.planner_last_estimated_scan_rows.?);
-            try std.testing.expectEqual(@as(i64, 8), stats.planner_last_estimated_result_buckets.?);
+            try std.testing.expectEqual(61, stats.planner_last_estimated_scan_rows.?);
+            try std.testing.expectEqual(8, stats.planner_last_estimated_result_buckets.?);
             try std.testing.expect(!stats.planner_lifecycle_ready.?);
             try std.testing.expectEqualStrings("capability_lifecycle_not_ready", stats.planner_lifecycle_blocking_reason.?);
             try std.testing.expectEqualStrings("stale", stats.capability_lifecycle_status.?);
-            try std.testing.expectEqual(@as(i64, 4), stats.recommendation_count.?);
-            try std.testing.expectEqual(@as(i64, 1), stats.adaptive_backfilling_count.?);
-            try std.testing.expectEqual(@as(i64, 2), stats.adaptive_ready_count.?);
-            try std.testing.expectEqual(@as(i64, 1), stats.adaptive_cleanup_recommended_count.?);
+            try std.testing.expectEqual(4, stats.recommendation_count.?);
+            try std.testing.expectEqual(1, stats.adaptive_backfilling_count.?);
+            try std.testing.expectEqual(2, stats.adaptive_ready_count.?);
+            try std.testing.expectEqual(1, stats.adaptive_cleanup_recommended_count.?);
             try std.testing.expectEqualStrings("backfilling", stats.active_progress_lifecycle.?);
-            try std.testing.expectEqual(@as(i64, 7), stats.active_progress_rows_processed.?);
+            try std.testing.expectEqual(7, stats.active_progress_rows_processed.?);
         },
         else => return error.UnexpectedOpenApiVariant,
     }
@@ -763,7 +763,8 @@ test "schema and indexes openapi modules are generated and wired" {
     try std.testing.expect(@hasDecl(indexes_generated, "ExecutionPolicy"));
     try std.testing.expect(@hasDecl(indexes_generated, "IndexExecutionConfig"));
     try std.testing.expect(@hasField(indexes_generated.EmbeddingsIndexConfig, "execution"));
-    try std.testing.expect(@hasField(indexes_generated.GraphIndexConfig, "execution"));
+    try std.testing.expect(@hasField(indexes_generated.GraphIndexConfig, "metrics"));
+    try std.testing.expect(@hasField(indexes_generated.GraphIndexConfig, "resolvers"));
     try std.testing.expect(@hasDecl(indexes_generated, "SortField"));
     try std.testing.expect(@hasDecl(generating_api_generated, "GenerationStepConfig"));
     try std.testing.expect(@hasDecl(generating_api_generated, "ClassificationTransformationResult"));
@@ -932,11 +933,11 @@ test "query OpenAPI integration generates a recursive query union" {
     try std.testing.expect(@hasField(query_generated.Query, "boolean_query"));
 }
 
-test "public and metadata query wrappers still keep raw full_text_search payloads" {
+test "public and metadata query wrappers retain raw JSON bytes" {
     const field_type = @FieldType(metadata_generated.QueryRequest, "full_text_search");
-    try std.testing.expect(field_type == ?std.json.Value);
+    try std.testing.expect(field_type == ?@import("antfly-json").RawValue);
     const public_field_type = @FieldType(generated.QueryRequest, "full_text_search");
-    try std.testing.expect(public_field_type == ?std.json.Value);
+    try std.testing.expect(public_field_type == ?@import("antfly-json").RawValue);
 }
 
 test "metadata openapi module resolves shared refs through owner modules" {
@@ -1093,18 +1094,11 @@ test "client chunker config keeps flattened provider-specific fields" {
     try std.testing.expect(@hasField(client_generated.ChunkerConfig, "full_text_index"));
 }
 
-test "public bundled root still exposes foreign-owned shared contract types" {
-    try std.testing.expect(@hasDecl(generated, "IndexConfig"));
-    try std.testing.expect(@hasDecl(generated, "TableSchema"));
-    try std.testing.expect(@hasDecl(generated, "EmbedderConfig"));
-    try std.testing.expect(@hasDecl(generated, "GeneratorConfig"));
-    try std.testing.expect(@hasDecl(generated, "RerankerConfig"));
-    try std.testing.expect(@hasDecl(generated, "ChatMessage"));
-    try std.testing.expect(@hasDecl(generated, "EvalConfig"));
-    try std.testing.expect(@hasDecl(generated, "WebSearchConfig"));
-    try std.testing.expect(@hasDecl(generated, "ExaSearchConfig"));
-    try std.testing.expect(@hasDecl(generated, "VertexSearchConfig"));
-    try std.testing.expect(@hasDecl(generated, "schemas_AntflyType"));
+test "public root keeps explicit shared aliases without duplicating owner types" {
+    try std.testing.expect(generated.EmbedderConfig == embeddings_generated.EmbedderConfig);
+    inline for (.{ "IndexConfig", "TableSchema", "GeneratorConfig", "RerankerConfig", "ChatMessage", "EvalConfig", "WebSearchConfig", "ExaSearchConfig", "VertexSearchConfig", "schemas_AntflyType" }) |name| {
+        try std.testing.expect(!@hasDecl(generated, name));
+    }
 }
 
 test "public openapi module resolves shared refs through owner modules" {

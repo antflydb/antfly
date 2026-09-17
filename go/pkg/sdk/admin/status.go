@@ -33,14 +33,15 @@ type standbyAdminIdentityJSON struct {
 }
 
 type standbyPrimaryStatusJSON struct {
-	Role          string                       `json:"role"`
-	NodeID        string                       `json:"node_id"`
-	Identity      standbyAdminIdentityJSON     `json:"identity"`
-	CurrentLSN    *uint64                      `json:"current_lsn"`
-	Retention     *standbyRetentionStatusJSON  `json:"retention"`
-	Durability    *standbyDurabilityStatusJSON `json:"durability,omitempty"`
-	Slots         *[]standbySlotStatusJSON     `json:"slots"`
-	LeaseWatchdog *StandbyLeaseWatchdogProof   `json:"lease_watchdog,omitempty"`
+	WaitingForTables *bool                        `json:"waiting_for_tables,omitempty"`
+	Role             string                       `json:"role"`
+	NodeID           string                       `json:"node_id"`
+	Identity         standbyAdminIdentityJSON     `json:"identity"`
+	CurrentLSN       *uint64                      `json:"current_lsn"`
+	Retention        *standbyRetentionStatusJSON  `json:"retention"`
+	Durability       *standbyDurabilityStatusJSON `json:"durability,omitempty"`
+	Slots            *[]standbySlotStatusJSON     `json:"slots"`
+	LeaseWatchdog    *StandbyLeaseWatchdogProof   `json:"lease_watchdog,omitempty"`
 }
 
 type standbyRetentionStatusJSON struct {
@@ -161,9 +162,10 @@ func ParseStandbyPrimaryStatus(raw []byte) (*ParsedStandbyPrimaryStatus, error) 
 		Response: StandbyPrimaryStatusResponse{
 			SchemaVersion: schemaVersion,
 			Snapshot: StandbyPrimarySnapshot{
-				CurrentLsn: *snapshot.CurrentLSN,
-				Identity:   standbyIdentityFromStatusJSON(snapshot.Identity),
-				NodeId:     nodeID,
+				WaitingForTables: snapshot.WaitingForTables,
+				CurrentLsn:       *snapshot.CurrentLSN,
+				Identity:         standbyIdentityFromStatusJSON(snapshot.Identity),
+				NodeId:           nodeID,
 				Retention: StandbyRetentionSnapshot{
 					PrimaryLsn:        standbyUint64StatusValue(snapshot.Retention.PrimaryLSN),
 					OldestRestartLsn:  standbyUint64StatusValue(snapshot.Retention.OldestRestartLSN),

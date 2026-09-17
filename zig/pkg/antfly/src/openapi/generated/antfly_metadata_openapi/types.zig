@@ -1663,13 +1663,60 @@ pub const CardinalityMode = enum {
     }
 };
 
+/// The mutation committed. Read the resource to observe it; do not replay the mutation to obtain its representation.
+pub const CatalogMutationVisibilityPending = struct {
+    status: []const u8,
+};
+
+/// An explicit native table target. Components are literal names; dots do not qualify a string table name.
+pub const CatalogTableTarget = struct {
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    table: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "database", "database", true },
+        .{ "namespace", "namespace", true },
+        .{ "table", "table", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.database) |value| {
+            try jw.objectField("database");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.endObject();
+    }
+};
+
+pub const CatalogTablespaceBindingRequest = struct {
+    /// Existing tablespace name to bind to the catalog object.
+    tablespace_name: []const u8,
+};
+
 pub const CdcConnection = struct {
     /// CDC provider type. Currently "postgres"; future CDC providers may add new values.
     provider: []const u8,
     /// Antfly table receiving changes from this CDC source.
     table_name: []const u8,
     /// Zero-based ordinal of the replication source within the table config.
-    source_ordinal: i64,
+    source_ordinal: u32,
     /// Source-side table or stream name when reported by the provider.
     external_table: ?[]const u8 = null,
     /// Provider replication cursor or slot name when applicable.
@@ -1679,15 +1726,15 @@ pub const CdcConnection = struct {
     /// Runtime CDC phase such as snapshot, streaming, configured, or failed.
     phase: ?[]const u8 = null,
     /// Source records behind, when reported by the runtime.
-    lag_records: ?i64 = null,
+    lag_records: ?u64 = null,
     /// Source commit lag in milliseconds, when reported by the runtime.
-    lag_millis: ?i64 = null,
+    lag_millis: ?u64 = null,
     /// Wall-clock timestamp of the last successful CDC poll/apply, in milliseconds.
-    last_success_at_ms: ?i64 = null,
+    last_success_at_ms: ?u64 = null,
     /// Wall-clock timestamp of the last applied source change, in milliseconds.
-    last_change_applied_at_ms: ?i64 = null,
+    last_change_applied_at_ms: ?u64 = null,
     /// Wall-clock timestamp when this CDC status was last updated, in milliseconds.
-    updated_at_ms: ?i64 = null,
+    updated_at_ms: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -1820,12 +1867,12 @@ pub const ClusterBackupResponse = struct {
 };
 
 pub const ClusterDataGroupStatus = struct {
-    group_id: i64,
+    group_id: u64,
     leader_known: ?bool = null,
-    leader_data_id: OpenApiOptionalNullable(i64) = .absent,
+    leader_data_id: OpenApiOptionalNullable(u64) = .absent,
     voter_count_known: ?bool = null,
-    voter_count: ?i64 = null,
-    healthy_voter_reports: ?i64 = null,
+    voter_count: ?u32 = null,
+    healthy_voter_reports: ?u32 = null,
     joint_consensus: ?bool = null,
     transition_pending: ?bool = null,
     replay_required: ?bool = null,
@@ -1833,8 +1880,8 @@ pub const ClusterDataGroupStatus = struct {
     cutover_ready: ?bool = null,
     reads_ready_after_cutover: ?bool = null,
     doc_identity_lifecycle: ?[]const u8 = null,
-    doc_count: ?i64 = null,
-    disk_bytes: ?i64 = null,
+    doc_count: ?u64 = null,
+    disk_bytes: ?u64 = null,
     empty: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -1941,8 +1988,8 @@ pub const ClusterDataGroupStatus = struct {
 };
 
 pub const ClusterDataNodeStatus = struct {
-    data_id: i64,
-    node_id: i64,
+    data_id: u64,
+    node_id: u64,
     api_url: ?[]const u8 = null,
     raft_url: ?[]const u8 = null,
     role: ?[]const u8 = null,
@@ -1951,12 +1998,12 @@ pub const ClusterDataNodeStatus = struct {
     failure_domain: ?[]const u8 = null,
     live: ?bool = null,
     drain_requested: ?bool = null,
-    capacity_bytes: ?i64 = null,
-    available_bytes: ?i64 = null,
-    lease_pressure: ?i64 = null,
-    read_load: ?i64 = null,
-    write_load: ?i64 = null,
-    active_backfills: ?i64 = null,
+    capacity_bytes: ?u64 = null,
+    available_bytes: ?u64 = null,
+    lease_pressure: ?u32 = null,
+    read_load: ?u32 = null,
+    write_load: ?u32 = null,
+    active_backfills: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -2053,19 +2100,19 @@ pub const ClusterDataNodeStatus = struct {
 };
 
 pub const ClusterDataRangeStatus = struct {
-    group_id: i64,
-    range_id: i64,
-    table_id: i64,
+    group_id: u64,
+    range_id: u64,
+    table_id: u64,
     table_name: ?[]const u8 = null,
     start_key: ?[]const u8 = null,
     end_key: OpenApiOptionalNullable([]const u8) = .absent,
-    doc_identity_shard_id: ?i64 = null,
-    doc_identity_range_id: ?i64 = null,
+    doc_identity_shard_id: ?u64 = null,
+    doc_identity_range_id: ?u64 = null,
     state: ?[]const u8 = null,
-    leader_data_id: OpenApiOptionalNullable(i64) = .absent,
-    voter_count: ?i64 = null,
-    doc_count: ?i64 = null,
-    disk_bytes: ?i64 = null,
+    leader_data_id: OpenApiOptionalNullable(u64) = .absent,
+    voter_count: ?u32 = null,
+    doc_count: ?u64 = null,
+    disk_bytes: ?u64 = null,
     empty: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -2165,11 +2212,11 @@ pub const ClusterDataRangeStatus = struct {
 };
 
 pub const ClusterDataReplicaStatus = struct {
-    group_id: i64,
-    data_id: i64,
-    node_id: i64,
-    replica_id: i64,
-    peer_node_ids: ?[]const i64 = null,
+    group_id: u64,
+    data_id: u64,
+    node_id: u64,
+    replica_id: u64,
+    peer_node_ids: ?[]const u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -2749,6 +2796,8 @@ pub const ConnectionsResponse = struct {
 };
 
 pub const CreateTableRequest = struct {
+    /// Explicit tablespace policy for the new table, overriding namespace and database defaults.
+    tablespace_name: ?[]const u8 = null,
     storage: ?TableStorageSettings = null,
     /// Number of shards to create for the table. Data is partitioned across shards based on key ranges. **Sizing Guidelines:** - Small datasets (<100K docs): 1-3 shards - Medium datasets (100K-1M docs): 3-10 shards - Large datasets (>1M docs): 10+ shards More shards enable better parallelism but increase overhead. Choose based on expected data size and query patterns. **When to Add More Shards:** Antfly supports **online shard reallocation** without downtime. Add more shards when: - Individual shards exceed size thresholds (configurable) - Query latency increases due to large shard size - Need better parallelism for write-heavy workloads Use the internal `/reallocate` endpoint to trigger automatic shard splitting: ```bash POST /internal/v1/reallocate ``` This enqueues a reallocation request that the leader processes asynchronously, splitting large shards and redistributing data without service interruption. **Advantages over Elasticsearch:** - Automatic shard splitting (no manual reindexing required) - Online operation (no downtime) - Transparent to applications (keys remain accessible during reallocation)
     num_shards: ?i64 = null,
@@ -2763,6 +2812,7 @@ pub const CreateTableRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "tablespace_name", "tablespace_name", true },
         .{ "storage", "storage", true },
         .{ "num_shards", "num_shards", true },
         .{ "description", "description", true },
@@ -2781,6 +2831,10 @@ pub const CreateTableRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.tablespace_name) |value| {
+            try jw.objectField("tablespace_name");
+            try jw.write(value);
+        }
         if (self.storage) |value| {
             try jw.objectField("storage");
             try jw.write(value);
@@ -2812,13 +2866,82 @@ pub const CreateTableRequest = struct {
     }
 };
 
+/// Tablespace creation request. Placement policy is validated and applied when new tables are created.
+pub const CreateTablespaceRequest = struct {
+    /// JSON-encoded location descriptor. Defaults to `null`.
+    location_json: ?[]const u8 = null,
+    /// JSON-encoded placement policy. Supported fields are placement_role, desired_replica_count, and min_ranges. Location is metadata, never a filesystem override.
+    placement_policy_json: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "location_json", "location_json", true },
+        .{ "placement_policy_json", "placement_policy_json", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.location_json) |value| {
+            try jw.objectField("location_json");
+            try jw.write(value);
+        }
+        if (self.placement_policy_json) |value| {
+            try jw.objectField("placement_policy_json");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Database catalog object. Tables and namespaces resolve under a database before authorization and routing.
+pub const DatabaseCatalogRecord = struct {
+    /// Stable database catalog identifier.
+    database_id: u64,
+    /// Database name.
+    name: []const u8,
+    /// JSON-encoded database settings owned by the catalog.
+    settings_json: []const u8,
+    /// Optional durable tablespace binding inherited by new namespace/table placement policy.
+    tablespace_name: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("database_id");
+        try jw.write(self.database_id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("settings_json");
+        try jw.write(self.settings_json);
+        switch (self.tablespace_name) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("tablespace_name");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("tablespace_name");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// A dense-index rebuild is retaining replay history and the node has reached its hard safety budget.
 pub const DenseRepairBackpressureError = struct {
     code: []const u8,
     message: []const u8,
     retryable: bool,
     /// Suggested delay before retrying the write.
-    retry_after_ms: i64,
+    retry_after_ms: u32,
 };
 
 pub const DistanceRange = struct {
@@ -2908,9 +3031,9 @@ pub const DocumentArtifactChildRange = struct {
     /// Current placement summary for the range.
     placement: []const u8,
     /// Owner group for this child artifact range, when assigned.
-    owner_group_id: OpenApiOptionalNullable(i64) = .absent,
+    owner_group_id: OpenApiOptionalNullable(u64) = .absent,
     /// Placement generation for range ownership metadata.
-    placement_generation: OpenApiOptionalNullable(i64) = .absent,
+    placement_generation: OpenApiOptionalNullable(u64) = .absent,
     /// Current routing status for child writes in this range.
     route_status: OpenApiOptionalNullable([]const u8) = .absent,
     /// Whether this range may split at its configured split boundary.
@@ -3014,9 +3137,9 @@ pub const DocumentArtifactManifest = struct {
     /// Stable identity of this artifact under the document.
     artifact_id: []const u8,
     /// Version of the opaque manifest payload schema.
-    manifest_version: i64,
+    manifest_version: u64,
     /// Monotonic generation for the current artifact state.
-    generation: i64,
+    generation: u64,
     /// Source URL or source identifier used to derive this artifact.
     source_url: []const u8,
     /// Fingerprint of the source bytes and extractor configuration.
@@ -3040,7 +3163,7 @@ pub const DocumentArtifactManifest = struct {
     /// Number of pages whose OCR rendering or recognition failed.
     ocr_failed_count: ?i64 = null,
     /// Up to 32 one-based page numbers where OCR failed.
-    ocr_failed_page_numbers: ?[]const i64 = null,
+    ocr_failed_page_numbers: ?[]const u32 = null,
     /// Whether additional failed page numbers were omitted from the summary.
     ocr_failed_pages_truncated: ?bool = null,
     /// Parsed child range descriptors for this artifact generation.
@@ -3050,9 +3173,9 @@ pub const DocumentArtifactManifest = struct {
     /// Current materialization or merge status.
     merge_status: []const u8,
     /// Previous artifact generation used by the current merge plan.
-    merge_from_generation: i64,
+    merge_from_generation: u64,
     /// Target artifact generation produced by the current merge plan.
-    merge_to_generation: i64,
+    merge_to_generation: u64,
     /// Granularity used when computing merge-plan operations.
     merge_operation_granularity: []const u8,
     /// Number of merge operations recorded for this artifact.
@@ -3237,9 +3360,9 @@ pub const DocumentArtifactReprocessFailure = struct {
 
 pub const DocumentArtifactReprocessJob = struct {
     /// Server-assigned durable repair job identifier.
-    job_id: i64,
+    job_id: u64,
     /// Monotonic execution attempt token for the current running pass.
-    attempt_id: i64,
+    attempt_id: u64,
     /// Table containing the source documents being repaired.
     table_name: []const u8,
     /// Name of the derived artifact being repaired.
@@ -3253,7 +3376,7 @@ pub const DocumentArtifactReprocessJob = struct {
     /// Original inclusive upper bound for the job, or empty for the end of the table/range.
     to_key: []const u8,
     /// Current per-shard bounded pass limit.
-    limit: i64,
+    limit: u32,
     /// Single-shard continuation key when no shard cursors are present.
     next_key: OpenApiOptionalNullable([]const u8) = .absent,
     /// Cumulative source rows scanned by completed passes.
@@ -3275,11 +3398,11 @@ pub const DocumentArtifactReprocessJob = struct {
     /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded reprocess boundary before the job transitions to cancelled.
     cancel_requested: bool,
     /// Unix epoch milliseconds when the job was created.
-    created_at_millis: i64,
+    created_at_millis: u64,
     /// Unix epoch milliseconds when the job was last updated.
-    last_updated_at_millis: i64,
+    last_updated_at_millis: u64,
     /// Unix epoch milliseconds after which the retained job status may be removed.
-    expires_at_millis: i64,
+    expires_at_millis: u64,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -3356,7 +3479,7 @@ pub const DocumentArtifactReprocessJobStartRequest = struct {
     /// Inclusive upper bound source document key, or empty for the end of the table/range.
     to_key: ?[]const u8 = null,
     /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
-    limit: ?i64 = null,
+    limit: ?u32 = null,
     /// When true, immediately runs the first bounded pass before returning the job state.
     advance: ?bool = null,
 
@@ -3405,7 +3528,7 @@ pub const DocumentArtifactReprocessResponse = struct {
 
 pub const DocumentArtifactReprocessShardCursor = struct {
     /// Physical table group that produced this cursor, when known.
-    group_id: OpenApiOptionalNullable(i64) = .absent,
+    group_id: OpenApiOptionalNullable(u64) = .absent,
     /// Source key cursor for resuming this shard-local repair pass.
     next_key: []const u8,
     /// Number of source rows scanned by this shard-local pass.
@@ -3417,7 +3540,7 @@ pub const DocumentArtifactReprocessShardCursor = struct {
     /// Number of scanned source rows that failed in this shard-local pass.
     failed: i64,
     /// Effective scan limit used by this shard-local pass.
-    limit: i64,
+    limit: u32,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -3455,7 +3578,7 @@ pub const DocumentArtifactTableReprocessRequest = struct {
     /// Inclusive upper bound source document key, or empty for the end of the table/range.
     to_key: ?[]const u8 = null,
     /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
-    limit: ?i64 = null,
+    limit: ?u32 = null,
     /// Per-shard continuation cursors returned by a prior response. When present, distributed repair resumes exactly these shard-local cursors instead of resolving a fresh global key span.
     shard_cursors: ?[]const DocumentArtifactReprocessShardCursor = null,
 
@@ -3513,7 +3636,7 @@ pub const DocumentArtifactTableReprocessResponse = struct {
     /// Number of scanned source rows that failed before recording a normal artifact manifest.
     failed: i64,
     /// Effective scan limit used by the bounded pass.
-    limit: i64,
+    limit: u32,
     /// Source key cursor for the next bounded pass, when more rows may remain.
     next_key: OpenApiOptionalNullable([]const u8) = .absent,
     /// Number of shard-local continuations still pending after this pass. For single-shard callers this is 1 when only `next_key` remains and 0 when complete.
@@ -4046,7 +4169,8 @@ pub const ForeignSource = struct {
 
 /// A stateful global query. The target table is required on this route.
 pub const GlobalStatefulQueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -4121,6 +4245,7 @@ pub const GlobalStatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", false },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -4170,6 +4295,10 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         try jw.objectField("table");
         try jw.write(self.table);
         if (self.query) |value| {
@@ -4355,7 +4484,7 @@ pub const GraphDistinctBudgetExceededError = struct {
     /// Distinct aggregation resource exhausted by the operation.
     dimension: []const u8,
     /// Configured request ceiling for the exhausted resource.
-    maximum: i64,
+    maximum: u64,
     /// Stable user-facing guidance for reducing exact distinct state.
     remediation: []const u8,
 };
@@ -4366,9 +4495,9 @@ pub const GraphMatchOperationLimitExceededError = struct {
     message: []const u8,
     retryable: bool,
     /// Maximum named MATCH operations accepted in one request.
-    maximum: i64,
+    maximum: u64,
     /// Named MATCH operations supplied by the request.
-    actual: i64,
+    actual: u64,
 };
 
 pub const GraphMetricActionResponse = struct {
@@ -4677,7 +4806,7 @@ pub const GraphWorkBudgetExceededError = struct {
     /// Bounded resource exhausted by the operation.
     dimension: []const u8,
     /// Configured request ceiling for the exhausted resource.
-    maximum: i64,
+    maximum: u64,
     /// Stable user-facing guidance for reducing graph work.
     remediation: []const u8,
 };
@@ -4773,7 +4902,7 @@ pub const HierarchyAncestors = struct {
 pub const HierarchyArtifact = struct {
     name: []const u8,
     kind: []const u8,
-    chunk_id: ?i64 = null,
+    chunk_id: ?u32 = null,
     unit_id: ?[]const u8 = null,
     source: ?HierarchyArtifactSource = null,
 
@@ -4819,7 +4948,7 @@ pub const HierarchyArtifact = struct {
 pub const HierarchyArtifactSource = struct {
     name: []const u8,
     kind: []const u8,
-    chunk_id: ?i64 = null,
+    chunk_id: ?u32 = null,
     unit_id: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -5105,7 +5234,7 @@ pub const HierarchyMatchHit = struct {
 
 pub const HierarchyMatches = struct {
     /// Maximum matching descendant hits attached to each group, independent of the top-level query limit. Matches follow the effective query order, and the group score is the score of its best matching descendant. The maximum bounds nested response growth. Group selection uses an adaptive candidate window, then each returned group is expanded with a separately bounded query, so a group with fewer matches never forces a global exhaustive scan. To bound execution as well as response growth, grouped queries accept at most 100 top-level groups and 1,000 requested matches across the complete result page.
-    limit: ?i64 = null,
+    limit: ?u32 = null,
     /// Fields to include in each nested match. This projection is required because grouped and matching records commonly have different schemas. Use an empty array to return match identity and hierarchy metadata without stored fields.
     fields: []const []const u8,
 
@@ -5333,8 +5462,9 @@ pub const InferenceProviderType = enum {
 
 /// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
 pub const JoinClause = struct {
-    /// Name of the table to join with.
-    right_table: []const u8,
+    right_target: ?CatalogTableTarget = null,
+    /// Literal native table name or declared foreign-source alias. Specify exactly one of right_table or right_target.
+    right_table: ?[]const u8 = null,
     /// Type of join to perform. Defaults to "inner".
     join_type: ?JoinType = null,
     /// Join condition specifying which fields to match.
@@ -5350,7 +5480,8 @@ pub const JoinClause = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "right_table", "right_table", false },
+        .{ "right_target", "right_target", true },
+        .{ "right_table", "right_table", true },
         .{ "join_type", "join_type", true },
         .{ "on", "on", false },
         .{ "right_filters", "right_filters", true },
@@ -5369,8 +5500,14 @@ pub const JoinClause = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("right_table");
-        try jw.write(self.right_table);
+        if (self.right_target) |value| {
+            try jw.objectField("right_target");
+            try jw.write(value);
+        }
+        if (self.right_table) |value| {
+            try jw.objectField("right_table");
+            try jw.write(value);
+        }
         if (self.join_type) |value| {
             try jw.objectField("join_type");
             try jw.write(value);
@@ -5833,42 +5970,42 @@ pub const LinearMergeResult = struct {
 
 /// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
 pub const LsmStorageStatus = struct {
-    run_count: ?i64 = null,
-    run_bytes: ?i64 = null,
-    l0_run_count: ?i64 = null,
-    l0_bytes: ?i64 = null,
-    lower_level_run_count: ?i64 = null,
-    lower_level_bytes: ?i64 = null,
-    max_level: ?i64 = null,
-    compactable_l0_run_count: ?i64 = null,
-    overlapping_l0_run_count: ?i64 = null,
-    soft_limit_l0_run_count: ?i64 = null,
-    hard_limit_l0_run_count: ?i64 = null,
-    write_stall_l0_run_debt: ?i64 = null,
-    soft_limit_l0_bytes: ?i64 = null,
-    hard_limit_l0_bytes: ?i64 = null,
-    write_stall_l0_byte_debt: ?i64 = null,
-    level_overflow_run_count: ?i64 = null,
-    level_overflow_bytes: ?i64 = null,
-    obsolete_path_count: ?i64 = null,
-    obsolete_paths_pinned_by_readers: ?i64 = null,
-    obsolete_paths_pinned_by_versions: ?i64 = null,
-    obsolete_paths_waiting_for_retry: ?i64 = null,
-    obsolete_paths_reclaimable: ?i64 = null,
-    obsolete_delete_failures: ?i64 = null,
-    obsolete_delete_retries: ?i64 = null,
-    current_manifest_bytes: ?i64 = null,
-    mutable_entry_count: ?i64 = null,
-    mutable_bytes: ?i64 = null,
-    immutable_memtable_count: ?i64 = null,
-    immutable_entry_count: ?i64 = null,
-    immutable_bytes: ?i64 = null,
-    mutable_snapshot_clone_count: ?i64 = null,
-    mutable_snapshot_clone_bytes: ?i64 = null,
-    mutable_snapshot_clone_peak_bytes: ?i64 = null,
-    read_snapshot_mutable_rotation_count: ?i64 = null,
-    read_snapshot_mutable_rotation_bytes: ?i64 = null,
-    wal_retained_bytes: ?i64 = null,
+    run_count: ?u64 = null,
+    run_bytes: ?u64 = null,
+    l0_run_count: ?u64 = null,
+    l0_bytes: ?u64 = null,
+    lower_level_run_count: ?u64 = null,
+    lower_level_bytes: ?u64 = null,
+    max_level: ?u64 = null,
+    compactable_l0_run_count: ?u64 = null,
+    overlapping_l0_run_count: ?u64 = null,
+    soft_limit_l0_run_count: ?u64 = null,
+    hard_limit_l0_run_count: ?u64 = null,
+    write_stall_l0_run_debt: ?u64 = null,
+    soft_limit_l0_bytes: ?u64 = null,
+    hard_limit_l0_bytes: ?u64 = null,
+    write_stall_l0_byte_debt: ?u64 = null,
+    level_overflow_run_count: ?u64 = null,
+    level_overflow_bytes: ?u64 = null,
+    obsolete_path_count: ?u64 = null,
+    obsolete_paths_pinned_by_readers: ?u64 = null,
+    obsolete_paths_pinned_by_versions: ?u64 = null,
+    obsolete_paths_waiting_for_retry: ?u64 = null,
+    obsolete_paths_reclaimable: ?u64 = null,
+    obsolete_delete_failures: ?u64 = null,
+    obsolete_delete_retries: ?u64 = null,
+    current_manifest_bytes: ?u64 = null,
+    mutable_entry_count: ?u64 = null,
+    mutable_bytes: ?u64 = null,
+    immutable_memtable_count: ?u64 = null,
+    immutable_entry_count: ?u64 = null,
+    immutable_bytes: ?u64 = null,
+    mutable_snapshot_clone_count: ?u64 = null,
+    mutable_snapshot_clone_bytes: ?u64 = null,
+    mutable_snapshot_clone_peak_bytes: ?u64 = null,
+    read_snapshot_mutable_rotation_count: ?u64 = null,
+    read_snapshot_mutable_rotation_bytes: ?u64 = null,
+    wal_retained_bytes: ?u64 = null,
     /// Whether WAL checkpoint maintenance is pending.
     wal_checkpoint_pending: ?bool = null,
     /// Whether WAL hard-limit admission is currently blocked.
@@ -5876,65 +6013,65 @@ pub const LsmStorageStatus = struct {
     /// Representative reason for the earliest pending WAL checkpoint retry.
     wal_checkpoint_retry_reason: ?[]const u8 = null,
     /// Consecutive failures for the representative WAL checkpoint retry.
-    wal_checkpoint_retry_attempts: ?i64 = null,
+    wal_checkpoint_retry_attempts: ?u64 = null,
     /// Nanoseconds until the earliest WAL checkpoint retry; zero means due now.
-    wal_checkpoint_retry_delay_ns: ?i64 = null,
+    wal_checkpoint_retry_delay_ns: ?u64 = null,
     /// Logical bytes in immutable memtables awaiting run publication.
-    active_immutable_logical_bytes: ?i64 = null,
+    active_immutable_logical_bytes: ?u64 = null,
     /// Logical bytes in runs awaiting durable manifest publication.
-    unpublished_wal_logical_bytes: ?i64 = null,
+    unpublished_wal_logical_bytes: ?u64 = null,
     /// Largest logical batch awaiting durable manifest publication.
-    unpublished_wal_max_batch_logical_bytes: ?i64 = null,
-    compaction_backlog_bytes: ?i64 = null,
-    active_readers: ?i64 = null,
-    active_readers_bound_read_txn: ?i64 = null,
-    active_readers_namespace_read_txn: ?i64 = null,
-    active_readers_probe_txn: ?i64 = null,
-    active_readers_current_scan: ?i64 = null,
-    active_readers_write_txn: ?i64 = null,
-    active_readers_compaction: ?i64 = null,
-    active_readers_other: ?i64 = null,
-    obsolete_paths_pinned_by_reader_bound_read_txn: ?i64 = null,
-    obsolete_paths_pinned_by_reader_namespace_read_txn: ?i64 = null,
-    obsolete_paths_pinned_by_reader_probe_txn: ?i64 = null,
-    obsolete_paths_pinned_by_reader_current_scan: ?i64 = null,
-    obsolete_paths_pinned_by_reader_write_txn: ?i64 = null,
-    obsolete_paths_pinned_by_reader_compaction: ?i64 = null,
-    obsolete_paths_pinned_by_reader_other: ?i64 = null,
-    active_bulk_ingest_batches: ?i64 = null,
+    unpublished_wal_max_batch_logical_bytes: ?u64 = null,
+    compaction_backlog_bytes: ?u64 = null,
+    active_readers: ?u64 = null,
+    active_readers_bound_read_txn: ?u64 = null,
+    active_readers_namespace_read_txn: ?u64 = null,
+    active_readers_probe_txn: ?u64 = null,
+    active_readers_current_scan: ?u64 = null,
+    active_readers_write_txn: ?u64 = null,
+    active_readers_compaction: ?u64 = null,
+    active_readers_other: ?u64 = null,
+    obsolete_paths_pinned_by_reader_bound_read_txn: ?u64 = null,
+    obsolete_paths_pinned_by_reader_namespace_read_txn: ?u64 = null,
+    obsolete_paths_pinned_by_reader_probe_txn: ?u64 = null,
+    obsolete_paths_pinned_by_reader_current_scan: ?u64 = null,
+    obsolete_paths_pinned_by_reader_write_txn: ?u64 = null,
+    obsolete_paths_pinned_by_reader_compaction: ?u64 = null,
+    obsolete_paths_pinned_by_reader_other: ?u64 = null,
+    active_bulk_ingest_batches: ?u64 = null,
     manifest_dirty: ?bool = null,
     obsolete_manifest_dirty: ?bool = null,
-    maintenance_score: ?i64 = null,
-    maintenance_debt_hint: ?i64 = null,
-    flush_count: ?i64 = null,
-    flush_output_run_count: ?i64 = null,
-    flush_output_bytes: ?i64 = null,
-    sorted_ingest_run_count: ?i64 = null,
-    sorted_ingest_bytes: ?i64 = null,
-    manifest_write_count: ?i64 = null,
-    manifest_bytes: ?i64 = null,
-    write_pressure_event_count: ?i64 = null,
-    write_pressure_compaction_count: ?i64 = null,
-    write_pressure_compaction_step_count: ?i64 = null,
-    write_pressure_overload_count: ?i64 = null,
-    write_pressure_overload_l0_run_debt: ?i64 = null,
-    immutable_rotation_count: ?i64 = null,
-    immutable_flush_count: ?i64 = null,
-    direct_bulk_ingest_attempt_count: ?i64 = null,
-    direct_bulk_ingest_success_count: ?i64 = null,
-    direct_bulk_ingest_entry_count: ?i64 = null,
-    bulk_append_attempt_count: ?i64 = null,
-    bulk_append_entry_count: ?i64 = null,
-    bulk_append_direct_success_count: ?i64 = null,
-    bulk_append_direct_entry_count: ?i64 = null,
-    bulk_append_fallback_backend_pending_count: ?i64 = null,
-    bulk_append_fallback_below_threshold_count: ?i64 = null,
-    bulk_append_fallback_duplicate_key_count: ?i64 = null,
-    bulk_append_fallback_to_mutable_entry_count: ?i64 = null,
-    direct_bulk_ingest_direct_entry_count: ?i64 = null,
-    direct_bulk_ingest_fallback_unsupported_count: ?i64 = null,
-    direct_bulk_ingest_fallback_backend_mutable_count: ?i64 = null,
-    direct_bulk_ingest_fallback_below_threshold_count: ?i64 = null,
+    maintenance_score: ?u64 = null,
+    maintenance_debt_hint: ?u64 = null,
+    flush_count: ?u64 = null,
+    flush_output_run_count: ?u64 = null,
+    flush_output_bytes: ?u64 = null,
+    sorted_ingest_run_count: ?u64 = null,
+    sorted_ingest_bytes: ?u64 = null,
+    manifest_write_count: ?u64 = null,
+    manifest_bytes: ?u64 = null,
+    write_pressure_event_count: ?u64 = null,
+    write_pressure_compaction_count: ?u64 = null,
+    write_pressure_compaction_step_count: ?u64 = null,
+    write_pressure_overload_count: ?u64 = null,
+    write_pressure_overload_l0_run_debt: ?u64 = null,
+    immutable_rotation_count: ?u64 = null,
+    immutable_flush_count: ?u64 = null,
+    direct_bulk_ingest_attempt_count: ?u64 = null,
+    direct_bulk_ingest_success_count: ?u64 = null,
+    direct_bulk_ingest_entry_count: ?u64 = null,
+    bulk_append_attempt_count: ?u64 = null,
+    bulk_append_entry_count: ?u64 = null,
+    bulk_append_direct_success_count: ?u64 = null,
+    bulk_append_direct_entry_count: ?u64 = null,
+    bulk_append_fallback_backend_pending_count: ?u64 = null,
+    bulk_append_fallback_below_threshold_count: ?u64 = null,
+    bulk_append_fallback_duplicate_key_count: ?u64 = null,
+    bulk_append_fallback_to_mutable_entry_count: ?u64 = null,
+    direct_bulk_ingest_direct_entry_count: ?u64 = null,
+    direct_bulk_ingest_fallback_unsupported_count: ?u64 = null,
+    direct_bulk_ingest_fallback_backend_mutable_count: ?u64 = null,
+    direct_bulk_ingest_fallback_below_threshold_count: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -6559,6 +6696,44 @@ pub const MultiBatchResponse = struct {
         if (self.tables) |value| {
             try jw.objectField("tables");
             try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces.
+pub const NamespaceCatalogRecord = struct {
+    /// Stable namespace catalog identifier.
+    namespace_id: u64,
+    /// Parent database identifier.
+    database_id: u64,
+    /// Parent database name.
+    database_name: []const u8,
+    /// Namespace name.
+    name: []const u8,
+    /// Optional durable tablespace binding inherited by new table placement policy in this namespace.
+    tablespace_name: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("namespace_id");
+        try jw.write(self.namespace_id);
+        try jw.objectField("database_id");
+        try jw.write(self.database_id);
+        try jw.objectField("database_name");
+        try jw.write(self.database_name);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        switch (self.tablespace_name) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("tablespace_name");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("tablespace_name");
+                try jw.write(value);
+            },
         }
         try jw.endObject();
     }
@@ -7280,7 +7455,7 @@ pub const QueryHits = struct {
 /// Total hit count metadata.
 pub const QueryHitsTotal = struct {
     /// Hit count value.
-    value: i64,
+    value: u64,
     /// Whether value is exact or a lower bound.
     relation: []const u8,
 };
@@ -7349,7 +7524,8 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -7420,6 +7596,7 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -7467,6 +7644,10 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         if (self.table) |value| {
             try jw.objectField("table");
             try jw.write(value);
@@ -8089,6 +8270,11 @@ pub const QueryUnprocessableError = union(enum) {
 /// An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
 pub const RawQuery = @import("antfly-json").RawValue;
 
+pub const RenameCatalogResourceRequest = struct {
+    /// New logical name. The durable resource identity remains unchanged.
+    name: []const u8,
+};
+
 /// Bounded request to list table repair issues.
 pub const RepairIssueListRequest = struct {
     /// Repair subsystem to list. `artifact` lists durable artifact queue records; `index` lists index repair candidates derived from index status and artifact debt.
@@ -8099,7 +8285,7 @@ pub const RepairIssueListRequest = struct {
     /// Opaque cursor returned by a prior response.
     cursor: ?[]const u8 = null,
     /// Maximum repair records to return.
-    limit: ?i64 = null,
+    limit: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -8159,7 +8345,7 @@ pub const RepairRunRequest = struct {
     /// Optional opaque generation fence for a repair control. A stale value is rejected instead of affecting a newer repair.
     repair_id: ?[]const u8 = null,
     /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
-    limit: ?i64 = null,
+    limit: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -9348,7 +9534,8 @@ pub const RetrievalAgentUsage = struct {
 
 /// A canonical query in the retrieval pipeline with an optional tree search configuration. Each query specifies its own table. Deprecated stateful graph_searches compatibility is intentionally unavailable here. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
 pub const RetrievalQueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -9421,6 +9608,7 @@ pub const RetrievalQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -9469,6 +9657,10 @@ pub const RetrievalQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         if (self.table) |value| {
             try jw.objectField("table");
             try jw.write(value);
@@ -9682,15 +9874,15 @@ pub const RetrievalStrategy = enum {
 /// Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only changes; startup-only changes remain stale until restart.
 pub const RuntimeConfigStatus = struct {
     /// Generation of the fully validated and atomically published configuration.
-    generation: ?i64 = null,
+    generation: ?u64 = null,
     /// Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters match the operator config-hash annotation.
     hash: ?[]const u8 = null,
     /// Whether the latest observed replacement failed loading, semantic validation, or requires restart because startup-only fields changed.
     last_reload_failed: ?bool = null,
     /// Whether requests are using the last-known-good snapshot after a failed reload.
     stale: ?bool = null,
-    reload_successes: ?i64 = null,
-    reload_failures: ?i64 = null,
+    reload_successes: ?u64 = null,
+    reload_failures: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -10086,7 +10278,7 @@ pub const SecretStatus = enum {
 /// Non-secret status for the local secrets file store, when one is available.
 pub const SecretStoreStatus = struct {
     /// Generation of the currently published secret-store snapshot.
-    generation: ?i64 = null,
+    generation: ?u64 = null,
     /// Whether this store can expose one exact opaque source-generation acknowledgement. This remains true when a single loaded file predates the generation field, and is false for layered stores whose served snapshot has multiple publication sources.
     supports_source_generation: ?bool = null,
     /// Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values.
@@ -10095,8 +10287,8 @@ pub const SecretStoreStatus = struct {
     last_reload_failed: ?bool = null,
     /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
     stale: ?bool = null,
-    reload_successes: ?i64 = null,
-    reload_failures: ?i64 = null,
+    reload_successes: ?u64 = null,
+    reload_failures: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -10422,7 +10614,8 @@ pub const SortProfile = struct {
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -10497,6 +10690,7 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -10546,6 +10740,10 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         if (self.table) |value| {
             try jw.objectField("table");
             try jw.write(value);
@@ -10891,7 +11089,7 @@ pub const StorageRuntimeStatus = struct {
 pub const StorageStatus = struct {
     source_vectors: ?VectorSourceStorageStatus = null,
     /// Disk usage in bytes.
-    disk_usage: ?i64 = null,
+    disk_usage: ?u64 = null,
     /// Whether the table has received data.
     empty: ?bool = null,
     lsm: ?LsmStorageStatus = null,
@@ -11234,7 +11432,7 @@ pub const TableRepairControlJobStartRequest = struct {
     repair_id: ?[]const u8 = null,
     /// Opaque continuation cursor from a prior bounded control response.
     cursor: ?[]const u8 = null,
-    limit: ?i64 = null,
+    limit: ?u32 = null,
     /// Attempt the first bounded pass immediately. Remaining passes always run server-side.
     advance: ?bool = null,
 
@@ -11302,24 +11500,24 @@ pub const TableRepairIssue = struct {
     /// Hex-encoded internal artifact storage key, when known.
     artifact_key: ?[]const u8 = null,
     /// Chunk ordinal for chunk-derived artifacts.
-    chunk_id: OpenApiOptionalNullable(i64) = .absent,
+    chunk_id: OpenApiOptionalNullable(u32) = .absent,
     /// Whether this artifact kind currently has an automated repair reprocessor.
     repairable: bool,
     /// Stable reason code when repairable is false.
     unsupported_reason: ?[]const u8 = null,
     /// Derived replay sequence that observed the issue.
-    sequence: i64,
+    sequence: u64,
     reason: ArtifactRepairReason,
     /// Number of enrichment generation attempts made before this issue was parked.
-    generation_attempts: i64,
+    generation_attempts: u64,
     /// Stable source-generation error code that caused this issue to be parked.
     generation_error: ?[]const u8 = null,
     /// Number of repair attempts made for this issue.
-    attempts: i64,
+    attempts: u64,
     /// Monotonic timestamp when this issue was first recorded.
-    first_seen_ns: i64,
+    first_seen_ns: u64,
     /// Monotonic timestamp when this issue was last observed or attempted.
-    last_seen_ns: i64,
+    last_seen_ns: u64,
     /// Last stable repair error code, when a repair attempt failed.
     last_error: ?[]const u8 = null,
 
@@ -11432,11 +11630,11 @@ pub const TableRepairIssueList = struct {
     table: []const u8,
     target: RepairTarget,
     /// Effective page limit.
-    limit: i64,
+    limit: u32,
     /// Number of repair records scanned while building this page.
-    scanned: i64,
+    scanned: u64,
     /// Number of table groups touched while building this page.
-    groups_scanned: i64,
+    groups_scanned: u64,
     /// Whether another page is available.
     has_more: bool,
     /// Opaque cursor for the next page when has_more is true.
@@ -11477,9 +11675,9 @@ pub const TableRepairIssueList = struct {
 /// Durable table repair job state.
 pub const TableRepairJob = struct {
     /// Server-assigned durable repair job identifier.
-    job_id: i64,
+    job_id: u64,
     /// Monotonic execution attempt token for the current running pass.
-    attempt_id: i64,
+    attempt_id: u64,
     /// Table being repaired.
     table_name: []const u8,
     /// Lifecycle phase of the repair job.
@@ -11497,7 +11695,7 @@ pub const TableRepairJob = struct {
     /// Opaque continuation cursor for the next bounded repair pass.
     cursor: OpenApiOptionalNullable([]const u8) = .absent,
     /// Effective per-pass repair limit.
-    limit: i64,
+    limit: u32,
     /// Whether the next bounded pass still needs to dispatch the job's one forced named-index generation.
     force: bool,
     result: TableRepairRunResult,
@@ -11506,13 +11704,13 @@ pub const TableRepairJob = struct {
     /// Whether cancellation is pending. For a named-index repair/rebuild job, cancellation durably pauses the matching repair in every group. Cancelling a control job stops remaining passes without undoing controls already applied.
     cancel_requested: bool,
     /// Unix epoch milliseconds when a deferred pass may next run; zero means immediately eligible.
-    next_retry_at_millis: ?i64 = null,
+    next_retry_at_millis: ?u64 = null,
     /// Unix epoch milliseconds when the job was created.
-    created_at_millis: i64,
+    created_at_millis: u64,
     /// Unix epoch milliseconds when the job state was last updated.
-    last_updated_at_millis: i64,
+    last_updated_at_millis: u64,
     /// Unix epoch milliseconds when the job is eligible for cleanup.
-    expires_at_millis: i64,
+    expires_at_millis: u64,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -11631,7 +11829,7 @@ pub const TableRepairJobStartRequest = struct {
     /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
     force: ?bool = null,
     /// Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
-    limit: ?i64 = null,
+    limit: ?u32 = null,
     /// When true, the server immediately attempts the first bounded repair pass before returning the job.
     advance: ?bool = null,
 
@@ -11694,40 +11892,40 @@ pub const TableRepairRunResponse = struct {
     table: []const u8,
     target: RepairTarget,
     /// Effective repair limit.
-    limit: i64,
+    limit: u32,
     result: TableRepairRunResult,
 };
 
 /// Result of one bounded table repair pass.
 pub const TableRepairRunResult = struct {
     /// Number of repair records attempted by this pass.
-    scanned: i64,
+    scanned: u64,
     /// Number of table groups touched by this bounded repair pass.
-    groups_scanned: i64,
+    groups_scanned: u64,
     /// Number of artifacts whose source was reprocessed.
-    reprocessed: i64,
+    reprocessed: u64,
     /// Number of repair records cleared because the artifact became readable.
-    repaired: i64,
+    repaired: u64,
     /// Number of repair records whose source document no longer exists.
-    missing_source_docs: i64,
+    missing_source_docs: u64,
     /// Number of supported repair attempts that failed.
-    failed: i64,
+    failed: u64,
     /// Number of repair records skipped because no automated repair exists for the selected target.
-    unsupported: i64,
+    unsupported: u64,
     /// Number of attempted repair records that remained queued after this pass.
-    unresolved: i64,
+    unresolved: u64,
     /// Number of selected repair records or indexes skipped because another repair pass already owns them.
-    in_progress: i64,
+    in_progress: u64,
     /// Number of indexes rebuilt by this pass when target is index.
-    indexes_rebuilt: i64,
+    indexes_rebuilt: u64,
     /// Number of selected indexes that were degraded or quarantined when this repair pass began.
-    indexes_degraded_before: i64,
+    indexes_degraded_before: u64,
     /// Number of selected indexes that remain degraded or quarantined when this repair pass returns.
-    indexes_degraded_after: i64,
+    indexes_degraded_after: u64,
     /// Number of existing index repairs that accepted the requested control.
-    controls_applied: i64,
+    controls_applied: u64,
     /// Effective repair limit.
-    limit: i64,
+    limit: u32,
     /// Opaque cursor for the next artifact repair pass when has_more is true. Named-index operations may return a continuation cursor when table groups remain.
     next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
     /// Whether another repair scan page is available via next_cursor.
@@ -11887,6 +12085,8 @@ pub const TableStatus = struct {
     replication_sources: ?[]const ReplicationSource = null,
     /// Effective runtime field capabilities for this table. Clients can use this to discover concrete field variants and their supported query modes, such as full_text, exact, range, geo, and autocomplete. Public exact field sort is supported only for `_id` or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
     field_capabilities: ?[]const FieldCapability = null,
+    /// Immutable physical table identity, preserved by catalog renames.
+    table_id: ?[]const u8 = null,
     storage_status: StorageStatus,
     /// Table-level generated artifact enrichments registered outside a specific index.
     artifact_enrichments: ?[]const antfly_indexes_openapi.EnrichmentConfig = null,
@@ -11902,6 +12102,7 @@ pub const TableStatus = struct {
         .{ "migration", "migration", true },
         .{ "replication_sources", "replication_sources", true },
         .{ "field_capabilities", "field_capabilities", true },
+        .{ "table_id", "table_id", true },
         .{ "storage_status", "storage_status", false },
         .{ "artifact_enrichments", "artifact_enrichments", true },
     };
@@ -11947,6 +12148,10 @@ pub const TableStatus = struct {
         }
         if (self.field_capabilities) |value| {
             try jw.objectField("field_capabilities");
+            try jw.write(value);
+        }
+        if (self.table_id) |value| {
+            try jw.objectField("table_id");
             try jw.write(value);
         }
         try jw.objectField("storage_status");
@@ -11997,6 +12202,18 @@ pub const TableStorageUnreadableError = struct {
     message: []const u8,
     /// Always false; recovery requires repair, restore, or table replacement.
     retryable: bool,
+};
+
+/// Tablespace catalog object. Placement policy resource with a stable identity. SQL adapters consume this native lifecycle surface.
+pub const TablespaceCatalogRecord = struct {
+    /// Stable tablespace catalog identifier.
+    tablespace_id: u64,
+    /// Tablespace name.
+    name: []const u8,
+    /// JSON-encoded location descriptor. String locations are encoded as JSON strings.
+    location_json: []const u8,
+    /// JSON-encoded placement policy reserved for native placement planning.
+    placement_policy_json: []const u8,
 };
 
 /// The table topology changed while a query was running after Antfly's bounded internal retry.
@@ -12134,13 +12351,13 @@ pub const TransactionConflict = struct {
     /// Whether retrying the transaction may succeed without changing its writes.
     retryable: bool,
     /// Minimum suggested delay before retrying a retryable conflict.
-    retry_after_ms: ?i64 = null,
+    retry_after_ms: ?u32 = null,
     /// Component whose state should be refreshed before retrying.
     retry_scope: ?[]const u8 = null,
     /// Version required by the transaction predicate.
-    expected_version: ?i64 = null,
+    expected_version: ?u64 = null,
     /// Version observed while validating the transaction predicate.
-    current_version: ?i64 = null,
+    current_version: ?u64 = null,
     participant: ?TransactionConflictParticipant = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -12204,7 +12421,7 @@ pub const TransactionConflict = struct {
 /// Participant location and 2PC phase where the conflict occurred.
 pub const TransactionConflictParticipant = struct {
     /// Raft group that reported the conflict.
-    group_id: ?i64 = null,
+    group_id: ?u64 = null,
     /// 2PC participant phase that reported the conflict.
     phase: ?[]const u8 = null,
 
@@ -13079,13 +13296,13 @@ pub const VectorSourceStorageStatus = struct {
     snapshot_read_ns: ?i64 = null,
     cache_reclaimed_bytes: ?i64 = null,
     retired_ann_references_skipped: ?i64 = null,
-    retained_payloads: ?i64 = null,
-    retained_payload_bytes: ?i64 = null,
-    unreferenced_payload_bytes_at_collection: ?i64 = null,
-    checkpoint_bytes_read: ?i64 = null,
-    checkpoint_bytes_written: ?i64 = null,
+    retained_payloads: ?u64 = null,
+    retained_payload_bytes: ?u64 = null,
+    unreferenced_payload_bytes_at_collection: ?u64 = null,
+    checkpoint_bytes_read: ?u64 = null,
+    checkpoint_bytes_written: ?u64 = null,
     /// Allocator-backed source-store state charged to the shared resource manager, excluding mmap pages and request-owned buffers.
-    heap_bytes: ?i64 = null,
+    heap_bytes: ?u64 = null,
     location_cache_hits: ?i64 = null,
     location_cache_misses: ?i64 = null,
     location_cache_bytes: ?i64 = null,
@@ -13100,21 +13317,21 @@ pub const VectorSourceStorageStatus = struct {
     preparation_ns: ?i64 = null,
     durable_append_ns: ?i64 = null,
     checkpoint_ns: ?i64 = null,
-    prepared_payloads: ?i64 = null,
-    prepared_payload_bytes: ?i64 = null,
-    wal_bytes_written: ?i64 = null,
-    active_sessions: ?i64 = null,
-    resolved_payloads: ?i64 = null,
-    resolved_bytes: ?i64 = null,
-    active_wal_bytes: ?i64 = null,
-    immutable_block_bytes: ?i64 = null,
-    live_payloads_at_collection: ?i64 = null,
-    live_payload_bytes_at_collection: ?i64 = null,
-    collections: ?i64 = null,
-    collection_deferrals: ?i64 = null,
-    collection_bytes_read: ?i64 = null,
-    collection_bytes_written: ?i64 = null,
-    unresolved_primary_commits: ?i64 = null,
+    prepared_payloads: ?u64 = null,
+    prepared_payload_bytes: ?u64 = null,
+    wal_bytes_written: ?u64 = null,
+    active_sessions: ?u64 = null,
+    resolved_payloads: ?u64 = null,
+    resolved_bytes: ?u64 = null,
+    active_wal_bytes: ?u64 = null,
+    immutable_block_bytes: ?u64 = null,
+    live_payloads_at_collection: ?u64 = null,
+    live_payload_bytes_at_collection: ?u64 = null,
+    collections: ?u64 = null,
+    collection_deferrals: ?u64 = null,
+    collection_bytes_read: ?u64 = null,
+    collection_bytes_written: ?u64 = null,
+    unresolved_primary_commits: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{

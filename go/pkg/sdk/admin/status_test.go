@@ -781,3 +781,21 @@ func standbyLegacyStandbyStatusJSON() string {
 		}
 	}`
 }
+
+func TestPrimaryStatusPreservesOptionalCatalogReadiness(t *testing.T) {
+	for _, field := range []string{"", `"waiting_for_tables":true,`, `"waiting_for_tables":false,`} {
+		body := strings.Replace(standbyLegacyPrimaryStatusJSON(), `"role":`, field+`"role":`, 1)
+		parsed, err := ParseStandbyPrimaryStatus([]byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := parsed.Response.Snapshot.WaitingForTables
+		if field == "" {
+			if got != nil {
+				t.Fatal("old runtime must leave catalog readiness unknown")
+			}
+		} else if got == nil || *got != strings.Contains(field, "true") {
+			t.Fatalf("readiness lost: field=%s got=%v", field, got)
+		}
+	}
+}

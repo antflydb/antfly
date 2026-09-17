@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
 const Edge = graph_mod.Edge;
+const PathEdge = @import("paths.zig").PathEdge;
 const EdgeDirection = graph_mod.EdgeDirection;
 const GraphIndex = graph_mod.GraphIndex;
 const NodeAdmission = @import("node_admission.zig").NodeAdmission;
@@ -76,6 +77,7 @@ pub const TraversalResult = struct {
     /// from distance for the legacy direct traversal response.
     total_weight: f64,
     path: ?[]const []const u8, // if include_paths
+    path_edges: ?[]const PathEdge = null,
     /// Table of the reached node, when the edge that reached it declared a
     /// cross-table endpoint (`target_table` in its metadata). Owned.
     target_table: ?[]const u8 = null,
@@ -103,6 +105,7 @@ const TraversalAncestryNode = struct {
     key: []const u8,
     target_table: ?[]const u8,
     parent: ?*const TraversalAncestryNode,
+    incoming_edge: ?PathEdge,
 };
 
 /// Request-local traversal storage. Queue states borrow their identity and
@@ -128,10 +131,13 @@ const TraversalAncestry = struct {
         key: []const u8,
         target_table: ?[]const u8,
         parent: ?*const TraversalAncestryNode,
+        incoming_edge: ?PathEdge,
     ) !*const TraversalAncestryNode {
         var added = std.math.add(usize, @sizeOf(TraversalAncestryNode) + @sizeOf(QueueEntry), key.len) catch
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
         if (target_table) |table| added = std.math.add(usize, added, table.len) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        if (incoming_edge) |edge| added = std.math.add(usize, added, try edgeOwnedBytes(edge)) catch
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
         try self.work_budget.retainStateBytes(added);
         errdefer self.work_budget.releaseStateBytes(added);
@@ -140,7 +146,7 @@ const TraversalAncestry = struct {
         const owned_key = try arena_alloc.dupe(u8, key);
         const owned_table = if (target_table) |table| try arena_alloc.dupe(u8, table) else null;
         const node = try arena_alloc.create(TraversalAncestryNode);
-        node.* = .{ .key = owned_key, .target_table = owned_table, .parent = parent };
+        node.* = .{ .key = owned_key, .target_table = owned_table, .parent = parent, .incoming_edge = if (incoming_edge) |edge| try cloneEdge(arena_alloc, edge) else null };
         self.retained_bytes += added;
         return node;
     }
@@ -231,7 +237,7 @@ pub fn traverseWithEdgeReader(
     // Seed with start node
     try work_budget.checkIntermediateStates(1, effective_rules.max_intermediate_states);
     try work_budget.consumeNode();
-    const start_ancestry = try ancestry.append(start_key, null, null);
+    const start_ancestry = try ancestry.append(start_key, null, null, null);
     try queue.append(alloc, .{
         .ancestry = start_ancestry,
         .depth = 0,
@@ -352,7 +358,14 @@ pub fn traverseWithEdgeReader(
                 const pending_states = queue.items.len - queue_head;
                 try work_budget.checkIntermediateStates(pending_states + 1, effective_rules.max_intermediate_states);
                 try work_budget.consumeNode();
-                const next_ancestry = try ancestry.append(next_key, target_table, current.ancestry);
+                const next_ancestry = try ancestry.append(next_key, target_table, current.ancestry, if (effective_rules.include_paths) .{
+                    .source = edge.source,
+                    .target = edge.target,
+                    .edge_type = edge.edge_type,
+                    .weight = edge.weight,
+                    .metadata = edge.metadata,
+                    .traversal_direction = if (std.mem.eql(u8, current.ancestry.key, edge.source)) .out else .in,
+                } else null);
                 const total_weight = current.total_weight + edge.weight;
                 if (!std.math.isFinite(total_weight)) return error.GraphPathWeightOverflow;
                 try queue.append(alloc, .{
@@ -404,6 +417,27 @@ fn traversalResultFromQueueEntry(
         for (items) |item| alloc.free(item);
         alloc.free(items);
     };
+    const path_edges = if (include_path) blk: {
+        const owned = try alloc.alloc(PathEdge, entry.depth);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[owned.len - initialized ..]) |edge| freeEdge(alloc, edge);
+            alloc.free(owned);
+        }
+        var cursor: ?*const TraversalAncestryNode = entry.ancestry;
+        while (cursor) |node| : (cursor = node.parent) {
+            if (node.incoming_edge) |edge| {
+                owned[owned.len - initialized - 1] = try cloneEdge(alloc, edge);
+                initialized += 1;
+            }
+        }
+        std.debug.assert(initialized == owned.len);
+        break :blk owned;
+    } else null;
+    errdefer if (path_edges) |edges| {
+        for (edges) |edge| freeEdge(alloc, edge);
+        alloc.free(edges);
+    };
     const target_table = if (entry.ancestry.target_table) |table|
         try alloc.dupe(u8, table)
     else
@@ -415,6 +449,7 @@ fn traversalResultFromQueueEntry(
         .distance = @floatFromInt(entry.depth),
         .total_weight = entry.total_weight,
         .path = path,
+        .path_edges = path_edges,
         .target_table = target_table,
         .retained_budget = returned_state_budget,
         .retained_state_bytes = retained_bytes,
@@ -430,6 +465,7 @@ fn traversalResultRetainedBytes(entry: QueueEntry, include_path: bool) !usize {
         var cursor: ?*const TraversalAncestryNode = entry.ancestry;
         while (cursor) |node| : (cursor = node.parent) {
             total = try std.math.add(usize, total, node.key.len);
+            if (node.incoming_edge) |edge| total = try std.math.add(usize, total, try edgeOwnedBytes(edge));
         }
     }
     return total;
@@ -583,6 +619,10 @@ fn freeResult(alloc: Allocator, result: TraversalResult) void {
     if (result.path) |path| {
         for (path) |key| alloc.free(key);
         alloc.free(path);
+    }
+    if (result.path_edges) |edges| {
+        for (edges) |edge| freeEdge(alloc, edge);
+        alloc.free(edges);
     }
     if (result.target_table) |table| alloc.free(table);
     if (result.retained_budget) |budget| budget.releaseStateBytes(result.retained_state_bytes);
@@ -903,4 +943,26 @@ test "traversal ancestry and returned paths share retained state budget" {
     }));
     try std.testing.expectEqual(work_budget_mod.Dimension.retained_state_bytes, budget.exhaustion().?.dimension);
     try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
+fn edgeOwnedBytes(edge: PathEdge) !usize {
+    var total: usize = @sizeOf(PathEdge);
+    inline for (.{ "source", "target", "edge_type", "metadata" }) |field| total = try std.math.add(usize, total, @field(edge, field).len);
+    return total;
+}
+fn cloneEdge(alloc: Allocator, edge: PathEdge) !PathEdge {
+    const source = try alloc.dupe(u8, edge.source);
+    errdefer alloc.free(source);
+    const target = try alloc.dupe(u8, edge.target);
+    errdefer alloc.free(target);
+    const kind = try alloc.dupe(u8, edge.edge_type);
+    errdefer alloc.free(kind);
+    const metadata = try alloc.dupe(u8, edge.metadata);
+    return .{ .source = source, .target = target, .edge_type = kind, .weight = edge.weight, .metadata = metadata, .traversal_direction = edge.traversal_direction };
+}
+fn freeEdge(alloc: Allocator, edge: PathEdge) void {
+    alloc.free(edge.source);
+    alloc.free(edge.target);
+    alloc.free(edge.edge_type);
+    alloc.free(edge.metadata);
 }

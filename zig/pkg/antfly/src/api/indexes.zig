@@ -1602,29 +1602,29 @@ fn appendAlgebraicIndexStatsFields(
     var stats = indexes_openapi.AlgebraicIndexStats{
         .index_type = .algebraic,
         .healthy = item.algebraic_parse_error_count == 0,
-        .parse_error_count = saturatingI64(item.algebraic_parse_error_count),
-        .schema_version = saturatingI64(item.algebraic_schema_version),
+        .parse_error_count = item.algebraic_parse_error_count,
+        .schema_version = item.algebraic_schema_version,
         .capability_lifecycle_status = item.algebraic_capability_lifecycle_status orelse "current",
-        .planner_selected = saturatingI64(item.algebraic_planner_selected),
-        .planner_fallback_count = saturatingI64(item.algebraic_planner_fallback_count),
+        .planner_selected = item.algebraic_planner_selected,
+        .planner_fallback_count = item.algebraic_planner_fallback_count,
         .planner_last_decision = item.algebraic_planner_last_decision,
         .planner_last_fallback_reason = item.algebraic_planner_last_fallback_reason,
-        .planner_last_estimated_scan_rows = if (item.algebraic_planner_last_estimated_scan_rows) |value| saturatingI64(value) else null,
-        .planner_last_estimated_result_buckets = if (item.algebraic_planner_last_estimated_result_buckets) |value| saturatingI64(value) else null,
+        .planner_last_estimated_scan_rows = item.algebraic_planner_last_estimated_scan_rows,
+        .planner_last_estimated_result_buckets = item.algebraic_planner_last_estimated_result_buckets,
         .planner_lifecycle_ready = item.algebraic_planner_lifecycle_ready,
         .planner_lifecycle_blocking_reason = item.algebraic_planner_lifecycle_blocking_reason,
-        .adaptive_progress_count = saturatingI64(item.algebraic_adaptive_progress_count),
-        .recommendation_count = saturatingI64(item.algebraic_recommendation_count),
-        .adaptive_backfilling_count = saturatingI64(item.algebraic_adaptive_backfilling_count),
-        .adaptive_ready_count = saturatingI64(item.algebraic_adaptive_ready_count),
-        .adaptive_stale_count = saturatingI64(item.algebraic_adaptive_stale_count),
-        .adaptive_cleanup_recommended_count = saturatingI64(item.algebraic_adaptive_dematerialize_recommended_count),
+        .adaptive_progress_count = item.algebraic_adaptive_progress_count,
+        .recommendation_count = item.algebraic_recommendation_count,
+        .adaptive_backfilling_count = item.algebraic_adaptive_backfilling_count,
+        .adaptive_ready_count = item.algebraic_adaptive_ready_count,
+        .adaptive_stale_count = item.algebraic_adaptive_stale_count,
+        .adaptive_cleanup_recommended_count = item.algebraic_adaptive_dematerialize_recommended_count,
         .last_error_reason = item.algebraic_last_error_reason,
     };
     if (item.algebraic_active_progress) |progress_status| {
         stats.active_progress_lifecycle = progress_status.lifecycle;
-        stats.active_progress_rows_processed = saturatingI64(progress_status.rows_processed);
-        stats.active_progress_target_rows = saturatingI64(progress_status.target_rows);
+        stats.active_progress_rows_processed = progress_status.rows_processed;
+        stats.active_progress_target_rows = progress_status.target_rows;
     }
 
     const encoded = try std.json.Stringify.valueAlloc(alloc, stats, .{ .emit_null_optional_fields = false });
@@ -1632,10 +1632,6 @@ fn appendAlgebraicIndexStatsFields(
     if (encoded.len <= 2) return;
     try out.append(alloc, ',');
     try out.appendSlice(alloc, encoded[1 .. encoded.len - 1]);
-}
-
-fn saturatingI64(value: u64) i64 {
-    return std.math.cast(i64, value) orelse std.math.maxInt(i64);
 }
 
 fn appendIndexRuntimeStatus(

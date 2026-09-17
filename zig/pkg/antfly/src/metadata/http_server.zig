@@ -13,6 +13,11 @@
 // limitations.
 
 const std = @import("std");
+const store_report_baseline = @import("store_report_baseline.zig");
+const snapshot_transfer = @import("snapshot_transfer.zig");
+const store_report_update = @import("store_report_update.zig");
+const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog_operations = @import("../system_catalog/operations.zig");
 const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
 const group_ids = @import("../common/group_ids.zig");
@@ -85,16 +90,43 @@ pub const ReplaceTableDefinitionRequest = struct {
 
 pub const ReseedExactCutoverResult = table_operations.ReseedExactCutoverResult;
 
+fn systemCatalogServiceCall(comptime Service: type) *const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, system_catalog.Call) anyerror![]u8 {
+    return struct {
+        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: system_catalog.Call) ![]u8 {
+            const svc: *Service = @ptrCast(@alignCast(ptr));
+            // Metadata service internals use native CPU deadlines. Keep the
+            // borrowed ingress clock until this concrete service boundary.
+            var native = context;
+            native.deadline_ns = (api_table_catalog.RoutingBudget{}).deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+            native.deadline_io = null;
+            return system_catalog_operations.call(svc, alloc, native, input);
+        }
+    }.call;
+}
+
+fn systemCatalogIdentityCall(comptime Service: type) *const fn (*anyopaque) anyerror!metadata_api.CatalogIdentity {
+    return struct {
+        fn call(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+            const svc: *Service = @ptrCast(@alignCast(ptr));
+            return svc.catalogIdentity();
+        }
+    }.call;
+}
+
 pub const AdminSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        catalog_identity: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.CatalogIdentity = null,
+        system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: system_catalog.Call) anyerror![]u8 = null,
+
         head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
         linearizable_head: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.MetadataHead = null,
         linearizable_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.AdminSnapshot = null,
         runtime_topology: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataRuntimeTopology = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
+        control_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
         table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
@@ -148,7 +180,11 @@ pub const AdminSource = struct {
         cancel_node_shutdown: ?*const fn (ptr: *anyopaque, node_id: u64) anyerror!void = null,
         finalize_node_shutdown: ?*const fn (ptr: *anyopaque, node_id: u64) anyerror!void = null,
         upsert_store: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.StoreRecord) anyerror!void = null,
+        report_store_baseline: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, bytes: []const u8) anyerror!store_report_baseline.Progress = null,
+
+        report_store_update: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, bytes: []const u8) anyerror!store_report_update.Cursor = null,
         report_store_status: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) anyerror!void = null,
+        upsert_schema_progress_batch: ?*const fn (ptr: *anyopaque, context: operation.RequestContext, records: []const metadata_table_manager.SchemaProgressRecord) anyerror!void = null,
         upsert_schema_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) anyerror!void = null,
         upsert_restore_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.RestoreProgressRecord) anyerror!void = null,
         remove_restore_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, identity: metadata_table_manager.RestoreProgressIdentity) anyerror!void = null,
@@ -499,6 +535,8 @@ pub const AdminSource = struct {
         return .{
             .ptr = svc,
             .vtable = &.{
+                .system_catalog = comptime systemCatalogServiceCall(service.MetadataService),
+                .catalog_identity = comptime systemCatalogIdentityCall(service.MetadataService),
                 .head = metadataServiceHead,
                 .linearizable_head = metadataServiceLinearizableHead,
                 .linearizable_snapshot = metadataServiceLinearizableSnapshot,
@@ -538,6 +576,7 @@ pub const AdminSource = struct {
                 .upsert_store = metadataServiceUpsertStore,
                 .report_store_status = metadataServiceReportStoreStatus,
                 .upsert_schema_progress = metadataServiceUpsertSchemaProgress,
+                .upsert_schema_progress_batch = metadataServiceUpsertSchemaProgressBatch,
                 .upsert_restore_progress = metadataServiceUpsertRestoreProgress,
                 .remove_restore_progress = metadataServiceRemoveRestoreProgress,
                 .sync_restore_progress = metadataServiceSyncRestoreProgress,
@@ -561,11 +600,14 @@ pub const AdminSource = struct {
         return .{
             .ptr = svc,
             .vtable = &.{
+                .system_catalog = comptime systemCatalogServiceCall(service.MetadataHttpService),
+                .catalog_identity = comptime systemCatalogIdentityCall(service.MetadataHttpService),
                 .head = metadataHttpServiceHead,
                 .linearizable_head = metadataHttpServiceLinearizableHead,
                 .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
                 .runtime_topology = metadataHttpServiceRuntimeTopology,
                 .status = metadataHttpServiceStatus,
+                .control_snapshot = metadataHttpServiceControlSnapshot,
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
@@ -600,7 +642,11 @@ pub const AdminSource = struct {
                 .finalize_node_shutdown = metadataHttpServiceFinalizeNodeShutdown,
                 .upsert_store = metadataHttpServiceUpsertStore,
                 .report_store_status = metadataHttpServiceReportStoreStatus,
+                .report_store_baseline = metadataHttpServiceReportStoreBaseline,
+
+                .report_store_update = metadataHttpServiceReportStoreUpdate,
                 .upsert_schema_progress = metadataHttpServiceUpsertSchemaProgress,
+                .upsert_schema_progress_batch = metadataHttpServiceUpsertSchemaProgressBatch,
                 .upsert_restore_progress = metadataHttpServiceUpsertRestoreProgress,
                 .remove_restore_progress = metadataHttpServiceRemoveRestoreProgress,
                 .sync_restore_progress = metadataHttpServiceSyncRestoreProgress,
@@ -989,6 +1035,11 @@ pub const AdminSource = struct {
         try flushMetadataServiceMutation(svc);
     }
 
+    fn metadataServiceUpsertSchemaProgressBatch(ptr: *anyopaque, context: operation.RequestContext, records: []const metadata_table_manager.SchemaProgressRecord) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.upsertSchemaProgressBatch(context, records);
+    }
+
     fn metadataServiceUpsertSchemaProgress(ptr: *anyopaque, _: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         try svc.upsertSchemaProgress(record);
@@ -1168,6 +1219,10 @@ pub const AdminSource = struct {
         return try svc.runtimeTopology();
     }
 
+    fn metadataHttpServiceControlSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return svc.controlSnapshot();
+    }
     fn metadataHttpServiceAdminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         return try svc.adminSnapshot();
@@ -1427,11 +1482,25 @@ pub const AdminSource = struct {
         try flushMetadataHttpServiceMutation(svc);
     }
 
+    fn metadataHttpServiceReportStoreBaseline(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, bytes: []const u8) !store_report_baseline.Progress {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return svc.reportStoreBaseline(alloc, context, bytes);
+    }
+    fn metadataHttpServiceReportStoreUpdate(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, bytes: []const u8) !store_report_update.Cursor {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return svc.reportStoreUpdate(alloc, context, bytes);
+    }
+
     fn metadataHttpServiceReportStoreStatus(ptr: *anyopaque, alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         defer freeStoreStatusReport(alloc, report);
         try svc.reportStoreStatus(report);
         try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceUpsertSchemaProgressBatch(ptr: *anyopaque, context: operation.RequestContext, records: []const metadata_table_manager.SchemaProgressRecord) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.upsertSchemaProgressBatch(context, records);
     }
 
     fn metadataHttpServiceUpsertSchemaProgress(ptr: *anyopaque, _: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) !void {
@@ -1634,18 +1703,21 @@ pub const MetadataHttpServer = struct {
     /// timeout while still honoring any shorter ingress or forwarded budget.
     const max_routing_request_budget_ms: u64 = 5_000;
 
+    alloc: std.mem.Allocator = std.heap.page_allocator,
+    transfers: snapshot_transfer.Transfers = .{},
     source: AdminSource,
     internal_service_auth_capability: ?[]const u8 = null,
 
     pub fn init(alloc: std.mem.Allocator, cfg: MetadataHttpServerConfig, source: AdminSource) MetadataHttpServer {
-        _ = alloc;
         return .{
+            .alloc = alloc,
             .source = source,
             .internal_service_auth_capability = cfg.internal_service_auth_capability,
         };
     }
 
     pub fn deinit(self: *MetadataHttpServer) void {
+        self.transfers.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1653,6 +1725,7 @@ pub const MetadataHttpServer = struct {
     /// routes. Unknown paths are rejected by httpx and never enter the
     /// metadata operation layer.
     pub fn registerRoutes(self: *MetadataHttpServer, server: *httpx.Server) !void {
+        try server.post(snapshot_transfer.path, httpx.Handler.bind(self, metadataSnapshotPage));
         try server.get(routes.Routes.health, httpx.Handler.bind(self, metadataHealth));
         try server.get(routes.Routes.head, httpx.Handler.bind(self, metadataHead));
         try server.get(routes.Routes.capabilities, httpx.Handler.bind(self, metadataCapabilities));
@@ -1687,10 +1760,15 @@ pub const MetadataHttpServer = struct {
         const node_path = routes.Routes.internal_nodes_prefix ++ ":node_id";
         try server.delete(node_path, httpx.Handler.bind(self, metadataFinalizeNodeShutdown));
         try server.post(node_path ++ routes.Routes.internal_node_status_suffix, httpx.Handler.bind(self, metadataReportNodeStatus));
+        try server.post(node_path ++ routes.Routes.internal_node_status_suffix ++ "/heartbeat", httpx.Handler.bind(self, metadataReportNodeHeartbeat));
+        try server.post(node_path ++ routes.Routes.internal_node_status_suffix ++ "/baseline", httpx.Handler.bind(self, metadataReportNodeBaseline));
+        try server.post(node_path ++ routes.Routes.internal_node_status_suffix ++ "/update", httpx.Handler.bind(self, metadataReportNodeUpdate));
+        try server.post("/internal/v1/system-catalog", httpx.Handler.bind(self, metadataSystemCatalog));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_catalog_group_retirement_check, httpx.Handler.bind(self, metadataCatalogGroupRetirementCheck));
         try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
+        try server.postWithBodyLimit(routes.Routes.internal_schema_progress_batch, 16384, httpx.Handler.bind(self, metadataUpsertSchemaProgressBatch));
         try server.post(routes.Routes.internal_schema_progress, httpx.Handler.bind(self, metadataUpsertSchemaProgress));
         try server.post(routes.Routes.internal_restore_progress, httpx.Handler.bind(self, metadataUpsertRestoreProgress));
         try server.postWithBodyLimit(
@@ -1736,6 +1814,50 @@ pub const MetadataHttpServer = struct {
         try server.post(table_path ++ routes.Routes.internal_merge_suffix, httpx.Handler.bind(self, metadataRequestTableMerge));
     }
 
+    fn metadataSystemCatalog(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
+        const body = (try ctx.body()) orelse return ctx.status(400).text("missing body");
+        if (body.len > system_catalog.max_command_bytes) return ctx.status(413).text("catalog request too large");
+        var parsed = std.json.parseFromSlice(system_catalog.Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
+        defer parsed.deinit();
+        const forwarding = (raft_mutation_forwarding.parseValues(
+            ctx.header(routes.Routes.raft_mutation_remaining_ms_header),
+            ctx.header(routes.Routes.raft_mutation_forwards_remaining_header),
+            ctx.header(routes.Routes.raft_mutation_campaign_allowed_header),
+            .{ .max_remaining_ms = raft_mutation_forwarding.max_remaining_ms, .max_forwards = raft_mutation_forwarding.max_forwards },
+        ) catch return ctx.status(400).text("invalid forwarding context")) orelse return ctx.status(400).text("missing forwarding context");
+        const context = systemCatalogRequestContext(ctx, forwarding.remaining_ms);
+        const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
+        const identity_reader = if (parsed.value != .mutate)
+            self.source.vtable.catalog_identity orelse return ctx.status(426).text("catalog identity upgrade required")
+        else
+            null;
+        const read_identity = if (identity_reader) |read| read(self.source.ptr) catch |err|
+            return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err)) else null;
+        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
+        const response = callback(self.source.ptr, ctx.allocator, context, parsed.value) catch |err| {
+            if (err == error.MetadataMutationOutcomeUnknown) try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
+            return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err));
+        };
+        defer ctx.allocator.free(response);
+        if (read_identity) |before| {
+            const after = identity_reader.?(self.source.ptr) catch |err|
+                return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err));
+            if (!std.meta.eql(before, after))
+                return ctx.status(503).text("metadata identity changed during catalog read");
+            const incarnation = after.metadata_incarnation;
+            // Header insertion owns its copy; avoid leaking temporary values
+            // when the HTTP context uses a general-purpose allocator.
+            var group_buf: [20]u8 = undefined;
+            try ctx.setHeader("x-antfly-catalog-metadata-group", try std.fmt.bufPrint(&group_buf, "{d}", .{after.metadata_group_id}));
+            try ctx.setHeader("x-antfly-catalog-metadata-incarnation", &incarnation);
+        }
+        try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_committed);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(response);
+        return ctx.response.build();
+    }
+
     fn requestContext(ctx: *httpx.Context) operation.RequestContext {
         return .{
             .cancellation = if (ctx.cancellation != null or ctx.cancellation_probe != null) .{
@@ -1750,6 +1872,17 @@ pub const MetadataHttpServer = struct {
             .request_id = ctx.header("x-request-id") orelse "",
             .deadline_ns = ctx.application_deadline_ns,
         };
+    }
+
+    fn systemCatalogRequestContext(ctx: *httpx.Context, remaining_ms: u32) operation.RequestContext {
+        var context = requestContext(ctx);
+        context.deadline_io = if (ctx.application_deadline_io) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null;
+        const clock = api_table_catalog.RoutingBudget.initIo(null, ctx.io);
+        const forwarded_deadline = clock.nowNs() +| @as(u64, remaining_ms) * std.time.ns_per_ms;
+        const admitted = clock.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        context.deadline_ns = @min(forwarded_deadline, admitted orelse forwarded_deadline);
+        context.deadline_io = clock.io;
+        return context;
     }
 
     fn readOperations(self: *MetadataHttpServer) admin_read_operations.Operations {
@@ -2172,6 +2305,54 @@ pub const MetadataHttpServer = struct {
         return self.trackedJson(ctx, result);
     }
 
+    fn metadataSnapshotPage(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        return self.metadataSnapshotPageImpl(ctx) catch |err| switch (err) {
+            error.ResourceRequestTooLarge => ctx.status(413).text("snapshot exceeds transfer budget"),
+            error.ResourceTemporarilyUnavailable => blk: {
+                try ctx.setHeader("Retry-After", "1");
+                break :blk ctx.status(503).text("snapshot transfer capacity exhausted");
+            },
+            error.InvalidRequest => ctx.status(400).text("invalid snapshot request"),
+            else => metadataReadError(ctx, err),
+        };
+    }
+    fn metadataSnapshotPageImpl(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        var parsed = std.json.parseFromSlice(snapshot_transfer.Request, ctx.allocator, (try ctx.body()) orelse "{}", .{}) catch return error.InvalidRequest;
+        defer parsed.deinit();
+        var request = parsed.value;
+        if (request.token == 0 and self.source.vtable.control_snapshot == null) request.control = false;
+        const transfer = self.transfers.lane(request);
+        if (request.token == 0) {
+            if (request.offset != 0 or request.release) return ctx.status(400).text("invalid snapshot offset");
+            request.token = try transfer.reserve(self.alloc, platform_time.monotonicNs());
+            errdefer transfer.cancel(self.alloc, request.token);
+            try requestContext(ctx).ensureActive();
+            var snapshot = if (request.control) blk: {
+                if (request.linearizable) _ = try self.source.linearizableHead(requestContext(ctx));
+                break :blk try self.source.vtable.control_snapshot.?(self.source.ptr);
+            } else if (request.linearizable)
+                try self.source.linearizableSnapshot(requestContext(ctx))
+            else
+                try self.source.adminSnapshot();
+            defer self.source.freeAdminSnapshot(&snapshot);
+            const bytes = try snapshot_transfer.encodeBounded(self.alloc, snapshot, transfer.snapshot_limit);
+            errdefer self.alloc.free(bytes);
+            try requestContext(ctx).ensureActive();
+            try transfer.publish(bytes, request.token, platform_time.monotonicNs());
+        }
+        const page = transfer.read(self.alloc, ctx.allocator, request, platform_time.monotonicNs()) catch |err| {
+            if (request.release and err == error.CatalogGenerationChanged) return ctx.status(204).text("");
+            if (err == error.CatalogGenerationChanged) return ctx.status(409).text("snapshot transfer expired");
+            return err;
+        };
+        defer ctx.allocator.free(page.bytes);
+        var token_buffer: [20]u8 = undefined;
+        var total_buffer: [20]u8 = undefined;
+        try ctx.setHeader("X-Antfly-Snapshot-Token", try std.fmt.bufPrint(&token_buffer, "{d}", .{page.token}));
+        try ctx.setHeader("X-Antfly-Snapshot-Bytes", try std.fmt.bufPrint(&total_buffer, "{d}", .{page.total}));
+        return ctx.status(200).text(page.bytes);
+    }
+
     fn metadataSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const operations = self.readOperations();
         var result = operations.snapshot(requestContext(ctx)) catch |err| return metadataReadError(ctx, err);
@@ -2382,6 +2563,18 @@ pub const MetadataHttpServer = struct {
         self.mutationOperations().triggerReallocate(requestContext(ctx)) catch |err|
             return metadataMutationError(ctx, err);
         return ctx.status(202).text("accepted");
+    }
+
+    fn metadataUpsertSchemaProgressBatch(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse "";
+        if (body.len > 16384) return ctx.status(413).text("schema progress batch too large");
+        var parsed = std.json.parseFromSlice([]const metadata_table_manager.SchemaProgressRecord, ctx.allocator, body, .{}) catch
+            return ctx.status(400).text("invalid schema progress batch");
+        defer parsed.deinit();
+        metadata_table_manager.validateSchemaProgressBatch(parsed.value) catch return ctx.status(400).text("invalid schema progress batch");
+        const apply = self.source.vtable.upsert_schema_progress_batch orelse return ctx.status(405).text("unsupported");
+        apply(self.source.ptr, requestContext(ctx), parsed.value) catch |err| return metadataMutationError(ctx, err);
+        return ctx.status(200).text("applied");
     }
 
     fn metadataUpsertSchemaProgress(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -2654,8 +2847,10 @@ pub const MetadataHttpServer = struct {
 
     fn nodeMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
-            error.InvalidArgument, error.StoreIdentityMismatch => ctx.status(400).text("invalid node request"),
+            error.InvalidArgument, error.StoreIdentityMismatch, error.InvalidStoreReporterFence, error.InvalidNodeID => ctx.status(400).text("invalid node request"),
             error.NodeNotFound, error.UnknownStore => ctx.status(404).text("node not found"),
+            error.StoreReportBaseMismatch => ctx.status(409).text("store report generation changed; send a full report"),
+            error.ResourceTemporarilyUnavailable => ctx.status(503).text("report admission capacity exhausted"),
             error.ActiveNodeFinalizeRejected => ctx.status(409).text("node is not ready to finalize"),
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
             else => metadataReadError(ctx, err),
@@ -2701,6 +2896,40 @@ pub const MetadataHttpServer = struct {
             return ctx.status(400).text("invalid node status request");
         var owned = node_operations.StatusReport{ .value = report };
         defer owned.deinit(ctx.allocator);
+        self.nodeOperations().reportStatus(ctx.allocator, requestContext(ctx), &owned) catch |err| return nodeMutationError(ctx, err);
+        try ctx.setHeader(metadata_table_manager.store_runtime_reference_header, "1");
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataReportNodeBaseline(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
+        const body = (try ctx.body()) orelse return ctx.status(400).text("missing report update");
+        if (body.len > store_report_baseline.max_chunk_bytes) return ctx.status(413).text("report chunk exceeds upload budget");
+        var parsed = std.json.parseFromSlice(struct { report: struct { store_id: u64 } }, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch return ctx.status(400).text("invalid report update");
+        defer parsed.deinit();
+        if (parsed.value.report.store_id != node_id) return ctx.status(400).text("store identity mismatch");
+        const apply = self.source.vtable.report_store_baseline orelse return ctx.status(404).text("unsupported");
+        const cursor = apply(self.source.ptr, ctx.allocator, requestContext(ctx), body) catch |err| return nodeMutationError(ctx, err);
+        return ctx.status(200).json(cursor);
+    }
+    fn metadataReportNodeUpdate(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
+        const body = (try ctx.body()) orelse return ctx.status(400).text("missing report update");
+        var parsed = std.json.parseFromSlice(struct { report: struct { store_id: u64 } }, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch return ctx.status(400).text("invalid report update");
+        defer parsed.deinit();
+        if (parsed.value.report.store_id != node_id) return ctx.status(400).text("store identity mismatch");
+        const apply = self.source.vtable.report_store_update orelse return ctx.status(404).text("unsupported");
+        const cursor = apply(self.source.ptr, ctx.allocator, requestContext(ctx), body) catch |err| return nodeMutationError(ctx, err);
+        return ctx.status(200).json(cursor);
+    }
+
+    fn metadataReportNodeHeartbeat(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
+        var report = parseNodeStatusReport(ctx.allocator, (try ctx.body()) orelse "", node_id) catch return ctx.status(400).text("invalid node heartbeat");
+        report.runtime_reference = true;
+        var owned = node_operations.StatusReport{ .value = report };
+        defer owned.deinit(ctx.allocator);
+        if (report.runtime_statuses.len != 0 or report.reporter_incarnation == 0) return ctx.status(400).text("invalid runtime reference");
         self.nodeOperations().reportStatus(ctx.allocator, requestContext(ctx), &owned) catch |err| return nodeMutationError(ctx, err);
         return ctx.status(202).text("accepted");
     }
@@ -2901,8 +3130,13 @@ pub const MetadataHttpServer = struct {
         defer forwarded.deinit();
         if (forwarded.value.protocol_version != routes.Routes.table_mutation_protocol_version)
             return ctx.status(426).text("unsupported table mutation protocol");
-        tables_api.validateTableMutationName(forwarded.value.table_name) catch
-            return ctx.status(400).text("invalid table name");
+        if (forwarded.value.kind == .drop_table) {
+            tables_api.validateInternalTableMutationName(forwarded.value.table_name) catch
+                return ctx.status(400).text("invalid table name");
+        } else {
+            tables_api.validateTableMutationName(forwarded.value.table_name) catch
+                return ctx.status(400).text("invalid table name");
+        }
         var create_request: ?tables_api.CreateTableRequest = null;
         defer if (create_request) |*request| request.deinit(ctx.allocator);
         switch (forwarded.value.kind) {
@@ -3449,7 +3683,8 @@ fn loadRestoreMetadataSpec(
     try backups_api.validateTableManifest(alloc, manifest, manifest.backup_id);
     if (manifest.artifact_integrity_mode != .declared)
         return error.BackupIntegrityMissing;
-    if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+    if (!std.mem.eql(u8, manifest.table_name, table_name) and
+        !(system_catalog.isRestoreTarget(table_name) catch false)) return error.InvalidBackupRequest;
     const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest) catch {
         return error.InvalidBackupRequest;
     };
@@ -4685,6 +4920,92 @@ test "metadata http server reports reallocation protocol upgrade gating" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 503), response.status.code);
     try std.testing.expectEqualStrings("metadata voter upgrade required", response.body.?);
+}
+
+test "system catalog read identity avoids diagnostic inventories and fences replacement" {
+    const Fixture = struct {
+        reads: usize = 0,
+        replace_identity: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn identity(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = if (self.replace_identity and self.reads % 2 == 0)
+                    "22222222222222222222222222222222".*
+                else
+                    "11111111111111111111111111111111".*,
+            };
+        }
+        fn catalog(_: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, _: system_catalog.Call) ![]u8 {
+            try context.ensureActive();
+            return alloc.dupe(u8, "{}");
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{};
+    var vtable = AdminSource.VTable{
+        .status = Fixture.status,
+        .admin_snapshot = Fixture.snapshot,
+        .free_admin_snapshot = Fixture.freeSnapshot,
+        .system_catalog = Fixture.catalog,
+        .catalog_identity = Fixture.identity,
+    };
+    var server = MetadataHttpServer.init(alloc, .{}, .{ .ptr = &fixture, .vtable = &vtable });
+    const body = try std.json.Stringify.valueAlloc(alloc, @as(system_catalog.Call, .snapshot), .{});
+    defer alloc.free(body);
+    for ([_]u16{ 200, 503, 426 }) |expected| {
+        fixture.reads = 0;
+        fixture.replace_identity = expected == 503;
+        if (expected == 426) vtable.catalog_identity = null;
+        var request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+        defer request.deinit();
+        try request.setBody(body);
+        try request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+        try request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+        try request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try server.metadataSystemCatalog(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(expected, response.status.code);
+        try std.testing.expectEqual(@as(usize, if (expected == 426) 0 else 2), fixture.reads);
+        if (expected == 200) {
+            try std.testing.expectEqualStrings("{}", response.body.?);
+            try std.testing.expectEqualStrings("11111111111111111111111111111111", response.headers.get("x-antfly-catalog-metadata-incarnation").?);
+        }
+    }
+}
+
+test "system catalog forwarding retains its executor clock and tighter ingress deadline" {
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer clock.deinit();
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/internal/v1/system-catalog");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, clock.io(), &request);
+    defer ctx.deinit();
+    const forwarded = MetadataHttpServer.systemCatalogRequestContext(&ctx, 2000);
+    try std.testing.expectEqual(@as(?u64, 9 * std.time.ns_per_s), forwarded.deadline_ns);
+    try std.testing.expect(forwarded.deadline_io != null);
+    try forwarded.ensureActive();
+    ctx.application_deadline_io = clock.io();
+    ctx.application_deadline_ns = 8 * std.time.ns_per_s;
+    const narrowed = MetadataHttpServer.systemCatalogRequestContext(&ctx, 2000);
+    try std.testing.expectEqual(ctx.application_deadline_ns, narrowed.deadline_ns);
+    try clock.advance(std.time.ns_per_s);
+    try std.testing.expectError(error.DeadlineExceeded, narrowed.ensureActive());
+    try std.testing.expectError(error.DeadlineExceeded, MetadataHttpServer.systemCatalogRequestContext(&ctx, 2000).ensureActive());
+    // Native ingress contracts are translated once, without refreshing them.
+    ctx.application_deadline_io = null;
+    ctx.application_deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, MetadataHttpServer.systemCatalogRequestContext(&ctx, 2000).ensureActive());
 }
 
 test "metadata routing server converts relative budget to local deadline" {

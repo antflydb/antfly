@@ -15,7 +15,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 49;
+pub const abi_version: u32 = 52;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -450,6 +450,43 @@ pub const Status = enum(u32) {
     index_rebuilding = 492,
     read_index_timeout = 493,
     incomplete_published_snapshot = 494,
+    distributed_query_unavailable = 495,
+    catalog_already_exists = 496,
+    catalog_command_too_large = 497,
+    catalog_generation_changed = 498,
+    catalog_id_exhausted = 499,
+    catalog_not_found = 500,
+    catalog_projection_refresh_required = 501,
+    catalog_routing_snapshot_timeout = 502,
+    catalog_table_topology_required = 503,
+    create_table_request_too_large = 504,
+    database_not_empty = 505,
+    database_not_found = 506,
+    forbidden = 507,
+    invalid_catalog_mutation = 508,
+    invalid_catalog_name = 509,
+    invalid_catalog_record = 510,
+    invalid_catalog_route_fence = 511,
+    invalid_metadata_node_id = 512,
+    invalid_store_reporter_fence = 513,
+    invalid_tablespace_location = 514,
+    invalid_tablespace_placement_policy = 515,
+    metadata_incarnation_mismatch = 516,
+    metadata_incarnation_unavailable = 517,
+    metadata_mutation_outcome_unknown = 518,
+    metadata_snapshot_head_mismatch = 519,
+    namespace_not_empty = 520,
+    namespace_not_found = 521,
+    not_leader = 522,
+    protected_catalog_resource = 523,
+    resource_request_too_large = 524,
+    store_report_base_mismatch = 525,
+    table_already_exists = 526,
+    table_topology_protocol_upgrade_required = 527,
+    tablespace_in_use = 528,
+    tablespace_not_found = 529,
+    ha_seed_snapshot_runtime_busy = 530,
+    ha_seed_capture_already_in_progress = 531,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

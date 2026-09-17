@@ -76,29 +76,22 @@ pub fn runFromIterator(init: std.process.Init, iterator: *std.process.Args.Itera
             .budget = budget,
         }, action);
     }
-    if (!std.mem.eql(u8, action, "run") or (once and cancelling)) return error.InvalidArguments;
+    const status_only = std.mem.eql(u8, action, "status");
+    if ((!std.mem.eql(u8, action, "run") and !status_only) or (once and cancelling) or (status_only and (once or cancelling))) return error.InvalidArguments;
     const path = catalog_path orelse return error.ExpectedCatalogReplicaRootTableAndJob;
     const root = replicas orelse return error.ExpectedCatalogReplicaRootTableAndJob;
     const name = table_name orelse return error.ExpectedCatalogReplicaRootTableAndJob;
     const request = migration.Request{ .job_id = job_id orelse return error.ExpectedCatalogReplicaRootTableAndJob, .mode = .offline, .budget = budget };
     try request.validate();
-    const lock = try antfly.migration_files.lockCatalog(alloc, init.io, path);
-    defer lock.close(init.io);
-    const raw = try std.Io.Dir.cwd().readFileAlloc(init.io, path, alloc, .limited(64 * 1024 * 1024));
-    // Preserve unknown fields and extension catalogs, changing only this
-    // table's ownership/marker and the catalog epoch.
-    var catalog = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
+    var catalog = try @import("../standalone/offline_catalog.zig").Catalog.open(alloc, init.io, path);
     defer catalog.deinit();
-    const json_alloc = catalog.arena.allocator();
-    const table_values = catalog.value.object.getPtr("tables") orelse return error.InvalidCatalog;
-    var table_value: *std.json.Value = blk: {
-        for (table_values.array.items) |*entry| {
-            const n = entry.object.get("name") orelse continue;
-            if (n == .string and std.mem.eql(u8, n.string, name)) break :blk entry;
-        }
-        return error.TableNotFound;
-    };
+    const json_alloc = catalog.document.arena.allocator();
+    const table_value = try catalog.findTable(name);
     const table_json = try std.json.Stringify.valueAlloc(alloc, table_value.*, .{});
+    if (status_only) {
+        std.debug.print("{s}\n", .{table_json});
+        return;
+    }
     var table = try std.json.parseFromSlice(antfly.metadata.TableRecord, alloc, table_json, .{ .ignore_unknown_fields = true });
     defer table.deinit();
     if (table.value.desired_replica_count != 1 or table.value.min_ranges != 1 or
@@ -106,7 +99,7 @@ pub fn runFromIterator(init: std.process.Init, iterator: *std.process.Args.Itera
     var replication = try std.json.parseFromSlice(std.json.Value, alloc, table.value.replication_sources_json, .{});
     defer replication.deinit();
     if (replication.value != .array or replication.value.array.items.len != 0) return error.VectorStoreRequiresLocalSingleShardTable;
-    const ranges_json = try std.json.Stringify.valueAlloc(alloc, catalog.value.object.get("ranges") orelse return error.InvalidCatalog, .{});
+    const ranges_json = try std.json.Stringify.valueAlloc(alloc, catalog.document.value.object.get("ranges") orelse return error.InvalidCatalog, .{});
     var ranges = try std.json.parseFromSlice([]const antfly.metadata.RangeRecord, alloc, ranges_json, .{ .ignore_unknown_fields = true });
     defer ranges.deinit();
     const range = blk: {
@@ -124,7 +117,7 @@ pub fn runFromIterator(init: std.process.Init, iterator: *std.process.Args.Itera
         const admission_json = try std.json.Stringify.valueAlloc(alloc, migration.Admission{ .request = request }, .{});
         const admitted = try std.json.parseFromSliceLeaky(std.json.Value, json_alloc, admission_json, .{ .allocate = .alloc_always });
         try table_value.object.put(json_alloc, "storage_migration", admitted);
-        try publishCatalog(json_alloc, init.io, path, &catalog.value);
+        try catalog.publish(table_value.*);
     }
     const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, root, range.group_id);
     if (cancelling) {
@@ -134,7 +127,7 @@ pub fn runFromIterator(init: std.process.Init, iterator: *std.process.Args.Itera
             .range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
         } });
         _ = table_value.object.swapRemove("storage_migration");
-        try publishCatalog(json_alloc, init.io, path, &catalog.value);
+        try catalog.publish(table_value.*);
         std.debug.print("offline vector migration cancelled\n", .{});
         return;
     }
@@ -154,7 +147,7 @@ pub fn runFromIterator(init: std.process.Init, iterator: *std.process.Args.Itera
         // stopped server behind the marker installed by this invocation.
         if (err == error.VectorMigrationCancelled) {
             _ = table_value.object.swapRemove("storage_migration");
-            try publishCatalog(json_alloc, init.io, path, &catalog.value);
+            try catalog.publish(table_value.*);
         }
         return err;
     };
@@ -163,19 +156,12 @@ pub fn runFromIterator(init: std.process.Init, iterator: *std.process.Args.Itera
         try storage.put(json_alloc, "dense_embeddings", .{ .string = "vector_store" });
         try table_value.object.put(json_alloc, "storage", .{ .object = storage });
         _ = table_value.object.swapRemove("storage_migration");
-        try publishCatalog(json_alloc, init.io, path, &catalog.value);
+        try catalog.publish(table_value.*);
     }
     std.debug.print("offline vector migration {s}\n", .{@tagName(result)});
 }
 fn printProgress(_: ?*anyopaque, raw: []const u8) !void {
     std.debug.print("{s}\n", .{raw});
-}
-fn publishCatalog(alloc: std.mem.Allocator, io: std.Io, path: []const u8, value: *std.json.Value) !void {
-    const epoch = value.object.get("epoch") orelse std.json.Value{ .integer = 0 };
-    try value.object.put(alloc, "epoch", .{ .integer = try std.math.add(i64, epoch.integer, 1) });
-    const encoded = try std.json.Stringify.valueAlloc(alloc, value.*, .{});
-    defer alloc.free(encoded);
-    try antfly.migration_files.writeAtomic(alloc, io, path, encoded);
 }
 
 fn printUsage() void {
@@ -183,7 +169,7 @@ fn printUsage() void {
         \\usage: antfly storage migrate --table NAME --to vector-store --job ID [options]
         \\
         \\Online: --url http://HOST:PORT [--action run|start|step|publish|cancel|status]
-        \\Offline: --catalog PATH --replica-root PATH [--once | --cancel]
+        \\Offline: --catalog PATH --replica-root PATH [--once | --cancel | --action status]
         \\Budgets: --batch-bytes N --batch-rows N --temporary-bytes N --disk-reserve-bytes N
         \\
         \\Online defaults to run: advance bounded steps and publish verified coverage.

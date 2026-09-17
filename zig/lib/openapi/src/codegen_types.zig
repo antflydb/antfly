@@ -1849,6 +1849,8 @@ pub const TypeGenerator = struct {
             if (schema.format) |fmt| {
                 if (std.mem.eql(u8, fmt, "int32")) return "i32";
                 if (std.mem.eql(u8, fmt, "int64")) return "i64";
+                if (std.mem.eql(u8, fmt, "uint32")) return "u32";
+                if (std.mem.eql(u8, fmt, "uint64")) return "u64";
             }
             return "i64";
         } else if (std.mem.eql(u8, type_str, "number")) {
@@ -1947,6 +1949,8 @@ test "zigTypeForSchema primitives" {
     try std.testing.expectEqualStrings("[]const u8", try gen.zigTypeForSchema(.{ .schema_type = .{ .single = "string" } }));
     try std.testing.expectEqualStrings("i64", try gen.zigTypeForSchema(.{ .schema_type = .{ .single = "integer" } }));
     try std.testing.expectEqualStrings("i32", try gen.zigTypeForSchema(.{ .schema_type = .{ .single = "integer" }, .format = "int32" }));
+    try std.testing.expectEqualStrings("u32", try gen.zigTypeForSchema(.{ .schema_type = .{ .single = "integer" }, .format = "uint32" }));
+    try std.testing.expectEqualStrings("u64", try gen.zigTypeForSchema(.{ .schema_type = .{ .single = "integer" }, .format = "uint64" }));
     try std.testing.expectEqualStrings("f64", try gen.zigTypeForSchema(.{ .schema_type = .{ .single = "number" } }));
     try std.testing.expectEqualStrings("f32", try gen.zigTypeForSchema(.{ .schema_type = .{ .single = "number" }, .format = "float" }));
     try std.testing.expectEqualStrings("bool", try gen.zigTypeForSchema(.{ .schema_type = .{ .single = "boolean" } }));

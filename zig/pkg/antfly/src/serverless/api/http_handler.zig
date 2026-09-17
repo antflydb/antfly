@@ -10978,7 +10978,7 @@ test "http handler serves public table joins on published heads" {
     const inner_response = parsed_inner.value.responses.?[0];
     const inner_hits = inner_response.hits.?.hits.?;
     try std.testing.expectEqual(@as(usize, 1), inner_hits.len);
-    try std.testing.expectEqual(@as(i64, 1), inner_response.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), inner_response.hits.?.total.?.value);
     try std.testing.expectEqualStrings("Alice", testQueryHitSourcePathValue(inner_hits[0], "customers.name").?.string);
     try std.testing.expectEqualStrings("index_lookup", testJoinProfileFieldValue(inner_response, "strategy_used").?.string);
 
@@ -12709,7 +12709,7 @@ test "serverless http handler serves the table public lifecycle and consistency 
     defer parsed_public_search_via_query.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_public_search_via_query.value.responses.?.len);
     try std.testing.expectEqualStrings("docs", parsed_public_search_via_query.value.responses.?[0].table.?);
-    try std.testing.expectEqual(@as(i64, 1), parsed_public_search_via_query.value.responses.?[0].hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), parsed_public_search_via_query.value.responses.?[0].hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc-a", parsed_public_search_via_query.value.responses.?[0].hits.?.hits.?[0]._id);
 
     var public_aggregated_query = try handler.handle(.{
@@ -13965,7 +13965,7 @@ test "http handler serves published graph query endpoints" {
     var parsed_from_search = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, from_search.body);
     defer parsed_from_search.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_from_search.value.responses.?.len);
-    try std.testing.expectEqual(@as(i64, 1), parsed_from_search.value.responses.?[0].hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), parsed_from_search.value.responses.?[0].hits.?.total.?.value);
     const neighbors_from_search_result = parsed_from_search.value.responses.?[0].graph_results.?.map.get("neighbors_from_search").?;
     const neighbors_from_search = switch (neighbors_from_search_result) {
         .graph_nodes_result => |result| result,
@@ -13987,7 +13987,7 @@ test "http handler serves published graph query endpoints" {
     var parsed_from_fused = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, from_fused.body);
     defer parsed_from_fused.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_from_fused.value.responses.?.len);
-    try std.testing.expectEqual(@as(i64, 1), parsed_from_fused.value.responses.?[0].hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), parsed_from_fused.value.responses.?[0].hits.?.total.?.value);
     const neighbors_from_fused_result = parsed_from_fused.value.responses.?[0].graph_results.?.map.get("neighbors_from_fused").?;
     const neighbors_from_fused = switch (neighbors_from_fused_result) {
         .graph_nodes_result => |result| result,

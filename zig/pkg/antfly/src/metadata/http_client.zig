@@ -13,6 +13,9 @@
 // limitations.
 
 const std = @import("std");
+const snapshot_transfer = @import("snapshot_transfer.zig");
+const store_report_update = @import("store_report_update.zig");
+const system_catalog = @import("../system_catalog/domain.zig");
 const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
 const tables_api = @import("../api/tables.zig");
@@ -29,6 +32,7 @@ const raft_routes = @import("../raft/transport/routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const routes = @import("http_routes.zig");
 
+const max_snapshot_admission_retries: usize = 8;
 const max_transport_retries: usize = 1;
 const max_metadata_not_leader_retries: usize = 2;
 const default_request_timeout_ms: u32 = 5_000;
@@ -243,6 +247,55 @@ pub const MetadataHttpClient = struct {
 
     pub fn fetchSnapshot(self: *MetadataHttpClient, base_uri: []const u8) !std.json.Parsed(metadata_api.AdminSnapshot) {
         return try self.fetchSnapshotWithBudget(base_uri, null);
+    }
+
+    pub fn fetchPagedSnapshot(self: *MetadataHttpClient, base_uri: []const u8, control: bool, linearizable: bool, budget: ?RequestBudget) !std.json.Parsed(metadata_api.AdminSnapshot) {
+        const uri = try join(self.alloc, base_uri, snapshot_transfer.path);
+        defer self.alloc.free(uri);
+        var request: snapshot_transfer.Request = .{ .control = control, .linearizable = linearizable };
+        defer if (request.token != 0) {
+            request.release = true;
+            const body = std.json.Stringify.valueAlloc(self.alloc, request, .{}) catch null;
+            if (body) |bytes| {
+                defer self.alloc.free(bytes);
+                // Releasing a retained transfer is cleanup, not a continuation of
+                // its caller. Cancellation or expiry must not strand capacity
+                // for the server's entire transfer TTL.
+                var cleanup_budget: RequestBudget = .{ .deadline_ns = 0, .io = if (budget) |value| value.io else null };
+                cleanup_budget.deadline_ns = cleanup_budget.nowNs() +| std.time.ns_per_s;
+                var response = self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .timeout_ms = 1000 }, cleanup_budget) catch null;
+                if (response) |*value| value.deinit(self.alloc);
+            }
+        };
+        var bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer bytes.deinit(self.alloc);
+        var total: ?usize = null;
+        var admission_retries: usize = 0;
+        while (true) {
+            const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+            defer self.alloc.free(body);
+            var response = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms }, budget);
+            defer response.deinit(self.alloc);
+            if (response.status == 413) return error.ResourceRequestTooLarge;
+            if (response.status == 503 and response.header(http_common.metadata_not_leader_header) == null) {
+                // Capture admission is replay-safe: no token has been issued.
+                // Keep one finite retry allowance and the original deadline.
+                if (request.token != 0 or admission_retries >= max_snapshot_admission_retries)
+                    return error.ResourceTemporarilyUnavailable;
+                admission_retries += 1;
+                try waitBeforeMetadataMutationRetry(metadataAuthorityRetryDelayNs(response), budget, if (budget) |value| value.cancellation else null);
+                continue;
+            }
+            try mapResponseStatus(response, error.InvalidRequest, error.UnsupportedOperation, error.CatalogGenerationChanged);
+            const token = try std.fmt.parseInt(u64, response.header("X-Antfly-Snapshot-Token") orelse return error.InvalidResponse, 10);
+            const size = try std.fmt.parseInt(usize, response.header("X-Antfly-Snapshot-Bytes") orelse return error.InvalidResponse, 10);
+            if (token == 0 or (request.token != 0 and request.token != token) or (total != null and total.? != size) or size > snapshot_transfer.max_snapshot_bytes or response.body.len > snapshot_transfer.page_bytes or response.body.len == 0 or bytes.items.len + response.body.len > size) return error.InvalidResponse;
+            request.token = token;
+            total = size;
+            try bytes.appendSlice(self.alloc, response.body);
+            if (bytes.items.len == size) return parseJson(metadata_api.AdminSnapshot, self.alloc, bytes.items);
+            request.offset = bytes.items.len;
+        }
     }
 
     pub fn fetchSnapshotWithBudget(
@@ -626,14 +679,74 @@ pub const MetadataHttpClient = struct {
         try self.requestNoBody(base_uri, .DELETE, path, null, null, null);
     }
 
-    pub fn reportNodeStatus(
-        self: *MetadataHttpClient,
-        base_uri: []const u8,
-        body: []const u8,
-    ) !void {
-        const status_route = try nodeStatusRouteForBody(self.alloc, body);
-        defer self.alloc.free(status_route);
-        try self.requestWithBody(base_uri, .POST, status_route, body, error.InvalidStoreStatusRequest, error.UnknownStore, null);
+    pub fn reportNodeStatus(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8) !void {
+        _ = try self.reportNodeStatusWithReferenceSupport(base_uri, body);
+    }
+
+    pub fn reportNodeStatusWithReferenceSupport(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8) !bool {
+        return self.reportNodeStatusWithReferenceSupportAndBudget(base_uri, body, null);
+    }
+
+    pub fn reportNodeStatusWithReferenceSupportAndBudget(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8, budget: ?RequestBudget) !bool {
+        const route = try nodeStatusRouteForBody(self.alloc, body);
+        defer self.alloc.free(route);
+        const uri = try join(self.alloc, base_uri, route);
+        defer self.alloc.free(uri);
+        var resp = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms }, budget);
+        defer resp.deinit(self.alloc);
+        try mapResponseStatus(resp, error.InvalidStoreStatusRequest, error.UnknownStore, null);
+        return responseHasHeaderValueAnyStatus(resp, metadata_table_manager.store_runtime_reference_header, "1");
+    }
+
+    pub fn reportNodeBaseline(self: *MetadataHttpClient, base_uri: []const u8, store_id: u64, body: []const u8) !@import("store_report_baseline.zig").Progress {
+        return self.reportNodeBaselineWithBudget(base_uri, store_id, body, null);
+    }
+
+    pub fn reportNodeBaselineWithBudget(self: *MetadataHttpClient, base_uri: []const u8, store_id: u64, body: []const u8, budget: ?RequestBudget) !@import("store_report_baseline.zig").Progress {
+        const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/nodes/{d}/status/baseline", .{store_id});
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        var resp = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms }, budget);
+        defer resp.deinit(self.alloc);
+        if (resp.status == 405) return error.UnsupportedOperation;
+        try mapResponseStatus(resp, error.InvalidStoreStatusRequest, error.UnsupportedOperation, error.StoreReportBaseMismatch);
+        var parsed = try std.json.parseFromSlice(@import("store_report_baseline.zig").Progress, self.alloc, resp.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+    pub fn reportNodeUpdate(self: *MetadataHttpClient, base_uri: []const u8, store_id: u64, body: []const u8) !store_report_update.Cursor {
+        return self.reportNodeUpdateWithBudget(base_uri, store_id, body, null);
+    }
+
+    pub fn reportNodeUpdateWithBudget(self: *MetadataHttpClient, base_uri: []const u8, store_id: u64, body: []const u8, budget: ?RequestBudget) !store_report_update.Cursor {
+        const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/nodes/{d}/status/update", .{store_id});
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+        var resp = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms }, budget);
+        defer resp.deinit(self.alloc);
+        if (resp.status == 405) return error.UnsupportedOperation;
+        try mapResponseStatus(resp, error.InvalidStoreStatusRequest, error.UnsupportedOperation, error.StoreReportBaseMismatch);
+        var parsed = try std.json.parseFromSlice(store_report_update.Cursor, self.alloc, resp.body, .{});
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    pub fn reportNodeHeartbeat(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8) !void {
+        return self.reportNodeHeartbeatWithBudget(base_uri, body, null);
+    }
+
+    pub fn reportNodeHeartbeatWithBudget(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8, budget: ?RequestBudget) !void {
+        const route = try nodeStatusRouteForBody(self.alloc, body);
+        defer self.alloc.free(route);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/heartbeat", .{route});
+        defer self.alloc.free(path);
+        try self.requestWithBodyBudget(base_uri, .POST, path, body, error.InvalidStoreStatusRequest, error.UnsupportedOperation, error.StoreReportBaseMismatch, budget);
+    }
+
+    pub fn upsertSchemaProgressBatch(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8, budget: ?RequestBudget) !void {
+        try self.requestWithBodyBudget(base_uri, .POST, routes.Routes.internal_schema_progress_batch, body, error.InvalidSchemaProgressRequest, error.UnsupportedOperation, null, budget);
     }
 
     pub fn upsertSchemaProgress(
@@ -642,6 +755,10 @@ pub const MetadataHttpClient = struct {
         body: []const u8,
     ) !void {
         try self.requestWithBody(base_uri, .POST, routes.Routes.internal_schema_progress, body, error.InvalidSchemaProgressRequest, null, null);
+    }
+
+    pub fn upsertSchemaProgressWithBudget(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8, budget: ?RequestBudget) !void {
+        try self.requestWithBodyBudget(base_uri, .POST, routes.Routes.internal_schema_progress, body, error.InvalidSchemaProgressRequest, null, null, budget);
     }
 
     pub fn upsertRestoreProgress(
@@ -837,6 +954,93 @@ pub const MetadataHttpClient = struct {
         );
     }
 
+    pub const CatalogRead = struct {
+        body: []u8,
+        metadata_group_id: u64,
+        metadata_incarnation: metadata_api.MetadataClusterIncarnation,
+
+        pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.body);
+        }
+    };
+
+    /// Read-only retries are safe. The response proves the metadata identity;
+    /// callers need no preceding status/discovery round trip on the happy path.
+    pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
+        if (input == .mutate) return error.InvalidCatalogMutation;
+        if (remaining_ms == 0) return error.Timeout;
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(body);
+        if (body.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+        const uri = try join(self.alloc, base_uri, "/internal/v1/system-catalog");
+        defer self.alloc.free(uri);
+        var remaining_buf: [10]u8 = undefined;
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms}) },
+            .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = "0" },
+            .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
+        };
+        var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
+        defer response.deinit(self.alloc);
+        if (response.status != 200) return switch (response.status) {
+            400 => error.InvalidCatalogName,
+            404 => error.CatalogNotFound,
+            409 => error.CatalogGenerationChanged,
+            413 => error.CatalogCommandTooLarge,
+            426 => error.TableTopologyProtocolUpgradeRequired,
+            503 => error.NotLeader,
+            else => error.RemoteUnavailable,
+        };
+        const group = responseHeader(response, "x-antfly-catalog-metadata-group") orelse return error.MetadataIncarnationUnavailable;
+        const raw_incarnation = responseHeader(response, "x-antfly-catalog-metadata-incarnation") orelse return error.MetadataIncarnationUnavailable;
+        if (raw_incarnation.len != 32) return error.InvalidMetadataIncarnation;
+        const incarnation: metadata_api.MetadataClusterIncarnation = raw_incarnation[0..32].*;
+        if (!@import("incarnation.zig").isValid(incarnation)) return error.InvalidMetadataIncarnation;
+        return .{
+            .metadata_group_id = std.fmt.parseInt(u64, group, 10) catch return error.MetadataGroupMismatch,
+            .metadata_incarnation = incarnation,
+            .body = try self.alloc.dupe(u8, response.body),
+        };
+    }
+
+    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, forwarding: raft_mutation_forwarding.Context) ![]u8 {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(body);
+        if (body.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+        const uri = try join(self.alloc, base_uri, "/internal/v1/system-catalog");
+        defer self.alloc.free(uri);
+        var remaining_buf: [10]u8 = undefined;
+        var forwards_buf: [3]u8 = undefined;
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{forwarding.remaining_ms}) },
+            .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{forwarding.forwards_remaining}) },
+            .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = if (forwarding.campaign_allowed) "true" else "false" },
+        };
+        var delivery: http_common.RequestDeliveryTracker = .{};
+        var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery }, self.internal_service) catch |err| {
+            if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) return error.RaftMutationRequestNotSent;
+            return error.MetadataMutationOutcomeUnknown;
+        };
+        defer response.deinit(self.alloc);
+        const outcome = responseHeader(response, routes.Routes.raft_mutation_outcome_header) orelse {
+            if (response.status == 404 or response.status == 405 or response.status == 426) return error.TableTopologyProtocolUpgradeRequired;
+            return error.MetadataMutationOutcomeUnknown;
+        };
+        if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_unknown)) return error.MetadataMutationOutcomeUnknown;
+        if (response.status >= 200 and response.status < 300 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return self.alloc.dupe(u8, response.body);
+        if (!std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) return error.MetadataMutationOutcomeUnknown;
+        return switch (response.status) {
+            400 => error.InvalidCatalogMutation,
+            404 => error.CatalogNotFound,
+            409 => error.CatalogGenerationChanged,
+            413 => error.CatalogCommandTooLarge,
+            426 => error.TableTopologyProtocolUpgradeRequired,
+            503 => error.NotLeader,
+            else => error.MetadataMutationOutcomeUnknown,
+        };
+    }
+
     pub fn forwardTableMutation(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -878,7 +1082,7 @@ pub const MetadataHttpClient = struct {
         definition_json: ?[]const u8,
         forwarding: raft_mutation_forwarding.Context,
     ) !?topology_protocol.DropResult {
-        try tables_api.validateTableMutationName(table_name);
+        if (kind == .drop_table) try tables_api.validateInternalTableMutationName(table_name) else try tables_api.validateTableMutationName(table_name);
         const body = try std.json.Stringify.valueAlloc(self.alloc, routes.ForwardedTableMutation{
             .kind = kind,
             .table_name = table_name,
@@ -1372,16 +1576,30 @@ pub const MetadataHttpClient = struct {
         not_found_err: ?anyerror,
         conflict_err: ?anyerror,
     ) !void {
+        return self.requestWithBodyBudget(base_uri, method, path, body, bad_request_err, not_found_err, conflict_err, null);
+    }
+
+    fn requestWithBodyBudget(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        method: http_common.Method,
+        path: []const u8,
+        body: []const u8,
+        bad_request_err: ?anyerror,
+        not_found_err: ?anyerror,
+        conflict_err: ?anyerror,
+        budget: ?RequestBudget,
+    ) !void {
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executeWithRetry(.{
+        var resp = try self.executeWithRetryBudget(.{
             .method = method,
             .uri = uri,
             .body = body,
             .content_type = "application/json",
             .timeout_ms = default_request_timeout_ms,
-        });
+        }, budget);
         defer resp.deinit(self.alloc);
         try mapResponseStatus(resp, bad_request_err, not_found_err, conflict_err);
     }
@@ -2393,6 +2611,63 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), executor.internal_calls);
         }
 
+        test "metadata http client paged snapshot bounds admission and releases after cancellation" {
+            const Capture = struct {
+                const Mode = enum { complete, cancel, exhausted };
+                mode: Mode,
+                cancellation: *http_common.RequestCancellation,
+                captures: usize = 0,
+                releases: usize = 0,
+
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    var request = try std.json.parseFromSlice(snapshot_transfer.Request, alloc, req.body, .{});
+                    defer request.deinit();
+                    try std.testing.expect(request.value.control);
+                    if (request.value.release) {
+                        try std.testing.expectEqual(@as(u64, 2), request.value.token);
+                        try std.testing.expect(req.cancellation == null);
+                        try std.testing.expect(req.timeout_ms.? <= 1000);
+                        self.releases += 1;
+                        return .{ .status = 200, .body = try alloc.dupe(u8, "") };
+                    }
+                    self.captures += 1;
+                    try std.testing.expectEqual(@as(u64, 0), request.value.token);
+                    if (self.captures == 1 or self.mode == .exhausted) {
+                        const headers = try alloc.alloc(http_common.Header, 1);
+                        headers[0] = .{ .name = try alloc.dupe(u8, "Retry-After"), .value = try alloc.dupe(u8, "0") };
+                        return .{ .status = 503, .headers = headers, .body = try alloc.dupe(u8, "capacity exhausted") };
+                    }
+                    const snapshot =
+                        \\{"status":{"metadata_group_id":91,"metadata_epoch":3,"metrics":{}},"tables":[],"ranges":[],"stores":[],"placement_intents":[],"split_transitions":[],"merge_transitions":[]}
+                    ;
+                    const headers = try alloc.alloc(http_common.Header, 2);
+                    headers[0] = .{ .name = try alloc.dupe(u8, "X-Antfly-Snapshot-Token"), .value = try alloc.dupe(u8, "2") };
+                    headers[1] = .{ .name = try alloc.dupe(u8, "X-Antfly-Snapshot-Bytes"), .value = try std.fmt.allocPrint(alloc, "{d}", .{snapshot.len}) };
+                    if (self.mode == .cancel) self.cancellation.cancel();
+                    return .{ .status = 200, .headers = headers, .body = try alloc.dupe(u8, if (self.mode == .cancel) snapshot[0..1] else snapshot) };
+                }
+            };
+            for ([_]Capture.Mode{ .complete, .cancel, .exhausted }) |mode| {
+                var cancellation = http_common.RequestCancellation{};
+                var capture: Capture = .{ .mode = mode, .cancellation = &cancellation };
+                var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &capture, .vtable = &.{ .execute = Capture.execute } });
+                const budget: RequestBudget = .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s, .cancellation = &cancellation };
+                const result = client.fetchPagedSnapshot("http://metadata.invalid", true, false, budget);
+                switch (mode) {
+                    .complete => {
+                        var parsed = try result;
+                        defer parsed.deinit();
+                        try std.testing.expectEqual(@as(u64, 91), parsed.value.status.metadata_group_id);
+                    },
+                    .cancel => try std.testing.expectError(error.Cancelled, result),
+                    .exhausted => try std.testing.expectError(error.ResourceTemporarilyUnavailable, result),
+                }
+                try std.testing.expectEqual(@as(usize, if (mode == .exhausted) 0 else 1), capture.releases);
+                try std.testing.expectEqual(@as(usize, if (mode == .exhausted) max_snapshot_admission_retries + 1 else 2), capture.captures);
+            }
+        }
+
         test "metadata http client fetches one bounded linearizable snapshot" {
             const FenceExecutor = struct {
                 calls: usize = 0,
@@ -3345,6 +3620,7 @@ fn consumerTests() type {
                 upsert_node_count: usize = 0,
                 upsert_store_count: usize = 0,
                 report_store_status_count: usize = 0,
+                referenced_report_count: usize = 0,
                 forwarded_create_deadline_seen: bool = false,
                 forwarded_drop_deadline_seen: bool = false,
 
@@ -3576,6 +3852,7 @@ fn consumerTests() type {
                     try std.testing.expectEqual(@as(u64, 7), report.store_id);
                     try std.testing.expectEqualStrings("healthy", report.health_class);
                     self.report_store_status_count += 1;
+                    if (report.runtime_reference) self.referenced_report_count += 1;
                 }
 
                 fn requestSplit(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.SplitRequest) !void {
@@ -3665,7 +3942,9 @@ fn consumerTests() type {
             try client.dropTable(base_uri, "docs");
             try client.dropTableForwarded(base_uri, "docs");
             try client.upsertNode(base_uri, "{\"store_id\":7,\"node_id\":7}");
-            try client.reportNodeStatus(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}");
+            try std.testing.expect(try client.reportNodeStatusWithReferenceSupport(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}"));
+            try client.reportNodeHeartbeat(base_uri, "{\"store_id\":7,\"reporter_incarnation\":77,\"status_generation\":1}");
+            try std.testing.expectError(error.InvalidStoreStatusRequest, client.reportNodeHeartbeat(base_uri, "{\"store_id\":7}"));
             try client.requestTableSplit(base_uri, "docs", "{\"split_key\":\"doc:m\"}");
             try client.requestTableMerge(base_uri, "docs", "{\"donor_group_id\":11,\"receiver_group_id\":10}");
             try std.testing.expectEqual(@as(usize, 2), source.create_count);
@@ -3679,7 +3958,8 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), source.delete_artifact_enrichment_count);
             try std.testing.expectEqual(@as(usize, 1), source.upsert_node_count);
             try std.testing.expectEqual(@as(usize, 1), source.upsert_store_count);
-            try std.testing.expectEqual(@as(usize, 1), source.report_store_status_count);
+            try std.testing.expectEqual(@as(usize, 2), source.report_store_status_count);
+            try std.testing.expectEqual(@as(usize, 1), source.referenced_report_count);
             try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
             try std.testing.expectEqual(@as(usize, 1), source.split_count);
             try std.testing.expectEqual(@as(usize, 1), source.merge_count);
@@ -3790,4 +4070,37 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "system catalog direct read carries identity and deadline without a discovery RPC" {
+    const alloc = std.testing.allocator;
+    const Executor = struct {
+        calls: usize = 0,
+        valid_identity: bool = true,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            try std.testing.expectEqual(@as(?u32, 25), request.timeout_ms);
+            try std.testing.expectEqualStrings("0", request.header(routes.Routes.raft_mutation_forwards_remaining_header).?);
+            try std.testing.expectEqualStrings("false", request.header(routes.Routes.raft_mutation_campaign_allowed_header).?);
+            const headers = try a.alloc(http_common.Header, 2);
+            headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "9") };
+            headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, if (self.valid_identity) "11111111111111111111111111111111" else "invalid") };
+            return .{ .status = 200, .headers = headers, .body = try a.dupe(u8, "null") };
+        }
+    };
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    const read = try client.readSystemCatalog("http://metadata.invalid", .{ .resolve = .{ .table = "a.b" } }, 25, null);
+    defer read.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expectEqual(@as(u64, 9), read.metadata_group_id);
+    try std.testing.expectEqualStrings("null", read.body);
+    executor.valid_identity = false;
+    try std.testing.expectError(error.InvalidMetadataIncarnation, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    try std.testing.expectError(error.Timeout, client.readSystemCatalog("http://metadata.invalid", .snapshot, 0, null));
+    try std.testing.expectError(error.InvalidCatalogMutation, client.readSystemCatalog("http://metadata.invalid", .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "denied" } } }, 25, null));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
 }
