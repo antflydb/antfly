@@ -3186,13 +3186,41 @@ pub const AntflyApiHandler = struct {
         self: *AntflyApiHandler,
         ctx: *httpx.Context,
         comptime operation_id: []const u8,
+        lease: *?RequestAdmission.Lease,
     ) !?httpx.Response {
         const class = comptime request_admission_policy.publicOperationClass(operation_id) orelse
             @compileError("public operation is missing an admission policy: " ++ operation_id);
         const acquired = switch (class) {
             .none => @compileError("operation does not use foreground admission: " ++ operation_id),
-            .query => self.api_server.tryAcquireQuery(),
-            .write => self.api_server.tryAcquireWrite(),
+            .query, .write => blk: {
+                const gate = if (class == .query) &self.api_server.query_admission else &self.api_server.write_admission;
+                const context = operationContext(ctx, null);
+                lease.* = gate.acquire(.{
+                    .io = ctx.io,
+                    .clock_io = ctx.application_deadline_io,
+                    .native_now_ns = if (ctx.application_deadline_io == null) @import("antfly_platform").time.monotonicNs else null,
+                    .deadline_ns = ctx.application_deadline_ns,
+                    .cancellation = context.cancellation,
+                    // The body is still transport-owned while queued. Decoding
+                    // happens only after grant under execution resource limits.
+                    .retained_bytes = ctx.request.bodyLen() +| @sizeOf(httpx.Context) +| 4096,
+                }) catch |err| switch (err) {
+                    error.AdmissionFull => break :blk false,
+                    error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge, error.AdmissionWaitTimeout, error.AdmissionClosed, error.DeadlineExceeded => {
+                        const status: u16 = if (err == error.DeadlineExceeded) 504 else if (err == error.AdmissionClosed) 503 else 429;
+                        if (status == 429 and err != error.AdmissionRequestTooLarge) try ctx.setHeader("Retry-After", "1");
+                        if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
+                        return try ctx.status(status).json(.{
+                            .@"error" = @errorName(err),
+                            .reason = if (err == error.AdmissionRequestTooLarge) "resource_exhausted" else if (status == 504) "deadline_exceeded" else if (status == 503) "draining" else "instance_busy",
+                            .stage = "admission",
+                            .execution_started = false,
+                        });
+                    },
+                    else => return err,
+                };
+                break :blk true;
+            },
             .inference => self.api_server.tryAcquireInference(),
         };
         if (!acquired) return switch (class) {
@@ -3202,13 +3230,18 @@ pub const AntflyApiHandler = struct {
             .inference => try inferenceOverloadedResponse(ctx),
         };
         self.api_server.reachRequestLifecycle(.admission_acquired, operation_id) catch |err| {
-            self.releasePublicOperation(operation_id);
+            self.releasePublicOperation(operation_id, lease);
             return err;
         };
         return null;
     }
 
-    fn releasePublicOperation(self: *AntflyApiHandler, comptime operation_id: []const u8) void {
+    fn releasePublicOperation(self: *AntflyApiHandler, comptime operation_id: []const u8, lease: *?RequestAdmission.Lease) void {
+        if (lease.*) |*owned| {
+            owned.release();
+            lease.* = null;
+            return;
+        }
         const class = comptime request_admission_policy.publicOperationClass(operation_id) orelse
             @compileError("public operation is missing an admission policy: " ++ operation_id);
         switch (class) {
@@ -3441,6 +3474,9 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "multiBatchWrite", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("multiBatchWrite", &admission_lease);
         var commit_req = transactions_api.parseMultiBatchRequest(alloc, body_data) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {
@@ -3449,8 +3485,6 @@ pub const AntflyApiHandler = struct {
             },
         };
         defer commit_req.deinit(alloc);
-        if (try self.acquirePublicOperation(ctx, "multiBatchWrite")) |response| return response;
-        defer self.releasePublicOperation("multiBatchWrite");
         return try self.executeCommitRequest(ctx, authenticated_identity, &commit_req, .multi_batch);
     }
 
@@ -3463,6 +3497,9 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction commit request");
         };
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "commitTransaction", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("commitTransaction", &admission_lease);
         var commit_req = transactions_api.parseCommitRequest(alloc, body_data) catch |err| switch (err) {
             error.InvalidTransactionCommitRequest => {
                 _ = ctx.status(400);
@@ -3471,8 +3508,6 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer commit_req.deinit(alloc);
-        if (try self.acquirePublicOperation(ctx, "commitTransaction")) |response| return response;
-        defer self.releasePublicOperation("commitTransaction");
         return try self.executeCommitRequest(ctx, authenticated_identity, &commit_req, .transaction);
     }
 
@@ -4182,8 +4217,9 @@ pub const AntflyApiHandler = struct {
             // same transaction ID through session maintenance.
             if (status == .committed and !terminal.coordinator_acknowledged) {
                 if (terminal.coordinator_group_id) |coordinator_group_id| {
-                    if (try self.acquirePublicOperation(ctx, "commitTransactionSession")) |response| return response;
-                    defer self.releasePublicOperation("commitTransactionSession");
+                    var admission_lease: ?RequestAdmission.Lease = null;
+                    if (try self.acquirePublicOperation(ctx, "commitTransactionSession", &admission_lease)) |response| return response;
+                    defer self.releasePublicOperation("commitTransactionSession", &admission_lease);
                     const coordinator_table_name = terminal.coordinator_table_name orelse return error.InvalidTransactionSessionRecord;
                     const acknowledged = source.acknowledgeTransactionCommit(
                         alloc,
@@ -4249,8 +4285,9 @@ pub const AntflyApiHandler = struct {
             return ctx.openApiJson(response);
         }
 
-        if (try self.acquirePublicOperation(ctx, "commitTransactionSession")) |response| return response;
-        defer self.releasePublicOperation("commitTransactionSession");
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "commitTransactionSession", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("commitTransactionSession", &admission_lease);
 
         // Persist the exact sealed request as recoverable work before 2PC can
         // choose a durable decision. This closes the response/crash window:
@@ -4644,8 +4681,9 @@ pub const AntflyApiHandler = struct {
         };
         // Body admission is released before expensive execution starts so
         // slow ingress and query compute cannot starve one another.
-        if (try self.acquirePublicOperation(ctx, "globalQuery")) |response| return response;
-        defer self.releasePublicOperation("globalQuery");
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "globalQuery", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("globalQuery", &admission_lease);
         var cancellation = requestCancellation(ctx);
         if (isNdjsonContentType(ctx.header("content-type"))) {
             var resp = try self.api_server.handleAdmittedPublicGlobalMultiQueryWithCancellation(
@@ -4740,8 +4778,9 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid retrieval agent request");
         };
-        if (try self.acquirePublicOperation(ctx, "retrievalAgent")) |response| return response;
-        defer self.releasePublicOperation("retrievalAgent");
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "retrievalAgent", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("retrievalAgent", &admission_lease);
 
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
@@ -5770,8 +5809,9 @@ pub const AntflyApiHandler = struct {
                 return ctx.text("missing body");
             };
         };
-        if (try self.acquirePublicOperation(ctx, "queryTable")) |response| return response;
-        defer self.releasePublicOperation("queryTable");
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "queryTable", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("queryTable", &admission_lease);
         const route = try system_catalog_routes.parseAlloc(ctx.allocator, http_server_mod.stripApiPrefix(ctx.request.uri.path));
         defer if (route) |value| value.deinit(ctx.allocator);
         const logical = if (route) |value| try (try value.target()).resourceNameAlloc(ctx.allocator) else blk: {
@@ -5796,8 +5836,9 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        if (try self.acquirePublicOperation(ctx, "batchWrite")) |response| return response;
-        defer self.releasePublicOperation("batchWrite");
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "batchWrite", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("batchWrite", &admission_lease);
         return try handleTableBatchOffEventLoop(
             ctx,
             self.api_server.cfg.backend_runtime,
@@ -5830,8 +5871,9 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid linear merge request");
         };
-        if (try self.acquirePublicOperation(ctx, "linearMerge")) |response| return response;
-        defer self.releasePublicOperation("linearMerge");
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "linearMerge", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("linearMerge", &admission_lease);
         var merge_req = linear_merge_api.parseRequest(alloc, body_data) catch |err| switch (err) {
             error.InvalidLinearMergeRequest => {
                 _ = ctx.status(400);
@@ -6066,6 +6108,9 @@ pub const AntflyApiHandler = struct {
         // The OpenAPI request body is optional; an absent body is the default
         // unbounded-range scan, just like an explicitly empty legacy request.
         const body_data = (try ctx.body()) orelse "";
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "scanKeys", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("scanKeys", &admission_lease);
         var scan_req = http_route_helpers.parseScanKeysRequest(alloc, body_data) catch |err| {
             if (http_route_helpers.scanRequestError(err)) |response| {
                 _ = ctx.status(response.status);
@@ -6084,8 +6129,6 @@ pub const AntflyApiHandler = struct {
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| try http_server_mod.injectRowFilterIntoScanRequest(alloc, &scan_req, value);
 
-        if (try self.acquirePublicOperation(ctx, "scanKeys")) |response| return response;
-        defer self.releasePublicOperation("scanKeys");
         const source = self.api_server.table_reads orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -7384,7 +7427,7 @@ const HttpxE2eServer = struct {
         query_capacity: usize,
         max_connections: u32,
     ) !void {
-        api_server.query_admission = RequestAdmission.init(query_capacity);
+        api_server.query_admission = RequestAdmission.initConfigured(query_capacity, api_server.cfg.query_admission_waiting);
         self.* = .{
             .allocator = allocator,
             .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{}),
@@ -9203,18 +9246,80 @@ test "httpx request lifecycle hook suspends after admission without leaking capa
     var ctx = httpx.Context.init(alloc, std.testing.io, &request);
     defer ctx.deinit();
 
-    try std.testing.expect((try handler.acquirePublicOperation(&ctx, "queryTable")) == null);
+    var admission_lease: ?RequestAdmission.Lease = null;
+    try std.testing.expect((try handler.acquirePublicOperation(&ctx, "queryTable", &admission_lease)) == null);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqual(http_server_mod.RequestLifecyclePhase.admission_acquired, probe.last_phase);
     try std.testing.expectEqualStrings("queryTable", probe.last_operation.?);
     try std.testing.expectEqual(@as(usize, 1), api_server.queryAdmissionStats().in_flight);
-    handler.releasePublicOperation("queryTable");
+    handler.releasePublicOperation("queryTable", &admission_lease);
 
     probe.fail = true;
     try std.testing.expectError(
         error.InjectedLifecycleSuspension,
-        handler.acquirePublicOperation(&ctx, "queryTable"),
+        handler.acquirePublicOperation(&ctx, "queryTable", &admission_lease),
     );
+    try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
+}
+
+test "httpx query admission bounded waiting transfers bytes and honors original deadline" {
+    const alloc = std.testing.allocator;
+    var runtime = std.Io.Threaded.init(alloc, .{});
+    defer runtime.deinit();
+    const io = runtime.io();
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .query_max_concurrent_requests = 1,
+        .query_admission_waiting = .{ .max_wait_ms = 1000, .max_queued_requests = 1, .max_queued_bytes = 65536, .max_retained_bytes = 131072 },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var blocker = api_server.query_admission.tryAcquireLease().?;
+    defer blocker.release();
+    const Worker = struct {
+        handler: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        lease: ?RequestAdmission.Lease = null,
+        response: ?httpx.Response = null,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.response = self.handler.acquirePublicOperation(self.ctx, "queryTable", &self.lease) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, io, &request);
+    defer ctx.deinit();
+    var worker: Worker = .{ .handler = &handler, .ctx = &ctx };
+    defer if (worker.lease) |*lease| lease.release();
+    defer if (worker.response) |*response| response.deinit();
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, Worker.run, .{&worker});
+    const deadline = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+    while (api_server.queryAdmissionStats().queued == 0) {
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const queued_bytes = api_server.queryAdmissionStats().queued_bytes;
+    try std.testing.expect(queued_bytes >= @sizeOf(httpx.Context));
+    blocker.release();
+    try group.await(io);
+    try std.testing.expect(worker.err == null and worker.response == null and worker.lease != null);
+    try std.testing.expectEqual(queued_bytes, api_server.queryAdmissionStats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().queued_bytes);
+    worker.lease.?.release();
+    try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().retained_bytes);
+
+    ctx.application_deadline_ns = 0;
+    var lease: ?RequestAdmission.Lease = null;
+    var response = (try handler.acquirePublicOperation(&ctx, "queryTable", &lease)).?;
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 504), response.status.code);
+    try std.testing.expect(lease == null);
     try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
 }
 
@@ -9662,6 +9767,72 @@ test "httpx query admission treats zero capacity as unlimited" {
     for (0..64) |_| admission.release();
     try std.testing.expectEqual(@as(usize, 0), admission.stats().in_flight);
     try std.testing.expectEqual(@as(u64, 0), admission.stats().rejected_total);
+}
+
+test "httpx query admission C80 transport burst waits behind 32 active requests" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const Hook = struct {
+        finish: std.Io.Event = .unset,
+        started: std.atomic.Value(u32) = .init(0),
+        fn reach(raw: *anyopaque, event: http_server_mod.RequestLifecycleEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (event.phase != .admission_acquired) return;
+            _ = self.started.fetchAdd(1, .monotonic);
+            try self.finish.wait(std.testing.io);
+        }
+    };
+    var hook: Hook = .{};
+    var status_source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .query_admission_waiting = .{ .max_wait_ms = 5000, .max_queued_requests = 64, .max_queued_bytes = 1024 * 1024, .max_retained_bytes = 4 * 1024 * 1024 },
+        .request_lifecycle_hook = .{ .ptr = &hook, .reach_fn = Hook.reach },
+    }, status_source.iface(), null, null);
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.initWithLimits(alloc, &api_server, 32, 96);
+    defer {
+        hook.finish.set(std.testing.io);
+        server.deinit();
+    }
+    const address = server.server.boundAddress().?;
+    var clients = [_]?httpx.Socket{null} ** 80;
+    defer for (&clients) |*slot| if (slot.*) |*client| client.close();
+    const request = "POST /db/v1/tables/docs/query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 11\r\n\r\n{\"limit\":1}";
+    for (&clients) |*slot| {
+        var client = try httpx.Socket.connect(address, std.testing.io);
+        errdefer client.close();
+        try client.setRecvTimeout(5000);
+        try client.sendAll(request);
+        slot.* = client;
+    }
+    const deadline = @import("antfly_platform").time.monotonicNs() + 3 * std.time.ns_per_s;
+    while (api_server.queryAdmissionStats().queued != 48) {
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 32), api_server.queryAdmissionStats().in_flight);
+    try std.testing.expectEqual(@as(u32, 32), hook.started.load(.acquire));
+    hook.finish.set(std.testing.io);
+    for (&clients) |*slot| {
+        var bytes: [256]u8 = undefined;
+        var len: usize = 0;
+        while (std.mem.indexOf(u8, bytes[0..len], "\r\n") == null) {
+            if (len == bytes.len) return error.TestUnexpectedResult;
+            const n = try slot.*.?.recv(bytes[len..]);
+            if (n == 0) return error.TestUnexpectedResult;
+            len += n;
+        }
+        // The fixture has no table-read backend. Every request reaches that
+        // normal 404 result after admission; none is rejected as overloaded.
+        try std.testing.expect(std.mem.startsWith(u8, bytes[0..len], "HTTP/1.1 404"));
+    }
+    try std.testing.expectEqual(@as(u32, 80), hook.started.load(.acquire));
+    const stats = api_server.queryAdmissionStats();
+    try std.testing.expectEqual(@as(usize, 32), stats.peak_in_flight);
+    try std.testing.expectEqual(@as(u64, 0), stats.rejected_total);
+    try std.testing.expectEqual(@as(usize, 0), stats.retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), stats.queued);
 }
 
 test "httpx production path sheds 128 abandoned queries and preserves control recovery" {

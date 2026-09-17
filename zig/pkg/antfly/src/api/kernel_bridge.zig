@@ -112,6 +112,10 @@ const OpaqueApiHttpServer = struct {
         return out;
     }
 
+    pub fn closeForegroundAdmission(self: *OpaqueApiHttpServer) void {
+        callInfallible(void, void, self.functions.close_foreground_admission, self.opaque_handle, null, null);
+    }
+
     pub fn writeAdmissionStats(self: *const OpaqueApiHttpServer) AdmissionStats {
         var out: AdmissionStats = undefined;
         callInfallible(void, AdmissionStats, self.functions.write_admission_stats, self.opaque_handle, null, &out);

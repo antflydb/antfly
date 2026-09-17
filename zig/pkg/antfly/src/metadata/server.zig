@@ -369,6 +369,7 @@ pub const MetadataServer = struct {
     }
 
     pub fn deinitWithDeadline(self: *MetadataServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
+        if (self.owned_public_http_server) |server| server.closeForegroundAdmission();
         self.stopRestoreSupervisor();
         if (self.transition_ops_registration) |*registration| registration.deinit();
         self.transition_ops_registration = null;

@@ -76,6 +76,8 @@ pub const BootstrapConfig = struct {
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
+    query_admission_waiting: @import("../../common/workload_admission.zig").Config = .{},
+    write_admission_waiting: @import("../../common/workload_admission.zig").Config = .{},
     graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// CPU fanout available to one graph-metric kernel. Work is scheduled on
@@ -672,6 +674,8 @@ pub const OwnedStack = struct {
         self.handler.setIo(io);
         self.handler.setEmbeddingProviderRuntime(&self.embedding_provider_runtime);
         self.handler.configureAdmission(cfg.query_max_concurrent_requests, cfg.write_max_concurrent_requests);
+        try self.handler.query_admission.configure(cfg.query_admission_waiting);
+        try self.handler.write_admission.configure(cfg.write_admission_waiting);
         self.handler.setRemoteContent(cfg.remote_content);
         if (self.query_cache) |*query_cache| self.handler.setQueryCache(query_cache);
         self.handler.setPublishedSearchSources(search_sources.publishedSearchSourcesForNames(
@@ -704,6 +708,8 @@ pub const OwnedStack = struct {
     }
 
     pub fn deinit(self: *OwnedStack) void {
+        self.handler.query_admission.close();
+        self.handler.write_admission.close();
         self.runtime.deinit();
         if (self.managed_query_embedder) |*query_embedder| query_embedder.deinit();
         self.embedding_provider_runtime.deinit();

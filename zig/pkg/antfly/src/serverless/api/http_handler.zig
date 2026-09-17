@@ -275,22 +275,33 @@ pub const HttpHandler = struct {
     }
 
     pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
-        try req.ensureActive();
+        req.ensureActive() catch |err| return admissionFailureResponse(self.alloc, err);
         const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
         const admission: ?*RequestAdmission = switch (http_routes.admissionClass(route)) {
             .none => null,
             .query => &self.query_admission,
             .write => &self.write_admission,
         };
+        var admission_lease: ?RequestAdmission.Lease = null;
         if (admission) |gate| {
-            if (!gate.tryAcquire()) {
-                var response = try textResponse(self.alloc, 429, if (gate == &self.query_admission) "query capacity exhausted" else "write capacity exhausted");
-                response.retry_after_seconds = 1;
-                return response;
-            }
+            admission_lease = gate.acquire(.{
+                .io = self.io orelse std.Io.Threaded.global_single_threaded.io(),
+                .cancellation = req.cancellation,
+                .deadline_ns = req.deadline_ns,
+                .clock_io = req.deadline_io,
+                .native_now_ns = if (req.deadline_io == null) @import("antfly_platform").time.monotonicNs else null,
+                .retained_bytes = req.body.len +| req.path.len +| @sizeOf(HttpRequest) +| 4096,
+            }) catch |err| switch (err) {
+                error.AdmissionFull => {
+                    var response = try textResponse(self.alloc, 429, if (gate == &self.query_admission) "query capacity exhausted" else "write capacity exhausted");
+                    response.retry_after_seconds = 1;
+                    return response;
+                },
+                else => return admissionFailureResponse(self.alloc, err),
+            };
         }
-        defer if (admission) |gate| gate.release();
-        try req.ensureActive();
+        defer if (admission_lease) |*lease| lease.release();
+        req.ensureActive() catch |err| return admissionFailureResponse(self.alloc, err);
 
         var response = switch (route) {
             .health => try self.handleHealth(),
@@ -601,6 +612,8 @@ pub const HttpHandler = struct {
             .ready = self.runtime_status.validated,
             .validated = self.runtime_status.validated,
             .query_capacity = query_admission.capacity,
+            .query_admission = query_admission,
+            .write_admission = write_admission,
             .query_in_flight = query_admission.in_flight,
             .query_peak_in_flight = query_admission.peak_in_flight,
             .query_rejected_total = query_admission.rejected_total,
@@ -9947,6 +9960,23 @@ fn updateJoinedResponseMetadata(
     });
 }
 
+fn admissionFailureResponse(alloc: Allocator, err: anyerror) !HttpResponse {
+    const status: u16 = switch (err) {
+        error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge, error.AdmissionWaitTimeout => 429,
+        error.AdmissionClosed => 503,
+        error.DeadlineExceeded => 504,
+        else => return err,
+    };
+    var response = try jsonResponse(alloc, status, .{
+        .@"error" = @errorName(err),
+        .reason = if (err == error.AdmissionRequestTooLarge) "resource_exhausted" else if (status == 504) "deadline_exceeded" else if (status == 503) "draining" else "instance_busy",
+        .stage = "admission",
+        .execution_started = false,
+    });
+    if (status == 429 and err != error.AdmissionRequestTooLarge) response.retry_after_seconds = 1;
+    return response;
+}
+
 fn jsonResponse(alloc: Allocator, status: u16, value: anytype) !HttpResponse {
     return .{
         .status = status,
@@ -10464,6 +10494,17 @@ test "serverless http handler serves internal namespace lifecycle, admission, an
     try std.testing.expectEqual(@as(u64, 0), parsed_metrics.value.cache_max_payload_bytes);
     try std.testing.expectEqual(@as(usize, common_config.default_query_max_concurrent_requests), parsed_metrics.value.query_capacity);
     try std.testing.expectEqual(@as(usize, common_config.default_write_max_concurrent_requests), parsed_metrics.value.write_capacity);
+    try std.testing.expectEqual(@as(usize, 0), parsed_metrics.value.query_admission.?.queued);
+    try std.testing.expectEqual(@as(u32, 0), parsed_metrics.value.query_admission.?.max_wait_ms);
+    var expired_admission = try handler.handle(.{
+        .method = .get,
+        .path = "/internal/v1/namespaces/docs/query/head",
+        .deadline_ns = 0,
+    });
+    defer expired_admission.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 504), expired_admission.status);
+    try std.testing.expect(std.mem.indexOf(u8, expired_admission.body, "deadline_exceeded") != null);
+    try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().in_flight);
 
     var create = try handler.handle(.{
         .method = .put,

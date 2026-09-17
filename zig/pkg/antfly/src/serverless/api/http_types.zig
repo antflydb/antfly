@@ -25,9 +25,15 @@ pub const HttpRequest = struct {
     /// Borrowed from the listener and valid only while `handle` is running.
     /// Application work must not retain this callback beyond the request.
     cancellation: cancellation_mod.CancellationToken = .none,
+    deadline_ns: ?u64 = null,
+    deadline_io: ?std.Io = null,
 
     pub fn ensureActive(self: HttpRequest) !void {
-        return self.cancellation.check();
+        try self.cancellation.check();
+        if (self.deadline_ns) |deadline| {
+            const now: u64 = if (self.deadline_io) |io| @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds)) else @import("antfly_platform").time.monotonicNs();
+            if (now >= deadline) return error.DeadlineExceeded;
+        }
     }
 };
 

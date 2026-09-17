@@ -51,6 +51,53 @@ pub const AdmissionConfig = struct {
     }
 };
 
+/// Opt-in bounded admission waiting. Configure all queue limits together. Zero max_wait_ms keeps fail-fast behavior. Request payload reservations survive admission until the active lease is released; execution working memory and transport body limits remain independently enforced.
+pub const AdmissionWaitingConfig = struct {
+    max_queued_requests: ?i64 = null,
+    max_queued_bytes: ?i64 = null,
+    /// Payload and admission metadata reservations across queued and active requests; must cover max_queued_bytes.
+    max_retained_bytes: ?i64 = null,
+    /// Maximum admission wait within the original request deadline; zero disables queueing.
+    max_wait_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_queued_requests", "max_queued_requests", true },
+        .{ "max_queued_bytes", "max_queued_bytes", true },
+        .{ "max_retained_bytes", "max_retained_bytes", true },
+        .{ "max_wait_ms", "max_wait_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_queued_requests) |value| {
+            try jw.objectField("max_queued_requests");
+            try jw.write(value);
+        }
+        if (self.max_queued_bytes) |value| {
+            try jw.objectField("max_queued_bytes");
+            try jw.write(value);
+        }
+        if (self.max_retained_bytes) |value| {
+            try jw.objectField("max_retained_bytes");
+            try jw.write(value);
+        }
+        if (self.max_wait_ms) |value| {
+            try jw.objectField("max_wait_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Per-connection AWS credential identity. Each named connection owns an independent refresh cache, allowing lanes to use different accounts, profiles, or workload identities.
 pub const AwsCredentialConfig = struct {
     source: []const u8,
@@ -1879,11 +1926,13 @@ pub const ObjectStorageLocation = struct {
 };
 
 pub const QueryAdmissionConfig = struct {
-    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
+    waiting: ?AdmissionWaitingConfig = null,
+    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Bounded waiting is opt-in through waiting. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
     max_concurrent_requests: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "waiting", "waiting", true },
         .{ "max_concurrent_requests", "max_concurrent_requests", true },
     };
 
@@ -1897,6 +1946,10 @@ pub const QueryAdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.waiting) |value| {
+            try jw.objectField("waiting");
+            try jw.write(value);
+        }
         if (self.max_concurrent_requests) |value| {
             try jw.objectField("max_concurrent_requests");
             try jw.write(value);
@@ -2321,11 +2374,13 @@ pub const WebSearchConnectionVariant = struct {
 };
 
 pub const WriteAdmissionConfig = struct {
-    /// Maximum concurrent foreground data mutations in this process. The default is 16. Table batch writes, cross-table batches, linear merges, and transaction commits consume this budget. Schema, index, backup, restore, repair, and other administrative operations use dedicated control or background-maintenance paths. Set to 0 to disable write admission. Excess HTTP work in either foreground class is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Both budgets are independent of transport safeguards and admission.inference.max_concurrent_requests.
+    waiting: ?AdmissionWaitingConfig = null,
+    /// Maximum concurrent foreground data mutations in this process. The default is 16. Table batch writes, cross-table batches, linear merges, and transaction commits consume this budget. Schema, index, backup, restore, repair, and other administrative operations use dedicated control or background-maintenance paths. Set to 0 to disable write admission. Excess HTTP work in either foreground class is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Bounded waiting is opt-in through waiting. Both budgets are independent of transport safeguards and admission.inference.max_concurrent_requests.
     max_concurrent_requests: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "waiting", "waiting", true },
         .{ "max_concurrent_requests", "max_concurrent_requests", true },
     };
 
@@ -2339,6 +2394,10 @@ pub const WriteAdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.waiting) |value| {
+            try jw.objectField("waiting");
+            try jw.write(value);
+        }
         if (self.max_concurrent_requests) |value| {
             try jw.objectField("max_concurrent_requests");
             try jw.write(value);

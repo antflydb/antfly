@@ -1,6 +1,8 @@
 # Workload Admission and Scheduling
 
-Status: proposed design; implementation has not started.
+Status: implementation in progress. See the
+[implementation record](WORKLOAD_SCHEDULING_IMPLEMENTATION.md) for completed
+mechanisms, operator ownership, validation, and remaining phases.
 
 Source baseline: `22b167264a` on `origin/main`.
 

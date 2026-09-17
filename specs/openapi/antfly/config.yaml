@@ -887,10 +887,44 @@ components:
           default: 3600
           description: End-to-end ceiling for one table or cluster backup. Increase this for exceptionally large datasets; cleanup fencing remains independent.
 
+    AdmissionWaitingConfig:
+      type: object
+      additionalProperties: false
+      description: |
+        Opt-in bounded admission waiting. Configure all queue limits together.
+        Zero max_wait_ms keeps fail-fast behavior. Request payload reservations
+        survive admission until the active lease is released; execution working
+        memory and transport body limits remain independently enforced.
+      properties:
+        max_queued_requests:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 0
+        max_queued_bytes:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          default: 0
+        max_retained_bytes:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          default: 0
+          description: Payload and admission metadata reservations across queued and active requests; must cover max_queued_bytes.
+        max_wait_ms:
+          type: integer
+          minimum: 0
+          maximum: 60000
+          default: 0
+          description: Maximum admission wait within the original request deadline; zero disables queueing.
+
     QueryAdmissionConfig:
       type: object
       additionalProperties: false
       properties:
+        waiting:
+          $ref: "#/components/schemas/AdmissionWaitingConfig"
         max_concurrent_requests:
           type: integer
           minimum: 0
@@ -906,7 +940,7 @@ components:
             scans consume it. Point lookups and operational/control-plane reads
             remain outside it. Excess HTTP work is rejected immediately with
             HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure
-            response. Excess work is not queued. Set to 0 to disable query
+            response. Bounded waiting is opt-in through waiting. Set to 0 to disable query
             admission. This budget is independent of transport safeguards,
             write admission, and
             admission.inference.max_concurrent_requests.
@@ -915,6 +949,8 @@ components:
       type: object
       additionalProperties: false
       properties:
+        waiting:
+          $ref: "#/components/schemas/AdmissionWaitingConfig"
         max_concurrent_requests:
           type: integer
           minimum: 0
@@ -932,7 +968,7 @@ components:
 
             Excess HTTP work in either foreground class is rejected immediately
             with HTTP 429 and Retry-After: 1; asynchronous protocols use their
-            native failure response. Excess work is not queued. Both budgets are
+            native failure response. Bounded waiting is opt-in through waiting. Both budgets are
             independent of transport safeguards and
             admission.inference.max_concurrent_requests.
 

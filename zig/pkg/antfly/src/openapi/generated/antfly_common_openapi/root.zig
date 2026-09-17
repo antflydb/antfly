@@ -4,6 +4,7 @@
 pub const types = @import("types.zig");
 
 pub const AdmissionConfig = types.AdmissionConfig;
+pub const AdmissionWaitingConfig = types.AdmissionWaitingConfig;
 pub const AwsCredentialConfig = types.AwsCredentialConfig;
 pub const BackupConfig = types.BackupConfig;
 pub const CdcConnectionConfig = types.CdcConnectionConfig;

@@ -210,6 +210,12 @@ pub fn queryAdmissionStats(context: *const CallContext) callconv(.c) abi.Status 
     return .ok;
 }
 
+pub fn closeForegroundAdmission(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, void, context)) |failure| return failure;
+    serverState(context).server.closeForegroundAdmission();
+    return .ok;
+}
+
 pub fn writeAdmissionStats(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, server_mod.RequestAdmission.Stats, context)) |failure| return failure;
     output(server_mod.RequestAdmission.Stats, context).* = serverState(context).server.writeAdmissionStats();
@@ -532,6 +538,7 @@ const function_table: abi.FunctionTable = .{
     .destroy = &destroy,
     .request_stats = &requestStats,
     .query_admission_stats = &queryAdmissionStats,
+    .close_foreground_admission = &closeForegroundAdmission,
     .write_admission_stats = &writeAdmissionStats,
     .set_provider = &setProvider,
     .set_ha_executor = &setHAExecutor,
@@ -1155,6 +1162,12 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         const imported = state.server.sharedApiFilesystemIo().?;
         var future = try state.server.sharedApiIo().?.concurrent(Probe.run, .{imported});
         try future.await(state.server.sharedApiIo().?);
+        var admission_lease = try state.server.acquireQuery(64, .{});
+        try std.testing.expect(closeForegroundAdmission(&.{ .abi_version = abi.abi_version, .handle = handle.? }).isOk());
+        try std.testing.expectError(error.AdmissionClosed, state.server.acquireQuery(64, .{}));
+        try std.testing.expectEqual(@as(usize, 1), state.server.queryAdmissionStats().in_flight);
+        admission_lease.release();
+        try std.testing.expectEqual(@as(usize, 0), state.server.queryAdmissionStats().retained_bytes);
         destroy(handle.?);
         handle = null;
         try Probe.run(std.testing.io);

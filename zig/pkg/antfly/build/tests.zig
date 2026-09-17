@@ -123,6 +123,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const reader_config_mod = options.antfly_imports.reader_config;
     const antfly_imports = options.antfly_imports;
     const test_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
+
+    const workload_admission_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/workload_admission_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, workload_admission_mod, true, true);
+    workload_admission_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const workload_admission_tests = b.addTest(.{
+        .root_module = workload_admission_mod,
+        .filters = &.{ "workload admission", "request_admission.test", "httpx query admission", "httpx write admission", "httpx request lifecycle hook", "shared application admission", "API kernel", "linked API dispatch", "serverless http handler serves internal namespace lifecycle" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_workload_admission_tests = addFilteredTestRunArtifact(b, workload_admission_tests);
+    b.step("antfly-workload-admission-test", "Run workload admission ownership, transport, ABI, and VOPR regressions").dependOn(&run_workload_admission_tests.step);
     const vopr_mod = options.vopr;
     const casbin_mod = antfly_imports.casbin;
     const antfly_mod = options.antfly_mod;
@@ -4108,6 +4124,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
+    unit_test_step.dependOn(&run_workload_admission_tests.step);
     unit_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_secret_store_abi_tests.step);

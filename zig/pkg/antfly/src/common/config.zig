@@ -89,6 +89,7 @@ pub const Config = struct {
         /// Zero disables this foreground admission class. Transport safeguards
         /// and inference admission remain independent.
         max_concurrent_requests: u32,
+        waiting: @import("workload_admission.zig").Config = .{},
     };
 
     pub const AdmissionConfig = struct {
@@ -710,11 +711,11 @@ pub const Config = struct {
                 .object => |object| object,
                 else => return error.InvalidConfig,
             };
-            if (admission_object.get("query") != null) {
-                try validateObjectMemberFields(admission_object, "query", &.{"max_concurrent_requests"});
-            }
-            if (admission_object.get("write") != null) {
-                try validateObjectMemberFields(admission_object, "write", &.{"max_concurrent_requests"});
+            inline for (.{ "query", "write" }) |class| {
+                if (admission_object.get(class)) |value| {
+                    try validateObjectMemberFields(admission_object, class, &.{ "max_concurrent_requests", "waiting" });
+                    if (value.object.get("waiting") != null) try validateObjectMemberFields(value.object, "waiting", &.{ "max_queued_requests", "max_queued_bytes", "max_retained_bytes", "max_wait_ms" });
+                }
             }
             if (admission_object.get("inference") != null) {
                 try validateObjectMemberFields(admission_object, "inference", &.{"max_concurrent_requests"});
@@ -833,26 +834,32 @@ pub const Config = struct {
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
             .admission = .{
-                .query = .{ .max_concurrent_requests = if (validated.value.admission) |admission|
-                    if (admission.query) |query|
-                        if (query.max_concurrent_requests) |value|
-                            std.math.cast(u32, value) orelse return error.InvalidConfig
+                .query = .{
+                    .max_concurrent_requests = if (validated.value.admission) |admission|
+                        if (admission.query) |query|
+                            if (query.max_concurrent_requests) |value|
+                                std.math.cast(u32, value) orelse return error.InvalidConfig
+                            else
+                                default_query_max_concurrent_requests
                         else
                             default_query_max_concurrent_requests
                     else
-                        default_query_max_concurrent_requests
-                else
-                    default_query_max_concurrent_requests },
-                .write = .{ .max_concurrent_requests = if (validated.value.admission) |admission|
-                    if (admission.write) |write|
-                        if (write.max_concurrent_requests) |value|
-                            std.math.cast(u32, value) orelse return error.InvalidConfig
+                        default_query_max_concurrent_requests,
+                    .waiting = if (validated.value.admission) |admission| if (admission.query) |query| try admissionWaitingFromOpenApi(query.waiting) else .{} else .{},
+                },
+                .write = .{
+                    .max_concurrent_requests = if (validated.value.admission) |admission|
+                        if (admission.write) |write|
+                            if (write.max_concurrent_requests) |value|
+                                std.math.cast(u32, value) orelse return error.InvalidConfig
+                            else
+                                default_write_max_concurrent_requests
                         else
                             default_write_max_concurrent_requests
                     else
-                        default_write_max_concurrent_requests
-                else
-                    default_write_max_concurrent_requests },
+                        default_write_max_concurrent_requests,
+                    .waiting = if (validated.value.admission) |admission| if (admission.write) |write| try admissionWaitingFromOpenApi(write.waiting) else .{} else .{},
+                },
                 .inference = .{ .max_concurrent_requests = canonical_inference_max_concurrent_requests orelse
                     legacy_inference_max_concurrent_requests orelse
                     default_inference_max_concurrent_requests },
@@ -1659,6 +1666,18 @@ fn parseRemoteContentS3Credential(alloc: std.mem.Allocator, value: std.json.Valu
         .buckets = if (scraping_cfg.value.buckets) |buckets| try dupOwnedStringSlice(alloc, buckets) else null,
         .security = if (scraping_cfg.value.security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
     };
+}
+
+fn admissionWaitingFromOpenApi(input: ?common_openapi.AdmissionWaitingConfig) !@import("workload_admission.zig").Config {
+    const value = input orelse return .{};
+    const config: @import("workload_admission.zig").Config = .{
+        .max_queued_requests = std.math.cast(usize, value.max_queued_requests orelse 0) orelse return error.InvalidConfig,
+        .max_queued_bytes = std.math.cast(usize, value.max_queued_bytes orelse 0) orelse return error.InvalidConfig,
+        .max_retained_bytes = std.math.cast(usize, value.max_retained_bytes orelse 0) orelse return error.InvalidConfig,
+        .max_wait_ms = std.math.cast(u32, value.max_wait_ms orelse 0) orelse return error.InvalidConfig,
+    };
+    try config.validate();
+    return config;
 }
 
 fn s3CredentialsFromOpenApi(
@@ -2568,6 +2587,28 @@ test "common config preserves disabled foreground admission" {
     try std.testing.expectEqual(@as(u32, 0), cfg.admission.query.max_concurrent_requests);
     try std.testing.expectEqual(@as(u32, 0), cfg.admission.write.max_concurrent_requests);
     try std.testing.expectEqual(@as(u32, 0), cfg.admission.inference.max_concurrent_requests);
+}
+
+test "common config validates bounded query and write waiting" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"admission":{"query":{"max_concurrent_requests":0,"waiting":{"max_wait_ms":50,"max_queued_requests":32,"max_queued_bytes":65536,"max_retained_bytes":131072}},"write":{"waiting":{"max_retained_bytes":4096}}}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 0), cfg.admission.query.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 50), cfg.admission.query.waiting.max_wait_ms);
+    try std.testing.expectEqual(@as(usize, 32), cfg.admission.query.waiting.max_queued_requests);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.admission.write.waiting.max_retained_bytes);
+    inline for (.{
+        \\{"admission":{"query":{"waiting":{"max_wait_ms":50}}}}
+        ,
+        \\{"admission":{"write":{"waiting":{"max_queued_requests":1}}}}
+        ,
+        \\{"admission":{"query":{"waiting":{"max_wait_ms":50,"max_queued_requests":1,"max_queued_bytes":100,"max_retained_bytes":99}}}}
+        ,
+        \\{"admission":{"query":{"waiting":{"max_wait_ms":60001,"max_queued_requests":1,"max_queued_bytes":100,"max_retained_bytes":100}}}}
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, invalid));
+    }
 }
 
 test "common config rejects unknown admission settings" {

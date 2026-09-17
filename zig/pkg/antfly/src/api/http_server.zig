@@ -1158,8 +1158,10 @@ pub const ApiHttpServerConfig = struct {
     mcp_max_tool_result_bytes: usize = common_config.default_mcp_max_tool_result_bytes,
     /// Node-local public database-query admission capacity. Zero is unlimited.
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
+    query_admission_waiting: @import("../common/workload_admission.zig").Config = .{},
     /// Node-local foreground data-mutation admission capacity. Zero is unlimited.
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
+    write_admission_waiting: @import("../common/workload_admission.zig").Config = .{},
     /// Node-local inference request admission capacity. Zero is unlimited.
     inference_max_concurrent_requests: u32 = common_config.default_inference_max_concurrent_requests,
     /// End-to-end ceiling for one table or cluster backup. This is distinct
@@ -3282,8 +3284,8 @@ pub const ApiHttpServer = struct {
             .alloc = request_alloc,
             .owner_alloc = owner_alloc,
             .cfg = cfg,
-            .query_admission = RequestAdmission.init(cfg.query_max_concurrent_requests),
-            .write_admission = RequestAdmission.init(cfg.write_max_concurrent_requests),
+            .query_admission = RequestAdmission.initConfigured(cfg.query_max_concurrent_requests, cfg.query_admission_waiting),
+            .write_admission = RequestAdmission.initConfigured(cfg.write_max_concurrent_requests, cfg.write_admission_waiting),
             .inference_admission = RequestAdmission.init(cfg.inference_max_concurrent_requests),
             .source = source,
             .table_reads = table_read_source,
@@ -3437,6 +3439,56 @@ pub const ApiHttpServer = struct {
 
     pub fn tryAcquireQuery(self: *ApiHttpServer) bool {
         return self.query_admission.tryAcquire();
+    }
+
+    pub fn acquireQuery(self: *ApiHttpServer, body_bytes: usize, request: api_operation.RequestContext) !RequestAdmission.Lease {
+        return self.acquireForeground(&self.query_admission, body_bytes, request);
+    }
+
+    pub fn acquireWrite(self: *ApiHttpServer, body_bytes: usize, request: api_operation.RequestContext) !RequestAdmission.Lease {
+        return self.acquireForeground(&self.write_admission, body_bytes, request);
+    }
+
+    fn acquireForeground(self: *ApiHttpServer, owner: *RequestAdmission, body_bytes: usize, request: api_operation.RequestContext) !RequestAdmission.Lease {
+        var clock_receiver: ?@import("../runtime_io_abi.zig").Receiver = if (request.deadline_io) |borrow| try borrow.receive() else null;
+        return owner.acquire(.{
+            .io = configuredApiIo(self.cfg) orelse std.Io.Threaded.global_single_threaded.io(),
+            .clock_io = if (clock_receiver) |*receiver| receiver.io() else null,
+            .native_now_ns = if (clock_receiver == null) platform_time.monotonicNs else null,
+            .deadline_ns = request.deadline_ns,
+            .cancellation = request.cancellation,
+            .retained_bytes = body_bytes +| 4096,
+        });
+    }
+
+    pub fn closeForegroundAdmission(self: *ApiHttpServer) void {
+        self.query_admission.close();
+        self.write_admission.close();
+        self.inference_admission.close();
+    }
+
+    fn foregroundAdmissionFailure(self: *ApiHttpServer, err: anyerror) !contextual_operations.OwnedResponse {
+        if (err == error.AdmissionFull) return self.queryOverloadedResponse();
+        const status: u16 = switch (err) {
+            error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge, error.AdmissionWaitTimeout => 429,
+            error.AdmissionClosed => 503,
+            error.DeadlineExceeded => 504,
+            else => return err,
+        };
+        var response = try contextualJsonResponse(self.alloc, status, .{
+            .@"error" = @errorName(err),
+            .reason = if (err == error.AdmissionRequestTooLarge) "resource_exhausted" else if (status == 504) "deadline_exceeded" else if (status == 503) "draining" else "instance_busy",
+            .stage = "admission",
+            .execution_started = false,
+        });
+        errdefer response.deinit(self.alloc);
+        if (status == 429 and err != error.AdmissionRequestTooLarge) {
+            const headers = try self.alloc.alloc(contextual_operations.Header, 1);
+            errdefer self.alloc.free(headers);
+            headers[0] = try ownedContextualHeader(self.alloc, "Retry-After", "1");
+            response.headers = headers;
+        }
+        return response;
     }
 
     pub fn releaseQuery(self: *ApiHttpServer) void {
@@ -3746,6 +3798,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        self.closeForegroundAdmission();
         self.restore_jobs_closing.store(true, .release);
         self.signalRestoreRetryWakeup();
         self.signalRestoreBackoffWaiters();
@@ -6782,14 +6835,15 @@ pub const ApiHttpServer = struct {
         request_context: managed_embedder.RequestContext,
     ) !contextual_operations.OwnedResponse {
         try request_context.check();
+        var admission_lease = self.acquireQuery(body.len, .{ .deadline_ns = request_context.deadline_ns, .cancellation = request_context.cancellation orelse .none }) catch |err|
+            return self.foregroundAdmissionFailure(err);
+        defer admission_lease.release();
         var parsed = metadata_openapi.server.parseQueryBuilderAgentBody(self.alloc, body) catch
             return try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request");
         defer parsed.deinit();
         if (parsed.value.intent.len == 0)
             return try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request");
         comptime std.debug.assert(request_admission_policy.publicOperationClass("queryBuilderAgent").? == .query);
-        if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
-        defer self.releaseQuery();
 
         var catalog_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
         defer if (catalog_identity) |*identity| identity.deinit(self.alloc);
@@ -6953,11 +7007,12 @@ pub const ApiHttpServer = struct {
             return;
         };
         comptime std.debug.assert(request_admission_policy.publicOperationClass("retrievalAgent").? == .query);
-        if (!self.tryAcquireQuery()) {
+        const request_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_min;
+        var admission_lease = self.acquireQuery(body.len, .{ .deadline_ns = request_deadline_ns }) catch {
             try queue.status(alloc, task_id, context_id, "failed", "query capacity exhausted");
             return;
-        }
-        defer self.releaseQuery();
+        };
+        defer admission_lease.release();
 
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
@@ -7098,7 +7153,7 @@ pub const ApiHttpServer = struct {
             .secret_store = self.cfg.secret_store,
             .inference_api_key = self.cfg.inference_api_key,
             .io = self.inferenceIo(),
-            .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
+            .deadline_ns = request_deadline_ns,
         };
 
         var query_runner = RetrievalQueryRunner{
@@ -15268,8 +15323,11 @@ pub const ApiHttpServer = struct {
         body: []const u8,
     ) ![]u8 {
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.batch) == .write);
-        if (!self.tryAcquireWrite()) return error.RequestAdmissionExhausted;
-        defer self.releaseWrite();
+        var admission_lease = self.acquireWrite(body.len, .{}) catch |err| switch (err) {
+            error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionWaitTimeout => return error.RequestAdmissionExhausted,
+            else => return err,
+        };
+        defer admission_lease.release();
         var response = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi(.{}));
         defer response.deinit(self.alloc);
         if (response.status < 200 or response.status >= 300) return error.ExtensionHostApiFailed;
@@ -15288,8 +15346,11 @@ pub const ApiHttpServer = struct {
         defer diagnostic_scope.deinit();
 
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.query) == .query);
-        if (!self.tryAcquireQuery()) return error.RequestAdmissionExhausted;
-        defer self.releaseQuery();
+        var admission_lease = self.acquireQuery(body.len, .{}) catch |err| switch (err) {
+            error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionWaitTimeout => return error.RequestAdmissionExhausted,
+            else => return err,
+        };
+        defer admission_lease.release();
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
         const source = self.table_reads orelse return error.TableNotFound;
@@ -15595,24 +15656,20 @@ pub const ApiHttpServer = struct {
             },
         }
         const admission_class = request_admission_policy.mcpOperationClass(operation);
-        const admitted = switch (admission_class) {
-            .none => true,
-            .query => self.tryAcquireQuery(),
-            .write => self.tryAcquireWrite(),
-            .inference => self.tryAcquireInference(),
+        const body_bytes = switch (operation) {
+            .query, .sample_documents, .batch => |value| value.body.len,
+            else => 0,
         };
-        if (!admitted) return switch (admission_class) {
-            .none => unreachable,
-            .query => try self.queryOverloadedResponse(),
-            .write => try self.writeOverloadedResponse(),
-            .inference => try self.inferenceOverloadedResponse(),
+        var admission_lease: ?RequestAdmission.Lease = switch (admission_class) {
+            .none, .inference => null,
+            .query => self.acquireQuery(body_bytes, .{}) catch |err| return self.foregroundAdmissionFailure(err),
+            .write => self.acquireWrite(body_bytes, .{}) catch |err| {
+                if (err == error.AdmissionFull) return self.writeOverloadedResponse();
+                return self.foregroundAdmissionFailure(err);
+            },
         };
-        defer switch (admission_class) {
-            .none => {},
-            .query => self.releaseQuery(),
-            .write => self.releaseWrite(),
-            .inference => self.releaseInference(),
-        };
+        if (admission_class == .inference and !self.tryAcquireInference()) return self.inferenceOverloadedResponse();
+        defer if (admission_lease) |*lease| lease.release() else if (admission_class == .inference) self.releaseInference();
 
         switch (operation) {
             .list_tables => {
@@ -16039,8 +16096,9 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
-        if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
-        defer self.releaseQuery();
+        var admission_lease = self.acquireQuery(body.len, .{ .cancellation = if (cancellation) |signal| signal.token() else .none }) catch |err|
+            return self.foregroundAdmissionFailure(err);
+        defer admission_lease.release();
         return try self.handleAdmittedPublicTableQueryWithContentTypeCancellation(
             table_name,
             body,
@@ -16103,8 +16161,9 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
-        if (!self.tryAcquireQuery()) return try self.queryOverloadedResponse();
-        defer self.releaseQuery();
+        var admission_lease = self.acquireQuery(body.len, .{ .cancellation = if (cancellation) |signal| signal.token() else .none }) catch |err|
+            return self.foregroundAdmissionFailure(err);
+        defer admission_lease.release();
         return try self.handleAdmittedPublicGlobalMultiQueryWithCancellation(body, authenticated_identity, cancellation);
     }
 

@@ -103,6 +103,7 @@ pub const ServerlessHttpServer = struct {
             .path = path,
             .body = req.body,
             .cancellation = if (req.cancellation) |value| value.token() else .none,
+            .deadline_ns = if (req.timeout_ms) |ms| @import("antfly_platform").time.monotonicNs() +| @as(u64, ms) * std.time.ns_per_ms else null,
         });
         defer resp.deinit(self.alloc);
 
@@ -147,6 +148,8 @@ pub const ServerlessHttpServer = struct {
             .method = method,
             .path = ctx.request.uri.path,
             .body = body,
+            .deadline_ns = ctx.application_deadline_ns,
+            .deadline_io = ctx.application_deadline_io,
             .cancellation = .{
                 .ptr = ctx,
                 .is_cancelled_fn = struct {

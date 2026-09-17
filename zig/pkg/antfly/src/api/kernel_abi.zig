@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 19;
+pub const abi_version: u32 = 20;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -220,6 +220,7 @@ pub const FunctionTable = extern struct {
     handler_destroy: *const fn (*anyopaque) callconv(.c) void,
     inference_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     handler_authorize_internal_service: *const fn (*const InternalServiceAuthContext) callconv(.c) Status,
+    close_foreground_admission: *const fn (*const CallContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
