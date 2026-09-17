@@ -58,8 +58,9 @@ The test still requires catalog absence and successful restore, but recovers adm
 with one explicit idempotency key and verifies that retries retain the same job ID.
 Timeout diagnostics now refresh metadata and retain observed job states. A fifth
 failure was a transient `TableTopologyProtocolUpgradeRequired` losing its identity
-at the compiled callback boundary and becoming HTTP 500. Register that identity in
-both failure formats so the existing HTTP 503 retry path remains available. The
+at the compiled callback boundary and becoming HTTP 500. The merged main catalog
+changes register that identity in both failure formats; boundary regressions verify
+that the existing HTTP 503 path remains available. The
 create harness recognizes the documented text rejections only with explicit
 non-admission headers; uncertain/committed outcomes still fail without replay.
 
@@ -112,6 +113,16 @@ one six-process cluster at a time (`ANTFLY_E2E_REGRESSION_WORKERS=1`,
 `ANTFLY_E2E_REGRESSION_REPEATS=50`) while retaining 100 total cases and both FD
 profiles. Scheduled Linux coverage keeps two workers and 25 repeats per profile;
 local serial results do not establish that parallel macOS runs are reliable.
+
+Final macOS ARM64 ReleaseSafe validation passed all 100 native cases: 50 normal
+and 50 with a 256-descriptor limit, one cluster at a time. JUnit verification found
+no missing, skipped, failed, or errored cases; the production executable SHA-256
+remained `7689b05ded6616b815c904b9e3727c2732fb6573566738ac7ed1427c953f0d15`.
+The merged-main runtime suite passed 34 tests, compiled owner source passed 14,
+error registry passed one, callback/error boundaries passed 20, and Python harness
+and script checks passed 110. All 256 VOPR histories (81 transitions each) and
+exact replays passed, as did the determinism audit. Linux CI and the scheduled
+parallel profile must validate the original platform separately.
 
 ## 2026-09-16: replay-retention fixture timed out on a checkpoint proxy
 

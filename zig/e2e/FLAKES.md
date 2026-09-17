@@ -30,6 +30,10 @@ sockets and explicit `EADDRNOTAVAIL` before restore). For a local 100-case run o
 macOS, set `ANTFLY_E2E_REGRESSION_WORKERS=1` and
 `ANTFLY_E2E_REGRESSION_REPEATS=50`; the scheduled Linux job keeps two workers.
 Neither uncertain mutation failures nor host resource exhaustion count as passes.
+Final macOS ARM64 ReleaseSafe validation passed 100/100 serial cases (50 normal,
+50 constrained), with complete JUnit evidence and an unchanged executable hash.
+The deterministic admission histories and all 110 harness/script checks also pass.
+Linux parallel qualification remains separate from this local result.
 
 ## 2026-09-16: constrained Autograph restart exited during teardown
 
