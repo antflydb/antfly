@@ -545,3 +545,60 @@ were then run against the pre-change implementation and reproduced identically:
 These are separate follow-ups from the centroid change. This manually broadened
 diagnostic selection does not establish the status of their owning CI targets;
 the latest full gate is not claimed green.
+
+
+### API regression fixture follow-up
+
+The four baseline failures exposed outdated fixtures, and repairing the startup
+fixture also exposed a production ordering bug. Neither came from centroid
+streaming. Embedding-only writes update artifacts and do not create
+primary documents; the profiled-query fixtures now insert a document field too.
+The cold-reader fixture provisions its metadata-defined empty index through a
+writer before opening a query-only DB.
+
+The 50,000-document fixture retains all 200 write-sync batches, 384 dimensions,
+and the cached cold-reader/first-query boundary. Its former two-second polling
+window observed only 12,250 indexed documents in one diagnostic run. The local
+harness now drains the writer and publishes its status before asserting public
+readiness, instead of depending on elapsed time and an absent status publisher.
+Allocator backtraces are opt-in with the existing environment switch; leak
+checking remains enabled.
+
+The startup repair fixture uses the current catalog format and damages the
+selected native generation after DB shutdown, preserving the original status
+watermark. A read-only reopen asserts zero indexed members and three primary
+documents before repair. The public readiness fixture now supplies publication
+target count/readiness, retaining its assertion that pending native projection
+keeps progress below completion.
+
+With a real persisted membership gap, startup attempted native vector projection
+publication before artifact repair. Publication correctly rejected the mismatch
+between three exact vectors and zero HBC members with
+`VectorBlockPublishedGenerationNotReady`. Startup now restores membership before
+publishing that projection. The updated fixture reproduced this failure on the
+original ordering and preserves the no-replay-debt boundary explicitly.
+
+The complete 50,000-document regression passed in 291 seconds in local Debug
+with allocator traces disabled and no leaks (other compilation was active, so
+this is diagnostic timing, not a controlled benchmark). This remains an indexing
+performance investigation, not evidence that a two-second completion deadline
+is valid. Its original input size remains unchanged.
+
+All four original failures now pass individually with no leaks. The hosted query
+measured about 0.85 seconds, readiness below a millisecond, and startup repair
+about 1.3 seconds. The updated repair regression fails on the old production
+ordering and passes after reordering, so it guards the dependency directly.
+
+Supplemental startup validation exposed a separate obsolete-file fixture
+self-deadlock: it called `persistManifest` while already holding the backend
+mutex. It now calls `persistManifestLocked`, waits only until the captured
+retention deadline, and verifies persisted reclamation through a read-only
+reopen. Retired startup owners do not guarantee optional live storage metrics
+in their cached status.
+
+Validation completed for nine distinct regressions: the original four, legacy
+artifact repair, native publication contention, terminal restore debt,
+counterless incomplete-generation repair, and obsolete-file reclamation. All
+passed with no leaks; the fixed reclamation fixture took about 0.37 seconds.
+Formatting and whitespace checks pass. This focused validation does not claim
+the entire latest CI gate is green.
