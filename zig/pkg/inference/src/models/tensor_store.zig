@@ -1166,6 +1166,146 @@ pub const CompositeGlinerStore = struct {
     fn weightSourceNoopDeinit(_: *CompositeGlinerStore) void {}
 };
 
+/// A GGUF checkpoint together with its multimodal projector GGUF. Audio
+/// encoder tensors (`a.*`, `mm.a.*`) resolve to the projector file, so a
+/// session can register them as ordinary lazy weights and keep them
+/// resident on the backend across requests instead of reloading and
+/// dequantizing the whole encoder per request. Name listing covers the
+/// checkpoint only; sessions ask for `projectorAudioNames` explicitly, so
+/// backends that never call the encoder do not register or load them.
+pub const CompositeProjectorStore = struct {
+    allocator: std.mem.Allocator,
+    primary: *GgufStore,
+    projector: *GgufStore,
+
+    const vtable = TensorStore.VTable{
+        .kind = @ptrCast(&kindImpl),
+        .weightSource = @ptrCast(&weightSourceImpl),
+        .describeTensor = @ptrCast(&describeTensorImpl),
+        .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
+        .loadTensorRef = @ptrCast(&loadTensorRefImpl),
+        .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
+        .discardTensorFileCache = @ptrCast(&discardTensorFileCacheImpl),
+        .preserveFileCacheOnDeinit = @ptrCast(&preserveFileCacheOnDeinitImpl),
+        .ggufFile = @ptrCast(&ggufFileImpl),
+        .deinit = @ptrCast(&deinitSelf),
+    };
+
+    const weight_source_vtable = weight_source_mod.WeightSource.VTable{
+        .getTensor = @ptrCast(&getTensorImpl),
+        .listNames = @ptrCast(&listNamesImpl),
+        .deinit = @ptrCast(&weightSourceNoopDeinit),
+    };
+
+    pub fn initAbsolute(allocator: std.mem.Allocator, primary_path: []const u8, projector_path: []const u8) !*CompositeProjectorStore {
+        const self = try allocator.create(CompositeProjectorStore);
+        errdefer allocator.destroy(self);
+        const primary = try GgufStore.initAbsolute(allocator, primary_path);
+        errdefer primary.tensorStore().deinit();
+        const projector = try GgufStore.initAbsolute(allocator, projector_path);
+        self.* = .{ .allocator = allocator, .primary = primary, .projector = projector };
+        return self;
+    }
+
+    pub fn tensorStore(self: *CompositeProjectorStore) TensorStore {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Whether the projector carries a Gemma 4 audio encoder, the only
+    /// consumer of resident projector tensors today.
+    pub fn hasGemma4AudioEncoder(self: *const CompositeProjectorStore) bool {
+        const meta = gguf_mod.metadata.View.init(&self.projector.parsed);
+        const projector_type = meta.getString("clip.audio.projector_type") orelse return false;
+        return std.mem.startsWith(u8, projector_type, "gemma4");
+    }
+
+    pub fn isProjectorAudioName(name: []const u8) bool {
+        return std.mem.startsWith(u8, name, "a.") or std.mem.startsWith(u8, name, "mm.a.");
+    }
+
+    /// Audio encoder tensor names, borrowed from the projector file for the
+    /// store's lifetime; the caller frees only the slice.
+    pub fn projectorAudioNames(self: *const CompositeProjectorStore, allocator: std.mem.Allocator) ![][]const u8 {
+        var names = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer names.deinit(allocator);
+        for (self.projector.parsed.tensors) |tensor| {
+            if (isProjectorAudioName(tensor.name)) try names.append(allocator, tensor.name);
+        }
+        return names.toOwnedSlice(allocator);
+    }
+
+    fn hasProjectorTensor(self: *CompositeProjectorStore, name: []const u8) bool {
+        if (!isProjectorAudioName(name)) return false;
+        return gguf_mod.tensor_catalog.Catalog.init(&self.projector.parsed).find(name) != null;
+    }
+
+    fn storeFor(self: *CompositeProjectorStore, name: []const u8) *GgufStore {
+        return if (self.hasProjectorTensor(name)) self.projector else self.primary;
+    }
+
+    fn kindImpl(_: *CompositeProjectorStore) StoreKind {
+        return .gguf;
+    }
+
+    fn weightSourceImpl(self: *CompositeProjectorStore) !?weight_source_mod.WeightSource {
+        return .{ .ptr = self, .vtable = &weight_source_vtable };
+    }
+
+    fn describeTensorImpl(self: *CompositeProjectorStore, allocator: std.mem.Allocator, name: []const u8) !LazyTensorRef {
+        return self.storeFor(name).describeTensorImpl(allocator, name);
+    }
+
+    fn describeTensorRangeImpl(_: *CompositeProjectorStore, _: std.mem.Allocator, _: []const u8) !?TensorRangeRef {
+        return null;
+    }
+
+    fn loadTensorRefImpl(self: *CompositeProjectorStore, tensor_ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
+        return ggufGetTensorRef(self.storeFor(tensor_ref.name), tensor_ref);
+    }
+
+    fn loadQuantizedStorageRefImpl(self: *CompositeProjectorStore, tensor_ref: *const LazyTensorRef) !?weight_source_mod.QuantizedStorage {
+        return ggufGetQuantizedStorageRef(self.storeFor(tensor_ref.name), tensor_ref);
+    }
+
+    fn discardTensorFileCacheImpl(self: *CompositeProjectorStore, name: []const u8) void {
+        self.storeFor(name).discardTensorFileCache(name);
+    }
+
+    fn preserveFileCacheOnDeinitImpl(self: *CompositeProjectorStore) void {
+        self.primary.preserveFileCacheOnDeinitImpl();
+        self.projector.preserveFileCacheOnDeinitImpl();
+    }
+
+    fn ggufFileImpl(self: *CompositeProjectorStore) ?*const gguf_mod.format.File {
+        return &self.primary.parsed;
+    }
+
+    fn deinitSelf(self: *CompositeProjectorStore) void {
+        self.primary.tensorStore().deinit();
+        self.projector.tensorStore().deinit();
+        self.allocator.destroy(self);
+    }
+
+    fn getTensorImpl(self: *CompositeProjectorStore, name: []const u8) !weight_source_mod.LoadedWeight {
+        return ggufGetTensor(self.storeFor(name), name);
+    }
+
+    fn listNamesImpl(self: *CompositeProjectorStore, allocator: std.mem.Allocator) ![][]const u8 {
+        return ggufListNames(self.primary, allocator);
+    }
+
+    fn weightSourceNoopDeinit(_: *CompositeProjectorStore) void {}
+};
+
+/// The projector audio tensor names a session should register as lazy
+/// weights, or null when `store` is not a projector composite. The caller
+/// frees the slice only.
+pub fn projectorAudioTensorNames(store: TensorStore, allocator: std.mem.Allocator) !?[][]const u8 {
+    if (store.vtable != &CompositeProjectorStore.vtable) return null;
+    const composite: *CompositeProjectorStore = @ptrCast(@alignCast(store.ptr));
+    return try composite.projectorAudioNames(allocator);
+}
+
 pub fn openFromManifest(allocator: std.mem.Allocator, manifest: manifest_mod.ModelManifest) !TensorStore {
     if (manifest.hasIncompleteGlinerBundle()) return error.IncompleteGlinerBundle;
     if (manifest.hasIncompleteFlorence2GgufBundle()) return error.IncompleteFlorence2Bundle;
@@ -1173,6 +1313,11 @@ pub fn openFromManifest(allocator: std.mem.Allocator, manifest: manifest_mod.Mod
         const head_path = manifest.gliner_head_gguf_path orelse manifest.gliner_head_safetensors_path.?;
         const store = try CompositeGlinerStore.initAbsolute(allocator, manifest.gguf_path.?, head_path, manifest.gliner_head_gguf_path != null);
         return store.tensorStore();
+    }
+    if (manifest.gguf_path != null and manifest.gguf_projector_path != null) {
+        const store = try CompositeProjectorStore.initAbsolute(allocator, manifest.gguf_path.?, manifest.gguf_projector_path.?);
+        if (store.hasGemma4AudioEncoder()) return store.tensorStore();
+        store.tensorStore().deinit();
     }
     return switch (manifest.nativeWeightArtifactKind() orelse return error.NoTensorStoreFound) {
         .gguf => (try GgufStore.initAbsolute(allocator, manifest.gguf_path.?)).tensorStore(),
@@ -1385,6 +1530,142 @@ test "open gguf tensor store from manifest" {
     try std.testing.expectEqual(@import("../backends/tensor.zig").DType.f16, loaded.tensor.dtype);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44 }, loaded.tensor.data);
     tensor_ref.deinit(allocator);
+}
+
+fn appendTestGgufF32Tensor(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), name: []const u8, offset: u64) !void {
+    try appendString(allocator, data, name);
+    try appendLe(u32, allocator, data, 1);
+    try appendLe(u64, allocator, data, 2);
+    try appendLe(u32, allocator, data, @intFromEnum(gguf_mod.tensor_types.KnownTensorType.F32));
+    try appendLe(u64, allocator, data, offset);
+}
+
+/// A minimal Gemma 4 audio projector GGUF on disk for tests: `clip` with
+/// `gemma4a` audio metadata, one `a.*` tensor (`[5, 6]`) and one `v.*`
+/// tensor (`[7, 8]`), written under a scratch directory the caller removes
+/// through `deinit`.
+pub const Gemma4AudioProjectorFixture = struct {
+    dir_path: []u8,
+    projector_path: []u8,
+
+    pub fn deinit(self: *Gemma4AudioProjectorFixture, allocator: std.mem.Allocator) void {
+        compat.cwd().deleteTree(compat.io(), self.dir_path) catch {};
+        allocator.free(self.projector_path);
+        allocator.free(self.dir_path);
+    }
+};
+
+pub fn writeGemma4AudioProjectorFixture(allocator: std.mem.Allocator, dir_name: []const u8) !Gemma4AudioProjectorFixture {
+    var projector = std.ArrayListUnmanaged(u8).empty;
+    defer projector.deinit(allocator);
+    try appendGemma4AudioProjectorFixtureBytes(allocator, &projector);
+    const dir_path = try testScratchDir(allocator, dir_name);
+    errdefer allocator.free(dir_path);
+    const projector_path = try std.fs.path.join(allocator, &.{ dir_path, "mmproj.gguf" });
+    errdefer allocator.free(projector_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = projector_path, .data = projector.items });
+    return .{ .dir_path = dir_path, .projector_path = projector_path };
+}
+
+fn appendGemma4AudioProjectorFixtureBytes(allocator: std.mem.Allocator, projector: *std.ArrayListUnmanaged(u8)) !void {
+    try projector.appendSlice(allocator, "GGUF");
+    try appendLe(u32, allocator, projector, 3);
+    try appendLe(u64, allocator, projector, 2);
+    try appendLe(u64, allocator, projector, 2);
+    try appendString(allocator, projector, "general.architecture");
+    try appendLe(u32, allocator, projector, 8);
+    try appendString(allocator, projector, "clip");
+    try appendString(allocator, projector, "clip.audio.projector_type");
+    try appendLe(u32, allocator, projector, 8);
+    try appendString(allocator, projector, "gemma4a");
+    try appendTestGgufF32Tensor(allocator, projector, "a.blk.0.ffn_up.weight", 0);
+    try appendTestGgufF32Tensor(allocator, projector, "v.blk.0.attn_q.weight", gguf_mod.format.default_alignment);
+    try padToAlignment(allocator, projector, gguf_mod.format.default_alignment);
+    try projector.appendSlice(allocator, std.mem.asBytes(&[_]f32{ 5.0, 6.0 }));
+    try padToAlignment(allocator, projector, gguf_mod.format.default_alignment);
+    try projector.appendSlice(allocator, std.mem.asBytes(&[_]f32{ 7.0, 8.0 }));
+}
+
+test "open gguf checkpoint with its gemma4 audio projector from manifest" {
+    const allocator = std.testing.allocator;
+
+    // Checkpoint: one string metadata entry, one tensor.
+    var primary = std.ArrayListUnmanaged(u8).empty;
+    defer primary.deinit(allocator);
+    try primary.appendSlice(allocator, "GGUF");
+    try appendLe(u32, allocator, &primary, 3);
+    try appendLe(u64, allocator, &primary, 1);
+    try appendLe(u64, allocator, &primary, 1);
+    try appendString(allocator, &primary, "general.architecture");
+    try appendLe(u32, allocator, &primary, 8);
+    try appendString(allocator, &primary, "gemma4");
+    try appendTestGgufF32Tensor(allocator, &primary, "blk.0.attn_q.weight", 0);
+    try padToAlignment(allocator, &primary, gguf_mod.format.default_alignment);
+    try primary.appendSlice(allocator, std.mem.asBytes(&[_]f32{ 1.0, 2.0 }));
+
+    // Projector: audio type metadata, one audio tensor and one vision tensor.
+    var projector = std.ArrayListUnmanaged(u8).empty;
+    defer projector.deinit(allocator);
+    try appendGemma4AudioProjectorFixtureBytes(allocator, &projector);
+
+    const dir_path = try testScratchDir(allocator, "tensor-store-projector-composite");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const gguf_path = try std.fs.path.join(allocator, &.{ dir_path, "model.gguf" });
+    defer allocator.free(gguf_path);
+    const projector_path = try std.fs.path.join(allocator, &.{ dir_path, "mmproj.gguf" });
+    defer allocator.free(projector_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = gguf_path, .data = primary.items });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = projector_path, .data = projector.items });
+
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .gguf_path = try allocator.dupe(u8, gguf_path),
+        .gguf_projector_path = try allocator.dupe(u8, projector_path),
+    };
+    defer manifest.deinit();
+
+    const store = try openFromManifest(allocator, manifest);
+    defer store.deinit();
+    try std.testing.expectEqual(StoreKind.gguf, store.kind());
+    try std.testing.expect(store.ggufFile() != null);
+
+    // Listing covers the checkpoint only; audio names come from the helper.
+    const source = (try store.weightSource()) orelse return error.TestUnexpectedResult;
+    const names = try source.listNames(allocator);
+    defer allocator.free(names);
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("blk.0.attn_q.weight", names[0]);
+    const audio_names = (try projectorAudioTensorNames(store, allocator)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(audio_names);
+    try std.testing.expectEqual(@as(usize, 1), audio_names.len);
+    try std.testing.expectEqualStrings("a.blk.0.ffn_up.weight", audio_names[0]);
+
+    // Audio tensors load from the projector, checkpoint tensors from the primary.
+    var audio_ref = try store.describeTensor(allocator, "a.blk.0.ffn_up.weight");
+    defer audio_ref.deinit(allocator);
+    var audio = try store.loadTensorRef(&audio_ref);
+    defer audio.deinit();
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 5.0, 6.0 }, audio.tensor.asFloat32());
+    var primary_ref = try store.describeTensor(allocator, "blk.0.attn_q.weight");
+    defer primary_ref.deinit(allocator);
+    var primary_loaded = try store.loadTensorRef(&primary_ref);
+    defer primary_loaded.deinit();
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0 }, primary_loaded.tensor.asFloat32());
+    // Vision tensors are not routed to the projector.
+    try std.testing.expectError(error.TensorNotFound, store.describeTensor(allocator, "v.blk.0.attn_q.weight"));
+
+    // A plain checkpoint store is not a projector composite.
+    var plain_manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .gguf_path = try allocator.dupe(u8, gguf_path),
+    };
+    defer plain_manifest.deinit();
+    const plain = try openFromManifest(allocator, plain_manifest);
+    defer plain.deinit();
+    try std.testing.expect((try projectorAudioTensorNames(plain, allocator)) == null);
 }
 
 test "open split gliner gguf bundle from manifest" {

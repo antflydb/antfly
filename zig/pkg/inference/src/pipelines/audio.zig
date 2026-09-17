@@ -137,9 +137,9 @@ pub fn whisperMelFromPcmSecondsMels(
     return logMelSpectrogramWithConfig(allocator, bounded, config);
 }
 
-const blas_available = build_options.enable_system_blas;
+pub const blas_available = build_options.enable_system_blas;
 
-const blas = if (blas_available) struct {
+pub const blas = if (blas_available) struct {
     pub const row_major: c_int = 101;
     pub const no_trans: c_int = 111;
     pub const trans: c_int = 112;

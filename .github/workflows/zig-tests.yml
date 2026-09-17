@@ -558,6 +558,7 @@ jobs:
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
+          tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
@@ -633,6 +634,7 @@ jobs:
         if: needs.changes.outputs.zig_tests == 'true'
         env:
           ANTFLY_TEST_CLEANUP_TRACE: "1"
+          ANTFLY_TEST_TIMINGS: "1"
         run: |
           set -euo pipefail
 
@@ -903,6 +905,7 @@ jobs:
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
+          tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
@@ -932,6 +935,8 @@ jobs:
           echo "build_runner=$patched_runner" >> "$GITHUB_OUTPUT"
 
       - name: Run library, Antfly, and inference unit tests
+        env:
+          ANTFLY_TEST_TIMINGS: "1"
         run: |
           set +e
           taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }} --summary all"

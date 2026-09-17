@@ -123,6 +123,11 @@ pub fn main(init: std.process.Init.Minimal) void {
         return;
     }
 
+    // Use independent I/O so teardown of the test's I/O remains measurable.
+    const trace_timings = getenvBool("ANTFLY_TEST_TIMINGS");
+    var timing_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer timing_io.deinit();
+    const clock_io = timing_io.io();
     const trace_cleanup = getenvBool("ANTFLY_TEST_CLEANUP_TRACE");
     const fail_on_error_logs = getenvBool("ANTFLY_TEST_FAIL_ON_ERROR_LOGS");
     var current_count: usize = 0;
@@ -133,6 +138,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         // setup itself terminates the process, CI still identifies the test
         // boundary instead of reporting an anonymous signal.
         std.debug.print("{d}/{d} {s}...", .{ current_count, total_count, test_fn.name });
+        const setup_start = timingNow(trace_timings, clock_io);
         testing.allocator_instance = .{};
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
@@ -145,6 +151,7 @@ pub fn main(init: std.process.Init.Minimal) void {
 
         const Outcome = enum { passed, skipped, failed };
         var outcome: Outcome = .passed;
+        const body_start = timingNow(trace_timings, clock_io);
         if (test_fn.func()) |_| {} else |err| switch (err) {
             error.SkipZigTest => {
                 outcome = .skipped;
@@ -161,11 +168,24 @@ pub fn main(init: std.process.Init.Minimal) void {
             },
         }
 
+        const body_end = timingNow(trace_timings, clock_io);
         if (trace_cleanup) std.debug.print("CLEANUP io_deinit begin {s}\n", .{test_fn.name});
         testing.io_instance.deinit();
+        const io_end = timingNow(trace_timings, clock_io);
         if (trace_cleanup) std.debug.print("CLEANUP allocator_deinit begin {s}\n", .{test_fn.name});
         if (testing.allocator_instance.deinit() == .leak) {
             leak_count += 1;
+        }
+        const allocator_end = timingNow(trace_timings, clock_io);
+        if (trace_timings) {
+            // Nanoseconds and full names survive buffered/prefixed CI output.
+            std.debug.print("\nTIMING\t{d}\t{d}\t{d}\t{d}\t{s}\n", .{
+                body_start - setup_start,
+                body_end - body_start,
+                io_end - body_end,
+                allocator_end - io_end,
+                test_fn.name,
+            });
         }
         if (trace_cleanup) std.debug.print("CLEANUP done {s}\n", .{test_fn.name});
 
@@ -315,4 +335,8 @@ pub fn log(
     });
     std.debug.print(format, args);
     std.debug.print("\n", .{});
+}
+
+fn timingNow(enabled: bool, io: std.Io) i96 {
+    return if (enabled) std.Io.Clock.awake.now(io).toNanoseconds() else 0;
 }

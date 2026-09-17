@@ -183,7 +183,11 @@ fn ownership(a: A) !void {
     try fixture(a, .native);
 }
 test "boundary recomputed head admission compilation unwinds every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, ownership, .{});
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const test_allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    try std.testing.checkAllAllocationFailures(test_allocator, ownership, .{});
 }
 
 test "boundary recomputed head admission handles direct no-gradient sessions and compile denials" {

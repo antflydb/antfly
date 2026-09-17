@@ -80,6 +80,7 @@ const tests = [_]common.TestSpec{
     .{
         .step_name = "test-gliner2-graph-cache",
         .root_source_file = "src/finetune_graph_cache_test_root.zig",
+        .covered_by_inference = true,
         .description = "Run GLiNER2 autodiff objective and graph-cache tests",
         .imports = &.{ .antfly_platform, .build_options, .ml, .onnx_graph, .pjrt, .inference_internal, .inference_hf_tokenizer, .protobuf, .inference_linalg },
         .native_link = .default,
@@ -114,11 +115,13 @@ const tests = [_]common.TestSpec{
     .{
         .step_name = "test-entity-cleanup-data",
         .root_source_file = "src/test_entity_cleanup_data.zig",
+        .covered_by_inference = true,
         .description = "Run isolated entity cleanup finetune data tests",
     },
     .{
         .step_name = "test-entity-cleanup-model",
         .root_source_file = "src/test_entity_cleanup_model.zig",
+        .covered_by_inference = true,
         .description = "Run isolated learned entity cleanup model tests",
         .imports = &.{ .build_options, .inference_hf_tokenizer },
         .native_link = .default,
@@ -140,6 +143,7 @@ const tests = [_]common.TestSpec{
     .{
         .step_name = "test-entity-cleanup",
         .root_source_file = "src/test_entity_cleanup_pipeline.zig",
+        .covered_by_inference = true,
         .description = "Run isolated learned entity cleanup pipeline tests",
     },
     .{
@@ -198,11 +202,13 @@ const tests = [_]common.TestSpec{
     },
 };
 
-pub fn addTests(ctx: common.Context, name: []const u8) *@import("std").Build.Step {
+pub fn addTests(ctx: common.Context, name: []const u8, combined_with_inference: bool) *@import("std").Build.Step {
     const aggregate = ctx.b.step(name, "Run focused fine-tuning tests and compile registered commands");
     for (tests) |spec| {
         const step = common.addTest(ctx, spec);
-        aggregate.dependOn(step);
+        // Standalone/focused finetuning retains every test. The combined CI
+        // gate assigns these imported tests to inference-test once.
+        if (!combined_with_inference or !spec.covered_by_inference) aggregate.dependOn(step);
     }
     return aggregate;
 }
