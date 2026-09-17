@@ -110,7 +110,7 @@ pub const Module = struct {
             var zero_ptr = out_ptr;
             var zero_count: i32 = @intCast(layout.output_elements * 3);
             var zero_args = [_]?*anyopaque{ @ptrCast(&zero_ptr), @ptrCast(&zero_count) };
-            try launch(ctx, self.zero, &zero_args, .{ @intCast((layout.output_elements * 3 + 255) / 256), 1, 1 }, .{ 256, 1, 1 }, 0);
+            try launch(ctx, self.zero, &zero_args, .{ @intCast(@divTrunc(layout.output_elements * 3 + 255, 256)), 1, 1 }, .{ 256, 1, 1 }, 0);
             const delta_bytes: usize = @intCast(layout.delta_elements * 4);
             var delta = (try region(scratch, bias_bytes, delta_bytes)).ptr;
             const delta_padded = std.mem.alignForward(usize, delta_bytes, 16);

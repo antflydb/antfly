@@ -259,8 +259,11 @@ class _ProcessTree:
 
 class ResourceGuard:
     def __init__(
-        self, max_rss_bytes: int = 8 * 1024**3, max_log_bytes: int = MAX_LOG_BYTES,
-        *, max_processes: int = MAX_PROCESSES,
+        self,
+        max_rss_bytes: int = 8 * 1024**3,
+        max_log_bytes: int = MAX_LOG_BYTES,
+        *,
+        max_processes: int = MAX_PROCESSES,
     ):
         if type(max_rss_bytes) is not int or max_rss_bytes <= 0:
             raise BenchmarkError("RSS ceiling must be a positive integer")
@@ -393,7 +396,9 @@ class Worker:
             )
             # Register the owner before any fallible selector/stream setup.
             self.guard._register(self)
-            self._tree = _ProcessTree(self.process, self.guard.psutil, self.guard.max_processes)
+            self._tree = _ProcessTree(
+                self.process, self.guard.psutil, self.guard.max_processes
+            )
             for stream in (
                 self.process.stdin,
                 self.process.stdout,
@@ -628,7 +633,9 @@ class Worker:
             if self.process is not None:
                 if self._tree is None:
                     try:
-                        self._tree = _ProcessTree(self.process, self.guard.psutil, self.guard.max_processes)
+                        self._tree = _ProcessTree(
+                            self.process, self.guard.psutil, self.guard.max_processes
+                        )
                     except Exception as error:
                         errors.append(
                             f"process registration: {type(error).__name__}: {error}"

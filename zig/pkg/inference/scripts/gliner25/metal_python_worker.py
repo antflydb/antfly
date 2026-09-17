@@ -119,10 +119,13 @@ def verify_runtime(torch: Any, device: str) -> None:
     if device == "cuda":
         if torch.version.cuda is None or not torch.cuda.is_available():
             raise WorkerError("requested CUDA runtime is not available")
-        if (torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
-                or torch.get_float32_matmul_precision() != "highest"
-                or os.environ.get("CUBLAS_WORKSPACE_CONFIG") != ":4096:8"
-                or os.environ.get("TRITON_F32_DEFAULT") != "ieee"):
+        if (
+            torch.backends.cuda.matmul.allow_tf32
+            or torch.backends.cudnn.allow_tf32
+            or torch.get_float32_matmul_precision() != "highest"
+            or os.environ.get("CUBLAS_WORKSPACE_CONFIG") != ":4096:8"
+            or os.environ.get("TRITON_F32_DEFAULT") != "ieee"
+        ):
             raise WorkerError("CUDA strict FP32 math policy changed")
 
 
@@ -169,7 +172,14 @@ def verify_model_tensors(model: Any, torch: Any, device: str) -> dict[str, Any]:
     return summary
 
 
-def load_model(auto_extractor: Any, model_dir: Path, device: str, profile: str = "eager_fp32", flashdeberta: bool = False, compile_static: bool = False) -> Any:
+def load_model(
+    auto_extractor: Any,
+    model_dir: Path,
+    device: str,
+    profile: str = "eager_fp32",
+    flashdeberta: bool = False,
+    compile_static: bool = False,
+) -> Any:
     # The pinned loader strictly restores every checkpoint tensor on CPU first.
     # Do not use a global default device: source preprocessing/decoding has
     # deliberate host operations, while batch.to() follows model parameters.
@@ -191,7 +201,9 @@ def load_model(auto_extractor: Any, model_dir: Path, device: str, profile: str =
     # This is a RuntimeMixin attribute, not an accepted extract() keyword.
     model.strict_extraction = True
     if flashdeberta and not type(model.encoder).__module__.startswith("flashdeberta."):
-        raise WorkerError("requested FlashDeBERTa silently fell back to another encoder")
+        raise WorkerError(
+            "requested FlashDeBERTa silently fell back to another encoder"
+        )
     if profile.startswith("compile_"):
         model.compile(dynamic=not compile_static)
     return model
@@ -226,7 +238,9 @@ def synchronize(torch: Any, device: str) -> None:
         try:
             torch.cuda.synchronize()
         except Exception as exc:
-            raise DeviceSynchronizationError(f"CUDA synchronization failed: {exc}") from exc
+            raise DeviceSynchronizationError(
+                f"CUDA synchronization failed: {exc}"
+            ) from exc
     if device == "mps":
         try:
             torch.mps.synchronize()
@@ -279,10 +293,18 @@ def capture_validation_inputs(model: Any, torch: Any, device: str, batch_size: i
             raise WorkerError("validation encoder has no tensor input IDs")
         if batch_size > 1:
             rows = ids.detach().cpu().tolist()
-            if (len(rows) != batch_size or not rows or not isinstance(rows[0], list)
-                    or not 1 <= len(rows[0]) <= oracle.MAX_ENCODED_TOKENS
-                    or any(not isinstance(row, list) or len(row) != len(rows[0])
-                           or any(type(token) is not int for token in row) for row in rows)):
+            if (
+                len(rows) != batch_size
+                or not rows
+                or not isinstance(rows[0], list)
+                or not 1 <= len(rows[0]) <= oracle.MAX_ENCODED_TOKENS
+                or any(
+                    not isinstance(row, list)
+                    or len(row) != len(rows[0])
+                    or any(type(token) is not int for token in row)
+                    for row in rows
+                )
+            ):
                 raise WorkerError("validation encoder batch shape differs")
             batch_ids.append([token for row in rows for token in row])
         observed = {}
@@ -322,7 +344,11 @@ def capture_validation_inputs(model: Any, torch: Any, device: str, batch_size: i
 
     handle = model.encoder.register_forward_pre_hook(capture, with_kwargs=True)
     try:
-        with (bench.capture_encoder_input_ids(model) if batch_size == 1 else contextlib.nullcontext(batch_ids)) as ids:
+        with (
+            bench.capture_encoder_input_ids(model)
+            if batch_size == 1
+            else contextlib.nullcontext(batch_ids)
+        ) as ids:
             yield ids, devices
     finally:
         handle.remove()
@@ -442,7 +468,9 @@ def ready_event(args, model, torch, bundle, provenance, requests_sha256):
         "event": "ready",
         "batch_size": getattr(args, "batch_size", 1),
         "arm": f"fastino_{args.device}",
-        "scope": "gliner25_direct_core_cuda_comparison_v1" if args.device == "cuda" else SCOPE,
+        "scope": "gliner25_direct_core_cuda_comparison_v1"
+        if args.device == "cuda"
+        else SCOPE,
         "timing_boundary": TIMING_BOUNDARY,
         "model": args.model,
         "model_id": bundle["model_id"],
@@ -461,20 +489,48 @@ def ready_event(args, model, torch, bundle, provenance, requests_sha256):
         "provenance": provenance,
         "qualification": False,
         "synchronization_policy": SYNC_POLICIES[args.device],
-        "math_policy": (f"pytorch_cuda_amp_{args.profile.rsplit('_', 1)[-1]}_no_tf32_v1" if "_amp_" in args.profile else "pytorch_cuda_fp32_deterministic_no_tf32_v1") if args.device == "cuda" else MATH_POLICY,
-        **({"profile": args.profile, "activation_dtype": "bfloat16_autocast" if "bf16" in args.profile else "float16_autocast" if "fp16" in args.profile else "float32",
-            "compile_static": args.compile_static,
-            "encoder_backend": "flashdeberta" if args.flashdeberta else "transformers",
-            "flashdeberta_version": importlib.metadata.version("flashdeberta") if args.flashdeberta else None} if args.device == "cuda" else {}),
+        "math_policy": (
+            f"pytorch_cuda_amp_{args.profile.rsplit('_', 1)[-1]}_no_tf32_v1"
+            if "_amp_" in args.profile
+            else "pytorch_cuda_fp32_deterministic_no_tf32_v1"
+        )
+        if args.device == "cuda"
+        else MATH_POLICY,
+        **(
+            {
+                "profile": args.profile,
+                "activation_dtype": "bfloat16_autocast"
+                if "bf16" in args.profile
+                else "float16_autocast"
+                if "fp16" in args.profile
+                else "float32",
+                "compile_static": args.compile_static,
+                "encoder_backend": "flashdeberta"
+                if args.flashdeberta
+                else "transformers",
+                "flashdeberta_version": importlib.metadata.version("flashdeberta")
+                if args.flashdeberta
+                else None,
+            }
+            if args.device == "cuda"
+            else {}
+        ),
         "mps_memory": mps_memory(torch, args.device),
-        **({"cuda_memory": cuda_memory(torch, args.device), "cuda_runtime": {
-            "torch_cuda": torch.version.cuda,
-            "device_name": torch.cuda.get_device_name(),
-            "compute_capability": list(torch.cuda.get_device_capability()),
-            "tf32": False,
-            "triton_f32_default": os.environ["TRITON_F32_DEFAULT"],
-            "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],
-        }} if args.device == "cuda" else {}),
+        **(
+            {
+                "cuda_memory": cuda_memory(torch, args.device),
+                "cuda_runtime": {
+                    "torch_cuda": torch.version.cuda,
+                    "device_name": torch.cuda.get_device_name(),
+                    "compute_capability": list(torch.cuda.get_device_capability()),
+                    "tf32": False,
+                    "triton_f32_default": os.environ["TRITON_F32_DEFAULT"],
+                    "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],
+                },
+            }
+            if args.device == "cuda"
+            else {}
+        ),
     }
 
 
@@ -485,8 +541,12 @@ def execute_batch(model, request, schema_json, batch_size):
     return model.batch_extract(
         [request["text"]] * batch_size,
         oracle.build_extract_schema(bench.strict_json(schema_json)),
-        batch_size=batch_size, num_workers=0, threshold=0.5,
-        include_confidence=True, include_spans=True, max_len=oracle.MAX_WORDS,
+        batch_size=batch_size,
+        num_workers=0,
+        threshold=0.5,
+        include_confidence=True,
+        include_spans=True,
+        max_len=oracle.MAX_WORDS,
     )
 
 
@@ -507,8 +567,17 @@ def serve_commands(
     source = sys.stdin.buffer if source is None else source
     emit = bench.emit if emit is None else emit
     batch_size = getattr(args, "batch_size", 1)
-    execute = (bench.execute_python if batch_size == 1 else
-               lambda model, request, schema: execute_batch(model, request, schema, batch_size)) if execute is None else execute
+    execute = (
+        (
+            bench.execute_python
+            if batch_size == 1
+            else lambda model, request, schema: execute_batch(
+                model, request, schema, batch_size
+            )
+        )
+        if execute is None
+        else execute
+    )
     canonical = bench.canonical_python if canonical is None else canonical
     by_id = {request["id"]: request for request in requests}
     schemas = {
@@ -551,7 +620,9 @@ def serve_commands(
                     "event": "stopped",
                     "arm": arm,
                     "request_id": previous_id,
-                    "scope": "gliner25_direct_core_cuda_comparison_v1" if args.device == "cuda" else SCOPE,
+                    "scope": "gliner25_direct_core_cuda_comparison_v1"
+                    if args.device == "cuda"
+                    else SCOPE,
                     "qualification": False,
                     "requests_sha256": requests_sha256,
                 }
@@ -582,7 +653,14 @@ def serve_commands(
                 if validating
                 else contextlib.nullcontext(([], []))
             )
-            autocast = torch.autocast("cuda", dtype=torch.bfloat16 if "bf16" in args.profile else torch.float16) if "_amp_" in args.profile else contextlib.nullcontext()
+            autocast = (
+                torch.autocast(
+                    "cuda",
+                    dtype=torch.bfloat16 if "bf16" in args.profile else torch.float16,
+                )
+                if "_amp_" in args.profile
+                else contextlib.nullcontext()
+            )
             with reject_mps_fallback(), capture as (input_ids, inputs), autocast:
                 output, duration = timed_call(
                     torch,
@@ -626,7 +704,11 @@ def serve_commands(
                     else None,
                     "output": output,
                     "mps_memory": memory,
-                    **({"cuda_memory": cuda_memory(torch, args.device)} if args.device == "cuda" else {}),
+                    **(
+                        {"cuda_memory": cuda_memory(torch, args.device)}
+                        if args.device == "cuda"
+                        else {}
+                    ),
                 }
             )
         except Exception as exc:
@@ -654,7 +736,10 @@ def python_worker(args) -> int:
         if args.device == "cuda":
             # PyTorch's flags do not govern FlashDeBERTa's default tl.dot.
             # Establish Triton's IEEE default before its first import/JIT too.
-            for name, value in (("CUBLAS_WORKSPACE_CONFIG", ":4096:8"), ("TRITON_F32_DEFAULT", "ieee")):
+            for name, value in (
+                ("CUBLAS_WORKSPACE_CONFIG", ":4096:8"),
+                ("TRITON_F32_DEFAULT", "ieee"),
+            ):
                 if os.environ.get(name) not in (None, value):
                     raise WorkerError(f"{name} differs from strict CUDA policy")
                 os.environ[name] = value
@@ -671,7 +756,14 @@ def python_worker(args) -> int:
 
         # Reinstall after third-party imports, which may add warning filters.
         with reject_mps_fallback():
-            model = load_model(AutoExtractor, args.model_dir, args.device, args.profile, args.flashdeberta, args.compile_static)
+            model = load_model(
+                AutoExtractor,
+                args.model_dir,
+                args.device,
+                args.profile,
+                args.flashdeberta,
+                args.compile_static,
+            )
             synchronize(torch, args.device)
             bench.emit(
                 ready_event(args, model, torch, bundle, provenance, requests_sha256)
@@ -681,7 +773,18 @@ def python_worker(args) -> int:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=("eager_fp32", "compile_fp32", "eager_amp_bf16", "compile_amp_bf16", "eager_amp_fp16", "compile_amp_fp16"), default="eager_fp32")
+    parser.add_argument(
+        "--profile",
+        choices=(
+            "eager_fp32",
+            "compile_fp32",
+            "eager_amp_bf16",
+            "compile_amp_bf16",
+            "eager_amp_fp16",
+            "compile_amp_fp16",
+        ),
+        default="eager_fp32",
+    )
     parser.add_argument("--flashdeberta", action="store_true")
     parser.add_argument("--compile-static", action="store_true")
     parser.add_argument("--device", choices=("mps", "cpu", "cuda"), required=True)
@@ -691,9 +794,13 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-commands", type=int, default=2048)
     args = parser.parse_args(argv)
-    if not 1 <= args.batch_size <= 64 or (args.device != "cuda" and args.batch_size != 1):
+    if not 1 <= args.batch_size <= 64 or (
+        args.device != "cuda" and args.batch_size != 1
+    ):
         parser.error("batch size must be 1..64 and larger batches require CUDA")
-    if args.device != "cuda" and (args.profile != "eager_fp32" or args.flashdeberta or args.compile_static):
+    if args.device != "cuda" and (
+        args.profile != "eager_fp32" or args.flashdeberta or args.compile_static
+    ):
         parser.error("additional profiles require CUDA")
     if args.compile_static and not args.profile.startswith("compile_"):
         parser.error("static shapes require a compiled profile")

@@ -5,7 +5,9 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-spec = importlib.util.spec_from_file_location("training_math_regen", Path(__file__).with_name("regen-cuda-training-math.py"))
+spec = importlib.util.spec_from_file_location(
+    "training_math_regen", Path(__file__).with_name("regen-cuda-training-math.py")
+)
 regen = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(regen)
 
@@ -17,9 +19,13 @@ class TrainingMathArtifactsTest(unittest.TestCase):
         regen.publish(regen.ARTIFACTS, regen.artifacts(source, ptx), False)
         self.assertIn(regen.COMPILER, ptx)
         for name in ("outer", "inner", "vector", "vector_sums"):
-            self.assertIn(f".visible .entry termite_gliner25_scan_{name}_v1(".encode(), ptx)
+            self.assertIn(
+                f".visible .entry termite_gliner25_scan_{name}_v1(".encode(), ptx
+            )
         for name in ("part", "finish"):
-            self.assertIn(f".visible .entry termite_gliner25_reduce_{name}_v1(".encode(), ptx)
+            self.assertIn(
+                f".visible .entry termite_gliner25_reduce_{name}_v1(".encode(), ptx
+            )
         self.assertIn(b".visible .entry termite_gliner25_gelu_f32_cuda128(", ptx)
         self.assertIn(b".visible .entry termite_gliner25_silu_f32_cuda128(", ptx)
         self.assertIn(b".visible .entry termite_gliner25_sigmoid_f32_cuda128(", ptx)
@@ -29,11 +35,18 @@ class TrainingMathArtifactsTest(unittest.TestCase):
         self.assertIn(b".visible .entry termite_gliner25_adamw_pytorch_v1(", ptx)
         self.assertIn(b".visible .entry termite_gliner25_elementwise_vjp_v1(", ptx)
         for name in ("prepare", "vjp"):
-            self.assertIn(f".visible .entry termite_gliner25_listwise_{name}_v1(".encode(), ptx)
+            self.assertIn(
+                f".visible .entry termite_gliner25_listwise_{name}_v1(".encode(), ptx
+            )
         for name in ("target_exp", "logp_vjp", "mask_vjp"):
-            self.assertIn(f".visible .entry termite_gliner25_record_{name}_v1(".encode(), ptx)
+            self.assertIn(
+                f".visible .entry termite_gliner25_record_{name}_v1(".encode(), ptx
+            )
         for name in ("warp", "block"):
-            self.assertIn(f".visible .entry termite_gliner25_log_softmax_{name}_f32(".encode(), ptx)
+            self.assertIn(
+                f".visible .entry termite_gliner25_log_softmax_{name}_f32(".encode(),
+                ptx,
+            )
 
     def test_shared_softmax_source_is_bound_and_missing_include_fails(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -49,7 +62,9 @@ class TrainingMathArtifactsTest(unittest.TestCase):
             with patch.object(regen, "ARTIFACTS", artifacts):
                 first = regen.artifacts(regen.source_bytes(), b"ptx")
                 header.write_text("second")
-                self.assertNotEqual(first, regen.artifacts(regen.source_bytes(), b"ptx"))
+                self.assertNotEqual(
+                    first, regen.artifacts(regen.source_bytes(), b"ptx")
+                )
                 source.write_text("missing")
                 with self.assertRaisesRegex(RuntimeError, "exactly one"):
                     regen.source_bytes()
