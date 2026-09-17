@@ -848,3 +848,69 @@ def test_cluster_delete_waits_for_visibility_after_committed_response(
         cluster, session, "docs", 7, {71}, timeout_s=1.0
     )
     assert len(calls) == 1
+
+
+def _replicated_cluster_snapshot(table_id=7, groups=(71, 72, 73)):
+    return {
+        "tables": [{"table_id": table_id, "name": "docs"}],
+        "ranges": [{"table_id": table_id, "group_id": group} for group in groups],
+        "placement_intents": [
+            {"record": {"group_id": group, "local_node_id": node}}
+            for group in groups
+            for node in (4, 5, 6)
+        ],
+        "merged_group_statuses": [
+            {
+                "group_id": group,
+                "leader_known": True,
+                "voter_count_known": True,
+                "voter_count": 3,
+                "healthy_voter_reports": 3,
+            }
+            for group in groups
+        ],
+    }
+
+
+def test_cluster_replication_returns_topology_without_a_second_probe():
+    observations = iter(
+        [[_replicated_cluster_snapshot() for _ in range(3)], [None] * 3]
+    )
+    cluster = SimpleNamespace(
+        assert_processes_alive=lambda: None,
+        metadata_snapshots=lambda: next(observations),
+    )
+    topology = backups.ThreeByThreeBackupCluster.fully_replicated_topology(
+        cluster, "docs"
+    )
+    assert topology == (7, {71, 72, 73})
+    # A later transient probe failure cannot invalidate the completed observation.
+    assert (
+        backups.ThreeByThreeBackupCluster.fully_replicated_topology(cluster, "docs")
+        is None
+    )
+    assert topology == (7, {71, 72, 73})
+
+
+@pytest.mark.parametrize(
+    "defect", ["table_identity", "group_identity", "placement", "health", "missing"]
+)
+def test_cluster_replication_requires_matching_ready_topology_on_every_node(defect):
+    snapshots = [_replicated_cluster_snapshot() for _ in range(3)]
+    if defect == "table_identity":
+        snapshots[2] = _replicated_cluster_snapshot(table_id=8)
+    elif defect == "group_identity":
+        snapshots[2] = _replicated_cluster_snapshot(groups=(81, 82, 83))
+    elif defect == "placement":
+        snapshots[2]["placement_intents"].pop()
+    elif defect == "health":
+        snapshots[2]["merged_group_statuses"][0]["healthy_voter_reports"] = 2
+    else:
+        snapshots[2] = None
+    cluster = SimpleNamespace(
+        assert_processes_alive=lambda: None, metadata_snapshots=lambda: snapshots
+    )
+    assert (
+        backups.ThreeByThreeBackupCluster.fully_replicated_topology(cluster, "docs")
+        is None
+    )

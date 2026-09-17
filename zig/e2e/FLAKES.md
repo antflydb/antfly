@@ -21,6 +21,10 @@ Run profiles sequentially at the scheduled two-cluster limit: a four-cluster loc
 experiment exhausted TCP ports. Its fatal generic HTTP write error also led to a
 deterministic socket-reset regression and transport-identity fix; see the runtime
 record for the failed experiment and its limits.
+The merged executable also exposed a redundant topology-probe failure after a
+successful restore and replication check. The check now returns the same agreed
+table/group identities it validated across all metadata nodes, removing the second
+optional read while retaining the incarnation and per-data-node content checks.
 
 ## 2026-09-16: constrained Autograph restart exited during teardown
 

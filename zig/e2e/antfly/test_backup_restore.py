@@ -920,13 +920,14 @@ class ThreeByThreeBackupCluster:
                 return False
         return True
 
-    def table_is_fully_replicated(self, table_name: str) -> bool:
+    def fully_replicated_topology(self, table_name: str) -> tuple[int, set[int]] | None:
         self.assert_processes_alive()
         expected_node_ids = set(range(4, 7))
         snapshots = self.metadata_snapshots()
         if any(snapshot is None for snapshot in snapshots):
-            return False
+            return None
 
+        topology = None
         for snapshot in snapshots:
             assert snapshot is not None
             table_id = next(
@@ -939,7 +940,7 @@ class ThreeByThreeBackupCluster:
                 None,
             )
             if table_id is None:
-                return False
+                return None
             group_ids = {
                 int(record.get("group_id", 0))
                 for record in snapshot.get("ranges", [])
@@ -947,7 +948,7 @@ class ThreeByThreeBackupCluster:
                 and int(record.get("table_id", 0)) == table_id
             }
             if len(group_ids) != 3:
-                return False
+                return None
 
             placed_nodes_by_group = {group_id: set() for group_id in group_ids}
             for intent in snapshot.get("placement_intents", []):
@@ -965,7 +966,7 @@ class ThreeByThreeBackupCluster:
                 placed_nodes != expected_node_ids
                 for placed_nodes in placed_nodes_by_group.values()
             ):
-                return False
+                return None
 
             statuses = {
                 int(status.get("group_id", 0)): status
@@ -974,7 +975,7 @@ class ThreeByThreeBackupCluster:
                 and int(status.get("group_id", 0)) in group_ids
             }
             if set(statuses) != group_ids:
-                return False
+                return None
             if any(
                 status.get("leader_known") is not True
                 or status.get("voter_count_known") is not True
@@ -982,31 +983,14 @@ class ThreeByThreeBackupCluster:
                 or int(status.get("healthy_voter_reports", 0)) < 3
                 for status in statuses.values()
             ):
-                return False
-        return True
-
-    def table_topology(self, table_name: str) -> tuple[int, set[int]] | None:
-        try:
-            snapshot = self.metadata_snapshot(0, request_timeout_s=1.0)
-        except (AssertionError, requests.RequestException, ValueError):
-            return None
-        table_id = next(
-            (
-                int(table.get("table_id", 0))
-                for table in snapshot.get("tables", [])
-                if isinstance(table, dict)
-                and table.get("logical_name", table.get("name")) == table_name
-            ),
-            None,
-        )
-        if table_id is None:
-            return None
-        group_ids = {
-            int(record.get("group_id", 0))
-            for record in snapshot.get("ranges", [])
-            if isinstance(record, dict) and int(record.get("table_id", 0)) == table_id
-        }
-        return table_id, group_ids
+                return None
+            observed = (table_id, group_ids)
+            if topology is not None and topology != observed:
+                return None
+            topology = observed
+        # Return the exact identities whose placement/status we just checked.
+        # A second HTTP probe can time out even after convergence succeeded.
+        return topology
 
     def restore_progress_cleared(self, table_name: str) -> bool:
         self.assert_processes_alive()
@@ -1647,11 +1631,15 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         {"num_shards": 3, "description": "3x3 backup and restore docs"},
     )
 
-    assert wait_until(
-        lambda: cluster.table_is_fully_replicated(table_name) or None,
+    original_topology = wait_until(
+        lambda: cluster.fully_replicated_topology(table_name),
         timeout_s=90.0,
         interval_s=0.5,
-    ), f"table did not reach 3x3 replication before backup\n{cluster.debug_logs()}"
+    )
+    assert original_topology is not None, (
+        f"table did not reach 3x3 replication before backup\n{cluster.debug_logs()}"
+    )
+    original_table_id, original_group_ids = original_topology
 
     source_docs = {
         "0:backup": {
@@ -1752,10 +1740,9 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         for shard in table_manifest["shards"]
     )
 
-    original_topology = cluster.table_topology(table_name)
-    assert original_topology is not None
-    original_table_id, original_group_ids = original_topology
-    assert len(original_group_ids) == 3
+    assert {
+        int(shard["group_id"]) for shard in table_manifest["shards"]
+    } == original_group_ids
 
     _delete_cluster_table_and_observe(
         cluster, session, table_name, original_table_id, original_group_ids
@@ -1854,13 +1841,14 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     assert restore["committed_table_count"] == 1
     assert restore["failed_table_count"] == 0
 
-    assert wait_until(
-        lambda: cluster.table_is_fully_replicated(table_name) or None,
+    restored_topology = wait_until(
+        lambda: cluster.fully_replicated_topology(table_name),
         timeout_s=90.0,
         interval_s=0.5,
-    ), f"restored table did not converge to 3x3 replication\n{cluster.debug_logs()}"
-    restored_topology = cluster.table_topology(table_name)
-    assert restored_topology is not None
+    )
+    assert restored_topology is not None, (
+        f"restored table did not converge to 3x3 replication\n{cluster.debug_logs()}"
+    )
     restored_table_id, restored_group_ids = restored_topology
     # Drop removes the catalog binding. Restore allocates a new immutable
     # destination so stale cleanup for the source cannot affect restored rows.

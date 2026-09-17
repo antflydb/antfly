@@ -89,6 +89,17 @@ Five harness regressions cover successful observation, missing/incorrect data,
 missing outcome headers, and exactly one mutation attempt. Partial runs from before
 the final production rebuild are excluded from qualification.
 
+The first run against the merged catalog executable completed 12 cases (11 passed,
+one post-restore assertion failure). The restore job succeeded and all metadata
+nodes reported full replication, but a separate one-second topology probe then
+returned `None`. That helper conflated transport/HTTP failures with missing tables,
+so the exact reason for the extra probe's failure was not captured. The replication
+check now returns the exact table/group identities it validated, requires agreement
+across all three metadata nodes, and avoids the redundant probe. Backup manifests
+must match the captured original groups, and restored documents must still be read
+through every data node. Six harness regressions cover a failed later observation,
+inconsistent identities, missing placement, missing health, and missing snapshots.
+
 ## 2026-09-16: replay-retention fixture timed out on a checkpoint proxy
 
 PR #691's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35176786855/job/105060523520)
