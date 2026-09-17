@@ -170,7 +170,7 @@ func (r *AntflyBackupReconciler) backupCatalogEmpty(ctx context.Context, backup 
 	if err != nil {
 		return false, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return false, fmt.Errorf("catalog returned HTTP %d", resp.StatusCode)
 	}
