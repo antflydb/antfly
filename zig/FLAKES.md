@@ -33,6 +33,11 @@ E2E keeps its crash-rejecting teardown assertion.
 The deterministic regression fails before the fix in `endGroupOperationLocked`
 and passes afterwards. The full writer lifecycle target passes all 228 tests;
 the merged error-ABI suites pass all 17 tests.
+On macOS ARM64, the rebuilt Debug and ReleaseSafe production executables each
+pass all 35 resolution/Autograph module cases (including data-node restart) and
+20 fresh-cluster repetitions of the originally failing exact-candidate case.
+That is 40/40 additional shutdown repetitions with the crash assertion enabled.
+Linux CI must still confirm the original platform.
 
 ## 2026-09-16: constrained Autograph restart lost retryable owner admission
 
