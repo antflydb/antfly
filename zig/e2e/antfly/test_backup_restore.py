@@ -78,11 +78,16 @@ def _lookup_doc(stateful_api, table_name: str, key: str) -> dict | None:
 
 
 def _lookup_doc_from_url(
-    session: requests.Session, api_url: str, table_name: str, key: str
+    session: requests.Session,
+    api_url: str,
+    table_name: str,
+    key: str,
+    *,
+    timeout_s=10.0,
 ) -> dict | None:
     try:
         response = session.get(
-            f"{api_url}/tables/{table_name}/documents/{key}", timeout=10
+            f"{api_url}/tables/{table_name}/documents/{key}", timeout=timeout_s
         )
         if response.status_code >= 400:
             return None
@@ -357,11 +362,12 @@ def _create_cluster_table_when_admitted(
 
 def _seed_cluster_docs_when_writable(
     cluster, session: requests.Session, table_name: str, docs: dict, *, timeout_s=30.0
-) -> dict:
+) -> dict | None:
     # Replication status is an observation, not a lease on the data leader or
     # its routing catalog. Seed through the write API's admission contract.
-    # Only this explicit pre-commit response permits a fresh batch attempt;
-    # transport failures and ambiguous/post-commit outcomes must remain errors.
+    # Only explicit pre-commit rejection permits a fresh batch attempt. An
+    # uncertain transaction is never replayed: require every expected document
+    # to become visible before treating setup as complete.
     deadline = time.monotonic() + timeout_s
     last_response: requests.Response | None = None
 
@@ -378,15 +384,54 @@ def _seed_cluster_docs_when_writable(
             and last_response.text.strip() == "write unavailable"
         ):
             return None
+        if last_response.status_code == 409:
+            try:
+                payload = last_response.json()
+            except ValueError:
+                payload = None
+            if (
+                isinstance(payload, dict)
+                and payload.get("code") == "transaction_outcome_unknown"
+                and payload.get("retryable") is False
+            ):
+                return payload
         return _check_response(last_response)
 
     try:
         batch = wait_until(attempt, timeout_s=timeout_s, interval_s=0.1)
         assert batch is not None, f"table {table_name} did not become writable"
+        if batch.get("code") == "transaction_outcome_unknown":
+
+            def committed() -> bool:
+                cluster.assert_processes_alive()
+                for key, expected in docs.items():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    actual = _lookup_doc_from_url(
+                        session,
+                        cluster.data_api_urls[0],
+                        table_name,
+                        key,
+                        timeout_s=min(10.0, remaining),
+                    )
+                    if actual != expected:
+                        return False
+                return True
+
+            assert docs and wait_until(
+                committed,
+                timeout_s=max(0.0, deadline - time.monotonic()),
+                interval_s=0.1,
+            ), "uncertain seed transaction did not commit every expected document"
+            print(
+                "backup seed commit confirmed by document reads; batch was not replayed"
+            )
+            return None
         return batch
     except (AssertionError, requests.RequestException) as exc:
-        # Ambiguous outcomes must stay failures, but preserve the routing and
-        # proposal diagnostics before teardown removes this six-process cluster.
+        # Preserve routing and proposal diagnostics for unresolved outcomes
+        # before teardown removes this six-process cluster.
         raise AssertionError(
             f"backup table {table_name} seed failed: {exc}; "
             f"last_status={last_response.status_code if last_response is not None else None}; "
@@ -394,6 +439,44 @@ def _seed_cluster_docs_when_writable(
             f"last_response={last_response.text if last_response is not None else None}\n"
             f"{cluster.debug_logs()}"
         ) from exc
+
+
+def _delete_cluster_table_and_observe(
+    cluster,
+    session: requests.Session,
+    table_name: str,
+    table_id: int,
+    group_ids: set[int],
+    *,
+    timeout_s=30.0,
+) -> None:
+    deleted = session.delete(
+        f"{cluster.data_api_urls[0]}/tables/{table_name}", timeout=timeout_s
+    )
+    known_commit = deleted.status_code == 204 or (
+        deleted.status_code == 202
+        and deleted.json().get("status") == "committed_repair_required"
+    )
+    unknown = (
+        deleted.status_code == 409
+        and deleted.headers.get("X-Antfly-Raft-Mutation-Outcome") == "unknown-v1"
+        and deleted.text.strip()
+        == "table mutation outcome is unknown; observe table state before retrying"
+    )
+    assert known_commit or unknown, f"delete={deleted.text}\n{cluster.debug_logs()}"
+
+    # Observe the original table/range identities disappearing everywhere. Never
+    # replay an uncertain delete, which could otherwise delete a restored table.
+    def absent() -> bool:
+        cluster.assert_processes_alive()
+        return cluster.table_absent_on_all_metadata_nodes(
+            table_name, table_id, group_ids
+        )
+
+    assert wait_until(absent, timeout_s=timeout_s, interval_s=0.5), (
+        f"table remained in metadata after delete; status={deleted.status_code}; "
+        f"response={deleted.text}\n{cluster.debug_logs()}"
+    )
 
 
 def _is_metadata_not_leader_response(response: requests.Response) -> bool:
@@ -1574,7 +1657,8 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         },
     }
     batch = _seed_cluster_docs_when_writable(cluster, session, table_name, source_docs)
-    assert batch["inserted"] == len(source_docs)
+    if batch is not None:
+        assert batch["inserted"] == len(source_docs)
     assert wait_until(
         lambda: (
             True
@@ -1662,21 +1746,9 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     original_table_id, original_group_ids = original_topology
     assert len(original_group_ids) == 3
 
-    deleted = session.delete(f"{data_api_url}/tables/{table_name}", timeout=30)
-    assert deleted.status_code == 204 or (
-        deleted.status_code == 202
-        and deleted.json().get("status") == "committed_repair_required"
-    ), f"delete={deleted.text}\n{cluster.debug_logs()}"
-    assert wait_until(
-        lambda: (
-            cluster.table_absent_on_all_metadata_nodes(
-                table_name, original_table_id, original_group_ids
-            )
-            or None
-        ),
-        timeout_s=30.0,
-        interval_s=0.5,
-    ), f"table remained in metadata after delete\n{cluster.debug_logs()}"
+    _delete_cluster_table_and_observe(
+        cluster, session, table_name, original_table_id, original_group_ids
+    )
 
     restore_response = None
     restore_coordinator_url = None

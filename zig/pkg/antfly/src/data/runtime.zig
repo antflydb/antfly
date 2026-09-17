@@ -20960,7 +20960,9 @@ const RemoteMetadataSource = struct {
                 if (deadline_ns) |deadline| {
                     if (self.awakeNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
                 }
-                ranges[initialized] = try antfly.metadata.table_manager.cloneRoutingRange(self.alloc, range);
+                // Point reads feed storage-owner admission and must retain the
+                // immutable restore binding; only catalog-wide routes are compact.
+                ranges[initialized] = try antfly.metadata.table_manager.cloneRange(self.alloc, range);
                 initialized += 1;
             }
         }
@@ -44642,11 +44644,19 @@ fn implementationTests() type {
             try std.testing.expect(server.lsm_maintenance_future == null);
         }
 
-        test "remote routing capture cache and session share a virtual deadline clock" {
+        test "remote routing point reads retain restore identity and share a virtual deadline clock" {
             const alloc = std.testing.allocator;
             var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{});
             defer vopr_io.deinit();
             const Stub = struct {
+                const identity: @import("../storage/restore_identity.zig").Identity = .{
+                    .backup_id = "backup",
+                    .location = "file:///backup",
+                    .snapshot_path = "groups/71.afb",
+                    .artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    .native_manifest_size_bytes = 123,
+                    .native_manifest_sha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                };
                 calls: usize = 0,
                 fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -44660,7 +44670,18 @@ fn implementationTests() type {
                             .metadata_incarnation = .{'1'} ** 32,
                             .catalog_revision = 9,
                             .tables = @constCast(&[_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }}),
-                            .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{ .table_id = 7, .group_id = 71, .range_id = 71, .start_key = "" }}),
+                            .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{
+                                .table_id = 7,
+                                .group_id = 71,
+                                .range_id = 71,
+                                .start_key = "",
+                                .restore_backup_id = identity.backup_id,
+                                .restore_location = identity.location,
+                                .restore_snapshot_path = identity.snapshot_path,
+                                .restore_artifact_sha256 = identity.artifact_sha256,
+                                .restore_native_manifest_size_bytes = identity.native_manifest_size_bytes,
+                                .restore_native_manifest_sha256 = identity.native_manifest_sha256,
+                            }}),
                         }, .{});
                     };
                     return .{ .status = 200, .body = body };
@@ -44673,6 +44694,7 @@ fn implementationTests() type {
             var captured = try source.remoteRoutingSnapshotWithMode(deadline, false);
             defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &captured);
             try std.testing.expectEqual(@as(u64, 9), captured.catalog_revision);
+            try std.testing.expectEqualStrings("", captured.ranges[0].restore_backup_id);
             const calls_after_capture = stub.calls;
             var cached = try source.remoteRoutingSnapshotWithMode(deadline, false);
             defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &cached);
@@ -44686,7 +44708,22 @@ fn implementationTests() type {
                 defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &table);
                 try std.testing.expectEqualStrings("docs", table.tables[0].name);
                 try std.testing.expectEqual(@as(usize, 1), table.ranges.len);
+                const range = table.ranges[0];
+                try std.testing.expect(Stub.identity.eql(.{
+                    .backup_id = range.restore_backup_id,
+                    .location = range.restore_location,
+                    .snapshot_path = range.restore_snapshot_path,
+                    .artifact_sha256 = range.restore_artifact_sha256,
+                    .native_manifest_size_bytes = range.restore_native_manifest_size_bytes,
+                    .native_manifest_sha256 = range.restore_native_manifest_sha256,
+                }));
             }
+            // The real storage-owner consumer must receive the complete binding,
+            // even after this source has populated its compact routing cache.
+            var descriptor = (try antfly.public_api.table_catalog.tableGroupDescriptorProjection(alloc, source.catalogSource(), "docs", 71, deadline)).?;
+            defer descriptor.deinit(alloc);
+            try std.testing.expect(descriptor.restore != null);
+            try std.testing.expect(Stub.identity.eql(descriptor.restore.?));
             vopr_io.monotonic_ns = deadline;
             try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, session.catalog().budget(deadline).checkpoint());
             try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.remoteRoutingSnapshotWithMode(deadline, false));

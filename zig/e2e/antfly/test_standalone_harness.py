@@ -742,3 +742,87 @@ def test_wait_until_preserves_nonretryable_service_unavailable():
         helpers.wait_until(probe, timeout_s=1.0)
 
     assert raised.value is expected
+
+
+@pytest.mark.parametrize("visible", [True, False])
+def test_cluster_seed_observes_uncertain_commit_without_replaying(monkeypatch, visible):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch,
+        [(409, b'{"code":"transaction_outcome_unknown","retryable":false}')],
+    )
+    docs = {"a": {"title": "a"}, "b": {"title": "b"}}
+    reads = []
+
+    def lookup(_session, _url, _table, key, **_kwargs):
+        reads.append(key)
+        return docs[key] if visible or key == "a" else {"title": "wrong"}
+
+    monkeypatch.setattr(backups, "_lookup_doc_from_url", lookup)
+    if visible:
+        assert (
+            backups._seed_cluster_docs_when_writable(
+                cluster, session, "docs", docs, timeout_s=0.25
+            )
+            is None
+        )
+        assert reads == ["a", "b"]
+    else:
+        with pytest.raises(
+            AssertionError, match="did not commit every expected document"
+        ):
+            backups._seed_cluster_docs_when_writable(
+                cluster, session, "docs", docs, timeout_s=0.25
+            )
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("absent", [True, False])
+def test_cluster_delete_observes_uncertain_commit_without_replaying(
+    monkeypatch, absent
+):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch,
+        [
+            (
+                409,
+                b"table mutation outcome is unknown; observe table state before retrying",
+                {"X-Antfly-Raft-Mutation-Outcome": "unknown-v1"},
+            )
+        ],
+    )
+    session.delete = session.post
+    observations = []
+
+    def check(table, table_id, group_ids):
+        observations.append((table, table_id, group_ids))
+        return absent
+
+    cluster.table_absent_on_all_metadata_nodes = check
+    if absent:
+        backups._delete_cluster_table_and_observe(
+            cluster, session, "docs", 7, {71, 72, 73}, timeout_s=0.5
+        )
+    else:
+        with pytest.raises(AssertionError, match="table remained in metadata"):
+            backups._delete_cluster_table_and_observe(
+                cluster, session, "docs", 7, {71, 72, 73}, timeout_s=0.5
+            )
+    assert observations
+    assert all(item == ("docs", 7, {71, 72, 73}) for item in observations)
+    assert len(calls) == 1
+
+
+def test_cluster_delete_rejects_unknown_without_outcome_contract(monkeypatch):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch,
+        [
+            (
+                409,
+                b"table mutation outcome is unknown; observe table state before retrying",
+            )
+        ],
+    )
+    session.delete = session.post
+    with pytest.raises(AssertionError, match="delete="):
+        backups._delete_cluster_table_and_observe(cluster, session, "docs", 7, {71})
+    assert len(calls) == 1

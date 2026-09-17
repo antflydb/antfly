@@ -1677,6 +1677,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "DataServer store status",
             "data runtime runRound backs off retryable provision metadata failures",
             "data runtime provisioned root refresh worker backs off retryable metadata failures",
+            "remote routing point reads retain restore identity",
             "data runtime split apply store seeding reuses cached source writer",
             "data raft retry checkpoints survive changed ready windows and publication failure",
         },
