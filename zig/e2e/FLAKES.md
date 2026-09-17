@@ -13,8 +13,10 @@ for evidence, the compiled-owner regression, and production admission fix.
 Scheduled VOPR qualification now runs the seeded admission histories; the production
 soak runs this exact E2E 50 times with normal limits and 50 times with 256 descriptors.
 The test preserves one restore idempotency key across uncertain admission, accepts
-only documented committed delete outcomes, and retains the original 120-second
-completion assertion. Timeout diagnostics include fresh metadata and observed jobs.
+documented committed or uncertain delete outcomes only after observing catalog
+absence, and retains the original 120-second completion assertion. An uncertain
+seed batch is never replayed and must converge to every expected document's exact
+payload within its existing budget. Unresolved or partial outcomes still fail. Timeout diagnostics include fresh metadata and observed jobs.
 Run profiles sequentially at the scheduled two-cluster limit: a four-cluster local
 experiment exhausted TCP ports. Its fatal generic HTTP write error also led to a
 deterministic socket-reset regression and transport-identity fix; see the runtime

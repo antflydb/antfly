@@ -19,7 +19,11 @@ repeated generation-transition admission errors. A deterministic compiled-owner
 regression then forced catalog visibility before bootstrap import: reconciliation
 incorrectly returned `complete` and retained an empty physical owner. Its generation
 reader prevents bootstrap's exclusive import, so retrying bootstrap cannot heal it.
-The point catalog projection also stripped the restore binding from range records.
+Both the server point catalog projection and the remote metadata client's owned
+point snapshot stripped the restore binding from range records. A regression using
+the real remote source on `VoprIo` fails before the client fix and verifies that
+both point-read modes and the final owner descriptor retain the exact binding,
+even after warming the compact catalog-wide routing cache.
 
 Owner descriptors now retain the range's restore identity. Before opening a cold
 owner, the storage kernel verifies that the published generation contains the exact
@@ -74,6 +78,16 @@ their identity. Executor tests cover GET/POST, one write attempt, delivery state
 and pool retirement; the VOPR status test covers delayed socket failures and the
 existing backoff/deadline rules. The injected regression establishes this transport
 bug, although the retained process log cannot identify the original socket errno.
+
+An intermediate two-worker run completed 18 cases (16 passed, two setup failures)
+before review found the missing remote client projection. The setup failures were
+explicit uncertain delete and stateless batch outcomes. The harness now observes
+all original table/range identities disappearing after an uncertain delete, and
+requires every seeded document's complete payload to appear after an uncertain
+batch. It never replays those mutations or treats unresolved outcomes as success.
+Five harness regressions cover successful observation, missing/incorrect data,
+missing outcome headers, and exactly one mutation attempt. Partial runs from before
+the final production rebuild are excluded from qualification.
 
 ## 2026-09-16: constrained Autograph restart lost retryable owner admission
 
