@@ -43,6 +43,9 @@ type Config struct {
 	InferenceBaseURL string
 	// HTTPClient is shared by Antfly and inference clients when provided.
 	HTTPClient *http.Client
+	// Admission optionally bounds this client's outstanding operations and local
+	// waiting. Reuse the Client and close streaming responses to return capacity.
+	Admission *ClientAdmission
 	// RequestEditors are applied to both Antfly and inference requests. Use
 	// WithBasicAuth, WithApiKey, or WithToken for authentication.
 	RequestEditors []oapi.RequestEditorFn
@@ -58,6 +61,18 @@ type Client struct {
 // NewClient creates a consolidated SDK client. The generated client uses the
 // public contract rooted at /db/v1, /auth/v1, and /ai/v1.
 func NewClient(config Config) (*Client, error) {
+	if config.Admission != nil {
+		client := http.Client{}
+		if config.HTTPClient != nil {
+			client = *config.HTTPClient
+		}
+		transport, err := newAdmissionTransport(client.Transport, *config.Admission)
+		if err != nil {
+			return nil, err
+		}
+		client.Transport = transport
+		config.HTTPClient = &client
+	}
 	baseURL := strings.TrimRight(config.BaseURL, "/")
 	antflyOptions := make([]oapi.ClientOption, 0, len(config.RequestEditors)+1)
 	inferenceOptions := make([]oapi.ClientOption, 0, len(config.RequestEditors)+1)
@@ -182,6 +197,13 @@ type APIError struct {
 	// RawBody retains the bounded structured response for forward-compatible
 	// inspection when no more specific convenience error is available.
 	RawBody json.RawMessage
+	// Reason and Stage identify admission overload and where it occurred.
+	Reason string
+	Stage  string
+	// ExecutionStarted is nil when the server has not established whether work
+	// began. Do not interpret an absent value as a definitely unexecuted write.
+	ExecutionStarted  *bool
+	RetryAfterSeconds int
 }
 
 // GraphQueryError preserves one graph-specific 422 response as its selected
@@ -328,6 +350,9 @@ type structuredAPIErrorResponse struct {
 	RetryAfterMS     int    `json:"retry_after_ms"`
 	BackupID         string `json:"backup_id"`
 	ArtifactBackupID string `json:"artifact_backup_id"`
+	Reason           string `json:"reason"`
+	Stage            string `json:"stage"`
+	ExecutionStarted *bool  `json:"execution_started"`
 }
 
 func queryRetryAfterSeconds(header http.Header) int {
@@ -497,10 +522,14 @@ func readErrorResponse(resp *http.Response) error {
 			message = stableCode
 		}
 		return &APIError{
-			StatusCode: resp.StatusCode,
-			Code:       stableCode,
-			Message:    message,
-			RawBody:    respBody,
+			StatusCode:        resp.StatusCode,
+			Code:              stableCode,
+			Message:           message,
+			RawBody:           respBody,
+			Reason:            errResp.Reason,
+			Stage:             errResp.Stage,
+			ExecutionStarted:  errResp.ExecutionStarted,
+			RetryAfterSeconds: queryRetryAfterSeconds(resp.Header),
 		}
 	}
 
