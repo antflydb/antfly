@@ -33387,7 +33387,23 @@ pub const DB = struct {
     }
 
     fn portableImportTargetEmptyLocked(self: *DB, alloc: Allocator) !bool {
-        if (self.core.schema != null or self.core.indexCount() != 0) return false;
+        if (self.core.schema != null) return false;
+        // Every Lite database is now provisioned with the default full-text
+        // index at creation, matching the server's table-create behavior, so
+        // a target carrying only that pristine index is still eligible for a
+        // full physical import. Anything beyond that single default index
+        // means the target has been configured and must not be silently
+        // overwritten.
+        switch (self.core.indexCount()) {
+            0 => {},
+            1 => {
+                const configs = try self.core.listIndexes(alloc);
+                defer types.freeIndexConfigs(alloc, configs);
+                if (configs.len != 1 or configs[0].kind != .full_text or
+                    !std.mem.eql(u8, configs[0].name, "full_text_index_v0")) return false;
+            },
+            else => return false,
+        }
 
         // Primary rows can be empty while durable identity tombstones and
         // forward/reverse mappings remain. Publishing over that state would

@@ -651,6 +651,19 @@ const Handle = struct {
     storage_owner_context: ?*StorageOwnerContext = null,
     storage_owner_transaction_recovery: ?*StorageOwnerTransactionRecovery = null,
     storage_owner_runtime_hooks: ?*StorageOwnerRuntimeHooks = null,
+    // Present only for a Lite handle opened with the local-runtime-configured
+    // flag on a build that both advertises and actually links the local
+    // inference runtime (see capi_build_options.inference_enabled and
+    // pkg/antfly/build/runtime.zig's addCapiInferenceVariantUnits). Default
+    // libantfly and Lite handles opened without the flag leave these null,
+    // which keeps today's behavior unchanged.
+    lite_inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
+    lite_inference_io: ?*std.Io.Threaded = null,
+
+    fn liteAntflyProvider(self: *Handle) ?managed_embedder.AntflyProvider {
+        const lifetime = if (self.lite_inference_lifetime) |*value| value else return null;
+        return inference_provider.inferenceBoundaryProvider(lifetime);
+    }
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -714,6 +727,216 @@ const StorageSnapshot = struct {
     }
 };
 
+/// Starts the embedded inference provider owned by a Lite handle. Callers
+/// must only invoke this when `capi_build_options.inference_enabled` is true
+/// (only true for the isolated `-Dcapi-inference=true` storage_kernel unit
+/// and for unit tests): that is the only context where the real inference
+/// runtime archive is linked in this binary instead of the
+/// capi/link_anchor(_inference).zig trap.
+fn startLiteEmbeddedInference(handle: *Handle, alloc: Allocator, path: []const u8) !void {
+    const io_impl = try alloc.create(std.Io.Threaded);
+    errdefer alloc.destroy(io_impl);
+    io_impl.* = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    errdefer io_impl.deinit();
+    const data_dir = std.fs.path.dirname(path) orelse ".";
+    const created = try inference_provider.createEmbeddedInferenceNode(data_dir, io_impl.io());
+    handle.lite_inference_io = io_impl;
+    handle.lite_inference_lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner };
+}
+
+fn stopLiteEmbeddedInference(handle: *Handle) void {
+    if (handle.lite_inference_lifetime) |*lifetime| {
+        lifetime.quiesce();
+        inference_provider.destroyEmbeddedInferenceNode(lifetime.handle, lifetime.resource_owner);
+        handle.lite_inference_lifetime = null;
+    }
+    if (handle.lite_inference_io) |io_impl| {
+        io_impl.deinit();
+        handle.alloc.destroy(io_impl);
+        handle.lite_inference_io = null;
+    }
+}
+
+/// `managed_embedder.zig`'s index scanner only recognizes an entry as a
+/// managed embeddings producer when it carries the public
+/// `"type":"embeddings"` marker, matching the shape a server table stores
+/// (see the `EmbeddingsIndexConfig` OpenAPI schema). Lite's own raw
+/// `config_json` for a dense_vector/sparse_vector index uses lower-level,
+/// pre-existing field names instead ("dims"/"metric" rather than
+/// "dimension"/"distance_metric", and no "type" at all -- confirmed against
+/// examples/dogfood's index_config.go), so without this the entry is
+/// silently skipped by `parseManagedEmbeddingEntry` rather than erroring.
+/// Bridges the gap by injecting the marker (and a "dimension" alias of
+/// "dims" so a known vector width skips the capability-discovery probe)
+/// without touching any field the caller supplied. Falls back to passing
+/// `config_json` through unchanged for any other index kind, or if it fails
+/// to parse as a JSON object.
+fn liteManagedEmbeddingIndexConfigJson(
+    alloc: Allocator,
+    kind: db_mod.types.IndexKind,
+    config_json: []const u8,
+) ![]u8 {
+    if (kind != .dense_vector and kind != .sparse_vector) return try alloc.dupe(u8, config_json);
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, config_json, .{}) catch
+        return try alloc.dupe(u8, config_json);
+    if (parsed.value != .object) return try alloc.dupe(u8, config_json);
+
+    if (parsed.value.object.get("type") == null) {
+        try parsed.value.object.put(arena, "type", .{ .string = "embeddings" });
+    }
+    if (kind == .sparse_vector and parsed.value.object.get("sparse") == null) {
+        try parsed.value.object.put(arena, "sparse", .{ .bool = true });
+    }
+    if (parsed.value.object.get("dimension") == null) {
+        if (parsed.value.object.get("dims")) |dims_value| {
+            try parsed.value.object.put(arena, "dimension", dims_value);
+        }
+    }
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
+}
+
+/// Server table provisioning never calls `db.addIndex` with a caller's raw
+/// dense/sparse config: `metadata_table_provisioner.extractIndexConfigJsonForKind`
+/// first runs it through `managed_embedder.translateEmbeddingsIndexConfigJson`,
+/// which is what attaches the internal `"generator"` section that
+/// `index_manager`'s `hasGeneratedEnrichmentTargets`/`appendGeneratedEnrichments`
+/// need to ever schedule a document's field for embedding. A native Lite
+/// handle calling `db.addIndex` directly skipped that step entirely, so even
+/// after `refreshLiteManagedEmbeddingRuntime` wires up a working embedder,
+/// the physical index never asks it for anything: `parseDenseConfig` only
+/// looks at `field`/`dims`/`metric`/`embedding_name`/`external`, and nothing
+/// else marks the index as awaiting generated content. Runs the same
+/// translation here so what gets stored via `db.addIndex` matches what the
+/// server would have stored. Falls back to the untranslated config on any
+/// translation error (for example a managed, non-external index with
+/// neither `embedder` nor `chunker` configured) so a Lite caller that never
+/// relied on this feature keeps today's permissive, pass-through behavior;
+/// `refreshLiteManagedEmbeddingRuntime` is likewise a no-op for such an
+/// index.
+fn litePhysicalIndexConfigJson(
+    alloc: Allocator,
+    kind: db_mod.types.IndexKind,
+    name: []const u8,
+    config_json: []const u8,
+    provider: ?managed_embedder.AntflyProvider,
+) ![]u8 {
+    if (kind != .dense_vector and kind != .sparse_vector) return try alloc.dupe(u8, config_json);
+    const bridged = try liteManagedEmbeddingIndexConfigJson(alloc, kind, config_json);
+    defer alloc.free(bridged);
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, bridged, .{}) catch
+        return try alloc.dupe(u8, config_json);
+    // `provider` must be threaded through here too: an embedder with no
+    // `api_url` translates to a durable `"antfly:embedded"` semantic
+    // producer identity, and the translator rejects that identity outright
+    // when no embedded provider is attached to validate it against.
+    return managed_embedder.translateEmbeddingsIndexConfigJsonWithOptions(alloc, name, parsed.value, .{ .antfly_provider = provider }) catch {
+        // A translation failure (for example dimension auto-detection
+        // requiring a live round trip this call cannot make) must not turn
+        // into a hard AddIndex error. Fall back to the bridged config, but
+        // `index_manager.parseDenseConfig` hard-requires `field` on every
+        // dense/sparse entry -- callers who omit it entirely (relying on
+        // translation to supply the artifact-storage default) would
+        // otherwise fail `db.addIndex` outright instead of landing in the
+        // same "no managed producer configured" no-op state as any other
+        // untranslatable config.
+        if (parsed.value == .object and parsed.value.object.get("field") == null) {
+            parsed.value.object.put(arena, "field", .{ .string = "embedding" }) catch
+                return try alloc.dupe(u8, config_json);
+            return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
+        }
+        return try alloc.dupe(u8, config_json);
+    };
+}
+
+/// Rebuilds the DB's managed embedding/chunking/extraction runtime from the
+/// currently declared indexes and enrichments. Provider "antfly" producers
+/// with no `api_url` route through the Lite handle's embedded inference
+/// provider when one exists (see `startLiteEmbeddedInference`); producers
+/// that carry their own `api_url` call that remote Antfly inference service
+/// directly and work fine with a null local provider. Scoped to the native
+/// profile: hosted Lite handles are reconciled by their owning process and
+/// non-Lite (storage-owner) handles are reconciled through
+/// `configureStorageKernelOwnerDb` instead. Includes every declared index
+/// kind (not just dense/sparse vector) plus standalone enrichments so a
+/// graph index's asset-producer extractor and any chunk enrichments are
+/// discovered the same way `indexesJsonNeedsAssetProducer` /
+/// `indexesJsonHasGeneratedEnrichment` discover them for the server. A
+/// database with neither a local provider nor any producer `api_url`
+/// resolves an empty producer set, which is a safe no-op: pending work stays
+/// visible and neither open nor AddIndex/AddEnrichment errors.
+/// Builds the merged `{"<index_name>":<bridged_config_json>, ...}` blob both
+/// `refreshLiteManagedEmbeddingRuntime` (write-time enrichment wiring) and
+/// `LiteSemanticResolver` (query-time `semantic_search` embedding) feed to
+/// `managed_embedder.zig`. Every index kind is included, not just
+/// dense_vector/sparse_vector: `indexesJsonNeedsAssetProducer`/
+/// `indexesJsonHasGeneratedEnrichment` recursively scan the whole merged
+/// object for a nested `"kind":"asset","producer_json":...}` object (see
+/// examples/dogfood's knowledgeGraphIndexJSON, which declares the graph
+/// index's extractor exactly that way, under an "artifact" key inside the
+/// graph index's own config), so a graph/full_text/algebraic index must not
+/// be filtered out here even though `managed_embedder.zig`'s embedder
+/// scanner only ever recognizes a dense_vector/sparse_vector entry.
+/// `liteManagedEmbeddingIndexConfigJson` passes every other kind through
+/// unchanged. Caller owns the returned slice.
+fn liteMergedIndexesJsonAlloc(handle: *Handle) ![]u8 {
+    const alloc = handle.alloc;
+    const configs = try handle.db.listIndexes(alloc);
+    defer db_mod.types.freeIndexConfigs(alloc, configs);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.append(alloc, '{');
+    var wrote_any = false;
+    for (configs) |cfg| {
+        if (wrote_any) try buf.append(alloc, ',');
+        wrote_any = true;
+        const escaped_name = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cfg.name, .{})});
+        defer alloc.free(escaped_name);
+        try buf.appendSlice(alloc, escaped_name);
+        try buf.append(alloc, ':');
+        const entry_config_json = try liteManagedEmbeddingIndexConfigJson(alloc, cfg.kind, cfg.config_json);
+        defer alloc.free(entry_config_json);
+        try buf.appendSlice(alloc, entry_config_json);
+    }
+    try buf.append(alloc, '}');
+    return try buf.toOwnedSlice(alloc);
+}
+
+fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
+    if (handle.lite_profile != .native) return;
+    // A read-only/status-only handle has nothing to reconcile toward, and
+    // `db.reconfigureEnrichmentRuntime` unconditionally fails with
+    // `error.ReadOnly` on one -- before it even looks at whether there is
+    // anything to configure. Every open of an already-written native Lite
+    // database (query_readonly, status_only) would otherwise fail outright.
+    if (!liteOpenModeCanWrite(handle.open_mode)) return;
+    const provider = handle.liteAntflyProvider();
+    const alloc = handle.alloc;
+    const merged_json = try liteMergedIndexesJsonAlloc(handle);
+    defer alloc.free(merged_json);
+
+    try local_write.reconfigureManagedDbEnrichmentRuntime(
+        alloc,
+        &handle.db,
+        merged_json,
+        handle.db.backend_runtime,
+        provider,
+        null,
+        null,
+        "",
+        null,
+        null,
+    );
+}
+
 fn closeHandle(handle: *Handle) void {
     const storage_owner_context = handle.storage_owner_context;
     const storage_owner_transaction_recovery = handle.storage_owner_transaction_recovery;
@@ -723,6 +946,7 @@ fn closeHandle(handle: *Handle) void {
         handle.db.syncIndexes(true) catch {};
     }
     handle.db.close();
+    stopLiteEmbeddedInference(handle);
     if (storage_owner_transaction_recovery) |recovery| {
         recovery.deinit();
         handle.alloc.destroy(recovery);
@@ -7021,6 +7245,17 @@ fn openLiteHandleAllocWithRuntime(
     var db = try db_mod.DB.open(alloc, path, opts);
     errdefer db.close();
 
+    if (create) {
+        // Antfly Lite databases provision the same default full-text index
+        // the server provisions on every table create, so text search works
+        // out of the box without a separate `lite index create` step.
+        try db.addIndex(.{
+            .name = tables_api.default_full_text_index_name,
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+    }
+
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
     errdefer alloc.destroy(handle);
     handle.* = .{
@@ -7030,6 +7265,32 @@ fn openLiteHandleAllocWithRuntime(
         .owned_lite_backend = backend,
         .lite_profile = resolved.profile,
         .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
+    };
+    // Only the native profile runs background enrichment automatically;
+    // only builds that both advertise (lite-local-inference-runtime) and
+    // actually link (capi_build_options.inference_enabled) the local
+    // inference runtime may construct one. Every other combination -- flag
+    // unset, default build, hosted profile -- leaves the handle exactly as
+    // it was before this feature existed.
+    if (resolved.profile == .native and
+        resolved.inference.local_runtime_configured and
+        capi_build_options.inference_enabled and
+        lite_backend.capabilitiesForProfile(.native).local_inference_runtime)
+    {
+        // `backend.deinit()`, `db.close()`, and `alloc.destroy(handle)` are
+        // already registered as `errdefer`s above (in that unwind order);
+        // adding any of that cleanup here too would run it twice on this
+        // error path. Only unwind the state this function itself owns.
+        try startLiteEmbeddedInference(handle, alloc, path);
+    }
+    // Restores the managed enrichment runtime for indexes/enrichments that
+    // were already declared in a prior session (`create` only ever adds the
+    // default full-text index, so this is a no-op there). Must run after
+    // `startLiteEmbeddedInference` so an embedded local provider is already
+    // attached to the handle when this reads it.
+    refreshLiteManagedEmbeddingRuntime(handle) catch |err| {
+        stopLiteEmbeddedInference(handle);
+        return err;
     };
     handle.db.startQuarantineRetryWorkerIfNeeded();
     return handle;
@@ -8355,11 +8616,15 @@ fn searchTextOwned(
     limit: u32,
     offset: u32,
 ) !DenseOwnedResult {
-    if (index_name.len == 0) return error.InvalidArgument;
+    // An empty index name aliases the default full-text index, matching the
+    // server's public-query resolution (see api/tables.zig). A name that
+    // does not resolve to an existing index still fails inside
+    // executeLocalSearch below.
+    const resolved_index_name = if (index_name.len == 0) tables_api.default_full_text_index_name else index_name;
     const identity_read_generation = try currentIdentityReadGenerationForHandle(handle, null);
 
     const req: db_mod.types.SearchRequest = .{
-        .index_name = index_name,
+        .index_name = resolved_index_name,
         .query = query,
         .limit = limit,
         .offset = offset,
@@ -9250,34 +9515,96 @@ fn storageOwnerQueryFailure(
     return out_failure.status;
 }
 
+/// Resolves a public query's `semantic_search` text into a dense query
+/// vector for a native Lite handle, the same way the server does for a
+/// managed table: embed the text through the index's own configured
+/// embedder, using the retrieval-query task/instruction (Qwen3's built-in
+/// query instruction, for example) rather than the document-indexing task.
+/// Mirrors `http_server.zig`'s `SemanticStatusResolver`, but against Lite's
+/// index list instead of a table's admin snapshot, and constructs a
+/// throwaway `ManagedEmbedder` per call instead of reusing one cached on the
+/// enrichment runtime: Lite queries are not expected at a rate where that
+/// matters, and every other Lite embedder call site (`refreshLite...`,
+/// `litePhysicalIndexConfigJson`) already does the same thing.
+const LiteSemanticResolver = struct {
+    handle: *Handle,
+
+    fn resolveDenseQuery(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        semantic_search: []const u8,
+        embedding_template: ?[]const u8,
+        limit: u32,
+    ) anyerror!db_mod.types.DenseKnnQuery {
+        _ = table_name;
+        if (embedding_template != null) return error.UnsupportedQueryRequest;
+        const self: *LiteSemanticResolver = @ptrCast(@alignCast(ptr));
+        const handle = self.handle;
+        const merged_json = try liteMergedIndexesJsonAlloc(handle);
+        defer handle.alloc.free(merged_json);
+        var managed = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(
+            handle.alloc,
+            merged_json,
+            .{ .antfly_provider = handle.liteAntflyProvider() },
+        );
+        defer managed.deinit();
+        const vector = try managed.embedQuery(alloc, index_name, semantic_search);
+        return .{ .vector = vector, .k = limit };
+    }
+
+    fn resolver(self: *LiteSemanticResolver) query_api.SemanticResolver {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .resolve_dense_query = resolveDenseQuery },
+        };
+    }
+};
+
 fn searchPublicQueryJson(
     handle: *Handle,
     table_name: []const u8,
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
+    // `linked_storage` says this compiled library links the full storage
+    // internals -- true unconditionally for the default `libantfly` since
+    // it is shared with the `antfly` executable -- not that `handle` is a
+    // genuine storage-owner/distributed-table handle. A Lite handle
+    // (`owned_lite_backend != null`) has no metadata/table catalog for
+    // `local_query_client`'s internal semantic-search resolution to look an
+    // index's embedder up in, so it always takes the simpler path below,
+    // which resolves `semantic_search` itself via `LiteSemanticResolver`.
     if (comptime capi_build_options.linked_storage) {
-        handle.prepareSearchRequest(.{}) catch |err| return capi.mapError(err);
-        var failure: kernel_owner_abi.FailureIdentity = .{};
-        const response = local_query_client.executeJsonAlloc(
-            std.heap.c_allocator,
-            @ptrCast(&handle.db),
-            table_name,
-            request_json.bytes(),
-            .public,
-            .{},
-            null,
-            null,
-            null,
-            &failure,
-        ) catch |err| return capi.mapError(err);
-        out_buf.* = .{ .ptr = response.json.ptr, .len = response.json.len };
-        return .ok;
+        if (handle.owned_lite_backend == null) {
+            handle.prepareSearchRequest(.{}) catch |err| return capi.mapError(err);
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const response = local_query_client.executeJsonAlloc(
+                std.heap.c_allocator,
+                @ptrCast(&handle.db),
+                table_name,
+                request_json.bytes(),
+                .public,
+                .{},
+                null,
+                null,
+                null,
+                &failure,
+            ) catch |err| return capi.mapError(err);
+            out_buf.* = .{ .ptr = response.json.ptr, .len = response.json.len };
+            return .ok;
+        }
     }
 
+    var lite_semantic_resolver = LiteSemanticResolver{ .handle = handle };
+    const semantic_resolver: ?query_api.SemanticResolver = if (handle.lite_profile == .native)
+        lite_semantic_resolver.resolver()
+    else
+        null;
     var owned = query_api.parsePublicQueryRequest(
         handle.alloc,
-        null,
+        semantic_resolver,
         table_name,
         request_json.bytes(),
     ) catch |err| return capi.mapError(err);
@@ -11518,11 +11845,21 @@ pub export fn antfly_db_add_index_json(
         .algebraic
     else
         return .invalid_argument;
+    // Only a native Lite handle calls `db.addIndex` directly with a raw
+    // public-shaped dense/sparse config; the server always translates first
+    // (see `litePhysicalIndexConfigJson`). Every other handle keeps calling
+    // `db.addIndex` with exactly the config it was given, unchanged.
+    const stored_config_json = if (handle.lite_profile == .native)
+        litePhysicalIndexConfigJson(handle.alloc, kind, parsed.value.name, parsed.value.config_json, handle.liteAntflyProvider()) catch |err| return capi.mapError(err)
+    else
+        parsed.value.config_json;
+    defer if (handle.lite_profile == .native) handle.alloc.free(@constCast(stored_config_json));
     handle.db.addIndex(.{
         .name = parsed.value.name,
         .kind = kind,
-        .config_json = parsed.value.config_json,
+        .config_json = stored_config_json,
     }) catch |err| return capi.mapError(err);
+    refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -11548,6 +11885,7 @@ pub export fn antfly_db_add_enrichment_json(
     }) catch return .invalid_argument;
     defer parsed.deinit();
     handle.db.addEnrichment(parsed.value) catch |err| return capi.mapError(err);
+    refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -12930,10 +13268,17 @@ test "capi lite exposes hosted and status-only profiles" {
     try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"ttl_cleanup_runtime\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"transaction_recovery_runtime\":false") != null);
 
+    // Creating a Lite database already provisions the default full-text
+    // index, matching the server's behavior on table create.
+    var initial_indexes: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_indexes_json(hosted_handle, &initial_indexes));
+    defer antfly_db_buffer_free(initial_indexes.ptr, initial_indexes.len);
+    try std.testing.expect(std.mem.indexOf(u8, initial_indexes.ptr.?[0..initial_indexes.len], "\"full_text_index_v0\"") != null);
+
     const index_json =
         \\{"name":"full_text_index_v0","kind":"full_text","config_json":"{}"}
     ;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(hosted_handle, .{
+    try std.testing.expectEqual(capi.ErrorCode.internal, antfly_db_add_index_json(hosted_handle, .{
         .ptr = index_json,
         .len = index_json.len,
     }));
@@ -13835,6 +14180,123 @@ test "capi dense search profile breakdown" {
     var final_result = try handle.db.search(alloc, req);
     defer final_result.deinit();
     try std.testing.expectEqual(@as(u32, 10), final_result.total_hits);
+}
+
+// This always runs (on every build, including the default) and only asserts
+// on the build-capability signal, never on whether construction succeeded:
+// `local_inference_runtime` and `inference_mode: "local_embedded"` must
+// report true/present only when the loaded build both advertises and links
+// the local inference runtime.
+test "capi lite local-runtime-configured flag reports local_embedded only when the build links inference" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-inference-variant-caps");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+    };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+
+    var status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(handle, &status));
+    defer antfly_db_buffer_free(status.ptr, status.len);
+    const status_json = status.ptr.?[0..status.len];
+
+    // capi_build_options.inference_enabled is only true for the isolated
+    // `-Dcapi-inference=true` storage_kernel unit and for unit tests
+    // themselves; it is never true for the default build.
+    if (capi_build_options.inference_enabled and lite_backend.capabilitiesForProfile(.native).local_inference_runtime) {
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"inference_mode\":\"local_embedded\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"local_inference_runtime\":true") != null);
+        const owned_handle = asHandle(handle).?;
+        try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
+        const owned_handle = asHandle(handle).?;
+        try std.testing.expect(owned_handle.lite_inference_lifetime == null);
+    }
+}
+
+fn liteLocalEmbeddingModelAvailable(alloc: Allocator) bool {
+    const home_c = std.c.getenv("HOME") orelse return false;
+    const home = std.mem.span(home_c);
+    const owner_dir = std.fs.path.join(alloc, &.{ home, ".antfly", "inference", "models", "Qwen" }) catch return false;
+    defer alloc.free(owner_dir);
+    var dir = std.Io.Dir.cwd().openDir(std.testing.io, owner_dir, .{ .iterate = true }) catch return false;
+    defer dir.close(std.testing.io);
+    var it = dir.iterateAssumeFirstIteration();
+    while (it.next(std.testing.io) catch return false) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "Qwen3-Embedding-0.6B-GGUF")) return true;
+    }
+    return false;
+}
+
+// Conditional on the `-Dcapi-inference=true` variant (skips on the default
+// build, where capi_build_options.inference_enabled is false) and on the
+// small local embedding model being present under
+// ~/.antfly/inference/models, so this never requires a network call and
+// never fails a machine that has not pulled the model.
+test "capi lite drains an antfly embedder with no api_url through the embedded inference provider" {
+    if (!capi_build_options.inference_enabled) return error.SkipZigTest;
+    if (!lite_backend.capabilitiesForProfile(.native).local_inference_runtime) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    if (!liteLocalEmbeddingModelAvailable(alloc)) return error.SkipZigTest;
+
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-local-embedding-drain");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+    };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owned_handle = asHandle(handle).?;
+    try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+
+    const index_json =
+        \\{"name":"body_embedding","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\"}}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = index_json.ptr,
+        .len = index_json.len,
+    }));
+
+    const enrichment_json =
+        \\{"name":"body_embedder","kind":"embedding","field":"body","vector_space":"body_embedding","producer_json":"{\"type\":\"embedder\",\"config\":{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\"}}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(handle, .{
+        .ptr = enrichment_json.ptr,
+        .len = enrichment_json.len,
+    }));
+
+    const batch_json = "{\"inserts\":{\"doc:capi-local-embedding\":{\"body\":\"antfly lite embeds documents locally\"}},\"sync_level\":\"write\"}";
+    var batch_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{
+        .ptr = batch_json.ptr,
+        .len = batch_json.len,
+    }, &batch_out));
+    defer antfly_db_buffer_free(batch_out.ptr, batch_out.len);
+
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+
+    const drained = owned_handle.db.pendingWorkStats();
+    try std.testing.expectEqual(@as(u64, 0), drained.enrichment.error_count);
+    try std.testing.expectEqual(@as(u64, 0), drained.enrichment.fatal_error_count);
+    try std.testing.expect(!drained.enrichment.stalled);
+    try std.testing.expectEqual(drained.enrichment.target_sequence, drained.enrichment.applied_sequence);
 }
 
 pub fn storageOwnerMergeArtifactsPage(owner_ptr: ?*anyopaque, request: *const kernel_owner_abi.MergeArtifactsPageRequest, out_result: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {

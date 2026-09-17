@@ -42,6 +42,11 @@ pub const EmbeddedInferenceProviderLifetime = struct {
     const count_mask: usize = closed_bit - 1;
 
     handle: *anyopaque,
+    // Owns the resource-budget capability `createEmbeddedInferenceNode`
+    // configures on `handle`; released by `destroyEmbeddedInferenceNode`
+    // after the node itself is torn down. Null only if configuration failed
+    // (`create()` still succeeded and the node is otherwise usable).
+    resource_owner: ?*LiteInferenceResourceOwner = null,
     // Admission and borrower count share one modification order. A separate
     // accepting flag and counter would leave a check/increment window where
     // shutdown could observe zero and destroy the node before that borrower
@@ -98,6 +103,232 @@ pub const EmbeddedInferenceProviderLifetime = struct {
         return self.state.load(.acquire) & count_mask;
     }
 };
+
+/// Creates a minimal, self-contained embedded inference node and returns its
+/// opaque handle. This is the smallest equivalent of standalone/runtime.zig's
+/// production `CreateContext` construction, scoped for an in-process,
+/// caller-owned inference runtime such as an Antfly Lite handle: no CLI
+/// configuration, warm preload, kernel JIT, or prompt cache tuning -- just
+/// model auto-discovery under the default `~/.antfly/inference/models`
+/// layout (when `models_dir`/`ml_dir` are null) and automatic memory budgets.
+///
+/// Callers must only invoke this when they know the real inference runtime
+/// archive is linked into the final binary (see
+/// `pkg/antfly/build/runtime.zig`'s `addCapiInferenceVariantUnits` and
+/// `capi/link_anchor_inference.zig`): the default libantfly and antfly
+/// executable's storage_kernel archive traps this entry point, and calling
+/// through the trap aborts the process.
+///
+/// `io` must outlive the returned node; destroy it with
+/// `destroyEmbeddedInferenceNode` before releasing `io`.
+/// Result of `createEmbeddedInferenceNode`: the opaque node handle plus the
+/// resource-budget owner `configureLiteInferenceResourceBudget` installed on
+/// it (null only if that configuration step itself failed; the node is still
+/// usable, but every provider call will fail with the same
+/// `ResourceOwnerNotConfigured`-class error a caller reached before this
+/// existed).
+pub const EmbeddedInferenceNode = struct {
+    handle: *anyopaque,
+    resource_owner: ?*LiteInferenceResourceOwner,
+};
+
+pub fn createEmbeddedInferenceNode(data_dir: []const u8, io: std.Io) !EmbeddedInferenceNode {
+    var borrowed_io = io;
+    var out_handle: ?*anyopaque = null;
+    const create_context = inference_bridge.CreateContext{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = data_dir.ptr,
+        .data_dir_len = data_dir.len,
+        .models_dir = .{},
+        .ml_dir = .{},
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = 0,
+        .process_memory_limit_provenance = .automatic,
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .{},
+        .s3_credentials_json = .{},
+        .runtime_config_json = inference_bridge.String.init("{}"),
+        .executor = .init(&borrowed_io),
+        .out_handle = &out_handle,
+    };
+    // Unit tests compile the inference call graph directly into the same
+    // binary (no archive/trap boundary), so `linkedInferenceApi` would try
+    // to resolve the real cross-archive symbol and fail to link. Route
+    // through the same inline codegen path `invokeInferenceProvider` uses
+    // for tests.
+    const handle = if (comptime inline_inference_codegen)
+        try inference_host.linkedInferenceCreate(&create_context)
+    else handle: {
+        const table = try linkedInferenceApi(
+            inference_bridge.Capability.provider |
+                inference_bridge.Capability.route_manifest |
+                inference_bridge.Capability.resource_budget |
+                inference_bridge.Capability.request_admission,
+        );
+        const status = table.create(&create_context);
+        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+        break :handle out_handle orelse return error.InferenceRuntimeStartupFailed;
+    };
+    // `Capability.resource_budget` was requested above, which the standalone
+    // runtime treats as a promise that a follow-up `configure()` call will
+    // install a resource-budget owner (see runtime.zig's
+    // `InferenceResourceBudgetOwner`, wired to the DataServer's storage
+    // ResourceManager). A Lite handle has no such storage-tied resource
+    // manager to reuse, so every provider call previously failed with
+    // `error.ResourceOwnerNotConfigured` the moment it tried to reserve
+    // admission. Install a minimal, permissive, host-detected-by-default
+    // owner instead: Lite is a single-process embedding of the runtime, not
+    // a multi-tenant server, so unconditional admission is the correct
+    // policy, matching "antfly inference run"'s own local/host-owned default
+    // when no external resource policy is configured.
+    const resource_owner = configureLiteInferenceResourceBudget(handle) catch |err| blk: {
+        std.log.warn(
+            "lite embedded inference resource budget configuration failed, provider calls will fail: {s}",
+            .{@errorName(err)},
+        );
+        break :blk null;
+    };
+    return .{ .handle = handle, .resource_owner = resource_owner };
+}
+
+/// Counterpart to `createEmbeddedInferenceNode`. Callers must quiesce any
+/// `EmbeddedInferenceProviderLifetime` wrapping `handle` before calling this.
+pub fn destroyEmbeddedInferenceNode(handle: *anyopaque, resource_owner: ?*LiteInferenceResourceOwner) void {
+    if (comptime inline_inference_codegen) {
+        inference_host.linkedInferenceDestroy(handle);
+    } else {
+        linkedInferenceApiInfallible().destroy(handle);
+    }
+    if (resource_owner) |owner| owner.releaseBaseReference();
+}
+
+/// Minimal resource-budget owner for a Lite-embedded inference node. Unlike
+/// `standalone/runtime.zig`'s `InferenceResourceBudgetOwner`, this does not
+/// track real memory accounting against a shared storage `ResourceManager`:
+/// Lite has no such manager, and a single embedded node with no concurrent
+/// tenants does not need arbitrated admission. It exists solely to satisfy
+/// the resource-budget capability contract every provider call requires.
+pub const LiteInferenceResourceOwner = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    next_lease_token: std.atomic.Value(usize) = .init(1),
+
+    fn releaseBaseReference(self: *LiteInferenceResourceOwner) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous >= 1);
+        if (previous == 1) std.heap.c_allocator.destroy(self);
+    }
+};
+
+fn retainLiteInferenceResourceOwner(context: *anyopaque) callconv(.c) u8 {
+    const owner: *LiteInferenceResourceOwner = @ptrCast(@alignCast(context));
+    var observed = owner.references.load(.acquire);
+    while (true) {
+        if (observed == 0) return 0;
+        if (owner.references.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire)) |actual| {
+            observed = actual;
+            continue;
+        }
+        return 1;
+    }
+}
+
+fn releaseLiteInferenceResourceOwner(context: *anyopaque) callconv(.c) void {
+    const owner: *LiteInferenceResourceOwner = @ptrCast(@alignCast(context));
+    owner.releaseBaseReference();
+}
+
+fn reserveLiteInferenceResources(
+    context: *anyopaque,
+    amounts: *const inference_bridge.AdmissionAmounts,
+    out_lease: *usize,
+) callconv(.c) inference_bridge.Status {
+    _ = amounts;
+    const owner: *LiteInferenceResourceOwner = @ptrCast(@alignCast(context));
+    out_lease.* = owner.next_lease_token.fetchAdd(1, .acq_rel);
+    return .{};
+}
+
+fn retainLiteInferenceResources(
+    context: *anyopaque,
+    lease_token: usize,
+    retained: *const inference_bridge.AdmissionAmounts,
+) callconv(.c) inference_bridge.Status {
+    _ = context;
+    _ = lease_token;
+    _ = retained;
+    return .{};
+}
+
+fn releaseLiteInferenceResources(context: *anyopaque, lease_token: usize) callconv(.c) void {
+    _ = context;
+    _ = lease_token;
+}
+
+fn observeLiteInferencePromptCache(context: *anyopaque, observer_id: usize, previous: u64, next: u64) callconv(.c) u8 {
+    _ = context;
+    _ = observer_id;
+    _ = previous;
+    _ = next;
+    return 1;
+}
+
+fn observeLiteInferenceTokenizerCache(context: *anyopaque, observer_id: usize, previous: u64, next: u64) callconv(.c) u8 {
+    _ = context;
+    _ = observer_id;
+    _ = previous;
+    _ = next;
+    return 1;
+}
+
+fn configureLiteInferenceResourceBudget(handle: *anyopaque) !*LiteInferenceResourceOwner {
+    const owner = try std.heap.c_allocator.create(LiteInferenceResourceOwner);
+    owner.* = .{};
+    // `Client.configure` (standalone/inference_worker.zig) calls
+    // `retain_context` -- and sets its own `self.budget` field to point at
+    // `owner` -- *before* it can fail (for example the `ensureWorker`
+    // failure this catches at the call site below): a failure after that
+    // point still leaves the client holding a retained reference it will
+    // release exactly once, whenever it deinits. Unconditionally destroying
+    // `owner` here on any error would be a use-after-free/double-free the
+    // instant that later release runs. `releaseBaseReference` is the
+    // correct unwind either way: it only frees `owner` once every retained
+    // reference -- ours here, and the client's if it got far enough to take
+    // one -- has been released.
+    errdefer owner.releaseBaseReference();
+    var budget = inference_bridge.ResourceBudget{
+        .abi_version = inference_bridge.abi_version,
+        .context = owner,
+        .retain_context = retainLiteInferenceResourceOwner,
+        .release_context = releaseLiteInferenceResourceOwner,
+        .reserve_admission = reserveLiteInferenceResources,
+        .retain_admission = retainLiteInferenceResources,
+        .release_admission = releaseLiteInferenceResources,
+        .observe_prompt_cache = observeLiteInferencePromptCache,
+        .observe_tokenizer_cache = observeLiteInferenceTokenizerCache,
+    };
+    const configure_context = inference_bridge.ConfigureContext{
+        .abi_version = inference_bridge.abi_version,
+        .handle = handle,
+        .resource_budget = &budget,
+    };
+    if (comptime inline_inference_codegen) {
+        try inference_host.linkedInferenceConfigure(&configure_context);
+    } else {
+        const status = (try linkedInferenceApi(
+            inference_bridge.Capability.resource_budget,
+        )).configure(&configure_context);
+        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+    }
+    return owner;
+}
 
 pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) inference.managed_embedder.AntflyProvider {
     return .{

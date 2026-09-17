@@ -18,8 +18,16 @@ package antflylite
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -262,6 +270,49 @@ func TestLiteHostedPauseResumeGeneratedEnrichment(t *testing.T) {
 	if !bytes.Contains(result, []byte("doc:go-resume")) {
 		stats, _ := resumed.StatsJSON()
 		t.Fatalf("resumed full-text search JSON %q did not contain restored document; stats=%s", result, stats)
+	}
+}
+
+func TestLiteCAPIProvisionsDefaultFullTextIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "go-default-index.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:    OpenModeWriter,
+		Profile: ProfileNative,
+		NoSync:  true,
+	})
+	if err != nil {
+		t.Fatalf("create Lite database: %v", err)
+	}
+	defer db.Close()
+
+	// Creating a Lite database provisions the default full-text index,
+	// matching the server's behavior on table create. No `lite index
+	// create`/AddIndexJSON call is needed for basic text search to work.
+	indexes, err := db.IndexesJSON()
+	if err != nil {
+		t.Fatalf("list indexes: %v", err)
+	}
+	if !bytes.Contains(indexes, []byte("full_text_index_v0")) {
+		t.Fatalf("indexes JSON %q did not contain the default full text index", indexes)
+	}
+
+	if err := db.Batch([]WriteIntent{{
+		Key:   "doc:default-index",
+		Value: []byte(`{"title":"searchable","body":"hybrid alpha without an explicit index"}`),
+	}}, 1); err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatalf("run until idle status: %v", err)
+	}
+
+	hybridQuery := []byte(`{"full_text_search":{"match":{"field":"body","text":"hybrid alpha"}},"limit":3}`)
+	result, err := db.SearchJSON(hybridQuery)
+	if err != nil {
+		t.Fatalf("hybrid full text search with no index name: %v", err)
+	}
+	if !bytes.Contains(result, []byte("doc:default-index")) {
+		t.Fatalf("hybrid search JSON %q did not contain the searchable document", result)
 	}
 }
 
@@ -1075,5 +1126,391 @@ func TestLiteCAPI(t *testing.T) {
 	}
 	if err != InvalidArgument {
 		t.Fatalf("hosted TTL open error = %v, want %v", err, InvalidArgument)
+	}
+}
+
+// fakeRemoteEmbeddingVector deterministically derives a fake embedding from
+// the exact text an antfly-provider embedder would send, so a test can both
+// serve embed responses from a fake inference server and independently
+// reconstruct the vector a query for the same text should match against.
+func fakeRemoteEmbeddingVector(text string, dims int) []float64 {
+	vec := make([]float64, dims)
+	for d := 0; d < dims; d++ {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(fmt.Sprintf("%s|%d", text, d)))
+		vec[d] = float64(h.Sum32()%1000) / 1000.0
+	}
+	return vec
+}
+
+// newFakeAntflyEmbedServer starts an httptest server implementing the
+// minimal antfly inference embed endpoint (POST .../embed, request
+// {"model":...,"input":[...]}, response
+// {"object":"list","data":[{"object":"embedding","index":...,"embedding":[...]}]})
+// that managed_embedder.zig's antfly-provider client calls for an embedder
+// config carrying its own api_url. It also answers the GET capability-probe
+// path with 404, which the client tolerates by falling back to a
+// conservative default (see remote_capabilities.zig's discoverOnce and
+// managed_embedder.zig's densePartLeaseForEntry). Returns the server and a
+// counter of embed requests received.
+func newFakeAntflyEmbedServer(t *testing.T, dims int) (*httptest.Server, *int32) {
+	t.Helper()
+	var embedCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/embed") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		atomic.AddInt32(&embedCalls, 1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var req struct {
+			Model string   `json:"model"`
+			Input []string `json:"input"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		data := make([]map[string]any, len(req.Input))
+		for i, text := range req.Input {
+			data[i] = map[string]any{
+				"object":    "embedding",
+				"index":     i,
+				"embedding": fakeRemoteEmbeddingVector(text, dims),
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data, "model": req.Model})
+	}))
+	t.Cleanup(server.Close)
+	return server, &embedCalls
+}
+
+// TestLiteNativeRemoteProviderEmbedsAndSearchesViaAPIURL reproduces (without
+// a real model) the runtime gap this change fixes: a native Lite database
+// created with RemoteProviderConfigured and a dense_vector index whose
+// embedder config carries its own api_url must actually call that inference
+// service to compute embeddings, and RunUntilIdleStatus must wait for that
+// work, rather than silently publishing zero vectors.
+func TestLiteNativeRemoteProviderEmbedsAndSearchesViaAPIURL(t *testing.T) {
+	const dims = 4
+	server, embedCalls := newFakeAntflyEmbedServer(t, dims)
+
+	path := filepath.Join(t.TempDir(), "remote-embed.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:                     OpenModeWriter,
+		Profile:                  ProfileNative,
+		RemoteProviderConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("create native remote-provider Lite database: %v", err)
+	}
+	defer db.Close()
+
+	indexConfig, err := json.Marshal(map[string]any{
+		"field":  "body",
+		"dims":   dims,
+		"metric": "l2_squared",
+		"embedder": map[string]any{
+			"provider": "antfly",
+			"model":    "fake-embedder",
+			"api_url":  server.URL,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal index config: %v", err)
+	}
+	addIndex, err := json.Marshal(map[string]any{
+		"name":        "dv_remote_v1",
+		"kind":        "dense_vector",
+		"config_json": string(indexConfig),
+	})
+	if err != nil {
+		t.Fatalf("marshal add-index request: %v", err)
+	}
+	if err := db.AddIndexJSON(addIndex); err != nil {
+		t.Fatalf("add remote embedder dense index: %v", err)
+	}
+
+	const bodyOne = "alpha searchable remote embedding text"
+	const bodyTwo = "beta unrelated remote embedding text"
+	if err := db.Batch([]WriteIntent{
+		{Key: "doc:alpha", Value: []byte(fmt.Sprintf(`{"title":"alpha","body":%q}`, bodyOne))},
+		{Key: "doc:beta", Value: []byte(fmt.Sprintf(`{"title":"beta","body":%q}`, bodyTwo))},
+	}, 2); err != nil {
+		t.Fatalf("batch write documents: %v", err)
+	}
+
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatalf("run until idle: %v", err)
+	}
+
+	if atomic.LoadInt32(embedCalls) == 0 {
+		t.Fatalf("fake inference server received no /ai/v1/embed requests; embedding runtime was not wired up")
+	}
+
+	query, err := json.Marshal(map[string]any{
+		"full_text_search": map[string]any{"match": map[string]any{"field": "body", "text": "alpha"}},
+		"embeddings":       map[string]any{"dv_remote_v1": fakeRemoteEmbeddingVector(bodyOne, dims)},
+		"indexes":          []string{"dv_remote_v1"},
+		"merge_config":     map[string]any{"strategy": "rrf"},
+		"limit":            3,
+	})
+	if err != nil {
+		t.Fatalf("marshal hybrid search request: %v", err)
+	}
+	result, err := db.SearchJSON(query)
+	if err != nil {
+		t.Fatalf("hybrid semantic search: %v", err)
+	}
+	if !bytes.Contains(result, []byte("doc:alpha")) {
+		t.Fatalf("hybrid semantic search result %q did not contain doc:alpha", result)
+	}
+}
+
+func liteLocalEmbeddingModelAvailable() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	matches, err := filepath.Glob(filepath.Join(home, ".antfly", "inference", "models", "Qwen", "Qwen3-Embedding-0.6B-GGUF*"))
+	if err != nil {
+		return false
+	}
+	return len(matches) > 0
+}
+
+// enrichmentPendingWorkStatus is the stable subset of the Lite "enrichment"
+// pending-work telemetry fields (see capi/db.zig's PendingWorkStats), used
+// here to assert local embedding work fully drains.
+type enrichmentPendingWorkStatus struct {
+	TargetSequence  uint64 `json:"target_sequence"`
+	AppliedSequence uint64 `json:"applied_sequence"`
+	ErrorCount      uint64 `json:"error_count"`
+	FatalErrorCount uint64 `json:"fatal_error_count"`
+	Stalled         bool   `json:"stalled"`
+}
+
+// TestLiteCAPILocalEmbeddedInferenceVariant exercises libantfly's embedded
+// local inference runtime through the Go binding: it creates a native Lite
+// database with LocalRuntimeConfigured, adds a dense_vector index and
+// embedder enrichment backed by the local Qwen embedding model with no
+// api_url, writes documents, and asserts the resulting embedding work
+// drains cleanly to idle (mirroring capi/db.zig's "capi lite drains an
+// antfly embedder with no api_url through the embedded inference provider"
+// test). It skips cleanly when the loaded libantfly does not advertise
+// LocalInferenceRuntime, and when the model has not been pulled, so it is
+// safe to leave enabled in normal `go test` runs.
+func TestLiteCAPILocalEmbeddedInferenceVariant(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "go-local-inference-variant.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:                   OpenModeWriter,
+		Profile:                ProfileNative,
+		LocalRuntimeConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("create native Lite database with local runtime configured: %v", err)
+	}
+	defer db.Close()
+
+	caps, err := db.Capabilities()
+	if err != nil {
+		t.Fatalf("capabilities: %v", err)
+	}
+	if !caps.LocalInferenceRuntime {
+		t.Skip("loaded libantfly does not advertise a local inference runtime")
+	}
+	if !liteLocalEmbeddingModelAvailable() {
+		t.Skip("Qwen3-Embedding-0.6B-GGUF model is not present under ~/.antfly/inference/models/Qwen")
+	}
+
+	indexJSON := []byte(`{"name":"go_body_embedding","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"dims\":1024,\"metric\":\"cosine\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\"}}"}`)
+	if err := db.AddIndexJSON(indexJSON); err != nil {
+		t.Fatalf("add dense vector index: %v", err)
+	}
+
+	enrichmentJSON := []byte(`{"name":"go_body_embedder","kind":"embedding","field":"body","vector_space":"go_body_embedding","producer_json":"{\"type\":\"embedder\",\"config\":{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\"}}"}`)
+	if err := db.AddEnrichmentJSON(enrichmentJSON); err != nil {
+		t.Fatalf("add embedding enrichment: %v", err)
+	}
+
+	batchJSON := []byte(`{"inserts":{"doc:go-local-a":{"body":"antfly lite embeds documents locally through the go binding"},"doc:go-local-b":{"body":"a second document for the local embedding drain test"}},"sync_level":"write"}`)
+	batchOut, err := db.BatchJSON(batchJSON)
+	if err != nil {
+		t.Fatalf("batch write documents: %v", err)
+	}
+	if !bytes.Contains(batchOut, []byte(`"inserted":2`)) {
+		t.Fatalf("batch response = %s, want inserted count of 2", batchOut)
+	}
+
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatalf("run until idle: %v", err)
+	}
+
+	pending, err := db.PendingWorkStats()
+	if err != nil {
+		t.Fatalf("pending work stats: %v", err)
+	}
+	var enrichment enrichmentPendingWorkStatus
+	if err := json.Unmarshal(pending.Enrichment, &enrichment); err != nil {
+		t.Fatalf("decode enrichment pending work: %v; raw=%s", err, pending.Enrichment)
+	}
+	if enrichment.ErrorCount != 0 || enrichment.FatalErrorCount != 0 || enrichment.Stalled ||
+		enrichment.TargetSequence != enrichment.AppliedSequence {
+		t.Fatalf("local embedding enrichment did not drain cleanly: %#v", enrichment)
+	}
+}
+
+// TestLiteNativeRemoteProviderSemanticSearchEmbedsQuery reproduces the other
+// half of the runtime gap this change fixes: a public query's
+// "semantic_search" text must be embedded through the index's own
+// configured embedder (the retrieval-query task, not the document task)
+// before it hits `handle.db.search`, not rejected outright because Lite's
+// search path never supplied a resolver.
+func TestLiteNativeRemoteProviderSemanticSearchEmbedsQuery(t *testing.T) {
+	const dims = 4
+	server, embedCalls := newFakeAntflyEmbedServer(t, dims)
+
+	path := filepath.Join(t.TempDir(), "remote-semantic-search.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:                     OpenModeWriter,
+		Profile:                  ProfileNative,
+		RemoteProviderConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("create native remote-provider Lite database: %v", err)
+	}
+	defer db.Close()
+
+	indexConfig, err := json.Marshal(map[string]any{
+		"field":  "body",
+		"dims":   dims,
+		"metric": "l2_squared",
+		"embedder": map[string]any{
+			"provider": "antfly",
+			"model":    "fake-embedder",
+			"api_url":  server.URL,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal index config: %v", err)
+	}
+	addIndex, err := json.Marshal(map[string]any{
+		"name":        "dv_semantic_v1",
+		"kind":        "dense_vector",
+		"config_json": string(indexConfig),
+	})
+	if err != nil {
+		t.Fatalf("marshal add-index request: %v", err)
+	}
+	if err := db.AddIndexJSON(addIndex); err != nil {
+		t.Fatalf("add remote embedder dense index: %v", err)
+	}
+
+	if err := db.Batch([]WriteIntent{
+		{Key: "doc:alpha", Value: []byte(`{"title":"alpha","body":"alpha semantic search remote embedding text"}`)},
+		{Key: "doc:beta", Value: []byte(`{"title":"beta","body":"beta semantic search remote embedding text"}`)},
+	}, 2); err != nil {
+		t.Fatalf("batch write documents: %v", err)
+	}
+
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatalf("run until idle: %v", err)
+	}
+
+	writeEmbedCalls := atomic.LoadInt32(embedCalls)
+	if writeEmbedCalls == 0 {
+		t.Fatalf("fake inference server received no /ai/v1/embed requests for document writes")
+	}
+
+	query, err := json.Marshal(map[string]any{
+		"full_text_search": map[string]any{"match": map[string]any{"field": "body", "text": "alpha"}},
+		"semantic_search":  "how does alpha relate to semantic search",
+		"indexes":          []string{"dv_semantic_v1"},
+		"merge_config":     map[string]any{"strategy": "rrf"},
+		"limit":            3,
+	})
+	if err != nil {
+		t.Fatalf("marshal hybrid semantic-search request: %v", err)
+	}
+	result, err := db.SearchJSON(query)
+	if err != nil {
+		t.Fatalf("hybrid semantic-search query: %v", err)
+	}
+	if !bytes.Contains(result, []byte("doc:alpha")) {
+		t.Fatalf("hybrid semantic-search result %q did not contain doc:alpha", result)
+	}
+	if atomic.LoadInt32(embedCalls) <= writeEmbedCalls {
+		t.Fatalf("fake inference server received no /ai/v1/embed request for the semantic_search query text")
+	}
+}
+
+// TestLiteNativeRemoteProviderSemanticSearchMatchesDogfoodRequestShape uses
+// the exact public-query request shape examples/dogfood's query.go sends
+// (full_text_search + full_text_index + semantic_search + indexes +
+// merge_config + fields together). A default `libantfly` build links the
+// full storage internals into every Lite handle too (capi_build_options.
+// linked_storage is unconditionally true), so `searchPublicQueryJson` must
+// route a genuine Lite handle to the simpler internal query path (which
+// resolves semantic_search via LiteSemanticResolver) instead of
+// local_query_client's storage-owner/distributed-table path, which has no
+// metadata catalog to resolve a Lite index's embedder against and rejects
+// the request with ANTFLY_INVALID_ARGUMENT.
+func TestLiteNativeRemoteProviderSemanticSearchMatchesDogfoodRequestShape(t *testing.T) {
+	const dims = 4
+	server, _ := newFakeAntflyEmbedServer(t, dims)
+
+	path := filepath.Join(t.TempDir(), "dogfood-shape.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:                     OpenModeWriter,
+		Profile:                  ProfileNative,
+		RemoteProviderConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer db.Close()
+
+	indexConfig, _ := json.Marshal(map[string]any{
+		"field": "body", "dims": dims, "metric": "l2_squared",
+		"embedder": map[string]any{"provider": "antfly", "model": "fake-embedder", "api_url": server.URL},
+	})
+	addIndex, _ := json.Marshal(map[string]any{"name": "chunk_vectors", "kind": "dense_vector", "config_json": string(indexConfig)})
+	if err := db.AddIndexJSON(addIndex); err != nil {
+		t.Fatalf("add dense index: %v", err)
+	}
+
+	if err := db.Batch([]WriteIntent{
+		{Key: "doc:a", Value: []byte(`{"title":"a","body":"alpha shape text"}`)},
+	}, 2); err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatalf("run until idle: %v", err)
+	}
+
+	request := map[string]any{
+		"full_text_search": map[string]any{"match": map[string]any{"field": "body", "text": "alpha"}},
+		"full_text_index":  "full_text_index_v0",
+		"semantic_search":  "alpha shape text",
+		"indexes":          []string{"chunk_vectors"},
+		"merge_config":     map[string]any{"strategy": "rrf"},
+		"limit":            5,
+		"fields":           []string{"title", "body"},
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal dogfood-shape request: %v", err)
+	}
+	result, err := db.SearchJSON(body)
+	if err != nil {
+		t.Fatalf("dogfood-shape hybrid search: %v result=%s", err, result)
+	}
+	if !bytes.Contains(result, []byte("doc:a")) {
+		t.Fatalf("dogfood-shape hybrid search result %q did not contain doc:a", result)
 	}
 }

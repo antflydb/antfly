@@ -137,6 +137,12 @@ antfly lite vacuum app.aflite
 antfly lite serve app.aflite --addr 127.0.0.1:8080 --config production.json
 ```
 
+A Lite database created through the embedding surfaces (the C ABI and the
+native Go/Zig `embedded` package) is provisioned with the default
+`full_text_index_v0` full-text index, matching the server's table-create
+behavior, so `antfly lite index create` is only needed for indexes beyond
+that default.
+
 `antfly lite init` should be non-destructive: it creates a new `.aflite` file
 and rejects an existing database path. Destructive replacement should stay on
 explicit restore/import flows where the source and target are both known.
@@ -675,15 +681,27 @@ unexpectedly start sending data to a network provider.
 
 #### Local Embedded Inference
 
-Local inference should be optional packaging:
+Local inference is built in, not optional packaging: every `libantfly`/
+`antfly lite` build embeds the standalone inference runtime in-process, the
+same as the `antfly` executable (see COMPILATION.md's "C API composition"
+section). There is no separate base/full build distinction -- `zig build
+capi` always links the inference archive (2026-09-17 product decision: Lite
+hosts get local inference without a separate runtime, at the cost of a much
+larger shared library).
 
-- `antfly lite` base build: database, search, vector indexes, no heavy model
-  runtime requirement.
-- `antfly lite` full build: bundled or dynamically available inference runtime.
-- Application embedding: caller links the inference runtime if wanted.
+Opening a Lite handle with the local-runtime-configured flag constructs an
+embedded inference provider owned by the handle and reports
+`local_inference_runtime: true` and `inference_mode: "local_embedded"`.
+Adding an `embeddings` index whose `embedder` (or chunker/extractor producer)
+uses `"provider": "antfly"` with no `api_url` runs against that embedded
+provider instead of failing or requiring a remote URL -- `antfly lite
+run-until-idle app.aflite` drains the resulting enrichment work locally, with
+no network calls. Application embedding (see `go/pkg/antflylite/README.md`
+for the Go binding) gets the same embedded behavior automatically by linking
+the standard `libantfly` -- no separate library or extra link flags.
 
-Local inference is important for demos and offline use, but it should not be
-required for the core embedded database.
+Models are still auto-discovered the same way as `antfly inference pull`,
+under `~/.antfly/inference/models/`.
 
 #### Manual Maintenance
 
@@ -791,6 +809,9 @@ antfly lite serve
 
 The CLI should accept JSON request files that match the public API contracts.
 This keeps Lite compatible with normal Antfly examples, tests, and SDKs.
+`antfly lite index create` adds indexes beyond the default `full_text_index_v0`
+full-text index that embedding-surface creation already provisions, matching
+the server; it does not need to be run just to make text search work.
 
 ## Packaging
 

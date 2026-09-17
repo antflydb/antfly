@@ -142,8 +142,17 @@ pub fn chunkInputWithProvider(
         try request_context.check();
         return try cloneRemoteChunks(alloc, chunks);
     };
-    const endpoint = resolved_endpoint orelse return try chunkInputDirect(alloc, cfg, input);
+    const endpoint_raw = resolved_endpoint orelse return try chunkInputDirect(alloc, cfg, input);
     if (cfg.model.len == 0) return error.InvalidChunkerConfig;
+    // Unlike `managed_embedder.zig`'s embedder/extractor base URLs, a
+    // chunker's `api_url` reached this call unnormalized: a bare
+    // `host:port` (the natural way to configure "the same inference
+    // service" for embedder and chunker together) resolves to
+    // `{host:port}/chunk` instead of `{host:port}/ai/v1/chunk`, so the
+    // request 404s against the real joined API. Normalize the same way the
+    // embedder path does, leaving an already-pathed URL untouched.
+    const endpoint = try normalizedAntflyChunkEndpointAlloc(alloc, endpoint_raw);
+    defer alloc.free(endpoint);
 
     var fallback_io: ?std.Io.Threaded = null;
     defer if (fallback_io) |*io_impl| io_impl.deinit();
@@ -247,6 +256,7 @@ pub fn chunkInputWithProvider(
     });
     defer resp.deinit();
     if (!resp.ok()) {
+        std.log.err("DEBUG chunk request failed url={s} status={d} body={s} sent={s}", .{ url, resp.status.code, resp.body orelse "<none>", body.metadata_or_json });
         const stale = resp.headers.get(remote_capabilities.capability_stale_header);
         if (resp.status.code == 409 and stale != null and
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))
@@ -261,6 +271,21 @@ pub fn chunkInputWithProvider(
     errdefer inference_chunker.types.freeChunks(alloc, chunks);
     try execution.check(platform_time.monotonicNs());
     return chunks;
+}
+
+/// Mirrors `managed_embedder.zig`'s `normalizeAntflyInferenceBaseUrl`: a bare
+/// `scheme://host:port` endpoint (no path) gets `/ai/v1` appended so it lands
+/// on the joined public API instead of the process root; an endpoint that
+/// already carries a path (including one already ending in `/ai/v1`) is left
+/// exactly as configured.
+fn normalizedAntflyChunkEndpointAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, raw, "/");
+    if (std.mem.endsWith(u8, trimmed, "/ai/v1")) return try alloc.dupe(u8, trimmed);
+    const scheme_pos = std.mem.indexOf(u8, trimmed, "://");
+    const host_start = if (scheme_pos) |pos| pos + 3 else 0;
+    const path_pos = std.mem.indexOfPos(u8, trimmed, host_start, "/");
+    if (path_pos == null) return try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{trimmed});
+    return try alloc.dupe(u8, trimmed);
 }
 
 fn chunkInputDirect(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput) ![]RemoteChunk {
