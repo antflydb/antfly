@@ -4,6 +4,34 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-16: replay-retention fixture timed out on a checkpoint proxy
+
+PR #691's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35176786855/job/105060523520)
+at `37b9910520` failed only
+`db async replay truncation retains journal behind generated enrichment`.
+`waitForAppliedSequenceAdvance` timed out waiting for `ft_v1` to persist a
+checkpoint within 100 ten-millisecond polls. The production E2E job passed,
+including the prior shutdown regression. Twenty fresh local Debug processes,
+with four running concurrently, did not reproduce this Linux timeout.
+
+The retention fixture used checkpoint appearance as a proxy for a truncation
+attempt, then watched the journal for another half second. Neither established
+that the truncation callback had finished. A delayed checkpoint is not evidence
+of replay loss, and the trace alone does not establish a stuck production worker.
+The test now observes the real provider rejection through an event, requests
+truncation through the captured source tail, and compares every retained record's
+sequence and payload after that call returns. It then permits provider recovery,
+drains the production pipeline, checks both durable index checkpoints, and
+queries the generated vectors for both documents. This covers retention and
+recovery without requiring autonomous checkpoint publication within one second.
+
+The revised case passed 40/40 fresh Debug processes with four concurrent workers.
+As a negative control, temporarily removing only the generated-enrichment clamp
+in `truncateReplaySequenceAsync` made it fail at the record-count assertion
+(`expected 1, found 0`). Restoring the clamp restores the passing test; the
+committed change modifies only the fixture and this investigation record. All
+five related replay-retention, provider-restart, and index-worker cases pass.
+
 ## 2026-09-16: source quiescence freed activity borrowed by transaction callbacks
 
 PR #691's [base Antfly E2E job](https://github.com/antflydb/antfly/actions/runs/35168905132/job/105044672774)

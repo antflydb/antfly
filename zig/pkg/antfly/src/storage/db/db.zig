@@ -65375,6 +65375,7 @@ const GateDenseEmbedder = struct {
     total_requests: std.atomic.Value(usize) = .init(0),
     blocked_requests: std.atomic.Value(usize) = .init(0),
     blocked_error: anyerror = error.EmbedRateLimited,
+    blocked_event: ?*std.Io.Event = null,
 
     fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (needle.len == 0) return true;
@@ -65413,6 +65414,7 @@ const GateDenseEmbedder = struct {
         if (previous_successes >= self.allowed_successes.load(.acquire)) {
             _ = self.successful_requests.fetchSub(1, .acq_rel);
             _ = self.blocked_requests.fetchAdd(1, .monotonic);
+            if (self.blocked_event) |event| event.set(std.testing.io);
             return self.blocked_error;
         }
         if (dims != 3) return error.InvalidVectorDimensions;
@@ -95959,7 +95961,8 @@ test "db async replay truncation retains journal behind generated enrichment" {
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    var gated = GateDenseEmbedder{};
+    var provider_failed: std.Io.Event = .unset;
+    var gated = GateDenseEmbedder{ .blocked_event = &provider_failed };
     gated.allowed_successes.store(0, .release);
     var db = try DB.open(alloc, std.mem.span(path), .{
         .executor = .{ .backend = .io_threaded },
@@ -95988,32 +95991,64 @@ test "db async replay truncation retains journal behind generated enrichment" {
         .sync_level = .write,
     });
 
-    _ = try waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
-    _ = try waitForAppliedSequenceAdvance(alloc, &db, "semantic_idx", 0);
-    var attempts: usize = 0;
-    while (attempts < default_test_wait_attempts and gated.snapshot().blocked_requests == 0) : (attempts += 1) {
-        sleepPollInterval();
+    const target_sequence = db.core.nextDerivedSequence();
+    try std.testing.expect(target_sequence > 0);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .raw = .fromSeconds(5),
+        .clock = .awake,
+    });
+    while (!provider_failed.isSet()) {
+        provider_failed.waitTimeout(std.testing.io, .{ .deadline = deadline }) catch |err| switch (err) {
+            error.Timeout => {
+                if (std.Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline))
+                    return error.ProviderFailureNotObserved;
+            },
+            error.Canceled => return err,
+        };
     }
-    try std.testing.expect(gated.snapshot().blocked_requests > 0);
     try std.testing.expectEqual(
         @as(u64, 0),
         try enrichment_state.loadAppliedSequence(alloc, db.core.store, enrichment_runtime_mod.scope_name),
     );
 
-    var retained_count: usize = 0;
-    var retention_attempts: usize = 0;
-    while (retention_attempts < 50) : (retention_attempts += 1) {
-        const retained = try db.core.store.iterateReplayFrom(alloc, 1);
-        defer {
-            for (retained) |*entry| entry.deinit(alloc);
-            alloc.free(retained);
-        }
-        retained_count = retained.len;
-        if (retained_count == 0) break;
-        sleepPollInterval();
+    const expected = try db.core.store.iterateReplayFrom(alloc, 1);
+    defer {
+        for (expected) |*entry| entry.deinit(alloc);
+        alloc.free(expected);
     }
-    try std.testing.expect(retained_count > 0);
+    try std.testing.expect(expected.len > 0);
+    try std.testing.expectEqual(target_sequence, expected[expected.len - 1].sequence);
+
+    // Exercise the worst-case consumer ordering directly: request truncation
+    // through the entire source tail while the real provider is failing.
+    // A checkpoint appearing within a short wall-clock window is neither the
+    // retention contract nor evidence that truncation has actually run.
+    try truncateReplaySequenceAsync(db.async_context, target_sequence);
+    const retained = try db.core.store.iterateReplayFrom(alloc, 1);
+    defer {
+        for (retained) |*entry| entry.deinit(alloc);
+        alloc.free(retained);
+    }
+    try std.testing.expectEqual(expected.len, retained.len);
+    for (expected, retained) |before, after| {
+        try std.testing.expectEqual(before.sequence, after.sequence);
+        try std.testing.expectEqualStrings(before.payload, after.payload);
+    }
     gated.allowAll();
+    try db.runUntilIdle();
+    const recovered = db.enrichment_runtime.?.stats();
+    try std.testing.expect(recovered.applied_sequence >= target_sequence);
+    try std.testing.expectEqual(recovered.target_sequence, recovered.applied_sequence);
+    for ([_][]const u8{ "ft_v1", "semantic_idx" }) |index_name| {
+        try std.testing.expect((try db.core.loadAppliedSequence(alloc, index_name)) >= target_sequence);
+    }
+    var result = try db.search(alloc, .{
+        .index_name = "semantic_idx",
+        .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 2 },
+        .limit = 2,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
 }
 
 test "db io_threaded executor processes indexed writes" {
