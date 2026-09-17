@@ -265,7 +265,13 @@ and the finetuning wrappers use the same selected backend configuration.
 
 The remaining overlaps use explicit aggregate-only exclusions in
 `pkg/antfly/build/unit_test_ownership_rules.zig`. Focused targets retain their
-original selections. Run nodes share compiler artifacts and preserve their
+original selections. Rules match an exact filter anchor anywhere in the selected
+runtime filters, falling back to compiler filters only for unfiltered runs.
+Prepending a new suite filter therefore cannot silently disable ownership rules.
+The inventory gate also runs matcher regressions for filter order, exact matching,
+and focused runtime scope. Catalog dependency tests belong to their metadata,
+standalone, or user-management owners rather than the HTTP integration suite.
+Run nodes share compiler artifacts and preserve their
 environment, output checks, memory reservations, and ordering dependencies.
 The audit compares original and reduced runtime selections and rejects lost,
 added, or multiply-owned named tests. It runs alongside tests, so it adds no
@@ -610,3 +616,17 @@ about 0.16 seconds and also passed with a 500 ms debugger pause immediately
 before journal publication; both runs reported no leaks.
 Formatting and whitespace checks pass. This focused validation does not claim
 the entire latest CI gate is green.
+
+
+The CI run at `df657ac4b7` completed the unit test runs but failed the ownership
+audit: 16,506 distinct names had 16,554 executions (48 repeats). The catalog merge
+prepended `system catalog` and `join planning` to two filter lists, bypassing
+rules keyed to their previous first filters, and added catalog dependency overlap.
+Filter-order-independent anchors and explicit catalog ownership address that
+failure without weakening the audit or enabling the scale suite.
+
+The corrected full local inventory passed all 421 build steps and both matcher
+regressions: 17,472 baseline executions became 16,508 executions of the same
+16,508 distinct names, with zero lost, added, or duplicated tests. These are local
+macOS counts; the failed Linux CI inventory reported 16,506 distinct names.
+The audit-tool and partition-tool Python checks also passed (eight tests).

@@ -9,6 +9,14 @@ const std = @import("std");
 pub fn add(b: *std.Build, aggregate: *std.Build.Step, baseline: ?*std.Build.Step, other_roots: []const *std.Build.Step) void {
     const audit = b.addSystemCommand(&.{"python3"});
     audit.addFileArg(b.path("tools/audit_unit_test_ownership.py"));
+    const ownership_tests = b.addTest(.{
+        .name = "unit-test-ownership-rule-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/build/unit_test_ownership.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    audit.step.dependOn(&b.addRunArtifact(ownership_tests).step);
     if (b.option(bool, "unit-test-inventory-allow-overlap", "Report overlapping unit ownership without failing (migration diagnostics)") orelse false)
         audit.addArg("--allow-overlap");
     var visited = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);

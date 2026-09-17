@@ -8,7 +8,8 @@ const Step = std.Build.Step;
 pub const Rule = struct {
     source: []const u8,
     artifact: []const u8,
-    /// The first runtime test filter (or first compile filter for unfiltered runs).
+    /// An exact runtime filter anchor, or compile filter when no runtime filter exists.
+    /// Its position is deliberately irrelevant; other filters may be prepended.
     selection: []const u8,
     skip: []const []const u8,
 };
@@ -39,6 +40,43 @@ pub fn selection(run: *Step.Run, object: *Step.Compile) []const u8 {
     return if (object.filters.len > 0) object.filters[0] else "all";
 }
 
+fn matchesSelection(argv: []const Step.Run.Arg, filters: []const []const u8, anchor: []const u8) bool {
+    var has_runtime_filter = false;
+    for (argv, 0..) |arg, index| {
+        if (arg != .bytes) continue;
+        const filter = if (std.mem.startsWith(u8, arg.bytes, "--test-filter="))
+            arg.bytes["--test-filter=".len..]
+        else if (std.mem.eql(u8, arg.bytes, "--test-filter") and index + 1 < argv.len and argv[index + 1] == .bytes)
+            argv[index + 1].bytes
+        else
+            continue;
+        has_runtime_filter = true;
+        if (std.mem.eql(u8, filter, anchor)) return true;
+    }
+    // A focused runtime selection must not inherit an unrelated compiler-wide
+    // rule merely because both runs share the same compiled artifact.
+    if (has_runtime_filter) return false;
+    for (filters) |filter| if (std.mem.eql(u8, filter, anchor)) return true;
+    return filters.len == 0 and std.mem.eql(u8, anchor, "all");
+}
+
+test "ownership anchors survive prepended runtime and compile filters" {
+    const argv = [_]Step.Run.Arg{
+        .{ .bytes = @constCast("--test-filter") },                   .{ .bytes = @constCast("system catalog") },
+        .{ .bytes = @constCast("--test-filter=backup heartbeat ") },
+    };
+    try std.testing.expect(matchesSelection(&argv, &.{}, "backup heartbeat "));
+    try std.testing.expect(matchesSelection(&.{}, &.{ "join planning", "public openapi contract" }, "public openapi contract"));
+}
+
+test "ownership anchors respect runtime scope and exact filter identity" {
+    const argv = [_]Step.Run.Arg{ .{ .bytes = @constCast("--test-filter") }, .{ .bytes = @constCast("focused") } };
+    try std.testing.expect(!matchesSelection(&argv, &.{"broad"}, "broad"));
+    try std.testing.expect(!matchesSelection(&argv, &.{}, "focus"));
+    try std.testing.expect(matchesSelection(&.{}, &.{}, "all"));
+    try std.testing.expect(!matchesSelection(&argv, &.{}, "all"));
+}
+
 fn copySelected(b: *std.Build, original: *Step, copies: *std.AutoHashMap(*Step, *Step)) *Step {
     if (copies.get(original)) |copy| return copy;
     // Compilation/code generation is shared with focused targets.
@@ -58,7 +96,7 @@ fn copySelected(b: *std.Build, original: *Step, copies: *std.AutoHashMap(*Step, 
                 else => continue,
             };
             for (rules) |rule| {
-                if (std.mem.eql(u8, path, rule.source) and std.mem.eql(u8, object.name, rule.artifact) and std.mem.eql(u8, selection(run, object), rule.selection)) {
+                if (std.mem.eql(u8, path, rule.source) and std.mem.eql(u8, object.name, rule.artifact) and matchesSelection(run.argv.items, object.filters, rule.selection)) {
                     skips = rule.skip;
                     break;
                 }
