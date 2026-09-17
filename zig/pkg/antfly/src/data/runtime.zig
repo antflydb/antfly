@@ -37258,12 +37258,16 @@ fn implementationTests() type {
                     server.store_status_dirty.store(true, .release);
                     remote_metadata.cached_snapshot_at_ms = remote_metadata.awakeMs();
                     metadata_transport.delayed_error = transport_error;
+                    // The metadata client owns one bounded retry for replay-safe
+                    // control requests after a socket reset. Backoff begins only
+                    // after that whole attempt finishes, not after its first send.
+                    const attempt_count: usize = if (transport_error == error.ConnectionResetByPeer) 2 else 1;
                     const started_at_ms = server.backgroundMonotonicMs();
                     const requests_before = metadata_transport.requests;
                     try server.runStoreStatusRoundOnly();
                     const failed_at_ms = server.backgroundMonotonicMs();
-                    try std.testing.expectEqual(started_at_ms + 2000, failed_at_ms);
-                    try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
+                    try std.testing.expectEqual(started_at_ms + 2000 * attempt_count, failed_at_ms);
+                    try std.testing.expectEqual(requests_before + attempt_count, metadata_transport.requests);
                     try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
                     const delayed_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
                     try std.testing.expect(delayed_retry_at_ms >= failed_at_ms + metadata_bootstrap_retry_base_ms);
@@ -37276,10 +37280,10 @@ fn implementationTests() type {
                     try server.runStoreStatusRoundOnly();
                     vopr_io.monotonic_ns = @as(i96, delayed_retry_at_ms - 1) * std.time.ns_per_ms;
                     try server.runStoreStatusRoundOnly();
-                    try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
+                    try std.testing.expectEqual(requests_before + attempt_count, metadata_transport.requests);
                     vopr_io.monotonic_ns += std.time.ns_per_ms;
                     try std.testing.expectError(error.MetadataIncarnationMismatch, server.runStoreStatusRoundOnly());
-                    try std.testing.expectEqual(requests_before + 2, metadata_transport.requests);
+                    try std.testing.expectEqual(requests_before + attempt_count + 1, metadata_transport.requests);
                     try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
                     try std.testing.expectEqual(delayed_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
                 }
