@@ -539,16 +539,27 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(resident_owner, owner_source.entries.items[0]);
     try std.testing.expectEqual(before_warmup.miss_count, owner_source.cacheStats().miss_count);
     {
-        catalog.include_cold_group = true;
-        defer catalog.include_cold_group = false;
-        var partial_status = (try owner_source.writeSource().localRuntimeStatuses(alloc, "articles")) orelse return error.ExpectedResidentGroupObservation;
+        // Start with the complete two-range catalog, retaining only one owner.
+        // Adding the sibling to the original fixture would also change its
+        // resident range from ["", infinity) to ["", "m") without a topology
+        // transition. Status correctly refuses that stale descriptor.
+        var status_tmp = std.testing.tmpDir(.{});
+        defer status_tmp.cleanup();
+        const status_root = try status_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+        defer alloc.free(status_root);
+        var status_catalog = Catalog{ .include_cold_group = true };
+        var status_source = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, status_root, status_catalog.iface(), read_gate.alreadyReadSafeBarrier());
+        defer status_source.deinit();
+        _ = try status_source.reconcileTableGroup(7001, "articles");
+        var partial_status = (try status_source.writeSource().localRuntimeStatuses(alloc, "articles")) orelse return error.ExpectedResidentGroupObservation;
         defer partial_status.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 1), partial_status.items.len);
         try std.testing.expectEqual(@as(u64, 7001), partial_status.items[0].group_id);
-        try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
-        resident_owner.exclusive_active = true;
-        defer resident_owner.exclusive_active = false;
-        try std.testing.expect((try owner_source.writeSource().localRuntimeStatuses(alloc, "articles")) == null);
+        try std.testing.expectEqual(@as(usize, 1), status_source.ownerCountForTest());
+        const status_owner = status_source.entries.items[0];
+        status_owner.exclusive_active = true;
+        defer status_owner.exclusive_active = false;
+        try std.testing.expect((try status_source.writeSource().localRuntimeStatuses(alloc, "articles")) == null);
     }
     // A compiled owner must return its post-reconcile observation to the
     // control-plane publisher. Completing the DB mutation without those facts
