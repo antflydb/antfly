@@ -48,7 +48,6 @@ pub const Module = struct {
         const forward = try function(ctx, f, "boundary_forward");
         const backward = try function(ctx, b, "boundary_backward");
         // The driver validates the device's opt-in shared-memory capacity.
-        const set_attribute = ctx.driver.fns.cuFuncSetAttribute orelse return error.CudaSymbolMissing;
         return .{ .forward_module = f, .backward_module = b, .forward = forward, .backward = backward, .bias = try function(ctx, f, "boundary_bias"), .delta = try function(ctx, b, "boundary_delta32"), .zero = try function(ctx, f, "boundary_zero") };
     }
 

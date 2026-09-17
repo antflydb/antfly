@@ -2240,7 +2240,7 @@ test "CUDA boundary binary loss gradients match pinned seeded VJPs" {
 
 test "CUDA boundary query loss matches pinned gradients and masking" {
     const a = std.testing.allocator;
-    const losses = @import("../../finetune/gliner_boundary_losses.zig");
+    const losses = @import("../../finetune/gliner/boundary_losses.zig");
     var device = try @import("../../graph/resident_training_fixture.zig").CudaDevice.init(a);
     defer device.deinit();
     try device.backend.enableResidentTrainingMath();
@@ -2281,7 +2281,7 @@ test "CUDA boundary query loss matches pinned gradients and masking" {
 
 test "CUDA boundary listwise loss matches pinned gradients and broadcast reductions" {
     const a = std.testing.allocator;
-    const losses = @import("../../finetune/gliner_boundary_losses.zig");
+    const losses = @import("../../finetune/gliner/boundary_losses.zig");
     var device = try @import("../../graph/resident_training_fixture.zig").CudaDevice.init(a);
     defer device.deinit();
     try device.backend.enableResidentTrainingMath();
@@ -2382,8 +2382,8 @@ test "CUDA boundary scalar record loss matches pinned gradients across supported
 
 test "CUDA boundary mixed record fields and objects preserve weighted reduction VJPs" {
     const a = std.testing.allocator;
-    const matching = @import("../../finetune/gliner_boundary_matching.zig");
-    const record_loss = @import("../../finetune/gliner_boundary_record_loss.zig");
+    const matching = @import("../../finetune/gliner/boundary_matching.zig");
+    const record_loss = @import("../../finetune/gliner/boundary_record_loss.zig");
     const schema = @import("../../pipelines/extraction_schema.zig");
     var device = try @import("../../graph/resident_training_fixture.zig").CudaDevice.init(a);
     defer device.deinit();
@@ -2413,7 +2413,7 @@ test "CUDA boundary mixed record fields and objects preserve weighted reduction 
 
 test "CUDA boundary consistency loss matches pinned weighted VJPs" {
     const a = std.testing.allocator;
-    const losses = @import("../../finetune/gliner_boundary_losses.zig");
+    const losses = @import("../../finetune/gliner/boundary_losses.zig");
     var device = try @import("../../graph/resident_training_fixture.zig").CudaDevice.init(a);
     defer device.deinit();
     try device.backend.enableResidentTrainingMath();

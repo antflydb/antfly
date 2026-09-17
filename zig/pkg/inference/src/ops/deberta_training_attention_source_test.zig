@@ -6,7 +6,7 @@
 //! No Python, checkpoint, source formula replica, or Torch RNG executes here.
 const std = @import("std");
 const attention = @import("deberta_training_attention.zig");
-const parity = @import("../architectures/gliner_boundary_parity_test.zig");
+const parity = @import("../architectures/gliner/boundary_parity_test.zig");
 const safetensors = @import("../models/safetensors.zig");
 const snapshot = @import("../runtime/file_snapshot.zig");
 const bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator;

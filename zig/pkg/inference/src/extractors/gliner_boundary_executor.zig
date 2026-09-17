@@ -8,8 +8,8 @@
 const std = @import("std");
 const wire = @import("extraction_v2.zig");
 const model = @import("../models/gliner_boundary.zig");
-const engine = @import("../architectures/gliner_boundary_engine.zig");
-const device_request = @import("../architectures/gliner_boundary_request_device.zig");
+const engine = @import("../architectures/gliner/boundary_engine.zig");
+const device_request = @import("../architectures/gliner/boundary_request_device.zig");
 const processor = @import("../pipelines/gliner_boundary_processor.zig");
 const pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
 const compute = @import("../ops/ops.zig");
@@ -387,7 +387,7 @@ test "gliner boundary executor pinned small Metal converted FP32 session and wir
 
 fn testPinnedSmallExecutor(directory: []const u8, converted: bool, metal: bool) !void {
     const a = std.testing.allocator;
-    const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const bytes = try fixtures.fixtureBytes(a, "pipeline_cases.json");
     defer a.free(bytes);
     var fixture = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
@@ -521,7 +521,7 @@ fn testWindowBatch(directory: []const u8, metal: bool) !void {
     const session = if (metal) try factory.createMetalSession(a, directory) else try factory.createNativeSession(a, directory);
     defer session.close();
     const identity = try factory.getGlinerBoundaryIdentity(session);
-    const bytes = try @import("../architectures/gliner_boundary_parity_test.zig").fixtureBytes(a, "pipeline_cases.json");
+    const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(a, "pipeline_cases.json");
     defer a.free(bytes);
     var reference = try std.json.parseFromSlice(pipeline.ReferenceFixture, a, bytes, .{});
     defer reference.deinit();

@@ -13,9 +13,9 @@ const pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
 const document_mod = @import("../pipelines/gliner_boundary_long_document.zig");
 const long_relations = @import("../pipelines/gliner_boundary_long_relations.zig");
 const boundary = @import("../pipelines/gliner_boundary_decode.zig");
-const engine = @import("../architectures/gliner_boundary_engine.zig");
-const head = @import("../architectures/gliner_boundary_head.zig");
-const device_request = @import("../architectures/gliner_boundary_request_device.zig");
+const engine = @import("../architectures/gliner/boundary_engine.zig");
+const head = @import("../architectures/gliner/boundary_head.zig");
+const device_request = @import("../architectures/gliner/boundary_request_device.zig");
 const compute = @import("../ops/ops.zig");
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
@@ -634,7 +634,7 @@ test "gliner boundary long executor profile preserves declared policy across wor
         \\{"schema_version":2,"model":"profile","schema":{"entities":["person"]},"inputs":[{"content":"Ada"}]}
     , .{});
     defer request.deinit();
-    const config = @import("../architectures/gliner_boundary_engine.zig").TestBatch.config();
+    const config = @import("../architectures/gliner/boundary_engine.zig").TestBatch.config();
     var options = Options{ .identity = .{ .backbone = config.backbone, .precision = .fp32, .weight = artifact.Digest.of("profile weights"), .sidecars = @splat(artifact.Digest.of("profile config")) } };
     const original = try profile(a, &config, &request.items[0], options, "metal");
     options.profile_encoder_device_limit = options.device.max_encoder_device_bytes;
@@ -722,7 +722,7 @@ test "gliner boundary long executor pinned small Metal one-window task parity an
 
 fn testPinnedSmallWindows(directory: []const u8, metal: bool) !void {
     const a = std.testing.allocator;
-    const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const bytes = try fixtures.fixtureBytes(a, "pipeline_cases.json");
     defer a.free(bytes);
     var reference = try std.json.parseFromSlice(pipeline.ReferenceFixture, a, bytes, .{});
@@ -780,7 +780,7 @@ fn fakeWindow(a: Allocator, sample: pipeline.Sample, rows: []const []const f64, 
 /// All packets below are synthetic post-score evidence. No tokenizer, encoder,
 /// boundary head, or checkpoint is used by these global integration tests.
 fn exerciseFakeMerge(a: Allocator, mode: FakeMergeMode) !void {
-    const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const config_bytes = try fixtures.fixtureBytes(a, "models/small/config.json");
     defer a.free(config_bytes);
     const encoder_bytes = try fixtures.fixtureBytes(a, "models/small/encoder_config.json");
