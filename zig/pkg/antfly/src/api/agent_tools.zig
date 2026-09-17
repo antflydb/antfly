@@ -71,8 +71,12 @@ pub fn withTools(alloc: std.mem.Allocator, chain: []const generating.ChainLink, 
             .antfly, .openai => {},
             else => return error.UnsupportedAgentToolProvider,
         }
-        link.generator.tools_json = schema;
-        link.generator.tool_choice_json = "\"auto\"";
+        // A finished graph walk can leave no available tools. Omit both
+        // fields for the final answer instead of sending an empty tool list
+        // with a provider-dependent automatic-tool choice.
+        const has_tools = !std.mem.eql(u8, schema, "[]");
+        link.generator.tools_json = if (has_tools) schema else null;
+        link.generator.tool_choice_json = if (has_tools) "\"auto\"" else null;
     }
     return copy;
 }

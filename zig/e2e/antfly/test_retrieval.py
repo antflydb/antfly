@@ -606,6 +606,18 @@ def test_retrieval_agent_tree_search_pipeline(backup_api):
                     {
                         "query": "how does the architecture work",
                         "stream": False,
+                        "steps": {
+                            "retrieval": {
+                                "navigation": {
+                                    "query_index": 1,
+                                    "strategy": "tree",
+                                    "selection": "ranked",
+                                    "index": "doc_hierarchy",
+                                    "start_nodes": "$find_start",
+                                    "max_depth": 2,
+                                },
+                            },
+                        },
                         "queries": [
                             {
                                 "table": table_name,
@@ -614,11 +626,6 @@ def test_retrieval_agent_tree_search_pipeline(backup_api):
                             },
                             {
                                 "table": table_name,
-                                "tree_search": {
-                                    "index": "doc_hierarchy",
-                                    "start_nodes": "$find_start",
-                                    "max_depth": 2,
-                                },
                                 "limit": 5,
                             },
                         ],
@@ -682,14 +689,21 @@ def test_retrieval_agent_tree_search_from_roots(backup_api):
         {
             "query": "how does the architecture work",
             "stream": False,
-            "queries": [
-                {
-                    "table": table_name,
-                    "tree_search": {
+            "steps": {
+                "retrieval": {
+                    "navigation": {
+                        "query_index": 0,
+                        "strategy": "tree",
+                        "selection": "ranked",
                         "index": "doc_hierarchy",
                         "start_nodes": "$roots",
                         "max_depth": 2,
                     },
+                },
+            },
+            "queries": [
+                {
+                    "table": table_name,
                     "limit": 5,
                 }
             ],
@@ -758,18 +772,23 @@ def test_retrieval_agent_tree_search_generation(backup_api, inference_generator)
                                 "api_key": "test-key",
                             },
                             "steps": {
+                                "retrieval": {
+                                    "navigation": {
+                                        "query_index": 0,
+                                        "strategy": "tree",
+                                        "selection": "ranked",
+                                        "index": "doc_hierarchy",
+                                        "start_key": "doc:root",
+                                        "max_depth": 2,
+                                        "beam_width": 2,
+                                    },
+                                },
                                 "generation": {"enabled": True},
                                 "followup": {"enabled": True, "count": 2},
                             },
                             "queries": [
                                 {
                                     "table": table_name,
-                                    "tree_search": {
-                                        "index": "doc_hierarchy",
-                                        "start_nodes": "doc:root",
-                                        "max_depth": 2,
-                                        "beam_width": 2,
-                                    },
                                     "limit": 5,
                                 }
                             ],
@@ -1343,15 +1362,22 @@ def test_retrieval_agent_streaming_tree_progress(backup_api):
                     {
                         "query": "summarize the architecture tree",
                         "stream": True,
-                        "queries": [
-                            {
-                                "table": table_name,
-                                "tree_search": {
+                        "steps": {
+                            "retrieval": {
+                                "navigation": {
+                                    "query_index": 0,
+                                    "strategy": "tree",
+                                    "selection": "ranked",
                                     "index": "doc_hierarchy",
                                     "start_nodes": "$roots",
                                     "max_depth": 2,
                                     "beam_width": 2,
                                 },
+                            },
+                        },
+                        "queries": [
+                            {
+                                "table": table_name,
                                 "limit": 5,
                             }
                         ],
@@ -2181,6 +2207,7 @@ def test_retrieval_agent_rejects_tree_search_without_start_nodes_or_seed_hits(
     table_name = f"retrieval_invalid_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
+    _create_ready_tree_index(backup_api, table_name)
 
     with pytest.raises(requests.HTTPError, match="invalid retrieval agent request"):
         backup_api.post(
@@ -2188,10 +2215,19 @@ def test_retrieval_agent_rejects_tree_search_without_start_nodes_or_seed_hits(
             {
                 "query": "find retrieval docs",
                 "stream": False,
+                "steps": {
+                    "retrieval": {
+                        "navigation": {
+                            "query_index": 0,
+                            "strategy": "tree",
+                            "selection": "ranked",
+                            "index": "doc_hierarchy",
+                        },
+                    },
+                },
                 "queries": [
                     {
                         "table": table_name,
-                        "tree_search": {"index": "doc_hierarchy"},
                     }
                 ],
             },
