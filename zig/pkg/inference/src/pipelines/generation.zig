@@ -3403,6 +3403,9 @@ pub const NativeGenerationPipeline = struct {
     model_dir: ?[]const u8 = null,
     artifact_dir: ?[]const u8 = null,
     gguf_projector_path: ?[]const u8 = null,
+    /// The model's open projector file for Gemma media prompts. Null makes
+    /// the pipeline open (and parse) the projector for the request.
+    projector_store: ?*gemma4_projector.ProjectorStore = null,
     decode_state: ?*NativeDecodeState = null,
     scheduler: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     scheduler_lease: ?*runtime.scheduler.native_generate.Lease = null,
@@ -3805,13 +3808,19 @@ pub const NativeGenerationPipeline = struct {
                     decode_state.qwen3vl_mrope_position_delta = prepared_qwen3vl_prompt.?.plan.mrope_position_delta;
                     decode_state.qwen3vl_text_only = false;
                 } else {
+                    const request_projector = if (self.projector_store == null)
+                        try gemma4_projector.ProjectorStore.open(allocator, projector_path)
+                    else
+                        null;
+                    defer if (request_projector) |store| store.close();
+                    const projector = self.projector_store orelse request_projector.?;
                     var projected_images = if (images.len > 0)
-                        try gemma4_projector.encodeProjectedImages(&self.cb, allocator, projector_path, images)
+                        try gemma4_projector.encodeProjectedImages(&self.cb, allocator, projector, images)
                     else
                         null;
                     defer if (projected_images) |*projected| projected.deinit();
                     var projected_audio = if (audio_clips.len > 0)
-                        try gemma4_projector.encodeProjectedAudio(&self.cb, allocator, projector_path, audio_clips)
+                        try gemma4_projector.encodeProjectedAudio(&self.cb, allocator, projector, audio_clips)
                     else
                         null;
                     defer if (projected_audio) |*projected| projected.deinit();
