@@ -418,6 +418,11 @@ components:
         - provider
         - model
 
+    OpenAIReasoningEffort:
+      type: string
+      enum: [none, minimal, low, medium, high, xhigh, max]
+      description: OpenAI reasoning effort; model support varies. Omit to use the model default.
+
     OpenAIGeneratorConfig:
       type: object
       description: |
@@ -448,6 +453,15 @@ components:
         max_tokens:
           type: integer
           description: "Maximum number of tokens to generate."
+        max_completion_tokens:
+          type: integer
+          minimum: 1
+          description: |
+            OpenAI completion budget, including visible output and reasoning tokens.
+            Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+        reasoning_effort:
+          $ref: "#/components/schemas/OpenAIReasoningEffort"
+          description: Optional reasoning effort. Supported values depend on the selected OpenAI model.
         top_p:
           type: number
           format: float
