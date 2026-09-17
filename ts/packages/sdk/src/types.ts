@@ -472,6 +472,7 @@ export interface AntflyConfig {
 }
 
 // Retrieval Agent types
+export type RetrievalNavigationConfig = components["schemas"]["RetrievalNavigationConfig"];
 export type RetrievalAgentRequest = components["schemas"]["RetrievalAgentRequest"];
 export type RetrievalAgentResult = components["schemas"]["RetrievalAgentResult"];
 export type RetrievalAgentSteps = components["schemas"]["RetrievalAgentSteps"];

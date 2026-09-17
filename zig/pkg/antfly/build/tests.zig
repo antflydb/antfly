@@ -1178,6 +1178,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "composed text exact sort surfaces missing component profile",
         "declared runtime sortable field capability reports covered queryable state",
         "declared runtime geo field capability reports covered filterable state",
+        "retrieval graph navigation",
         "retrieval agent treats aggregations as first-class tool capability",
         "retrieval agent requires filter and aggregate tools for filtered aggregations",
         "retrieval agent ignores empty map-valued tool fields for policy and strategy",
@@ -1369,6 +1370,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     for (root_test_skip_filters) |filter| {
         run_lib_unit_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
+    // Keep retrieval's unit/contract gate independent of the HTTP-linked
+    // serving harness pulled in by root-test. Reuse the same root module and
+    // runner, with only retrieval tests selected for code generation.
+    const retrieval_filters = &[_][]const u8{"api.retrieval_agent."};
+    const retrieval_selected_filters = selectTestFilters(b, retrieval_filters);
+    const retrieval_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, retrieval_selected_filters),
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_retrieval_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, retrieval_tests, retrieval_selected_filters);
+    b.step("antfly-retrieval-test", "Run retrieval agent contracts and navigation regressions").dependOn(&run_retrieval_tests.step);
+
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
