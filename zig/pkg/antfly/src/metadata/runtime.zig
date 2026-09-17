@@ -175,8 +175,14 @@ const Factory = struct {
             .vtable = &.{
                 .build_descriptor = buildDescriptor,
                 .free_descriptor = freeDescriptor,
+                .accepts_record = acceptsRecord,
             },
         };
+    }
+
+    fn acceptsRecord(ptr: *anyopaque, record: antfly.raft.catalog.ReplicaRecord) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return record.group_id == self.metadata_group_id;
     }
 
     fn buildDescriptor(ptr: *anyopaque, record: antfly.raft.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
@@ -356,6 +362,8 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_async_send_queue_full_total", "counter", "Total async raft HTTP global queue-full events", host_metrics.async_send_queue_full);
         try append(writer, "antfly_raft_async_send_peer_queue_full_total", "counter", "Total async raft HTTP per-peer queue-full events", host_metrics.async_send_peer_queue_full);
         try append(writer, "antfly_raft_async_send_pending", "gauge", "Pending async raft HTTP frames", @intCast(host_metrics.async_send_pending));
+        try append(writer, "antfly_raft_async_send_retained_bytes", "gauge", "Retained async raft HTTP bytes including in-flight and failed frames", @intCast(host_metrics.async_send_retained_bytes));
+        try append(writer, "antfly_raft_async_send_retained_frames", "gauge", "Retained async raft HTTP frames including in-flight and failed frames", @intCast(host_metrics.async_send_retained_frames));
         try append(writer, "antfly_raft_async_snapshot_send_enqueued_total", "counter", "Total raft snapshots admitted to the bounded async HTTP send lane", host_metrics.async_snapshot_send_enqueued);
         try append(writer, "antfly_raft_async_snapshot_send_failed_total", "counter", "Total async raft snapshot HTTP send failures", host_metrics.async_snapshot_send_failed);
         try append(writer, "antfly_raft_async_snapshot_send_retried_total", "counter", "Total async raft snapshot sends requeued for retry", host_metrics.async_snapshot_send_retried);
@@ -591,6 +599,7 @@ pub const Server = struct {
         errdefer freeReallocationProtocolPeers(alloc, result.reallocation_protocol_peers);
         const service_cfg = antfly.metadata_service.MetadataServiceConfig{
             .observe_local_replica_root = cfg.observe_local_replica_root,
+            .local_data_owner = false,
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
             .reallocation_protocol_peers = result.reallocation_protocol_peers,
@@ -2676,9 +2685,331 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
     try server.bootstrapLocal(group_ids.main_metadata_group_id, 1);
     try std.testing.expectEqual(@as(usize, 0), hook_ctx.runs);
 
-    var rounds: usize = 0;
-    while (hook_ctx.runs == 0 and rounds < 8) : (rounds += 1) {
-        try server.runRound();
+    for (0..8) |_| try server.runRound();
+    try std.testing.expectEqual(@as(usize, 0), hook_ctx.runs);
+}
+
+test "metadata ownership rejects direct data replica admission" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
+    defer paths.deinit(alloc);
+    var server = try Server.init(alloc, paths.config());
+    defer server.deinit();
+    try server.start();
+    try server.bootstrapLocal(group_ids.main_metadata_group_id, 3);
+    const host = server.metadataHttpService().raft.host.http_host.host;
+    const foreign: antfly.raft.catalog.ReplicaRecord = .{
+        .group_id = 1951,
+        .replica_id = 1,
+        .local_node_id = 3,
+        .bootstrap_mode = .empty,
+    };
+    std.debug.print("OWNERSHIP_RED direct_admission expects ReplicaAdmissionRejected\n", .{});
+    try std.testing.expectError(error.ReplicaAdmissionRejected, host.ensureReplica(foreign));
+    try std.testing.expectEqual(.absent, host.status(foreign.group_id));
+    try std.testing.expect(!host.replicaCatalogContains(foreign.group_id).?);
+}
+
+test "metadata ownership ignores retained foreign catalog before serving" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
+    defer paths.deinit(alloc);
+    const cfg = paths.config();
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try server.start();
+        try server.bootstrapLocal(cfg.metadata_group_id, cfg.local_node_id);
     }
-    try std.testing.expect(hook_ctx.runs > 0);
+    const foreign: antfly.raft.catalog.ReplicaRecord = .{
+        .group_id = 1951,
+        .replica_id = 1,
+        .local_node_id = cfg.local_node_id,
+        .bootstrap_mode = .empty,
+    };
+    {
+        var catalog = try antfly.raft.storage.FileReplicaCatalog.init(alloc, paths.catalog);
+        defer catalog.deinit();
+        try catalog.catalog().upsertReplica(foreign);
+    }
+    var restarted = try Server.init(alloc, cfg);
+    defer restarted.deinit();
+    const svc = restarted.metadataHttpService();
+    std.debug.print("OWNERSHIP_RED retained_catalog expects absent foreign group\n", .{});
+    try std.testing.expectEqual(.absent, svc.raft.host.status(foreign.group_id));
+    try std.testing.expectEqual(.active, svc.raft.host.status(cfg.metadata_group_id));
+    try std.testing.expectEqual(@as(usize, 1), svc.raft.host.http_host.transport_stack.transport_host.served_groups.count());
+    try std.testing.expect(svc.raft.host.http_host.host.replicaCatalogContains(foreign.group_id).?);
+    try restarted.start();
+    try restarted.bootstrapLocal(cfg.metadata_group_id, cfg.local_node_id);
+    for (0..8) |_| try restarted.runRound();
+    try std.testing.expectEqual(.absent, svc.raft.host.status(foreign.group_id));
+}
+
+test "metadata ownership excludes colliding data placements across control rounds and restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
+    defer paths.deinit(alloc);
+    for (0..2) |boot| {
+        var server = try Server.init(alloc, paths.config());
+        defer server.deinit();
+        try server.start();
+        // start() runs the restore supervisor. Drive Raft through the service
+        // owner so Ready processing shares its lock with supervisor ReadIndex.
+        const svc = server.metadataHttpService();
+        try server.bootstrapLocal(svc.metadata_group_id, 3);
+        if (boot == 0) {
+            try svc.upsertNode(.{ .node_id = 3 });
+            try svc.runRaftRoundOnly();
+            try svc.upsertStore(.{
+                .store_id = 3,
+                .node_id = 3,
+                .api_url = "http://data-3.invalid:8080",
+                .capacity_bytes = 1024,
+                .available_bytes = 900,
+            });
+            try svc.upsertTable(.{ .table_id = 77, .name = "seeded", .desired_replica_count = 1 });
+            try svc.upsertRange(.{ .group_id = 1951, .table_id = 77, .start_key = "" });
+            try svc.upsertReplicaIntent(.{
+                .record = .{ .group_id = 1951, .replica_id = 1, .local_node_id = 3, .bootstrap_mode = .empty },
+                .store_id = 3,
+                .peer_node_ids = &.{},
+            }, null, 0, false);
+            for (0..8) |_| try svc.runRaftRoundOnly();
+        }
+        for (0..8) |_| try server.runRound();
+        std.debug.print("OWNERSHIP_RED placements boot={d} expects absent foreign group\n", .{boot});
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} foreign_status\n", .{boot});
+        try std.testing.expectEqual(.absent, svc.raft.host.status(1951));
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} served_group_count\n", .{boot});
+        try std.testing.expectEqual(@as(usize, 1), svc.raft.host.http_host.transport_stack.transport_host.served_groups.count());
+        const intents = try svc.listProjectedPlacementIntents(alloc);
+        defer svc.freeProjectedPlacementIntents(alloc, intents);
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} intent_count\n", .{boot});
+        try std.testing.expectEqual(@as(usize, 1), intents.len);
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} intent_group_id\n", .{boot});
+        try std.testing.expectEqual(@as(u64, 1951), intents[0].record.group_id);
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} lease_held\n", .{boot});
+        try std.testing.expect(svc.reconcileLeaseStats().held_by_local);
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} placement_epoch\n", .{boot});
+        try std.testing.expectEqual(svc.placement_epoch.load(.monotonic), svc.local_placement_epoch.?);
+        try svc.upsertTable(.{ .table_id = 77, .name = if (boot == 0) "first" else "restarted" });
+        for (0..8) |_| try server.runRound();
+        const tables = try svc.listProjectedTables(alloc);
+        defer svc.freeProjectedTables(alloc, tables);
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} table_count\n", .{boot});
+        try std.testing.expectEqual(@as(usize, 1), tables.len);
+        std.debug.print("OWNERSHIP_ASSERT placements boot={d} table_name\n", .{boot});
+        try std.testing.expectEqualStrings(if (boot == 0) "first" else "restarted", tables[0].name);
+    }
+}
+
+test "metadata ownership never provisions data roots on repeated control rounds" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
+    defer paths.deinit(alloc);
+    const Hook = struct {
+        calls: usize = 0,
+        fn run(ptr: *anyopaque, _: antfly.metadata_service.LocalReplicaRootReconcileHook.Request) !antfly.metadata.table_provisioner.ProvisionSummary {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{};
+        }
+    };
+    var server = try Server.init(alloc, paths.config());
+    defer server.deinit();
+    try server.start();
+    var hook = Hook{};
+    server.setLocalReplicaRootReconcileHook(.{ .ptr = &hook, .vtable = &.{ .run = Hook.run } });
+    try server.bootstrapLocal(group_ids.main_metadata_group_id, 3);
+    try std.testing.expectEqual(@as(usize, 0), hook.calls);
+    for (0..8) |_| try server.runRound();
+    std.debug.print("OWNERSHIP_RED provisioning expects zero calls; actual={d}\n", .{hook.calls});
+    try std.testing.expectEqual(@as(usize, 0), hook.calls);
+    const svc = server.metadataHttpService();
+    try std.testing.expect(svc.observe_local_replica_root);
+    try std.testing.expect(svc.reconcileLeaseStats().held_by_local);
+    try std.testing.expectEqual(svc.placement_epoch.load(.monotonic), svc.local_placement_epoch.?);
+}
+
+test "metadata ownership preserves same-id remote progress across rounds and restart" {
+    try exerciseMetadataOwnershipProjection(.progress);
+}
+
+test "metadata ownership scalar routing keeps same-id data node remote" {
+    try exerciseMetadataOwnershipProjection(.scalar_route);
+}
+
+test "metadata ownership batch routing keeps same-id data node remote" {
+    try exerciseMetadataOwnershipProjection(.batch_route);
+}
+
+test "metadata ownership preserves same-id remote backfill observations" {
+    try exerciseMetadataOwnershipProjection(.backfill);
+}
+
+const MetadataOwnershipTestPaths = struct {
+    replicas: []u8,
+    catalog: []u8,
+    snapshots: []u8,
+
+    fn init(alloc: std.mem.Allocator, sub_path: []const u8) !@This() {
+        const replicas = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-ownership/replicas", .{sub_path});
+        errdefer alloc.free(replicas);
+        const catalog = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-ownership/catalog.txt", .{sub_path});
+        errdefer alloc.free(catalog);
+        return .{
+            .replicas = replicas,
+            .catalog = catalog,
+            .snapshots = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-ownership/snapshots", .{sub_path}),
+        };
+    }
+
+    fn config(self: @This()) ServerConfig {
+        return .{ .local_node_id = 3, .replica_root_dir = self.replicas, .replica_catalog_path = self.catalog, .snapshot_root_dir = self.snapshots };
+    }
+
+    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.replicas);
+        alloc.free(self.catalog);
+        alloc.free(self.snapshots);
+    }
+};
+
+const MetadataOwnershipProjectionCase = enum { progress, scalar_route, batch_route, backfill };
+
+fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
+    defer paths.deinit(alloc);
+    const data_group_id = 1951;
+    const api_url = "http://data-3.invalid:8080";
+    for (0..2) |boot| {
+        var cfg = paths.config();
+        cfg.observe_local_replica_root = false;
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try server.start();
+        // start() runs the restore supervisor. Drive Raft through the service
+        // owner so Ready processing shares its lock with supervisor ReadIndex.
+        const svc = server.metadataHttpService();
+        try server.bootstrapLocal(svc.metadata_group_id, 3);
+        if (boot == 0) {
+            try svc.upsertNode(.{ .node_id = 3 });
+            try svc.runRaftRoundOnly();
+            var groups = [_]antfly.metadata.table_manager.GroupStatusReport{.{
+                .group_id = data_group_id,
+                .doc_count = 1,
+                .empty = false,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 1,
+            }};
+            try svc.upsertStore(.{
+                .store_id = 3,
+                .node_id = 3,
+                .api_url = api_url,
+                .group_statuses = &groups,
+                .active_backfills = 7,
+                .backfill_progress_millis = 250,
+            });
+            try svc.upsertTable(.{ .table_id = 77, .name = "docs", .desired_replica_count = 1 });
+            try svc.upsertRange(.{
+                .group_id = data_group_id,
+                .table_id = 77,
+                .start_key = "",
+                .restore_backup_id = if (case == .progress) "remote-backup" else "",
+                .restore_location = if (case == .progress) "file:///remote-backups" else "",
+            });
+            if (case == .scalar_route or case == .batch_route) {
+                try svc.upsertReplicaIntent(.{
+                    .record = .{ .group_id = data_group_id, .replica_id = 1, .local_node_id = 3, .bootstrap_mode = .empty },
+                    .store_id = 3,
+                    .peer_node_ids = &.{},
+                }, null, 0, false);
+            }
+            if (case == .progress) {
+                try svc.upsertSchemaProgress(.{ .table_id = 77, .node_id = 3, .schema_version = 0 });
+                try svc.upsertRestoreProgress(.{
+                    .table_id = 77,
+                    .node_id = 3,
+                    .group_id = data_group_id,
+                    .backup_id = "remote-backup",
+                    .location = "file:///remote-backups",
+                    .primary_restored = true,
+                });
+            }
+        }
+        for (0..8) |_| try svc.runRaftRoundOnly();
+        switch (case) {
+            .progress => {
+                try expectMetadataOwnershipRemoteProgress(svc, boot, "before_control");
+                svc.setLifecycleReconcileHook(null);
+                svc.observe_local_replica_root = true;
+                for (0..8) |_| try server.runRound();
+                std.debug.print("OWNERSHIP_RED progress expects retained schema and restore reports\n", .{});
+                try expectMetadataOwnershipRemoteProgress(svc, boot, "after_control");
+            },
+            .scalar_route, .batch_route => {
+                const source = server.server.owned_public_read_source.?;
+                for ([_]antfly.public_api.table_router.RoutePolicy{ .any_active, .prefer_leader }) |policy| {
+                    if (case == .scalar_route) {
+                        std.debug.print("OWNERSHIP_RED scalar_route expects remote node 3\n", .{});
+                        var route = (try antfly.public_api.table_router.resolveGroupRoute(alloc, source.catalog, source.router, data_group_id, policy)) orelse return error.MissingRemoteDataRoute;
+                        defer route.deinit(alloc);
+                        try std.testing.expect(route == .remote);
+                        try std.testing.expectEqual(@as(u64, 3), route.remote.node_id);
+                        try std.testing.expectEqualStrings(api_url, route.remote.base_uri);
+                    } else {
+                        std.debug.print("OWNERSHIP_RED batch_route expects remote node 3\n", .{});
+                        const routes = (try antfly.public_api.table_router.resolveGroupRoutes(alloc, source.catalog, source.router, &.{data_group_id}, policy)) orelse return error.MissingRemoteDataRoutes;
+                        defer antfly.public_api.table_router.freeGroupRoutes(alloc, routes);
+                        try std.testing.expectEqual(@as(usize, 1), routes.len);
+                        try std.testing.expect(routes[0] == .remote);
+                        try std.testing.expectEqual(@as(u64, 3), routes[0].remote.node_id);
+                        try std.testing.expectEqualStrings(api_url, routes[0].remote.base_uri);
+                    }
+                }
+            },
+            .backfill => {
+                svc.observe_local_replica_root = true;
+                svc.store_status_ticks = 39;
+                for (0..8) |_| try server.runRound();
+                const stores = try svc.listProjectedStores(alloc);
+                defer svc.freeProjectedStores(alloc, stores);
+                std.debug.print("OWNERSHIP_RED backfill expects retained 7 and 250\n", .{});
+                try std.testing.expectEqual(@as(usize, 1), stores.len);
+                try std.testing.expectEqual(@as(u32, 7), stores[0].active_backfills);
+                try std.testing.expectEqual(@as(u16, 250), stores[0].backfill_progress_millis);
+            },
+        }
+    }
+}
+
+fn expectMetadataOwnershipRemoteProgress(svc: *antfly.metadata_service.MetadataHttpService, boot: usize, phase: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const schema = try svc.listProjectedSchemaProgress(alloc);
+    defer svc.freeProjectedSchemaProgress(alloc, schema);
+    const restore = try svc.listProjectedRestoreProgress(alloc);
+    defer svc.freeProjectedRestoreProgress(alloc, restore);
+    std.debug.print("OWNERSHIP_ASSERT progress boot={d} phase={s} schema_count\n", .{ boot, phase });
+    try std.testing.expectEqual(@as(usize, 1), schema.len);
+    std.debug.print("OWNERSHIP_ASSERT progress boot={d} phase={s} schema_node_id\n", .{ boot, phase });
+    try std.testing.expectEqual(@as(u64, 3), schema[0].node_id);
+    std.debug.print("OWNERSHIP_ASSERT progress boot={d} phase={s} restore_count\n", .{ boot, phase });
+    try std.testing.expectEqual(@as(usize, 1), restore.len);
+    std.debug.print("OWNERSHIP_ASSERT progress boot={d} phase={s} restore_node_id\n", .{ boot, phase });
+    try std.testing.expectEqual(@as(u64, 3), restore[0].node_id);
+    std.debug.print("OWNERSHIP_ASSERT progress boot={d} phase={s} restore_backup_id\n", .{ boot, phase });
+    try std.testing.expectEqualStrings("remote-backup", restore[0].backup_id);
 }

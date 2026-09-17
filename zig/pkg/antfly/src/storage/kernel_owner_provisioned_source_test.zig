@@ -60,6 +60,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
 
         accept_publication: bool = true,
         present: bool = true,
+        include_cold_group: bool = false,
 
         fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
@@ -104,6 +105,11 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             if (!self.present) {
                 result.tables = &.{};
                 result.ranges = &.{};
+            } else if (self.include_cold_group) {
+                result.ranges = @constCast(&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .range_id = 7001, .start_key = "", .end_key = "m" },
+                    .{ .group_id = 7002, .table_id = 7, .range_id = 7002, .start_key = "m", .end_key = null },
+                });
             }
             return result;
         }
@@ -258,6 +264,63 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     }
 
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+    // A delayed startup warmup must not retire the owner already installed by
+    // foreground work or startup catch-up. Its workers and future observations
+    // belong to that resident owner even when no API lease is currently held.
+    const before_warmup = owner_source.cacheStats();
+    const resident_owner = owner_source.entries.items[0];
+    try owner_source.warmTableGroup(7001, "articles");
+    try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+    try std.testing.expectEqual(resident_owner, owner_source.entries.items[0]);
+    try std.testing.expectEqual(before_warmup.miss_count, owner_source.cacheStats().miss_count);
+    {
+        catalog.include_cold_group = true;
+        defer catalog.include_cold_group = false;
+        var partial_status = (try owner_source.writeSource().localRuntimeStatuses(alloc, "articles")) orelse return error.ExpectedResidentGroupObservation;
+        defer partial_status.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), partial_status.items.len);
+        try std.testing.expectEqual(@as(u64, 7001), partial_status.items[0].group_id);
+        try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+        resident_owner.exclusive_active = true;
+        defer resident_owner.exclusive_active = false;
+        try std.testing.expect((try owner_source.writeSource().localRuntimeStatuses(alloc, "articles")) == null);
+    }
+    // A compiled owner must return its post-reconcile observation to the
+    // control-plane publisher. Completing the DB mutation without those facts
+    // leaves exact activation retrying EmptyTargetedIndexObservation forever.
+    var before_activation = (try snapshot_cache.snapshot(alloc, "articles")).?;
+    defer before_activation.deinit(alloc);
+    const before_status = before_activation.items[0];
+    const expected_index = for (before_status.stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, "dense_idx")) break item;
+    } else return error.ExpectedDenseIndex;
+    _ = try write_source.source().createIndex(alloc, "articles", "dense_idx", "{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}");
+    {
+        const time = @import("antfly_platform").time;
+        const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        while (write_source.structural_reconcile_scheduled.load(.acquire) and time.monotonicNs() < deadline)
+            try io_impl.io().sleep(.fromMilliseconds(5), .awake);
+        try std.testing.expect(!write_source.structural_reconcile_scheduled.load(.acquire));
+        // Completion requires fresh publication of this exact incarnation,
+        // not merely an idle worker (which could also mean discarded work).
+        var published = (try snapshot_cache.snapshot(alloc, "articles")) orelse return error.ExpectedActivationPublication;
+        defer published.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), published.items.len);
+        const status = published.items[0];
+        try std.testing.expectEqual(@as(u64, 7001), status.group_id);
+        try std.testing.expectEqual(generations.generation, status.metadata.lsm_root_generation);
+        try std.testing.expectEqual(.fresh, status.metadata.freshness);
+        try std.testing.expectEqual(.live_writer_publish, status.metadata.source);
+        try std.testing.expect(status.metadata.target_observation_complete);
+        try std.testing.expect(status.metadata.updated_at_ns > before_status.metadata.updated_at_ns);
+        const activated = for (status.stats.indexes) |item| {
+            if (std.mem.eql(u8, item.name, "dense_idx")) break item;
+        } else return error.ExpectedActivatedDenseIndex;
+        try std.testing.expectEqual(expected_index.coverage_generation, activated.coverage_generation);
+        try std.testing.expectEqual(expected_index.coverage_config_hash, activated.coverage_config_hash);
+    }
     const initial_cache_stats = owner_source.cacheStats();
     try std.testing.expect(initial_cache_stats.miss_count >= 1);
     const initial_context_metrics = try owner_source.contextMetrics();
@@ -900,6 +963,47 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             self.rollback_count += 1;
         }
     };
+    // Exercise the production maintenance/status paths while restore stages,
+    // publishes, rejects metadata publication, reconciles, and reopens owners.
+    // Unlike the deterministic held-lease regression, this uses native workers
+    // and the real compiled storage archive and backup bytes.
+    const RestoreMaintenance = struct {
+        source: *kernel_owner_source.ProvisionedKernelOwnerSource,
+        stop: std.atomic.Value(bool) = .init(false),
+        rounds: std.atomic.Value(usize) = .init(0),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                self.round() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                _ = self.rounds.fetchAdd(1, .release);
+                std.testing.io.sleep(.fromMilliseconds(1), .awake) catch return;
+            }
+        }
+
+        fn round(self: *@This()) !void {
+            const maintenance = self.source.maintenanceSource();
+            _ = try maintenance.maintenanceSnapshot(false);
+            _ = try maintenance.runLsmRound(false);
+            maintenance.publishRuntimeStatuses();
+        }
+    };
+    var concurrent_maintenance = RestoreMaintenance{ .source = &owner_source };
+    const maintenance_thread = try std.Thread.spawn(.{}, RestoreMaintenance.run, .{&concurrent_maintenance});
+    var maintenance_joined = false;
+    defer if (!maintenance_joined) {
+        concurrent_maintenance.stop.store(true, .release);
+        maintenance_thread.join();
+    };
+    const maintenance_deadline = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 5 * std.time.ns_per_s;
+    while (concurrent_maintenance.rounds.load(.acquire) == 0) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= maintenance_deadline) return error.TestMaintenanceNotStarted;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const rounds_before = concurrent_maintenance.rounds.load(.acquire);
     for (backup_formats, 0..) |backup, backup_index| {
         const mutation_key = if (backup.format == .portable) "doc:after-portable" else "doc:after-native";
         _ = try write_source.source().batch(alloc, "articles", .{
@@ -1013,6 +1117,12 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         )) != null);
         try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
     }
+
+    concurrent_maintenance.stop.store(true, .release);
+    maintenance_thread.join();
+    maintenance_joined = true;
+    if (concurrent_maintenance.failure) |err| return err;
+    try std.testing.expect(concurrent_maintenance.rounds.load(.acquire) > rounds_before);
 
     const accepted_snapshot = try shard_state_store.encodeGroupStateSnapshot(
         alloc,

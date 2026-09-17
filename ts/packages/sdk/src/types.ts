@@ -366,7 +366,7 @@ export const embedderProviderCapabilities = {
   gemini: { index: false },
   ollama: { index: true },
   openai: { index: true },
-  openrouter: { index: false },
+  openrouter: { index: true },
   vertex: { index: false },
 } as const satisfies Record<EmbedderProvider, { index: boolean }>;
 export const embedderProviders = Object.keys(embedderProviderCapabilities) as EmbedderProvider[];
@@ -379,6 +379,7 @@ export const generatorProviderCapabilities = {
   gemini: {},
   ollama: {},
   openai: {},
+  openrouter: {},
   vertex: {},
 } as const satisfies Record<GeneratorProvider, object>;
 export const generatorProviders = Object.keys(generatorProviderCapabilities) as GeneratorProvider[];
@@ -554,3 +555,12 @@ export interface QueryOptions {
   orderBy?: Record<string, boolean>;
   aggregations?: Record<string, AggregationRequest>;
 }
+
+// System catalog resources and lifecycle requests.
+export type DatabaseCatalogRecord = components["schemas"]["DatabaseCatalogRecord"];
+export type NamespaceCatalogRecord = components["schemas"]["NamespaceCatalogRecord"];
+export type TablespaceCatalogRecord = components["schemas"]["TablespaceCatalogRecord"];
+export type CreateTablespaceRequest = components["schemas"]["CreateTablespaceRequest"];
+export type CatalogTablespaceBindingRequest =
+  components["schemas"]["CatalogTablespaceBindingRequest"];
+export type RenameCatalogResourceRequest = components["schemas"]["RenameCatalogResourceRequest"];

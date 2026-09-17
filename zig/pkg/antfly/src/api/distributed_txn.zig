@@ -2973,7 +2973,7 @@ fn consumerTests() type {
                     return 1;
                 }
 
-                fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+                fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: table_router.RouteBudget) ![]u64 {
                     return try alloc.dupe(u64, &.{ 1, 2, 3 });
                 }
 
@@ -3339,7 +3339,7 @@ fn consumerTests() type {
                     return 1;
                 }
 
-                fn groupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+                fn groupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64, _: table_router.RouteBudget) ![]u64 {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.fail_group_nodes) return error.TestCandidateDiscoveryFailure;
                     return try alloc.dupe(u64, &.{ 1, 2, 3 });
@@ -3449,7 +3449,7 @@ fn consumerTests() type {
                     return 99;
                 }
 
-                fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+                fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: table_router.RouteBudget) ![]u64 {
                     return try alloc.dupe(u64, &.{ 99, 2 });
                 }
 

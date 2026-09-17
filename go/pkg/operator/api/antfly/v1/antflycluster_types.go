@@ -570,6 +570,20 @@ const (
 	HAModeHotStandby HAMode = "HotStandby"
 )
 
+// HADataLayout selects the on-disk hot-standby data layout the operator
+// renders into pod arguments and default paths.
+type HADataLayout string
+
+const (
+	// HADataLayoutLegacy is the pre-0.3 layout:
+	// <root>/ha/{primary.wal,slots,standby.wal,standby-progress.wal,fence.wal}.
+	HADataLayoutLegacy HADataLayout = "ha"
+
+	// HADataLayoutStandby is the 0.3 layout:
+	// <root>/standby/{primary.wal,slots,log.wal,progress.wal,fence.wal}.
+	HADataLayoutStandby HADataLayout = "standby"
+)
+
 // HADurabilityMode selects when a primary write may be acknowledged.
 type HADurabilityMode string
 
@@ -642,6 +656,13 @@ const (
 
 // HighAvailabilitySpec configures hot-standby HA for an AntflyCluster.
 type HighAvailabilitySpec struct {
+	// ActivationPolicy controls initial standby seeding. OnFirstTable defers
+	// seeding until the runtime reports a table and is supported only for Async
+	// durability. Eager preserves protection of synchronous table creation.
+	// +kubebuilder:validation:Enum=Eager;OnFirstTable
+	// +optional
+	ActivationPolicy string `json:"activationPolicy,omitempty"`
+
 	// Mode selects whether hot standby is managed.
 	// +kubebuilder:validation:Enum=Disabled;HotStandby
 	// +kubebuilder:default=Disabled
@@ -1945,6 +1966,26 @@ type HAStatus struct {
 	// Mode is the observed HA mode.
 	// +optional
 	Mode HAMode `json:"mode,omitempty"`
+
+	// DataLayout is the hot-standby on-disk layout the operator renders into
+	// pod arguments. Empty means undecided; once set to standby it never
+	// reverts.
+	// +kubebuilder:validation:Enum=ha;standby
+	// +optional
+	DataLayout HADataLayout `json:"dataLayout,omitempty"`
+
+	// CatalogObserved means the current primary explicitly reported catalog readiness.
+	// +optional
+	CatalogObserved bool `json:"catalogObserved,omitempty"`
+
+	// WaitingForTables reports an empty catalog before initial HA activation.
+	// +optional
+	WaitingForTables bool `json:"waitingForTables,omitempty"`
+
+	// ActivationStarted latches once a nonempty catalog or existing HA work
+	// is observed. Deleting the last table must never disable established HA.
+	// +optional
+	ActivationStarted bool `json:"activationStarted,omitempty"`
 
 	// PrimaryLSN is the current primary replication LSN.
 	// +optional

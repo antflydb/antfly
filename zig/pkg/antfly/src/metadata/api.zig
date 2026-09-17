@@ -270,6 +270,7 @@ pub const AdminSnapshot = struct {
     placement_intents: []raft_reconciler.PlacementIntent,
     shuffle_join_leases: []table_manager.ShuffleJoinLeaseRecord = &.{},
     local_bootstrap_statuses: []raft_host.BootstrapStatus = &.{},
+    schema_progresses: []table_manager.SchemaProgressRecord = &.{},
     restore_progresses: []table_manager.RestoreProgressRecord = &.{},
     replication_source_statuses: []table_manager.ReplicationSourceStatusRecord = &.{},
     replication_source_action_hints: []ReplicationSourceActionHint = &.{},
@@ -1007,6 +1008,9 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
     if (@hasDecl(SourceDeclType, "listLocalBootstrapStatuses")) {
         snapshot.local_bootstrap_statuses = try source.listLocalBootstrapStatuses(alloc);
     }
+    if (@hasDecl(SourceDeclType, "listProjectedSchemaProgress")) {
+        snapshot.schema_progresses = try source.listProjectedSchemaProgress(alloc);
+    }
     if (@hasDecl(SourceDeclType, "listProjectedRestoreProgress")) {
         snapshot.restore_progresses = try source.listProjectedRestoreProgress(alloc);
     }
@@ -1071,6 +1075,9 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
     }
     if (@hasDecl(SourceDeclType, "freeLocalBootstrapStatuses") and snapshot.local_bootstrap_statuses.len > 0) {
         source.freeLocalBootstrapStatuses(alloc, snapshot.local_bootstrap_statuses);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedSchemaProgress") and snapshot.schema_progresses.len > 0) {
+        source.freeProjectedSchemaProgress(alloc, snapshot.schema_progresses);
     }
     if (@hasDecl(SourceDeclType, "freeProjectedRestoreProgress") and snapshot.restore_progresses.len > 0) {
         source.freeProjectedRestoreProgress(alloc, snapshot.restore_progresses);

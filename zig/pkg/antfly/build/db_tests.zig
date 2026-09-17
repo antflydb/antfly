@@ -29,7 +29,19 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const repair_activation_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{
+            "db repair activation",
+            "db dense shadow activation rejects surplus candidate coverage",
+            "db paused dense repair resumes its durable candidate after restart",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = &.{
+        "db resolver workers recover pending journal targets after reopen without new writes",
         "db resolver worker resumes durable backfill after deferred activation and reopen",
         "db managed resolver changes fence in-flight replay and reset durable cursors",
         "storage.db.db.test.db batch marks generated enrichment replay",
@@ -199,9 +211,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db writer open resumes generated enrichment replay from journal",
         "storage.db.db.test.enrichment worker bounds retries against a durable foreign lease",
         "storage.db.db.test.generated enrichment preparation helpers release partial allocations",
-        "storage.db.db.test.storage.ha db waits for remote apply before completing derived enrichment",
-        "storage.db.db.test.storage.ha seed snapshot predrains enrichment before exclusive capture",
+        "storage.db.db.test.storage.hot_standby db waits for remote apply before completing derived enrichment",
+        "storage.db.db.test.storage.hot_standby seed snapshot predrains enrichment before exclusive capture",
         "storage.db.derived.io_threaded_runtime.test.derived enrichment visibility guard observes cancellation and deadline",
+        "storage.db.derived.runtime_types.test.derived visibility wait retains its deadline clock and cancellation",
         "storage.db.derived.replay_source.test.replay source primary store collects enrichment groups from hint lane",
         "storage.db.enrichment.chunker_stub.test.enrichment chunker stub configured chunking replaces invalid utf8 before dispatch",
         "storage.db.enrichment.chunker_stub.test.enrichment chunker stub makes progress when byte window is smaller than utf8 scalar",
@@ -502,16 +515,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &.{
             "storage.db.db.test.db reopens persisted",
+            "storage.db.db.test.db split prepare and finalize work with durable lsm primary backend",
             "storage.db.db.test.db delete index persists",
             "storage.db.db.test.db indexed delete removes",
             "storage.db.db.test.db indexed overwrite replaces",
-            "storage.db.db.test.db compacts tiny text segments",
             "storage.db.db.test.db phrase query survives",
             "storage.db.db.test.db prefix wildcard and regexp",
             "storage.db.db.test.db typed and dictionary queries survive",
             "storage.db.db.test.db mixed-type stored fields survive",
             "storage.db.db.test.db persists byte range across reopen",
-            "storage.db.db.test.db snapshot copies current store and derived log",
             "storage.db.db.test.db updateRange constrains index backfill",
         },
     });

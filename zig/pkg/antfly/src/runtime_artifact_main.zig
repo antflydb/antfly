@@ -22,7 +22,6 @@ const inference_process_supervisor = @import("antfly_platform").inference_proces
 
 extern fn antfly_runtime_cli(context: *const bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const bridge.Context) callconv(.c) c_int;
-extern fn antfly_runtime_graph_metric_maintenance(context: *const bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_inference(context: *const bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_metadata(context: *const bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const bridge.Context) callconv(.c) c_int;
@@ -77,6 +76,16 @@ fn mainImpl(init: std.process.Init) anyerror!void {
     if (worker_invocation) command = "inference";
     const runtime_arguments = if (worker_invocation) argument_views.items[1..] else argument_views.items;
 
+    if (comptime role_options.role == .inference) {
+        const one_shot = @import("antfly_platform").one_shot_process;
+        if (one_shot.isTrainingInvocation(init.minimal.args)) {
+            // Preserve the executable's invocation before the runtime ABI
+            // substitutes its synthetic argv vector. Ignore inherited claims.
+            const original = try one_shot.encodeOriginalArguments(init.gpa, init.minimal.args);
+            defer init.gpa.free(original);
+            try init.environ_map.put(one_shot.original_argv_env, original);
+        }
+    }
     const environment_names = init.environ_map.keys();
     const environment_values = init.environ_map.values();
     std.debug.assert(environment_names.len == environment_values.len);
@@ -96,7 +105,6 @@ fn mainImpl(init: std.process.Init) anyerror!void {
     const code = switch (role_options.role) {
         .cli => antfly_runtime_cli(&context),
         .data => antfly_runtime_data(&context),
-        .graph_metric_maintenance => antfly_runtime_graph_metric_maintenance(&context),
         .inference => antfly_runtime_inference(&context),
         .metadata => antfly_runtime_metadata(&context),
         .standalone => if (worker_invocation) antfly_runtime_inference(&context) else antfly_runtime_standalone(&context),

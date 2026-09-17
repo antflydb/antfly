@@ -163,7 +163,8 @@ remain co-resident with their parents and that parents spanning a three-shard
 table produce indexed chunks on every shard. Its deliberately skewed parent
 distribution also drives one shard past the former 746k ceiling. The dedicated
 `Zig Scale Tests` workflow runs this gate daily, through manual dispatch, or on
-a same-repository pull request when the `ci:scale-tests` label is applied. It
+a pull request when the `ci:scale-tests` label is applied and a maintainer
+approves its exact head commit with `/ci run <sha>`. It
 runs separately from the required and full E2E shards.
 
 Run it locally from `zig/` with:

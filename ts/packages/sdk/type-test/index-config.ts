@@ -35,3 +35,15 @@ const graphWithRootMapping: CreateIndexRequest = {
   nodes: { model: "document" },
 };
 void graphWithRootMapping;
+
+const openRouterEmbeddings: CreateIndexRequest = {
+  type: "embeddings",
+  field: "body",
+  embedder: {
+    provider: "openrouter",
+    model: "openai/text-embedding-3-small",
+    url: "https://openrouter.ai/api/v1",
+    dimensions: 1536,
+  },
+};
+void openRouterEmbeddings;

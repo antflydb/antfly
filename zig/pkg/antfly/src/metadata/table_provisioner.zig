@@ -219,15 +219,16 @@ pub fn reconcileReplicaRootWithOptions(
             options.backend_runtime,
         );
 
-        const runtime_schema = try runtimeTableSchemaFromJson(alloc, table.schema_json);
-        defer if (runtime_schema) |schema| @import("../storage/schema.zig").freeSchema(alloc, schema);
+        const schema_json = tables_api.effectiveSchemaJson(table.schema_json);
+        const runtime_schema = try runtimeTableSchemaFromJson(alloc, schema_json);
+        defer @import("../storage/schema.zig").freeSchema(alloc, runtime_schema);
         var open_options = provisioningDbOpenOptions();
         open_options.start_resolver_workers = options.drain_resolver_backfill;
         open_options.backend_runtime = options.backend_runtime;
-        open_options.schema_before_index_load = if (runtime_schema) |schema| .{
-            .runtime_schema = schema,
-            .public_schema_json = table.schema_json,
-        } else null;
+        open_options.schema_before_index_load = .{
+            .runtime_schema = runtime_schema,
+            .public_schema_json = schema_json,
+        };
         open_options.table_storage = table.storage;
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
@@ -243,8 +244,7 @@ pub fn reconcileReplicaRootWithOptions(
     return summary;
 }
 
-fn runtimeTableSchemaFromJson(alloc: std.mem.Allocator, schema_json: []const u8) !?@import("../storage/schema.zig").TableSchema {
-    if (schema_json.len == 0) return null;
+fn runtimeTableSchemaFromJson(alloc: std.mem.Allocator, schema_json: []const u8) !@import("../storage/schema.zig").TableSchema {
     var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
     return try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
@@ -533,7 +533,88 @@ pub fn collectLocalSchemaProgressWithOptions(
     return try out.toOwnedSlice(alloc);
 }
 
+/// Compare current ready observations with replicated acknowledgements, not a
+/// process-local sent bit. Failed/ambiguous delivery and metadata restore are
+/// repaired naturally by the next captured snapshot.
+pub fn schemaProgressDelta(alloc: std.mem.Allocator, ready: []const table_manager.SchemaProgressRecord, acknowledged: []const table_manager.SchemaProgressRecord) ![]table_manager.SchemaProgressRecord {
+    var known: std.AutoHashMapUnmanaged(struct { table_id: u64, node_id: u64 }, u32) = .empty;
+    defer known.deinit(alloc);
+    for (acknowledged) |record| try known.put(alloc, .{ .table_id = record.table_id, .node_id = record.node_id }, record.schema_version);
+    var out: std.ArrayListUnmanaged(table_manager.SchemaProgressRecord) = .empty;
+    errdefer out.deinit(alloc);
+    for (ready) |record| {
+        const version = known.get(.{ .table_id = record.table_id, .node_id = record.node_id });
+        if (version != null and version.? == record.schema_version) continue;
+        try out.append(alloc, record);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 pub fn collectLocalSchemaProgressFromRuntime(
+    alloc: std.mem.Allocator,
+    local_node_id: u64,
+    hosted_group_ids: []const u64,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+    stores: []const table_manager.StoreRecord,
+) ![]table_manager.SchemaProgressRecord {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const State = struct { version: u32, read_version: u32, hosted: usize = 0, ready: bool = true };
+    var states: std.AutoHashMapUnmanaged(u64, State) = .empty;
+    for (tables) |table| {
+        if (table.read_schema_json.len == 0) continue;
+        try states.put(a, table.table_id, .{
+            .version = try schemaVersion(alloc, table.schema_json),
+            .read_version = try schemaVersion(alloc, table.read_schema_json),
+        });
+    }
+    if (states.count() == 0) return alloc.alloc(table_manager.SchemaProgressRecord, 0);
+    var ranges_by_group: std.AutoHashMapUnmanaged(u64, table_manager.RangeRecord) = .empty;
+    for (ranges) |range| {
+        const entry = try ranges_by_group.getOrPut(a, range.group_id);
+        if (!entry.found_existing) entry.value_ptr.* = range;
+    }
+    var runtimes: std.AutoHashMapUnmanaged(struct { table_id: u64, group_id: u64 }, table_manager.RuntimeGroupStatusReport) = .empty;
+    for (stores) |store| {
+        if (store.node_id != local_node_id) continue;
+        for (store.runtime_statuses) |runtime| {
+            if (runtime.node_id != 0 and runtime.node_id != local_node_id) continue;
+            const entry = try runtimes.getOrPut(a, .{ .table_id = runtime.table_id, .group_id = runtime.group_id });
+            if (!entry.found_existing) entry.value_ptr.* = runtime;
+        }
+    }
+    for (hosted_group_ids) |group_id| {
+        const range = ranges_by_group.get(group_id) orelse continue;
+        const state = states.getPtr(range.table_id) orelse continue;
+        state.hosted += 1;
+        const runtime = runtimes.get(.{ .table_id = range.table_id, .group_id = group_id }) orelse {
+            state.ready = false;
+            continue;
+        };
+        state.ready = state.ready and runtimeHasReadySchemaVersionIndex(runtime, range, state.version, state.read_version);
+    }
+    var out: std.ArrayListUnmanaged(table_manager.SchemaProgressRecord) = .empty;
+    errdefer out.deinit(alloc);
+    var entries = states.iterator();
+    while (entries.next()) |entry| {
+        if (entry.value_ptr.hosted != 0 and entry.value_ptr.ready) try out.append(alloc, .{
+            .table_id = entry.key_ptr.*,
+            .node_id = local_node_id,
+            .schema_version = entry.value_ptr.version,
+        });
+    }
+    std.mem.sort(table_manager.SchemaProgressRecord, out.items, {}, struct {
+        fn lessThan(_: void, x: table_manager.SchemaProgressRecord, y: table_manager.SchemaProgressRecord) bool {
+            return x.table_id < y.table_id or (x.table_id == y.table_id and x.node_id < y.node_id);
+        }
+    }.lessThan);
+    return out.toOwnedSlice(alloc);
+}
+
+// Benchmark oracle for the former repeated-scan collector.
+fn collectLocalSchemaProgressReference(
     alloc: std.mem.Allocator,
     local_node_id: u64,
     hosted_group_ids: []const u64,
@@ -1857,6 +1938,70 @@ fn implementationTests() type {
             try std.testing.expect(!localSchemaRuntimeCoverageComplete(4, &hosted, &tables, &ranges, &stores));
         }
 
+        test "system catalog schema progress indexed collector and acknowledged delta workload" {
+            const a = std.testing.allocator;
+            const benchmark = std.c.getenv("ANTFLY_CATALOG_REPORT_BENCH") != null;
+            const table_count: usize = if (benchmark) 100 else 4;
+            const count: usize = if (benchmark) 2000 else 16;
+            const tables = try a.alloc(table_manager.TableRecord, table_count);
+            defer a.free(tables);
+            for (tables, 0..) |*table, i| table.* = .{ .table_id = i + 1, .name = "tenant", .schema_json = "{\"version\":1}", .read_schema_json = "{\"version\":0}" };
+            const ranges = try a.alloc(table_manager.RangeRecord, count);
+            defer a.free(ranges);
+            const hosted = try a.alloc(u64, count);
+            defer a.free(hosted);
+            const runtimes = try a.alloc(table_manager.RuntimeGroupStatusReport, count);
+            defer a.free(runtimes);
+            var indexes = [_]table_manager.RuntimeIndexStatusReport{.{ .name = "full_text_index_v1", .kind = "full_text", .doc_count = 1 }};
+            for (ranges, hosted, runtimes, 0..) |*range, *group, *runtime, i| {
+                const table_id = i % table_count + 1;
+                group.* = i + 100;
+                range.* = .{ .table_id = table_id, .group_id = group.*, .start_key = "" };
+                runtime.* = .{ .table_id = table_id, .group_id = group.*, .node_id = 3, .freshness = "fresh", .indexes = &indexes, .doc_identity = .{ .namespace_table_id = table_id, .namespace_shard_id = group.*, .namespace_range_id = group.*, .next_ordinal = 2, .allocated_ordinals = 1, .live_ordinals = 1 } };
+            }
+            const stores = [_]table_manager.StoreRecord{.{ .store_id = 5, .node_id = 3, .runtime_statuses = runtimes }};
+            var reference_ns: [5]u64 = undefined;
+            var indexed_ns: [5]u64 = undefined;
+            for (0..if (benchmark) @as(usize, 6) else 1) |sample| {
+                const start = @import("antfly_platform").time.monotonicNs();
+                const reference = try collectLocalSchemaProgressReference(a, 3, hosted, tables, ranges, &stores);
+                defer a.free(reference);
+                const middle = @import("antfly_platform").time.monotonicNs();
+                const ready = try collectLocalSchemaProgressFromRuntime(a, 3, hosted, tables, ranges, &stores);
+                defer a.free(ready);
+                const end = @import("antfly_platform").time.monotonicNs();
+                try std.testing.expectEqualDeep(reference, ready);
+                try std.testing.expectEqual(table_count, ready.len);
+                const quiet = try schemaProgressDelta(a, ready, ready);
+                defer a.free(quiet);
+                try std.testing.expectEqual(@as(usize, 0), quiet.len);
+                const restored = try schemaProgressDelta(a, ready, &.{});
+                defer a.free(restored);
+                try std.testing.expectEqualDeep(ready, restored);
+                // A stale version or a different reporter is never an acknowledgement.
+                const stale = [_]table_manager.SchemaProgressRecord{
+                    .{ .table_id = 1, .node_id = 3, .schema_version = 0 },
+                    .{ .table_id = 2, .node_id = 4, .schema_version = 1 },
+                };
+                const retry = try schemaProgressDelta(a, ready, &stale);
+                defer a.free(retry);
+                try std.testing.expectEqualDeep(ready, retry);
+                if (benchmark and sample > 0) {
+                    reference_ns[sample - 1] = middle - start;
+                    indexed_ns[sample - 1] = end - middle;
+                }
+            }
+            // Missing observations and non-authoritative observations both withhold cutover.
+            runtimes[0].freshness = "opening";
+            const partial = try collectLocalSchemaProgressFromRuntime(a, 3, hosted, tables, ranges, &stores);
+            defer a.free(partial);
+            const partial_reference = try collectLocalSchemaProgressReference(a, 3, hosted, tables, ranges, &stores);
+            defer a.free(partial_reference);
+            try std.testing.expectEqualDeep(partial_reference, partial);
+            try std.testing.expectEqual(table_count - 1, partial.len);
+            if (benchmark) std.debug.print("SCHEMA_PROGRESS_BENCH tables={d} groups={d} nested_ns={any} indexed_ns={any} first_proposals={d} acknowledged_proposals=0\n", .{ table_count, count, reference_ns, indexed_ns, (table_count + table_manager.max_schema_progress_batch - 1) / table_manager.max_schema_progress_batch });
+        }
+
         test "runtime schema progress requires every hosted range" {
             const tables = [_]table_manager.TableRecord{.{
                 .table_id = 11,
@@ -2084,11 +2229,10 @@ fn implementationTests() type {
         }
 
         test "table provisioner materializes metadata indexes into hosted group dbs" {
-            const path = "/tmp/antfly-metadata-table-provisioner";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
-            defer io_impl.deinit();
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
-            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/table-provisioner", .{tmp.sub_path});
+            defer std.testing.allocator.free(path);
 
             const summary = try reconcileReplicaRoot(
                 std.testing.allocator,
@@ -2117,6 +2261,10 @@ fn implementationTests() type {
             var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
             defer db.close();
             try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
+            const schema_json = (try db.getSchemaJson(std.testing.allocator)) orelse
+                return error.TestExpectedLocalTableManifest;
+            defer std.testing.allocator.free(schema_json);
+            try std.testing.expectEqualStrings(tables_api.default_schema_json, schema_json);
         }
 
         test "table provisioner materializes array-form metadata indexes" {

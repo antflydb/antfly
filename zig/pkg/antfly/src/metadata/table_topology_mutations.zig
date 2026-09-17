@@ -53,7 +53,7 @@ fn unlockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
 
 pub const DropResult = topology_protocol.DropResult;
 
-fn deriveRestoreDestinationRanges(
+pub fn deriveRestoreDestinationRanges(
     alloc: std.mem.Allocator,
     table: metadata_table_manager.TableRecord,
     source_ranges: []const metadata_table_manager.RangeRecord,
@@ -124,8 +124,10 @@ pub fn create(
     // boundary so embedded, HTTP-local, and forwarded callers cannot persist
     // different definitions for the same request.
     var normalized_req = req;
-    if (req.storage.dense_embeddings == .vector_store)
-        return error.VectorStoreRequiresLocalSingleShardTable;
+    if (req.storage) |storage| {
+        if (storage.dense_embeddings == .vector_store)
+            return error.VectorStoreRequiresLocalSingleShardTable;
+    }
     const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(
         alloc,
         table_name,
@@ -224,6 +226,11 @@ pub fn restore(
         if (range.table_id != table.table_id or unique_groups.contains(range.group_id))
             return error.InvalidTableTopologyMutation;
         unique_groups.putAssumeCapacity(range.group_id, {});
+    }
+    if (try @import("../system_catalog/domain.zig").restoreTarget(alloc, table.name)) |owned_target| {
+        defer owned_target.deinit(alloc);
+        const target = owned_target.value;
+        return @import("../system_catalog/operations.zig").restore(svc, alloc, request, target, table, ranges);
     }
     const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(
         request,

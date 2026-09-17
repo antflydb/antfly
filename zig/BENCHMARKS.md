@@ -29,7 +29,7 @@ The commands below preserve the former workload defaults. Replace the arguments 
 | `antfly-storage-bench` | `./zig-out/bin/storage_bench ingest --docs 5000 --dims 1536 --batch-size 500 --sync-level write --status-probe-every 1 --max-dense-lsm-run-bytes 1073741824 --max-dense-l0-runs 64 --max-status-probe-ns 500000000` |
 | `dense-profile-summary` | `./zig-out/bin/dense_profile_summary` |
 | `dense-stack-bench` | `./zig-out/bin/dense_stack_bench` |
-| `graph-pattern-bench` | `./zig-out/bin/graph_pattern_query_bench --mode exact --fanout 10000 --tags-per-post 8 --target-degree 100000 --match-every 10 --warmup 5 --samples 30` |
+| `antfly-graph-bench` | `./zig-out/bin/antfly-graph-bench pattern --mode exact --fanout 10000 --tags-per-post 8 --target-degree 100000 --match-every 10 --warmup 5 --samples 30` |
 | `antfly-storage-bench` | `./zig-out/bin/storage_bench hbc-search` |
 | `hbc-isolate` | `./zig-out/bin/hbc_isolate` |
 | `hbc-leaf-debug` | `./zig-out/bin/hbc_leaf_debug` |

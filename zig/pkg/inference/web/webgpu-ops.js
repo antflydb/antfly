@@ -1946,27 +1946,42 @@ export class WebGPUOps {
       }
 
       case 'download': {
-        const buf = this.buffers.get(msg.id);
-        if (buf) {
+        try {
+          const buf = this.buffers.get(msg.id);
+          if (!buf) throw new Error('GPU download buffer is unavailable');
           const size = toJsIndex(msg.size, 'GPU download size');
+          const offset = toJsIndex(msg.offsetBytes ?? 0, 'GPU download offset');
+          if (!Number.isSafeInteger(size) || size < 0 || size % 4 !== 0 ||
+              !Number.isSafeInteger(offset) || offset < 0 || offset % 4 !== 0 ||
+              size > sab.byteLength - dataOffset || offset > buf.size || size > buf.size - offset) {
+            throw new RangeError('GPU download range exceeds the buffer or shared transfer capacity');
+          }
+          if (size === 0) break;
           const staging = this.device.createBuffer({
             size,
             usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
           });
-
-          const encoder = this.device.createCommandEncoder();
-          encoder.copyBufferToBuffer(buf, 0, staging, 0, size);
-          this.device.queue.submit([encoder.finish()]);
-
-          await this.device.queue.onSubmittedWorkDone();
-          await staging.mapAsync(GPUMapMode.READ);
-
-          const mapped = new Uint8Array(staging.getMappedRange());
-          const dst = new Uint8Array(sab, dataOffset, msg.size);
-          dst.set(mapped);
-
-          staging.unmap();
-          staging.destroy();
+          let mapped = false;
+          try {
+            const encoder = this.device.createCommandEncoder();
+            encoder.copyBufferToBuffer(buf, offset, staging, 0, size);
+            this.device.queue.submit([encoder.finish()]);
+            await this.device.queue.onSubmittedWorkDone();
+            await staging.mapAsync(GPUMapMode.READ);
+            mapped = true;
+            const bytes = new Uint8Array(staging.getMappedRange());
+            new Uint8Array(sab, dataOffset, size).set(bytes);
+          } finally {
+            try {
+              if (mapped) staging.unmap();
+            } finally {
+              staging.destroy();
+            }
+          }
+        } catch {
+          // The worker is blocked in gpuSync. Wake it with a failure rather
+          // than leaving an unhandled readback rejection and a permanent wait.
+          result = -1;
         }
         break;
       }
@@ -2265,7 +2280,10 @@ export class WebGPUOps {
         break;
     }
 
-    // Write result and signal worker
+    // Fire-and-forget work can arrive while a later download is waiting. It
+    // must not acknowledge that download before its data has been copied.
+    if (msg.type === 'gpu') return;
+    // Write result and signal worker (untyped legacy callers remain sync).
     Atomics.store(ctrl, 1, result);     // ctrl[1] = result value
     Atomics.store(ctrl, 0, 1);          // ctrl[0] = response ready
     Atomics.notify(ctrl, 0);            // wake worker

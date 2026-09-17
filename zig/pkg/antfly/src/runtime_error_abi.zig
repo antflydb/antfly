@@ -359,10 +359,71 @@ pub const Detail = enum(c_int) {
     // An ambiguous remote backup cannot authorize rollback at its caller.
     backup_outcome_ambiguous,
     metadata_mutation_not_applied,
-    // Append unpublished branch details after all main wire identities.
+    // Published graph details precede this branch's new catalog identities.
     graph_metric_action_partial_outcome,
     index_generation_mismatch,
     generation_transition_active,
+    storage_busy,
+    storage_kernel_failure,
+    invalid_vector_migration_budget,
+    invalid_vector_migration_id,
+    invalid_vector_migration_state,
+    unsupported_vector_migration_direction,
+    unsupported_vector_migration_version,
+    vector_migration_active,
+    vector_migration_already_exists,
+    vector_migration_already_published,
+    vector_migration_configuration_changed,
+    vector_migration_coverage_mismatch,
+    vector_migration_disk_reserve,
+    vector_migration_idempotency_conflict,
+    vector_migration_identity_mismatch,
+    vector_migration_inline_payload_remains,
+    vector_migration_not_found,
+    vector_migration_not_ready,
+    vector_migration_read_epoch_changed,
+    vector_migration_recovery_required,
+    vector_migration_row_exceeds_budget,
+    vector_migration_temporary_budget_exceeded,
+    vector_migration_offline_admission,
+    vector_migration_catalog_in_use,
+    vector_migration_copy_mismatch,
+    vector_migration_unsupported_file,
+    vector_store_requires_offline_command,
+    read_index_timeout,
+    incomplete_published_snapshot,
+    distributed_query_unavailable,
+    // System catalog errors cross the independently compiled runtime boundary.
+    database_not_found,
+    namespace_not_found,
+    tablespace_not_found,
+    catalog_not_found,
+    catalog_already_exists,
+    catalog_generation_changed,
+    tablespace_in_use,
+    namespace_not_empty,
+    database_not_empty,
+    protected_catalog_resource,
+    invalid_catalog_name,
+    invalid_catalog_mutation,
+    invalid_tablespace_location,
+    invalid_tablespace_placement_policy,
+    catalog_command_too_large,
+    invalid_catalog_record,
+    catalog_id_exhausted,
+    table_topology_protocol_upgrade_required,
+    ha_seed_snapshot_runtime_busy,
+    ha_seed_capture_already_in_progress,
+    storage_kernel_owner_unavailable,
+    // Catalog admission outcomes must survive independently compiled write
+    // callbacks so the public layer can preserve its pre-proposal response.
+    // Append only: existing detail ordinals are part of the native contract.
+    catalog_routing_snapshot_timeout,
+    catalog_routing_unavailable,
+    catalog_projection_refresh_required,
+    metadata_incarnation_unavailable,
+    invalid_metadata_incarnation,
+    metadata_incarnation_mismatch,
 };
 
 pub const Status = extern struct {
@@ -380,6 +441,34 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.HASeedSnapshotRuntimeBusy => status(.unavailable, .ha_seed_snapshot_runtime_busy),
+        error.HASeedCaptureAlreadyInProgress => status(.unavailable, .ha_seed_capture_already_in_progress),
+        error.StorageKernelOwnerUnavailable => status(.unavailable, .storage_kernel_owner_unavailable),
+        error.TableTopologyProtocolUpgradeRequired => status(.unavailable, .table_topology_protocol_upgrade_required),
+        error.DatabaseNotFound => status(.not_found, .database_not_found),
+        error.NamespaceNotFound => status(.not_found, .namespace_not_found),
+        error.TablespaceNotFound => status(.not_found, .tablespace_not_found),
+        error.CatalogRoutingSnapshotTimeout => status(.timeout, .catalog_routing_snapshot_timeout),
+        error.MetadataIncarnationUnavailable => status(.unavailable, .metadata_incarnation_unavailable),
+        error.InvalidMetadataIncarnation => status(.unavailable, .invalid_metadata_incarnation),
+        error.MetadataIncarnationMismatch => status(.unavailable, .metadata_incarnation_mismatch),
+        error.CatalogRoutingUnavailable => status(.unavailable, .catalog_routing_unavailable),
+        error.CatalogProjectionRefreshRequired => status(.unavailable, .catalog_projection_refresh_required),
+        error.CatalogNotFound => status(.not_found, .catalog_not_found),
+        error.CatalogAlreadyExists => status(.conflict, .catalog_already_exists),
+        error.CatalogGenerationChanged => status(.conflict, .catalog_generation_changed),
+        error.TablespaceInUse => status(.conflict, .tablespace_in_use),
+        error.NamespaceNotEmpty => status(.conflict, .namespace_not_empty),
+        error.DatabaseNotEmpty => status(.conflict, .database_not_empty),
+        error.ProtectedCatalogResource => status(.conflict, .protected_catalog_resource),
+        error.InvalidCatalogName => status(.invalid_argument, .invalid_catalog_name),
+        error.InvalidCatalogMutation => status(.invalid_argument, .invalid_catalog_mutation),
+        error.InvalidTablespaceLocation => status(.invalid_argument, .invalid_tablespace_location),
+        error.InvalidTablespacePlacementPolicy => status(.invalid_argument, .invalid_tablespace_placement_policy),
+        error.CatalogCommandTooLarge => status(.invalid_argument, .catalog_command_too_large),
+        error.InvalidCatalogRecord => status(.corrupt, .invalid_catalog_record),
+        error.CatalogIdExhausted => status(.internal, .catalog_id_exhausted),
+
         error.OutOfMemory => status(.out_of_memory, .out_of_memory),
         error.InvalidArgument => status(.invalid_argument, .invalid_argument),
         error.InvalidArguments => status(.invalid_argument, .invalid_arguments),
@@ -420,6 +509,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.HAReadRequiresPrimary => status(.unavailable, .ha_read_requires_primary),
         error.HAReadWaitForApply => status(.retryable, .ha_read_wait_for_apply),
         error.HAReadWaitForMetadata => status(.retryable, .ha_read_wait_for_metadata),
+        error.StorageBusy => status(.retryable, .storage_busy),
+        error.DistributedQueryUnavailable => status(.retryable, .distributed_query_unavailable),
         error.StorageReadTemporarilyUnavailable => status(.retryable, .storage_read_temporarily_unavailable),
         error.PersistentDescriptorAdmissionExhausted => status(.retryable, .persistent_descriptor_admission_exhausted),
         error.ResourceRequestTooLarge => status(.invalid_argument, .resource_request_too_large),
@@ -457,6 +548,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.GenerationDurabilityUncertain => status(.retryable, .generation_durability_uncertain),
         error.GenerationTransitionActive => status(.retryable, .generation_transition_active),
         error.IndexRebuilding => status(.retryable, .index_rebuilding),
+        error.IncompletePublishedSnapshot => status(.retryable, .incomplete_published_snapshot),
         error.TableVisibilityTimeout => status(.timeout, .table_visibility_timeout),
         error.WriterLocked => status(.retryable, .writer_locked),
         error.LsmRootWriterAlreadyOpen => status(.retryable, .lsm_root_writer_already_open),
@@ -478,6 +570,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedVersion => status(.unsupported, .unsupported_version),
         error.UnsupportedPlatform => status(.unsupported, .unsupported_platform),
         error.Timeout => status(.timeout, .timeout),
+        error.ReadIndexTimeout => status(.timeout, .read_index_timeout),
         error.DeadlineExceeded => status(.timeout, .deadline_exceeded),
         error.PreDecisionDeadlineExceeded => status(.timeout, .pre_decision_deadline_exceeded),
         error.ConnectionTimeout => status(.timeout, .connection_timeout),
@@ -703,6 +796,32 @@ pub fn statusFromError(err: anyerror) Status {
         error.ImmutableTableStorageSettings => status(.conflict, .immutable_table_storage_settings),
         error.VectorStoreLifecycleUnsupported => status(.unsupported, .vector_store_lifecycle_unsupported),
         error.VectorStoreReferenceFormatRequired => status(.unsupported, .vector_store_reference_format_required),
+        error.InvalidVectorMigrationBudget => status(.invalid_argument, .invalid_vector_migration_budget),
+        error.InvalidVectorMigrationId => status(.invalid_argument, .invalid_vector_migration_id),
+        error.InvalidVectorMigrationState => status(.corrupt, .invalid_vector_migration_state),
+        error.UnsupportedVectorMigrationDirection => status(.unsupported, .unsupported_vector_migration_direction),
+        error.UnsupportedVectorMigrationVersion => status(.unsupported, .unsupported_vector_migration_version),
+        error.VectorMigrationActive => status(.conflict, .vector_migration_active),
+        error.VectorMigrationAlreadyExists => status(.conflict, .vector_migration_already_exists),
+        error.VectorMigrationAlreadyPublished => status(.conflict, .vector_migration_already_published),
+        error.VectorMigrationConfigurationChanged => status(.conflict, .vector_migration_configuration_changed),
+        error.VectorMigrationCoverageMismatch => status(.corrupt, .vector_migration_coverage_mismatch),
+        error.VectorMigrationDiskReserve => status(.retryable, .vector_migration_disk_reserve),
+        error.VectorMigrationIdempotencyConflict => status(.conflict, .vector_migration_idempotency_conflict),
+        error.VectorMigrationIdentityMismatch => status(.corrupt, .vector_migration_identity_mismatch),
+        error.VectorMigrationInlinePayloadRemains => status(.corrupt, .vector_migration_inline_payload_remains),
+        error.VectorMigrationNotFound => status(.not_found, .vector_migration_not_found),
+        error.VectorMigrationNotReady => status(.retryable, .vector_migration_not_ready),
+        error.VectorMigrationReadEpochChanged => status(.retryable, .vector_migration_read_epoch_changed),
+        error.VectorMigrationRecoveryRequired => status(.retryable, .vector_migration_recovery_required),
+        error.VectorMigrationRowExceedsBudget => status(.invalid_argument, .vector_migration_row_exceeds_budget),
+        error.VectorMigrationTemporaryBudgetExceeded => status(.retryable, .vector_migration_temporary_budget_exceeded),
+        error.VectorMigrationOfflineAdmission => status(.conflict, .vector_migration_offline_admission),
+        error.VectorMigrationCatalogInUse => status(.conflict, .vector_migration_catalog_in_use),
+        error.VectorMigrationCopyMismatch => status(.conflict, .vector_migration_copy_mismatch),
+        error.VectorMigrationUnsupportedFile => status(.conflict, .vector_migration_unsupported_file),
+        error.VectorStoreRequiresOfflineCommand => status(.conflict, .vector_store_requires_offline_command),
+        error.StorageKernelFailure => status(.internal, .storage_kernel_failure),
         else => status(.internal, .none),
     };
 }
@@ -746,13 +865,66 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .table_topology_protocol_upgrade_required => "TableTopologyProtocolUpgradeRequired",
+        .database_not_found => "DatabaseNotFound",
+        .namespace_not_found => "NamespaceNotFound",
+        .tablespace_not_found => "TablespaceNotFound",
+        .catalog_routing_snapshot_timeout => "CatalogRoutingSnapshotTimeout",
+        .metadata_incarnation_unavailable => "MetadataIncarnationUnavailable",
+        .invalid_metadata_incarnation => "InvalidMetadataIncarnation",
+        .metadata_incarnation_mismatch => "MetadataIncarnationMismatch",
+        .catalog_routing_unavailable => "CatalogRoutingUnavailable",
+        .catalog_projection_refresh_required => "CatalogProjectionRefreshRequired",
+        .catalog_not_found => "CatalogNotFound",
+        .catalog_already_exists => "CatalogAlreadyExists",
+        .catalog_generation_changed => "CatalogGenerationChanged",
+        .tablespace_in_use => "TablespaceInUse",
+        .namespace_not_empty => "NamespaceNotEmpty",
+        .database_not_empty => "DatabaseNotEmpty",
+        .protected_catalog_resource => "ProtectedCatalogResource",
+        .invalid_catalog_name => "InvalidCatalogName",
+        .invalid_catalog_mutation => "InvalidCatalogMutation",
+        .invalid_tablespace_location => "InvalidTablespaceLocation",
+        .invalid_tablespace_placement_policy => "InvalidTablespacePlacementPolicy",
+        .catalog_command_too_large => "CatalogCommandTooLarge",
+        .invalid_catalog_record => "InvalidCatalogRecord",
+        .catalog_id_exhausted => "CatalogIdExhausted",
+
         .none => "RuntimeBoundaryFailure",
+        .ha_seed_snapshot_runtime_busy => "HASeedSnapshotRuntimeBusy",
+        .ha_seed_capture_already_in_progress => "HASeedCaptureAlreadyInProgress",
+        .storage_kernel_owner_unavailable => "StorageKernelOwnerUnavailable",
         .invalid_table_storage_settings => "InvalidTableStorageSettings",
         .vector_store_requires_local_single_shard_table => "VectorStoreRequiresLocalSingleShardTable",
         .vector_store_requires_empty_table => "VectorStoreRequiresEmptyTable",
         .immutable_table_storage_settings => "ImmutableTableStorageSettings",
         .vector_store_lifecycle_unsupported => "VectorStoreLifecycleUnsupported",
         .vector_store_reference_format_required => "VectorStoreReferenceFormatRequired",
+        .invalid_vector_migration_budget => "InvalidVectorMigrationBudget",
+        .invalid_vector_migration_id => "InvalidVectorMigrationId",
+        .invalid_vector_migration_state => "InvalidVectorMigrationState",
+        .unsupported_vector_migration_direction => "UnsupportedVectorMigrationDirection",
+        .unsupported_vector_migration_version => "UnsupportedVectorMigrationVersion",
+        .vector_migration_active => "VectorMigrationActive",
+        .vector_migration_already_exists => "VectorMigrationAlreadyExists",
+        .vector_migration_already_published => "VectorMigrationAlreadyPublished",
+        .vector_migration_configuration_changed => "VectorMigrationConfigurationChanged",
+        .vector_migration_coverage_mismatch => "VectorMigrationCoverageMismatch",
+        .vector_migration_disk_reserve => "VectorMigrationDiskReserve",
+        .vector_migration_idempotency_conflict => "VectorMigrationIdempotencyConflict",
+        .vector_migration_identity_mismatch => "VectorMigrationIdentityMismatch",
+        .vector_migration_inline_payload_remains => "VectorMigrationInlinePayloadRemains",
+        .vector_migration_not_found => "VectorMigrationNotFound",
+        .vector_migration_not_ready => "VectorMigrationNotReady",
+        .vector_migration_read_epoch_changed => "VectorMigrationReadEpochChanged",
+        .vector_migration_recovery_required => "VectorMigrationRecoveryRequired",
+        .vector_migration_row_exceeds_budget => "VectorMigrationRowExceedsBudget",
+        .vector_migration_temporary_budget_exceeded => "VectorMigrationTemporaryBudgetExceeded",
+        .vector_migration_offline_admission => "VectorMigrationOfflineAdmission",
+        .vector_migration_catalog_in_use => "VectorMigrationCatalogInUse",
+        .vector_migration_copy_mismatch => "VectorMigrationCopyMismatch",
+        .vector_migration_unsupported_file => "VectorMigrationUnsupportedFile",
+        .vector_store_requires_offline_command => "VectorStoreRequiresOfflineCommand",
 
         .out_of_memory => "OutOfMemory",
         .invalid_argument => "InvalidArgument",
@@ -791,6 +963,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .write_unavailable => "WriteUnavailable",
         .read_unavailable => "ReadUnavailable",
         .read_requires_primary => "ReadRequiresPrimary",
+        .storage_busy => "StorageBusy",
+        .distributed_query_unavailable => "DistributedQueryUnavailable",
         .storage_read_temporarily_unavailable => "StorageReadTemporarilyUnavailable",
         .resource_request_too_large => "ResourceRequestTooLarge",
         .resource_temporarily_unavailable => "ResourceTemporarilyUnavailable",
@@ -816,6 +990,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .generation_durability_uncertain => "GenerationDurabilityUncertain",
         .generation_transition_active => "GenerationTransitionActive",
         .index_rebuilding => "IndexRebuilding",
+        .incomplete_published_snapshot => "IncompletePublishedSnapshot",
         .table_visibility_timeout => "TableVisibilityTimeout",
         .writer_locked => "WriterLocked",
         .lsm_root_writer_already_open => "LsmRootWriterAlreadyOpen",
@@ -831,6 +1006,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_exact_sort => "UnsupportedExactSort",
         .unsupported_version => "UnsupportedVersion",
         .timeout => "Timeout",
+        .read_index_timeout => "ReadIndexTimeout",
         .connection_timeout => "ConnectionTimeout",
         .connection_timed_out => "ConnectionTimedOut",
         .cancelled => "Cancelled",
@@ -1059,6 +1235,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .provider_quota_registry_full => "ProviderQuotaRegistryFull",
         .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
         .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
+        .storage_kernel_failure => "StorageKernelFailure",
     };
 }
 
@@ -1081,6 +1258,13 @@ test "transaction capacity rejection retains a permanent public status" {
 }
 
 test "stable status preserves public boundary semantics" {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable }) |err| {
+        const readiness = statusFromError(err);
+        try std.testing.expectEqual(@intFromEnum(Code.retryable), readiness.code);
+        try std.testing.expectEqual(err, errorFromStatus(readiness));
+    }
+    try std.testing.expectEqual(error.ReadIndexTimeout, errorFromStatus(statusFromError(error.ReadIndexTimeout)));
+    try std.testing.expectEqual(@intFromEnum(Code.timeout), statusFromError(error.ReadIndexTimeout).code);
     try std.testing.expectEqual(error.GenerationTransitionActive, errorFromStatus(statusFromError(error.GenerationTransitionActive)));
     try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.GenerationTransitionActive).code);
     try std.testing.expectEqual(error.IndexGenerationMismatch, errorFromStatus(statusFromError(error.IndexGenerationMismatch)));
@@ -1150,7 +1334,9 @@ test "stable detail detection distinguishes private errors" {
 }
 
 test "every classified boundary outcome retains its identity" {
+    @setEvalBranchQuota(32 * std.meta.fields(Detail).len);
     const classified = comptime blk: {
+        @setEvalBranchQuota(@typeInfo(Detail).@"enum".fields.len * 8);
         const details = std.meta.tags(Detail)[1..];
         var errors: [details.len]anyerror = undefined;
         for (details, 0..) |detail, index| {
@@ -1202,8 +1388,26 @@ test "generation capacity retains retryability across the runtime boundary" {
     try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
 }
 
+test "system catalog errors retain their stable runtime boundary classification" {
+    const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
+    for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+}
+
 test "ambiguous backup outcome survives runtime transport without rollback authorization" {
     const wire = statusFromError(error.BackupOutcomeAmbiguous);
     try std.testing.expectEqual(@intFromEnum(Code.conflict), wire.code);
     try std.testing.expectEqual(error.BackupOutcomeAmbiguous, errorFromStatus(wire));
+}
+
+test "HA capture availability survives runtime callback transport" {
+    inline for (.{ error.HASeedSnapshotRuntimeBusy, error.HASeedCaptureAlreadyInProgress, error.StorageKernelOwnerUnavailable }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+}
+
+test "storage owner contention retains retryability and exact identity" {
+    const wire = statusFromError(error.StorageBusy);
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), wire.code);
+    try std.testing.expect(errorHasStableDetail(error.StorageBusy));
+    try std.testing.expectEqual(error.StorageBusy, errorFromStatus(wire));
 }

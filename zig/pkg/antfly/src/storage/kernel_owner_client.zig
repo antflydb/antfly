@@ -227,7 +227,7 @@ fn haSeedRequest(operation: abi.HASeedOperation, request_json: []const u8) abi.H
 pub fn haSeedActivate(request_json: []const u8) !Response {
     var response: Response = .{};
     var failure: abi.FailureIdentity = .{};
-    const status = abi.antfly_storage_ha_seed_activate_json(
+    const status = abi.antfly_storage_hot_standby_seed_activate_json(
         &haSeedRequest(.activate, request_json),
         &response.buffer,
         &failure,
@@ -239,7 +239,7 @@ pub fn haSeedActivate(request_json: []const u8) !Response {
 pub fn haSeedValidateActivatedGeneration(request_json: []const u8) !u64 {
     var result: abi.HASeedValidationResult = .{};
     var failure: abi.FailureIdentity = .{};
-    const status = abi.antfly_storage_ha_seed_validate_json(
+    const status = abi.antfly_storage_hot_standby_seed_validate_json(
         &haSeedRequest(.validate_activated_generation, request_json),
         &result,
         &failure,
@@ -253,7 +253,7 @@ pub fn haSeedValidateActivatedGeneration(request_json: []const u8) !u64 {
 pub fn haSeedPruneActivatedGenerations(request_json: []const u8) !Response {
     var response: Response = .{};
     var failure: abi.FailureIdentity = .{};
-    const status = abi.antfly_storage_ha_seed_prune_json(
+    const status = abi.antfly_storage_hot_standby_seed_prune_json(
         &haSeedRequest(.prune_activated_generations, request_json),
         &response.buffer,
         &failure,
@@ -342,6 +342,21 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_preflight_write_admission(self.handle, &.{
             .table_name = .fromSlice(table_name),
         }));
+    }
+
+    /// Reconstruction uses a shared generation lease. Configuration is a
+    /// separate exclusive operation and cannot change under this invocation.
+    pub fn repairIndex(self: *Owner, table_name: []const u8, target_index_name: ?[]const u8, controls: abi.RepairControls) !abi.ReconcileResult {
+        var result: abi.ReconcileResult = .{};
+        try statusToError(abi.antfly_storage_owner_reconcile(self.handle, &.{
+            .advance_index_repair = 1,
+            .repair_only = 1,
+            .table_name = .fromSlice(table_name),
+            .target_index_name = .fromSlice(target_index_name orelse ""),
+            .repair_controls = controls,
+        }, &result));
+        if (result.version != abi.abi_version) return error.InvalidAbi;
+        return result;
     }
 
     pub fn findMedianKey(self: *Owner, table_name: []const u8) !?Response {
@@ -822,6 +837,13 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn vectorMigrationJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response: Response = .{};
+        const request = operationRequest(table_name, request_json);
+        try statusToError(abi.antfly_storage_owner_vector_migration_json(self.handle, &request, &response.buffer));
+        return response;
+    }
+
     pub fn artifactOperationJson(
         self: *Owner,
         table_name: []const u8,
@@ -921,6 +943,17 @@ pub const Owner = struct {
         ));
         if (result.version != abi.abi_version) return error.InvalidAbiVersion;
         return result;
+    }
+
+    pub fn captureHASeedSnapshot(self: *Owner, table_name: []const u8, token: []const u8, destination: []const u8) !void {
+        var result: abi.MaintenanceResult = .{};
+        try statusToError(abi.antfly_storage_owner_maintenance(self.handle, &.{
+            .action = @intFromEnum(abi.MaintenanceAction.capture_ha_seed_snapshot),
+            .table_name = .fromSlice(table_name),
+            .snapshot_token = .fromSlice(token),
+            .destination_root = .fromSlice(destination),
+        }, &result));
+        if (result.version != abi.abi_version) return error.InvalidAbiVersion;
     }
 
     pub fn prepareHASeedSnapshot(

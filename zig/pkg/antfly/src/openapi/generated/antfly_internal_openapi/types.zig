@@ -3,10 +3,10 @@
 
 const std = @import("std");
 
-pub const HACreateReplicationSlotRequest = struct {
-    slot_name: HASlotName,
+pub const StandbyCreateReplicationSlotRequest = struct {
+    slot_name: StandbySlotName,
     /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
-    initial_lsn: ?i64 = null,
+    initial_lsn: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -34,25 +34,25 @@ pub const HACreateReplicationSlotRequest = struct {
     }
 };
 
-/// Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
-pub const HAIdentifier = []const u8;
+/// Stable hot-standby node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+pub const StandbyIdentifier = []const u8;
 
-pub const HAIdentifySystemResponse = struct {
-    identity: HAIdentity,
-    current_lsn: i64,
-    next_lsn: i64,
-    record_format_version: i64,
+pub const StandbyIdentifySystemResponse = struct {
+    identity: StandbyIdentity,
+    current_lsn: u64,
+    next_lsn: u64,
+    record_format_version: u32,
 };
 
-pub const HAIdentity = struct {
-    cluster_id: i64,
-    shard_id: i64,
-    table_id: i64,
-    timeline_id: i64,
-    epoch: i64,
+pub const StandbyIdentity = struct {
+    cluster_id: u64,
+    shard_id: u64,
+    table_id: u64,
+    timeline_id: u64,
+    epoch: u64,
 };
 
-pub const HAPayloadCodec = enum {
+pub const StandbyPayloadCodec = enum {
     raw,
     json,
     binary,
@@ -80,7 +80,7 @@ pub const HAPayloadCodec = enum {
     }
 };
 
-pub const HARecordKind = enum {
+pub const StandbyRecordKind = enum {
     batch_mutation,
     metadata_mutation,
     derived_effect,
@@ -126,25 +126,25 @@ pub const HARecordKind = enum {
     }
 };
 
-pub const HAReplicationFrame = struct {
-    lsn: i64,
-    kind: HARecordKind,
-    payload_codec: HAPayloadCodec,
+pub const StandbyReplicationFrame = struct {
+    lsn: u64,
+    kind: StandbyRecordKind,
+    payload_codec: StandbyPayloadCodec,
     /// Base64-encoded complete replication record envelope.
     encoded: []const u8,
 };
 
-pub const HAReplicationSlotResponse = struct {
-    slot_name: HASlotName,
-    timeline_id: i64,
-    restart_lsn: i64,
-    received_lsn: i64,
-    applied_lsn: i64,
-    safe_read_lsn: i64,
+pub const StandbyReplicationSlotResponse = struct {
+    slot_name: StandbySlotName,
+    timeline_id: u64,
+    restart_lsn: u64,
+    received_lsn: u64,
+    applied_lsn: u64,
+    safe_read_lsn: u64,
     active: bool,
     reseed_required: bool,
     last_error: OpenApiOptionalNullable([]const u8) = .absent,
-    current_lsn: i64,
+    current_lsn: u64,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -182,15 +182,71 @@ pub const HAReplicationSlotResponse = struct {
 };
 
 /// Stable standby replication slot name.
-pub const HASlotName = []const u8;
+pub const StandbySlotName = []const u8;
 
-pub const HAStandbyStatusUpdateRequest = struct {
-    slot_name: HASlotName,
-    timeline_id: i64,
-    received_lsn: i64,
-    applied_lsn: i64,
+pub const StandbyStartReplicationRequest = struct {
+    slot_name: StandbySlotName,
+    from_lsn: u64,
+    /// Optional maximum record count. Zero means no record-count limit.
+    max_records: ?u64 = null,
+    /// Optional encoded byte budget. Zero means no byte limit.
+    max_encoded_bytes: ?u64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "slot_name", "slot_name", false },
+        .{ "from_lsn", "from_lsn", false },
+        .{ "max_records", "max_records", true },
+        .{ "max_encoded_bytes", "max_encoded_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        try jw.objectField("from_lsn");
+        try jw.write(self.from_lsn);
+        if (self.max_records) |value| {
+            try jw.objectField("max_records");
+            try jw.write(value);
+        }
+        if (self.max_encoded_bytes) |value| {
+            try jw.objectField("max_encoded_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const StandbyStartReplicationResponse = struct {
+    slot_name: StandbySlotName,
+    identity: StandbyIdentity,
+    record_format_version: u32,
+    timeline_id: u64,
+    from_lsn: u64,
+    current_lsn: u64,
+    last_sent_lsn: u64,
+    next_lsn: u64,
+    end_of_wal: bool,
+    encoded_bytes: u64,
+    records: []const StandbyReplicationFrame,
+};
+
+pub const StandbyStatusUpdateRequest = struct {
+    slot_name: StandbySlotName,
+    timeline_id: u64,
+    received_lsn: u64,
+    applied_lsn: u64,
     /// Optional safe-read boundary. Defaults to applied_lsn.
-    safe_read_lsn: ?i64 = null,
+    safe_read_lsn: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -227,17 +283,17 @@ pub const HAStandbyStatusUpdateRequest = struct {
     }
 };
 
-pub const HAStandbyStatusUpdateResponse = struct {
-    slot_name: HASlotName,
-    timeline_id: i64,
-    restart_lsn: i64,
-    received_lsn: i64,
-    applied_lsn: i64,
-    safe_read_lsn: i64,
+pub const StandbyStatusUpdateResponse = struct {
+    slot_name: StandbySlotName,
+    timeline_id: u64,
+    restart_lsn: u64,
+    received_lsn: u64,
+    applied_lsn: u64,
+    safe_read_lsn: u64,
     active: bool,
     reseed_required: bool,
     last_error: OpenApiOptionalNullable([]const u8) = .absent,
-    current_lsn: i64,
+    current_lsn: u64,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -272,62 +328,6 @@ pub const HAStandbyStatusUpdateResponse = struct {
         try jw.write(self.current_lsn);
         try jw.endObject();
     }
-};
-
-pub const HAStartReplicationRequest = struct {
-    slot_name: HASlotName,
-    from_lsn: i64,
-    /// Optional maximum record count. Zero means no record-count limit.
-    max_records: ?i64 = null,
-    /// Optional encoded byte budget. Zero means no byte limit.
-    max_encoded_bytes: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "slot_name", "slot_name", false },
-        .{ "from_lsn", "from_lsn", false },
-        .{ "max_records", "max_records", true },
-        .{ "max_encoded_bytes", "max_encoded_bytes", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("slot_name");
-        try jw.write(self.slot_name);
-        try jw.objectField("from_lsn");
-        try jw.write(self.from_lsn);
-        if (self.max_records) |value| {
-            try jw.objectField("max_records");
-            try jw.write(value);
-        }
-        if (self.max_encoded_bytes) |value| {
-            try jw.objectField("max_encoded_bytes");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const HAStartReplicationResponse = struct {
-    slot_name: HASlotName,
-    identity: HAIdentity,
-    record_format_version: i64,
-    timeline_id: i64,
-    from_lsn: i64,
-    current_lsn: i64,
-    last_sent_lsn: i64,
-    next_lsn: i64,
-    end_of_wal: bool,
-    encoded_bytes: i64,
-    records: []const HAReplicationFrame,
 };
 
 /// Presence-aware representation of an optional OpenAPI property that also permits JSON null.

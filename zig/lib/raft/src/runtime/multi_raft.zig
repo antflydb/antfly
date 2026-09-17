@@ -2796,10 +2796,12 @@ const GroupBatchBuilder = struct {
 const PeerBatchBuilder = struct {
     peer_id: core.types.NodeId,
     groups: std.ArrayListUnmanaged(GroupBatchBuilder) = .empty,
+    group_indexes: std.AutoHashMapUnmanaged(core.types.GroupId, usize) = .empty,
 
     fn deinit(self: *PeerBatchBuilder, alloc: std.mem.Allocator) void {
         for (self.groups.items) |*group| group.deinit(alloc);
         self.groups.deinit(alloc);
+        self.group_indexes.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -2924,24 +2926,22 @@ const TransportOutbox = struct {
             peer_builders.deinit(alloc);
         }
 
+        var peer_indexes: std.AutoHashMapUnmanaged(core.types.NodeId, usize) = .empty;
+        defer peer_indexes.deinit(alloc);
         for (self.items.items) |item| {
             if (item.accepted) continue;
-            const peer_idx = blk: {
-                for (peer_builders.items, 0..) |peer, i| {
-                    if (peer.peer_id == item.message.to) break :blk i;
-                }
+            const peer_entry = try peer_indexes.getOrPut(alloc, item.message.to);
+            if (!peer_entry.found_existing) {
+                peer_entry.value_ptr.* = peer_builders.items.len;
                 try peer_builders.append(alloc, .{ .peer_id = item.message.to });
-                break :blk peer_builders.items.len - 1;
-            };
-
-            const peer = &peer_builders.items[peer_idx];
-            const group_idx = blk: {
-                for (peer.groups.items, 0..) |group, i| {
-                    if (group.group_id == item.group_id) break :blk i;
-                }
+            }
+            const peer = &peer_builders.items[peer_entry.value_ptr.*];
+            const group_entry = try peer.group_indexes.getOrPut(alloc, item.group_id);
+            if (!group_entry.found_existing) {
+                group_entry.value_ptr.* = peer.groups.items.len;
                 try peer.groups.append(alloc, .{ .group_id = item.group_id });
-                break :blk peer.groups.items.len - 1;
-            };
+            }
+            const group_idx = group_entry.value_ptr.*;
 
             try peer.groups.items[group_idx].messages.append(alloc, item.message);
         }

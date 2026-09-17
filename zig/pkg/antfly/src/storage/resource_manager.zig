@@ -23,6 +23,63 @@ const dense_perf = @import("dense_perf_experiments.zig");
 pub const ProjectionPageCache = @import("projection_page_cache.zig");
 
 const MiB: u64 = 1024 * 1024;
+
+/// Resource identities churn for the entire process lifetime. std.HashMap
+/// restores insertion capacity on removal, but retains tombstones: absent-key
+/// probes can eventually traverse the whole table while holding the admission
+/// mutex. Bound deleted slots independently of live occupancy. Rehashing is
+/// allocation-free and amortized over at least capacity/8 successful removals.
+/// As with insertion, removal may invalidate pointers into this ledger.
+fn IdentityLedger(comptime K: type, comptime V: type) type {
+    return struct {
+        const Self = @This();
+        const Map = std.AutoHashMapUnmanaged(K, V);
+        map: Map = .empty,
+        removals: usize = 0,
+        rehashes: u64 = 0,
+        const empty: Self = .{};
+
+        fn count(self: *const Self) u32 {
+            return self.map.count();
+        }
+
+        fn contains(self: *const Self, key: K) bool {
+            return self.map.contains(key);
+        }
+
+        fn get(self: *const Self, key: K) ?V {
+            return self.map.get(key);
+        }
+
+        fn getPtr(self: *const Self, key: K) ?*V {
+            return self.map.getPtr(key);
+        }
+
+        fn put(self: *Self, allocator: std.mem.Allocator, key: K, value: V) !void {
+            try self.map.put(allocator, key, value);
+        }
+
+        fn getOrPut(self: *Self, allocator: std.mem.Allocator, key: K) !Map.GetOrPutResult {
+            return self.map.getOrPut(allocator, key);
+        }
+
+        fn remove(self: *Self, key: K) bool {
+            if (!self.map.remove(key)) return false;
+            self.removals += 1;
+            if (self.removals >= @max(1, self.map.capacity() / 8)) {
+                self.map.rehash(std.hash_map.AutoContext(K){});
+                self.removals = 0;
+                self.rehashes +|= 1;
+            }
+            return true;
+        }
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.map.deinit(allocator);
+            self.* = .empty;
+        }
+    };
+}
 const dense_replay_window_min_bytes: u64 = 16 * MiB;
 const dense_replay_window_growth_numerator: u64 = 5;
 const dense_replay_window_growth_denominator: u64 = 4;
@@ -481,6 +538,8 @@ pub const DenseReadTaskStats = struct {
     active: u32 = 0,
     peak_active: u32 = 0,
     denied: u64 = 0,
+    physically_ordered_batches: u64 = 0,
+    physically_ordered_requests: u64 = 0,
 };
 
 pub const DenseSearchAdmissionStats = struct {
@@ -821,11 +880,24 @@ pub const ResourceManager = struct {
     dense_projection_borrow_enabled: bool = false,
     dense_projection_trace_enabled: bool = false,
     dense_grouped_fallbacks: bool = false,
+    dense_physical_rerank_order: bool = false,
+    dense_member_bindings: bool = true,
+    dense_query_snapshot: bool = false,
+    dense_query_snapshot_native_only: bool = false,
+    dense_configured_bulk_build: bool = false,
+    dense_unified_fetch: bool = false,
+    dense_exact_mapped: bool = true,
+    dense_read_inline: bool = false,
+    dense_read_single_helper: bool = true,
+    dense_read_adaptive: bool = false,
+    dense_read_profile: bool = false,
     dense_projection_pages: std.atomic.Value(?*ProjectionPageCache.Cache) = .init(null),
     dense_projection_pages_mutex: std.atomic.Mutex = .unlocked,
     dense_read_extra_tasks: std.atomic.Value(u32) = .init(0),
     dense_read_peak_extra_tasks: std.atomic.Value(u32) = .init(0),
     dense_read_denied_tasks: std.atomic.Value(u64) = .init(0),
+    dense_physically_ordered_batches: std.atomic.Value(u64) = .init(0),
+    dense_physically_ordered_requests: std.atomic.Value(u64) = .init(0),
     slices: [slice_count]MutableSlice,
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,
@@ -846,9 +918,9 @@ pub const ResourceManager = struct {
     capacity_source: ?CapacitySource = null,
     identity_allocator: std.mem.Allocator,
     next_identity: u64 = 1,
-    reservation_identities: std.AutoHashMapUnmanaged(u64, ReservationIdentity) = .empty,
-    batch_reservation_identities: std.AutoHashMapUnmanaged(u64, BatchReservationIdentity) = .empty,
-    observer_identities: std.AutoHashMapUnmanaged(ObserverKey, ObserverIdentity) = .empty,
+    reservation_identities: IdentityLedger(u64, ReservationIdentity) = .empty,
+    batch_reservation_identities: IdentityLedger(u64, BatchReservationIdentity) = .empty,
+    observer_identities: IdentityLedger(ObserverKey, ObserverIdentity) = .empty,
 
     pub fn init(options: Options) ResourceManager {
         var slices: [slice_count]MutableSlice = undefined;
@@ -881,6 +953,11 @@ pub const ResourceManager = struct {
             .dense_rerank_admission = .{ .capacity = @intCast(std.Thread.getCpuCount() catch 1) },
             .dense_driver_admission = .{ .capacity = @intCast(std.Thread.getCpuCount() catch 1) },
             .dense_aggregate_admission = dense_perf.enabled("ANTFLY_EXPERIMENT_AGGREGATE_ADMISSION"),
+            .dense_query_snapshot = dense_perf.enabled("ANTFLY_EXPERIMENT_QUERY_SNAPSHOT"),
+            .dense_query_snapshot_native_only = dense_perf.enabled("ANTFLY_EXPERIMENT_QUERY_SNAPSHOT_NATIVE_ONLY"),
+            .dense_configured_bulk_build = dense_perf.enabled("ANTFLY_EXPERIMENT_CONFIGURED_BULK_BUILD"),
+            .dense_unified_fetch = dense_perf.enabled("ANTFLY_EXPERIMENT_UNIFIED_VECTOR_FETCH"),
+            .dense_exact_mapped = dense_perf.enabledDefault("ANTFLY_EXPERIMENT_EXACT_MAPPED", true),
             .dense_phase_admission = dense_perf.enabled("ANTFLY_EXPERIMENT_PHASE_ADMISSION"),
             .dense_scan_prediction = dense_perf.enabled("ANTFLY_EXPERIMENT_SCAN_PREDICTION"),
             .dense_fused_no_copy = dense_perf.enabled("ANTFLY_EXPERIMENT_FUSED_NO_COPY"),
@@ -901,6 +978,12 @@ pub const ResourceManager = struct {
             .dense_projection_borrow_enabled = dense_perf.enabled("ANTFLY_EXPERIMENT_PROJECTION_BORROW"),
             .dense_projection_trace_enabled = dense_perf.enabled("ANTFLY_EXPERIMENT_PROJECTION_TRACE"),
             .dense_grouped_fallbacks = dense_perf.enabled("ANTFLY_EXPERIMENT_GROUPED_FALLBACKS"),
+            .dense_physical_rerank_order = dense_perf.enabled("ANTFLY_SOURCE_VECTOR_PHYSICAL_RERANK_ORDER"),
+            .dense_member_bindings = dense_perf.enabledDefault("ANTFLY_SOURCE_VECTOR_MEMBER_BINDINGS", true),
+            .dense_read_inline = dense_perf.enabled("ANTFLY_EXPERIMENT_VECTOR_READ_INLINE"),
+            .dense_read_single_helper = dense_perf.enabledDefault("ANTFLY_EXPERIMENT_VECTOR_READ_SINGLE_HELPER", true),
+            .dense_read_adaptive = dense_perf.enabled("ANTFLY_EXPERIMENT_VECTOR_READ_ADAPTIVE"),
+            .dense_read_profile = dense_perf.enabled("ANTFLY_EXPERIMENT_VECTOR_READ_PROFILE"),
             .identity_allocator = options.identity_allocator,
         };
     }
@@ -961,7 +1044,14 @@ pub const ResourceManager = struct {
             .active = self.dense_read_extra_tasks.load(.monotonic),
             .peak_active = self.dense_read_peak_extra_tasks.load(.monotonic),
             .denied = self.dense_read_denied_tasks.load(.monotonic),
+            .physically_ordered_batches = self.dense_physically_ordered_batches.load(.monotonic),
+            .physically_ordered_requests = self.dense_physically_ordered_requests.load(.monotonic),
         };
+    }
+
+    pub fn notePhysicallyOrderedReads(self: *ResourceManager, count: usize) void {
+        _ = self.dense_physically_ordered_batches.fetchAdd(1, .monotonic);
+        _ = self.dense_physically_ordered_requests.fetchAdd(@intCast(count), .monotonic);
     }
 
     pub fn registerReclaimer(
@@ -1107,46 +1197,57 @@ pub const ResourceManager = struct {
                 candidate_slice != .dense_search_working_set and
                 candidate_slice != .hbc_node_metadata_cache and
                 candidate_slice != .document_extraction_working_set) continue;
-            var remaining_weight: u64 = 0;
-            lockAtomic(&self.reclaimer_mutex);
-            for (0..scan_len) |offset| {
-                const index = (start_cursor + offset) % scan_len;
-                const slot = &self.reclaimers.items[index];
-                if (slot.identity == 0 or slot.identity > identity_cutoff or
-                    slot.retiring or slot.slice != candidate_slice) continue;
-                remaining_weight +|= slot.weight;
-            }
-            self.reclaimer_mutex.unlock();
-
-            for (0..scan_len) |offset| {
+            // Preserve weighted fairness on the first pass. If some owners
+            // cannot use their share, offer the remaining debt once more to
+            // available owners before rejecting otherwise admissible work.
+            // Both passes use the original identity fence and non-blocking
+            // callbacks; no allocation or unbounded pressure wait is added.
+            for (0..2) |pass| {
+                const before_pass = reclaimed;
+                var divided_target = false;
+                var remaining_weight: u64 = 0;
                 lockAtomic(&self.reclaimer_mutex);
-                const index = (start_cursor + offset) % scan_len;
-                const slot = &self.reclaimers.items[index];
-                if (slot.identity == 0 or slot.identity > identity_cutoff or
-                    slot.retiring or slot.slice != candidate_slice)
-                {
-                    self.reclaimer_mutex.unlock();
-                    continue;
+                for (0..scan_len) |offset| {
+                    const index = (start_cursor + offset) % scan_len;
+                    const slot = &self.reclaimers.items[index];
+                    if (slot.identity == 0 or slot.identity > identity_cutoff or
+                        slot.retiring or slot.slice != candidate_slice) continue;
+                    remaining_weight +|= slot.weight;
                 }
-                const invocation = ReclaimerInvocation{
-                    .slot_index = index,
-                    .identity = slot.identity,
-                    .context = slot.context.?,
-                    .reclaim = slot.reclaim.?,
-                    .weight = slot.weight,
-                };
-                slot.in_flight += 1;
-                const remaining_target = target_bytes -| reclaimed;
-                const fair_target = if (remaining_weight <= invocation.weight)
-                    remaining_target
-                else
-                    @max(@as(u64, 1), mulDivSaturating(remaining_target, invocation.weight, remaining_weight));
-                remaining_weight -|= invocation.weight;
                 self.reclaimer_mutex.unlock();
 
-                reclaimed +|= invocation.reclaim(invocation.context, fair_target);
-                self.releaseReclaimerInvocation(invocation);
-                if (reclaimed >= target_bytes) break;
+                for (0..scan_len) |offset| {
+                    lockAtomic(&self.reclaimer_mutex);
+                    const index = (start_cursor + offset) % scan_len;
+                    const slot = &self.reclaimers.items[index];
+                    if (slot.identity == 0 or slot.identity > identity_cutoff or
+                        slot.retiring or slot.slice != candidate_slice)
+                    {
+                        self.reclaimer_mutex.unlock();
+                        continue;
+                    }
+                    const invocation = ReclaimerInvocation{
+                        .slot_index = index,
+                        .identity = slot.identity,
+                        .context = slot.context.?,
+                        .reclaim = slot.reclaim.?,
+                        .weight = slot.weight,
+                    };
+                    slot.in_flight += 1;
+                    const remaining_target = target_bytes -| reclaimed;
+                    if (pass == 0 and remaining_weight > invocation.weight) divided_target = true;
+                    const fair_target = if (pass != 0 or remaining_weight <= invocation.weight)
+                        remaining_target
+                    else
+                        @max(@as(u64, 1), mulDivSaturating(remaining_target, invocation.weight, remaining_weight));
+                    remaining_weight -|= invocation.weight;
+                    self.reclaimer_mutex.unlock();
+
+                    reclaimed +|= invocation.reclaim(invocation.context, fair_target);
+                    self.releaseReclaimerInvocation(invocation);
+                    if (reclaimed >= target_bytes) break;
+                }
+                if (reclaimed >= target_bytes or reclaimed == before_pass or !divided_target) break;
             }
             if (reclaimed >= target_bytes) break;
         }
@@ -1345,10 +1446,16 @@ pub const ResourceManager = struct {
 
     pub fn shouldDeferOptionalMaintenanceForForegroundTraffic(self: *const ResourceManager) bool {
         if (self.foreground_query_sessions.load(.acquire) != 0) return true;
+        return platform_time.monotonicNs() < self.foreground_query_quiet_until_ns.load(.acquire) or
+            self.shouldDeferPostingRefreshForForegroundWrites();
+    }
+
+    /// A small posting refresh admitted through the DB's nonblocking apply
+    /// fence may use a gap between queries without waiting for a query-quiet
+    /// interval that a steady serving workload might never provide.
+    pub fn shouldDeferPostingRefreshForForegroundWrites(self: *const ResourceManager) bool {
         if (self.foreground_write_sessions.load(.acquire) != 0) return true;
-        const now_ns = platform_time.monotonicNs();
-        return now_ns < self.foreground_query_quiet_until_ns.load(.acquire) or
-            now_ns < self.foreground_write_quiet_until_ns.load(.acquire);
+        return platform_time.monotonicNs() < self.foreground_write_quiet_until_ns.load(.acquire);
     }
 
     /// Soft compaction builders call this at bounded work intervals. Each
@@ -2517,6 +2624,16 @@ pub const ResourceManager = struct {
     }
 
     pub fn adjustUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) !void {
+        errdefer if (builtin.link_libc) {
+            if (std.c.getenv("ANTFLY_RESOURCE_ALLOCATION_DIAGNOSTICS")) |raw| {
+                if (std.mem.eql(u8, std.mem.span(raw), "1")) {
+                    const snapshot_stats = self.snapshot();
+                    const state = snapshot_stats.slices[sliceIndex(slice)];
+                    std.log.warn("observer admission denied slice={s} current={d} next={d} slice_used={d} slice_limit={d} aggregate_used={d} aggregate_limit={d}", .{ @tagName(slice), current.*, next, state.used_bytes, state.hard_limit_bytes, snapshot_stats.memory.used_bytes, snapshot_stats.memory.hard_limit_bytes });
+                    std.debug.dumpCurrentStackTrace(.{});
+                }
+            }
+        };
         self.adjustUsageOnce(slice, current, next) catch |err| {
             if (err != error.ResourceBudgetExceeded or next <= current.*) return err;
             if (self.reclaimForAllocation(slice, next - current.*) == 0) return err;
@@ -3291,12 +3408,12 @@ pub const BudgetedAllocator = struct {
         };
         // Opt-in stack diagnostics allocate through the debug runtime, never
         // this allocator. Normal admission records only a bounded receipt.
-        if (@import("builtin").link_libc and self.reservation.slice == .dense_source_payload_state) {
-            if (std.c.getenv("ANTFLY_SOURCE_VECTOR_ALLOCATION_DIAGNOSTICS")) |raw| {
-                if (std.mem.eql(u8, std.mem.span(raw), "1")) {
-                    std.log.warn("source allocation denied cause={s} requested={d} live={d} slice_used={d} slice_limit={d} aggregate_used={d} aggregate_limit={d} caller=0x{x}", .{ @tagName(cause), bytes, self.live_bytes, slice.used_bytes, slice.hard_limit_bytes, snapshot.memory.used_bytes, snapshot.memory.hard_limit_bytes, ret_addr });
-                    std.debug.dumpCurrentStackTrace(.{});
-                }
+        if (@import("builtin").link_libc) {
+            const general = if (std.c.getenv("ANTFLY_RESOURCE_ALLOCATION_DIAGNOSTICS")) |raw| std.mem.eql(u8, std.mem.span(raw), "1") else false;
+            const source = self.reservation.slice == .dense_source_payload_state and if (std.c.getenv("ANTFLY_SOURCE_VECTOR_ALLOCATION_DIAGNOSTICS")) |raw| std.mem.eql(u8, std.mem.span(raw), "1") else false;
+            if (general or source) {
+                std.log.warn("allocation denied slice={s} cause={s} requested={d} live={d} slice_used={d} slice_limit={d} aggregate_used={d} aggregate_limit={d} caller=0x{x}", .{ @tagName(self.reservation.slice), @tagName(cause), bytes, self.live_bytes, slice.used_bytes, slice.hard_limit_bytes, snapshot.memory.used_bytes, snapshot.memory.hard_limit_bytes, ret_addr });
+                std.debug.dumpCurrentStackTrace(.{});
             }
         }
     }
@@ -3871,6 +3988,39 @@ test "batch release accounting errors fail closed" {
     try std.testing.expectEqual(@as(u64, 14), stats.memory.used_bytes);
     try std.testing.expectEqual(@as(u64, 20), manager.sliceStats(.inference_model_residency).used_bytes);
     try std.testing.expectEqual(@as(u64, 4), stats.memory.accounting_errors);
+}
+
+test "resource identity ledgers bound tombstones across churn and reject stale owners" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var pinned = try manager.reserve(.dense_apply_working_set, 7);
+    defer pinned.release();
+    var stale: ?Reservation = null;
+    var stale_batch: ?BatchReservation = null;
+    for (0..8192) |i| {
+        var reservation = try manager.reserve(.dense_apply_working_set, 3);
+        var batch = try manager.reserveBatch(&.{.{ .slice = .dense_apply_working_set, .bytes = 5 }});
+        if (i == 0) {
+            stale = reservation;
+            stale_batch = batch;
+        }
+        const key = i + 1;
+        try std.testing.expect(manager.tryObserveUsageIdentity(.dense_apply_working_set, key, 0, 11));
+        try std.testing.expect(manager.tryObserveUsageIdentity(.dense_apply_working_set, key, 11, 0));
+        reservation.release();
+        batch.release();
+        try std.testing.expectEqual(@as(u64, 7), manager.snapshot().memory.used_bytes);
+        try std.testing.expect(manager.reservation_identities.removals < @max(1, manager.reservation_identities.map.capacity() / 8));
+        try std.testing.expect(manager.batch_reservation_identities.removals < @max(1, manager.batch_reservation_identities.map.capacity() / 8));
+        try std.testing.expect(manager.observer_identities.removals < @max(1, manager.observer_identities.map.capacity() / 8));
+    }
+    stale.?.release();
+    stale_batch.?.release();
+    try std.testing.expectEqual(@as(u64, 7), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 2), manager.snapshot().memory.accounting_errors);
+    try std.testing.expect(manager.reservation_identities.rehashes > 0);
+    try std.testing.expect(manager.batch_reservation_identities.rehashes > 0);
+    try std.testing.expect(manager.observer_identities.rehashes > 0);
 }
 
 test "single release and observer mismatch cannot debit unrelated memory" {
@@ -4799,6 +4949,43 @@ test "dense search admission reclaims retained scratch from its own slice" {
     try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.dense_search_working_set).used_bytes);
 }
 
+test "source vector payloads admission redistributes idle scratch shares" {
+    const Owner = struct {
+        manager: *ResourceManager,
+        bytes: u64 = 0,
+        calls: usize = 0,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const released = @min(target, self.bytes);
+            self.manager.observeUsage(.dense_search_working_set, &self.bytes, self.bytes - released);
+            return released;
+        }
+    };
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.dense_search_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+    var retained = Owner{ .manager = &manager };
+    var empty = Owner{ .manager = &manager };
+    // Observation can report grown query workspaces above their slice limit.
+    // The first owner can release all of it; the second owns no idle memory.
+    manager.observeUsage(.dense_search_working_set, &retained.bytes, 120);
+    defer manager.observeUsage(.dense_search_working_set, &retained.bytes, 0);
+    const first = try manager.registerReclaimer(.dense_search_working_set, &retained, Owner.reclaim);
+    defer manager.unregisterReclaimer(first);
+    const second = try manager.registerReclaimer(.dense_search_working_set, &empty, Owner.reclaim);
+    defer manager.unregisterReclaimer(second);
+    var active: u64 = 0;
+    defer manager.observeUsage(.dense_search_working_set, &active, 0);
+    try manager.adjustUsage(.dense_search_working_set, &active, 20);
+    try std.testing.expectEqual(@as(u64, 80), retained.bytes);
+    try std.testing.expectEqual(@as(u64, 20), active);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.dense_search_working_set).used_bytes);
+    try std.testing.expectEqual(@as(usize, 2), retained.calls);
+}
+
 test "HBC admission reclaims retained metadata from its own slice" {
     const ReclaimContext = struct {
         manager: *ResourceManager,
@@ -4918,8 +5105,10 @@ test "resource manager invokes reclaimers without holding registry mutex" {
 
     var accounted: u64 = 0;
     manager.observeUsage(.hbc_node_metadata_cache, &accounted, 100);
-    try std.testing.expectEqual(@as(u64, 5), manager.reclaimForAllocation(.dense_apply_working_set, 10));
-    try std.testing.expectEqual(@as(u64, 1), retiring.calls);
+    // The second bounded pass can revisit the surviving owner, but never
+    // invokes the registry slot retired by its first callback.
+    try std.testing.expectEqual(@as(u64, 10), manager.reclaimForAllocation(.dense_apply_working_set, 10));
+    try std.testing.expectEqual(@as(u64, 2), retiring.calls);
     try std.testing.expectEqual(@as(u64, 0), passive.calls);
 }
 

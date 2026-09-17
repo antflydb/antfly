@@ -37,12 +37,12 @@ fn liteEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "lite", runLite);
 }
 
-fn runGraphMetricMaintenance(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
-    return @import("cmd/graph_metric_maintenance.zig").runFromIterator(init, "antfly", args);
+fn runStorage(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
+    return @import("cmd/storage.zig").runFromIterator(init, args);
 }
 
-fn graphMetricMaintenanceEntry(context: *const bridge.Context) callconv(.c) c_int {
-    return runtimeEntry(context, "graph_metric_maintenance", runGraphMetricMaintenance);
+fn storageEntry(context: *const bridge.Context) callconv(.c) c_int {
+    return runtimeEntry(context, "storage", runStorage);
 }
 
 comptime {
@@ -53,7 +53,7 @@ comptime {
     _ = storage_kernel_exports;
     exportInternal(&storage_kernel_exports.storageOwnerMergeArtifactsPage, "antfly_storage_owner_merge_artifacts_page");
     exportInternal(&liteEntry, "antfly_runtime_lite");
-    exportInternal(&graphMetricMaintenanceEntry, "antfly_runtime_graph_metric_maintenance");
+    exportInternal(&storageEntry, "antfly_runtime_storage");
     exportInternal(&restore_staging_exports.create, "antfly_restore_staging_create");
     exportInternal(&restore_staging_exports.destroy, "antfly_restore_staging_destroy");
     exportInternal(&@import("storage/db/enrichment/enrichment_types.zig").interactiveActivity, "antfly_storage_interactive_activity");
@@ -78,6 +78,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageSystemWriteGet, "antfly_storage_system_write_get");
     exportInternal(&storage_kernel_exports.storageSystemWritePut, "antfly_storage_system_write_put");
     exportInternal(&storage_kernel_exports.storageSystemWriteDelete, "antfly_storage_system_write_delete");
+    exportInternal(&storage_kernel_exports.storageSystemWriteOpenCursor, "antfly_storage_system_write_open_cursor");
     exportInternal(&storage_kernel_exports.storageSystemWriteCommit, "antfly_storage_system_write_commit");
     exportInternal(&storage_kernel_exports.storageSystemWriteAbort, "antfly_storage_system_write_abort");
     exportInternal(&storage_kernel_exports.storageSystemCursorMove, "antfly_storage_system_cursor_move");
@@ -122,9 +123,9 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerLocalTransition, "antfly_storage_owner_local_transition");
     exportInternal(&storage_kernel_exports.storageOwnerOpen, "antfly_storage_owner_open");
     exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
-    exportInternal(&storage_kernel_exports.storageHASeedActivateJson, "antfly_storage_ha_seed_activate_json");
-    exportInternal(&storage_kernel_exports.storageHASeedValidateJson, "antfly_storage_ha_seed_validate_json");
-    exportInternal(&storage_kernel_exports.storageHASeedPruneJson, "antfly_storage_ha_seed_prune_json");
+    exportInternal(&storage_kernel_exports.storageHASeedActivateJson, "antfly_storage_hot_standby_seed_activate_json");
+    exportInternal(&storage_kernel_exports.storageHASeedValidateJson, "antfly_storage_hot_standby_seed_validate_json");
+    exportInternal(&storage_kernel_exports.storageHASeedPruneJson, "antfly_storage_hot_standby_seed_prune_json");
     exportInternal(&storage_kernel_exports.storageOwnerConfigure, "antfly_storage_owner_configure");
     exportInternal(&storage_kernel_exports.storageOwnerReconcile, "antfly_storage_owner_reconcile");
     exportInternal(&storage_kernel_exports.storageOwnerPreflightWriteAdmission, "antfly_storage_owner_preflight_write_admission");
@@ -163,6 +164,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerGraphEdgesJson, "antfly_storage_owner_graph_edges_json");
     exportInternal(&storage_kernel_exports.storageOwnerDocumentArtifactManifestJson, "antfly_storage_owner_document_artifact_manifest_json");
     exportInternal(&storage_kernel_exports.storageOwnerDocumentArtifactManifestsJson, "antfly_storage_owner_document_artifact_manifests_json");
+    exportInternal(&storage_kernel_exports.storageOwnerVectorMigrationJson, "antfly_storage_owner_vector_migration_json");
     exportInternal(&storage_kernel_exports.storageOwnerArtifactOperationJson, "antfly_storage_owner_artifact_operation_json");
     exportInternal(&storage_kernel_exports.storageOwnerRuntimeStatusJson, "antfly_storage_owner_runtime_status_json");
     exportInternal(&storage_kernel_exports.storageOwnerObservedDynamicFieldCapabilitySetsJson, "antfly_storage_owner_observed_dynamic_field_capability_sets_json");

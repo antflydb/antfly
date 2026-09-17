@@ -128,6 +128,10 @@ pub const Builder = struct {
         return self.unaryOp(.sqrt, input);
     }
 
+    pub fn stopGradient(self: *Builder, input: NodeId) !NodeId {
+        return self.unaryOp(.stop_gradient, input);
+    }
+
     pub fn rsqrt(self: *Builder, input: NodeId) !NodeId {
         return self.unaryOp(.rsqrt, input);
     }
@@ -755,6 +759,31 @@ pub const Builder = struct {
             .op = .{ .fused_selected_tied_head_logits = attrs },
             .output_shape = Shape.init(.f32, &.{ 1, 2 }),
             .inputs = .{ hidden, weight, token_ids, null_node },
+            .num_inputs = 3,
+            .vjp_alternate = null_node,
+        });
+    }
+
+    /// Training-only tiled/replay attention. Integer control is immutable and
+    /// nondifferentiable; its physical storage must remain i32 on all backends.
+    pub fn debertaTrainingAttentionV1(
+        self: *Builder,
+        qkv: NodeId,
+        relative: NodeId,
+        control: NodeId,
+        attrs: node_mod.DebertaTrainingAttentionAttrs,
+    ) !NodeId {
+        const layout = try attrs.layout();
+        for ([_]NodeId{ qkv, relative, control }) |id|
+            if (id == null_node or id >= self.graph.nodes.items.len) return error.InvalidGraphDependency;
+        if (!self.graph.node(qkv).output_shape.eq(layout.qkvShape()) or
+            !self.graph.node(relative).output_shape.eq(layout.relativeShape()) or
+            !self.graph.node(control).output_shape.eq(layout.controlShape()))
+            return error.InvalidDebertaTrainingAttentionShape;
+        return self.graph.addNode(.{
+            .op = .{ .fused_deberta_training_attention_v1 = attrs },
+            .output_shape = layout.outputShape(),
+            .inputs = .{ qkv, relative, control, null_node },
             .num_inputs = 3,
             .vjp_alternate = null_node,
         });

@@ -395,6 +395,55 @@ test "opaque storage owner fences exact source targets before acknowledging writ
     try std.testing.expect(!observer.invalid.load(.acquire));
 }
 
+test "opaque storage owner schedules source verification after reopen without traffic" {
+    const alloc = std.testing.allocator;
+    const time = @import("antfly_platform").time;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-source-maintenance");
+    defer directory.cleanup();
+    const path = std.mem.span(directory.path().ptr);
+    {
+        var owner = try client.Owner.open(.{
+            .path = .fromSlice(path),
+            .table_name = .fromSlice("docs"),
+            .group_id = 7001,
+            .dense_embedding_storage = .vector_store,
+            .indexes_json = .fromSlice("{\"model\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}"),
+        });
+        defer owner.deinit();
+        var response = try owner.batchJson("docs",
+            \\{"inserts":{"a":{"title":"retained","_embeddings":{"model":[1,0,0]}}},"sync_level":"full_index"}
+        );
+        defer response.deinit();
+    }
+    // Reopen with persisted policy and no requests that explicitly drain
+    // maintenance. Status observation must not be required to perform GC.
+    var owner = try client.Owner.open(.{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7001,
+    });
+    defer owner.deinit();
+    const deadline = time.monotonicNs() + 15 * std.time.ns_per_s;
+    while (time.monotonicNs() < deadline) {
+        var response = try ownerStatusEventually(&owner);
+        defer response.deinit();
+        const Status = struct {
+            source_vectors: ?struct { collections: u64, retained_payloads: u64, live_payloads_at_collection: u64 } = null,
+        };
+        var parsed = try std.json.parseFromSlice(Status, alloc, response.bytes(), .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (parsed.value.source_vectors) |source| {
+            if (source.collections > 0) {
+                try std.testing.expectEqual(@as(u64, 1), source.retained_payloads);
+                try std.testing.expectEqual(@as(u64, 1), source.live_payloads_at_collection);
+                return;
+            }
+        }
+        try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return error.SourceVerificationDidNotRun;
+}
+
 fn ownerStatusEventually(owner: *client.Owner) !client.Response {
     const time = @import("antfly_platform").time;
     const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
@@ -407,6 +456,57 @@ fn ownerStatusEventually(owner: *client.Owner) !client.Response {
             },
             else => return err,
         };
+    }
+}
+
+test "opaque storage owner preserves dense profiles and captured identity" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-owner-dense-profile";
+    cleanup(path);
+    defer cleanup(path);
+    var owner = try client.Owner.open(.{
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 7001,
+        .has_identity_namespace = 1,
+        .identity_table_id = 7,
+        .identity_shard_id = 7001,
+        .identity_range_id = 7001,
+        .indexes_json = .fromSlice("{\"vec\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}"),
+    });
+    defer owner.deinit();
+    var batch = try owner.batchJson("docs",
+        \\{"inserts":{"doc:a":{"_embeddings":{"vec":[1,0,0]}},"doc:b":{"_embeddings":{"vec":[0,1,0]}}},"sync_level":"full_index"}
+    );
+    defer batch.deinit();
+    var identity: ?u64 = null;
+    for ([_]bool{ false, true }) |profile| {
+        const request_json = try std.fmt.allocPrint(alloc, "{{\"embeddings\":{{\"vec\":[1,0,0]}},\"indexes\":[\"vec\"],\"limit\":2,\"fields\":[],\"profile\":{}}}", .{profile});
+        defer alloc.free(request_json);
+        var response = try owner.queryJson("docs", request_json);
+        defer response.deinit();
+        if (response.identityReadGeneration() == null) return error.MissingCapturedIdentity;
+        if (identity) |expected| try std.testing.expectEqual(expected, response.identityReadGeneration().?);
+        identity = response.identityReadGeneration();
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.bytes(), .{});
+        defer parsed.deinit();
+        const body = parsed.value.object.get("responses").?.array.items[0].object;
+        const hits = body.get("hits").?.object.get("hits").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), hits.len);
+        try std.testing.expectEqualStrings("doc:a", hits[0].object.get("_id").?.string);
+        try std.testing.expectEqualStrings("doc:b", hits[1].object.get("_id").?.string);
+        if (profile) {
+            const profile_value = body.get("profile") orelse return error.MissingQueryProfile;
+            const dense = (profile_value.object.get("dense_search") orelse return error.MissingDenseProfile).object;
+            if (dense.get("search_route").?.string.len == 0) return error.MissingDenseRoute;
+            try std.testing.expectEqual(@as(i64, 2), dense.get("returned_hit_count").?.integer);
+            try std.testing.expectEqual(@as(i64, 0), dense.get("hbc_leaf_payload_stale").?.integer);
+            if (!dense.contains("hbc_rerank_read_adaptive_inline_batches")) return error.MissingAdaptiveInlineCounter;
+            if (!dense.contains("hbc_rerank_read_adaptive_wide_batches")) return error.MissingAdaptiveWideCounter;
+            if (!dense.contains("hbc_rerank_read_adaptive_probe_ns")) return error.MissingAdaptiveProbeCounter;
+        } else {
+            if (body.get("profile")) |value| if (value != .null) return error.UnexpectedUnprofiledMetadata;
+        }
     }
 }
 
@@ -607,6 +707,20 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     const query_json =
         \\{"query":{"match_all":{}},"limit":10}
     ;
+    // A catalog label crosses both compiled archives without changing the
+    // physical owner target. Serialization finishes before its borrowed storage
+    // can be released; the response owns its public name.
+    var labeled = label_scope: {
+        const label = try std.testing.allocator.dupe(u8, "tenant.public.events");
+        defer std.testing.allocator.free(label);
+        const response = try owner.queryJsonWithOptions("docs", query_json, .{
+            .execution = @import("local_query_controls.zig").executionOptions(.{ .response_table_name = label }),
+        });
+        @memset(label, 0xaa);
+        break :label_scope response;
+    };
+    defer labeled.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, labeled.bytes(), "\"table\":\"tenant.public.events\"") != null);
     try std.testing.expectError(error.Timeout, owner.queryJsonWithOptions("docs", query_json, .{
         .execution_deadline_ns = 1,
     }));
@@ -1544,9 +1658,9 @@ test "opaque metadata apply owner preserves semantic error identity" {
         .commit_index = 7,
         .entries_bytes = "not-projectable-entries",
     });
-    const latest = (try store.latestBatch(91)) orelse return error.TestExpectedEqual;
+    const latest = (try store.latestCheckpoint(91)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 7), latest.commit_index);
-    try std.testing.expectEqualStrings("not-projectable-entries", latest.entries_bytes);
+    try std.testing.expectEqual(@as(usize, "not-projectable-entries".len), latest.input_bytes);
     try std.testing.expectError(
         error.AppliedSnapshotIndexMismatch,
         snapshots.prepareSnapshot(91, 8),
@@ -1663,6 +1777,11 @@ test "opaque metadata listener boundary preserves incarnation commit ordering" {
     try std.testing.expectEqual(@as(usize, 1), capture.signals);
     try std.testing.expectEqual(@as(usize, 1), capture.ended);
     try std.testing.expectEqual(metadata_apply_client.ProjectionSignalKind.metadata_incarnation, capture.last_kind.?);
+    const checkpoint = (try store.latestCheckpoint(91)).?;
+    try std.testing.expectEqual(@as(u64, 1), checkpoint.commit_index);
+    try std.testing.expectEqual(@as(u64, encoded.len), checkpoint.input_bytes);
+    try std.testing.expect((try store.topologyActivation(91)) == null);
+
     try std.testing.expectEqual(@as(u64, 91), capture.last_group_id);
     try std.testing.expect(!capture.barrier_active);
     try std.testing.expect(!capture.ordering_violation);
@@ -1677,7 +1796,26 @@ test "opaque metadata listener boundary preserves incarnation commit ordering" {
 }
 
 test "storage kernel status registry is unique and lossless" {
-    try @import("kernel_error_identity").validateForTest();
+    try error_identity.validateForTest();
+    const runtime_error = @import("../runtime_error_abi.zig");
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable }) |expected| {
+        const failure = error_identity.failureFromError(
+            expected,
+            .local_query,
+            abi.abi_version,
+            @intFromEnum(abi.LocalQueryOperation.execute_internal_query),
+        );
+        var forwarded: abi.FailureIdentity = .{};
+        try local_query_client.acceptProviderFailure(failure.status, failure, .validate_provider_response, &forwarded);
+        const received = blk: {
+            client.statusToError(forwarded.status) catch |err| break :blk err;
+            return error.ExpectedReadinessFailure;
+        };
+        try std.testing.expectEqual(expected, received);
+        const public_status = runtime_error.statusFromError(received);
+        try std.testing.expectEqual(@intFromEnum(runtime_error.Code.retryable), public_status.code);
+        try std.testing.expectEqual(expected, runtime_error.errorFromStatus(public_status));
+    }
 }
 
 test "failed owner configuration releases its writer and context lease" {

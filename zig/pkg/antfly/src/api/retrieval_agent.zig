@@ -7530,9 +7530,9 @@ test "generation messages prefer query-relevant tree branches" {
     try storage_source.put(alloc, "_tree", .{ .object = storage_tree });
 
     const messages = try buildGenerationMessages(alloc, "explain payments architecture", &[_]QueryHit{
-        .{ ._id = "doc:infra", ._score = 0.93, ._source = .{ .object = infra_source } },
-        .{ ._id = "doc:storage", ._score = 0.91, ._source = .{ .object = storage_source } },
-        .{ ._id = "doc:payments", ._score = 0.22, ._source = .{ .object = payments_source } },
+        .{ ._id = "doc:infra", ._score = 0.93, ._source = .{ .map = infra_source } },
+        .{ ._id = "doc:storage", ._score = 0.91, ._source = .{ .map = storage_source } },
+        .{ ._id = "doc:payments", ._score = 0.22, ._source = .{ .map = payments_source } },
     }, .{
         .chain = &[_]generating.ChainLink{
             .{ .generator = .{
@@ -7637,7 +7637,7 @@ test "generation messages expand branch when deeper node is query-relevant" {
         try hits.append(alloc, .{
             ._id = id,
             ._score = 1.0 - @as(f32, @floatFromInt(depth)) * 0.1,
-            ._source = .{ .object = source },
+            ._source = .{ .map = source },
         });
     }
 
@@ -8493,7 +8493,9 @@ test "retrieval agent agentic mode selects one best query" {
             var parsed_query = try parseJsonBody(QueryRequest, alloc, query_json);
             defer parsed_query.deinit();
             try std.testing.expect(parsed_query.value.full_text_search != null);
-            try expectFullTextQueryValue(parsed_query.value.full_text_search.?, "body:raft");
+            var full_text = try std.json.parseFromSlice(std.json.Value, alloc, parsed_query.value.full_text_search.?.bytes, .{});
+            defer full_text.deinit();
+            try expectFullTextQueryValue(full_text.value, "body:raft");
             return .{
                 .json = try alloc.dupe(u8,
                     \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"raft consensus in antfly"}}]}}]}
@@ -8649,8 +8651,8 @@ test "retrieval agent agentic mode evaluates misses and falls back to the next q
     var saw_evaluation_selection = false;
     for (parsed.value.steps.?) |step| {
         if (std.mem.eql(u8, step.name, "evaluate")) saw_evaluate = true;
-        if (std.mem.eql(u8, step.name, "select_strategy") and step.details != null and step.details.? == .object) {
-            if (step.details.?.object.get("selection_source")) |selection_source| {
+        if (std.mem.eql(u8, step.name, "select_strategy") and step.details != null) {
+            if (step.details.?.map.get("selection_source")) |selection_source| {
                 if (selection_source == .string and std.mem.eql(u8, selection_source.string, "evaluation")) {
                     saw_evaluation_selection = true;
                 }

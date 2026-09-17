@@ -1,34 +1,61 @@
 name: Diagnose Darwin ARM64 release packaging
 
-# Run this expensive release reproduction from the Actions UI, or before a PR
-# merges by applying the `ci:darwin-release` label. Ordinary PR updates do not
-# schedule the 20 GiB ReleaseFast build.
+# Select ci:darwin-release, then approve the PR with /ci run <sha>.
 on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        default: ''
+      head_sha:
+        type: string
+        default: ''
+      base_sha:
+        type: string
+        default: ''
+      check_id:
+        type: string
+        default: ''
+      comment_id:
+        type: string
+        default: ''
   workflow_dispatch:
-  pull_request:
-    types: [labeled]
-
 permissions:
   contents: read
+  checks: read
+  pull-requests: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  admission:
+    uses: ./.github/workflows/pr-ci-admission.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+      suite: darwin
+
   darwin-release:
-    name: Darwin ARM64 ReleaseFast archive
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       github.event.label.name == 'ci:darwin-release' &&
-       github.event.pull_request.head.repo.full_name == github.repository)
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) }}
+    needs: admission
+    name: Darwin ARM64 ReleaseFast archive
     runs-on: arc-antfly-publish
     timeout-minutes: 180
     steps:
       - name: Checkout requested revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           submodules: true
 
       - name: Load pinned toolchain policy

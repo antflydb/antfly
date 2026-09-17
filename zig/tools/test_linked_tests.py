@@ -54,6 +54,23 @@ test "fixture consumer" {
         )
         self.write("implementation.zig", 'test "fixture implementation" {}\n')
 
+    def test_owner_filters_are_runtime_only_and_audited_across_shards(self):
+        self.write("owner_a.zig", 'test "owned alpha" {}\ntest "outside scope" {}\n')
+        self.write("owner_b.zig", 'test "owned beta" {}\n')
+        self.build("owner", "--", "alpha")
+        output = self.build("owner", "--", "beta")
+        for name in ("owner-a", "owner-b"):
+            self.assert_compile(output, "test", name, "cached")
+        self.assertIn("owned beta...", output)
+        self.assertNotIn("owned alpha...", output)
+        output = self.build("owner", "--", "outside scope", succeeds=False)
+        self.assertIn("test filter matched no declared tests", output)
+        output = self.build("owner", "--", "missing", succeeds=False)
+        self.assertIn("test filter matched no declared tests", output)
+        self.build("owner", "--", "missing", "--allow-empty-test-filter")
+        output = self.build("owner", "-Dduplicate-owner=true", succeeds=False)
+        self.assertIn("test has multiple owners", output)
+
     def write(self, name, text):
         (self.build_dir / name).write_text(text)
 

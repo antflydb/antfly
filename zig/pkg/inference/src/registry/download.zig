@@ -24,6 +24,7 @@ const builtin = @import("builtin");
 const managed_receipt = @import("managed_receipt.zig");
 const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
+const qwen3_reranker_catalog = @import("qwen3_reranker_catalog.zig");
 
 pub const default_max_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024;
 pub const default_max_model_bytes: u64 = 128 * 1024 * 1024 * 1024;
@@ -212,6 +213,7 @@ const always_files = [_][]const u8{
     "config_sentence_transformers.json",
     "1_SpladePooling/config.json",
     "1_Pooling/config.json",
+    "1_LogitScore/config.json",
     "added_tokens.json",
     "gliner_config.json",
     "termite_bundle.json",
@@ -1786,6 +1788,45 @@ pub fn downloadPinnedQwen3EmbeddingBundle(
     progress: ProgressSink,
 ) !void {
     try qwen3_embedding_catalog.validate();
+    try downloadPinnedQwenBundleArtifacts(
+        allocator,
+        io,
+        source_owner,
+        source_name,
+        source_variant,
+        bundle.artifacts(),
+        null,
+        dest_dir,
+        config,
+        progress,
+    );
+    if (bundle.generated_model_manifest) |manifest| {
+        try writeManagedArtifactAndUpdatePlan(
+            allocator,
+            io,
+            dest_dir,
+            "model_manifest.json",
+            manifest,
+        );
+    }
+}
+
+/// Download an immutable pinned Qwen3 text-reranker bundle. The Q8 serving
+/// bundle pairs llama.cpp's compact two-row scoring-head GGUF with official
+/// Qwen tokenizer/config sidecars; the BF16 bundle remains an exact upstream
+/// parity path. Both preserve the generative yes/no scoring contract.
+pub fn downloadPinnedQwen3RerankerBundle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_owner: []const u8,
+    source_name: []const u8,
+    source_variant: []const u8,
+    bundle: *const qwen3_reranker_catalog.RerankerBundle,
+    dest_dir: []const u8,
+    config: HubConfig,
+    progress: ProgressSink,
+) !void {
+    try qwen3_reranker_catalog.validate();
     try downloadPinnedQwenBundleArtifacts(
         allocator,
         io,

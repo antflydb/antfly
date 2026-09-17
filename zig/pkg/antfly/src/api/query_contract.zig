@@ -408,6 +408,25 @@ pub const QueryResponseMeta = struct {
         hbc_rerank_vector_physical_reads: u64 = 0,
         hbc_rerank_vector_physical_bytes: u64 = 0,
         hbc_rerank_vector_location_reuses: u64 = 0,
+        hbc_rerank_member_binding_hits: u64 = 0,
+        hbc_rerank_member_binding_batches: u64 = 0,
+        hbc_rerank_member_binding_mixed_batches: u64 = 0,
+        hbc_rerank_member_binding_bytes: u64 = 0,
+        hbc_rerank_read_batches: u64 = 0,
+        hbc_rerank_read_requests: u64 = 0,
+        hbc_rerank_read_helpers: u64 = 0,
+        hbc_rerank_read_denied: u64 = 0,
+        hbc_rerank_read_dispatch_ns: u64 = 0,
+        hbc_rerank_read_caller_ns: u64 = 0,
+        hbc_rerank_read_join_ns: u64 = 0,
+        hbc_rerank_read_worker_wall_ns: u64 = 0,
+        hbc_rerank_read_adaptive_inline_batches: u64 = 0,
+        hbc_rerank_read_adaptive_wide_batches: u64 = 0,
+        hbc_rerank_read_adaptive_probe_ns: u64 = 0,
+        hbc_rerank_read_worker_start_delay_ns: u64 = 0,
+        hbc_rerank_read_mapped_requests: u64 = 0,
+        hbc_rerank_read_mapped_bytes: u64 = 0,
+        hbc_rerank_member_binding_misses: u64 = 0,
         hbc_rerank_vector_block_misses: u64 = 0,
         hbc_rerank_vector_block_fallbacks: u64 = 0,
         hbc_rerank_artifact_cache_hits: u64 = 0,
@@ -3510,7 +3529,7 @@ pub fn encodeQueryResponses(
                 .profile = profile,
                 .took = meta.took_ms,
                 .status = 200,
-                .table = table_name,
+                .table = req.response_table_name orelse table_name,
             };
             break :blk try std.json.Stringify.valueAlloc(
                 alloc,
@@ -3540,7 +3559,7 @@ pub fn encodeQueryResponses(
                 .profile = profile,
                 .took = meta.took_ms,
                 .status = 200,
-                .table = table_name,
+                .table = req.response_table_name orelse table_name,
             };
             break :blk try std.json.Stringify.valueAlloc(
                 alloc,
@@ -13122,7 +13141,7 @@ fn consumerTests() type {
             const count = aggregates.map.get("count") orelse return error.TestUnexpectedResult;
             try std.testing.expectEqualStrings("9384729384729384", count.value);
             try std.testing.expect(count.exact);
-            try std.testing.expectEqual(@as(i64, 1), aggregate_result.stats.returned_items);
+            try std.testing.expectEqual(@as(u64, 1), aggregate_result.stats.returned_items);
         }
 
         test "graph aggregate response fails closed on missing or inexact results" {

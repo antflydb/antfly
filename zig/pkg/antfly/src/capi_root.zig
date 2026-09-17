@@ -18,6 +18,7 @@
 
 pub const aggregation = @import("search/aggregation.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
+pub const vector_migration = @import("common/vector_migration.zig");
 pub const common_config = @import("common/config.zig");
 pub const common_secrets = @import("common/secrets.zig");
 pub const data_snapshot = @import("data/storage/shard_state_store.zig");
@@ -29,7 +30,9 @@ pub const geo = @import("search/geo.zig");
 pub const graph = @import("graph/graph.zig");
 pub const graph_pattern = @import("graph/pattern.zig");
 pub const graph_query = @import("graph/query.zig");
-pub const ha_seed_activation = @import("storage/ha/seed_activation.zig");
+pub const ha_seed_activation = @import("storage/hot_standby/seed_activation.zig");
+pub const ha_seed_snapshot = @import("storage/hot_standby/seed_snapshot.zig");
+pub const ha_validation = @import("storage/hot_standby/validation.zig");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const managed_embedder = @import("inference/managed_embedder.zig");
 pub const lite = @import("storage/lite/mod.zig");

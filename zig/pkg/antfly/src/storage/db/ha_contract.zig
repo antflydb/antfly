@@ -17,11 +17,11 @@
 //! complete physical database implementation into a control-only unit.
 
 const std = @import("std");
-const primary_mod = @import("../ha/primary.zig");
-const mutation_barrier_mod = @import("../ha/mutation_barrier.zig");
-const standby_mod = @import("../ha/standby.zig");
-const write_gate_mod = @import("../ha/write_gate.zig");
-const public_gate_state_mod = @import("../ha/public_gate_state.zig");
+const primary_mod = @import("../hot_standby/primary.zig");
+const mutation_barrier_mod = @import("../hot_standby/mutation_barrier.zig");
+const standby_mod = @import("../hot_standby/standby.zig");
+const write_gate_mod = @import("../hot_standby/write_gate.zig");
+const public_gate_state_mod = @import("../hot_standby/public_gate_state.zig");
 
 pub const SyncWaitFn = *const fn (
     ctx: *anyopaque,

@@ -28,7 +28,6 @@ import {
 import {
   artifactEmbeddingIndexConfig,
   artifactFullTextIndexConfig,
-  type EmbedderConfig,
   type GeneratorConfig,
   graphIndexSources,
   type IndexConfig,
@@ -40,7 +39,7 @@ import { useFieldArray, useForm, useFormContext } from "react-hook-form";
 import { z } from "zod";
 import type { TableSchema } from "../api";
 import { useApi } from "../hooks/use-api-config";
-import { createIndexArguments } from "../lib/create-index";
+import { createIndexArguments, indexEmbedderConfigFromForm } from "../lib/create-index";
 import AdvancedIndexEditor from "./AdvancedIndexEditor";
 import { Combobox } from "./Combobox";
 import { parseAdvancedIndexConfig, usesArtifactBackedIndexSource } from "./create-index-config";
@@ -1186,28 +1185,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
                 sources: graphIndexSources(...data.graphSources.map(buildGraphSourceConfig)),
               } as IndexConfig);
       } else {
-        let embedderConfig: EmbedderConfig;
-        const { provider, model, api_key, url, region } = data.embedder;
-        switch (provider) {
-          case "ollama":
-            embedderConfig = { provider: "ollama", model, url };
-            break;
-          case "openai":
-            embedderConfig = { provider: "openai", model, api_key, url };
-            break;
-          case "bedrock":
-            embedderConfig = {
-              provider: "bedrock",
-              model,
-              region,
-            };
-            break;
-          case "antfly":
-            embedderConfig = { provider: "antfly", model };
-            break;
-          default:
-            throw new Error("Invalid provider");
-        }
+        const embedderConfig = indexEmbedderConfigFromForm(data.embedder);
 
         indexConfig =
           data.sourceType === "artifacts"

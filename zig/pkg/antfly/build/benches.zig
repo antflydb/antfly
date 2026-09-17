@@ -28,6 +28,7 @@ const AntflyRootImports = @import("imports.zig").AntflyRootImports;
 const LmdbBackend = @import("storage.zig").LmdbBackend;
 
 pub const AddBenchmarksOptions = struct {
+    vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
     api_bench_standalone: bool,
     optimize: std.builtin.OptimizeMode,
@@ -66,6 +67,31 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_ha_compat_tests = options.run_lib_ha_compat_tests;
     const compiled_recall_tests = options.compiled_recall_tests;
+    const system_catalog_bench = b.addExecutable(.{
+        .name = "antfly-system-catalog-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/benchmarks/system_catalog.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    system_catalog_bench.root_module.addImport("system_catalog", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/system_catalog/domain.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    b.step("antfly-system-catalog-bench", "Benchmark indexed catalog lookups and mutation planning").dependOn(&b.addRunArtifact(system_catalog_bench).step);
+    const system_catalog_routing_bench = b.addExecutable(.{
+        .name = "antfly-system-catalog-routing-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/system_catalog_routing_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const catalog_bench_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
+    catalog_bench_imports.configure(b, system_catalog_routing_bench.root_module, true, true);
+    b.step("antfly-system-catalog-routing-bench", "Benchmark rebuilt and retained indexed routing generations").dependOn(&b.addRunArtifact(system_catalog_routing_bench).step);
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
     const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, true, false);
     const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, optimize, true, lmdb_bench_engine_options_c);
@@ -154,33 +180,14 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const backend_bench_step = b.step("backend-bench", "Build and install backend_bench");
     backend_bench_step.dependOn(&b.addInstallArtifact(backend_bench, .{}).step);
 
-    const graph_metric_prepare_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/graph/metric_preparation_bench.zig"),
+    const graph_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/graph/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    graph_metric_prepare_bench_mod.addImport("antfly_zig", antfly_mod);
-    const graph_metric_prepare_bench = b.addExecutable(.{
-        .name = "graph_metric_preparation_bench",
-        .root_module = graph_metric_prepare_bench_mod,
-    });
-    const run_graph_metric_prepare_bench = b.addRunArtifact(graph_metric_prepare_bench);
-    if (b.args) |args| run_graph_metric_prepare_bench.addArgs(args);
-    b.step("graph-metric-preparation-bench", "Compare unpack/hash and packed ordinal graph-metric preparation").dependOn(&run_graph_metric_prepare_bench.step);
-
-    const graph_pattern_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/graph/pattern_query_bench.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    graph_pattern_bench_mod.addImport("antfly_zig", antfly_mod);
-    const graph_pattern_bench = b.addExecutable(.{
-        .name = "graph_pattern_query_bench",
-        .root_module = graph_pattern_bench_mod,
-    });
-
-    const graph_pattern_bench_step = b.step("graph-pattern-bench", "Build and install graph_pattern_query_bench");
-    graph_pattern_bench_step.dependOn(&b.addInstallArtifact(graph_pattern_bench, .{}).step);
+    graph_bench_mod.addImport("antfly_zig", antfly_mod);
+    const graph_bench = b.addExecutable(.{ .name = "antfly-graph-bench", .root_module = graph_bench_mod });
+    b.step("antfly-graph-bench", "Build and install graph preparation and query benchmarks").dependOn(&b.addInstallArtifact(graph_bench, .{}).step);
 
     const lsm_backend_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/lsm_backend_bench.zig"),
@@ -673,6 +680,16 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     const hbc_isolate_step = b.step("hbc-isolate", "Build and install hbc_isolate");
     hbc_isolate_step.dependOn(&b.addInstallArtifact(hbc_isolate, .{}).step);
+
+    const build_quality_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench_build_quality.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    build_quality_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
+    const build_quality = b.addExecutable(.{ .name = "bench_build_quality", .root_module = build_quality_mod });
+    const build_quality_step = b.step("bench-build-quality", "Build bounded-bootstrap held-out recall benchmark");
+    build_quality_step.dependOn(&b.addInstallArtifact(build_quality, .{}).step);
 
     const dense_stack_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/dense_stack_bench.zig"),

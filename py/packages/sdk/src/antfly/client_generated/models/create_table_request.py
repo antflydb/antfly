@@ -22,7 +22,13 @@ T = TypeVar("T", bound="CreateTableRequest")
 class CreateTableRequest:
     """
     Attributes:
-        storage (TableStorageSettings | Unset): Immutable source embedding storage selected when creating a table.
+        tablespace_name (str | Unset): Explicit tablespace policy for the new table, overriding namespace and database
+            defaults.
+        storage (TableStorageSettings | Unset): Immutable source embedding ownership. Omit storage when creating a table
+            to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for
+            other deployments. Existing tables retain their recorded ownership; changing the creation default does not
+            migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select
+            primary_lsm when these operations are required.
         num_shards (int | Unset): Number of shards to create for the table. Data is partitioned across shards based on
             key ranges.
 
@@ -78,6 +84,7 @@ class CreateTableRequest:
             Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
     """
 
+    tablespace_name: str | Unset = UNSET
     storage: TableStorageSettings | Unset = UNSET
     num_shards: int | Unset = UNSET
     description: str | Unset = UNSET
@@ -87,6 +94,8 @@ class CreateTableRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        tablespace_name = self.tablespace_name
+
         storage: dict[str, Any] | Unset = UNSET
         if not isinstance(self.storage, Unset):
             storage = self.storage.to_dict()
@@ -113,6 +122,8 @@ class CreateTableRequest:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if tablespace_name is not UNSET:
+            field_dict["tablespace_name"] = tablespace_name
         if storage is not UNSET:
             field_dict["storage"] = storage
         if num_shards is not UNSET:
@@ -136,6 +147,8 @@ class CreateTableRequest:
         from ..models.table_storage_settings import TableStorageSettings
 
         d = dict(src_dict)
+        tablespace_name = d.pop("tablespace_name", UNSET)
+
         _storage = d.pop("storage", UNSET)
         storage: TableStorageSettings | Unset
         if isinstance(_storage, Unset):
@@ -171,6 +184,7 @@ class CreateTableRequest:
                 replication_sources.append(replication_sources_item)
 
         create_table_request = cls(
+            tablespace_name=tablespace_name,
             storage=storage,
             num_shards=num_shards,
             description=description,

@@ -41,6 +41,10 @@ const Options = struct {
     model_dir: []const u8,
     audio_path: []const u8,
     backend: BackendChoice = .auto,
+    /// Backend for the decoder session. `auto` keeps the decoder on the
+    /// primary session; `native` loads a CPU copy for the decoder so the
+    /// two placements can be measured against each other.
+    decoder_backend: BackendChoice = .auto,
     language: ?[]const u8 = null,
 };
 
@@ -94,7 +98,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
         var result = try pipeline.transcribe(audio_data);
         defer result.deinit();
-        try writeResultJson(allocator, opts.model_dir, result.text, result.language);
+        try writeResultJson(allocator, opts.model_dir, result.text, result.language, result.timing);
         return;
     } else |_| {}
 
@@ -103,6 +107,18 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     const model = try model_manager.loadFromDir(opts.model_dir);
     const whisper_cfg = session_factory.getWhisperConfig(model.session) orelse return error.InvalidModelForTranscription;
+    const decoder_session: backends.Session = blk: {
+        const want_native = switch (opts.decoder_backend) {
+            .native => true,
+            .metal, .auto => false,
+        };
+        if (!want_native or model.session.backend() == .native) break :blk model.session;
+        const cpu_model = model_manager.loadFromDirWithPreferredBackends(opts.model_dir, &.{backends.BackendType.native}, false) catch |err| {
+            std.log.warn("decoder backend native unavailable, decoding on {s}: {s}", .{ @tagName(model.session.backend()), @errorName(err) });
+            break :blk model.session;
+        };
+        break :blk cpu_model.session;
+    };
     const prompt_cache = if (model.whisper_prompt_cache) |*cache|
         cache
     else
@@ -113,21 +129,24 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var pipeline = transcription.TranscriptionPipeline.init(
         allocator,
         model.session,
-        model.session,
+        decoder_session,
         model.getTokenizer(),
         .{
             .max_length = @intCast(whisper_cfg.max_target_positions),
             .decoder_start_token_id = whisper_cfg.decoder_start_token_id,
             .eos_token_id = whisper_cfg.eos_token_id,
+            .n_mels = whisper_cfg.num_mel_bins,
             .language = opts.language,
             .forced_decoder_ids = forced_ids,
             .language_tokens = prompt_cache.language_tokens,
+            .decode = prompt_cache.decode,
+            .no_timestamps_id = prompt_cache.no_timestamps_id,
         },
     );
 
     var result = try pipeline.transcribe(audio_data);
     defer result.deinit();
-    try writeResultJson(allocator, opts.model_dir, result.text, result.language);
+    try writeResultJson(allocator, opts.model_dir, result.text, result.language, result.timing);
 }
 
 fn parseArgs(args: []const []const u8) !Options {
@@ -148,6 +167,10 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingBackendValue;
             opts.backend = parseBackendChoice(args[i]) orelse return error.InvalidBackend;
+        } else if (std.mem.eql(u8, arg, "--decoder-backend")) {
+            i += 1;
+            if (i >= args.len) return error.MissingBackendValue;
+            opts.decoder_backend = parseBackendChoice(args[i]) orelse return error.InvalidBackend;
         } else if (std.mem.eql(u8, arg, "--language")) {
             i += 1;
             if (i >= args.len) return error.MissingLanguageValue;
@@ -161,7 +184,7 @@ fn parseArgs(args: []const []const u8) !Options {
     return opts;
 }
 
-fn writeResultJson(allocator: std.mem.Allocator, model_name: []const u8, text: []const u8, language: ?[]const u8) !void {
+fn writeResultJson(allocator: std.mem.Allocator, model_name: []const u8, text: []const u8, language: ?[]const u8, timing: transcription.Timing) !void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(allocator);
 
@@ -173,6 +196,20 @@ fn writeResultJson(allocator: std.mem.Allocator, model_name: []const u8, text: [
         try buf.appendSlice(allocator, ",\"language\":");
         try jsonEncodeString(&buf, allocator, lang);
     }
+    const timing_json = try std.fmt.allocPrint(
+        allocator,
+        ",\"timing_ms\":{{\"mel\":{d:.1},\"encoder\":{d:.1},\"prefill\":{d:.1},\"decode\":{d:.1},\"decode_steps\":{d},\"kv_cached\":{}}}",
+        .{
+            @as(f64, @floatFromInt(timing.mel_ns)) / 1e6,
+            @as(f64, @floatFromInt(timing.encoder_ns)) / 1e6,
+            @as(f64, @floatFromInt(timing.prefill_ns)) / 1e6,
+            @as(f64, @floatFromInt(timing.decode_ns)) / 1e6,
+            timing.decode_steps,
+            timing.kv_cached,
+        },
+    );
+    defer allocator.free(timing_json);
+    try buf.appendSlice(allocator, timing_json);
     try buf.appendSlice(allocator, "}\n");
 
     print("{s}", .{buf.items});
@@ -229,7 +266,7 @@ fn ensureRequestedMetalHostedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference transcribe <model-dir> <audio.wav> [--backend auto|native|metal] [--language <lang>]
+        \\usage: antfly inference transcribe <model-dir> <audio.wav> [--backend auto|native|metal] [--decoder-backend auto|native|metal] [--language <lang>]
         \\  Runs local audio transcription and prints a JSON response to stdout.
         \\
     , .{});

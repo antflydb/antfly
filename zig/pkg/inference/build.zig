@@ -1291,6 +1291,7 @@ pub fn build(b: *std.Build) void {
 
     // GLiNER2 end-to-end native bench: random weights, real eager forward.
     workflows_benches.addGliner(workflow_ctx);
+    workflows_tests.addGliner25Trained(workflow_ctx, workflows_benches.addGliner25(workflow_ctx));
 
     const gliner2_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-gliner2-e2e-bench",

@@ -4651,7 +4651,7 @@ test "public table query handler maps exact graph execution failures" {
     try std.testing.expectEqualStrings("pattern", work_error.operation);
     try std.testing.expectEqualStrings("match", work_error.mode);
     try std.testing.expectEqualStrings("intermediate_states", work_error.dimension);
-    try std.testing.expectEqual(@as(i64, 100_000), work_error.maximum);
+    try std.testing.expectEqual(@as(u64, 100_000), work_error.maximum);
 
     kind = .path_weight_domain;
     var weight_resp = try handleTableQueryRequest(
@@ -4702,7 +4702,7 @@ test "public table query handler maps exact graph execution failures" {
     try std.testing.expect(!distinct_error.retryable);
     try std.testing.expectEqualStrings("unique_people", distinct_error.operation);
     try std.testing.expectEqualStrings("distinct_identities", distinct_error.dimension);
-    try std.testing.expectEqual(@as(i64, 512), distinct_error.maximum);
+    try std.testing.expectEqual(@as(u64, 512), distinct_error.maximum);
     try std.testing.expect(distinct_error.remediation.len > 0);
 
     kind = .anchor_filter;
@@ -4758,8 +4758,8 @@ test "public table query handler maps exact graph execution failures" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(!limit_error.retryable);
-    try std.testing.expectEqual(@as(i64, graph_query_mod.max_match_queries_per_request), limit_error.maximum);
-    try std.testing.expectEqual(@as(i64, graph_query_mod.max_match_queries_per_request + 1), limit_error.actual);
+    try std.testing.expectEqual(@as(u64, graph_query_mod.max_match_queries_per_request), limit_error.maximum);
+    try std.testing.expectEqual(@as(u64, graph_query_mod.max_match_queries_per_request + 1), limit_error.actual);
 
     kind = .graph_query_mode;
     var cross_range_resp = try handleTableQueryRequest(
@@ -4852,7 +4852,7 @@ test "public table query handler maps exact graph execution failures" {
         .graph_match_operation_limit_exceeded_error => |value| value,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expectEqual(@as(i64, 2), legacy_limit_error.actual);
+    try std.testing.expectEqual(@as(u64, 2), legacy_limit_error.actual);
 }
 
 test "unsupported graph diagnostics identify the rejected operation feature" {

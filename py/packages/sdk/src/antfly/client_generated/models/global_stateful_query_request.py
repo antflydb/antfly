@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.analyses import Analyses
     from ..models.bool_field_query import BoolFieldQuery
     from ..models.boolean_query import BooleanQuery
+    from ..models.catalog_table_target import CatalogTableTarget
     from ..models.conjunction_query import ConjunctionQuery
     from ..models.date_range_string_query import DateRangeStringQuery
     from ..models.disjunction_query import DisjunctionQuery
@@ -62,6 +63,8 @@ class GlobalStatefulQueryRequest:
 
     Attributes:
         table (str): Name of the table to query. Example: wikipedia.
+        table_target (CatalogTableTarget | Unset): An explicit native table target. Components are literal names; dots
+            do not qualify a string table name.
         query (QueryRequestQuery | Unset): Canonical public query AST. Prefer this field for new clients.
 
             Boolean clauses are normalized before planning:
@@ -400,6 +403,7 @@ class GlobalStatefulQueryRequest:
     """
 
     table: str
+    table_target: CatalogTableTarget | Unset = UNSET
     query: QueryRequestQuery | Unset = UNSET
     full_text_search: (
         BooleanQuery
@@ -550,6 +554,10 @@ class GlobalStatefulQueryRequest:
         from ..models.wildcard_query import WildcardQuery
 
         table = self.table
+
+        table_target: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.table_target, Unset):
+            table_target = self.table_target.to_dict()
 
         query: dict[str, Any] | Unset = UNSET
         if not isinstance(self.query, Unset):
@@ -835,6 +843,8 @@ class GlobalStatefulQueryRequest:
                 "table": table,
             }
         )
+        if table_target is not UNSET:
+            field_dict["table_target"] = table_target
         if query is not UNSET:
             field_dict["query"] = query
         if full_text_search is not UNSET:
@@ -915,6 +925,7 @@ class GlobalStatefulQueryRequest:
         from ..models.analyses import Analyses
         from ..models.bool_field_query import BoolFieldQuery
         from ..models.boolean_query import BooleanQuery
+        from ..models.catalog_table_target import CatalogTableTarget
         from ..models.conjunction_query import ConjunctionQuery
         from ..models.date_range_string_query import DateRangeStringQuery
         from ..models.disjunction_query import DisjunctionQuery
@@ -956,6 +967,13 @@ class GlobalStatefulQueryRequest:
 
         d = dict(src_dict)
         table = d.pop("table")
+
+        _table_target = d.pop("table_target", UNSET)
+        table_target: CatalogTableTarget | Unset
+        if isinstance(_table_target, Unset):
+            table_target = UNSET
+        else:
+            table_target = CatalogTableTarget.from_dict(_table_target)
 
         _query = d.pop("query", UNSET)
         query: QueryRequestQuery | Unset
@@ -1830,6 +1848,7 @@ class GlobalStatefulQueryRequest:
 
         global_stateful_query_request = cls(
             table=table,
+            table_target=table_target,
             query=query,
             full_text_search=full_text_search,
             full_text_index=full_text_index,

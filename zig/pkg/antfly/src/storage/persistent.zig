@@ -133,6 +133,7 @@ fn nsToMs(ns: u64) u64 {
 
 pub const PersistentIndexOptions = struct {
     path: [*:0]const u8,
+    io: ?std.Io = null,
     main_backend: MainBackend = .lsm,
     wal_backend: ?wal_mod.StorageBackend = null,
     main_lsm_storage: ?lsm_backend.Storage = null,
@@ -894,6 +895,7 @@ pub const PreparedMergeSegment = struct {
 
 /// Meta keys in the LMDB metadata database.
 const meta_committed_lsn = "committed_lsn";
+const meta_rebuild_cursor = "rebuild_snapshot_cursor";
 const meta_next_seg_id = "next_seg_id";
 const meta_active_segments = "active_segments";
 const meta_active_segment_prefix = "active_segment:";
@@ -903,14 +905,43 @@ pub const text_projection_provenance_meta_key = "text_projection_provenance";
 const segments_db_name = "segments";
 const meta_db_name = "meta";
 const deletions_db_name = "deletions";
-var global_storage_mu: std.atomic.Mutex = .unlocked;
 
-fn lockPersistentStorage() void {
-    platform_sync.lockYielding(&global_storage_mu);
+fn persistentStorageIo(runtime_io: ?std.Io) std.Io {
+    return runtime_io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
-fn unlockPersistentStorage() void {
-    global_storage_mu.unlock();
+test "persistent storage contention yields through borrowed IO during cancellation cleanup" {
+    const Probe = struct {
+        index: *PersistentIndex,
+        waits: usize = 0,
+        wakes: usize = 0,
+        io: std.Io = undefined,
+
+        fn wait(ptr: ?*anyopaque, _: *const u32, _: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.waits += 1;
+            self.index.unlockStorage();
+        }
+
+        fn wake(ptr: ?*anyopaque, _: *const u32, _: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.wakes += 1;
+        }
+    };
+    var index: PersistentIndex = undefined;
+    var mutex: std.Io.Mutex = .init;
+    index.storage_mu = &mutex;
+    var probe = Probe{ .index = &index };
+    var vtable: std.Io.VTable = undefined;
+    vtable.futexWaitUncancelable = Probe.wait;
+    vtable.futexWake = Probe.wake;
+    probe.io = .{ .userdata = &probe, .vtable = &vtable };
+    index.io = probe.io;
+    try std.testing.expect(index.storage_mu.tryLock());
+    index.lockStorage();
+    index.unlockStorage();
+    try std.testing.expectEqual(@as(usize, 1), probe.waits);
+    try std.testing.expectEqual(@as(usize, 2), probe.wakes);
 }
 
 const MainKeyspace = enum {
@@ -1056,12 +1087,18 @@ const OpenedMainStore = struct {
 
 pub const PersistentIndex = struct {
     alloc: Allocator,
+    // Each live generation owns its writer, WAL, and stores. Serialize its
+    // mutations without fencing unrelated indexes or their IO runtimes.
+    // Keep the wait address stable when the catalog moves a quiescent owner.
+    storage_mu: *std.Io.Mutex,
+    io: ?std.Io = null,
     writer: index_mod.IndexWriter,
     main_store: backend_erased.NamespaceStore,
     main_store_owner: MainStoreOwner,
     segment_files: ?SegmentFileStore,
     retired_segment_file_deleter: ?*RetiredSegmentFileDeleter = null,
     retirement_reconcile_pending: bool = false,
+    active_rebuild_page: ?*RebuildPage = null,
     wal: wal_mod.WAL,
     committed_lsn: u64,
     main_backend: MainBackend,
@@ -1069,6 +1106,78 @@ pub const PersistentIndex = struct {
     main_map_size: usize,
     wal_map_size: usize,
     read_only: bool = false,
+
+    /// A private candidate publishes all segments produced by one source page
+    /// together with its cursor. Until commit they are unreachable orphan files
+    /// (or owned buffers), so a crash cannot expose a partial or duplicate page.
+    /// The candidate's single repair writer owns this synchronous scope.
+    pub const RebuildPage = struct {
+        index: *PersistentIndex,
+        cursor: []const u8,
+        segments: std.ArrayListUnmanaged(index_mod.ReplacementSegmentData) = .empty,
+        active: bool = false,
+
+        pub fn begin(self: *RebuildPage) !void {
+            if (self.index.read_only) return error.ReadOnly;
+            if (self.index.active_rebuild_page != null) return error.InvalidArgument;
+            self.index.active_rebuild_page = self;
+            self.active = true;
+        }
+
+        pub fn deinit(self: *RebuildPage) void {
+            if (self.active) self.index.active_rebuild_page = null;
+            for (self.segments.items) |*segment| {
+                segment.data.deinit(self.index.alloc);
+                self.index.deleteSegmentFile(segment.id);
+            }
+            self.segments.deinit(self.index.alloc);
+            self.* = undefined;
+        }
+
+        pub fn commit(self: *RebuildPage) !void {
+            std.debug.assert(self.active and self.index.active_rebuild_page == self);
+            const index = self.index;
+            index.lockStorage();
+            defer index.unlockStorage();
+            var publication = if (self.segments.items.len != 0)
+                try index.writer.prepareSegmentsManyData(&.{}, self.segments.items)
+            else
+                null;
+            defer if (publication) |*prepared| prepared.abort();
+            var txn = try index.beginWriteMainTxn();
+            errdefer txn.abort();
+            for (self.segments.items) |segment| {
+                var range = try extractSegmentKeyRange(index.alloc, segment.data.bytes());
+                defer range.deinit(index.alloc);
+                const key = std.mem.toBytes(std.mem.nativeToBig(u64, segment.id));
+                if (index.segment_files == null) try txn.put(.segments, &key, segment.data.bytes());
+                try index.saveSegmentRange(&txn, segment.id, range);
+                try index.updateActiveSegments(&txn, segment.id, .add);
+            }
+            try saveNextSegmentId(&txn, index.writer.next_segment_id);
+            try txn.put(.meta, meta_rebuild_cursor, self.cursor);
+            try txn.commit();
+            if (publication) |*prepared| prepared.publish();
+            self.segments.clearRetainingCapacity(); // ownership moved to writer
+            index.active_rebuild_page = null;
+            self.active = false;
+            // The external repair intent may now advance independently. Its
+            // cursor can lag this transaction, but cannot outrun durable pages.
+            try index.main_store_owner.sync(true);
+        }
+    };
+
+    pub fn rebuildCursorAlloc(self: *PersistentIndex, alloc: Allocator) !?[]u8 {
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        const cursor = txn.get(.meta, meta_rebuild_cursor) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        return try alloc.dupe(u8, cursor);
+    }
 
     pub const BackendStore = backend_adapter.Store(PersistentIndex, MainTxn, MainTxn, MainTxn, .{
         .capabilities = backendCapabilities,
@@ -1320,9 +1429,10 @@ pub const PersistentIndex = struct {
 
     /// Open or create a persistent index. Recovers existing state + replays WAL.
     pub fn open(alloc: Allocator, opts: PersistentIndexOptions) !PersistentIndex {
-        lockPersistentStorage();
-        defer unlockPersistentStorage();
-
+        // The new owner is unpublished until recovery completes.
+        const storage_mu = try alloc.create(std.Io.Mutex);
+        errdefer alloc.destroy(storage_mu);
+        storage_mu.* = .init;
         const path_span = std.mem.span(opts.path);
         const wal_storage = opts.wal_storage orelse opts.main_lsm_storage;
         const needs_host_dirs =
@@ -1501,6 +1611,8 @@ pub const PersistentIndex = struct {
         }
 
         var pi = PersistentIndex{
+            .storage_mu = storage_mu,
+            .io = opts.io,
             .alloc = alloc,
             .writer = writer,
             .main_store = opened_main.store,
@@ -1543,13 +1655,11 @@ pub const PersistentIndex = struct {
     }
 
     fn lockStorage(self: *PersistentIndex) void {
-        _ = self;
-        lockPersistentStorage();
+        self.storage_mu.lockUncancelable(persistentStorageIo(self.io));
     }
 
     fn unlockStorage(self: *PersistentIndex) void {
-        _ = self;
-        unlockPersistentStorage();
+        self.storage_mu.unlock(persistentStorageIo(self.io));
     }
 
     pub fn close(self: *PersistentIndex) void {
@@ -1562,6 +1672,7 @@ pub const PersistentIndex = struct {
         if (self.retired_segment_file_deleter) |deleter| deleter.release();
         if (self.segment_files) |*store| store.close();
         self.unlockStorage();
+        self.alloc.destroy(self.storage_mu);
         self.* = undefined;
     }
 
@@ -1583,6 +1694,7 @@ pub const PersistentIndex = struct {
         if (self.retired_segment_file_deleter) |deleter| deleter.release();
         if (self.segment_files) |*store| store.close();
         self.unlockStorage();
+        self.alloc.destroy(self.storage_mu);
         self.* = undefined;
     }
 
@@ -1750,6 +1862,10 @@ pub const PersistentIndex = struct {
             try self.updateActiveSegments(&txn, seg_id, .remove);
         }
         try saveNextSegmentId(&txn, replacement_writer.next_segment_id);
+        txn.delete(.meta, meta_rebuild_cursor) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
         try txn.commit();
 
         // The catalog transaction is the logical reset commit. Retaining the
@@ -1936,6 +2052,23 @@ pub const PersistentIndex = struct {
 
         var owned: ?[]u8 = segment_bytes;
         defer if (owned) |buf| self.alloc.free(buf);
+
+        if (self.active_rebuild_page) |page| {
+            const id = self.reserveSegmentId();
+            var data = if (self.segment_files != null)
+                try self.materializeSegmentData(id, owned.?)
+            else blk: {
+                const value = index_mod.SegmentData.fromOwnedHeap(owned.?);
+                owned = null;
+                break :blk value;
+            };
+            errdefer {
+                data.deinit(self.alloc);
+                self.deleteSegmentFile(id);
+            }
+            try page.segments.append(self.alloc, .{ .id = id, .data = data });
+            return;
+        }
 
         const profile_enabled = benchPersistentPublishEnabled();
         const total_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
@@ -2127,6 +2260,13 @@ pub const PersistentIndex = struct {
         };
         if (profile_enabled) key_range_ns = platform_time.monotonicNs() - key_range_start_ns;
         defer key_range.deinit(self.alloc);
+
+        if (self.active_rebuild_page) |page| {
+            try page.segments.append(self.alloc, .{ .id = seg_id, .data = segment_data.? });
+            segment_data = null;
+            rollback_segment = false;
+            return segment_len;
+        }
 
         var replacement = [_]index_mod.ReplacementSegmentData{.{
             .id = seg_id,
@@ -3732,6 +3872,55 @@ fn cleanupPersistDir(path: [*:0]const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "persistent independent indexes publish while another owner is locked" {
+    const alloc = std.testing.allocator;
+    var first_path_buf: [256]u8 = undefined;
+    const first_path = persistTmpPath(&first_path_buf);
+    defer cleanupPersistDir(first_path);
+    var second_path_buf: [256]u8 = undefined;
+    const second_path = persistTmpPath(&second_path_buf);
+    defer cleanupPersistDir(second_path);
+    var first = try PersistentIndex.open(alloc, .{ .path = first_path });
+    defer first.close();
+
+    // A contended second owner releases the first so a regression fails an
+    // assertion instead of hanging. Neither open nor publication may wait.
+    const Probe = struct {
+        first: *PersistentIndex,
+        first_locked: bool = true,
+        waits: usize = 0,
+
+        fn wait(ptr: ?*anyopaque, _: *const u32, _: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.waits += 1;
+            if (self.first_locked) {
+                self.first_locked = false;
+                self.first.unlockStorage();
+            }
+        }
+
+        fn wake(_: ?*anyopaque, _: *const u32, _: u32) void {}
+    };
+    var probe = Probe{ .first = &first };
+    var vtable = std.testing.io.vtable.*;
+    vtable.futexWaitUncancelable = Probe.wait;
+    vtable.futexWake = Probe.wake;
+    const io: std.Io = .{ .userdata = &probe, .vtable = &vtable };
+    first.lockStorage();
+    defer if (probe.first_locked) first.unlockStorage();
+    var second = try PersistentIndex.open(alloc, .{ .path = second_path, .io = io });
+    defer second.close();
+    const segment = try buildSimpleSegment(alloc, "doc1", "hello");
+    defer alloc.free(segment);
+    try second.indexSegment(segment);
+    try second.writeGenerationMetadata("independent", "published");
+    const value = (try second.readGenerationMetadataAlloc(alloc, "independent")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("published", value);
+    try std.testing.expectEqual(@as(usize, 0), probe.waits);
+    try std.testing.expect(probe.first_locked);
 }
 
 test "persistent index write and read" {
@@ -6165,4 +6354,105 @@ test "persistent modeled sim workload stays green" {
 test "persistent sim soak stays green" {
     if (!storage_sim_soak) return;
     try runPersistentSoak(std.testing.allocator);
+}
+
+test "persistent rebuild page publishes segments and cursor atomically across reopen" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+    {
+        var pi = try PersistentIndex.open(alloc, .{ .path = path });
+        defer pi.close();
+        var page: PersistentIndex.RebuildPage = .{ .index = &pi, .cursor = "doc2" };
+        defer page.deinit();
+        try page.begin();
+        const first = try buildSimpleSegment(alloc, "doc1", "hello");
+        defer alloc.free(first);
+        const second = try buildSimpleSegment(alloc, "doc2", "world");
+        defer alloc.free(second);
+        try pi.indexSegment(first);
+        try pi.indexSegment(second);
+        try std.testing.expectEqual(@as(u32, 0), pi.snapshot().liveDocCount());
+        try std.testing.expect((try pi.rebuildCursorAlloc(alloc)) == null);
+        try page.commit();
+        try std.testing.expectEqual(@as(u32, 2), pi.snapshot().liveDocCount());
+        try std.testing.expectEqual(@as(u64, 2), pi.snapshot().global_total_field_len.get("body").?);
+        const cursor = (try pi.rebuildCursorAlloc(alloc)).?;
+        defer alloc.free(cursor);
+        try std.testing.expectEqualStrings("doc2", cursor);
+        // Aborting a later partial page must not publish any of its segments.
+        var aborted: PersistentIndex.RebuildPage = .{ .index = &pi, .cursor = "doc3" };
+        defer aborted.deinit();
+        try aborted.begin();
+        const third = try buildSimpleSegment(alloc, "doc3", "aborted");
+        defer alloc.free(third);
+        try pi.indexSegment(third);
+    }
+    {
+        var pi = try PersistentIndex.open(alloc, .{ .path = path });
+        defer pi.close();
+        try std.testing.expectEqual(@as(u32, 2), pi.snapshot().liveDocCount());
+        try std.testing.expectEqual(@as(u64, 2), pi.snapshot().global_total_field_len.get("body").?);
+        const cursor = (try pi.rebuildCursorAlloc(alloc)).?;
+        defer alloc.free(cursor);
+        try std.testing.expectEqualStrings("doc2", cursor);
+        var appended: PersistentIndex.RebuildPage = .{ .index = &pi, .cursor = "doc3" };
+        defer appended.deinit();
+        try appended.begin();
+        const third = try buildSimpleSegment(alloc, "doc3", "committed");
+        defer alloc.free(third);
+        try pi.indexSegment(third);
+        try appended.commit();
+        try std.testing.expectEqual(@as(u32, 3), pi.snapshot().liveDocCount());
+        try std.testing.expectEqual(@as(u64, 3), pi.snapshot().global_total_field_len.get("body").?);
+        // Filtered pages can advance the cursor without an output segment.
+        var empty: PersistentIndex.RebuildPage = .{ .index = &pi, .cursor = "doc4" };
+        defer empty.deinit();
+        try empty.begin();
+        try empty.commit();
+        const advanced = (try pi.rebuildCursorAlloc(alloc)).?;
+        defer alloc.free(advanced);
+        try std.testing.expectEqualStrings("doc4", advanced);
+        try std.testing.expectEqual(@as(u32, 3), pi.snapshot().liveDocCount());
+        try std.testing.expectEqual(@as(u64, 3), pi.snapshot().global_total_field_len.get("body").?);
+    }
+}
+
+test "persistent rebuild page publication scaling benchmark" {
+    if (!envEnabled("ANTFLY_BENCH_REBUILD_PAGE")) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 16_384, 65_536, 131_072 }) |count| {
+        for ([_]bool{ false, true }) |atomic_page| {
+            var path_buf: [256]u8 = undefined;
+            const path = persistTmpPath(&path_buf);
+            defer cleanupPersistDir(path);
+            var pi = try PersistentIndex.open(alloc, .{ .path = path });
+            defer pi.close();
+            var elapsed_ns: u64 = 0;
+            var start: usize = 0;
+            while (start < count) : (start += 256) {
+                const segment = try buildHighFrequencyKeywordSegmentRange(alloc, start, 256);
+                defer alloc.free(segment);
+                var keys: [256][32]u8 = undefined;
+                var ids: [256][]const u8 = undefined;
+                for (&ids, 0..) |*id, i| id.* = try std.fmt.bufPrint(&keys[i], "doc:{d}", .{start + i});
+                const began = platform_time.monotonicNs();
+                if (atomic_page) {
+                    var page: PersistentIndex.RebuildPage = .{ .index = &pi, .cursor = ids[255] };
+                    defer page.deinit();
+                    try page.begin();
+                    try pi.indexSegment(segment);
+                    try page.commit();
+                } else {
+                    const deleted = try pi.deleteByIdsTracked(&ids);
+                    defer pi.freeDeleteInfos(deleted);
+                    try pi.indexSegment(segment);
+                }
+                elapsed_ns += platform_time.monotonicNs() - began;
+            }
+            try std.testing.expectEqual(@as(u32, @intCast(count)), pi.snapshot().liveDocCount());
+            std.debug.print("rebuild_page_bench docs={} atomic={} publication_ns={} segments={}\n", .{ count, atomic_page, elapsed_ns, count / 256 });
+        }
+    }
 }

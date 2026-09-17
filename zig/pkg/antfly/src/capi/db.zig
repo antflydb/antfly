@@ -259,6 +259,11 @@ const MetadataListenerBridge = struct {
             .group_id = signal.group_id,
             .store_id = signal.store_id,
             .node_id = signal.node_id,
+            .store_reports_changed = @intFromBool(signal.store_reports_changed),
+            .store_runtime_changed = @intFromBool(signal.store_runtime_changed),
+            .has_store_group_ids = @intFromBool(signal.store_group_ids != null),
+            .store_group_ids = if (signal.store_group_ids) |ids| ids.ptr else null,
+            .store_group_ids_len = if (signal.store_group_ids) |ids| ids.len else 0,
         };
         callback(self.request.context, &value);
     }
@@ -759,19 +764,7 @@ fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.
             "docs",
             request_json,
             .internal,
-            .{
-                .enabled = 1,
-                .include_stored = @intFromBool(req.include_stored),
-                .return_mode = switch (req.return_mode) {
-                    .parent => .parent,
-                    .chunk => .chunk,
-                    .parent_with_chunks => .parent_with_chunks,
-                    .unit => .unit,
-                    .unit_with_chunks => .unit_with_chunks,
-                    .member => .member,
-                },
-                .max_chunks_per_parent = req.max_chunks_per_parent,
-            },
+            antfly.local_query_controls.executionOptions(req),
             req.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
@@ -1277,7 +1270,7 @@ const JsonTextMergeStats = struct {
     failed_merges: u64,
     quarantined_merges: u64,
     quarantined_segments: u64,
-    last_merge_error: []const u8,
+    last_merge_error: db_mod.types.RuntimeErrorName,
     backpressure_events: u64,
     backpressure_ns: u64,
     max_pending_segments: u64,
@@ -2644,6 +2637,65 @@ pub fn storageSystemWriteDelete(
     return .ok;
 }
 
+pub fn storageSystemWriteOpenCursor(
+    txn_ptr: ?*anyopaque,
+    out_cursor: *?*anyopaque,
+) callconv(.c) kernel_owner_abi.Status {
+    out_cursor.* = null;
+    const handle = asSystemWriteTxn(txn_ptr) orelse return .invalid_argument;
+    const cursor = handle.txn.openCursor() catch |err| return storageOwnerStatusFromError(err);
+    const wrapper = handle.alloc.create(SystemCursorHandle) catch {
+        var owned = cursor;
+        owned.close();
+        return .out_of_memory;
+    };
+    wrapper.* = .{ .alloc = handle.alloc, .cursor = cursor };
+    out_cursor.* = wrapper;
+    return .ok;
+}
+
+test "capi system write cursor sees pending catalog rows and preserves abort" {
+    const alloc = std.testing.allocator;
+    var test_tmp = try TestDirectory.init("system-write-cursor");
+    defer test_tmp.cleanup();
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "catalog");
+    defer alloc.free(path);
+    var backend = try lite_backend.Handle.create(alloc, path, false);
+    defer backend.deinit();
+    const store = try backend.runtimeStoreForNamespace("system/metadata");
+    {
+        var seed = try store.beginWrite();
+        errdefer seed.abort();
+        try seed.put("catalog:a", "old");
+        try seed.commit();
+    }
+    {
+        var txn = SystemWriteTxnHandle{ .alloc = alloc, .txn = try store.beginWrite() };
+        defer txn.txn.abort();
+        try txn.txn.delete("catalog:a");
+        try txn.txn.put("catalog:b", "pending");
+        try txn.txn.put("catalog:c", "last");
+        var cursor: ?*anyopaque = null;
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, storageSystemWriteOpenCursor(null, &cursor));
+        try std.testing.expect(cursor == null);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageSystemWriteOpenCursor(&txn, &cursor));
+        defer storageSystemCursorClose(cursor);
+        var entry: kernel_owner_abi.SystemEntryResult = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageSystemCursorMove(cursor, .at_or_after, .fromSlice("catalog:"), &entry));
+        try std.testing.expectEqual(@as(u8, 1), entry.present);
+        try std.testing.expectEqualStrings("catalog:b", entry.key.slice());
+        try std.testing.expectEqualStrings("pending", entry.value.slice());
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageSystemCursorMove(cursor, .next, .{}, &entry));
+        try std.testing.expectEqualStrings("catalog:c", entry.key.slice());
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageSystemCursorMove(cursor, .previous, .{}, &entry));
+        try std.testing.expectEqualStrings("catalog:b", entry.key.slice());
+    }
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("old", try read.get("catalog:a"));
+    try std.testing.expectError(error.NotFound, read.get("catalog:b"));
+}
+
 pub fn storageSystemWriteCommit(txn_ptr: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
     const handle = asSystemWriteTxn(txn_ptr) orelse return .invalid_argument;
     const alloc = handle.alloc;
@@ -3065,8 +3117,103 @@ pub fn metadataApplyStoreProjection(
     const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
     const alloc = handle.alloc;
     return switch (request.kind) {
-        .latest_batch => blk: {
-            const value = handle.store.latestBatch(request.group_id) catch |err|
+        .system_catalog => blk: {
+            const contract = metadata_raft_apply.apply_contract;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const input_request = std.json.parseFromSliceLeaky(contract.CatalogProjectionRequest, a, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+            const group_id = request.group_id;
+            switch (input_request) {
+                .read_store => |input| {
+                    const value = handle.store.readStore(a, group_id, input.store_id, input.reports) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .read_store_group_facts => |input| {
+                    const value = handle.store.readStoreGroupFacts(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .read_store_report_targets => |input| {
+                    const value = handle.store.readStoreReportTargetsWithRuntime(a, group_id, .{ .sequence = 1, .report = .{ .store_id = input.store_id }, .base = if (input.full) null else .{ .reporter_incarnation = 0, .sequence = 0, .digest = @splat(0) }, .removed_groups = input.group_ids }, input.include_runtime) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_read => |input| {
+                    const value = handle.store.systemCatalogRead(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_export => {
+                    const value = handle.store.exportSystemCatalog(a, group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_list_tables => |input| {
+                    const value = handle.store.listSystemCatalogTables(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_meta => {
+                    const value = handle.store.systemCatalogMeta(a, group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_admission => |input| {
+                    const value = handle.store.systemCatalogAdmission(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_prepare => |input| {
+                    const value = handle.store.prepareSystemCatalogResult(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_resolve_table => |input| {
+                    const value = handle.store.resolveSystemCatalogTable(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_resolve_identity => |input| {
+                    const value = handle.store.resolveSystemCatalogIdentity(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_resolve_many => |input| {
+                    const value = handle.store.resolveSystemCatalogIdentities(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_write_validation => |name| {
+                    const value = handle.store.tableWriteValidation(a, group_id, name) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_write_validation_revision => {
+                    const value = handle.store.writeValidationRevision(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_query_definition => |input| {
+                    const value = handle.store.queryTableDefinition(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .topology_activation => {
+                    const value = handle.store.topologyActivation(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .report_baseline_fragment_admission => |input| {
+                    const value = handle.store.admitBaselineFragment(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .report_baseline_progress => |input| {
+                    const value = handle.store.reportBaselineProgressForKey(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .read_control_stores => |groups| {
+                    const value = handle.store.readControlStores(a, group_id, groups) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .report_cursor => |input| {
+                    const value = handle.store.reportCursor(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .catalog_snapshot => {
+                    var value = handle.store.systemCatalogSnapshot(a, group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    defer value.deinit();
+                    break :blk metadataProjectionJson(alloc, out_json, .{ .meta = value.meta, .value = value.value });
+                },
+            }
+        },
+        .latest_checkpoint => blk: {
+            const value = handle.store.latestCheckpoint(request.group_id) catch |err|
                 break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
@@ -4331,6 +4478,9 @@ pub fn storageOwnerOpen(
         .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
         .entity_sink = if (runtime_hooks) |value| value.entitySink() else null,
         .promotion_owner = if (runtime_hooks) |value| value.promotionOwner() else null,
+        // Reconcile the authoritative resolver catalog before autonomous
+        // replay can hold its catalog fence or invoke distributed callbacks.
+        .start_resolver_workers = false,
         .index_backends = .{ .dense_native_migration_policy_source = if (runtime_hooks) |value| value.nativeMigrationPolicy() else null },
         .remote_content = if (owner_context) |context| context.remoteContent() else null,
     };
@@ -4345,7 +4495,12 @@ pub fn storageOwnerOpen(
     defer if (!success) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
-        .db = db_mod.DB.open(alloc, path, open_options) catch |err| return storageOwnerStatusFromError(err),
+        .db = db_mod.DB.open(alloc, path, open_options) catch |err| {
+            std.log.err("storage owner open failed table={s} group_id={} err={s}", .{
+                table_name, request.group_id, @errorName(err),
+            });
+            return storageOwnerStatusFromError(err);
+        },
         .storage_owner_path = owned_path,
         .storage_owner_table_name = owned_table_name,
         .storage_owner_group_id = request.group_id,
@@ -4375,6 +4530,11 @@ pub fn storageOwnerOpen(
         if (owner_context) |context| context.remoteContent() else null,
         &handle.storage_owner_managed_config,
     ) catch |err| return storageOwnerStatusFromError(err);
+    // The opaque handle now owns the DB at its final address. Match resident
+    // cache installation: source verification and other DB-owned maintenance
+    // must progress even when this owner receives no foreground requests.
+    handle.db.activateResolverReplayRuntimes() catch |err| return storageOwnerStatusFromError(err);
+    handle.db.startResidentBackgroundWorkersIfNeeded();
     success = true;
     out_owner.* = handle;
     context_borrowed = false;
@@ -4412,27 +4572,60 @@ pub fn storageOwnerConfigure(
     return .ok;
 }
 
+const OwnerRepairControls = struct {
+    wire: kernel_owner_abi.RepairControls,
+    fn cancelled(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return if (self.wire.cancelled) |check| check(self.wire.context) != 0 else false;
+    }
+    fn yieldRequested(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return if (self.wire.yield_requested) |check| check(self.wire.context) != 0 else false;
+    }
+    fn activationAllowed(ptr: *anyopaque) anyerror!bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return if (self.wire.activation_allowed) |check| check(self.wire.context) != 0 else true;
+    }
+    fn options(self: *@This()) db_mod.types.ArtifactRepairRunOptions {
+        return .{
+            .cancel_check = if (self.wire.cancelled != null) .{ .ptr = self, .is_requested = cancelled } else null,
+            .yield_check = if (self.wire.yield_requested != null) .{ .ptr = self, .is_requested = yieldRequested } else null,
+            .activation_check = if (self.wire.activation_allowed != null) .{ .ptr = self, .is_current_owner = activationAllowed } else null,
+            .owner_epoch = self.wire.owner_epoch,
+            .capacity_domain_id = (@as(u128, self.wire.capacity_domain_hi) << 64) | self.wire.capacity_domain_lo,
+            .estimated_candidate_bytes = self.wire.estimated_candidate_bytes,
+            .max_activation_gap_sequences = self.wire.max_activation_gap_sequences,
+            .max_convergence_rounds = self.wire.max_convergence_rounds,
+            .max_activation_pause_ms = self.wire.max_activation_pause_ms,
+        };
+    }
+};
+
 pub fn storageOwnerReconcile(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.ReconcileRequest,
     out_result: *kernel_owner_abi.ReconcileResult,
 ) callconv(.c) kernel_owner_abi.Status {
-    out_result.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    out_result.* = .{};
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    const reconciled = local_write.reconcileStorageKernelOwnerDb(
-        handle.alloc,
-        &handle.db,
-        request.table_name.slice(),
-        request.schema_json.slice(),
-        request.indexes_json.slice(),
-        if (request.target_index_name.slice().len == 0) null else request.target_index_name.slice(),
-        request.advance_index_repair != 0,
-        if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
-        if (handle.storage_owner_context) |context| context.antflyProvider() else null,
-        &handle.storage_owner_managed_config,
-    ) catch |err| return storageOwnerStatusFromError(err);
+    var controls = OwnerRepairControls{ .wire = request.repair_controls };
+    const reconciled = if (request.repair_only != 0)
+        local_write.repairStorageKernelOwnerDb(handle.alloc, &handle.db, if (request.target_index_name.slice().len == 0) null else request.target_index_name.slice(), request.advance_index_repair != 0, controls.options()) catch |err| return storageOwnerStatusFromError(err)
+    else
+        local_write.reconcileStorageKernelOwnerDb(
+            handle.alloc,
+            &handle.db,
+            request.table_name.slice(),
+            request.schema_json.slice(),
+            request.indexes_json.slice(),
+            if (request.target_index_name.slice().len == 0) null else request.target_index_name.slice(),
+            request.advance_index_repair != 0,
+            if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
+            if (handle.storage_owner_context) |context| context.antflyProvider() else null,
+            &handle.storage_owner_managed_config,
+        ) catch |err| return storageOwnerStatusFromError(err);
     out_result.* = .{
         .state = switch (reconciled.state) {
             .complete => .complete,
@@ -4449,6 +4642,7 @@ pub fn storageOwnerReconcile(
         .repair_repaired = @intCast(reconciled.repair_repaired),
         .repair_remaining = @intCast(reconciled.repair_remaining),
         .repair_terminal = @intCast(reconciled.repair_terminal),
+        .repair_paused = @intCast(reconciled.repair_paused),
         .repair_busy = @intCast(reconciled.repair_busy),
         .repair_disk_waits = @intCast(reconciled.repair_disk_waits),
         .next_retry_at_ms = reconciled.next_retry_at_ms,
@@ -6020,6 +6214,25 @@ fn storageOwnerArtifactJsonResponse(
     return .ok;
 }
 
+pub fn storageOwnerVectorMigrationJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(antfly.vector_migration.Command, handle.alloc, request.request_json.slice(), .{}) catch return .invalid_argument;
+    defer parsed.deinit();
+    // Offline publication owns a separate exclusive root transition; it may
+    // never run against a serving compiled owner through this online endpoint.
+    if (parsed.value.request.mode != .online) return .invalid_argument;
+    const result = handle.db.vectorMigrationCommand(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    out_response.* = .{ .ptr = result.ptr, .len = @intCast(result.len) };
+    return .ok;
+}
+
 pub fn storageOwnerArtifactOperationJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.ArtifactOperationRequest,
@@ -6184,7 +6397,7 @@ pub fn storageOwnerRuntimeStatusJson(
     };
     defer status.deinit(handle.alloc);
     status.replaceMetadata(.{
-        .updated_at_ns = @import("antfly_platform").time.monotonicNs(),
+        .updated_at_ns = antfly.platform_time.monotonicNs(),
         .source = .live_writer_publish,
         .freshness = .fresh,
         .lsm_root_generation = handle.storage_owner_root_generation,
@@ -6203,7 +6416,9 @@ pub fn storageOwnerRuntimeStatusJson(
 
 test "storage owner runtime status does not wait behind apply writer" {
     const alloc = std.testing.allocator;
-    const path = try tempTestPath(alloc, "storage-owner-runtime-status-busy");
+    var test_tmp = try TestDirectory.init("storage-owner-runtime-status-busy");
+    defer test_tmp.cleanup();
+    const path = try tempTestPath(alloc, test_tmp.path(), "db");
     defer alloc.free(path);
     cleanupTestDir(path);
     defer cleanupTestDir(path);
@@ -6354,16 +6569,22 @@ pub fn storageOwnerMaintenance(
                 return storageOwnerStatusFromError(err));
         },
         .dense_posting_idle => {
-            if (handle.db.hasActiveDenseBulkWork()) return .ok;
-            const started = @import("antfly_platform").time.monotonicNs();
-            var pass: usize = 0;
-            while (pass < 64 and @import("antfly_platform").time.monotonicNs() -| started < 50 * std.time.ns_per_ms) : (pass += 1) {
-                const steps = handle.db.runDensePostingReadinessMaintenanceForIdle() catch |err|
-                    return storageOwnerStatusFromError(err);
-                out_result.dense_steps += steps;
-                if (steps == 0) break;
+            if (handle.db.hasActiveDenseBulkWork()) {
+                out_result.deferred = 1;
+                return .ok;
             }
-            out_result.progressed = @intFromBool(out_result.dense_steps != 0);
+            const started = antfly.platform_time.monotonicNs();
+            var pass: usize = 0;
+            out_result.deferred = 1;
+            while (pass < 64 and antfly.platform_time.monotonicNs() -| started < 50 * std.time.ns_per_ms) : (pass += 1) {
+                const page = handle.db.refreshDensePostingPayloadPageBestEffort() catch |err|
+                    return storageOwnerStatusFromError(err);
+                out_result.dense_steps += page.repaired;
+                out_result.dense_scanned += page.scanned;
+                out_result.deferred = @intFromBool(page.pending);
+                if (!page.pending or page.scanned == 0 or page.yield_after_page) break;
+            }
+            out_result.progressed = @intFromBool(out_result.dense_steps != 0 or out_result.dense_scanned != 0);
         },
         .publish_dense_checkpoints => {
             const result = handle.db.publishCompletedDensePostingCheckpoints() catch |err|
@@ -6385,15 +6606,26 @@ pub fn storageOwnerMaintenance(
             }
             out_result.progressed = @intFromBool(out_result.dense_steps != 0);
         },
+        .capture_ha_seed_snapshot => {
+            const token = request.snapshot_token.slice();
+            const destination = request.destination_root.slice();
+            if (!antfly.ha_validation.isIdentifier(token) or !std.fs.path.isAbsolute(destination)) return .invalid_argument;
+            antfly.ha_seed_snapshot.capture(handle.alloc, &handle.db, handle.db.core.path, token, destination) catch |err| {
+                std.log.warn("storage owner HA seed capture failed err={s}", .{@errorName(err)});
+                return storageOwnerStatusFromError(err);
+            };
+        },
         .prepare_ha_seed_snapshot => {
             if (request.deadline_ns == 0) return .invalid_argument;
-            handle.db.prepareHASeedSnapshot(request.deadline_ns) catch |err|
+            handle.db.prepareHASeedSnapshot(request.deadline_ns) catch |err| {
+                std.log.warn("storage owner HA seed preparation failed err={s}", .{@errorName(err)});
                 return storageOwnerStatusFromError(err);
+            };
         },
     }
 
     out_result.maintenance_score = switch (action) {
-        .inspect, .lsm_step, .prepare_ha_seed_snapshot => @max(
+        .inspect, .lsm_step, .prepare_ha_seed_snapshot, .capture_ha_seed_snapshot => @max(
             handle.db.lsmMaintenanceScore(),
             handle.db.lsmMaintenanceDebtHint(),
         ),
@@ -6412,7 +6644,14 @@ pub fn storageOwnerBufferDestroy(buffer: *kernel_owner_abi.OwnedBytes) callconv(
 }
 
 fn storageOwnerStatusFromError(err: anyerror) kernel_owner_abi.Status {
-    return kernel_error_identity.statusFromError(err);
+    const status = kernel_error_identity.statusFromError(err);
+    if (status == .internal) {
+        // This status-only boundary cannot carry undeclared error names.
+        // Preserve the originating diagnostic before consumers see the
+        // intentionally generic StorageKernelFailure control-flow status.
+        std.log.warn("storage owner returned undeclared error err={s}", .{@errorName(err)});
+    }
+    return status;
 }
 
 fn openDefaultDirectoryHandle(path: []const u8) !*Handle {

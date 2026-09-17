@@ -18,10 +18,8 @@ pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
 
 test {
+    _ = @import("testing/backup_restore.zig");
     _ = @import("cmd/lite.zig");
-    _ = @import("cmd/cli/backup.zig");
-    _ = @import("cmd/cli/index.zig");
-    _ = @import("cmd/cli/mod.zig");
 }
 
 /// Implementation source choices for this compilation root.

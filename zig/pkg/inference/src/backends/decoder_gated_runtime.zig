@@ -957,11 +957,11 @@ fn plePostNormSlot(configured_layer_count: usize, layer: usize) usize {
     return gemma4_runtime.plePostNormSlot(configured_layer_count, layer);
 }
 
-fn qHeadNormSlot(configured_layer_count: usize, layer: usize) usize {
+pub fn qHeadNormSlot(configured_layer_count: usize, layer: usize) usize {
     return gemma4_runtime.qHeadNormSlot(configured_layer_count, layer);
 }
 
-fn kHeadNormSlot(configured_layer_count: usize, layer: usize) usize {
+pub fn kHeadNormSlot(configured_layer_count: usize, layer: usize) usize {
     return gemma4_runtime.kHeadNormSlot(configured_layer_count, layer);
 }
 
@@ -5055,6 +5055,31 @@ pub fn prepareDecodeRuntime(
     kv_tokens: usize,
     configured_layer_count: usize,
 ) !bool {
+    return prepareRuntime(cb, allocator, gpt_config, kv_tokens, configured_layer_count, true);
+}
+
+/// Dense text prefill consumes final hidden states, not vocabulary logits.
+/// Keep the generation entry point's head preparation unchanged.
+pub fn prepareTextPrefillRuntime(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    kv_tokens: usize,
+    configured_layer_count: usize,
+) !bool {
+    if (!gpt_arch.denseQwen3PrefillEligible(gpt_config)) return false;
+    return prepareRuntime(cb, allocator, gpt_config, kv_tokens, configured_layer_count, false);
+}
+
+fn prepareRuntime(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    kv_tokens: usize,
+    configured_layer_count: usize,
+    include_lm_head: bool,
+) !bool {
+    try cb.checkExecutionControl();
     if (!supportsPreparedDecodeConfig(gpt_config)) return false;
     timing_stats.prepare_calls += 1;
     var started_at = monotonicNowNs();
@@ -5076,6 +5101,7 @@ pub fn prepareDecodeRuntime(
 
     const prepared_layer_count = preparedLayers(@min(configured_layer_count, gpt_config.num_hidden_layers));
     for (0..prepared_layer_count) |layer| {
+        try cb.checkExecutionControl();
         var name_buf: [256]u8 = undefined;
         const layer_head_dim = gpt_config.effectiveHeadDimForLayer(layer);
         const layer_kv_heads = gpt_config.effectiveKVHeadsForLayer(layer);
@@ -5492,6 +5518,8 @@ pub fn prepareDecodeRuntime(
     }
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.final_prep_nanos += finished_at - started_at;
+
+    if (!include_lm_head) return true;
 
     started_at = monotonicNowNs();
     const lm_head_w = try decoder_tail_runtime.getLmHeadWeight(cb, gpt_config);

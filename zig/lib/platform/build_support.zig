@@ -73,7 +73,12 @@ pub fn addTests(b: *std.Build, options: struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     link_libc: bool,
-}) struct { unit: *std.Build.Step.Run, process: ?*std.Build.Step } {
+}) struct {
+    unit: *std.Build.Step.Run,
+    process: ?*std.Build.Step,
+    one_shot_unit: *std.Build.Step.Run,
+    one_shot_process: ?*std.Build.Step,
+} {
     const target = options.target;
     const optimize = options.optimize;
     const link_libc = options.link_libc;
@@ -84,7 +89,15 @@ pub fn addTests(b: *std.Build, options: struct {
         .link_libc = link_libc,
     });
     const unit = b.addTest(.{ .root_module = supervisor });
+    const one_shot = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/one_shot_process.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    const one_shot_unit = b.addTest(.{ .root_module = one_shot });
     var process: ?*std.Build.Step = null;
+    var one_shot_process: ?*std.Build.Step = null;
     if (target.result.os.tag == .linux or target.result.os.tag == .macos) {
         const fixture = b.addExecutable(.{
             .name = "inference-supervisor-fixture",
@@ -97,13 +110,36 @@ pub fn addTests(b: *std.Build, options: struct {
             }),
         });
         process = addNativeProcessTest(b, fixture, options.root.path(b, "tests/test_inference_supervisor.py"));
+        const platform = createModule(b, .{
+            .root_source_file = options.root.path(b, "src/root.zig"),
+            .filesystem_capacity_source_file = options.root.path(b, "src/filesystem_capacity.c"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = link_libc,
+        });
+        const one_shot_fixture = b.addExecutable(.{
+            .name = "one-shot-process-fixture",
+            .root_module = b.createModule(.{
+                .root_source_file = options.root.path(b, "tests/one_shot_process_fixture.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = link_libc,
+                .imports = &.{.{ .name = "platform", .module = platform }},
+            }),
+        });
+        one_shot_process = addNativeProcessTest(b, one_shot_fixture, options.root.path(b, "tests/test_one_shot_process.py"));
     }
-    return .{ .unit = b.addRunArtifact(unit), .process = process };
+    return .{
+        .unit = b.addRunArtifact(unit),
+        .process = process,
+        .one_shot_unit = b.addRunArtifact(one_shot_unit),
+        .one_shot_process = one_shot_process,
+    };
 }
 
-/// Python owns these POSIX process groups and signals. Compile foreign fixtures,
-/// but leave emulation of ordinary unit tests to std.Build.addRunArtifact.
-pub fn addNativeProcessTest(b: *std.Build, fixture: *std.Build.Step.Compile, script: std.Build.LazyPath) *std.Build.Step {
+/// Fixtures that spawn target executables directly require a native executor.
+/// Ordinary unit tests retain std.Build.addRunArtifact emulator support.
+pub fn canRunNativeProcess(b: *std.Build, fixture: *std.Build.Step.Compile) bool {
     const target = fixture.root_module.resolved_target.?.result;
     // Static libc does not require the target's dynamic linker to be installed
     // on the host. Zig defaults musl executables to static linkage.
@@ -117,7 +153,11 @@ pub fn addNativeProcessTest(b: *std.Build, fixture: *std.Build.Step.Compile, scr
         .allow_wasmtime = false,
         .allow_darling = false,
     });
-    if (executor == .native) {
+    return executor == .native;
+}
+
+pub fn addNativeProcessTest(b: *std.Build, fixture: *std.Build.Step.Compile, script: std.Build.LazyPath) *std.Build.Step {
+    if (canRunNativeProcess(b, fixture)) {
         const run = b.addSystemCommand(&.{"python3"});
         run.addFileArg(script);
         run.addArtifactArg(fixture);

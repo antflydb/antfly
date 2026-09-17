@@ -21,6 +21,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
         return listArtifactsWithFirstArg(allocator, io, client, null, args);
     };
 
+    if (std.mem.eql(u8, subcommand, "maintenance")) return @import("maintenance.zig").run(allocator, io, client, .artifact, args);
     if (std.mem.eql(u8, subcommand, "list")) return listArtifactsWithFirstArg(allocator, io, client, null, args);
     if (std.mem.eql(u8, subcommand, "get")) return getArtifact(allocator, io, client, args);
     if (std.mem.eql(u8, subcommand, "put")) return putArtifactEnrichment(allocator, io, client, args);
@@ -210,7 +211,7 @@ fn reprocessArtifact(allocator: std.mem.Allocator, io: std.Io, client: *antfly_c
     var artifact_name: ?[]const u8 = null;
     var from_key: ?[]const u8 = null;
     var to_key: ?[]const u8 = null;
-    var limit: ?i64 = null;
+    var limit: ?u32 = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
@@ -300,7 +301,7 @@ const JobArgs = struct {
     job_id: ?[]const u8 = null,
     from_key: ?[]const u8 = null,
     to_key: ?[]const u8 = null,
-    limit: ?i64 = null,
+    limit: ?u32 = null,
     advance: ?bool = null,
 };
 
@@ -310,7 +311,7 @@ fn parseJobArgs(args: *std.process.Args.Iterator, start: bool) !JobArgs {
     var job_id: ?[]const u8 = null;
     var from_key: ?[]const u8 = null;
     var to_key: ?[]const u8 = null;
-    var limit: ?i64 = null;
+    var limit: ?u32 = null;
     var advance: ?bool = null;
     var advance_set = false;
 
@@ -357,7 +358,7 @@ fn parseJobArgs(args: *std.process.Args.Iterator, start: bool) !JobArgs {
     };
 }
 
-fn parseIntFlag(raw: ?[]const u8, flag_name: []const u8) i64 {
+fn parseIntFlag(raw: ?[]const u8, flag_name: []const u8) u32 {
     const value = raw orelse cli.fatal("{s} requires a value", .{flag_name});
-    return std.fmt.parseInt(i64, value, 10) catch cli.fatal("invalid integer for {s}: {s}", .{ flag_name, value });
+    return std.fmt.parseInt(u32, value, 10) catch cli.fatal("invalid integer for {s}: {s}", .{ flag_name, value });
 }

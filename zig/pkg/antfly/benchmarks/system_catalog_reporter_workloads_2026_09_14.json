@@ -1,0 +1,225 @@
+{
+  "source_commit": "64a11bf6d44082967e3c9fc86671b0eae5de033e",
+  "main_commit": "3554f821010a7e4b9ac01b30378322ef79abb53f",
+  "date": "2026-09-14",
+  "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+  "build_mode": "Debug",
+  "server_binary_sha256": "7d61bc3d289a8261ea2af84e222b2fccd8d951a12663250f7950b743d31aa991",
+  "test_executables": {
+    "report": [
+      {
+        "path": "./.zig-cache/o/4d3619a94a0b363541249324bad3abdf/test",
+        "sha256": "86d715c6c2f3fd4221be6e45c0fcddf6c285c18a7af72d28372977332f2a67eb"
+      },
+      {
+        "path": "./.zig-cache/o/fa194e5ff7117191b2a9fb2826d31180/test",
+        "sha256": "73567e8c5e982f5063816064eb3f796e3381d097024f5b05564b162bcf86bddc"
+      }
+    ],
+    "progress": [
+      {
+        "path": "./.zig-cache/o/6c45c5ffa2209b79b367de0db0cbea05/test",
+        "sha256": "6fa4d6a6863b33e1ffec90588ba26a8f18e72312067ce1b60d9f1d6f8dfc19cc"
+      }
+    ]
+  },
+  "commands": [
+    "env ANTFLY_CATALOG_REPORT_BENCH=1 python3 tools/run_bounded_zig_build.py build antfly-system-catalog-report-bench",
+    "env ANTFLY_CATALOG_REPORT_BENCH=1 python3 tools/run_bounded_zig_build.py build antfly-system-catalog-progress-test"
+  ],
+  "retained_heartbeat": {
+    "warmup": 1,
+    "samples": 9,
+    "allocator": "c_allocator",
+    "results": [
+      {
+        "groups": 1000,
+        "indexes_per_group": 32,
+        "changed": false,
+        "retained": false,
+        "prepare_p50_ns": 4552000,
+        "sorted_samples_ns": [
+          4390000,
+          4393000,
+          4398000,
+          4465000,
+          4552000,
+          4641000,
+          4657000,
+          4786000,
+          4800000
+        ]
+      },
+      {
+        "groups": 1000,
+        "indexes_per_group": 32,
+        "changed": false,
+        "retained": true,
+        "prepare_p50_ns": 922000,
+        "sorted_samples_ns": [
+          871000,
+          885000,
+          908000,
+          918000,
+          922000,
+          934000,
+          935000,
+          937000,
+          959000
+        ]
+      },
+      {
+        "groups": 1000,
+        "indexes_per_group": 32,
+        "changed": true,
+        "retained": false,
+        "prepare_p50_ns": 4393000,
+        "sorted_samples_ns": [
+          4323000,
+          4344000,
+          4384000,
+          4386000,
+          4393000,
+          4423000,
+          4461000,
+          4706000,
+          4864000
+        ]
+      },
+      {
+        "groups": 1000,
+        "indexes_per_group": 32,
+        "changed": true,
+        "retained": true,
+        "prepare_p50_ns": 877000,
+        "sorted_samples_ns": [
+          873000,
+          875000,
+          875000,
+          876000,
+          877000,
+          877000,
+          901000,
+          945000,
+          981000
+        ]
+      },
+      {
+        "groups": 10000,
+        "indexes_per_group": 32,
+        "changed": false,
+        "retained": false,
+        "prepare_p50_ns": 47066000,
+        "sorted_samples_ns": [
+          46193000,
+          46507000,
+          46703000,
+          46869000,
+          47066000,
+          47223000,
+          47361000,
+          47676000,
+          48385000
+        ]
+      },
+      {
+        "groups": 10000,
+        "indexes_per_group": 32,
+        "changed": false,
+        "retained": true,
+        "prepare_p50_ns": 10431000,
+        "sorted_samples_ns": [
+          10240000,
+          10336000,
+          10364000,
+          10422000,
+          10431000,
+          10536000,
+          10550000,
+          10619000,
+          10724000
+        ]
+      },
+      {
+        "groups": 10000,
+        "indexes_per_group": 32,
+        "changed": true,
+        "retained": false,
+        "prepare_p50_ns": 47542000,
+        "sorted_samples_ns": [
+          46280000,
+          46324000,
+          46884000,
+          46897000,
+          47542000,
+          47810000,
+          50209000,
+          56757000,
+          57533000
+        ]
+      },
+      {
+        "groups": 10000,
+        "indexes_per_group": 32,
+        "changed": true,
+        "retained": true,
+        "prepare_p50_ns": 8294000,
+        "sorted_samples_ns": [
+          8046000,
+          8088000,
+          8189000,
+          8206000,
+          8294000,
+          8333000,
+          8347000,
+          8722000,
+          8885000
+        ]
+      }
+    ],
+    "limitations": [
+      "Both paths use the new implementation. The full-runtime comparison includes activity scanning; it is not a reconstruction or build of the old retained-runtime path.",
+      "Preparation only, excluding fixture creation, prepared-result destruction, HTTP, Raft, and storage apply. Each prepared result is abandoned so all samples compare against the same acknowledged base.",
+      "Synthetic inventory has 32 identical index descriptors per group. Wide-inventory behavior is measured; unique index-name lookup is not."
+    ]
+  },
+  "schema_progress": {
+    "tables": 100,
+    "groups": 2000,
+    "warmup": 1,
+    "samples": 5,
+    "allocator": "std.testing.allocator",
+    "nested_ns": [
+      1610391000,
+      1614357000,
+      1604263000,
+      1605976000,
+      1613997000
+    ],
+    "indexed_ns": [
+      63400000,
+      63639000,
+      63828000,
+      63572000,
+      63771000
+    ],
+    "nested_median_ns": 1610391000,
+    "indexed_median_ns": 63639000,
+    "speedup": 25.30509593173997,
+    "initial_batch_proposals_calculated": 2,
+    "acknowledged_batch_proposals_calculated": 0,
+    "limitations": [
+      "Former scan implementation retained as an equality oracle in the same Debug test artifact. Includes schema parsing, index construction, readiness checks, and result allocation; excludes result destruction and fixture creation.",
+      "In-process collection only. No DB collection, HTTP, Raft replication, or cutover latency. Request counts are calculated from the validated 64-record batch limit, not measured network counts."
+    ]
+  },
+  "validation": {
+    "catalog_e2e": "7 passed in 61.44 seconds, including real document schema migration and 64-record HTTP batch validation/replay",
+    "production_runtime": "2 production DataServer simulations and 11 worker/scheduler/snapshot tests passed; zero leaks",
+    "core": "Catalog storage, API and progress targets passed",
+    "generated": "make zig-generated-check passed"
+  },
+  "raw_report_log": "antfly-system-catalog-report-bench\n+- run test\n   +- run test w\nCOLLECTION_BENCH groups=100 indexed=false p50_ms=0.079000\nCOLLECTION_BENCH groups=100 indexed=true p50_ms=0.063000\nCOLLECTION_BENCH groups=1000 indexed=false p50_ms=9.510000\nCOLLECTION_BENCH groups=1000 indexed=true p50_ms=0.565000\nCOLLECTION_BENCH groups=10000 indexed=false p50_ms=983.405000\nCOLLECTION_BENCH groups=10000 indexed=true p50_ms=5.195000\nREPORT_BENCH groups=100 scenario=cached_heartbeat apply_p50_ms=2.566 wal_bytes_per_apply=304 full_record_bytes=82218 command_bytes=82224\nREPORT_BENCH groups=100 scenario=fresh_clocks apply_p50_ms=2.073 wal_bytes_per_apply=4280 full_record_bytes=82218 command_bytes=82224\nREPORT_BENCH groups=100 scenario=one_group_change apply_p50_ms=2.077 wal_bytes_per_apply=10111 full_record_bytes=82218 command_bytes=82224\nREPORT_BENCH groups=100 scenario=all_groups_change apply_p50_ms=1.945 wal_bytes_per_apply=15886 full_record_bytes=82218 command_bytes=82224\nREPORT_BENCH groups=100 scenario=referenced_runtime apply_p50_ms=1.207 wal_bytes_per_apply=304 full_record_bytes=82218 command_bytes=12424\nSPARSE_REPORT_BENCH groups=100 runtime_changed=false apply_p50_ms=0.865 wal_bytes_per_apply=10232 command_bytes=1125\nSPARSE_REPORT_BENCH groups=100 runtime_changed=true apply_p50_ms=0.853 wal_bytes_per_apply=59417 command_bytes=1125\nREPORT_BENCH groups=100 full_store_read_p50_ms=0.558\nREPORT_BENCH groups=100 full_store_read_allocations=412 full_store_read_allocated_bytes=114855\nREPORT_BENCH groups=100 placement_drain_read_p50_ms=0.110240\nREPORT_BENCH groups=1000 scenario=cached_heartbeat apply_p50_ms=18.963 wal_bytes_per_apply=304 full_record_bytes=821118 command_bytes=821124\nREPORT_BENCH groups=1000 scenario=fresh_clocks apply_p50_ms=15.594 wal_bytes_per_apply=35324 full_record_bytes=821118 command_bytes=821124\nREPORT_BENCH groups=1000 scenario=one_group_change apply_p50_ms=14.920 wal_bytes_per_apply=10111 full_record_bytes=821118 command_bytes=821124\nREPORT_BENCH groups=1000 scenario=all_groups_change apply_p50_ms=13.613 wal_bytes_per_apply=153766 full_record_bytes=821118 command_bytes=821124\nREPORT_BENCH groups=1000 scenario=referenced_runtime apply_p50_ms=6.434 wal_bytes_per_apply=304 full_record_bytes=821118 command_bytes=123124\nSPARSE_REPORT_BENCH groups=1000 runtime_changed=false apply_p50_ms=0.873 wal_bytes_per_apply=10232 command_bytes=1125\nSPARSE_REPORT_BENCH groups=1000 runtime_changed=true apply_p50_ms=0.956 wal_bytes_per_apply=59417 command_bytes=1125\nREPORT_BENCH groups=1000 full_store_read_p50_ms=4.429\nREPORT_BENCH groups=1000 full_store_read_allocations=4014 full_store_read_allocated_bytes=1216195\nREPORT_BENCH groups=1000 placement_drain_read_p50_ms=0.115810\nREPORT_BENCH groups=10000 scenario=cached_heartbeat apply_p50_ms=188.335 wal_bytes_per_apply=304 full_record_bytes=8210118 command_bytes=8210124\nREPORT_BENCH groups=10000 scenario=fresh_clocks apply_p50_ms=250.174 wal_bytes_per_apply=347228 full_record_bytes=8210118 command_bytes=8210124\nREPORT_BENCH groups=10000 scenario=one_group_change apply_p50_ms=201.738 wal_bytes_per_apply=10111 full_record_bytes=8210118 command_bytes=8210124\nREPORT_BENCH groups=10000 scenario=all_groups_change apply_p50_ms=251.679 wal_bytes_per_apply=1533295 full_record_bytes=8210118 command_bytes=8210124\nREPORT_BENCH groups=10000 scenario=referenced_runtime apply_p50_ms=108.494 wal_bytes_per_apply=304 full_record_bytes=8210118 command_bytes=1230124\nSPARSE_REPORT_BENCH groups=10000 runtime_changed=false apply_p50_ms=1.248 wal_bytes_per_apply=10232 command_bytes=1125\nSPARSE_REPORT_BENCH groups=10000 runtime_changed=true apply_p50_ms=1.192 wal_bytes_per_apply=59417 command_bytes=1125\nREPORT_BENCH groups=10000 full_store_read_p50_ms=41.819\nREPORT_BENCH groups=10000 full_store_read_allocations=40015 full_store_read_allocated_bytes=12609695\nREPORT_BENCH groups=10000 placement_drain_read_p50_ms=0.115070\nREPAIR_ADMISSION_BENCH groups=1000 repair=false p50_ms=0.076\nREPAIR_ADMISSION_BENCH groups=1000 repair=true p50_ms=8.680\nREPAIR_ADMISSION_BENCH groups=10000 repair=false p50_ms=0.708\nREPAIR_ADMISSION_BENCH groups=10000 repair=true p50_ms=78.842\nPUBLISHER_BENCH groups=100 sparse=false p50_ms=2.332 http_bytes=361351\nPUBLISHER_BENCH groups=100 sparse=true p50_ms=0.172 http_bytes=4285\nPUBLISHER_BENCH groups=1000 sparse=false p50_ms=24.678 http_bytes=3610552\nPUBLISHER_BENCH groups=1000 sparse=true p50_ms=1.393 http_bytes=4285\nPUBLISHER_BENCH groups=10000 sparse=false p50_ms=241.852 http_bytes=36127753\nPUBLISHER_BENCH groups=10000 sparse=true p50_ms=14.953 http_bytes=4285\nACTIVITY_BENCH groups=1000 compact=false p50_ms=24.626 total_http_bytes=3903907 max_request_bytes=3903907 requests=1\nACTIVITY_BENCH groups=1000 compact=true p50_ms=3.493 total_http_bytes=293503 max_request_bytes=150201 requests=2\nACTIVITY_BENCH groups=10000 compact=false p50_ms=244.542 total_http_bytes=39048908 max_request_bytes=39048908 requests=1\nACTIVITY_BENCH groups=10000 compact=true p50_ms=35.080 total_http_bytes=2944994 max_request_bytes=150821 requests=20\nRETAINED_HEARTBEAT_BENCH groups=1000 indexes_per_group=32 changed=false retained=false prepare_p50_ns=4552000 samples_ns={ 4390000, 4393000, 4398000, 4465000, 4552000, 4641000, 4657000, 4786000, 4800000 }\nRETAINED_HEARTBEAT_BENCH groups=1000 indexes_per_group=32 changed=false retained=true prepare_p50_ns=922000 samples_ns={ 871000, 885000, 908000, 918000, 922000, 934000, 935000, 937000, 959000 }\nRETAINED_HEARTBEAT_BENCH groups=1000 indexes_per_group=32 changed=true retained=false prepare_p50_ns=4393000 samples_ns={ 4323000, 4344000, 4384000, 4386000, 4393000, 4423000, 4461000, 4706000, 4864000 }\nRETAINED_HEARTBEAT_BENCH groups=1000 indexes_per_group=32 changed=true retained=true prepare_p50_ns=877000 samples_ns={ 873000, 875000, 875000, 876000, 877000, 877000, 901000, 945000, 981000 }\nRETAINED_HEARTBEAT_BENCH groups=10000 indexes_per_group=32 changed=false retained=false prepare_p50_ns=47066000 samples_ns={ 46193000, 46507000, 46703000, 46869000, 47066000, 47223000, 47361000, 47676000, 48385000 }\nRETAINED_HEARTBEAT_BENCH groups=10000 indexes_per_group=32 changed=false retained=true prepare_p50_ns=10431000 samples_ns={ 10240000, 10336000, 10364000, 10422000, 10431000, 10536000, 10550000, 10619000, 10724000 }\nRETAINED_HEARTBEAT_BENCH groups=10000 indexes_per_group=32 changed=true retained=false prepare_p50_ns=47542000 samples_ns={ 46280000, 46324000, 46884000, 46897000, 47542000, 47810000, 50209000, 56757000, 57533000 }\nRETAINED_HEARTBEAT_BENCH groups=10000 indexes_per_group=32 changed=true retained=true prepare_p50_ns=8294000 samples_ns={ 8046000, 8088000, 8189000, 8206000, 8294000, 8333000, 8347000, 8722000, 8885000 }\nfailed command: ./.zig-cache/o/4d3619a94a0b363541249324bad3abdf/test --cache-dir=./.zig-cache --seed=0xda7516c --listen=-\n\nantfly-system-catalog-report-bench\n+- run test w\nADMISSION_CACHE_BENCH stores=1 groups_per_store=100 selected=false p50_ms=0.138000\nADMISSION_CACHE_BENCH stores=1 groups_per_store=100 selected=true p50_ms=0.124000\nADMISSION_CACHE_BENCH stores=10 groups_per_store=100 selected=false p50_ms=1.384000\nADMISSION_CACHE_BENCH stores=10 groups_per_store=100 selected=true p50_ms=0.133000\nADMISSION_CACHE_BENCH stores=100 groups_per_store=100 selected=false p50_ms=14.387000\nADMISSION_CACHE_BENCH stores=100 groups_per_store=100 selected=true p50_ms=0.148000\nADMISSION_PLAN_BENCH groups=100 header_change=false single_pass=false p50_ms=1.543000 allocations=763\nADMISSION_PLAN_BENCH groups=100 header_change=false single_pass=true p50_ms=0.689000 allocations=33\nADMISSION_PLAN_BENCH groups=100 header_change=true single_pass=false p50_ms=1.696000 allocations=1465\nADMISSION_PLAN_BENCH groups=100 header_change=true single_pass=true p50_ms=0.846000 allocations=736\nADMISSION_PLAN_BENCH groups=1000 header_change=false single_pass=false p50_ms=20.013000 allocations=7111\nADMISSION_PLAN_BENCH groups=1000 header_change=false single_pass=true p50_ms=10.007000 allocations=57\nADMISSION_PLAN_BENCH groups=1000 header_change=true single_pass=false p50_ms=22.456000 allocations=14113\nADMISSION_PLAN_BENCH groups=1000 header_change=true single_pass=true p50_ms=11.470000 allocations=7060\nADMISSION_PLAN_BENCH groups=10000 header_change=false single_pass=false p50_ms=195.581000 allocations=70147\nADMISSION_PLAN_BENCH groups=10000 header_change=false single_pass=true p50_ms=82.036000 allocations=75\nADMISSION_PLAN_BENCH groups=10000 header_change=true single_pass=false p50_ms=187.372000 allocations=140149\nADMISSION_PLAN_BENCH groups=10000 header_change=true single_pass=true p50_ms=95.118000 allocations=70078\nRECONCILE_VIEW_BENCH stores=1 groups_per_store=100 shared=false p50_ms=0.127000\nRECONCILE_VIEW_BENCH stores=1 groups_per_store=100 shared=true p50_ms=0.000405\nRECONCILE_VIEW_BENCH stores=10 groups_per_store=100 shared=false p50_ms=1.236000\nRECONCILE_VIEW_BENCH stores=10 groups_per_store=100 shared=true p50_ms=0.002420\nRECONCILE_VIEW_BENCH stores=100 groups_per_store=100 shared=false p50_ms=12.777000\nRECONCILE_VIEW_BENCH stores=100 groups_per_store=100 shared=true p50_ms=0.022256\nGROUP_CACHE_BENCH groups=100 sparse=false refresh_p50_ms=0.465 allocations=1038\nGROUP_CACHE_BENCH groups=100 sparse=true refresh_p50_ms=0.011 allocations=36\nGROUP_CACHE_BENCH groups=1000 sparse=false refresh_p50_ms=4.368 allocations=10101\nGROUP_CACHE_BENCH groups=1000 sparse=true refresh_p50_ms=0.009 allocations=36\nGROUP_CACHE_BENCH groups=10000 sparse=false refresh_p50_ms=47.613 allocations=100708\nGROUP_CACHE_BENCH groups=10000 sparse=true refresh_p50_ms=0.011 allocations=36\nGROUP_CACHE_FIRST_READER_BENCH groups=100 p50_ms=0.033000\nGROUP_CACHE_FIRST_READER_BENCH groups=1000 p50_ms=0.294000\nGROUP_CACHE_FIRST_READER_BENCH groups=10000 p50_ms=3.404000\nfailed command: ./.zig-cache/o/fa194e5ff7117191b2a9fb2826d31180/test --cache-dir=./.zig-cache --seed=0xda7516c --listen=-\n\n",
+  "raw_progress_log": "antfly-system-catalog-progress-test\n+- run test w\nSCHEMA_PROGRESS_BENCH tables=100 groups=2000 nested_ns={ 1610391000, 1614357000, 1604263000, 1605976000, 1613997000 } indexed_ns={ 63400000, 63639000, 63828000, 63572000, 63771000 } first_proposals=2 acknowledged_proposals=0\nfailed command: ./.zig-cache/o/6c45c5ffa2209b79b367de0db0cbea05/test --cache-dir=./.zig-cache --seed=0x4ab1548a --listen=-\n\n",
+  "log_note": "The bounded build runner prints \"failed command\" alongside benchmark stderr even on success. Both commands exited zero."
+}

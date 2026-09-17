@@ -162,6 +162,7 @@ fn processResolutionArtifactWithCatalog(
         if (e.canonical_name.len == 0) continue;
         try entries.append(a, .{
             .table = e.doc_ref.table,
+            .storage_table = e.doc_ref.storage_table,
             .key = e.doc_ref.key,
             .doc_json = try buildEntityDocAlloc(a, e),
         });
@@ -317,6 +318,9 @@ pub const PromotionRuntime = struct {
         var store_handle = try resolution_runtime.initRuntimeStore(alloc, store);
         errdefer store_handle.deinit();
         const applied = try enrichment_state.loadAppliedSequence(alloc, store_handle.store, scope_name);
+        // A resolution can be durable while its cross-table upsert is still
+        // pending. Restore that target independently of graph replay/startup.
+        const target = @max(applied, try replay_source.latestMatchingSequence(alloc, applied, .promotion));
         return .{
             .alloc = alloc,
             .store_handle = store_handle,
@@ -327,7 +331,7 @@ pub const PromotionRuntime = struct {
             .missing_sink_blocked = .init(false),
             .missing_sink_policy = missing_sink_policy,
             .applied_sequence = .init(applied),
-            .target_sequence = .init(applied),
+            .target_sequence = .init(target),
             .error_count = .init(0),
             .shutdown_flag = .init(false),
             .worker_started = .init(false),
@@ -902,8 +906,13 @@ const FakeSource = struct {
     fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
         return error.Unsupported;
     }
-    fn latest(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!u64 {
-        return error.Unsupported;
+    fn latest(ptr: *anyopaque, _: Allocator, from_sequence: u64, hint: replay_source_mod.TargetHint) anyerror!u64 {
+        const self: *FakeSource = @ptrCast(@alignCast(ptr));
+        var last = from_sequence;
+        for (self.records) |record| {
+            if (record.sequence > last and try change_journal_mod.encodedRecordHasHint(record.payload, hint)) last = record.sequence;
+        }
+        return last;
     }
     fn collectGroups(_: *anyopaque, _: Allocator, _: u64) anyerror![]replay_source_mod.PendingDocumentGroup {
         return error.Unsupported;

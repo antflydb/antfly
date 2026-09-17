@@ -388,7 +388,7 @@ pub const FieldMappingType = enum {
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
-    version: ?i64 = null,
+    version: ?u32 = null,
     /// Default type to use from the document_types.
     default_type: ?[]const u8 = null,
     /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.

@@ -751,6 +751,11 @@ spec:
                 type: object
               highAvailability:
                 properties:
+                  activationPolicy:
+                    enum:
+                    - Eager
+                    - OnFirstTable
+                    type: string
                   admin:
                     properties:
                       directPrerequisiteTimeoutSeconds:
@@ -5072,8 +5077,17 @@ spec:
                 type: object
               haStatus:
                 properties:
+                  activationStarted:
+                    type: boolean
                   automaticPromotionAllowed:
                     type: boolean
+                  catalogObserved:
+                    type: boolean
+                  dataLayout:
+                    enum:
+                    - ha
+                    - standby
+                    type: string
                   desiredStandbyCount:
                     format: int32
                     type: integer
@@ -6251,6 +6265,8 @@ spec:
                   unhealthyStandbyCount:
                     format: int32
                     type: integer
+                  waitingForTables:
+                    type: boolean
                 type: object
               internalServiceAuthRotation:
                 properties:

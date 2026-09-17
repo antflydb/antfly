@@ -126,7 +126,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
-    const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, graph_metric_maintenance, inference, metadata, or standalone");
+    const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, inference, metadata, or standalone");
     const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
@@ -182,6 +182,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const platform_test_step = b.step("lib-platform-test", "Run supervisor unit and process-lifecycle tests (Python 3 on POSIX)");
     platform_test_step.dependOn(&platform_tests.unit.step);
     if (platform_tests.process) |process| platform_test_step.dependOn(process);
+    platform_test_step.dependOn(&platform_tests.one_shot_unit.step);
+    if (platform_tests.one_shot_process) |process| platform_test_step.dependOn(process);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, true, false);
@@ -832,6 +834,11 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lib_json_test_step = b.step("lib-json-test", "Run standalone lib/json tests");
     lib_json_test_step.dependOn(&run_lib_json_tests.step);
 
+    const lib_ml_tests = b.addTest(.{ .root_module = inference_ml_mod });
+    const run_lib_ml_tests = b.addRunArtifact(lib_ml_tests);
+    const lib_ml_test_step = b.step("lib-ml-test", "Run standalone lib/ml graph and optimizer tests");
+    lib_ml_test_step.dependOn(&run_lib_ml_tests.step);
+
     const lib_ml_tabular_tests = b.addTest(.{
         .root_module = ml_tabular_mod,
     });
@@ -996,6 +1003,12 @@ pub fn create(b: *std.Build) ?Artifacts {
     const vector_kernel_tests = b.addTest(.{ .root_module = vector_kernel_mod, .filters = b.args orelse &.{} });
     const run_vector_kernel_tests = b.addRunArtifact(vector_kernel_tests);
     b.step("lib-vector-kernel-test", "Run standalone quantizer kernel tests (no external recall fixtures)").dependOn(&run_vector_kernel_tests.step);
+
+    const packing_bench_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_query_packing.zig"), .target = target, .optimize = optimize });
+    packing_bench_mod.addImport("antfly_vector", vector_mod);
+    const packing_bench = b.addExecutable(.{ .name = "bench-query-packing", .root_module = packing_bench_mod });
+    const run_packing_bench = b.addRunArtifact(packing_bench);
+    b.step("bench-query-packing", "Compare exact query bitplane packing and complete scoring kernels").dependOn(&run_packing_bench.step);
 
     const subgroup_scan_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_subgroup_scan.zig"), .target = target, .optimize = optimize });
     subgroup_scan_mod.addImport("antfly_vector", vector_mod);
@@ -1314,6 +1327,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     tokenizer_bench_step.dependOn(&b.addInstallArtifact(tokenizer_bench, .{}).step);
 
     const benchmarks = antfly_benches_build.addBenchmarks(b, .{
+        .vopr = vopr_mod,
         .lmdb_engine = lmdb_engine_mod,
         .api_bench_standalone = api_bench_standalone,
         .optimize = optimize,
@@ -1375,29 +1389,33 @@ pub fn create(b: *std.Build) ?Artifacts {
     antfly_main_test_step.dependOn(&run_antfly_main_tests.step);
     unit_test_step.dependOn(&run_antfly_main_tests.step);
 
-    const graph_metric_process_harness_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/cmd/graph_metric_process_harness.zig"),
+    const maintenance_process_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/maintenance_process_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    graph_metric_process_harness_mod.addImport("antfly-zig", antfly_mod);
-    graph_metric_process_harness_mod.addImport("antfly_platform", platform_mod);
-    graph_metric_process_harness_mod.addImport("httpx", httpx_mod);
-    const graph_metric_process_harness = b.addExecutable(.{
-        .name = "graph-metric-process-harness",
-        .root_module = graph_metric_process_harness_mod,
+    antfly_imports.configure(b, maintenance_process_mod, link_libc);
+    @import("pkg/antfly/build/storage.zig").configureLmdb(b, maintenance_process_mod, lmdb_engine_mod, true);
+    maintenance_process_mod.addImport("vopr", vopr_mod);
+    maintenance_process_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    maintenance_process_mod.addImport("antfly_platform", platform_mod);
+    maintenance_process_mod.addImport("httpx", httpx_mod);
+    const maintenance_process = b.addExecutable(.{
+        .name = "maintenance-process-tests",
+        .root_module = maintenance_process_mod,
     });
-    graph_metric_process_harness.root_module.linkLibrary(
+    maintenance_process.root_module.linkLibrary(
         runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?,
     );
-    graph_metric_process_harness.step.dependOn(&antfly_main.step);
-    const run_graph_metric_process_harness = b.addRunArtifact(graph_metric_process_harness);
-    run_graph_metric_process_harness.addArtifactArg(antfly_main);
-    run_graph_metric_process_harness.addArgs(&.{ "--profile", "promotion" });
-    run_graph_metric_process_harness.has_side_effects = true;
-    const graph_metric_process_test_step = b.step("graph-metric-process-test", "Run process-level graph metric promotion and failover gates");
-    graph_metric_process_test_step.dependOn(&run_graph_metric_process_harness.step);
-    integration_test_step.dependOn(&run_graph_metric_process_harness.step);
+    const run_maintenance_process = b.addRunArtifact(maintenance_process);
+    run_maintenance_process.has_side_effects = true;
+    if (@import("lib/platform/build_support.zig").canRunNativeProcess(b, maintenance_process)) {
+        integration_test_step.dependOn(&run_maintenance_process.step);
+    } else {
+        // Child processes execute this same target directly. Keep cross-build
+        // coverage without attempting to spawn foreign binaries from a fixture.
+        integration_test_step.dependOn(&maintenance_process.step);
+    }
 
     // The aggregate intentionally runs with normal CPU concurrency. Give every
     // compile step a conservative scheduler claim unless it already has a

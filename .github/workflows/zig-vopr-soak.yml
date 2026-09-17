@@ -1,6 +1,16 @@
 name: Zig VOPR soaks
 
 on:
+  workflow_call:
+    inputs:
+      head_sha:
+        description: Approved revision to qualify (empty uses the triggering revision)
+        type: string
+        default: ''
+      qualification_only:
+        description: Build and qualify the runner without starting full soaks
+        type: boolean
+        default: false
   schedule:
     - cron: '0 10 * * *'
   workflow_dispatch:
@@ -9,24 +19,72 @@ on:
         description: Histories per shard (0 uses scenario budgets)
         type: number
         default: 0
+      require_seed:
+        description: Require replay-compatible entries restored from an earlier run
+        type: boolean
+        default: false
+
+      diagnostic_run:
+        description: Inspect an earlier soak with its original executable (empty runs a new soak)
+        type: string
+        default: ''
+      diagnostic_shard:
+        description: Artifact name when inspecting an earlier run
+        type: string
+        default: ''
+      diagnostic_trace:
+        description: Trace filename when inspecting an earlier run
+        type: string
+        default: ''
+      diagnostic_replays:
+        description: Fresh process diagnostic replays, stopping at first failure (1-200)
+        type: number
+        default: 1
 
 permissions:
   contents: read
 
+defaults:
+  run:
+    # Explicit bash enables pipefail, including production soaks piped to tee.
+    shell: bash
+
 concurrency:
-  group: vopr-soak-${{ github.ref }}
+  # Approved PR callers all have github.ref == refs/heads/main. Give each
+  # qualification its own group: cancel-in-progress:false still lets a newer
+  # pending request replace an older pending request in the same group.
+  # The caller already cancels superseded runs for the same PR. Keep scheduled
+  # and manually dispatched soak campaigns serialized by ref as before.
+  group: vopr-soak-${{ inputs.qualification_only && github.run_id || github.ref }}-${{ inputs.diagnostic_trace || 'campaign' }}
   cancel-in-progress: false
 
 jobs:
-  build:
+  diagnose:
+    if: inputs.diagnostic_run != ''
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/zig-vopr-replay-diagnostics.yml
+    with:
+      run_id: ${{ inputs.diagnostic_run }}
+      shard_artifact: ${{ inputs.diagnostic_shard }}
+      trace_name: ${{ inputs.diagnostic_trace }}
+      replays: ${{ fromJSON(inputs.diagnostic_replays || '1') }}
+
+  # Cold qualification and runner compilation have independent job budgets.
+  # Dedicated cache variables keep setup actions from replacing these paths.
+  qualify:
+    if: inputs.diagnostic_run == ''
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}
-      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+      VOPR_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}-qualify
+      VOPR_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           submodules: true
       - name: Load pinned toolchain policy
         id: toolchain
@@ -37,40 +95,124 @@ jobs:
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
-      - name: Build campaign runner
+      - name: Test soak orchestration
+        run: |
+          python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
+          python3 -m unittest discover -s scripts/ci -p test_zig_e2e_regression_loop.py
+      - name: Test production transport, runtime scheduling, and determinism boundaries
         working-directory: zig
-        run: zig build vopr-build -Doptimize=ReleaseSafe -j1 --summary all
+        run: |
+          zig build antfly-raft-transport-test standby-vopr-test vopr-runtime-test vopr-determinism-audit \
+            -Doptimize=ReleaseSafe -j1 --summary all \
+            --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
+
+  build:
+    if: inputs.diagnostic_run == ''
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 90
+    outputs:
+      binary_sha256: ${{ steps.binary.outputs.sha256 }}
+    env:
+      VOPR_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}-build
+      VOPR_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+          submodules: true
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Restore the pinned runner for this revision
+        id: runner_cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/vopr-cached-runner/vopr.tar.gz
+          key: vopr-runner-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.head_sha || github.sha }}
+      - name: Build campaign runner
+        if: steps.runner_cache.outputs.cache-hit != 'true'
+        working-directory: zig
+        run: |
+          zig build vopr-build -Doptimize=ReleaseSafe -j1 --summary all \
+            --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
+      - name: Restore executable
+        if: steps.runner_cache.outputs.cache-hit == 'true'
+        run: |
+          mkdir -p zig/zig-out/bin
+          tar -C zig/zig-out/bin -xzf "$RUNNER_TEMP/vopr-cached-runner/vopr.tar.gz"
+      - name: Identify the exact runner
+        id: binary
+        run: |
+          digest="$(sha256sum zig/zig-out/bin/vopr)"
+          echo "sha256=${digest%% *}" >> "$GITHUB_OUTPUT"
+      - name: Exercise campaign merge restore and reuse
+        run: python3 scripts/ci/zig_vopr_qualification.py --binary zig/zig-out/bin/vopr --output "$RUNNER_TEMP/vopr-qualification"
+      - name: Retain qualification diagnostics
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-qualification-diagnostics
+          path: |
+            ${{ runner.temp }}/vopr-qualification/**/*.json
+            ${{ runner.temp }}/vopr-qualification/**/*.log
+            ${{ runner.temp }}/vopr-qualification/**/*.voprtrace
+            ${{ runner.temp }}/vopr-qualification/**/*.voprquarantine
+          retention-days: 90
       - name: Package executable
-        run: tar -C zig/zig-out/bin -czf "$RUNNER_TEMP/vopr.tar.gz" vopr
+        if: steps.runner_cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/vopr-cached-runner"
+          tar -C zig/zig-out/bin -czf "$RUNNER_TEMP/vopr-cached-runner/vopr.tar.gz" vopr
+      - name: Preserve the runner layout for subsequent campaigns
+        if: steps.runner_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/vopr-cached-runner/vopr.tar.gz
+          key: vopr-runner-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.head_sha || github.sha }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vopr-runner
-          path: ${{ runner.temp }}/vopr.tar.gz
-          retention-days: 7
+          path: ${{ runner.temp }}/vopr-cached-runner/vopr.tar.gz
+          retention-days: 90
           overwrite: true
 
   campaign:
-    needs: build
+    needs: [build, qualify]
+    if: inputs.qualification_only != true
     runs-on: arc-antfly-heavy
     timeout-minutes: 300
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
-        scenario: [ha, raft, distributed-data, ha-scaling]
+        scenario: [standby, raft, distributed-data, standby-scaling]
         shard: [0, 1]
         include:
-          - scenario: ha
+          - scenario: standby
             histories: 1000
           - scenario: raft
             histories: 1000
           - scenario: distributed-data
             histories: 12
-          - scenario: ha-scaling
+          - scenario: standby-scaling
             histories: 2
+          - shard: 0
+            policy: bounded-fair
+          - shard: 1
+            policy: adversarial
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           submodules: true
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -81,45 +223,182 @@ jobs:
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ runner.temp }}/vopr-corpus-retained
-          key: vopr-corpus-v1-${{ github.ref_name }}--${{ matrix.scenario }}--${{ github.run_id }}-${{ github.run_attempt }}
+          key: vopr-corpus-v2-${{ github.ref_name }}--${{ matrix.scenario }}--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            vopr-corpus-v1-${{ github.ref_name }}--${{ matrix.scenario }}--
+            vopr-corpus-v2-${{ github.ref_name }}--${{ matrix.scenario }}--${{ needs.build.outputs.binary_sha256 }}--
       - name: Run retained-corpus campaign
         timeout-minutes: 240
         working-directory: zig
         env:
           SCENARIO: ${{ matrix.scenario }}
           SHARD: ${{ matrix.shard }}
-          HISTORY_BUDGET: ${{ inputs.histories || matrix.histories }}
+          HISTORY_BUDGET: ${{ inputs.histories }}
+          DEFAULT_HISTORY_BUDGET: ${{ matrix.histories }}
           RUN_NUMBER: ${{ github.run_number }}
+          EXPLORATION_POLICY: ${{ matrix.policy }}
+          REQUIRE_SEED: ${{ inputs.require_seed }}
         run: |
+          # Dispatch can supply the string "0", which is truthy in expressions.
+          # Normalize the sentinel and the absent scheduled input explicitly.
+          if [ -z "$HISTORY_BUDGET" ] || [ "$HISTORY_BUDGET" = "0" ]; then
+            HISTORY_BUDGET="$DEFAULT_HISTORY_BUDGET"
+          fi
           seed=$((0xa17f5500 + RUN_NUMBER * 65536 + SHARD))
+          reuse_args=()
+          if [ "${REQUIRE_SEED:-false}" = "true" ]; then reuse_args+=(--require-seed); fi
           python3 ../scripts/ci/zig_vopr_soak.py --binary "$RUNNER_TEMP/runner/vopr" run \
             --scenario "$SCENARIO" --histories "$HISTORY_BUDGET" --seed "$seed" \
-            --corpus "$RUNNER_TEMP/vopr-corpus-retained" --output "$RUNNER_TEMP/vopr-run"
+            --corpus "$RUNNER_TEMP/vopr-corpus-retained" --output "$RUNNER_TEMP/vopr-run" \
+            --exploration-policy "${EXPLORATION_POLICY:-bounded-fair}" "${reuse_args[@]}"
+      - name: Retain small campaign diagnostics first
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-diagnostics-${{ matrix.scenario }}--${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/vopr-run/run.json
+            ${{ runner.temp }}/vopr-run/results.*
+            ${{ runner.temp }}/vopr-run/*.log
+            ${{ runner.temp }}/vopr-run/*.schedule.json
+            ${{ runner.temp }}/vopr-run/*.progress.json
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
       - name: Retain reports, replay traces, and failure diagnostics
         if: always()
+        timeout-minutes: 40
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vopr-run-${{ matrix.scenario }}--${{ matrix.shard }}
-          path: ${{ runner.temp }}/vopr-run
+          path: |
+            ${{ runner.temp }}/vopr-run/*.voprtrace
+            ${{ runner.temp }}/vopr-run/*.schedule.json
+            ${{ runner.temp }}/vopr-run/*.flight.json
+            ${{ runner.temp }}/vopr-run/quarantine
           retention-days: 90
           overwrite: true
           if-no-files-found: error
 
+  # Native production stress complements the replayable scheduling campaigns.
+  # Build once, repeat against those bytes, and keep every case's result.
+  production-e2e:
+    if: inputs.diagnostic_run == '' && inputs.qualification_only != true
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 240
+    env:
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}-restore
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+      SKIP_BUILD: '1'
+      ANTFLY_E2E_ENV_LOADED: '1'
+      ANTFLY_BIN: ${{ github.workspace }}/zig/zig-out/bin/antfly
+      ANTFLY_E2E_REGRESSION_WORKERS: '4'
+      ANTFLY_E2E_REGRESSION_REPEATS: '25'
+      ANTFLY_E2E_PRESERVE_FAILURE_LIMIT: '4'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+          submodules: true
+      - name: Prepare evidence directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/production-e2e-soak/tmp" "$RUNNER_TEMP/production-e2e-soak/reports"
+          echo "TMPDIR=$RUNNER_TEMP/production-e2e-soak/tmp" >> "$GITHUB_ENV"
+          echo "ANTFLY_E2E_REGRESSION_REPORT_DIR=$RUNNER_TEMP/production-e2e-soak/reports" >> "$GITHUB_ENV"
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Install build tools and native debugger
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Build production executable and qualify owner publication
+        id: production-build
+        working-directory: zig
+        run: |
+          zig build antfly antfly-storage-owner-source-test -Doptimize=ReleaseSafe -j1 --summary all \
+            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/build.log"
+          sha256sum zig-out/bin/antfly > "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
+          tar -C zig-out/bin -czf "$RUNNER_TEMP/production-e2e-soak/antfly.tar.gz" antfly
+      - name: Soak compiled-owner restore with concurrent maintenance and status
+        working-directory: zig
+        run: |
+          for iteration in $(seq 1 20); do
+            zig build antfly-storage-owner-source-test -Doptimize=ReleaseSafe -j1 --summary all \
+              > "$RUNNER_TEMP/production-e2e-soak/owner-$iteration.log" 2>&1
+          done
+      - name: Soak public overwrite restore with concurrent readers and status
+        run: |
+          scripts/ci/zig-e2e-regression-loop.sh \
+            e2e/antfly/test_backup_restore.py::test_cluster_restore_modes \
+            e2e/antfly/test_backup_restore.py::test_cluster_restore_modes_with_concurrent_observers \
+            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/e2e.log"
+      - name: Soak cross-shard Autograph resolution, promotion, and hydration
+        timeout-minutes: 45
+        if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
+        env:
+          ANTFLY_E2E_REGRESSION_WORKERS: '2'
+          ANTFLY_E2E_REGRESSION_REPORT_DIR: ${{ runner.temp }}/production-e2e-soak/autograph
+        run: |
+          scripts/ci/zig-e2e-autograph-soak.sh \
+            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/autograph.log"
+      - name: Verify complete production soak evidence
+        working-directory: zig
+        run: |
+          sha256sum -c "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
+          python3 - <<'PY'
+          import os
+          from collections import Counter
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          reports = list(Path(os.environ["ANTFLY_E2E_REGRESSION_REPORT_DIR"]).glob("*.xml"))
+          assert len(reports) == 200, len(reports)
+          cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
+          assert len(cases) == 200, len(cases)
+          assert Counter(case.attrib["name"] for case in cases) == {
+              "test_cluster_restore_modes": 100,
+              "test_cluster_restore_modes_with_concurrent_observers": 100,
+          }
+          assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases)
+          for profile in ("normal", "constrained"):
+              reports = list((Path(os.environ["RUNNER_TEMP"]) / "production-e2e-soak/autograph" / profile).glob("*.xml"))
+              assert len(reports) == 100, (profile, len(reports))
+              cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
+              assert Counter(case.attrib["name"] for case in cases) == {
+                  "test_multinode_autograph_resolves_promotes_and_hydrates_entities": 50,
+                  "test_multinode_autograph_recovers_after_data_restart": 50,
+              }, profile
+              assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
+          PY
+      - name: Retain production executable, reports, and failed server roots
+        if: always()
+        timeout-minutes: 20
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: production-e2e-soak
+          path: ${{ runner.temp }}/production-e2e-soak
+          retention-days: 30
+          if-no-files-found: error
+
   corpus:
-    needs: [build, campaign]
-    if: always() && needs.build.result == 'success'
+    needs: [build, qualify, campaign]
+    if: always() && needs.build.result == 'success' && needs.qualify.result == 'success' && inputs.qualification_only != true
     runs-on: arc-antfly-heavy
     timeout-minutes: 180
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
-        scenario: [ha, raft, distributed-data, ha-scaling]
+        scenario: [standby, raft, distributed-data, standby-scaling]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
           submodules: true
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -137,13 +416,21 @@ jobs:
           python3 ../scripts/ci/zig_vopr_soak.py --binary "$RUNNER_TEMP/runner/vopr" merge \
             --inputs "$RUNNER_TEMP/vopr-shards" --output "$RUNNER_TEMP/vopr-corpus" \
             --retained "$RUNNER_TEMP/vopr-corpus-retained"
-      - name: Publish corpus for the next scheduled run
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+      - name: Retain small corpus diagnostics first
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          path: ${{ runner.temp }}/vopr-corpus-retained
-          key: vopr-corpus-v1-${{ github.ref_name }}--${{ matrix.scenario }}--${{ github.run_id }}-${{ github.run_attempt }}
+          name: vopr-corpus-diagnostics-${{ matrix.scenario }}
+          path: |
+            ${{ runner.temp }}/vopr-corpus/*.json
+            ${{ runner.temp }}/vopr-corpus/*.log
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
       - name: Retain merged corpus and quarantine review evidence
         if: always()
+        timeout-minutes: 40
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vopr-corpus-${{ matrix.scenario }}
@@ -151,3 +438,9 @@ jobs:
           retention-days: 90
           overwrite: true
           if-no-files-found: error
+
+      - name: Publish corpus for the next scheduled run
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/vopr-corpus-retained
+          key: vopr-corpus-v2-${{ github.ref_name }}--${{ matrix.scenario }}--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}

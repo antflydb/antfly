@@ -18,6 +18,8 @@ export type RerankRequest = components["schemas"]["InferenceRerankRequest"];
 export type RerankResponse = components["schemas"]["InferenceRerankResponse"];
 
 export type ExtractRequest = components["schemas"]["ExtractionRequest"];
+/** A strict mixed-task request; extractV2 supplies schema_version:2. */
+export type ExtractV2Request = Omit<ExtractRequest, "schema_version">;
 export type ExtractResponse = components["schemas"]["ExtractionResponse"];
 export type ExtractEntity = components["schemas"]["ExtractionEntity"];
 export type ExtractRelation = components["schemas"]["ExtractionRelation"];

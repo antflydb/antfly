@@ -69,6 +69,7 @@ fn isRootRoute(uri: []const u8) bool {
         "/extensions/v1",
         "/agents/v1/extensions/",
         "/admin/",
+        "/standby/",
         "/ha/",
     };
     for (root_prefixes) |prefix| {

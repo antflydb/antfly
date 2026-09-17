@@ -17,7 +17,8 @@ class InferenceTranscribeRequest:
     Attributes:
         model (str): Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and
             distributed execution resolve the same model. Example: openai/whisper-tiny.
-        audio (str): Base64-encoded audio data (WAV, MP3, FLAC, etc.)
+        audio (str): Base64-encoded audio data (WAV, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows
+            cut at pauses; silent clips return an empty transcript.
         language (str | Unset): Force specific language for transcription (optional, model-dependent) Example: en.
     """
 

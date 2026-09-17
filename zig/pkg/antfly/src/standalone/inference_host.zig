@@ -1719,7 +1719,7 @@ fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
     else
         path;
     for (inference_api.server.routes) |route| {
-        if (std.mem.eql(u8, route.method, method_name) and std.mem.eql(u8, route.path, relative_path)) {
+        if (std.mem.eql(u8, route.method, method_name) and routeTemplateMatches(route.path, relative_path)) {
             return .{
                 .request_body = switch (route.request_body) {
                     .none => .none,
@@ -1733,6 +1733,43 @@ fn routeMetadata(method: http_abi.HttpMethod, path: []const u8) RouteMetadata {
         .request_body = if (method == .get) .none else .buffered,
         .streaming_response = false,
     };
+}
+
+/// The generated route table keeps OpenAPI templates (`/x/{id}`) while the
+/// router registers httpx patterns (`/x/:id`). Compare segment by segment so
+/// path-parameter routes keep their declared body and streaming modes.
+fn routeTemplateMatches(template: []const u8, registered: []const u8) bool {
+    var template_segments = std.mem.splitScalar(u8, template, '/');
+    var registered_segments = std.mem.splitScalar(u8, registered, '/');
+    while (true) {
+        const expected = template_segments.next();
+        const actual = registered_segments.next();
+        if (expected == null or actual == null) return expected == null and actual == null;
+        const t = expected.?;
+        const r = actual.?;
+        const t_is_param = t.len >= 2 and t[0] == '{' and t[t.len - 1] == '}';
+        const r_is_param = r.len >= 1 and r[0] == ':';
+        if (t_is_param and r_is_param) {
+            if (!std.mem.eql(u8, t[1 .. t.len - 1], r[1..])) return false;
+            continue;
+        }
+        if (!std.mem.eql(u8, t, r)) return false;
+    }
+}
+
+test "route templates match registered path-parameter patterns" {
+    try std.testing.expect(routeTemplateMatches("/transcribe", "/transcribe"));
+    try std.testing.expect(routeTemplateMatches("/transcription/sessions/{session_id}/audio", "/transcription/sessions/:session_id/audio"));
+    try std.testing.expect(!routeTemplateMatches("/transcription/sessions/{session_id}", "/transcription/sessions/:other"));
+    try std.testing.expect(!routeTemplateMatches("/transcription/sessions/{session_id}", "/transcription/sessions"));
+    try std.testing.expect(!routeTemplateMatches("/a", "/a/b"));
+    const metadata = routeMetadata(.post, inference.server.ai_api_prefix ++ "/transcription/sessions/:session_id/audio");
+    try std.testing.expectEqual(http_abi.RequestBodyMode.buffered, metadata.request_body);
+    try std.testing.expect(!metadata.streaming_response);
+    const dictate = routeMetadata(.post, inference.server.ai_api_prefix ++ "/dictate");
+    try std.testing.expect(dictate.streaming_response);
+    const status = routeMetadata(.get, inference.server.ai_api_prefix ++ "/transcription/sessions/:session_id");
+    try std.testing.expectEqual(http_abi.RequestBodyMode.none, status.request_body);
 }
 
 const DirectServer = struct {
@@ -2591,6 +2628,35 @@ fn localModelCapabilities(
     task: antfly.inference.work.Task,
 ) !antfly.inference.work.InferenceCapabilities {
     return localModelCapabilitiesInScope(node, io, model, task, null);
+}
+
+test "encoded reader ABI enforces resolved model capabilities for Qwen3-VL generator bundles" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "generators/owner/qwen");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "generators/owner/qwen/config.json",
+        .data = "{\"model_type\":\"qwen3_vl\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "generators/owner/qwen/model_manifest.json",
+        .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "generators/owner/qwen/antfly_inference_bundle.json",
+        .data = "{\"family\":\"qwen3_vl_gguf_bundle/v1\",\"decoder\":\"config.json\",\"projector\":\"model_manifest.json\"}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(models_root);
+    var node = try inference.server.Node.init(allocator, .{ .models_dir = models_root });
+    defer node.deinit();
+    const capabilities = try localModelCapabilities(&node, std.testing.io, "owner/qwen", .read);
+    try std.testing.expect(capabilities.input_modalities.image);
+    try std.testing.expectEqual(.serial_compatibility, capabilities.batch.mode);
+    try std.testing.expectEqual(.read_result, capabilities.output);
+    try std.testing.expect(capabilities.borrowed_attachments);
+    try std.testing.expect(!capabilities.borrowed_rasters);
 }
 
 fn localModelCapabilitiesInScope(

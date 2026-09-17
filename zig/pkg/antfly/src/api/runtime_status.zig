@@ -98,19 +98,7 @@ pub const LocalTableRuntimeStatus = struct {
     }
 
     pub fn clone(self: *const @This(), alloc: std.mem.Allocator) !@This() {
-        return .{
-            .group_id = self.group_id,
-            .cache_observation_generation = self.cache_observation_generation,
-            .cache_publication_epoch = self.cache_publication_epoch,
-            .disk_observation_generation = self.disk_observation_generation,
-            .metadata = self.metadata,
-            .disk_bytes = self.disk_bytes,
-            .disk_bytes_known = self.disk_bytes_known,
-            .created_at_millis = self.created_at_millis,
-            .stats = try cloneDBStats(alloc, self.stats),
-            .lsm_storage_stats = self.lsm_storage_stats,
-            .source_vectors = self.source_vectors,
-        };
+        return copySnapshotWithOverrides(self.*, .{ .stats = try cloneDBStats(alloc, self.stats) });
     }
 
     pub fn withMetadataDefaults(self: *@This(), source: RuntimeStatusSource, now_ns: u64) void {
@@ -4376,8 +4364,11 @@ fn preserveIndexProjectionLifecycle(
 }
 
 fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
-    if (statusHasRuntimeFacts(status)) return true;
-    return false;
+    // A physical owner can be idle or empty. Its identity proves that these
+    // are sampled runtime facts even when workload counters are all zero.
+    // This retains stale observations; serving/convergence authority remains
+    // independently fenced. Root invalidation discards the owner and its facts.
+    return status.stats.runtime_owner_id != 0 or statusHasRuntimeFacts(status);
 }
 
 fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
@@ -4869,16 +4860,16 @@ fn mergeCachedStatusWithNonAuthoritativePlaceholder(
     // captured before an actual catalog mutation.
     merged.cache_observation_generation = previous.cache_observation_generation;
 
-    merged.stats.storage_change_token = previous.stats.storage_change_token;
-    merged.stats.source_doc_count = previous.stats.source_doc_count;
-    merged.stats.doc_count = previous.stats.doc_count;
-    merged.stats.enrichment = previous.stats.enrichment;
-    merged.stats.ttl_cleanup = previous.stats.ttl_cleanup;
-    merged.stats.transaction_recovery = previous.stats.transaction_recovery;
-    merged.stats.text_merge = previous.stats.text_merge;
-    merged.stats.term_doc_freq_cache_hits = previous.stats.term_doc_freq_cache_hits;
-    merged.stats.term_doc_freq_cache_misses = previous.stats.term_doc_freq_cache_misses;
-    merged.stats.async_indexing = previous.stats.async_indexing;
+    // The cached owner supplies every table runtime fact. The catalog supplies
+    // index membership and fresh disk observations, not replacement zero stats.
+    // Exchange owned stats, then restore the catalog's index array. The retained
+    // value owns the old index array for the incarnation-fenced moves below and
+    // the unused placeholder diagnostics for cleanup. No field-by-field runtime
+    // allowlist or additional allocations are needed.
+    var retained = try previous.clone(alloc);
+    defer retained.deinit(alloc);
+    std.mem.swap(db_mod.types.DBStats, &merged.stats, &retained.stats);
+    std.mem.swap([]db_mod.types.DBIndexStats, &merged.stats.indexes, &retained.stats.indexes);
     merged.stats.index_count = @intCast(merged.stats.indexes.len);
 
     // Relabel before copying exact cached index snapshots. replaceMetadata
@@ -4886,10 +4877,6 @@ fn mergeCachedStatusWithNonAuthoritativePlaceholder(
     // immediately erase the owner acknowledgement we are trying to retain.
     merged.replaceMetadata(cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns));
 
-    // Each snapshot owns its index strings and nested arrays. Moving a deep
-    // clone preserves that ownership when the previous cache entry retires.
-    var retained = try previous.clone(alloc);
-    defer retained.deinit(alloc);
     var previous_lookup = try IndexObservationLookup.init(alloc, previous.stats.indexes);
     defer previous_lookup.deinit(alloc);
     for (merged.stats.indexes) |*dst| {
@@ -5222,6 +5209,230 @@ fn testGraphMetricStatsClone(alloc: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("page-error", status.build_pages[0].last_error);
 }
 
+fn freeSourceReplayStatuses(alloc: std.mem.Allocator, sources: []db_mod.types.IndexSourceReplayStatus) void {
+    for (sources) |source| alloc.free(source.artifact_name);
+    if (sources.len > 0) alloc.free(sources);
+}
+
+fn cloneSourceReplayStatuses(alloc: std.mem.Allocator, sources: []const db_mod.types.IndexSourceReplayStatus) ![]db_mod.types.IndexSourceReplayStatus {
+    if (sources.len == 0) return &.{};
+    const out = try alloc.alloc(db_mod.types.IndexSourceReplayStatus, sources.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |source| alloc.free(source.artifact_name);
+        alloc.free(out);
+    }
+    for (sources, out) |source, *copy| {
+        copy.* = source;
+        copy.artifact_name = try alloc.dupe(u8, source.artifact_name);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn testSourceReplayStatsClone(alloc: std.mem.Allocator) !void {
+    const expected = [_]db_mod.types.IndexSourceReplayStatus{
+        .{ .artifact_name = "document_dense_v1", .published_sequence = 7, .target_sequence = 7, .observation_count = 3 },
+        .{ .artifact_name = "lagging", .published_sequence = 5, .target_sequence = 9, .repair_summary_ready = false, .observation_count = 0 },
+        .{ .artifact_name = "failed", .published_sequence = 4, .target_sequence = 8, .failed = true, .repair_issue_count = 2 },
+    };
+    var source_arena = std.heap.ArenaAllocator.init(alloc);
+    defer source_arena.deinit();
+    const source_alloc = source_arena.allocator();
+    const sources = try source_alloc.dupe(db_mod.types.IndexSourceReplayStatus, &expected);
+    for (sources) |*source| source.artifact_name = try source_alloc.dupe(u8, source.artifact_name);
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "vec",
+        .kind = .dense_vector,
+        .source_replay = sources,
+        .projection_checkpoint_status = try source_alloc.dupe(u8, "rebuilding"),
+        .index_repair_trigger = try source_alloc.dupe(u8, "catalog_admission"),
+        .index_repair_phase = try source_alloc.dupe(u8, "building"),
+        .index_repair_automation = try source_alloc.dupe(u8, "paused"),
+        .index_repair_wait_reason = try source_alloc.dupe(u8, "backoff"),
+    }};
+    const cloned = try cloneDBStats(alloc, .{ .indexes = &indexes, .index_count = 1, .enrichment = .{
+        .embed_batches_completed = 11,
+        .projection_checkpoint_status = try source_alloc.dupe(u8, "clean"),
+        .active_phase = try source_alloc.dupe(u8, "publishing"),
+        .stall_reason = try source_alloc.dupe(u8, "publishing_overdue"),
+    } });
+    defer db_mod.types.freeDBStats(alloc, cloned);
+    try std.testing.expectEqual(expected.len, cloned.indexes[0].source_replay.len);
+    try std.testing.expect(cloned.indexes[0].source_replay.ptr != sources.ptr);
+    for (sources, cloned.indexes[0].source_replay) |original, copy|
+        try std.testing.expect(original.artifact_name.ptr != copy.artifact_name.ptr);
+    // The ABI response/parser and each cache reader have independent lifetimes.
+    _ = source_arena.reset(.free_all);
+    try std.testing.expectEqualDeep(&expected, cloned.indexes[0].source_replay);
+    try std.testing.expectEqual(@as(u64, 11), cloned.enrichment.embed_batches_completed);
+
+    var snapshot = snapshot: {
+        var cache = TableRuntimeSnapshotCache.init(alloc);
+        defer cache.deinit();
+        _ = try publishGroupForTest(&cache, "docs", .{ .group_id = 7, .stats = cloned });
+        break :snapshot (try cache.snapshotGroupStatus(alloc, "docs", 7)) orelse return error.OutOfMemory;
+    };
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqualDeep(&expected, snapshot.stats.indexes[0].source_replay);
+    try std.testing.expectEqual(@as(u64, 11), snapshot.stats.enrichment.embed_batches_completed);
+    try std.testing.expectEqualStrings("clean", snapshot.stats.enrichment.projection_checkpoint_status);
+    try std.testing.expectEqualStrings("publishing", snapshot.stats.enrichment.active_phase);
+    try std.testing.expectEqualStrings("publishing_overdue", snapshot.stats.enrichment.stall_reason);
+    const index = snapshot.stats.indexes[0];
+    try std.testing.expectEqualStrings("rebuilding", index.projection_checkpoint_status);
+    try std.testing.expectEqualStrings("catalog_admission", index.index_repair_trigger);
+    try std.testing.expectEqualStrings("building", index.index_repair_phase);
+    try std.testing.expectEqualStrings("paused", index.index_repair_automation);
+    try std.testing.expectEqualStrings("backoff", index.index_repair_wait_reason);
+}
+
+// Exercise every scalar recursively, including fields added after this fixture.
+// Pointer-bearing values get explicit fixtures and independent lifetime checks.
+fn seedSnapshotValues(value: anytype) @TypeOf(value) {
+    var result = value;
+    switch (@typeInfo(@TypeOf(value))) {
+        .@"struct" => |info| inline for (info.fields) |field| {
+            @field(result, field.name) = seedSnapshotValues(@field(value, field.name));
+        },
+        .bool => result = !value,
+        .int => result = if (value == 0) 1 else 0,
+        .float => result = 1,
+        .@"enum" => |info| result = @enumFromInt(info.fields[info.fields.len - 1].value),
+        else => {},
+    }
+    return result;
+}
+
+fn testSyntheticSnapshotStatsOwnership(alloc: std.mem.Allocator) !void {
+    const types = db_mod.types;
+    var source_arena = std.heap.ArenaAllocator.init(alloc);
+    defer source_arena.deinit();
+    const source_alloc = source_arena.allocator();
+    var previous_indexes = [_]types.DBIndexStats{
+        .{ .name = "keep", .kind = .graph, .doc_count = 3, .load_error = "retained diagnostic" },
+        .{ .name = "remove", .kind = .full_text, .doc_count = 4 },
+        .{ .name = "remove_too", .kind = .full_text, .doc_count = 5 },
+    };
+    var catalog_indexes = [_]types.DBIndexStats{
+        .{ .name = "new", .kind = .full_text },
+        .{ .name = "keep", .kind = .graph },
+    };
+    var resolver = [_]types.ResolverReplayDiagnostic{.{ .name = "resolver", .table = "docs", .source_artifact = "source", .resolution_artifact = "resolved" }};
+    var expected = seedSnapshotValues(types.DBStats{});
+    expected.schema_index_state = "ready";
+    expected.index_count = previous_indexes.len;
+    expected.indexes = &previous_indexes;
+    expected.resolver_replay.resolvers = &resolver;
+    expected.text_merge.last_merge_error = .init("RetainedMergeFailure");
+    expected.graph_metric_runtime.last_error_name = .init("RetainedWorkerFailure");
+    // Both inputs contain independent heap-backed diagnostics. Neither input
+    // arena nor the unused catalog diagnostics may back the merged snapshot.
+    const previous = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .cache_observation_generation = 11,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = try cloneDBStats(source_alloc, expected),
+    };
+    const placeholder = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .disk_bytes = 123,
+        .disk_bytes_known = true,
+        .disk_observation_generation = 20,
+        .metadata = .{ .source = .synthetic_config, .freshness = .stale },
+        .stats = try cloneDBStats(source_alloc, .{ .index_count = 2, .indexes = &catalog_indexes, .resolver_replay = .{ .resolvers = &resolver } }),
+    };
+    var merged = try mergeCachedStatusWithNonAuthoritativePlaceholder(alloc, previous, placeholder, 30, null, false);
+    defer merged.deinit(alloc);
+    _ = source_arena.reset(.free_all);
+    // Compare every table fact; only catalog index membership/count is overlaid.
+    var table_facts = merged.stats;
+    table_facts.indexes = expected.indexes;
+    table_facts.index_count = expected.index_count;
+    try std.testing.expectEqualDeep(expected, table_facts);
+    try std.testing.expectEqual(@as(u32, 2), merged.stats.index_count);
+    try std.testing.expectEqual(@as(usize, 2), merged.stats.indexes.len);
+    try std.testing.expectEqualStrings("new", merged.stats.indexes[0].name);
+    try std.testing.expectEqual(@as(u64, 0), merged.stats.indexes[0].doc_count);
+    try std.testing.expectEqualStrings("keep", merged.stats.indexes[1].name);
+    try std.testing.expectEqual(@as(u64, 3), merged.stats.indexes[1].doc_count);
+    try std.testing.expectEqualStrings("retained diagnostic", merged.stats.indexes[1].load_error.?);
+    try std.testing.expectEqual(@as(u64, 11), merged.cache_observation_generation);
+    try std.testing.expectEqual(@as(u64, 123), merged.disk_bytes);
+    try std.testing.expectEqual(@as(u64, 20), merged.disk_observation_generation);
+    try std.testing.expectEqual(RuntimeStatusSource.cached_snapshot, merged.metadata.source);
+    try std.testing.expect(!merged.metadata.target_observation_complete);
+}
+
+fn testSnapshotStatsCompleteness(alloc: std.mem.Allocator) !void {
+    var indexes = [_]db_mod.types.DBIndexStats{seedSnapshotValues(db_mod.types.DBIndexStats{ .name = "text", .kind = .full_text })};
+    indexes[0].text_merge.last_merge_error = .init("IndexSpecificMergeFailure");
+    indexes[0].algebraic_top_candidate = .{
+        .recommendation = "candidate",
+        .materialization_id = "materialization",
+        .lifecycle = "ready",
+        .decision = "keep",
+    };
+    indexes[0].algebraic_active_progress = .{
+        .recommendation = "candidate",
+        .materialization_id = "materialization",
+        .lifecycle = "ready",
+    };
+    var expected = seedSnapshotValues(db_mod.types.DBStats{});
+    expected.indexes = &indexes;
+    expected.index_count = 1;
+    expected.schema_index_state = "building";
+    expected.text_merge.last_merge_error = .init("TableSpecificMergeFailure");
+    expected.graph_metric_runtime.last_error_name = .init("WorkerSpecificFailure");
+    expected.graph_metric_runtime.role = .worker_pool;
+
+    // Reproduce the ABI lifetime: destroy both the JSON and parser before
+    // publishing the clone, and destroy the cache before inspecting a reader.
+    var cloned = cloned: {
+        const json = try std.json.Stringify.valueAlloc(alloc, expected, .{});
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(db_mod.types.DBStats, alloc, json, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        const copy = try cloneDBStats(alloc, parsed.value);
+        parsed.value.text_merge.last_merge_error = .init("overwritten");
+        parsed.value.indexes[0].text_merge.last_merge_error = .init("overwritten");
+        parsed.value.graph_metric_runtime.last_error_name = .init("overwritten");
+        break :cloned copy;
+    };
+    defer db_mod.types.freeDBStats(alloc, cloned);
+    // Deep equality covers every member, not a second hand-maintained field list.
+    try std.testing.expectEqualDeep(expected, cloned);
+    var snapshot = snapshot: {
+        var cache = TableRuntimeSnapshotCache.init(alloc);
+        defer cache.deinit();
+        _ = try publishGroupForTest(&cache, "docs", .{ .group_id = 7, .stats = cloned });
+        break :snapshot (try cache.snapshotGroupStatus(alloc, "docs", 7)) orelse return error.OutOfMemory;
+    };
+    defer snapshot.deinit(alloc);
+    var cached_expected = expected;
+    var cached_indexes = indexes;
+    cached_indexes[0].runtime_observation_serviceable = false;
+    cached_indexes[0].runtime_observation_targeted_sibling = false;
+    cached_indexes[0].runtime_target_observation_complete = true;
+    cached_expected.indexes = &cached_indexes;
+    try std.testing.expectEqualDeep(cached_expected, snapshot.stats);
+
+    // These merge operations intentionally copy diagnostics without allocation.
+    var retained_index = indexes[0];
+    preserveIndexArtifactVisibility(&retained_index, cloned.indexes[0]);
+    cloned.indexes[0].text_merge.last_merge_error = .init("overwritten");
+    try std.testing.expectEqualStrings("IndexSpecificMergeFailure", retained_index.text_merge.last_merge_error.slice());
+    var aggregate: db_mod.types.TextMergeStats = .{};
+    db_mod.types.accumulateTextMergeStats(&aggregate, cloned.text_merge);
+    cloned.text_merge.last_merge_error = .init("overwritten");
+    try std.testing.expectEqualStrings("TableSpecificMergeFailure", aggregate.last_merge_error.slice());
+    try std.testing.expectEqualStrings("WorkerSpecificFailure", snapshot.stats.graph_metric_runtime.last_error_name.?.slice());
+    const encoded = try std.json.Stringify.valueAlloc(alloc, snapshot.stats, .{});
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"last_merge_error\":\"TableSpecificMergeFailure\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"last_error_name\":\"WorkerSpecificFailure\"") != null);
+}
+
 pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_mod.types.DBStats {
     const resolver_replay = try cloneResolverReplayDiagnostics(alloc, stats.resolver_replay);
     errdefer db_mod.types.freeResolverReplayDiagnostics(alloc, resolver_replay);
@@ -5233,6 +5444,8 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
     }
 
     for (stats.indexes, 0..) |item, i| {
+        const source_replay = try cloneSourceReplayStatuses(alloc, item.source_replay);
+        errdefer freeSourceReplayStatuses(alloc, source_replay);
         const load_error = if (item.load_error) |value|
             try alloc.dupe(u8, value)
         else
@@ -5288,20 +5501,30 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         else
             null;
         errdefer if (algebraic_last_recommended_materialization) |value| alloc.free(value);
-        const algebraic_top_candidate: ?db_mod.types.AlgebraicCandidateStatus = if (item.algebraic_top_candidate) |candidate| .{
-            .recommendation = try alloc.dupe(u8, candidate.recommendation),
-            .materialization_id = try alloc.dupe(u8, candidate.materialization_id),
-            .lifecycle = try alloc.dupe(u8, candidate.lifecycle),
-            .decision = try alloc.dupe(u8, candidate.decision),
-            .observation_count = candidate.observation_count,
-            .estimated_scan_rows_saved = candidate.estimated_scan_rows_saved,
-            .estimated_write_cost = candidate.estimated_write_cost,
-            .estimated_tensor_rows = candidate.estimated_tensor_rows,
-            .estimated_storage_bytes = candidate.estimated_storage_bytes,
-            .estimated_write_amplification = candidate.estimated_write_amplification,
-            .score = candidate.score,
-            .idle_miss_count = candidate.idle_miss_count,
-            .generation = candidate.generation,
+        const algebraic_top_candidate: ?db_mod.types.AlgebraicCandidateStatus = if (item.algebraic_top_candidate) |candidate| blk: {
+            const recommendation = try alloc.dupe(u8, candidate.recommendation);
+            errdefer alloc.free(recommendation);
+            const materialization_id = try alloc.dupe(u8, candidate.materialization_id);
+            errdefer alloc.free(materialization_id);
+            const lifecycle = try alloc.dupe(u8, candidate.lifecycle);
+            errdefer alloc.free(lifecycle);
+            const decision = try alloc.dupe(u8, candidate.decision);
+            errdefer alloc.free(decision);
+            break :blk .{
+                .recommendation = recommendation,
+                .materialization_id = materialization_id,
+                .lifecycle = lifecycle,
+                .decision = decision,
+                .observation_count = candidate.observation_count,
+                .estimated_scan_rows_saved = candidate.estimated_scan_rows_saved,
+                .estimated_write_cost = candidate.estimated_write_cost,
+                .estimated_tensor_rows = candidate.estimated_tensor_rows,
+                .estimated_storage_bytes = candidate.estimated_storage_bytes,
+                .estimated_write_amplification = candidate.estimated_write_amplification,
+                .score = candidate.score,
+                .idle_miss_count = candidate.idle_miss_count,
+                .generation = candidate.generation,
+            };
         } else null;
         errdefer if (algebraic_top_candidate) |candidate| {
             alloc.free(candidate.recommendation);
@@ -5309,14 +5532,22 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             alloc.free(candidate.lifecycle);
             alloc.free(candidate.decision);
         };
-        const algebraic_active_progress: ?db_mod.types.AlgebraicProgressStatus = if (item.algebraic_active_progress) |progress| .{
-            .recommendation = try alloc.dupe(u8, progress.recommendation),
-            .materialization_id = try alloc.dupe(u8, progress.materialization_id),
-            .lifecycle = try alloc.dupe(u8, progress.lifecycle),
-            .target_sequence = progress.target_sequence,
-            .applied_sequence = progress.applied_sequence,
-            .rows_processed = progress.rows_processed,
-            .target_rows = progress.target_rows,
+        const algebraic_active_progress: ?db_mod.types.AlgebraicProgressStatus = if (item.algebraic_active_progress) |progress| blk: {
+            const recommendation = try alloc.dupe(u8, progress.recommendation);
+            errdefer alloc.free(recommendation);
+            const materialization_id = try alloc.dupe(u8, progress.materialization_id);
+            errdefer alloc.free(materialization_id);
+            const lifecycle = try alloc.dupe(u8, progress.lifecycle);
+            errdefer alloc.free(lifecycle);
+            break :blk .{
+                .recommendation = recommendation,
+                .materialization_id = materialization_id,
+                .lifecycle = lifecycle,
+                .target_sequence = progress.target_sequence,
+                .applied_sequence = progress.applied_sequence,
+                .rows_processed = progress.rows_processed,
+                .target_rows = progress.target_rows,
+            };
         } else null;
         errdefer if (algebraic_active_progress) |progress| {
             alloc.free(progress.recommendation);
@@ -5331,135 +5562,24 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         errdefer freeAlgebraicProgressStatuses(alloc, algebraic_progress);
         const graph_metric_status = try db_mod.types.cloneGraphMetricStatuses(alloc, item.graph_metric_status);
         errdefer db_mod.types.freeGraphMetricStatuses(alloc, graph_metric_status);
-        indexes[i] = .{
+        indexes[i] = copySnapshotWithOverrides(item, .{
+            .source_replay = source_replay,
             .graph_metric_status = graph_metric_status,
             .name = try alloc.dupe(u8, item.name),
-            .kind = item.kind,
-            .runtime_observation_stale = item.runtime_observation_stale,
-            .runtime_observation_serviceable = item.runtime_observation_serviceable,
-            .runtime_observation_targeted_sibling = item.runtime_observation_targeted_sibling,
-            .runtime_target_observation_complete = item.runtime_target_observation_complete,
-            .runtime_serving_applied_sequence = item.runtime_serving_applied_sequence,
-            .runtime_coverage_applied_sequence = item.runtime_coverage_applied_sequence,
-            .runtime_coverage_source_sequence = item.runtime_coverage_source_sequence,
-            .serving_publication = item.serving_publication,
-            .coverage_publication = item.coverage_publication,
             .load_error = load_error,
-            .doc_count = item.doc_count,
-            .term_count = item.term_count,
-            .edge_count = item.edge_count,
-            .graph_counts_pending = item.graph_counts_pending,
-            .node_count = item.node_count,
-            .root_node = item.root_node,
-            .publication_target_count = item.publication_target_count,
-            .publication_target_ready = item.publication_target_ready,
-            .serving_snapshot_ready = item.serving_snapshot_ready,
-            .serving_snapshot_revision = item.serving_snapshot_revision,
-            .serving_snapshot_owner_id = item.serving_snapshot_owner_id,
-            .coverage_produced_count = item.coverage_produced_count,
-            .coverage_skipped_count = item.coverage_skipped_count,
-            .coverage_terminal_failed_count = item.coverage_terminal_failed_count,
-            .coverage_config_hash = item.coverage_config_hash,
-            .coverage_summary_ready = item.coverage_summary_ready,
-            .coverage_generation = item.coverage_generation,
-            .coverage_identity_ready = item.coverage_identity_ready,
-            .embedding_activity_observed = item.embedding_activity_observed,
-            .embedding_activity_sample_fresh = item.embedding_activity_sample_fresh,
-            .embedding_activity = item.embedding_activity,
-            .backfill_active = item.backfill_active,
-            .backfill_progress = item.backfill_progress,
-            .dense_vector_projection_pending = item.dense_vector_projection_pending,
-            .dense_native_storage_phase = item.dense_native_storage_phase,
-            .enrichment_failed = item.enrichment_failed,
-            .repair_degraded = item.repair_degraded,
-            .repair_issue_count = item.repair_issue_count,
-            .repair_summary_ready = item.repair_summary_ready,
-            .repair_issue_count_estimated = item.repair_issue_count_estimated,
-            .repair_scan_issue_count = item.repair_scan_issue_count,
-            .index_repair_id = item.index_repair_id,
-            .index_lifecycle_work_class = item.index_lifecycle_work_class,
-            .index_repair_trigger = item.index_repair_trigger,
-            .index_repair_phase = item.index_repair_phase,
-            .index_repair_automation = item.index_repair_automation,
-            .index_repair_attempts = item.index_repair_attempts,
-            .index_repair_started_at_ms = item.index_repair_started_at_ms,
-            .index_repair_updated_at_ms = item.index_repair_updated_at_ms,
-            .index_repair_build_floor_sequence = item.index_repair_build_floor_sequence,
-            .index_repair_applied_sequence = item.index_repair_applied_sequence,
-            .index_repair_target_sequence = item.index_repair_target_sequence,
-            .index_repair_next_retry_at_ms = item.index_repair_next_retry_at_ms,
+            .index_repair_trigger = stableStatusLabel(@import("../storage/db/derived/index_repair_state.zig").Trigger, item.index_repair_trigger, &.{ "none", "index_activation", "corrupt_local_repair_state" }),
+            .index_repair_phase = stableStatusLabel(@import("../storage/db/derived/index_repair_state.zig").Phase, item.index_repair_phase, &.{"none"}),
+            .index_repair_automation = stableStatusLabel(@import("../storage/db/derived/index_repair_state.zig").Automation, item.index_repair_automation, &.{"none"}),
             .index_repair_last_error = index_repair_last_error,
-            .index_repair_wait_reason = item.index_repair_wait_reason,
-            .index_repair_status = item.index_repair_status,
-            .index_repair_action_required = item.index_repair_action_required,
-            .index_repair_active_generation_serviceable = item.index_repair_active_generation_serviceable,
-            .projection_checkpoint_status = item.projection_checkpoint_status,
-            .projection_checkpoint_applied_sequence = item.projection_checkpoint_applied_sequence,
-            .projection_checkpoint_generation = item.projection_checkpoint_generation,
-            .projection_checkpoint_config_hash = item.projection_checkpoint_config_hash,
-            .replay_applied_sequence = item.replay_applied_sequence,
-            .replay_target_sequence = item.replay_target_sequence,
-            .checkpoint_replay_tail_sequence_count = item.checkpoint_replay_tail_sequence_count,
-            .replay_catch_up_required = item.replay_catch_up_required,
-            .catch_up_active = item.catch_up_active,
-            .catch_up_phase = item.catch_up_phase,
-            .catch_up_applied_sequence = item.catch_up_applied_sequence,
-            .catch_up_target_sequence = item.catch_up_target_sequence,
-            .text_merge = item.text_merge,
-            .hbc_cache = item.hbc_cache,
-            .hbc_posting = item.hbc_posting,
-            .algebraic_parse_error_count = item.algebraic_parse_error_count,
+            .index_repair_wait_reason = stableStatusLabel(enum {}, item.index_repair_wait_reason, &.{ "none", "paused", "terminal", "backoff", "rollback", "convergence", "action_required" }),
+            .projection_checkpoint_status = stableProjectionStatus(item.projection_checkpoint_status),
             .algebraic_last_error_doc_key = algebraic_last_error_doc_key,
             .algebraic_last_error_reason = algebraic_last_error_reason,
-            .algebraic_schema_version = item.algebraic_schema_version,
             .algebraic_capability_fingerprint = algebraic_capability_fingerprint,
             .algebraic_capability_lifecycle_status = algebraic_capability_lifecycle_status,
-            .algebraic_capability_change_added_fields = item.algebraic_capability_change_added_fields,
-            .algebraic_capability_change_removed_fields = item.algebraic_capability_change_removed_fields,
-            .algebraic_capability_change_changed_type_fields = item.algebraic_capability_change_changed_type_fields,
-            .algebraic_skipped_dynamic_fields = item.algebraic_skipped_dynamic_fields,
-            .algebraic_skipped_complex_fields = item.algebraic_skipped_complex_fields,
-            .algebraic_skipped_unbounded_fields = item.algebraic_skipped_unbounded_fields,
-            .algebraic_minmax_cache_hits = item.algebraic_minmax_cache_hits,
-            .algebraic_minmax_cache_misses = item.algebraic_minmax_cache_misses,
-            .algebraic_minmax_support_scans = item.algebraic_minmax_support_scans,
-            .algebraic_planner_selected = item.algebraic_planner_selected,
-            .algebraic_planner_fallback_count = item.algebraic_planner_fallback_count,
             .algebraic_planner_last_decision = algebraic_planner_last_decision,
             .algebraic_planner_last_fallback_reason = algebraic_planner_last_fallback_reason,
-            .algebraic_planner_last_estimated_scan_rows = item.algebraic_planner_last_estimated_scan_rows,
-            .algebraic_planner_last_estimated_result_buckets = item.algebraic_planner_last_estimated_result_buckets,
-            .algebraic_planner_lifecycle_ready = item.algebraic_planner_lifecycle_ready,
             .algebraic_planner_lifecycle_blocking_reason = algebraic_planner_lifecycle_blocking_reason,
-            .algebraic_dictionary_registry_claimed_count = item.algebraic_dictionary_registry_claimed_count,
-            .algebraic_dictionary_registry_already_owned_count = item.algebraic_dictionary_registry_already_owned_count,
-            .algebraic_dictionary_registry_owned_by_other_count = item.algebraic_dictionary_registry_owned_by_other_count,
-            .algebraic_dictionary_registry_ready_hit_count = item.algebraic_dictionary_registry_ready_hit_count,
-            .algebraic_dictionary_registry_ready_miss_count = item.algebraic_dictionary_registry_ready_miss_count,
-            .algebraic_distributed_partial_validation_proven_count = item.algebraic_distributed_partial_validation_proven_count,
-            .algebraic_distributed_partial_validation_rejected_count = item.algebraic_distributed_partial_validation_rejected_count,
-            .algebraic_distributed_partial_rows_exported_count = item.algebraic_distributed_partial_rows_exported_count,
-            .algebraic_vector_filter_attempt_count = item.algebraic_vector_filter_attempt_count,
-            .algebraic_vector_filter_resolved_count = item.algebraic_vector_filter_resolved_count,
-            .algebraic_vector_filter_unsupported_count = item.algebraic_vector_filter_unsupported_count,
-            .algebraic_vector_filter_fail_closed_count = item.algebraic_vector_filter_fail_closed_count,
-            .algebraic_vector_filter_include_doc_id_count = item.algebraic_vector_filter_include_doc_id_count,
-            .algebraic_vector_filter_exclude_doc_id_count = item.algebraic_vector_filter_exclude_doc_id_count,
-            .algebraic_graph_traversal_attempt_count = item.algebraic_graph_traversal_attempt_count,
-            .algebraic_graph_traversal_proven_count = item.algebraic_graph_traversal_proven_count,
-            .algebraic_graph_traversal_rejected_count = item.algebraic_graph_traversal_rejected_count,
-            .algebraic_graph_traversal_fallback_count = item.algebraic_graph_traversal_fallback_count,
-            .algebraic_graph_traversal_result_node_count = item.algebraic_graph_traversal_result_node_count,
-            .algebraic_observed_query_shape_count = item.algebraic_observed_query_shape_count,
-            .algebraic_recommendation_count = item.algebraic_recommendation_count,
-            .algebraic_adaptive_candidate_count = item.algebraic_adaptive_candidate_count,
-            .algebraic_adaptive_progress_count = item.algebraic_adaptive_progress_count,
-            .algebraic_adaptive_backfilling_count = item.algebraic_adaptive_backfilling_count,
-            .algebraic_adaptive_ready_count = item.algebraic_adaptive_ready_count,
-            .algebraic_adaptive_stale_count = item.algebraic_adaptive_stale_count,
-            .algebraic_adaptive_dematerialize_recommended_count = item.algebraic_adaptive_dematerialize_recommended_count,
-            .algebraic_adaptive_decision_history_count = item.algebraic_adaptive_decision_history_count,
-            .algebraic_adaptive_policy_drift_count = item.algebraic_adaptive_policy_drift_count,
             .algebraic_last_observed_query_shape = algebraic_last_observed_query_shape,
             .algebraic_last_recommended_materialization = algebraic_last_recommended_materialization,
             .algebraic_top_candidate = algebraic_top_candidate,
@@ -5467,34 +5587,68 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .algebraic_candidates = algebraic_candidates,
             .algebraic_candidate_decision_history = algebraic_candidate_decision_history,
             .algebraic_progress = algebraic_progress,
-        };
+        });
         initialized += 1;
     }
 
-    return .{
-        .runtime_owner_id = stats.runtime_owner_id,
-        .storage_change_token = stats.storage_change_token,
-        .source_doc_count = stats.source_doc_count,
-        .doc_count = stats.doc_count,
-        .index_count = stats.index_count,
+    return copySnapshotWithOverrides(stats, .{
         .indexes = indexes,
-        .repair_degraded = stats.repair_degraded,
-        .repair_issue_count = stats.repair_issue_count,
-        .repair_summary_ready = stats.repair_summary_ready,
-        .repair_issue_count_estimated = stats.repair_issue_count_estimated,
-        .doc_identity = stats.doc_identity,
-        .doc_set_planning = stats.doc_set_planning,
-        .enrichment = stats.enrichment,
+        .resolver_replay = resolver_replay,
+        .enrichment = cloneEnrichmentStats(stats.enrichment),
         .resolution = cloneReplayStageStats(stats.resolution),
         .promotion = cloneReplayStageStats(stats.promotion),
-        .resolver_replay = resolver_replay,
-        .ttl_cleanup = stats.ttl_cleanup,
-        .transaction_recovery = stats.transaction_recovery,
-        .text_merge = stats.text_merge,
-        .term_doc_freq_cache_hits = stats.term_doc_freq_cache_hits,
-        .term_doc_freq_cache_misses = stats.term_doc_freq_cache_misses,
-        .async_indexing = stats.async_indexing,
+        .schema_index_state = stableStatusLabel(@import("../storage/db/table_catalog.zig").IndexState, stats.schema_index_state, &.{}),
+    });
+}
+
+// New value fields copy automatically. Adding a pointer-bearing field requires
+// an explicit ownership decision here instead of silently borrowing its storage.
+fn copySnapshotWithOverrides(value: anytype, overrides: anytype) @TypeOf(value) {
+    var result = value;
+    inline for (std.meta.fields(@TypeOf(value))) |field| {
+        if (@hasField(@TypeOf(overrides), field.name)) {
+            @field(result, field.name) = @field(overrides, field.name);
+        } else if (comptime snapshotHasPointers(field.type)) {
+            @compileError("snapshot ownership must be explicit for " ++ @typeName(@TypeOf(value)) ++ "." ++ field.name);
+        }
+    }
+    return result;
+}
+
+fn snapshotHasPointers(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => true,
+        .optional => |info| snapshotHasPointers(info.child),
+        .array => |info| snapshotHasPointers(info.child),
+        .@"struct", .@"union" => blk: {
+            for (std.meta.fields(T)) |field| if (snapshotHasPointers(field.type)) break :blk true;
+            break :blk false;
+        },
+        else => false,
     };
+}
+
+// These fields borrow static labels in native DBStats. Re-intern wire labels
+// through their owning enums before the parser buffer is released. Unknown
+// peer-version values stay explicit instead of becoming a false healthy state.
+fn stableStatusLabel(comptime T: type, value: []const u8, comptime extra: []const []const u8) []const u8 {
+    if (@typeInfo(T).@"enum".fields.len > 0) {
+        if (std.meta.stringToEnum(T, value)) |tag| return @tagName(tag);
+    }
+    inline for (extra) |label| if (std.mem.eql(u8, value, label)) return label;
+    return "unknown";
+}
+
+fn stableProjectionStatus(value: []const u8) []const u8 {
+    return stableStatusLabel(@import("../storage/db/derived/apply_state.zig").ProjectionStatus, value, &.{ "retrying", "failed" });
+}
+
+fn cloneEnrichmentStats(stats: db_mod.types.EnrichmentStats) db_mod.types.EnrichmentStats {
+    var cloned = stats;
+    cloned.projection_checkpoint_status = stableProjectionStatus(stats.projection_checkpoint_status);
+    cloned.active_phase = stableStatusLabel(@import("../inference/execution_context.zig").Phase, stats.active_phase, &.{"idle"});
+    cloned.stall_reason = stableStatusLabel(enum {}, stats.stall_reason, &.{ "", "worker_missing", "model_loading", "publishing_overdue", "embedding_overdue" });
+    return cloned;
 }
 
 fn cloneReplayStageStats(stats: db_mod.types.ReplayStageStats) db_mod.types.ReplayStageStats {
@@ -6308,6 +6462,116 @@ fn consumerTests() type {
             try std.testing.expect(failing.has_induced_failure);
             try std.testing.expect((try cache.snapshot(std.testing.allocator, "docs")) == null);
             try std.testing.expectEqual(@as(u64, 8), cache.tables.get("docs").?.groups.get(8).?.stats.doc_count);
+        }
+
+        test "table runtime snapshot cache clones stored status synthetic merge ownership" {
+            try testSyntheticSnapshotStatsOwnership(std.testing.allocator);
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, testSyntheticSnapshotStatsOwnership, .{});
+        }
+
+        test "table runtime snapshot cache clones stored status across synthetic and root transitions" {
+            const alloc = std.testing.allocator;
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            var indexes = [_]db_mod.types.DBIndexStats{.{ .name = "graph", .kind = .graph }};
+            var live = LocalTableRuntimeStatus{
+                .group_id = 7,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+                .stats = .{
+                    .index_count = 1,
+                    .indexes = &indexes,
+                    .runtime_owner_id = 10,
+                    .schema_epoch = 7,
+                    .row_format_version = 2,
+                    .table_catalog_generation = 8,
+                    .schema_index_state = "building",
+                    .columnar_maintenance = .{ .passes = 5 },
+                    .visibility = .{ .cache_hits_total = 6 },
+                    .graph_metric_runtime = .{ .enabled = true, .worker_count = 2 },
+                },
+            };
+            _ = try publishGroupForTest(&cache, "docs", live);
+            // A same-root catalog fence cannot erase physical runtime facts.
+            const before_catalog = try cache.capturePublicationToken("docs");
+            cache.fenceTablePublications("docs");
+            try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.stale_table, try cache.publishGroup(before_catalog, "docs", live));
+            const placeholder = LocalTableRuntimeStatus{
+                .group_id = 7,
+                .metadata = .{ .source = .synthetic_config, .freshness = .stale, .lsm_root_generation = 9 },
+                .stats = .{ .index_count = 1, .indexes = &indexes },
+            };
+            for (0..2) |_| {
+                _ = try publishGroupForTest(&cache, "docs", placeholder);
+                var observed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+                defer observed.deinit(alloc);
+                var facts = observed.stats;
+                facts.indexes = live.stats.indexes;
+                try std.testing.expectEqualDeep(live.stats, facts);
+                try std.testing.expectEqual(RuntimeStatusFreshness.stale, observed.metadata.freshness);
+                try std.testing.expect(!observed.metadata.target_observation_complete);
+            }
+            // An authoritative owner observation replaces cached values,
+            // including legitimate decreases and disabled runtime components.
+            live.stats.schema_epoch = 8;
+            live.stats.table_catalog_generation = 9;
+            live.stats.graph_metric_runtime = .{};
+            live.stats.columnar_maintenance.passes = 0;
+            _ = try publishGroupForTest(&cache, "docs", live);
+            var refreshed = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+            defer refreshed.deinit(alloc);
+            try std.testing.expectEqualDeep(live.stats, refreshed.stats);
+
+            // An idle/empty owner still supplies physical catalog facts even
+            // when optional runtimes are disabled and counters are zero.
+            for (0..2) |_| {
+                _ = try publishGroupForTest(&cache, "docs", placeholder);
+                var idle = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+                defer idle.deinit(alloc);
+                var facts = idle.stats;
+                facts.indexes = live.stats.indexes;
+                try std.testing.expectEqualDeep(live.stats, facts);
+            }
+
+            // A replacement root cannot inherit the previous root's facts,
+            // and a delayed publication cannot resurrect them.
+            const before_root = try cache.capturePublicationToken("docs");
+            cache.invalidateTable("docs");
+            try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.stale_table, try cache.publishGroup(before_root, "docs", live));
+            _ = try publishGroupForTest(&cache, "docs", placeholder);
+            var empty_root = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+            defer empty_root.deinit(alloc);
+            try std.testing.expectEqualDeep(placeholder.stats, empty_root.stats);
+            live.metadata.lsm_root_generation = 10;
+            live.stats.runtime_owner_id = 20;
+            live.stats.schema_epoch = 1;
+            live.stats.table_catalog_generation = 1;
+            _ = try publishGroupForTest(&cache, "docs", live);
+            var replacement = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+            defer replacement.deinit(alloc);
+            try std.testing.expectEqualDeep(live.stats, replacement.stats);
+        }
+
+        test "table runtime snapshot cache clones stored status diagnostic wire bounds" {
+            const maximum = [_]u8{'E'} ** 256;
+            const json = try std.json.Stringify.valueAlloc(std.testing.allocator, &maximum, .{});
+            defer std.testing.allocator.free(json);
+            const decoded = try std.json.parseFromSlice(db_mod.types.RuntimeErrorName, std.testing.allocator, json, .{});
+            defer decoded.deinit();
+            try std.testing.expectEqualStrings(&maximum, decoded.value.slice());
+            const too_long = [_]u8{'E'} ** 257;
+            const invalid = try std.json.Stringify.valueAlloc(std.testing.allocator, &too_long, .{});
+            defer std.testing.allocator.free(invalid);
+            try std.testing.expectError(error.Overflow, std.json.parseFromSlice(db_mod.types.RuntimeErrorName, std.testing.allocator, invalid, .{}));
+        }
+
+        test "table runtime snapshot cache clones stored status complete values and diagnostic ownership" {
+            try testSnapshotStatsCompleteness(std.testing.allocator);
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, testSnapshotStatsCompleteness, .{});
+        }
+
+        test "table runtime snapshot cache clones stored status source replay with independent ownership" {
+            try testSourceReplayStatsClone(std.testing.allocator);
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, testSourceReplayStatsClone, .{});
         }
 
         test "table runtime snapshot cache clones stored status" {
@@ -10815,61 +11079,68 @@ fn consumerTests() type {
         }
 
         test "projection continuity preserves lifecycle classification as one bundle" {
-            var previous_indexes = [_]db_mod.types.DBIndexStats{.{
-                .name = @constCast("thumbnail"),
-                .kind = .dense_vector,
-                .serving_snapshot_ready = true,
-                .coverage_config_hash = 77,
-                .coverage_generation = 42,
-                .coverage_identity_ready = true,
-                .coverage_summary_ready = true,
-                .projection_checkpoint_applied_sequence = 10,
-                .projection_checkpoint_generation = 4,
-                .projection_checkpoint_config_hash = 77,
-                .index_repair_id = 91,
-                .index_lifecycle_work_class = .initial_build,
-                .index_repair_trigger = "catalog_admission",
-                .index_repair_phase = "building",
-                .index_repair_status = .rebuilding,
-            }};
-            const previous = LocalTableRuntimeStatus{
-                .group_id = 7,
-                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
-                .stats = .{ .index_count = 1, .indexes = previous_indexes[0..] },
-            };
+            for ([_]bool{ false, true }) |action_required| {
+                var previous_indexes = [_]db_mod.types.DBIndexStats{.{
+                    .name = @constCast("thumbnail"),
+                    .kind = .dense_vector,
+                    .serving_snapshot_ready = true,
+                    .coverage_config_hash = 77,
+                    .coverage_generation = 42,
+                    .coverage_identity_ready = true,
+                    .coverage_summary_ready = true,
+                    .projection_checkpoint_applied_sequence = 10,
+                    .projection_checkpoint_generation = 4,
+                    .projection_checkpoint_config_hash = 77,
+                    .index_repair_id = 91,
+                    .index_lifecycle_work_class = .initial_build,
+                    .index_repair_trigger = "catalog_admission",
+                    .index_repair_phase = "building",
+                    .index_repair_status = .rebuilding,
+                }};
+                const previous = LocalTableRuntimeStatus{
+                    .group_id = 7,
+                    .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+                    .stats = .{ .index_count = 1, .indexes = previous_indexes[0..] },
+                };
 
-            var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
-                .name = @constCast("thumbnail"),
-                .kind = .dense_vector,
-                .coverage_config_hash = 77,
-                .coverage_generation = 42,
-                .coverage_identity_ready = true,
-                .projection_checkpoint_applied_sequence = 0,
-                .projection_checkpoint_generation = 4,
-                .projection_checkpoint_config_hash = 77,
-                // A separately sampled lifecycle must not be combined with the
-                // retained projection generation.
-                .index_repair_id = 92,
-                .index_lifecycle_work_class = .repair,
-                .index_repair_trigger = "artifact_coverage_mismatch",
-                .index_repair_phase = "preflight",
-                .index_repair_status = .waiting,
-                .index_repair_action_required = true,
-            }};
-            var incoming = LocalTableRuntimeStatus{
-                .group_id = 7,
-                .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
-                .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
-            };
+                var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
+                    .name = @constCast("thumbnail"),
+                    .kind = .dense_vector,
+                    .coverage_config_hash = 77,
+                    .coverage_generation = 42,
+                    .coverage_identity_ready = true,
+                    .projection_checkpoint_applied_sequence = 0,
+                    .projection_checkpoint_generation = 4,
+                    .projection_checkpoint_config_hash = 77,
+                    // A separately sampled lifecycle must not be combined with the
+                    // retained projection generation.
+                    .index_repair_id = 92,
+                    .index_lifecycle_work_class = .repair,
+                    .index_repair_trigger = "artifact_coverage_mismatch",
+                    .index_repair_phase = "preflight",
+                    .index_repair_status = .waiting,
+                    .index_repair_action_required = action_required,
+                }};
+                var incoming = LocalTableRuntimeStatus{
+                    .group_id = 7,
+                    .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
+                    .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
+                };
 
-            try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
-            const retained = incoming.stats.indexes[0];
-            try std.testing.expectEqual(@as(?u128, 91), retained.index_repair_id);
-            try std.testing.expectEqual(db_mod.types.IndexLifecycleWorkClass.initial_build, retained.index_lifecycle_work_class);
-            try std.testing.expectEqualStrings("catalog_admission", retained.index_repair_trigger);
-            try std.testing.expectEqualStrings("building", retained.index_repair_phase);
-            try std.testing.expectEqual(db_mod.types.IndexRepairStatus.rebuilding, retained.index_repair_status.?);
-            try std.testing.expect(!retained.index_repair_action_required);
+                const incoming_expected = incoming_indexes[0];
+                try preserveArtifactVisibilityOnReplayRegression(std.testing.allocator, previous, &incoming, null, false, null);
+                const retained = incoming.stats.indexes[0];
+                // Retained serving facts keep their lifecycle unless the incoming
+                // owner explicitly requires repair; that failure remains authoritative.
+                const expected = if (action_required) incoming_expected else previous_indexes[0];
+                try std.testing.expect(retained.serving_snapshot_ready);
+                try std.testing.expectEqual(@as(?u128, if (action_required) 92 else 91), retained.index_repair_id);
+                try std.testing.expectEqual(expected.index_lifecycle_work_class, retained.index_lifecycle_work_class);
+                try std.testing.expectEqualStrings(expected.index_repair_trigger, retained.index_repair_trigger);
+                try std.testing.expectEqualStrings(expected.index_repair_phase, retained.index_repair_phase);
+                try std.testing.expectEqual(expected.index_repair_status, retained.index_repair_status);
+                try std.testing.expectEqual(action_required, retained.index_repair_action_required);
+            }
         }
 
         test "catching up observation cannot preserve a same-config replacement incarnation" {
@@ -11512,6 +11783,12 @@ fn consumerTests() type {
             const docs_items = try std.testing.allocator.alloc(LocalTableRuntimeStatus, 2);
             docs_items[0] = .{
                 .group_id = 7,
+                .lsm_storage_stats = .{
+                    .maintenance = .{ .mutable_entries = 11, .total_runs = 2 },
+                    .write = .{ .flushes = 3, .table_file_compression_codec_mask = 0b001 },
+                    .maintenance_score = 4,
+                    .maintenance_debt_hint = 5,
+                },
                 .stats = .{
                     .doc_count = 11,
                     .index_count = 2,
@@ -11950,4 +12227,18 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "system catalog runtime status clones retain status names after JSON is released" {
+    const alloc = std.testing.allocator;
+    const body = try alloc.dupe(u8, "{\"enrichment\":{\"projection_checkpoint_status\":\"repair_required\",\"stall_reason\":\"publishing_overdue\",\"active_phase\":\"publishing\"}}");
+    var parsed = try std.json.parseFromSlice(db_mod.types.DBStats, alloc, body, .{});
+    const cloned = try cloneDBStats(alloc, parsed.value);
+    defer db_mod.types.freeDBStats(alloc, cloned);
+    parsed.deinit();
+    @memset(body, 0xaa);
+    alloc.free(body);
+    try std.testing.expectEqualStrings("repair_required", cloned.enrichment.projection_checkpoint_status);
+    try std.testing.expectEqualStrings("publishing_overdue", cloned.enrichment.stall_reason);
+    try std.testing.expectEqualStrings("publishing", cloned.enrichment.active_phase);
 }

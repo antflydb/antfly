@@ -938,6 +938,7 @@ fn metadataDataBearingStoreGroupRouter(svc: *service.MetadataHttpService) api_ta
 
 fn metadataStoreRouterLocalNodeId(ptr: *anyopaque) u64 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    if (!svc.local_data_owner) return 0;
     return svc.raft.host.http_host.host.cfg.local_node_id;
 }
 
@@ -975,7 +976,7 @@ fn metadataDataBearingStoreRouterGroupLeaderNodeId(ptr: *anyopaque, group_id: u6
     return candidate.node_id;
 }
 
-fn metadataDataBearingStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u64 {
+fn metadataDataBearingStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, _: api_table_router.RouteBudget) ![]u64 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     var snapshot = try loadMetadataRoutingSnapshot(svc, svc.alloc);
     defer snapshot.deinit(svc, svc.alloc);
@@ -998,12 +999,7 @@ fn metadataDataBearingStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Al
     return out;
 }
 
-fn metadataDataBearingStoreRouterGroupRoutes(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    group_ids: []const u64,
-    policy: api_table_router.RoutePolicy,
-) !?[]api_table_router.GroupRoute {
+fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.Allocator, group_ids: []const u64, policy: api_table_router.RoutePolicy, _: api_table_router.RouteBudget) !?[]api_table_router.GroupRoute {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     // Metadata nodes never own data replicas, so both policies use the same
     // remote ordering: the comparator prefers a leader and otherwise returns
@@ -1067,7 +1063,7 @@ fn metadataDataBearingStoreRouterGroupRoutes(
     defer candidates.deinit(alloc);
     try candidates.ensureTotalCapacity(alloc, @intCast(snapshot.placements.len));
     for (snapshot.stores) |store| {
-        if (store.node_id == local_node_id or store.api_url.len == 0 or
+        if ((svc.local_data_owner and store.node_id == local_node_id) or store.api_url.len == 0 or
             !store.live or !std.mem.eql(u8, store.health_class, "healthy")) continue;
 
         for (store.group_statuses) |status| {
@@ -1137,7 +1133,7 @@ fn metadataDataBearingStoreRouterGroupRoutes(
     return routes;
 }
 
-fn metadataStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u64 {
+fn metadataStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, _: api_table_router.RouteBudget) ![]u64 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const placements = try svc.listProjectedPlacementIntents(svc.alloc);
     defer svc.freeProjectedPlacementIntents(svc.alloc, placements);
@@ -1159,7 +1155,7 @@ fn metadataStoreRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, nod
     return try alloc.dupe(u8, store.api_url);
 }
 
-fn metadataStoreRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64) !?[]u8 {
+fn metadataStoreRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, _: api_table_router.RouteBudget) !?[]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     var snapshot = try loadMetadataRoutingSnapshot(svc, svc.alloc);
     defer snapshot.deinit(svc, svc.alloc);

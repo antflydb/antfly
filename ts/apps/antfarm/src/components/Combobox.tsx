@@ -48,26 +48,14 @@ export function Combobox({
   const selectedOption = options.find((option) => option.value === value);
 
   const handleSelect = (selectedValue: string) => {
-    onChange?.(selectedValue === value ? "" : selectedValue);
+    onChange?.(selectedValue);
     setOpen(false);
     setSearchValue("");
   };
 
-  const handleInputChange = (inputValue: string) => {
-    setSearchValue(inputValue);
-    if (allowCustomValue && onChange) {
-      onChange(inputValue);
-    }
-  };
-
-  const handleKeyDown = (event: React.KeyboardEvent) => {
-    if (allowCustomValue && event.key === "Enter" && searchValue) {
-      onChange?.(searchValue);
-      setOpen(false);
-      setSearchValue("");
-      event.preventDefault();
-    }
-  };
+  const customValue = searchValue.trim();
+  const showCustomOption =
+    allowCustomValue && customValue && !options.some((option) => option.value === customValue);
 
   const displayValue = selectedOption
     ? selectedOption.label
@@ -76,7 +64,13 @@ export function Combobox({
       : "";
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover
+      open={open}
+      onOpenChange={(nextOpen) => {
+        setOpen(nextOpen);
+        if (!nextOpen) setSearchValue("");
+      }}
+    >
       <PopoverTrigger asChild>
         <Button
           variant="outline"
@@ -98,11 +92,10 @@ export function Combobox({
           <CommandInput
             placeholder={searchPlaceholder}
             value={searchValue}
-            onValueChange={handleInputChange}
-            onKeyDown={handleKeyDown}
+            onValueChange={setSearchValue}
           />
           <CommandList>
-            <CommandEmpty>{emptyText}</CommandEmpty>
+            {!showCustomOption && <CommandEmpty>{emptyText}</CommandEmpty>}
             {options.length > 0 && (
               <CommandGroup>
                 {options.map((option) => (
@@ -116,6 +109,13 @@ export function Combobox({
                     {option.label}
                   </CommandItem>
                 ))}
+              </CommandGroup>
+            )}
+            {showCustomOption && (
+              <CommandGroup>
+                <CommandItem value={customValue} onSelect={() => handleSelect(customValue)}>
+                  Use “{customValue}”
+                </CommandItem>
               </CommandGroup>
             )}
           </CommandList>

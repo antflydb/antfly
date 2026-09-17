@@ -44,7 +44,8 @@ pub const TableRecord = topology_records.TableRecord;
 pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
+    return @import("../common/vector_migration.zig").admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
+        lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
         lhs.table_id == rhs.table_id and
         std.mem.eql(u8, lhs.name, rhs.name) and
         std.mem.eql(u8, lhs.description, rhs.description) and
@@ -71,6 +72,16 @@ fn hashTableDefinitionPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const 
 pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerprint {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-table-definition-v1");
+    if (table.storage_migration) |migration| {
+        hashTableDefinitionPart(&hasher, "vector-migration-v1");
+        hashTableDefinitionPart(&hasher, migration.request.job_id);
+        hashTableDefinitionPart(&hasher, @tagName(migration.request.mode));
+        inline for (std.meta.fields(@TypeOf(migration.request.budget))) |field| {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, @field(migration.request.budget, field.name), .little);
+            hasher.update(&bytes);
+        }
+    }
     // Preserve fingerprints of existing default-mode tables.
     if (table.storage.dense_embeddings != .primary_lsm)
         hashTableDefinitionPart(&hasher, @tagName(table.storage.dense_embeddings));
@@ -794,8 +805,13 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
     return digest;
 }
 
+pub const store_runtime_reference_header = "X-Antfly-Store-Runtime-Reference";
+
 pub const StoreStatusReport = struct {
     store_id: u64,
+    /// Internal heartbeat endpoint only: retain committed runtime observations
+    /// for this exact reporter incarnation and status generation.
+    runtime_reference: bool = false,
     /// Version of the volatile owner-activity projection carried by this
     /// heartbeat. Zero means absent/legacy; version 2 is the current schema.
     /// This is intentionally not copied into StoreRecord or Raft state.
@@ -1212,6 +1228,15 @@ pub const RuntimeIndexSourceReplayStatusReport = struct {
     failed: bool = false,
 };
 
+pub const max_schema_progress_batch = 64;
+pub fn validateSchemaProgressBatch(records: []const SchemaProgressRecord) !void {
+    if (records.len == 0 or records.len > max_schema_progress_batch) return error.InvalidSchemaProgressRequest;
+    for (records, 0..) |record, i| {
+        if (record.table_id == 0 or record.node_id == 0 or record.node_id != records[0].node_id) return error.InvalidSchemaProgressRequest;
+        for (records[0..i]) |prior| if (prior.table_id == record.table_id) return error.InvalidSchemaProgressRequest;
+    }
+}
+
 pub const SchemaProgressRecord = struct {
     table_id: u64,
     node_id: u64,
@@ -1340,6 +1365,7 @@ pub const MergeIntent = struct {
 pub const TableManager = struct {
     alloc: std.mem.Allocator,
     tables: std.AutoHashMapUnmanaged(u64, TableRecord) = .empty,
+    table_names: std.StringHashMapUnmanaged(u64) = .empty,
     ranges: std.AutoHashMapUnmanaged(u64, RangeRecord) = .empty,
     split_intents: std.AutoHashMapUnmanaged(u64, SplitIntent) = .empty,
     merge_intents: std.AutoHashMapUnmanaged(u64, MergeIntent) = .empty,
@@ -1349,6 +1375,7 @@ pub const TableManager = struct {
     }
 
     pub fn deinit(self: *TableManager) void {
+        self.table_names.deinit(self.alloc);
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
         self.tables.deinit(self.alloc);
@@ -1368,24 +1395,76 @@ pub const TableManager = struct {
         self.* = undefined;
     }
 
+    pub fn findTableByName(self: *const TableManager, name: []const u8) ?*const TableRecord {
+        const id = self.table_names.get(name) orelse return null;
+        return self.tables.getPtr(id);
+    }
+
     pub fn upsertTable(self: *TableManager, record: TableRecord) !void {
+        if (self.tables.get(record.table_id)) |existing| {
+            if (existing.storage_migration != null and !tableDefinitionsEqual(existing, record))
+                return error.VectorMigrationActive;
+        }
+        return self.upsertTableUnchecked(record);
+    }
+
+    pub fn publishVectorMigrationTable(self: *TableManager, expected: TableRecord, record: TableRecord) !void {
+        const current = self.tables.get(expected.table_id) orelse return error.UnknownTable;
+        if (!tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+        var contract = record;
+        contract.storage = expected.storage;
+        contract.storage_migration = expected.storage_migration;
+        if (!tableDefinitionsEqual(contract, expected)) return error.VectorMigrationConfigurationChanged;
+        if (record.storage_migration) |admission| try admission.request.validate();
+        if (expected.storage.dense_embeddings == .vector_store and record.storage.dense_embeddings != .vector_store)
+            return error.UnsupportedVectorMigrationDirection;
+        if (expected.storage_migration) |active| {
+            if (record.storage_migration) |next| if (!active.eql(next)) return error.VectorMigrationIdempotencyConflict;
+        } else if (!tableDefinitionsEqual(expected, record)) {
+            if (expected.storage.dense_embeddings != .primary_lsm or record.storage.dense_embeddings != .primary_lsm or
+                record.storage_migration == null) return error.InvalidVectorMigrationState;
+        }
+        return self.upsertTableUnchecked(record);
+    }
+
+    fn upsertTableUnchecked(self: *TableManager, record: TableRecord) !void {
+        if (self.table_names.get(record.name)) |id| if (id != record.table_id) return error.TableAlreadyExists;
         const owned = try cloneTable(self.alloc, record);
         errdefer freeTable(self.alloc, owned);
+        // Complete every allocation before changing either index or freeing a
+        // borrowed name. Replacement/rollback cannot publish half an index.
+        try self.tables.ensureUnusedCapacity(self.alloc, 1);
+        try self.table_names.ensureUnusedCapacity(self.alloc, 1);
         if (self.tables.getPtr(record.table_id)) |existing| {
+            _ = self.table_names.remove(existing.name);
             freeTable(self.alloc, existing.*);
             existing.* = owned;
-            return;
-        }
-        try self.tables.put(self.alloc, record.table_id, owned);
+        } else self.tables.putAssumeCapacity(record.table_id, owned);
+        self.table_names.putAssumeCapacity(owned.name, owned.table_id);
     }
 
     pub fn upsertRange(self: *TableManager, record: RangeRecord) !void {
         try group_ids.requireDataGroupId(record.group_id);
         const table = self.tables.get(record.table_id) orelse return error.UnknownTable;
-        _ = table;
-
         var normalized = record;
         if (normalized.range_id == 0) normalized.range_id = normalized.group_id;
+        if (table.storage_migration != null) {
+            const existing = self.ranges.get(record.group_id) orelse return error.VectorMigrationActive;
+            if (!rangeRecordsEqual(existing, normalized)) return error.VectorMigrationActive;
+        }
+
+        try self.installProjectedRange(normalized);
+    }
+
+    // Loading a complete durable projection reconstructs an already-admitted
+    // topology. It must not apply the live topology-change fence to its first
+    // range, while ordinary upserts still reject changes during migration.
+    fn installProjectedRange(self: *TableManager, record: RangeRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
+        if (!self.tables.contains(record.table_id)) return error.UnknownTable;
+        var normalized = record;
+        if (normalized.range_id == 0) normalized.range_id = normalized.group_id;
+
         const owned = try cloneRange(self.alloc, normalized);
         errdefer freeRange(self.alloc, owned);
         if (self.ranges.getPtr(record.group_id)) |existing| {
@@ -1397,6 +1476,7 @@ pub const TableManager = struct {
     }
 
     pub fn clearTopology(self: *TableManager) void {
+        self.table_names.clearRetainingCapacity();
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
         self.tables.clearRetainingCapacity();
@@ -1409,7 +1489,7 @@ pub const TableManager = struct {
     pub fn replaceTopology(self: *TableManager, tables: []const TableRecord, ranges: []const RangeRecord) !void {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
-        for (ranges) |record| try self.upsertRange(record);
+        for (ranges) |record| try self.installProjectedRange(record);
     }
 
     pub const ProjectedTopologyLoadResult = struct {
@@ -1426,7 +1506,7 @@ pub const TableManager = struct {
                 result.skipped_orphan_ranges += 1;
                 continue;
             }
-            try self.upsertRange(record);
+            try self.installProjectedRange(record);
         }
         return result;
     }
@@ -1434,6 +1514,7 @@ pub const TableManager = struct {
     pub fn removeTable(self: *TableManager, table_id: u64) bool {
         const removed = self.tables.fetchRemove(table_id);
         if (removed) |entry| {
+            _ = self.table_names.remove(entry.value.name);
             freeTable(self.alloc, entry.value);
             return true;
         }
@@ -1507,6 +1588,7 @@ pub const TableManager = struct {
     }
 
     pub fn requestSplit(self: *TableManager, intent: SplitIntent) !void {
+        if (self.tables.get(intent.table_id)) |table| if (table.storage_migration != null) return error.VectorMigrationActive;
         try group_ids.requireDataGroupId(intent.source_group_id);
         try group_ids.requireDataGroupId(intent.destination_group_id);
         const source = self.ranges.getPtr(intent.source_group_id) orelse return error.UnknownSourceRange;
@@ -2091,6 +2173,9 @@ fn freeOwnedOptional(alloc: std.mem.Allocator, value: ?[]const u8) void {
 }
 
 pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
+    var storage_migration = record.storage_migration;
+    if (storage_migration) |*migration| migration.request.job_id = try alloc.dupe(u8, migration.request.job_id);
+    errdefer if (storage_migration) |migration| alloc.free(migration.request.job_id);
     const name = try alloc.dupe(u8, record.name);
     errdefer alloc.free(name);
     const description = try alloc.dupe(u8, record.description);
@@ -2111,6 +2196,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     errdefer alloc.free(restore_location);
     return .{
         .storage = record.storage,
+        .storage_migration = storage_migration,
         .table_id = record.table_id,
         .name = name,
         .description = description,
@@ -2166,6 +2252,7 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
 }
 
 pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
+    if (record.storage_migration) |migration| alloc.free(migration.request.job_id);
     alloc.free(record.name);
     alloc.free(record.description);
     alloc.free(record.schema_json);
@@ -3410,4 +3497,39 @@ test "table manager parses placement classes and checks compatibility" {
     try std.testing.expect(!placementRoleCompatible("serving", "bulk"));
     try std.testing.expect(placementRoleCompatible("custom", "custom"));
     try std.testing.expect(!placementRoleCompatible("custom", "archive"));
+}
+
+test "system catalog table name index follows replacement removal and topology reset" {
+    const alloc = std.testing.allocator;
+    var manager = TableManager.init(alloc);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 1, .name = "before" });
+    try manager.upsertTable(.{ .table_id = 1, .name = "after" });
+    try std.testing.expect(manager.findTableByName("before") == null);
+    try std.testing.expectEqual(@as(u64, 1), manager.findTableByName("after").?.table_id);
+    try std.testing.expectError(error.TableAlreadyExists, manager.upsertTable(.{ .table_id = 2, .name = "after" }));
+    try std.testing.expect(manager.tables.get(2) == null);
+    try std.testing.expect(manager.removeTable(1));
+    try std.testing.expect(manager.findTableByName("after") == null);
+    try manager.upsertTable(.{ .table_id = 2, .name = "after" });
+    manager.clearTopology();
+    try std.testing.expect(manager.findTableByName("after") == null);
+}
+
+test "system catalog table name index replacement is atomic on allocation failure" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var manager = TableManager.init(alloc);
+            defer manager.deinit();
+            try manager.upsertTable(.{ .table_id = 1, .name = "before" });
+            manager.upsertTable(.{ .table_id = 1, .name = "after" }) catch |err| {
+                try std.testing.expectEqual(@as(u64, 1), manager.findTableByName("before").?.table_id);
+                try std.testing.expect(manager.findTableByName("after") == null);
+                return err;
+            };
+            try std.testing.expect(manager.findTableByName("before") == null);
+            try std.testing.expectEqual(@as(u64, 1), manager.findTableByName("after").?.table_id);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

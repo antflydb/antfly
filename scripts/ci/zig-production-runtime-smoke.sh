@@ -124,6 +124,29 @@ run_profile() {
   if [[ "$profile" == "local" ]]; then
     exercise_post_handler_init_failure "$port"
   fi
+  # Exercise catalog writes and ordered listing through the production storage
+  # boundary, including the lite system-store adapter. A fresh-start readiness
+  # check alone does not verify that persisted catalog indexes survive reopen.
+  local catalog_url="http://127.0.0.1:${port}/db/v1/databases/runtime_smoke"
+  local tables_url="${catalog_url}/namespaces/public/tables"
+  assert_http_status "$profile-catalog-database" 201 POST "$catalog_url" '{}'
+  assert_http_status "$profile-catalog-table" 201 POST "$tables_url/events" '{}'
+  assert_http_status "$profile-catalog-before" 200 GET "$tables_url"
+  cleanup_server
+  "$binary" standalone \
+    --host 127.0.0.1 \
+    --port "$port" \
+    --health false \
+    "$@" >"$log" 2>&1 &
+  server_pid="$!"
+  wait_ready "$profile-reopen" "$port" "$log"
+  assert_http_status "$profile-catalog-after" 200 GET "$tables_url"
+  python3 -c '
+import json, sys
+before, after = (json.load(open(path)) for path in sys.argv[1:])
+assert len(before) == len(after) == 1, (before, after)
+assert before[0]["table_id"] == after[0]["table_id"], (before, after)
+' "$smoke_root/$profile-catalog-before-response.txt" "$smoke_root/$profile-catalog-after-response.txt"
   cleanup_server
   echo "production ${profile} runtime boundary smoke passed"
 }

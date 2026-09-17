@@ -800,6 +800,40 @@ pub const ExclusiveTransition = struct {
         _ = try reconcilePublishedGenerationExclusive(self.alloc, io_impl.io(), self.path, self.cleanup_scheduler);
     }
 
+    /// Stable, explicitly retained candidate for resumable offline conversion.
+    /// The caller validates its durable job before opening any existing stage.
+    pub fn resumeStaging(self: *ExclusiveTransition, job_id: []const u8) !StagedGeneration {
+        try self.validate(self.path);
+        try (@import("../../common/vector_migration.zig").Request{ .job_id = job_id, .mode = .offline }).validate();
+        const io = self.io orelse return error.MissingBackendRuntimeIo;
+        try self.reconcilePublished();
+        const live = try self.alloc.dupe(u8, self.path);
+        errdefer self.alloc.free(live);
+        const live_z = try self.alloc.dupeZ(u8, self.path);
+        errdefer self.alloc.free(live_z);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(job_id, &digest, .{});
+        const stage = try std.fmt.allocPrint(self.alloc, "{s}.restore-stage-{x}-{x}", .{
+            self.path, std.mem.readInt(u64, digest[0..8], .little), std.mem.readInt(u64, digest[8..16], .little),
+        });
+        errdefer self.alloc.free(stage);
+        const stage_z = try self.alloc.dupeZ(u8, stage);
+        errdefer self.alloc.free(stage_z);
+        try fs_paths.createDirPathPortable(io, stage);
+        return .{
+            .alloc = self.alloc,
+            .manager = self.manager,
+            .transition_id = self.id,
+            .live_path = live,
+            .live_path_z = live_z,
+            .staging_path = stage,
+            .staging_path_z = stage_z,
+            .cleanup_scheduler = self.cleanup_scheduler,
+            .io = io,
+            .preserve_unpublished = true,
+        };
+    }
+
     pub fn beginStaging(self: *ExclusiveTransition) !StagedGeneration {
         try self.validate(self.path);
         return try beginStagingGeneration(self.alloc, self.manager, self.path, self.id, self.cleanup_scheduler, self.io, true);
@@ -815,27 +849,11 @@ fn beginStagingGeneration(
     io_override: ?std.Io,
     reconcile: bool,
 ) !StagedGeneration {
-    const live_path = try alloc.dupe(u8, path);
-    errdefer alloc.free(live_path);
-    const live_path_z = try alloc.dupeZ(u8, path);
-    errdefer alloc.free(live_path_z);
-    // The basename is also the durable publication/cleanup identity. Mix wall
-    // and monotonic time so an intent surviving a process or host restart does
-    // not alias a new staging generation after local counters reset.
-    const nonce = platform.time.realtimeNs() ^ std.math.rotl(u64, platform.time.monotonicNs(), 23);
-    const staging_path = try std.fmt.allocPrint(alloc, "{s}.restore-stage-{x}-{x}", .{ path, transition_id, nonce });
-    errdefer alloc.free(staging_path);
-    const staging_path_z = try alloc.dupeZ(u8, staging_path);
-    errdefer alloc.free(staging_path_z);
-
     if (io_override) |io| {
         return try beginStagingGenerationWithIo(
             alloc,
             manager,
-            live_path,
-            live_path_z,
-            staging_path,
-            staging_path_z,
+            path,
             transition_id,
             cleanup_scheduler,
             io,
@@ -847,10 +865,7 @@ fn beginStagingGeneration(
     var staged = try beginStagingGenerationWithIo(
         alloc,
         manager,
-        live_path,
-        live_path_z,
-        staging_path,
-        staging_path_z,
+        path,
         transition_id,
         cleanup_scheduler,
         io_impl.io(),
@@ -865,15 +880,28 @@ fn beginStagingGeneration(
 fn beginStagingGenerationWithIo(
     alloc: Allocator,
     manager: *Manager,
-    live_path: []u8,
-    live_path_z: [:0]u8,
-    staging_path: []u8,
-    staging_path_z: [:0]u8,
+    path: []const u8,
     transition_id: u64,
     cleanup_scheduler: ?CleanupScheduler,
     io: std.Io,
     reconcile: bool,
 ) !StagedGeneration {
+    const live_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(live_path);
+    const live_path_z = try alloc.dupeZ(u8, path);
+    errdefer alloc.free(live_path_z);
+    // This basename is a durable publication/cleanup identity. Use the same
+    // runtime's entropy as its filesystem so VOPR can replay it, while real
+    // restarts remain independent even when clocks or transition IDs repeat.
+    // Fixed-width encoding also keeps marker size independent of the nonce.
+    var nonce: [16]u8 = undefined;
+    try io.randomSecure(&nonce);
+    const nonce_hex = std.fmt.bytesToHex(nonce, .lower);
+    const staging_path = try std.fmt.allocPrint(alloc, "{s}.restore-stage-{x}-{s}", .{ path, transition_id, nonce_hex });
+    errdefer alloc.free(staging_path);
+    const staging_path_z = try alloc.dupeZ(u8, staging_path);
+    errdefer alloc.free(staging_path_z);
+
     if (reconcile) _ = try reconcilePublishedGenerationExclusive(alloc, io, live_path, cleanup_scheduler);
     if (pathExists(io, staging_path)) return error.GenerationStagingCollision;
     try fs_paths.createDirPathPortable(io, staging_path);
@@ -905,6 +933,7 @@ pub const StagedGeneration = struct {
     publication_outcome: ?PublicationOutcome = null,
     sealed: bool = false,
     preserve_retired: bool = false,
+    preserve_unpublished: bool = false,
     cleanup_scheduler: ?CleanupScheduler = null,
     /// Runtime-owned I/O carried by runtime-backed transitions. Legacy direct
     /// callers leave this null and retain the historical local-I/O fallback.
@@ -1137,7 +1166,7 @@ pub const StagedGeneration = struct {
         }
         if (self.published) {
             if (!self.preserve_retired) std.Io.Dir.cwd().deleteTree(io, self.staging_path) catch {};
-        } else {
+        } else if (!self.preserve_unpublished) {
             std.Io.Dir.cwd().deleteTree(io, self.staging_path) catch {};
         }
         self.alloc.free(self.staging_path);
@@ -1960,6 +1989,58 @@ pub fn hasPublishedGenerationRead(path: []const u8) !bool {
 
 pub fn hasPublishedGenerationReadWithIo(path: []const u8, io: std.Io) !bool {
     return try process_manager.hasReadersWithIo(path, io);
+}
+
+test "generation publication replays durable identities on borrowed VoprIo" {
+    const alloc = std.testing.allocator;
+    const VoprIo = @import("vopr").vopr_io.VoprIo;
+    var left = try VoprIo.init(.{ .seed = 704, .file_allocator = alloc });
+    defer left.deinit();
+    var right = try VoprIo.init(.{ .seed = 704, .file_allocator = alloc });
+    defer right.deinit();
+    var previous_name: ?[]u8 = null;
+    defer if (previous_name) |name| alloc.free(name);
+    var marker_bytes: ?u64 = null;
+
+    for (0..4) |_| {
+        // Recreate process-local counters while runtime clocks remain frozen.
+        // Each new durable identity must be unique, and replay must reproduce it.
+        var left_manager = Manager.init(alloc);
+        defer left_manager.deinit();
+        var right_manager = Manager.init(alloc);
+        defer right_manager.deinit();
+        var left_transition = try left_manager.beginExclusiveWithIo("/db", left.io());
+        defer left_transition.deinit();
+        var right_transition = try right_manager.beginExclusiveWithIo("/db", right.io());
+        defer right_transition.deinit();
+        var left_stage = try left_transition.beginStaging();
+        defer left_stage.deinit();
+        var right_stage = try right_transition.beginStaging();
+        defer right_stage.deinit();
+        try std.testing.expectEqualStrings(left_stage.path(), right_stage.path());
+        try std.testing.expect(isGeneratedStageName(std.fs.path.basename(left_stage.path()), "db.restore-stage-"));
+        if (previous_name) |name| {
+            try std.testing.expect(!std.mem.eql(u8, name, left_stage.path()));
+            alloc.free(name);
+            previous_name = null;
+        }
+        previous_name = try alloc.dupe(u8, left_stage.path());
+
+        _ = try left_stage.publishPrepared();
+        _ = try right_stage.publishPrepared();
+        var left_marker = (try readPublicationMarker(alloc, left.io(), "/db")).?;
+        defer left_marker.deinit(alloc);
+        var right_marker = (try readPublicationMarker(alloc, right.io(), "/db")).?;
+        defer right_marker.deinit(alloc);
+        try std.testing.expectEqualStrings(left_marker.retained_name, right_marker.retained_name);
+        const bytes = try left.files.bytesUnderPrefix("/db");
+        try std.testing.expect(bytes > 0);
+        try std.testing.expectEqual(bytes, try right.files.bytesUnderPrefix("/db"));
+        if (marker_bytes) |expected| try std.testing.expectEqual(expected, bytes);
+        marker_bytes = bytes;
+    }
+    try left.ensureNoCapabilityViolation();
+    try right.ensureNoCapabilityViolation();
 }
 
 test "generation lifecycle serializes the same root and validates capability target" {

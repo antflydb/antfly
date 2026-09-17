@@ -1,5 +1,127 @@
 # Zig E2E flakes
 
+## 2026-09-16: constrained Autograph restart exited during teardown
+
+The [second PR #704 production soak](https://github.com/antflydb/antfly/actions/runs/35126679231/job/104951437450)
+failed `test_multinode_autograph_recovers_after_data_restart` at constrained
+worker 2, iteration 16: node 102 exited with `StorageBusy` during committed Raft
+apply. The same root logged lost `DistributedQueryUnavailable` error identity.
+The test body passed; the teardown assertion correctly caught the failed process.
+The workflow's `tee` pipeline hid the script failure until JUnit verification.
+See [the runtime investigation](../FLAKES.md#2026-09-16-constrained-autograph-restart-lost-retryable-owner-admission)
+for the admission/replay fix, error transport, and deterministic regressions.
+
+## 2026-09-15: Autograph promotion and read-timeout boundary
+
+The first corrected local executable still failed 3/10 data-restart cases and
+exposed a promotion callback using a freed Raft service during shutdown. The
+compiled-owner shutdown barrier and resolver activation ordering are corrected.
+Revision `256bb99782` passed ten restart probes and the full local 200-case
+Autograph soak: 100 normal and 100 descriptor-limited cases, with 50 ordinary
+and 50 restart cases per profile, zero failures/errors/skips, and an unchanged
+executable hash. This result precedes the subsequent apply-lock handoff fix;
+Linux CI and full VOPR qualification must validate the final revision. The restart test now rejects
+spontaneous assertion/segmentation crashes instead of silently replacing the
+process. See `../FLAKES.md` for exact executable hashes and evidence.
+
+`test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities`
+failed in [run 34928784180](https://github.com/antflydb/antfly/actions/runs/34928784180/job/104259435053)
+with missing promoted entities and an HTTP 500 caused by an untransportable
+`ReadIndexTimeout`. See [the runtime investigation](../FLAKES.md#2026-09-15-multi-node-autograph-promotion-stalls-with-an-untransportable-read-timeout)
+for the exact revision, retained journal evidence, and deterministic reopen fix.
+The merged-main production binary reproduced two failures in 100 local cases:
+pending promotion at journal sequence 3 was absent from the reopened runtime's
+target of 2. A later 50/50 pass does not invalidate those failures.
+The poller now rejects unexpected 500s immediately. The scheduled production
+soak runs 50 normal and 50 constrained-descriptor repetitions of each of the
+original case and `test_multinode_autograph_recovers_after_data_restart`, using
+`scripts/ci/zig-e2e-autograph-soak.sh`, with exact JUnit counts and retained native
+failure diagnostics (GDB on Linux, `sample` on macOS). The restart case exposed
+an additional untransportable `AddressUnavailable`; known read-transport failures
+now preserve the existing retryable read-availability contract. A passing helper
+or deterministic test does not qualify the post-fix production soak.
+
+
+## 2026-09-13: artifact coverage restart failure reproduced locally (#722)
+
+[CI run 34789270919, job 103815319126](https://github.com/antflydb/antfly/actions/runs/34789270919/job/103815319126?pr=722)
+reported three failures, 443 passes, and five skips on `87da3ef6d4`:
+
+- `test_table_chunker_full_text_index_routes_template_chunks[stateful]` returned
+  HTTP 500 with `RuntimeBoundaryFailure` while querying the enabled full-text index.
+- `test_artifact_coverage_terminal_outcomes_by_policy_after_restart` exhausted
+  its existing 90-second wait after restart; the partial-policy index reported
+  `runtime_unavailable` and `missing_group`.
+- `test_semantic_timeout_budget_survives_embedding_cache` returned an unexpected
+  HTTP 504 in the positive query-budget loop.
+
+[The rerun job](https://github.com/antflydb/antfly/actions/runs/34789270919/job/103820209296)
+reported **one failure, 445 passes, five skips**: only the same partial-policy
+artifact restart failure recurred. The other two scenarios passed that attempt.
+
+The unchanged PR revision was built locally in native macOS arm64 Debug.
+Executable SHA-256:
+`289c0bf27f8a13dabd35f138414bad784daf3062df2c42f3c24c6893cbec77b9`.
+Python was 3.12.11. Each scenario passed three serial repetitions and 30
+concurrent repetitions (three workers, ten iterations each): **33/33 per
+scenario**, with no failures or skips. The three containing modules then passed
+**54/54** using the CI scheduler settings of four pytest workers and two Antfly
+process slots, including the shared module fixture used by the full-text case.
+Assertions, deadlines, and test implementations were unchanged; no failed-case
+retries were added. Failure-root preservation and native diagnostics were enabled.
+
+A fresh batch on the same executable ran **100 repetitions per scenario**
+(four workers, 25 iterations each). Full-text routing passed **100/100** and
+semantic deadlines passed **100/100**; artifact restart passed **99/100**.
+Worker 1, iteration 3 reproduced the CI signature after restart: the
+partial-policy index had `runtime_present=false`, `runtime_fresh=false`,
+one expected group, zero reported groups, and one missing group. Its coverage
+reasons were exactly `runtime_unavailable` and `missing_group`, and the
+unchanged 90-second wait expired. The earlier 33/33 batch did not expose this
+failure; its passes are not combined with this fresh batch.
+
+Complete batch output is `/tmp/pr722-local-100.log`. Worker logs are preserved
+under `/var/folders/4d/kpjq2k9s0290tgwy5n3rwxxr0000gn/T/antfly-e2e-regression.DDj7Pl`.
+The failed database and server log are archived in
+`/tmp/pr722-artifact-restart-failure.tar.gz`, SHA-256
+`a35c64eda13c504e86c1e601975887b74e3052b1d5da18fc30e508495eaa132d`.
+Use workers=4 and repeats=25 in the command below to reproduce this batch shape.
+
+The unchanged base commit `c1a39a3aeb65e62d9e4494c5b785a028e4520c5d` then
+passed **100/100 in all three scenarios** under the same native Debug workload,
+using the identical PR test harness and changing only `ANTFLY_BIN` to the base
+executable. Its SHA-256 is
+`60b322cf0d40bc18352ce9850d63d8f5250a23e8e9d4d108f39f4342d7be2b37`.
+The base checkout is `.worktrees/maintenance-base-repro`; complete output is
+`/tmp/pr722-base-100.log`. Machine-checked counts and binary identities are in
+`/tmp/pr722-100-run-comparison.json`. These are separate batches, with no skipped
+tests or failed-case retries. One PR failure versus zero base failures in these
+samples does not establish causation or show the base is free of the race.
+
+From the worktree root, after building `zig-out/bin/antfly` under `zig/`:
+
+```sh
+SKIP_BUILD=1 ANTFLY_E2E_ENV_LOADED=1 \
+  ANTFLY_E2E_REGRESSION_WORKERS=3 ANTFLY_E2E_REGRESSION_REPEATS=10 \
+  ANTFLY_E2E_PRESERVE_FAILURE_LIMIT=3 \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  'e2e/antfly/test_index_lifecycle.py::test_table_chunker_full_text_index_routes_template_chunks[stateful]' \
+  e2e/antfly/test_artifacts.py::test_artifact_coverage_terminal_outcomes_by_policy_after_restart \
+  e2e/antfly/test_query_deadlines.py::test_semantic_timeout_budget_survives_embedding_cache
+```
+
+Evidence: `/tmp/pr722-latest-failure.log`, `/tmp/pr722-local-e2e-build.log`,
+`/tmp/pr722-local-serial.log`, `/tmp/pr722-local-concurrent.log`, and
+`/tmp/pr722-local-modules.log`. CI used Linux x86_64 ReleaseFast with eight-CPU
+affinity and the complete Antfly base suite. The native artifact-restart failure
+matches its observed CI signature, but the two other failures remain unreproduced.
+These runs do not yet establish whether the failures predate the PR.
+The subsequent follow-up is tracked in [Zig runtime flakes](../FLAKES.md),
+including the overlapping #626 failures, deterministic ownership/publication
+and text-planning regressions, and separate before/after validation batches.
+The retained native failure is evidence for that investigation; the original
+full-text and deadline signatures have not been reproduced locally.
+
 ## 2026-09-11: stale expiry and uncertain capacity found in fresh review (#694)
 
 Two deterministic regressions failed on `8a4d2d83e`: a delayed expired-job

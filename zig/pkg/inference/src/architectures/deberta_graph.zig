@@ -62,6 +62,16 @@ const Shape = ml.graph.Shape;
 const null_node = ml.graph.null_node;
 const deberta_config = @import("../models/deberta.zig");
 
+/// The strict boundary training profile binds physical i32 indices. Preserve
+/// that dtype through the differentiable gather; legacy embedding paths keep
+/// the existing i64 conversion and fused dispatch behavior.
+fn embeddingLookupTyped(bld: *Builder, weight: NodeId, indices: NodeId, total: u32, dim: u32) !NodeId {
+    if (bld.graph.node(indices).output_shape.dtype == .i32) {
+        return bld.gather(weight, indices, Shape.init(bld.graph.node(weight).output_shape.dtype, &.{ @intCast(total), @intCast(dim) }));
+    }
+    return bld.embeddingLookup(weight, indices, total, dim);
+}
+
 pub const Config = struct {
     vocab_size: u32,
     hidden_size: u32,
@@ -86,6 +96,78 @@ pub const DebertaGraph = struct {
     output_node: NodeId,
 };
 
+/// Explicit graph construction controls. Legacy inference entry points retain
+/// their environment-selected attention route. Training callers choose the
+/// materialized route and supply replayable, non-trainable dropout inputs.
+pub const Attention = enum { legacy_default, fused, materialized, training_replay_v1 };
+pub const DropoutKind = enum { embeddings, relative_positions, attention_probabilities, attention_output, ffn_output };
+pub const DropoutSite = struct { kind: DropoutKind, layer: u32 = 0 };
+pub const Dropout = struct {
+    context: *anyopaque,
+    apply: *const fn (*anyopaque, *Builder, NodeId, DropoutSite) anyerror!NodeId,
+};
+/// Semantic boundaries for regional training replay. Callers retain/remap
+/// these IDs through later PEFT injection; node order is not a region contract.
+pub const RegionObserver = struct {
+    context: *anyopaque,
+    prelude: *const fn (*anyopaque, NodeId, NodeId) anyerror!void,
+    layer: *const fn (*anyopaque, u32, NodeId, NodeId) anyerror!void,
+};
+pub const BuildOptions = struct {
+    attention: Attention = .legacy_default,
+    dropout: ?Dropout = null,
+    regions: ?RegionObserver = null,
+    /// Multiplicative 0/1 score mask, paired with the additive bias. This
+    /// reproduces masked_fill's zero score gradient on invalid query/key pairs.
+    attention_score_mask: ?NodeId = null,
+    /// Module-call order matters for training dropout and shared Q/K LoRA:
+    /// project the normalized relative table before looking up each bucket.
+    project_relative_before_gather: bool = false,
+    /// Compact physical i32 replay/mask/bucket leaf consumed by the versioned
+    /// training operation. Probability dropout is replayed inside attention;
+    /// the ordinary callback still owns all other dropout module calls.
+    training_attention_v1: ?struct { control: NodeId, probability: f32 } = null,
+};
+
+pub fn buildForwardGraphWithOptions(
+    bld: *Builder,
+    config: Config,
+    input_ids: NodeId,
+    attn_bias: NodeId,
+    embedding_mask: ?NodeId,
+    batch: u32,
+    seq_len: u32,
+    options: BuildOptions,
+) !DebertaGraph {
+    if (options.attention == .training_replay_v1) {
+        const replay = options.training_attention_v1 orelse return error.InvalidTrainingAttentionPlan;
+        if (!options.project_relative_before_gather or options.attention_score_mask != null or attn_bias != null_node)
+            return error.InvalidTrainingAttentionPlan;
+        const attrs = ml.graph.DebertaTrainingAttentionAttrs{
+            .batch = batch,
+            .seq_len = seq_len,
+            .num_heads = config.num_attention_heads,
+            .head_dim = if (config.num_attention_heads == 0) 0 else config.hidden_size / config.num_attention_heads,
+            .relative_rows = config.max_position_embeddings,
+            .dropout_probability = replay.probability,
+            .dropout_stream_id = 0,
+        };
+        const layout = try attrs.layout();
+        if (config.hidden_size != layout.hidden or replay.control == null_node or
+            replay.control >= bld.graph.nodes.items.len or
+            !bld.graph.node(replay.control).output_shape.eq(layout.controlShape()))
+            return error.InvalidTrainingAttentionPlan;
+    } else if (options.training_attention_v1 != null) return error.InvalidTrainingAttentionPlan;
+    if ((options.dropout != null or options.attention_score_mask != null) and
+        options.attention != .materialized and options.attention != .training_replay_v1)
+        return error.InvalidTrainingAttentionPlan;
+    return buildForwardGraphInternal(bld, config, input_ids, attn_bias, embedding_mask, batch, seq_len, options);
+}
+
+fn applyDropout(bld: *Builder, input: NodeId, options: BuildOptions, site: DropoutSite) !NodeId {
+    return if (options.dropout) |dropout| dropout.apply(dropout.context, bld, input, site) else input;
+}
+
 /// Construct a DeBERTa forward graph with HF-compatible parameter names.
 /// `input_ids` and `attn_bias` are created by the caller (typically the
 /// autodiff trainer harness) and passed in; this function does NOT create
@@ -102,7 +184,7 @@ pub fn buildForwardGraph(
     batch: u32,
     seq_len: u32,
 ) !DebertaGraph {
-    return buildForwardGraphInternal(bld, config, input_ids, attn_bias, null, batch, seq_len);
+    return buildForwardGraphInternal(bld, config, input_ids, attn_bias, null, batch, seq_len, .{});
 }
 
 /// Construct a DeBERTa forward graph with an explicit embedding mask.
@@ -117,7 +199,7 @@ pub fn buildForwardGraphMasked(
     batch: u32,
     seq_len: u32,
 ) !DebertaGraph {
-    return buildForwardGraphInternal(bld, config, input_ids, attn_bias, embedding_mask, batch, seq_len);
+    return buildForwardGraphInternal(bld, config, input_ids, attn_bias, embedding_mask, batch, seq_len, .{});
 }
 
 fn buildForwardGraphInternal(
@@ -128,9 +210,12 @@ fn buildForwardGraphInternal(
     embedding_mask: ?NodeId,
     batch: u32,
     seq_len: u32,
+    options: BuildOptions,
 ) !DebertaGraph {
     const H: u32 = config.hidden_size;
-    const total: u32 = batch * seq_len;
+    if (batch == 0 or seq_len == 0 or H == 0 or config.num_attention_heads == 0 or
+        H % config.num_attention_heads != 0) return error.InvalidInputShape;
+    const total = try std.math.mul(u32, batch, seq_len);
     const num_heads: u32 = config.num_attention_heads;
     const head_dim: u32 = H / num_heads;
 
@@ -139,39 +224,64 @@ fn buildForwardGraphInternal(
     if (embedding_mask) |mask| {
         hidden = try bld.mul(hidden, mask);
     }
+    hidden = try applyDropout(bld, hidden, options, .{ .kind = .embeddings });
 
     // ──────── Relative position embeddings (disentangled attention) ────────
     // 1. Shared rel_embeddings.weight: [max_position, H]
     // 2. DeBERTa-v3 norm_rel_ebd: encoder.LayerNorm applied to raw rel_embeddings
     // 3. Bucket index lookup to get [num_rel, H]
-    const rel_emb_gathered = try buildRelativePositionEmb(bld, config, seq_len, H);
+    const training_replay = options.attention == .training_replay_v1;
+    const relative = try buildRelativePositionTable(bld, config, seq_len, H, options.attention == .materialized, !training_replay);
+    if (options.regions) |observer| try observer.prelude(observer.context, hidden, relative.table);
+    const rel_emb_gathered = if (options.project_relative_before_gather)
+        relative.table
+    else
+        try embeddingLookupTyped(bld, relative.table, relative.indices, 2 * seq_len - 1, H);
 
-    // 4. Pair indices for Toeplitz selection: [S*S] mapping (qi,ki) → rel_idx
-    const pair_indices = try buildPairIndices(bld, seq_len);
-
-    // 4b. Optional low-memory rel-score gather formulation (shared constants).
-    const rel_score_indices: ?RelScoreIndices = if (relScoreGatherEnabled())
-        try buildRelScoreIndices(bld, seq_len)
+    // Construct only the constants consumed by the selected attention route.
+    // Fused attention uses relative projections directly; constructing these
+    // unused quadratic tables would otherwise dominate long-context graph memory.
+    const use_fused_attention = switch (options.attention) {
+        .legacy_default => fusedDisentangledAttentionEnabledForProduction(),
+        .fused => true,
+        .materialized => false,
+        .training_replay_v1 => true,
+    };
+    const use_score_gather = !use_fused_attention and (options.attention == .materialized or relScoreGatherEnabled());
+    const pair_indices: ?NodeId = if (!use_fused_attention and !use_score_gather)
+        try buildPairIndices(bld, seq_len)
+    else
+        null;
+    const rel_score_indices: ?RelScoreIndices = if (use_score_gather)
+        if (options.attention == .materialized)
+            try buildFlatRelScoreIndices(bld, batch * num_heads, seq_len)
+        else
+            try buildRelScoreIndices(bld, seq_len)
     else
         null;
 
     // ──────── Encoder layers ────────
     var layer: u32 = 0;
     while (layer < config.num_hidden_layers) : (layer += 1) {
+        const layer_input = hidden;
         hidden = try encoderLayer(
             bld,
             config,
             hidden,
             attn_bias,
-            rel_emb_gathered,
+            try applyDropout(bld, rel_emb_gathered, options, .{ .kind = .relative_positions, .layer = layer }),
+            if (options.project_relative_before_gather and !training_replay) relative.indices else null,
             pair_indices,
             rel_score_indices,
+            use_fused_attention,
             batch,
             seq_len,
             layer,
             num_heads,
             head_dim,
+            options,
         );
+        if (options.regions) |observer| try observer.layer(observer.context, layer, layer_input, hidden);
     }
 
     return .{
@@ -202,7 +312,7 @@ fn embeddings(
         "embeddings.word_embeddings.weight",
         Shape.init(.f32, &.{ @intCast(config.vocab_size), @intCast(H) }),
     );
-    const word_lookup = try bld.embeddingLookup(word_emb_param, input_ids, total, H);
+    const word_lookup = try embeddingLookupTyped(bld, word_emb_param, input_ids, total, H);
 
     const ln_w = try bld.parameter(
         "embeddings.LayerNorm.weight",
@@ -222,12 +332,16 @@ fn embeddings(
 // This is normalized with encoder.LayerNorm (norm_rel_ebd), then indexed
 // by log-bucketed relative position IDs to produce a [num_rel, H] tensor
 // where num_rel = 2*seq_len - 1.
-fn buildRelativePositionEmb(
+const RelativePositionTable = struct { table: NodeId, indices: NodeId };
+
+fn buildRelativePositionTable(
     bld: *Builder,
     config: Config,
     seq_len: u32,
     H: u32,
-) !NodeId {
+    physical_i32_indices: bool,
+    emit_indices: bool,
+) !RelativePositionTable {
     const max_pos: u32 = config.max_position_embeddings;
     const num_buckets: u32 = config.position_buckets;
     const num_rel: u32 = 2 * seq_len - 1;
@@ -249,25 +363,25 @@ fn buildRelativePositionEmb(
     );
     const rel_emb_normed = try bld.layerNorm(rel_emb_param, rel_ln_w, rel_ln_b, H, config.layer_norm_eps);
 
+    if (!emit_indices) return .{ .table = rel_emb_normed, .indices = null_node };
+
     // Compute bucket IDs for relative positions -(seq_len-1) to +(seq_len-1).
-    // Store as f32 in the constant pool (values are small non-negative integers
-    // that fit exactly in f32), then convert to i64 for the gather op.
-    const bucket_ids_f32 = try bld.graph.allocator.alloc(f32, num_rel);
-    defer bld.graph.allocator.free(bucket_ids_f32);
+    // Keep indices integer in graph metadata and physical constant storage.
+    const bucket_ids = try bld.graph.allocator.alloc(i64, num_rel);
+    defer bld.graph.allocator.free(bucket_ids);
 
     for (0..num_rel) |i| {
         const rel_pos: i64 = @as(i64, @intCast(i)) - @as(i64, @intCast(seq_len - 1));
-        bucket_ids_f32[i] = @floatFromInt(deberta_config.relativePositionBucket(rel_pos, num_buckets, max_pos));
+        bucket_ids[i] = @intCast(deberta_config.relativePositionBucket(rel_pos, num_buckets, max_pos));
     }
 
-    const bucket_ids_const = try bld.tensorConst(
-        bucket_ids_f32,
-        Shape.init(.f32, &.{@intCast(num_rel)}),
-    );
-    const bucket_ids_i64 = try bld.convertDtype(bucket_ids_const, .i64);
-
-    // Gather from normalized rel_embeddings: [max_pos, H] → [num_rel, H]
-    return bld.embeddingLookup(rel_emb_normed, bucket_ids_i64, num_rel, H);
+    const bucket_ids_node = if (physical_i32_indices) block: {
+        const ids = try bld.graph.allocator.alloc(i32, num_rel);
+        defer bld.graph.allocator.free(ids);
+        for (bucket_ids, ids) |source, *target| target.* = std.math.cast(i32, source) orelse return error.InvalidInputShape;
+        break :block try bld.tensorConstBytes(std.mem.sliceAsBytes(ids), Shape.init(.i32, &.{@intCast(num_rel)}));
+    } else try bld.tensorConstBytes(std.mem.sliceAsBytes(bucket_ids), Shape.init(.i64, &.{@intCast(num_rel)}));
+    return .{ .table = rel_emb_normed, .indices = bucket_ids_node };
 }
 
 // ──────── Rel-score gather formulation (HF-equivalent, low-memory) ────────
@@ -328,35 +442,58 @@ const RelScoreIndices = struct {
     c2p: NodeId,
     /// [S*S] i64: p2c_flat[qi*S+ki] = ki*num_rel + (qi-ki+S-1)
     p2c: NodeId,
+    /// Materialized training uses a plain row gather of the contiguous score
+    /// buffer, avoiding the legacy transpose/gather/transpose Metal route.
+    flat_heads: bool = false,
 };
 
+fn buildFlatRelScoreIndices(bld: *Builder, bh: u32, seq_len: u32) !RelScoreIndices {
+    const ss = try std.math.mul(u32, seq_len, seq_len);
+    const count = try std.math.mul(u32, bh, ss);
+    const num_rel = try std.math.sub(u32, try std.math.mul(u32, seq_len, 2), 1);
+    const source_per_head = try std.math.mul(u32, seq_len, num_rel);
+    const source_count = try std.math.mul(u32, bh, source_per_head);
+    if (source_count > std.math.maxInt(i32)) return error.InvalidInputShape;
+    const data = try bld.graph.allocator.alloc(i32, count);
+    defer bld.graph.allocator.free(data);
+    for (0..bh) |head| for (0..seq_len) |qi| for (0..seq_len) |ki| {
+        const rel = qi + seq_len - 1 - ki;
+        data[head * ss + qi * seq_len + ki] = @intCast(head * source_per_head + qi * num_rel + rel);
+    };
+    const c2p = try bld.tensorConstBytes(std.mem.sliceAsBytes(data), Shape.init(.i32, &.{@intCast(count)}));
+    for (0..bh) |head| for (0..seq_len) |qi| for (0..seq_len) |ki| {
+        const rel = qi + seq_len - 1 - ki;
+        data[head * ss + qi * seq_len + ki] = @intCast(head * source_per_head + ki * num_rel + rel);
+    };
+    const p2c = try bld.tensorConstBytes(std.mem.sliceAsBytes(data), Shape.init(.i32, &.{@intCast(count)}));
+    return .{ .c2p = c2p, .p2c = p2c, .flat_heads = true };
+}
+
 /// Flat indices into a row-major [S, num_rel] score matrix for the Toeplitz
-/// score gather. Same construction pattern as buildPairIndices (f32 constant
-/// pool → i64); values are bounded by S*(2S-1) < 2^24 for S <= 512, so they
-/// are exact in f32.
+/// score gather. Store integer constants directly: long-context flattened
+/// indices exceed the exact integer range of f32.
 fn buildRelScoreIndices(bld: *Builder, seq_len: u32) !RelScoreIndices {
-    const ss: u32 = seq_len * seq_len;
-    const num_rel: u32 = 2 * seq_len - 1;
-    const data = try bld.graph.allocator.alloc(f32, ss);
+    if (seq_len == 0) return error.InvalidInputShape;
+    const ss = try std.math.mul(u32, seq_len, seq_len);
+    const num_rel = (try std.math.mul(u32, 2, seq_len)) - 1;
+    const data = try bld.graph.allocator.alloc(i64, ss);
     defer bld.graph.allocator.free(data);
 
     for (0..seq_len) |qi| {
         for (0..seq_len) |ki| {
             const rel_idx: i64 = @as(i64, @intCast(qi)) - @as(i64, @intCast(ki)) + @as(i64, @intCast(seq_len - 1));
-            data[qi * seq_len + ki] = @floatFromInt(@as(i64, @intCast(qi)) * @as(i64, @intCast(num_rel)) + rel_idx);
+            data[qi * seq_len + ki] = @as(i64, @intCast(qi)) * @as(i64, @intCast(num_rel)) + rel_idx;
         }
     }
-    const c2p_const = try bld.tensorConst(data, Shape.init(.f32, &.{@intCast(ss)}));
-    const c2p = try bld.convertDtype(c2p_const, .i64);
+    const c2p = try bld.tensorConstBytes(std.mem.sliceAsBytes(data), Shape.init(.i64, &.{@intCast(ss)}));
 
     for (0..seq_len) |qi| {
         for (0..seq_len) |ki| {
             const rel_idx: i64 = @as(i64, @intCast(qi)) - @as(i64, @intCast(ki)) + @as(i64, @intCast(seq_len - 1));
-            data[qi * seq_len + ki] = @floatFromInt(@as(i64, @intCast(ki)) * @as(i64, @intCast(num_rel)) + rel_idx);
+            data[qi * seq_len + ki] = @as(i64, @intCast(ki)) * @as(i64, @intCast(num_rel)) + rel_idx;
         }
     }
-    const p2c_const = try bld.tensorConst(data, Shape.init(.f32, &.{@intCast(ss)}));
-    const p2c = try bld.convertDtype(p2c_const, .i64);
+    const p2c = try bld.tensorConstBytes(std.mem.sliceAsBytes(data), Shape.init(.i64, &.{@intCast(ss)}));
 
     return .{ .c2p = c2p, .p2c = p2c };
 }
@@ -413,13 +550,19 @@ fn gatherRelScores(
     bh: u32,
     seq_len: u32,
     num_rel: u32,
+    flat_heads: bool,
 ) !NodeId {
     const ss: u32 = seq_len * seq_len;
+    if (flat_heads) {
+        const flat = try bld.reshape(scores, Shape.init(.f32, &.{ @intCast(bh * seq_len * num_rel), 1 }));
+        const gathered = try embeddingLookupTyped(bld, flat, flat_idx, bh * ss, 1);
+        return bld.reshape(gathered, Shape.init(.f32, &.{ @intCast(bh), @intCast(seq_len), @intCast(seq_len) }));
+    }
     const flat = try bld.reshape(scores, Shape.init(.f32, &.{
         @intCast(bh), @intCast(seq_len * num_rel),
     }));
     const flat_t = try bld.transpose(flat, &.{ 1, 0 }); // [S*num_rel, bh]
-    const gathered = try bld.embeddingLookup(flat_t, flat_idx, ss, bh); // [S*S, bh]
+    const gathered = try embeddingLookupTyped(bld, flat_t, flat_idx, ss, bh); // [S*S, bh]
     const gathered_t = try bld.transpose(gathered, &.{ 1, 0 }); // [bh, S*S]
     return bld.reshape(gathered_t, Shape.init(.f32, &.{
         @intCast(bh), @intCast(seq_len), @intCast(seq_len),
@@ -440,7 +583,7 @@ fn contentToPositionGather(
     const num_rel: u32 = 2 * seq_len - 1;
     const krt = try relProjPerHeadTiled(bld, k_r, batch, num_heads, head_dim, num_rel);
     const scores = try bld.matmul3D(q_c, krt); // [bh, S, num_rel]
-    return gatherRelScores(bld, scores, indices.c2p, batch * num_heads, seq_len, num_rel);
+    return gatherRelScores(bld, scores, indices.c2p, batch * num_heads, seq_len, num_rel, indices.flat_heads);
 }
 
 /// P2C via score-gather: p2c[bh,qi,ki] = (K_c @ Q_r^T)[bh, ki, qi-ki+S-1].
@@ -457,7 +600,7 @@ fn positionToContentGather(
     const num_rel: u32 = 2 * seq_len - 1;
     const qrt = try relProjPerHeadTiled(bld, q_r, batch, num_heads, head_dim, num_rel);
     const scores = try bld.matmul3D(k_c, qrt); // [bh, S(ki), num_rel]
-    return gatherRelScores(bld, scores, indices.p2c, batch * num_heads, seq_len, num_rel);
+    return gatherRelScores(bld, scores, indices.p2c, batch * num_heads, seq_len, num_rel, indices.flat_heads);
 }
 
 // ──────── Pair indices for Toeplitz C2P/P2C selection ────────
@@ -470,22 +613,22 @@ fn buildPairIndices(
     bld: *Builder,
     seq_len: u32,
 ) !NodeId {
-    const ss: u32 = seq_len * seq_len;
-    const pair_data = try bld.graph.allocator.alloc(f32, ss);
+    if (seq_len == 0) return error.InvalidInputShape;
+    const ss = try std.math.mul(u32, seq_len, seq_len);
+    const pair_data = try bld.graph.allocator.alloc(i64, ss);
     defer bld.graph.allocator.free(pair_data);
 
     for (0..seq_len) |qi| {
         for (0..seq_len) |ki| {
             const rel_idx: i64 = @as(i64, @intCast(qi)) - @as(i64, @intCast(ki)) + @as(i64, @intCast(seq_len - 1));
-            pair_data[qi * seq_len + ki] = @floatFromInt(rel_idx);
+            pair_data[qi * seq_len + ki] = rel_idx;
         }
     }
 
-    const pair_const = try bld.tensorConst(
-        pair_data,
-        Shape.init(.f32, &.{@intCast(ss)}),
+    return bld.tensorConstBytes(
+        std.mem.sliceAsBytes(pair_data),
+        Shape.init(.i64, &.{@intCast(ss)}),
     );
-    return bld.convertDtype(pair_const, .i64);
 }
 
 // ──────── Content-to-Position (C2P) attention component ────────
@@ -513,7 +656,7 @@ fn contentToPosition(
     const H: u32 = num_heads * head_dim;
 
     // 1. Gather K_r with pair_indices: [num_rel, H] → [S*S, H]
-    const rel_gathered = try bld.embeddingLookup(k_r, pair_indices, ss, H);
+    const rel_gathered = try embeddingLookupTyped(bld, k_r, pair_indices, ss, H);
 
     // 2. Reshape to per-head and tile across batch
     const rel_tiled = try tileRelEmbAcrossBatch(bld, rel_gathered, batch, seq_len, num_heads, head_dim);
@@ -559,7 +702,7 @@ fn positionToContent(
     const H: u32 = num_heads * head_dim;
 
     // 1. Gather Q_r with pair_indices: [num_rel, H] → [S*S, H]
-    const rel_gathered = try bld.embeddingLookup(q_r, pair_indices, ss, H);
+    const rel_gathered = try embeddingLookupTyped(bld, q_r, pair_indices, ss, H);
 
     // 2. Reshape to per-head and tile across batch → [bh*S, S, D]
     const rel_tiled = try tileRelEmbAcrossBatch(bld, rel_gathered, batch, seq_len, num_heads, head_dim);
@@ -668,13 +811,16 @@ fn encoderLayer(
     hidden_in: NodeId,
     attn_bias: NodeId,
     rel_emb_gathered: NodeId,
-    pair_indices: NodeId,
+    relative_indices: ?NodeId,
+    pair_indices: ?NodeId,
     rel_score_indices: ?RelScoreIndices,
+    use_fused_attention: bool,
     batch: u32,
     seq_len: u32,
     layer: u32,
     num_heads: u32,
     head_dim: u32,
+    options: BuildOptions,
 ) !NodeId {
     const H: u32 = config.hidden_size;
     const I: u32 = config.intermediate_size;
@@ -702,8 +848,11 @@ fn encoderLayer(
     // DeBERTa-v3 with share_att_key=true: Q_r and K_r share the same
     // projection weights as Q and K respectively.
     // rel_emb_gathered: [num_rel, H] → project through same Q/K weights
-    const Q_r = try bld.linear(rel_emb_gathered, q_w, q_b, num_rel, H, H);
-    const K_r = try bld.linear(rel_emb_gathered, k_w, k_b, num_rel, H, H);
+    const relative_rows = if (relative_indices != null or options.attention == .training_replay_v1) config.max_position_embeddings else num_rel;
+    const Q_r_projection = try bld.linear(rel_emb_gathered, q_w, q_b, relative_rows, H, H);
+    const K_r_projection = try bld.linear(rel_emb_gathered, k_w, k_b, relative_rows, H, H);
+    const Q_r = if (relative_indices) |indices| try embeddingLookupTyped(bld, Q_r_projection, indices, num_rel, H) else Q_r_projection;
+    const K_r = if (relative_indices) |indices| try embeddingLookupTyped(bld, K_r_projection, indices, num_rel, H) else K_r_projection;
 
     // ──────── Disentangled attention: C2C + C2P + P2C ────────
     //
@@ -712,7 +861,19 @@ fn encoderLayer(
     // P2C: Q_r[qi-ki+S-1] · K_c (position-to-content)
     //
     // scores = (C2C + C2P + P2C) / sqrt(3 * head_dim) + attn_bias
-    const attn_merged = if (fusedDisentangledAttentionEnabledForProduction()) blk: {
+    const attn_merged = if (options.training_attention_v1) |replay| blk: {
+        const packed_qkv = try bld.concat(try bld.concat(Q, K, 0), V, 0);
+        const packed_relative = try bld.concat(Q_r_projection, K_r_projection, 0);
+        break :blk try bld.debertaTrainingAttentionV1(packed_qkv, packed_relative, replay.control, .{
+            .batch = batch,
+            .seq_len = seq_len,
+            .num_heads = num_heads,
+            .head_dim = head_dim,
+            .relative_rows = config.max_position_embeddings,
+            .dropout_probability = replay.probability,
+            .dropout_stream_id = (@as(u64, layer) << 32) | (@as(u64, @intFromEnum(DropoutKind.attention_probabilities)) + 1),
+        });
+    } else if (use_fused_attention) blk: {
         // Single fused kernel over the [batch*seq, H] content projections and
         // the [num_rel, H] relative projections. Inputs are packed to fit the
         // 4-slot node: qkv_packed = [Q;K;V] ([3*total, H]),
@@ -766,17 +927,18 @@ fn encoderLayer(
         const c2p = if (rel_score_indices) |indices|
             try contentToPositionGather(bld, q_bhsd, K_r, indices, batch, seq_len, num_heads, head_dim)
         else
-            try contentToPosition(bld, q_bhsd, K_r, pair_indices, batch, seq_len, num_heads, head_dim);
+            try contentToPosition(bld, q_bhsd, K_r, pair_indices orelse return error.InvalidAttentionPlan, batch, seq_len, num_heads, head_dim);
         const p2c = if (rel_score_indices) |indices|
             try positionToContentGather(bld, k_bhsd, Q_r, indices, batch, seq_len, num_heads, head_dim)
         else
-            try positionToContent(bld, k_bhsd, Q_r, pair_indices, batch, seq_len, num_heads, head_dim);
+            try positionToContent(bld, k_bhsd, Q_r, pair_indices orelse return error.InvalidAttentionPlan, batch, seq_len, num_heads, head_dim);
 
         const scores_sum = try bld.add(c2c, try bld.add(c2p, p2c));
         const scale = try bld.scalarConst(.f32, 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)) * 3.0));
         const scores_scaled = try bld.mul(scores_sum, scale);
-        const scores_masked = try bld.add(scores_scaled, attn_bias);
-        const probs = try bld.softmax(scores_masked);
+        const scores_valid = if (options.attention_score_mask) |mask| try bld.mul(scores_scaled, mask) else scores_scaled;
+        const scores_masked = try bld.add(scores_valid, attn_bias);
+        const probs = try applyDropout(bld, try bld.softmax(scores_masked), options, .{ .kind = .attention_probabilities, .layer = layer });
         const attn_bhsd = try bld.matmul3D(probs, v_bhsd);
 
         // Reshape back: [bh, seq, head_dim] → [total, H]
@@ -792,7 +954,7 @@ fn encoderLayer(
     // ──────── Attention output projection + residual + LayerNorm ────────
     const o_w = try layerParam2D(bld, layer, "attention.output.dense", ".weight", H, H);
     const o_b = try layerParam1D(bld, layer, "attention.output.dense", ".bias", H);
-    const attn_proj = try bld.linear(attn_merged, o_w, o_b, total, H, H);
+    const attn_proj = try applyDropout(bld, try bld.linear(attn_merged, o_w, o_b, total, H, H), options, .{ .kind = .attention_output, .layer = layer });
 
     const attn_res = try bld.add(attn_proj, hidden_in);
     const attn_ln_w = try layerParam1D(bld, layer, "attention.output.LayerNorm", ".weight", H);
@@ -807,7 +969,7 @@ fn encoderLayer(
 
     const ffn_o_w = try layerParam2D(bld, layer, "output.dense", ".weight", H, I);
     const ffn_o_b = try layerParam1D(bld, layer, "output.dense", ".bias", H);
-    const ffn_out = try bld.linear(ffn_gelu, ffn_o_w, ffn_o_b, total, I, H);
+    const ffn_out = try applyDropout(bld, try bld.linear(ffn_gelu, ffn_o_w, ffn_o_b, total, I, H), options, .{ .kind = .ffn_output, .layer = layer });
 
     const ffn_res = try bld.add(ffn_out, attn_normed);
     const ffn_ln_w = try layerParam1D(bld, layer, "output.LayerNorm", ".weight", H);
@@ -860,6 +1022,60 @@ fn layerParam1D(
 }
 
 // ──────── Tests ────────
+
+test "deberta relative gather constants preserve integer coordinate layouts" {
+    var g = Graph.init(std.testing.allocator);
+    defer g.deinit();
+    var bld = Builder.init(&g);
+    const indices = try buildRelScoreIndices(&bld, 3);
+    const pair = try buildPairIndices(&bld, 3);
+    const expected = [_][]const i64{
+        &.{ 2, 1, 0, 8, 7, 6, 14, 13, 12 },
+        &.{ 2, 6, 10, 3, 7, 11, 4, 8, 12 },
+        &.{ 2, 1, 0, 3, 2, 1, 4, 3, 2 },
+    };
+    for ([_]NodeId{ indices.c2p, indices.p2c, pair }, expected) |id, values| {
+        const node = g.node(id);
+        try std.testing.expectEqual(.i64, node.output_shape.dtype);
+        // There must be no lossy f32 constant followed by an integer cast.
+        try std.testing.expect(node.op == .constant);
+        const c = node.op.constant;
+        try std.testing.expectEqualSlices(i64, values, g.constantDataAs(i64, c.data_offset, c.data_len));
+    }
+    try std.testing.expectError(error.InvalidInputShape, buildRelScoreIndices(&bld, 0));
+    try std.testing.expectError(error.Overflow, buildRelScoreIndices(&bld, 65536));
+    try std.testing.expectError(error.InvalidInputShape, buildPairIndices(&bld, 0));
+    try std.testing.expectError(error.Overflow, buildPairIndices(&bld, 65536));
+}
+
+test "deberta fused long context graph construction has bounded constant memory" {
+    if (!fusedDisentangledAttentionEnabledForProduction()) return error.SkipZigTest;
+    // This constructs the real 4096-position graph without allocating model
+    // weights or activations. The old eager index tables needed hundreds of MB.
+    var storage: [768 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var g = Graph.init(fixed.allocator());
+    defer g.deinit();
+    var bld = Builder.init(&g);
+    const config = Config{
+        .vocab_size = 100,
+        .hidden_size = 32,
+        .num_hidden_layers = 1,
+        .num_attention_heads = 4,
+        .intermediate_size = 64,
+    };
+    const input = try bld.parameter("__input_ids", Shape.init(.i64, &.{4096}));
+    const bias = try bld.parameter("__attn_bias", Shape.init(.f32, &.{ 4, 4096, 4096 }));
+    const output = try buildForwardGraph(&bld, config, input, bias, 1, 4096);
+    try std.testing.expectEqual(@as(i64, 4096), g.node(output.output_node).output_shape.dims[0]);
+    try std.testing.expect(g.constant_pool.items.len < 4096 * 64);
+    var fused_count: usize = 0;
+    for (g.nodes.items) |node| {
+        if (node.op == .fused_disentangled_attention) fused_count += 1;
+        if (node.op == .constant) try std.testing.expect(node.output_shape.numElements().? < 4096 * 4);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fused_count);
+}
 
 test "buildForwardGraph constructs DeBERTa graph with correct output shape" {
     const allocator = std.testing.allocator;

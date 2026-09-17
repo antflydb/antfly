@@ -26,6 +26,7 @@ const managed_receipt = @import("managed_receipt.zig");
 pub const download = @import("download.zig");
 pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
+pub const qwen3_reranker_catalog = @import("qwen3_reranker_catalog.zig");
 
 pub const ModelKind = enum {
     embedder,
@@ -45,6 +46,7 @@ pub const ModelEntry = struct {
     kind: ModelKind,
     path: []const u8,
     variant: []const u8,
+    gliner_architecture: @import("../models/gliner_boundary.zig").Architecture = .unknown,
 };
 
 const DiscoverKindMode = enum {
@@ -56,6 +58,7 @@ test {
     _ = download;
     _ = qwen3vl_catalog;
     _ = qwen3_embedding_catalog;
+    _ = qwen3_reranker_catalog;
 }
 
 /// Friendly short names accepted by user-facing commands in place of a full
@@ -87,6 +90,9 @@ pub const friendly_aliases = [_]FriendlyAlias{
     .{ .alias = "qwen3-embedding-0.6b", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1" },
     .{ .alias = "qwen3-embedding-0.6b-f16", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1" },
     .{ .alias = "qwen3-embedding-0.6b-safetensors", .ref = "Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1" },
+    .{ .alias = "qwen3-reranker", .ref = "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:q8-0-bundle-v1" },
+    .{ .alias = "qwen3-reranker-0.6b", .ref = "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:q8-0-bundle-v1" },
+    .{ .alias = "qwen3-reranker-0.6b-safetensors", .ref = "Qwen/Qwen3-Reranker-0.6B:bf16-safetensors-bundle-v1" },
 };
 
 /// Resolve a friendly alias to its pinned `owner/name:variant` reference.
@@ -140,6 +146,10 @@ test "friendly alias refs parse as explicit model refs" {
             try std.testing.expect(
                 qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant) != null,
             );
+        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-reranker")) {
+            try std.testing.expect(
+                qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant) != null,
+            );
         } else if (std.mem.eql(u8, entry.alias, "bge-m3")) {
             try std.testing.expectEqualStrings("safetensors@" ++ bge_m3_pinned_revision, ref.variant);
         } else {
@@ -191,6 +201,11 @@ test "pull model refs accept friendly Qwen aliases" {
     try std.testing.expectEqualStrings("Qwen", reranker.owner);
     try std.testing.expectEqualStrings("Qwen3-VL-Reranker-2B", reranker.name);
     try std.testing.expectEqualStrings(qwen3vl_catalog.reranker_bundle_variant, reranker.variant);
+
+    const text_reranker = try parseModelRefOrAlias("QWEN3-RERANKER-0.6B");
+    try std.testing.expectEqualStrings("ggml-org", text_reranker.owner);
+    try std.testing.expectEqualStrings("Qwen3-Reranker-0.6B-Q8_0-GGUF", text_reranker.name);
+    try std.testing.expectEqualStrings(qwen3_reranker_catalog.q8_0_bundle_variant, text_reranker.variant);
 }
 
 test "gemma4 qat gguf pulls derive the MTP assistant companion ref" {
@@ -592,6 +607,18 @@ pub const ModelRegistry = struct {
                 hub_config,
                 progress_sink,
             );
+        } else if (qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3RerankerBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
         } else {
             try download.downloadModel(
                 self.allocator,
@@ -672,10 +699,12 @@ pub const ModelRegistry = struct {
             return err;
         };
 
+        var gliner_architecture: @import("../models/gliner_boundary.zig").Architecture = .unknown;
         const kind = switch (kind_mode) {
             .manifest => blk: {
                 var manifest = try manifest_mod.loadFromDir(self.allocator, model_path);
                 defer manifest.deinit();
+                gliner_architecture = manifest.gliner_architecture;
                 break :blk modelKindFromManifestType(manifest.model_type);
             },
             .path => kind_hint orelse inferModelKindFromPath(model_path),
@@ -693,6 +722,7 @@ pub const ModelRegistry = struct {
             .kind = kind,
             .path = owned_path,
             .variant = "f32",
+            .gliner_architecture = gliner_architecture,
         });
     }
 
@@ -1010,6 +1040,7 @@ fn appendManifestTasks(
     manifest: *const manifest_mod.ModelManifest,
     tasks: *std.ArrayListUnmanaged([]const u8),
 ) !void {
+    if (!manifest.hasSupportedGlinerRuntime()) return;
     for (manifest.tasks) |task| try appendUniqueOwnedString(allocator, tasks, task);
 
     switch (manifest.model_type) {
@@ -1032,12 +1063,41 @@ fn appendSupplementalTasks(
     manifest: *const manifest_mod.ModelManifest,
     tasks: *std.ArrayListUnmanaged([]const u8),
 ) !void {
+    if (!manifest.hasSupportedGlinerRuntime()) return;
     if (manifest.hasCapability("extraction")) {
         try appendUniqueOwnedString(allocator, tasks, "extract");
     }
     if (std.mem.eql(u8, manifest.gliner_model_type, "gliner2")) {
         try appendUniqueOwnedString(allocator, tasks, "extract");
     }
+}
+
+test "gliner boundary registry withholds tasks until runtime support exists" {
+    const allocator = std.testing.allocator;
+    var declared_tasks = [_][]const u8{"extract"};
+    var declared_capabilities = [_][]const u8{ "classification", "relations", "extraction" };
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .recognizer,
+        .gliner_architecture = .boundary,
+        .tasks = &declared_tasks,
+        .capabilities = &declared_capabilities,
+    };
+    var tasks = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (tasks.items) |task| allocator.free(task);
+        tasks.deinit(allocator);
+    }
+    var capabilities = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (capabilities.items) |capability| allocator.free(capability);
+        capabilities.deinit(allocator);
+    }
+    try appendManifestTasks(allocator, &manifest, &tasks);
+    try appendSupplementalTasks(allocator, &manifest, &tasks);
+    try appendInferredCapabilities(allocator, &manifest, &declared_tasks, &capabilities);
+    try std.testing.expectEqual(@as(usize, 0), tasks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), capabilities.items.len);
 }
 
 fn taskListContains(tasks: []const []const u8, needle: []const u8) bool {
@@ -1066,6 +1126,7 @@ fn appendInferredCapabilities(
     tasks: []const []const u8,
     capabilities: *std.ArrayListUnmanaged([]const u8),
 ) !void {
+    if (!manifest.hasSupportedGlinerRuntime()) return;
     for (manifest.capabilities) |cap| try appendUniqueOwnedString(allocator, capabilities, cap);
 
     if (taskListContains(tasks, "embed") and manifest.sparse_3d_output_layout != null) {
@@ -1103,8 +1164,20 @@ fn normalizeTaskHint(raw_task: []const u8) []const u8 {
         "transcribe"
     else if (std.mem.eql(u8, raw_task, "extractors"))
         "extract"
+    else if (std.mem.eql(u8, raw_task, "vads") or std.mem.eql(u8, raw_task, "voice-activity"))
+        "vad"
     else
         raw_task;
+}
+
+/// Voice activity detection models (Silero) are frame classifiers over audio.
+/// They keep the classifier registry kind but advertise the `vad` task and an
+/// audio input so dictation and session requests can find them.
+pub const vad_task = "vad";
+
+fn tasksIncludeVad(tasks: []const []const u8) bool {
+    for (tasks) |task| if (std.mem.eql(u8, task, vad_task)) return true;
+    return false;
 }
 
 fn appendCsvCapabilities(
@@ -1223,6 +1296,7 @@ fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.Model
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .recognizer;
     }
+    if (tasksIncludeVad(tasks)) return .classifier;
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "rerank") or std.mem.eql(u8, task, "rerankers")) return .reranker;
     }
@@ -1295,6 +1369,9 @@ fn synthesizePulledModelManifestJsonInternal(
     };
     defer manifest.deinit();
 
+    if (!manifest.hasSupportedGlinerRuntime() and (tasks_csv != null or capabilities_csv != null))
+        return error.UnsupportedGlinerBoundaryRuntime;
+
     var tasks = std.ArrayListUnmanaged([]const u8).empty;
     defer {
         for (tasks.items) |task| allocator.free(task);
@@ -1314,7 +1391,10 @@ fn synthesizePulledModelManifestJsonInternal(
         for (inputs.items) |input| allocator.free(input);
         inputs.deinit(allocator);
     }
-    try appendInferredInputs(allocator, &manifest, manifest_type, &inputs);
+    if (tasksIncludeVad(tasks.items))
+        try appendUniqueOwnedString(allocator, &inputs, "audio")
+    else
+        try appendInferredInputs(allocator, &manifest, manifest_type, &inputs);
 
     var capabilities = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -1710,6 +1790,32 @@ test "synthesized pulled manifest accepts plural task directory hints" {
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"read\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"image\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"capabilities\"") == null);
+}
+
+test "synthesized pulled manifest records a vad task as an audio classifier" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "models/silero-vad/onnx");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/silero-vad/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/silero-vad/onnx/model.onnx", .data = "" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models/silero-vad" });
+    defer allocator.free(model_dir);
+
+    const manifest_json = try synthesizePulledModelManifestJson(allocator, model_dir, "vad", null);
+    defer allocator.free(manifest_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"type\":\"classifier\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"tasks\":[\"vad\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_json, "\"inputs\":[\"audio\"]") != null);
+    try std.testing.expectEqualStrings("vad", normalizeTaskHint("vads"));
 }
 
 test "synthesized pulled manifest keeps generate read gguf as generator" {
