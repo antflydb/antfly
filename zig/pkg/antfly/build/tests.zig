@@ -1758,6 +1758,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "data runtime runRound backs off retryable provision metadata failures",
             "data runtime provisioned root refresh worker backs off retryable metadata failures",
             "data runtime split apply store seeding reuses cached source writer",
+            "data raft retry checkpoints survive changed ready windows and publication failure",
         },
         .max_rss = production_vopr_compile_max_rss,
     });

@@ -403,6 +403,7 @@ pub const Detail = enum(c_int) {
     vector_store_requires_offline_command,
     read_index_timeout,
     incomplete_published_snapshot,
+    distributed_query_unavailable,
     // Unpublished relational/restore identities follow every released main ID.
     backup_cohort_already_committed,
     backup_cohort_cancelled,
@@ -840,6 +841,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.HAReadRequiresPrimary => status(.unavailable, .ha_read_requires_primary),
         error.HAReadWaitForApply => status(.retryable, .ha_read_wait_for_apply),
         error.HAReadWaitForMetadata => status(.retryable, .ha_read_wait_for_metadata),
+        error.DistributedQueryUnavailable => status(.retryable, .distributed_query_unavailable),
         error.StorageReadTemporarilyUnavailable => status(.retryable, .storage_read_temporarily_unavailable),
         error.PersistentDescriptorAdmissionExhausted => status(.retryable, .persistent_descriptor_admission_exhausted),
         error.ResourceRequestTooLarge => status(.invalid_argument, .resource_request_too_large),
@@ -1455,6 +1457,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .write_unavailable => "WriteUnavailable",
         .read_unavailable => "ReadUnavailable",
         .read_requires_primary => "ReadRequiresPrimary",
+        .distributed_query_unavailable => "DistributedQueryUnavailable",
         .storage_read_temporarily_unavailable => "StorageReadTemporarilyUnavailable",
         .resource_request_too_large => "ResourceRequestTooLarge",
         .resource_temporarily_unavailable => "ResourceTemporarilyUnavailable",
@@ -1761,7 +1764,7 @@ test "stable status preserves deterministic raft rejection and malformed respons
 }
 
 test "stable status preserves public boundary semantics" {
-    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot }) |err| {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable }) |err| {
         const readiness = statusFromError(err);
         try std.testing.expectEqual(@intFromEnum(Code.retryable), readiness.code);
         try std.testing.expectEqual(err, errorFromStatus(readiness));
@@ -1911,7 +1914,7 @@ test "released main Detail identifiers retain their exact names and numeric valu
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
     inline for (@typeInfo(Detail).@"enum".fields) |field| {
-        if (field.value <= 340) {
+        if (field.value <= 341) {
             for (field.name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             var encoded: [4]u8 = undefined;
             std_test.mem.writeInt(u32, &encoded, @intCast(field.value), .little);
@@ -1919,6 +1922,6 @@ test "released main Detail identifiers retain their exact names and numeric valu
             count += 1;
         }
     }
-    try std_test.testing.expectEqual(@as(usize, 341), count);
-    try std_test.testing.expectEqual(@as(u64, 0x11e27a0c485aaa14), fingerprint);
+    try std_test.testing.expectEqual(@as(usize, 342), count);
+    try std_test.testing.expectEqual(@as(u64, 0x5f6899626d4ae845), fingerprint);
 }
