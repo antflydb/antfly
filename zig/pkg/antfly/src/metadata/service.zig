@@ -3750,6 +3750,40 @@ const StoreCapabilities = struct {
         return out;
     }
 };
+test "catalog projection capability counts cover every enum tag and last-owner removal" {
+    var snapshot: ProjectedCoreSnapshot = .{};
+    for (std.enums.values(StoreCapabilities.Kind)) |kind| {
+        const facts: StoreCapabilities = .{ .flags = .initOne(kind) };
+        snapshot.adjustCapabilities(facts, true);
+        snapshot.adjustCapabilities(facts, true);
+        try std.testing.expectEqual(@as(usize, 2), snapshot.capability_counts.get(kind));
+        try std.testing.expect(snapshot.capabilities().flags.contains(kind));
+        snapshot.adjustCapabilities(facts, false);
+        try std.testing.expect(snapshot.capabilities().flags.contains(kind));
+        snapshot.adjustCapabilities(facts, false);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.capabilities().flags.count());
+    }
+    snapshot.adjustCapabilities(.{ .flags = .initFull() }, true);
+    try std.testing.expectEqual(std.enums.values(StoreCapabilities.Kind).len, snapshot.capabilities().flags.count());
+    snapshot.deinitStores(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.capabilities().flags.count());
+}
+
+test "catalog projection store lease includes relational rollout capability" {
+    const alloc = std.testing.allocator;
+    const record = try metadata_table_manager.cloneStore(alloc, .{ .store_id = 1, .node_id = 1, .relational_topology_protocol_version = 1 });
+    const lease = StoreProjectionLease.create(alloc, record, null, false, false) catch |err| {
+        metadata_table_manager.freeStore(alloc, record);
+        return err;
+    };
+    defer lease.release(alloc);
+    var snapshot: ProjectedCoreSnapshot = .{};
+    snapshot.adjustCapabilities(lease.capabilities, true);
+    try std.testing.expect(snapshot.capabilities().flags.contains(.relational_topology));
+    snapshot.adjustCapabilities(lease.capabilities, false);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.capabilities().flags.count());
+}
+
 const StoreProjectionLease = struct {
     const Groups = SharedStoreReports(metadata_table_manager.GroupStatusReport, metadata_table_manager.freeGroupStatuses);
     const Runtime = SharedStoreReports(metadata_table_manager.RuntimeGroupStatusReport, metadata_table_manager.freeRuntimeGroupStatusReports);
@@ -3820,7 +3854,9 @@ const StoreProjectionLease = struct {
 const ProjectedCoreSnapshot = struct {
     store_leases: std.ArrayListUnmanaged(*StoreProjectionLease) = .empty,
     store_positions: std.AutoHashMapUnmanaged(u64, usize) = .empty,
-    capability_counts: [7]usize = @splat(0),
+    // Capability identity, not a separately maintained ordinal count, owns
+    // the storage shape. New (or sparse) enum tags cannot overrun this map.
+    capability_counts: std.enums.EnumArray(StoreCapabilities.Kind, usize) = .initFill(0),
 
     stores: []metadata_table_manager.StoreRecord = &.{},
     placement_intents: []raft_reconciler.PlacementIntent = &.{},
@@ -3835,14 +3871,14 @@ const ProjectedCoreSnapshot = struct {
     fn adjustCapabilities(self: *@This(), facts: StoreCapabilities, add: bool) void {
         var it = facts.flags.iterator();
         while (it.next()) |kind| {
-            const count = &self.capability_counts[@intFromEnum(kind)];
+            const count = self.capability_counts.getPtr(kind);
             if (add) count.* += 1 else count.* -= 1;
         }
     }
     fn capabilities(self: *const @This()) StoreCapabilities {
         var out: StoreCapabilities = .{};
-        for (self.capability_counts, 0..) |count, i| if (count != 0) {
-            out.flags.insert(@enumFromInt(i));
+        for (std.enums.values(StoreCapabilities.Kind)) |kind| if (self.capability_counts.get(kind) != 0) {
+            out.flags.insert(kind);
         };
         return out;
     }
@@ -3867,7 +3903,7 @@ const ProjectedCoreSnapshot = struct {
         self.stores = &.{};
         self.store_leases = .empty;
         self.store_positions = .empty;
-        self.capability_counts = @splat(0);
+        self.capability_counts = .initFill(0);
     }
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {

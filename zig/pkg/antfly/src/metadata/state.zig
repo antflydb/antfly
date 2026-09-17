@@ -86,8 +86,8 @@ pub const MetadataState = struct {
     pub fn init(alloc: std.mem.Allocator) MetadataState {
         return .{
             .alloc = alloc,
-            .desired = metadata_table_manager.TableManager.init(alloc),
-            .projected = metadata_table_manager.TableManager.init(alloc),
+            .desired = metadata_table_manager.TableManager.initProvisioning(alloc),
+            .projected = metadata_table_manager.TableManager.initProvisioning(alloc),
         };
     }
 

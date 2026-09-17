@@ -623,6 +623,75 @@ def test_catalog_relational_rows_keep_scope_and_identity_after_rename(stateful_a
     api.delete(f"/tables/{literal}")
 
 
+@pytest.mark.parametrize("scoped", [False, True])
+def test_catalog_constraint_drop_rejection_preserves_durable_identity(
+    stateful_api, scoped
+):
+    api = stateful_api
+    suffix = uuid.uuid4().hex[:10]
+    database = "guarded_" + suffix
+    if scoped:
+        api.post(f"/databases/{database}", {})
+    root = f"/databases/{database}/namespaces/public/tables" if scoped else "/tables"
+    parent, child = "parent_" + suffix, "child_" + suffix
+
+    def definition(parent_name=None):
+        schema = {
+            "storage_mode": "relational",
+            "default_type": "row",
+            "document_schemas": {
+                "row": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"id": {"type": "integer"}},
+                        "required": ["id"],
+                        "additionalProperties": False,
+                    }
+                }
+            },
+        }
+        if parent_name is None:
+            schema["unique_constraints"] = [{"name": "pk", "columns": ["id"]}]
+        else:
+            schema["foreign_keys"] = [
+                {
+                    "name": "parent_fk",
+                    "child_columns": ["id"],
+                    "parent_table": parent_name,
+                    "parent_columns": ["id"],
+                }
+            ]
+        return schema
+
+    identities = {}
+    for name, schema in ((parent, definition()), (child, definition(parent))):
+        path = root + "/" + name
+        identities[name] = api.post(path, {"schema": schema})["table_id"]
+        assert wait_until(
+            lambda: api.get(path + "/constraints/status").get("state") == "enforced",
+            timeout_s=30,
+        )
+        api.post(path + "/batch", {"inserts": {"row": {"id": 1}}})
+
+    for name in (parent, child):
+        rejected = api._request("DELETE", root + "/" + name)
+        assert rejected.status_code == 409, rejected.text
+        assert "constraint retirement" in rejected.text
+    # Rollback must include the logical binding and range rows, both live and
+    # after reopen; a refusal is not an ambiguous or partially committed drop.
+    for restart in (False, True):
+        if restart:
+            api.restart_server()
+        for name in (parent, child):
+            path = root + "/" + name
+            assert api.get(path)["table_id"] == identities[name]
+            assert api.get(path + "/documents/row") == {"id": 1}
+    ordinary = root + "/ordinary_" + suffix
+    api.post(ordinary, {})
+    api.delete(ordinary)
+    assert api._request("GET", ordinary).status_code == 404
+
+
 def test_catalog_mutation_results_keep_resource_and_binding_identities(stateful_api):
     api = stateful_api
     suffix = uuid.uuid4().hex[:12]

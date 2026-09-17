@@ -2351,6 +2351,17 @@ test "relational integrity restore staging overwrite keeps old generation until 
     try std.testing.expectEqual(@as(usize, 2), provisioning.tables.len);
     try std.testing.expectEqual(@as(usize, 2), provisioning.ranges.len);
     for (provisioning.tables) |table| try std.testing.expectEqualStrings("", table.restore_backup_id);
+    // Both generations share a name until atomic cutover. Placement and its
+    // desired-state seed must retain them by ID, without publishing an alias.
+    var placement = metadata_table_manager.TableManager.initProvisioning(alloc);
+    defer placement.deinit();
+    _ = try placement.replaceProjectedTopology(provisioning.tables, provisioning.ranges);
+    try std.testing.expectEqual(@as(u32, 2), placement.tables.count());
+    try std.testing.expect(placement.findTableByName("documents") == null);
+    var desired = metadata_table_manager.TableManager.initProvisioning(alloc);
+    defer desired.deinit();
+    try desired.replaceTopology(provisioning.tables, provisioning.ranges);
+    try std.testing.expectEqual(@as(u32, 2), desired.tables.count());
     var txn = try store.store.beginWriteTxn();
     var txn_open = true;
     defer if (txn_open) txn.abort();
@@ -3285,6 +3296,53 @@ test "standalone metadata released JSON replay verifies imported ranges and pres
     record.previous_lsn = 1;
     try std.testing.expectError(error.MetadataHASourceChanged, store.applyHARecord(record));
     try std.testing.expectEqual(@as(u64, 2), try store.standaloneRevision());
+}
+
+test "system catalog standalone rejected constraint drop preserves bindings ranges and revisions" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/guarded-drop", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "table:parent", .schema_json =
+        \\{"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    };
+    const range: metadata.RangeRecord = .{ .table_id = 7, .group_id = 17, .range_id = 17, .start_key = "" };
+    const binding: system_catalog.Resource = .{ .kind = .table, .id = 7, .parent_id = system_catalog.default_namespace_id, .name = "parent", .storage_name = table.name };
+    try store.updateStandaloneCatalog(group, 0, .{
+        .tables = &.{table},
+        .ranges = &.{range},
+        .auxiliary_json = "{}",
+        .import_catalog = .{ .revision = 1, .next_id = 8, .resources = &.{binding} },
+    });
+    const revision = try store.standaloneRevision();
+    const before = (try store.loadStandaloneCatalogSnapshot(alloc)).?;
+    defer alloc.free(before);
+    // Logical unbind and range removals are staged first, but a rejected drop
+    // must abort all of them, leave revisions untouched, and retain its cause.
+    try std.testing.expectError(error.ConstraintRetirementRequired, store.updateStandaloneCatalog(group, revision, .{
+        .remove_tables = &.{table.table_id},
+        .remove_ranges = &.{range.group_id},
+        .logical = .{ .previous_revision = 1, .delta = .{ .removes = @constCast(&[_]system_catalog.Resource{binding}), .upserts = &.{}, .next_id = 8 } },
+    }));
+    try std.testing.expectEqual(revision, try store.standaloneRevision());
+    const after = (try store.loadStandaloneCatalogSnapshot(alloc)).?;
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    try std.testing.expectError(error.ConstraintRetirementRequired, store.replaceStandaloneCatalog(group, revision, &.{}, &.{}, "{}"));
+    try std.testing.expectEqual(revision, try store.standaloneRevision());
+    // Raft's rejected command is a committed no-op, not a partial unbind.
+    try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = table.table_id, .expected_transition_generation = 0 } });
+    var catalog = try store.systemCatalogSnapshot(alloc, group);
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(u64, 1), catalog.value.revision);
+    try std.testing.expectEqualStrings(table.name, catalog.value.byId(.table, table.table_id).?.storage_name);
+    const tables = try store.listTables(alloc, group);
+    defer store.freeTables(alloc, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
 }
 
 test "standalone metadata migration and listeners are failure atomic" {
@@ -4388,9 +4446,7 @@ pub const RaftApplyStore = struct {
         for (old_tables) |old| {
             for (tables) |record| if (record.table_id == old.table_id) break else {} else {
                 const fence = try self.loadTableTransitionFenceTxn(&txn, group_id, old.table_id);
-                try self.applyTransitionCommandTxn(&txn, group_id, .{ .remove_table = .{ .table_id = old.table_id, .expected_transition_generation = fence.generation } });
-                var key_buf: [160]u8 = undefined;
-                if (try stagingGet(&txn, try tableKeyForGroup(&key_buf, group_id, old.table_id)) != null) return error.TableLifecycleConflict;
+                try self.removeTableTxn(&txn, group_id, old.table_id, fence.generation);
             }
         }
         for (update.remove_ranges) |id| {
@@ -4400,9 +4456,7 @@ pub const RaftApplyStore = struct {
         }
         for (update.remove_tables) |id| {
             const fence = try self.loadTableTransitionFenceTxn(&txn, group_id, id);
-            try self.applyTransitionCommandTxn(&txn, group_id, .{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
-            var key_buf: [160]u8 = undefined;
-            if (try stagingGet(&txn, try tableKeyForGroup(&key_buf, group_id, id)) != null) return error.TableLifecycleConflict;
+            try self.removeTableTxn(&txn, group_id, id, fence.generation);
         }
         // A one-time import trusts the already durable local catalog and loads
         // all definitions before FK validation; ordinary edits use exact same
@@ -9281,37 +9335,12 @@ pub const RaftApplyStore = struct {
                 );
             },
             .remove_table => |record| {
-                const fence = try self.loadTableTransitionFenceTxn(
-                    txn,
-                    group_id,
-                    record.table_id,
-                );
-                if (fence.active() or
-                    fence.generation != record.expected_transition_generation)
-                    return;
-                try self.removeSystemCatalogTableTxn(txn, group_id, record.table_id);
-                const existing_table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
-                defer if (existing_table_name) |name| self.alloc.free(name);
-                var key_buf: [160]u8 = undefined;
-                const key = try tableKeyForGroup(&key_buf, group_id, record.table_id);
-                if (txn.get(key)) |encoded| {
-                    const existing = try decodeTableRecord(self.alloc, encoded);
-                    defer metadata_table_manager.freeTable(self.alloc, existing);
-                    if (try self.relationalDropBlockedTxn(txn, group_id, existing)) return;
-                } else |err| if (err != error.NotFound) return err;
-                txn.delete(key) catch |err| switch (err) {
-                    error.NotFound => {},
+                // Replicated stale/rejected commands are deterministic no-ops;
+                // standalone callers use the same guard but retain its reason.
+                self.removeTableTxn(txn, group_id, record.table_id, record.expected_transition_generation) catch |err| switch (err) {
+                    error.TableTransitionActive, error.TableGenerationChanged, error.ConstraintRetirementRequired => return,
                     else => return err,
                 };
-                if (existing_table_name) |name|
-                    try self.deleteTableNameIndexTxn(txn, group_id, name);
-                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
-                self.notifyProjectionListeners(.{
-                    .kind = .table,
-                    .metadata_group_id = group_id,
-                    .table_name = existing_table_name,
-                    .table_id = record.table_id,
-                });
             },
             .apply_table_topology => |mutation| {
                 try self.applyTableTopologyMutationTxn(txn, group_id, mutation);
@@ -9870,6 +9899,32 @@ pub const RaftApplyStore = struct {
                 try self.applyExtensionLifecycleDeltaTxn(txn, group_id, delta);
             },
         }
+    }
+
+    /// Admission and mutation share the caller's transaction. In particular,
+    /// rejection must precede logical unbinding: Raft commits rejected commands
+    /// as no-ops, while standalone aborts and exposes the precise policy error.
+    fn removeTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64, expected_generation: u64) !void {
+        const fence = try self.loadTableTransitionFenceTxn(txn, group_id, table_id);
+        if (fence.active()) return error.TableTransitionActive;
+        if (fence.generation != expected_generation) return error.TableGenerationChanged;
+        var key_buf: [160]u8 = undefined;
+        const key = try tableKeyForGroup(&key_buf, group_id, table_id);
+        if (try stagingGet(txn, key)) |encoded| {
+            const existing = try decodeTableRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeTable(self.alloc, existing);
+            if (try self.relationalDropBlockedTxn(txn, group_id, existing)) return error.ConstraintRetirementRequired;
+        }
+        const existing_table_name = try self.lookupTableNameTxn(txn, group_id, table_id);
+        defer if (existing_table_name) |name| self.alloc.free(name);
+        try self.removeSystemCatalogTableTxn(txn, group_id, table_id);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        if (existing_table_name) |name| try self.deleteTableNameIndexTxn(txn, group_id, name);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id, .table_name = existing_table_name, .table_id = table_id });
     }
 
     fn applyTableUpsertTxn(

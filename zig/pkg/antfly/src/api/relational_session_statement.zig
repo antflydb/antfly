@@ -12,7 +12,7 @@ const types = @import("../storage/db/types.zig");
 pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionCommitRequest, updates: []const contract.TableCommitRequest) !void {
     for (updates) |update| {
         if (update.writes.len == 0 and update.deletes.len == 0) continue;
-        for (candidate.tables) |*table| if (std.mem.eql(u8, table.table_name, update.table_name)) {
+        for (candidate.tables) |*table| if (std.mem.eql(u8, candidate.physicalName(table.table_name), update.table_name)) {
             var writes: std.ArrayList(types.BatchWrite) = .empty;
             defer writes.deinit(alloc);
             var deletes: std.ArrayList([]const u8) = .empty;
@@ -46,8 +46,13 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
         const writes = try alloc.alloc(types.BatchWrite, update.writes.len);
         defer alloc.free(writes);
         for (writes, update.writes) |*out, input| out.* = .{ .key = input.key, .value = input.value };
-        var entry = [_]sessions.TableCommitRequest{.{ .table_name = @constCast(update.table_name), .batch = .{ .writes = writes, .deletes = @constCast(update.deletes) } }};
-        const request: sessions.OwnedTransactionCommitRequest = .{ .tables = &entry };
+        const label = candidate.logicalName(update.table_name);
+        // New cascade participants also receive a server-authored binding;
+        // never reinterpret their physical identity as a public table name.
+        try candidate.bind(alloc, label, update.table_name);
+        var entry = [_]sessions.TableCommitRequest{.{ .table_name = @constCast(label), .batch = .{ .writes = writes, .deletes = @constCast(update.deletes) } }};
+        var binding = [_]sessions.CatalogBinding{.{ .logical = label, .physical = update.table_name }};
+        const request: sessions.OwnedTransactionCommitRequest = .{ .tables = &entry, .catalog_bindings = .{ .items = &binding, .capacity = binding.len } };
         try candidate.mergeFrom(alloc, &request);
     }
 }
@@ -93,4 +98,25 @@ test "distributed txn session statement normalization replaces old deletes and c
         try std.testing.expectEqual(@as(usize, 1), table.writes.len);
         try std.testing.expectEqualStrings("{\"id\":3}", table.writes[0].value);
     }
+}
+
+test "distributed txn session normalization coalesces catalog aliases and new cascade participants" {
+    const alloc = std.testing.allocator;
+    var candidate = try sessions.parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"parent\":{\"inserts\":{\"x\":{\"id\":1}}}}}");
+    defer candidate.deinit(alloc);
+    try candidate.bind(alloc, "parent", "table:1");
+    try apply(alloc, &candidate, &.{
+        .{ .table_name = "table:1", .writes = &.{.{ .key = "x", .value = "{\"id\":2}" }} },
+        .{ .table_name = "table:2", .writes = &.{.{ .key = "y", .value = "{\"id\":2}" }} },
+    });
+    var next = try sessions.parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"renamed\":{\"inserts\":{\"z\":{\"id\":3}}},\"child\":{\"inserts\":{\"w\":{\"id\":3}}}}}");
+    defer next.deinit(alloc);
+    try next.bind(alloc, "renamed", "table:1");
+    try next.bind(alloc, "child", "table:2");
+    try candidate.mergeFrom(alloc, &next);
+    const result = try candidate.distributedTables(alloc);
+    defer alloc.free(result);
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    for (result) |table| try std.testing.expectEqual(@as(usize, 2), table.writes.len);
+    try std.testing.expectEqualStrings("{\"id\":2}", candidate.tables[0].batch.writes[0].value);
 }

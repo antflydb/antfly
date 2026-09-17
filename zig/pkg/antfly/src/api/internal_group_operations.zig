@@ -1390,7 +1390,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     return self.failure;
                 }
-                fn validate(_: *anyopaque, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
+                fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
             };
             var source = Source{ .failure = error.UnexpectedTestCall };
             const operations = Operations{

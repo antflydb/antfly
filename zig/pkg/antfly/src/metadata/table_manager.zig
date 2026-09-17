@@ -1372,12 +1372,19 @@ pub const TableManager = struct {
     alloc: std.mem.Allocator,
     tables: std.AutoHashMapUnmanaged(u64, TableRecord) = .empty,
     table_names: std.StringHashMapUnmanaged(u64) = .empty,
+    // Provisioning holds published and unpublished generations with the same
+    // name. It is an ID-only topology, never a public name-resolution source.
+    index_table_names: bool = true,
     ranges: std.AutoHashMapUnmanaged(u64, RangeRecord) = .empty,
     split_intents: std.AutoHashMapUnmanaged(u64, SplitIntent) = .empty,
     merge_intents: std.AutoHashMapUnmanaged(u64, MergeIntent) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) TableManager {
         return .{ .alloc = alloc };
+    }
+
+    pub fn initProvisioning(alloc: std.mem.Allocator) TableManager {
+        return .{ .alloc = alloc, .index_table_names = false };
     }
 
     pub fn deinit(self: *TableManager) void {
@@ -1440,13 +1447,13 @@ pub const TableManager = struct {
         // Complete every allocation before changing either index or freeing a
         // borrowed name. Replacement/rollback cannot publish half an index.
         try self.tables.ensureUnusedCapacity(self.alloc, 1);
-        try self.table_names.ensureUnusedCapacity(self.alloc, 1);
+        if (self.index_table_names) try self.table_names.ensureUnusedCapacity(self.alloc, 1);
         if (self.tables.getPtr(record.table_id)) |existing| {
             _ = self.table_names.remove(existing.name);
             freeTable(self.alloc, existing.*);
             existing.* = owned;
         } else self.tables.putAssumeCapacity(record.table_id, owned);
-        self.table_names.putAssumeCapacity(owned.name, owned.table_id);
+        if (self.index_table_names) self.table_names.putAssumeCapacity(owned.name, owned.table_id);
     }
 
     pub fn upsertRange(self: *TableManager, record: RangeRecord) !void {

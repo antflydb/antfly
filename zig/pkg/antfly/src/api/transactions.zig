@@ -193,7 +193,12 @@ pub const OwnedTransactionCommitRequest = struct {
         for (other.catalog_bindings.items) |binding| try self.bind(alloc, binding.logical, binding.physical);
         try appendReadSet(alloc, self, other.read_set);
         for (other.tables) |table| {
-            const existing = findTableIndex(self.tables, table.table_name);
+            // Labels can change (rename) or be server-authored (FK cascade).
+            // A participant is identified by its pinned physical generation.
+            const physical = other.physicalName(table.table_name);
+            const existing: ?usize = for (self.tables, 0..) |current, index| {
+                if (std.mem.eql(u8, self.physicalName(current.table_name), physical)) break index;
+            } else null;
             if (existing) |idx| {
                 try self.tables[idx].mergeFrom(alloc, table);
             } else {
@@ -3651,13 +3656,6 @@ fn appendTable(
     for (req.tables) |*entry| entry.deinit(alloc);
     if (req.tables.len > 0) alloc.free(req.tables);
     req.tables = next;
-}
-
-fn findTableIndex(tables: []const TableCommitRequest, table_name: []const u8) ?usize {
-    for (tables, 0..) |table, i| {
-        if (std.mem.eql(u8, table.table_name, table_name)) return i;
-    }
-    return null;
 }
 
 fn clearPreparedWrites(table: *TableCommitRequest, alloc: std.mem.Allocator) void {
