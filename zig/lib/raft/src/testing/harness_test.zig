@@ -4156,3 +4156,37 @@ fn freeReadStates(alloc: std.mem.Allocator, read_states: []core.types.ReadState)
     for (read_states) |*read_state| read_state.deinit(alloc);
     if (read_states.len > 0) alloc.free(read_states);
 }
+
+test "membership application drops old traffic but preserves the current Ready batch" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |v2| {
+        var cluster = try Cluster.init(alloc, &.{ 1, 2, 3 });
+        defer cluster.deinit();
+        var changes = [_]core.types.ConfChangeSingle{.{ .change_type = .remove_node, .node_id = 3 }};
+        const encoded = if (v2)
+            try (core.types.ConfChangeV2{ .changes = &changes }).encode(alloc)
+        else
+            try (core.types.ConfChange{ .change_type = .remove_node, .node_id = 3 }).encode(alloc);
+        defer alloc.free(encoded);
+
+        // Supply a persisted/committed membership entry and its outbound Ready
+        // batch directly, isolating the harness boundary from election timing.
+        const node = cluster.node(1);
+        _ = try node.raft.log.appendEntries(&.{.{ .term = 1, .index = 1, .entry_type = if (v2) .conf_change_v2 else .conf_change, .data = encoded }});
+        node.raft.log.commitTo(1);
+        node.raft.hard_state = .{ .current_term = 1, .commit_index = 1 };
+        try cluster.network.append(alloc, .{ .msg_type = .heartbeat, .from = 3, .to = 1 });
+        try cluster.network.append(alloc, .{ .msg_type = .heartbeat, .from = 1, .to = 3 });
+        try cluster.network.append(alloc, .{ .msg_type = .heartbeat, .from = 1, .to = 2 });
+        try node.raft.messages.append(alloc, .{ .msg_type = .heartbeat, .from = 1, .to = 3, .term = 1, .commit_index = 1 });
+
+        try cluster.collectReady(1);
+        try std.testing.expectEqualSlices(core.types.NodeId, &.{ 1, 2 }, node.status().conf_state.voters);
+        const pending = cluster.pendingMessageSlice();
+        try std.testing.expectEqual(@as(usize, 2), pending.len);
+        try std.testing.expectEqual(@as(core.types.NodeId, 2), pending[0].to);
+        try std.testing.expectEqual(@as(core.types.NodeId, 3), pending[1].to);
+        try std.testing.expectEqual(@as(core.types.Index, 1), pending[1].commit_index);
+        try std.testing.expectEqual(@as(core.types.Index, 1), node.status().applied_index);
+    }
+}

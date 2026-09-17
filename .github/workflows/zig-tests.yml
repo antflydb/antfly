@@ -1421,12 +1421,16 @@ jobs:
           scripts/ci/zig-e2e-regression-loop.sh
           e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
 
-      - name: Retain failed standalone E2E server logs
+      - name: Retain failed E2E server logs and cluster diagnostics
         if: failure() && matrix.suite == 'antfly'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: antfly-e2e-server-logs-${{ github.run_attempt }}
-          path: ${{ env.TMPDIR }}/antfly-zig-standalone-e2e-*/server.log
+          path: |
+            ${{ env.TMPDIR }}/antfly-zig-standalone-e2e-*/server.log
+            ${{ env.TMPDIR }}/antfly-zig-scaling-e2e-*/*.log
+            ${{ env.TMPDIR }}/antfly-zig-scaling-e2e-*/failure-diagnostics.json
+            ${{ env.TMPDIR }}/antfly-zig-scaling-e2e-*/native-stacks.txt
           if-no-files-found: ignore
           retention-days: 7
 

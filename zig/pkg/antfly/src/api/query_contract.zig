@@ -3529,7 +3529,7 @@ pub fn encodeQueryResponses(
                 .profile = profile,
                 .took = meta.took_ms,
                 .status = 200,
-                .table = table_name,
+                .table = req.response_table_name orelse table_name,
             };
             break :blk try std.json.Stringify.valueAlloc(
                 alloc,
@@ -3559,7 +3559,7 @@ pub fn encodeQueryResponses(
                 .profile = profile,
                 .took = meta.took_ms,
                 .status = 200,
-                .table = table_name,
+                .table = req.response_table_name orelse table_name,
             };
             break :blk try std.json.Stringify.valueAlloc(
                 alloc,
@@ -13141,7 +13141,7 @@ fn consumerTests() type {
             const count = aggregates.map.get("count") orelse return error.TestUnexpectedResult;
             try std.testing.expectEqualStrings("9384729384729384", count.value);
             try std.testing.expect(count.exact);
-            try std.testing.expectEqual(@as(i64, 1), aggregate_result.stats.returned_items);
+            try std.testing.expectEqual(@as(u64, 1), aggregate_result.stats.returned_items);
         }
 
         test "graph aggregate response fails closed on missing or inexact results" {

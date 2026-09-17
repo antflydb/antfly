@@ -359,7 +359,7 @@ pub const Detail = enum(c_int) {
     // An ambiguous remote backup cannot authorize rollback at its caller.
     backup_outcome_ambiguous,
     metadata_mutation_not_applied,
-    // Append unpublished branch details after all main wire identities.
+    // Published graph details precede this branch's new catalog identities.
     graph_metric_action_partial_outcome,
     index_generation_mismatch,
     generation_transition_active,
@@ -393,7 +393,37 @@ pub const Detail = enum(c_int) {
     read_index_timeout,
     incomplete_published_snapshot,
     distributed_query_unavailable,
+    // System catalog errors cross the independently compiled runtime boundary.
+    database_not_found,
+    namespace_not_found,
+    tablespace_not_found,
+    catalog_not_found,
+    catalog_already_exists,
+    catalog_generation_changed,
+    tablespace_in_use,
+    namespace_not_empty,
+    database_not_empty,
+    protected_catalog_resource,
+    invalid_catalog_name,
+    invalid_catalog_mutation,
+    invalid_tablespace_location,
+    invalid_tablespace_placement_policy,
+    catalog_command_too_large,
+    invalid_catalog_record,
+    catalog_id_exhausted,
     table_topology_protocol_upgrade_required,
+    ha_seed_snapshot_runtime_busy,
+    ha_seed_capture_already_in_progress,
+    storage_kernel_owner_unavailable,
+    // Catalog admission outcomes must survive independently compiled write
+    // callbacks so the public layer can preserve its pre-proposal response.
+    // Append only: existing detail ordinals are part of the native contract.
+    catalog_routing_snapshot_timeout,
+    catalog_routing_unavailable,
+    catalog_projection_refresh_required,
+    metadata_incarnation_unavailable,
+    invalid_metadata_incarnation,
+    metadata_incarnation_mismatch,
 };
 
 pub const Status = extern struct {
@@ -411,6 +441,34 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.HASeedSnapshotRuntimeBusy => status(.unavailable, .ha_seed_snapshot_runtime_busy),
+        error.HASeedCaptureAlreadyInProgress => status(.unavailable, .ha_seed_capture_already_in_progress),
+        error.StorageKernelOwnerUnavailable => status(.unavailable, .storage_kernel_owner_unavailable),
+        error.TableTopologyProtocolUpgradeRequired => status(.unavailable, .table_topology_protocol_upgrade_required),
+        error.DatabaseNotFound => status(.not_found, .database_not_found),
+        error.NamespaceNotFound => status(.not_found, .namespace_not_found),
+        error.TablespaceNotFound => status(.not_found, .tablespace_not_found),
+        error.CatalogRoutingSnapshotTimeout => status(.timeout, .catalog_routing_snapshot_timeout),
+        error.MetadataIncarnationUnavailable => status(.unavailable, .metadata_incarnation_unavailable),
+        error.InvalidMetadataIncarnation => status(.unavailable, .invalid_metadata_incarnation),
+        error.MetadataIncarnationMismatch => status(.unavailable, .metadata_incarnation_mismatch),
+        error.CatalogRoutingUnavailable => status(.unavailable, .catalog_routing_unavailable),
+        error.CatalogProjectionRefreshRequired => status(.unavailable, .catalog_projection_refresh_required),
+        error.CatalogNotFound => status(.not_found, .catalog_not_found),
+        error.CatalogAlreadyExists => status(.conflict, .catalog_already_exists),
+        error.CatalogGenerationChanged => status(.conflict, .catalog_generation_changed),
+        error.TablespaceInUse => status(.conflict, .tablespace_in_use),
+        error.NamespaceNotEmpty => status(.conflict, .namespace_not_empty),
+        error.DatabaseNotEmpty => status(.conflict, .database_not_empty),
+        error.ProtectedCatalogResource => status(.conflict, .protected_catalog_resource),
+        error.InvalidCatalogName => status(.invalid_argument, .invalid_catalog_name),
+        error.InvalidCatalogMutation => status(.invalid_argument, .invalid_catalog_mutation),
+        error.InvalidTablespaceLocation => status(.invalid_argument, .invalid_tablespace_location),
+        error.InvalidTablespacePlacementPolicy => status(.invalid_argument, .invalid_tablespace_placement_policy),
+        error.CatalogCommandTooLarge => status(.invalid_argument, .catalog_command_too_large),
+        error.InvalidCatalogRecord => status(.corrupt, .invalid_catalog_record),
+        error.CatalogIdExhausted => status(.internal, .catalog_id_exhausted),
+
         error.OutOfMemory => status(.out_of_memory, .out_of_memory),
         error.InvalidArgument => status(.invalid_argument, .invalid_argument),
         error.InvalidArguments => status(.invalid_argument, .invalid_arguments),
@@ -453,7 +511,6 @@ pub fn statusFromError(err: anyerror) Status {
         error.HAReadWaitForMetadata => status(.retryable, .ha_read_wait_for_metadata),
         error.StorageBusy => status(.retryable, .storage_busy),
         error.DistributedQueryUnavailable => status(.retryable, .distributed_query_unavailable),
-        error.TableTopologyProtocolUpgradeRequired => status(.retryable, .table_topology_protocol_upgrade_required),
         error.StorageReadTemporarilyUnavailable => status(.retryable, .storage_read_temporarily_unavailable),
         error.PersistentDescriptorAdmissionExhausted => status(.retryable, .persistent_descriptor_admission_exhausted),
         error.ResourceRequestTooLarge => status(.invalid_argument, .resource_request_too_large),
@@ -808,7 +865,35 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .table_topology_protocol_upgrade_required => "TableTopologyProtocolUpgradeRequired",
+        .database_not_found => "DatabaseNotFound",
+        .namespace_not_found => "NamespaceNotFound",
+        .tablespace_not_found => "TablespaceNotFound",
+        .catalog_routing_snapshot_timeout => "CatalogRoutingSnapshotTimeout",
+        .metadata_incarnation_unavailable => "MetadataIncarnationUnavailable",
+        .invalid_metadata_incarnation => "InvalidMetadataIncarnation",
+        .metadata_incarnation_mismatch => "MetadataIncarnationMismatch",
+        .catalog_routing_unavailable => "CatalogRoutingUnavailable",
+        .catalog_projection_refresh_required => "CatalogProjectionRefreshRequired",
+        .catalog_not_found => "CatalogNotFound",
+        .catalog_already_exists => "CatalogAlreadyExists",
+        .catalog_generation_changed => "CatalogGenerationChanged",
+        .tablespace_in_use => "TablespaceInUse",
+        .namespace_not_empty => "NamespaceNotEmpty",
+        .database_not_empty => "DatabaseNotEmpty",
+        .protected_catalog_resource => "ProtectedCatalogResource",
+        .invalid_catalog_name => "InvalidCatalogName",
+        .invalid_catalog_mutation => "InvalidCatalogMutation",
+        .invalid_tablespace_location => "InvalidTablespaceLocation",
+        .invalid_tablespace_placement_policy => "InvalidTablespacePlacementPolicy",
+        .catalog_command_too_large => "CatalogCommandTooLarge",
+        .invalid_catalog_record => "InvalidCatalogRecord",
+        .catalog_id_exhausted => "CatalogIdExhausted",
+
         .none => "RuntimeBoundaryFailure",
+        .ha_seed_snapshot_runtime_busy => "HASeedSnapshotRuntimeBusy",
+        .ha_seed_capture_already_in_progress => "HASeedCaptureAlreadyInProgress",
+        .storage_kernel_owner_unavailable => "StorageKernelOwnerUnavailable",
         .invalid_table_storage_settings => "InvalidTableStorageSettings",
         .vector_store_requires_local_single_shard_table => "VectorStoreRequiresLocalSingleShardTable",
         .vector_store_requires_empty_table => "VectorStoreRequiresEmptyTable",
@@ -880,7 +965,6 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .read_requires_primary => "ReadRequiresPrimary",
         .storage_busy => "StorageBusy",
         .distributed_query_unavailable => "DistributedQueryUnavailable",
-        .table_topology_protocol_upgrade_required => "TableTopologyProtocolUpgradeRequired",
         .storage_read_temporarily_unavailable => "StorageReadTemporarilyUnavailable",
         .resource_request_too_large => "ResourceRequestTooLarge",
         .resource_temporarily_unavailable => "ResourceTemporarilyUnavailable",
@@ -1174,7 +1258,7 @@ test "transaction capacity rejection retains a permanent public status" {
 }
 
 test "stable status preserves public boundary semantics" {
-    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable, error.TableTopologyProtocolUpgradeRequired }) |err| {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable }) |err| {
         const readiness = statusFromError(err);
         try std.testing.expectEqual(@intFromEnum(Code.retryable), readiness.code);
         try std.testing.expectEqual(err, errorFromStatus(readiness));
@@ -1250,6 +1334,7 @@ test "stable detail detection distinguishes private errors" {
 }
 
 test "every classified boundary outcome retains its identity" {
+    @setEvalBranchQuota(32 * std.meta.fields(Detail).len);
     const classified = comptime blk: {
         @setEvalBranchQuota(@typeInfo(Detail).@"enum".fields.len * 8);
         const details = std.meta.tags(Detail)[1..];
@@ -1303,10 +1388,21 @@ test "generation capacity retains retryability across the runtime boundary" {
     try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
 }
 
+test "system catalog errors retain their stable runtime boundary classification" {
+    const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
+    for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+}
+
 test "ambiguous backup outcome survives runtime transport without rollback authorization" {
     const wire = statusFromError(error.BackupOutcomeAmbiguous);
     try std.testing.expectEqual(@intFromEnum(Code.conflict), wire.code);
     try std.testing.expectEqual(error.BackupOutcomeAmbiguous, errorFromStatus(wire));
+}
+
+test "HA capture availability survives runtime callback transport" {
+    inline for (.{ error.HASeedSnapshotRuntimeBusy, error.HASeedCaptureAlreadyInProgress, error.StorageKernelOwnerUnavailable }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
 }
 
 test "storage owner contention retains retryability and exact identity" {

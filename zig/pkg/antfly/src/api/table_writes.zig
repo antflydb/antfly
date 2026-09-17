@@ -8969,9 +8969,11 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     /// Stop every source-owned worker before an attached storage owner begins
-    /// closing cached DBs. This is deliberately separate from `deinit`: cache
-    /// pointers are borrowed, so a standalone source must remain safe to
-    /// destroy after its optional cache owner has already gone away.
+    /// closing cached DBs. DB-owned promotion/recovery workers may still
+    /// borrow this source until their owner joins them. Retain callback state
+    /// here; `deinit` releases it only after those external users have drained.
+    /// Cache pointers are borrowed, so final destruction must also remain safe
+    /// after the optional cache owner has already gone away.
     pub fn quiesce(self: *ProvisionedTableWriteSource) void {
         lockAtomic(&self.dropped_table_job_owner_mutex);
         if (self.lifecycle.load(.acquire) != .open) {
@@ -8999,7 +9001,29 @@ pub const ProvisionedTableWriteSource = struct {
         self.structural_reconcile_work_group.await(io) catch {};
         self.restore_repair_completion_group.await(io) catch {};
         self.freeRestoreRepairCompletions();
+        // Release queued source-owned reservations before DB callbacks drain;
+        // retaining these fences could strand a borrower waiting for admission.
         self.freeStructuralReconcileTables();
+        self.lifecycle.store(.closed, .release);
+    }
+
+    /// Publish cached DB worker shutdown before a borrowed deterministic
+    /// scheduler is drained. This deliberately does not await work groups or
+    /// destroy cache entries.
+    pub fn beginTeardown(self: *ProvisionedTableWriteSource) void {
+        self.restore_repair_shutdown.store(true, .release);
+        if (self.write_cache) |cache| cache.beginTeardown();
+        if (self.startup_write_cache) |cache| {
+            if (self.write_cache != cache) cache.beginTeardown();
+        }
+    }
+
+    /// The caller must first join every external owner that can invoke this
+    /// source (including DB-owned promotion and transaction recovery workers).
+    /// Quiescence alone only drains source-owned jobs, not those borrowers.
+    pub fn deinit(self: *ProvisionedTableWriteSource) void {
+        self.quiesce();
+        const io = self.tableActivityIo();
         self.freeWriteCoalesceQueues();
         lockAtomic(&self.startup_catch_up_backoff_mutex);
         self.startup_catch_up_backoffs.deinit(self.startup_catch_up_backoff_alloc);
@@ -9022,22 +9046,6 @@ pub const ProvisionedTableWriteSource = struct {
         self.recovering_replica_retirement_intents.deinit(std.heap.page_allocator);
         self.recovering_replica_retirement_intents = .empty;
         self.replica_retirement_intent_mutex.unlock();
-        self.lifecycle.store(.closed, .release);
-    }
-
-    /// Publish cached DB worker shutdown before a borrowed deterministic
-    /// scheduler is drained. This deliberately does not await work groups or
-    /// destroy cache entries.
-    pub fn beginTeardown(self: *ProvisionedTableWriteSource) void {
-        self.restore_repair_shutdown.store(true, .release);
-        if (self.write_cache) |cache| cache.beginTeardown();
-        if (self.startup_write_cache) |cache| {
-            if (self.write_cache != cache) cache.beginTeardown();
-        }
-    }
-
-    pub fn deinit(self: *ProvisionedTableWriteSource) void {
-        self.quiesce();
         lockAtomic(&self.dirty_write_tables_mutex);
         self.clearAllDirtyWriteTablesLocked();
         self.dirty_write_tables.deinit(std.heap.page_allocator);
@@ -14651,6 +14659,7 @@ pub const ProvisionedTableWriteSource = struct {
                 table_name,
                 metadata.target_index_name,
                 metadata.advance_index_repairs,
+                metadata.index_repair_options,
                 false,
             )) orelse return error.StorageKernelOwnerUnavailable;
             defer observation.deinit(alloc);
@@ -14695,6 +14704,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .restore_repair_progressed = result.restore_repair_progressed != 0,
                 .index_repair_pending = result.state == .repair_pending or result.repair_remaining != 0,
                 .index_repair_attempted = result.repair_attempted != 0,
+                .index_repair_paused = result.repair_paused != 0,
                 .index_repair_repaired = result.repair_repaired != 0,
                 .index_repair_degraded = result.state == .degraded or result.repair_terminal != 0,
                 .index_repair_disk_wait = result.repair_disk_waits != 0,
@@ -16161,7 +16171,11 @@ pub const ProvisionedTableWriteSource = struct {
         snapshot_token: []const u8,
         destination_root: []const u8,
     ) !void {
-        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            _ = (try owner.captureHASeedSnapshotGroupLocal(group_id, table_name, snapshot_token, destination_root)) orelse return error.StorageKernelOwnerUnavailable;
+            return;
+        }
         var probe = self.probeManagedWriterGroupBestEffort(table_name, group_id);
         defer probe.deinit();
         switch (probe) {
@@ -16307,33 +16321,8 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn captureHASeedDbSnapshot(
-        alloc: std.mem.Allocator,
-        db: *db_mod.DB,
-        db_path: []const u8,
-        snapshot_token: []const u8,
-        destination_root: []const u8,
-    ) !void {
-        switch (db.primary_backend) {
-            .lmdb, .lsm => {},
-            .mem, .lsm_memory => return error.HASeedSnapshotUnsupportedBackend,
-        }
-        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
-        defer alloc.free(snapshot_root);
-        var io_impl = Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
-        defer Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
-        const maintenance_clock = db.backend_runtime.monotonicClock();
-        const maintenance_deadline_ns = maintenance_clock.nowRealtimeNs() +| std.time.ns_per_s;
-        _ = db.snapshotHASeed(snapshot_token, maintenance_deadline_ns) catch |err| switch (err) {
-            error.EnrichmentWaitCanceled,
-            error.EnrichmentWaitTimeout,
-            error.EnrichmentRetryInProgress,
-            => return error.HASeedSnapshotRuntimeBusy,
-            else => return err,
-        };
-        try backups_api.copyDirectoryRecursive(alloc, snapshot_root, destination_root);
+    fn captureHASeedDbSnapshot(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, snapshot_token: []const u8, destination_root: []const u8) !void {
+        return @import("../storage/hot_standby/seed_snapshot.zig").capture(alloc, db, db_path, snapshot_token, destination_root);
     }
 
     fn hasActiveBulkIngestSessionForTableBestEffort(
@@ -19646,6 +19635,7 @@ pub const ProvisionedTableWriteSource = struct {
                 table_name,
                 metadata.target_index_name,
                 false,
+                .{},
                 true,
             )) orelse return error.StorageKernelOwnerUnavailable;
             defer observation.deinit(alloc);
@@ -22255,10 +22245,9 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(local_location);
 
         const source_shard = plan.manifest.shards[0];
-        const group_id = if (plan.replace_existing)
-            (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null
-        else
-            source_shard.group_id;
+        // The source shard identifies the backup artifact. Publication always
+        // targets the current catalog incarnation, including restore-as-new.
+        const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const restore_source: backup_restore.RestoreSource = .{
@@ -22434,11 +22423,9 @@ pub const ProvisionedTableWriteSource = struct {
         const source_identity = try backups_api.canonicalRestoreSourceIdentityAlloc(alloc, plan.source_location);
         defer alloc.free(source_identity);
         const source_shard = &plan.manifest.shards[0];
-        const group_id = if (plan.replace_existing)
-            (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse
-                return null
-        else
-            source_shard.group_id;
+        // The backup shard identifies the source artifact. Restore-as-new must
+        // publish into the destination catalog's newly allocated group.
+        const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const identity_namespace = try loadTableIdentityNamespaceForGroup(
@@ -33177,7 +33164,7 @@ fn consumerTests() type {
                 fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
                     return error.UnexpectedBatch;
                 }
-                fn observe(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: ?[]const u8, advance: bool, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
+                fn observe(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: ?[]const u8, advance: bool, _: db_mod.types.ArtifactRepairRunOptions, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(!advance and !retain);
                     self.calls += 1;
@@ -33222,7 +33209,7 @@ fn consumerTests() type {
                 fn reconcile(_: *anyopaque, _: u64, _: []const u8, _: ?[]const u8, _: bool) anyerror!?table_write_source.LocalStructuralReconcileResult {
                     return .{ .state = .complete };
                 }
-                fn observe(ptr: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, target: ?[]const u8, advance: bool, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
+                fn observe(ptr: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, target: ?[]const u8, advance: bool, _: db_mod.types.ArtifactRepairRunOptions, retain: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table);
                     try std.testing.expectEqualStrings("vec", target.?);
@@ -36478,7 +36465,7 @@ fn consumerTests() type {
             const ownership = source.structural_reconcile_keys.getPtr(yielded.scheduler_key).?;
             ownership.* = .active;
             source.structural_reconcile_mutex.unlock(io);
-            const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+            const now_ms = monotonicMsWithIo(io);
             yielded.not_before_ms = ProvisionedTableWriteSource.structuralReconcileRequeueAtMs(.yielded, now_ms);
             source.requeueActiveStructuralReconcile(&yielded, std.heap.page_allocator);
 
@@ -38946,6 +38933,55 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 0), status.pending_epochs);
             try std.testing.expectEqual(@as(u32, 0), status.consecutive_enqueue_failures);
             try std.testing.expect(!status.worker_scheduled);
+        }
+
+        test "provisioned source quiesce retains activity until borrowed transaction callbacks drain" {
+            const Probe = struct {
+                source: *ProvisionedTableWriteSource,
+                cancel: bool,
+                entered: bool = false,
+
+                fn batch(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.entered = true;
+                    // A DB-owned promotion can be inside participant resolution
+                    // when the source stops its own workers. The DB is joined
+                    // afterwards, while this callback still borrows the source.
+                    self.source.quiesce();
+                    if (self.cancel) return error.Canceled;
+                }
+            };
+            for ([_]bool{ false, true }) |cancel| {
+                var source = ProvisionedTableWriteSource.init("unused", table_catalog.emptyCatalogSource());
+                defer source.deinit();
+                var probe = Probe{ .source = &source, .cancel = cancel };
+                _ = source.withRaftBatcher(.{ .ptr = &probe, .vtable = &.{
+                    .batch_group = Probe.batch,
+                    .batch_group_local = Probe.batch,
+                } });
+                const result = source.source().txnResolveGroupLocalWithCancellation(
+                    std.testing.allocator,
+                    7001,
+                    "entities",
+                    [_]u8{1} ** 16,
+                    .committed,
+                    1,
+                    0,
+                    .write,
+                    .none,
+                );
+                if (cancel) {
+                    try std.testing.expectError(error.Canceled, result);
+                } else {
+                    try std.testing.expect((try result) != null);
+                }
+                try std.testing.expect(probe.entered);
+                try std.testing.expect(!source.isOpen());
+                // Releasing the last borrowed operation must still find its
+                // activity and prune it normally, including on cancellation.
+                try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
+                source.quiesce();
+            }
         }
 
         test "provisioned source quiesce closes cleanup admission and drains accepted owner jobs" {

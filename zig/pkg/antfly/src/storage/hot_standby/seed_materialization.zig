@@ -353,6 +353,10 @@ pub fn validateRuntimeIdentity(
     }
 }
 
+const validateTableIdentityName = seed_topology.validateTableIdentityName;
+
+const validateLogicalCatalog = seed_topology.validateLogicalCatalog;
+
 pub fn validateTopology(
     alloc: Allocator,
     io: std.Io,
@@ -572,4 +576,34 @@ fn pathExists(io: std.Io, path: []const u8) !bool {
         else => return err,
     };
     return true;
+}
+
+test "storage.ha system catalog seed versions require complete logical identities" {
+    const alloc = std.testing.allocator;
+    const legacy: LogicalCatalog = .{ .epoch = 1, .tables = &.{}, .ranges = &.{} };
+    try validateLogicalCatalog(alloc, 3, legacy);
+    try std.testing.expectError(error.InvalidSeedTopology, validateLogicalCatalog(alloc, 4, legacy));
+    var current = legacy;
+    current.system_catalog = .{};
+    try validateLogicalCatalog(alloc, 4, current);
+    current.system_catalog = .{ .revision = 1, .next_id = 5, .resources = &.{
+        .{ .kind = .database, .id = 3, .name = "analytics" },
+        .{ .kind = .namespace, .id = 4, .parent_id = 3, .name = "serving" },
+        .{ .kind = .table, .id = 99, .parent_id = 4, .name = "events", .storage_name = "table:99" },
+    } };
+    try std.testing.expectError(error.InvalidSeedTopology, validateLogicalCatalog(alloc, 4, current));
+    current.tables = &.{.{ .table_id = 99, .name = "table:99" }};
+    try validateLogicalCatalog(alloc, 4, current);
+    current.tables = &.{.{ .table_id = 99, .name = "replacement" }};
+    try std.testing.expectError(error.InvalidSeedTopology, validateLogicalCatalog(alloc, 4, current));
+}
+
+test "storage.ha system catalog portable table names preserve literal and restore identities" {
+    const domain = @import("../../system_catalog/domain.zig");
+    for ([_][]const u8{ "docs", "sales/archive", "..", "docs table", "*" }) |name| try validateTableIdentityName(name);
+    try std.testing.expectError(error.InvalidSeedTopology, validateTableIdentityName("bad\nname"));
+    const component: [domain.max_name_bytes]u8 = @splat('a');
+    const restore = try domain.restoreStorageNameAlloc(std.testing.allocator, "table:00000000000000000000000000000000", .{ .database = &component, .namespace = &component, .table = &component });
+    defer std.testing.allocator.free(restore);
+    try validateTableIdentityName(restore);
 }

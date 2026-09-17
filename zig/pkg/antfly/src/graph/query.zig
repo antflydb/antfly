@@ -540,14 +540,7 @@ fn appendGraphMetricDependencyName(
 // Result types
 // ============================================================================
 
-pub const PathEdgeInfo = struct {
-    source: []const u8,
-    target: []const u8,
-    edge_type: []const u8,
-    weight: f64,
-    metadata: []const u8 = "",
-    traversal_direction: ?graph_mod.EdgeDirection = null,
-};
+pub const PathEdgeInfo = paths_mod.PathEdge;
 
 pub const GraphResultNode = struct {
     key: []const u8,
@@ -1930,6 +1923,17 @@ fn traversalResultNodeAlloc(
         null;
     errdefer if (path_tables) |tables| freePathTables(alloc, tables);
 
+    const path_edges = if (result.path_edges) |edges| blk: {
+        const owned = try alloc.alloc(PathEdgeInfo, edges.len);
+        var initialized: usize = 0;
+        errdefer freePathEdgeItems(alloc, owned, initialized);
+        for (edges, owned) |edge, *out| {
+            out.* = try pathEdgeInfoFromPathEdge(alloc, edge);
+            initialized += 1;
+        }
+        break :blk owned;
+    } else null;
+
     return .{
         .key = key,
         .table = table,
@@ -1937,7 +1941,7 @@ fn traversalResultNodeAlloc(
         .distance = result.distance,
         .path = path,
         .path_tables = path_tables,
-        .path_edges = null,
+        .path_edges = path_edges,
     };
 }
 
@@ -1949,6 +1953,12 @@ fn traversalGraphResultNodeOwnedBytes(result: traversal_mod.TraversalResult) !us
         for (items) |item| total = try std.math.add(usize, total, item.len);
         total = try std.math.add(usize, total, try std.math.mul(usize, items.len, @sizeOf(?[]const u8)));
         if (result.target_table) |table| total = try std.math.add(usize, total, table.len);
+    }
+    if (result.path_edges) |edges| {
+        total = try std.math.add(usize, total, try std.math.mul(usize, edges.len, @sizeOf(PathEdgeInfo)));
+        for (edges) |edge| inline for (.{ "source", "target", "edge_type", "metadata" }) |field| {
+            total = try std.math.add(usize, total, @field(edge, field).len);
+        };
     }
     return total;
 }
@@ -4565,4 +4575,50 @@ test "pattern algebraic provenance falls back for ambiguous linear chain" {
     defer fallback_result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), fallback_result.matches.len);
+}
+
+test "BFS traversal preserves physical edge provenance for distributed paths" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-bfs-path-return-s", "gq-bfs-path-return-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    ctx.graph.algebraic_semiring_traversal = false;
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("B", "C", "e", 1.0, 0, 0, "");
+
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const start_keys: []const []const u8 = &.{"A"};
+    var result = try engine.execute(&ctx.graph, .{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{
+            .max_depth = 2,
+            .include_paths = true,
+        },
+    }, start_keys);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.nodes.len);
+    try std.testing.expectEqualStrings("B", result.nodes[0].key);
+    try std.testing.expect(result.nodes[0].path != null);
+    try std.testing.expect(result.nodes[0].path_edges != null);
+    try std.testing.expect(result.nodes[0].provenance == null);
+    try std.testing.expectEqualStrings("C", result.nodes[1].key);
+    const c_path = result.nodes[1].path orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 3), c_path.len);
+    try std.testing.expectEqualStrings("A", c_path[0]);
+    try std.testing.expectEqualStrings("B", c_path[1]);
+    try std.testing.expectEqualStrings("C", c_path[2]);
+    const c_edges = result.nodes[1].path_edges orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 2), c_edges.len);
+    try std.testing.expectEqualStrings("A", c_edges[0].source);
+    try std.testing.expectEqualStrings("B", c_edges[0].target);
+    try std.testing.expectEqualStrings("B", c_edges[1].source);
+    try std.testing.expectEqualStrings("C", c_edges[1].target);
 }

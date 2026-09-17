@@ -2060,8 +2060,16 @@ pub const IndexWriter = struct {
             idx += 1;
         }
 
-        var global_field_lens = try self.buildGlobalFieldLens(new_segments);
+        // Appends retain every old segment, so their field-name storage and
+        // aggregate totals remain valid. Read only the newly added segments.
+        var global_field_lens = if (old_ids.len == 0)
+            try cloneGlobalFieldLens(self.alloc, old.global_total_field_len)
+        else
+            try self.buildGlobalFieldLens(new_segments);
         errdefer global_field_lens.deinit(self.alloc);
+        if (old_ids.len == 0) for (replacement_readers) |*reader| {
+            try addSegmentFieldLens(self.alloc, &global_field_lens, reader);
+        };
         const new_snap = try self.alloc.create(IndexSnapshot);
         new_snap.* = .{
             .alloc = self.alloc,

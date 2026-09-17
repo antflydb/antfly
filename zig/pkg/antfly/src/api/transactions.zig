@@ -47,8 +47,10 @@ pub const TransactionReadItem = struct {
     expected_version: u64,
 
     pub fn clone(self: TransactionReadItem, alloc: std.mem.Allocator) !TransactionReadItem {
+        const table_name = try alloc.dupe(u8, self.table_name);
+        errdefer alloc.free(table_name);
         return .{
-            .table_name = try alloc.dupe(u8, self.table_name),
+            .table_name = table_name,
             .key = try alloc.dupe(u8, self.key),
             .expected_version = self.expected_version,
         };
@@ -110,12 +112,43 @@ pub const TableCommitRequest = struct {
     }
 };
 
+pub const CatalogBinding = struct { logical: []const u8, physical: []const u8 };
+
 pub const OwnedTransactionCommitRequest = struct {
+    // Server-authored identity bindings are persisted with staged operations.
+    // Public JSON cannot supply them. Labels remain stable across renames.
+    catalog_bindings: std.ArrayListUnmanaged(CatalogBinding) = .empty,
+
     read_set: []TransactionReadItem = &.{},
     tables: []TableCommitRequest = &.{},
     sync_level: db_mod.types.SyncLevel = .propose,
 
+    pub fn bind(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, logical: []const u8, physical: []const u8) !void {
+        for (self.catalog_bindings.items) |binding| if (std.mem.eql(u8, binding.logical, logical)) {
+            if (!std.mem.eql(u8, binding.physical, physical)) return error.CatalogGenerationChanged;
+            return;
+        };
+        const owned_logical = try alloc.dupe(u8, logical);
+        errdefer alloc.free(owned_logical);
+        const owned_physical = try alloc.dupe(u8, physical);
+        errdefer alloc.free(owned_physical);
+        try self.catalog_bindings.append(alloc, .{ .logical = owned_logical, .physical = owned_physical });
+    }
+    pub fn physicalName(self: OwnedTransactionCommitRequest, logical: []const u8) []const u8 {
+        for (self.catalog_bindings.items) |binding| if (std.mem.eql(u8, binding.logical, logical)) return binding.physical;
+        return logical;
+    }
+    pub fn logicalName(self: OwnedTransactionCommitRequest, physical: []const u8) []const u8 {
+        for (self.catalog_bindings.items) |binding| if (std.mem.eql(u8, binding.physical, physical)) return binding.logical;
+        return physical;
+    }
+
     pub fn deinit(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator) void {
+        for (self.catalog_bindings.items) |binding| {
+            alloc.free(binding.logical);
+            alloc.free(binding.physical);
+        }
+        self.catalog_bindings.deinit(alloc);
         for (self.read_set) |*item| item.deinit(alloc);
         if (self.read_set.len > 0) alloc.free(self.read_set);
         for (self.tables) |*table| table.deinit(alloc);
@@ -128,12 +161,14 @@ pub const OwnedTransactionCommitRequest = struct {
             .sync_level = self.sync_level,
         };
         errdefer out.deinit(alloc);
+        for (self.catalog_bindings.items) |binding| try out.bind(alloc, binding.logical, binding.physical);
 
         out.read_set = try alloc.alloc(TransactionReadItem, self.read_set.len);
         var read_count: usize = 0;
         errdefer {
             for (out.read_set[0..read_count]) |*item| item.deinit(alloc);
             if (out.read_set.len > 0) alloc.free(out.read_set);
+            out.read_set = &.{};
         }
         for (self.read_set) |item| {
             out.read_set[read_count] = try item.clone(alloc);
@@ -145,6 +180,7 @@ pub const OwnedTransactionCommitRequest = struct {
         errdefer {
             for (out.tables[0..table_count]) |*table| table.deinit(alloc);
             if (out.tables.len > 0) alloc.free(out.tables);
+            out.tables = &.{};
         }
         for (self.tables) |table| {
             out.tables[table_count] = try table.clone(alloc);
@@ -154,6 +190,7 @@ pub const OwnedTransactionCommitRequest = struct {
     }
 
     pub fn mergeFrom(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, other: *const OwnedTransactionCommitRequest) !void {
+        for (other.catalog_bindings.items) |binding| try self.bind(alloc, binding.logical, binding.physical);
         try appendReadSet(alloc, self, other.read_set);
         for (other.tables) |table| {
             const existing = findTableIndex(self.tables, table.table_name);
@@ -170,7 +207,7 @@ pub const OwnedTransactionCommitRequest = struct {
         var out = try alloc.alloc(distributed_txn.TableCommitRequest, self.tables.len);
         for (self.tables, 0..) |*table, i| {
             out[i] = .{
-                .table_name = table.table_name,
+                .table_name = self.physicalName(table.table_name),
                 .writes = table.txn_writes,
                 .deletes = table.batch.deletes,
                 .transforms = table.batch.transforms,
@@ -2818,6 +2855,9 @@ pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !Owned
 }
 
 pub fn encodeCommitRequest(alloc: std.mem.Allocator, req: OwnedTransactionCommitRequest) ![]u8 {
+    return encodeCommitRequestMode(alloc, req, false);
+}
+fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommitRequest, trusted: bool) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.appendSlice(alloc, "{\"read_set\":[");
@@ -2845,6 +2885,12 @@ pub fn encodeCommitRequest(alloc: std.mem.Allocator, req: OwnedTransactionCommit
     try out.append(alloc, '}');
     try out.appendSlice(alloc, ",\"sync_level\":");
     try appendJsonString(alloc, &out, syncLevelText(req.sync_level));
+    if (trusted and req.catalog_bindings.items.len != 0) {
+        try out.appendSlice(alloc, ",\"catalog_bindings\":");
+        const bindings = try std.json.Stringify.valueAlloc(alloc, req.catalog_bindings.items, .{});
+        defer alloc.free(bindings);
+        try out.appendSlice(alloc, bindings);
+    }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
@@ -3004,6 +3050,22 @@ fn parseReadSet(alloc: std.mem.Allocator, value: std.json.Value) ![]TransactionR
         initialized += 1;
     }
     return out;
+}
+
+fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTransactionCommitRequest {
+    var request = try parseCommitValue(alloc, value);
+    errdefer request.deinit(alloc);
+    if (value.object.get("catalog_bindings")) |bindings| {
+        if (bindings != .array) return error.InvalidTransactionSessionRecord;
+        for (bindings.array.items) |binding| {
+            if (binding != .object) return error.InvalidTransactionSessionRecord;
+            const logical = requireString(binding.object, "logical");
+            const physical = requireString(binding.object, "physical");
+            if (logical.len == 0 or physical.len == 0) return error.InvalidTransactionSessionRecord;
+            try request.bind(alloc, logical, physical);
+        }
+    }
+    return request;
 }
 
 fn parseCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTransactionCommitRequest {
@@ -3221,62 +3283,9 @@ fn participantPhaseText(phase: distributed_txn.ParticipantPhase) []const u8 {
 fn cloneBatchRequest(alloc: std.mem.Allocator, batch: batch_api.OwnedBatchRequest) !batch_api.OwnedBatchRequest {
     var out: batch_api.OwnedBatchRequest = .{};
     errdefer out.deinit(alloc);
-    out.writes = try alloc.alloc(db_mod.types.BatchWrite, batch.writes.len);
-    var write_count: usize = 0;
-    errdefer {
-        for (out.writes[0..write_count]) |write| {
-            alloc.free(@constCast(write.key));
-            alloc.free(@constCast(write.value));
-        }
-        if (out.writes.len > 0) alloc.free(out.writes);
-    }
-    for (batch.writes) |write| {
-        out.writes[write_count] = .{
-            .key = try alloc.dupe(u8, write.key),
-            .value = try alloc.dupe(u8, write.value),
-        };
-        write_count += 1;
-    }
-    out.deletes = try alloc.alloc([]const u8, batch.deletes.len);
-    var delete_count: usize = 0;
-    errdefer {
-        for (out.deletes[0..delete_count]) |key| alloc.free(key);
-        if (out.deletes.len > 0) alloc.free(out.deletes);
-    }
-    for (batch.deletes) |key| {
-        out.deletes[delete_count] = try alloc.dupe(u8, key);
-        delete_count += 1;
-    }
-    out.transforms = try alloc.alloc(db_mod.types.DocumentTransform, batch.transforms.len);
-    var transform_count: usize = 0;
-    errdefer {
-        for (out.transforms[0..transform_count]) |transform| {
-            alloc.free(@constCast(transform.key));
-            for (transform.operations) |op| {
-                alloc.free(@constCast(op.path));
-                if (op.value_json) |value_json| alloc.free(@constCast(value_json));
-            }
-            if (transform.operations.len > 0) alloc.free(transform.operations);
-        }
-        if (out.transforms.len > 0) alloc.free(out.transforms);
-    }
-    for (batch.transforms) |transform| {
-        const ops = try alloc.alloc(db_mod.types.TransformOp, transform.operations.len);
-        errdefer alloc.free(ops);
-        for (transform.operations, 0..) |op, i| {
-            ops[i] = .{
-                .op = op.op,
-                .path = try alloc.dupe(u8, op.path),
-                .value_json = if (op.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
-            };
-        }
-        out.transforms[transform_count] = .{
-            .key = try alloc.dupe(u8, transform.key),
-            .operations = ops,
-            .upsert = transform.upsert,
-        };
-        transform_count += 1;
-    }
+    try appendBatchWrites(alloc, &out, batch.writes);
+    try appendBatchDeletes(alloc, &out, batch.deletes);
+    try appendBatchTransforms(alloc, &out, batch.transforms);
     syncBatchReq(&out);
     return out;
 }
@@ -3555,15 +3564,19 @@ fn appendBatchWrites(alloc: std.mem.Allocator, batch: *batch_api.OwnedBatchReque
         alloc.free(next);
     }
     for (batch.writes) |write| {
+        const key = try alloc.dupe(u8, write.key);
+        errdefer alloc.free(key);
         next[copied] = .{
-            .key = try alloc.dupe(u8, write.key),
+            .key = key,
             .value = try alloc.dupe(u8, write.value),
         };
         copied += 1;
     }
     for (writes) |write| {
+        const key = try alloc.dupe(u8, write.key);
+        errdefer alloc.free(key);
         next[copied] = .{
-            .key = try alloc.dupe(u8, write.key),
+            .key = key,
             .value = try alloc.dupe(u8, write.value),
         };
         copied += 1;
@@ -3598,69 +3611,54 @@ fn appendBatchDeletes(alloc: std.mem.Allocator, batch: *batch_api.OwnedBatchRequ
     batch.deletes = next;
 }
 
-fn appendBatchTransforms(
-    alloc: std.mem.Allocator,
-    batch: *batch_api.OwnedBatchRequest,
-    transforms: []const db_mod.types.DocumentTransform,
-) !void {
+fn cloneTransform(alloc: std.mem.Allocator, transform: db_mod.types.DocumentTransform) !db_mod.types.DocumentTransform {
+    const key = try alloc.dupe(u8, transform.key);
+    errdefer alloc.free(key);
+    const ops = try alloc.alloc(db_mod.types.TransformOp, transform.operations.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (ops[0..initialized]) |op| {
+            alloc.free(op.path);
+            if (op.value_json) |value| alloc.free(value);
+        }
+        alloc.free(ops);
+    }
+    for (transform.operations, 0..) |op, i| {
+        const path = try alloc.dupe(u8, op.path);
+        errdefer alloc.free(path);
+        ops[i] = .{ .op = op.op, .path = path, .value_json = if (op.value_json) |value| try alloc.dupe(u8, value) else null };
+        initialized += 1;
+    }
+    return .{ .key = key, .operations = ops, .upsert = transform.upsert };
+}
+
+fn freeTransform(alloc: std.mem.Allocator, transform: db_mod.types.DocumentTransform) void {
+    alloc.free(transform.key);
+    for (transform.operations) |op| {
+        alloc.free(op.path);
+        if (op.value_json) |value| alloc.free(value);
+    }
+    alloc.free(transform.operations);
+}
+
+fn appendBatchTransforms(alloc: std.mem.Allocator, batch: *batch_api.OwnedBatchRequest, transforms: []const db_mod.types.DocumentTransform) !void {
     if (transforms.len == 0) return;
-    const old_len = batch.transforms.len;
-    var next = try alloc.alloc(db_mod.types.DocumentTransform, old_len + transforms.len);
+    const next = try alloc.alloc(db_mod.types.DocumentTransform, batch.transforms.len + transforms.len);
     var copied: usize = 0;
     errdefer {
-        for (next[0..copied]) |transform| {
-            alloc.free(@constCast(transform.key));
-            for (transform.operations) |op| {
-                alloc.free(@constCast(op.path));
-                if (op.value_json) |value_json| alloc.free(@constCast(value_json));
-            }
-            if (transform.operations.len > 0) alloc.free(transform.operations);
-        }
+        for (next[0..copied]) |transform| freeTransform(alloc, transform);
         alloc.free(next);
     }
     for (batch.transforms) |transform| {
-        const ops = try alloc.alloc(db_mod.types.TransformOp, transform.operations.len);
-        errdefer alloc.free(ops);
-        for (transform.operations, 0..) |op, i| {
-            ops[i] = .{
-                .op = op.op,
-                .path = try alloc.dupe(u8, op.path),
-                .value_json = if (op.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
-            };
-        }
-        next[copied] = .{
-            .key = try alloc.dupe(u8, transform.key),
-            .operations = ops,
-            .upsert = transform.upsert,
-        };
+        next[copied] = try cloneTransform(alloc, transform);
         copied += 1;
     }
     for (transforms) |transform| {
-        const ops = try alloc.alloc(db_mod.types.TransformOp, transform.operations.len);
-        errdefer alloc.free(ops);
-        for (transform.operations, 0..) |op, i| {
-            ops[i] = .{
-                .op = op.op,
-                .path = try alloc.dupe(u8, op.path),
-                .value_json = if (op.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
-            };
-        }
-        next[copied] = .{
-            .key = try alloc.dupe(u8, transform.key),
-            .operations = ops,
-            .upsert = transform.upsert,
-        };
+        next[copied] = try cloneTransform(alloc, transform);
         copied += 1;
     }
-    for (batch.transforms) |transform| {
-        alloc.free(@constCast(transform.key));
-        for (transform.operations) |op| {
-            alloc.free(@constCast(op.path));
-            if (op.value_json) |value_json| alloc.free(@constCast(value_json));
-        }
-        if (transform.operations.len > 0) alloc.free(transform.operations);
-    }
-    if (batch.transforms.len > 0) alloc.free(batch.transforms);
+    for (batch.transforms) |transform| freeTransform(alloc, transform);
+    alloc.free(batch.transforms);
     batch.transforms = next;
 }
 
@@ -3969,7 +3967,7 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     try out.print(alloc, "{d}", .{session.next_savepoint_id});
     try out.appendSlice(alloc, ",\"staged\":");
     if (session.staged) |staged| {
-        const encoded = try encodeCommitRequest(alloc, staged);
+        const encoded = try encodeCommitRequestMode(alloc, staged, true);
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     } else {
@@ -4026,7 +4024,7 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
         try out.appendSlice(alloc, "{\"id\":");
         try out.print(alloc, "{d}", .{entry.key_ptr.*});
         try out.appendSlice(alloc, ",\"snapshot\":");
-        const encoded = try encodeCommitRequest(alloc, entry.value_ptr.snapshot);
+        const encoded = try encodeCommitRequestMode(alloc, entry.value_ptr.snapshot, true);
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
         try out.appendSlice(alloc, ",\"read_snapshots\":[");
@@ -4088,7 +4086,7 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
     else
         session.begin_timestamp;
     if (obj.get("staged")) |staged_value| {
-        if (staged_value != .null) session.staged = try parseCommitValue(alloc, staged_value);
+        if (staged_value != .null) session.staged = try parseStoredCommitValue(alloc, staged_value);
     }
     if (obj.get("commit_body_digest")) |digest_value| {
         switch (digest_value) {
@@ -4163,7 +4161,7 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             .integer => |v| try nonNegativeRecordInteger(v),
             else => return error.InvalidTransactionSessionRecord,
         };
-        const snapshot = try parseCommitValue(alloc, entry_obj.get("snapshot") orelse return error.InvalidTransactionSessionRecord);
+        const snapshot = try parseStoredCommitValue(alloc, entry_obj.get("snapshot") orelse return error.InvalidTransactionSessionRecord);
         var read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty;
         errdefer deinitReadSnapshotMap(alloc, &read_snapshots);
         if (entry_obj.get("read_snapshots")) |read_snapshots_value| {
@@ -5317,4 +5315,43 @@ test "transaction commit response includes participant group diagnostics" {
     const participant = conflict.participant.?;
     try std.testing.expectEqual(@as(?u64, 7001), participant.group_id);
     try std.testing.expectEqualStrings("prepare", participant.phase.?);
+}
+
+test "transaction catalog bindings persist privately and cannot be injected publicly" {
+    const alloc = std.testing.allocator;
+    const body = "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{}}}},\"catalog_bindings\":[{\"logical\":\"docs\",\"physical\":\"table:untrusted\"}]}";
+    var request = try parseCommitRequest(alloc, body);
+    defer request.deinit(alloc);
+    try std.testing.expectEqualStrings("docs", request.physicalName("docs"));
+    try request.bind(alloc, "docs", "table:original");
+    try std.testing.expectError(error.CatalogGenerationChanged, request.bind(alloc, "docs", "table:replacement"));
+    const public = try encodeCommitRequest(alloc, request);
+    defer alloc.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "catalog_bindings") == null);
+    const stored = try encodeCommitRequestMode(alloc, request, true);
+    defer alloc.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    var restored = try parseStoredCommitValue(alloc, parsed.value);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqualStrings("table:original", restored.physicalName("docs"));
+    try std.testing.expectEqualStrings("docs", restored.logicalName("table:original"));
+    var copied = try restored.clone(alloc);
+    defer copied.deinit(alloc);
+    try std.testing.expectEqualStrings("table:original", copied.physicalName("docs"));
+}
+
+fn checkCatalogBoundRequestClone(alloc: std.mem.Allocator, request: OwnedTransactionCommitRequest) !void {
+    var copied = try request.clone(alloc);
+    defer copied.deinit(alloc);
+}
+
+test "transaction catalog binding clone releases partial allocations" {
+    const alloc = std.testing.allocator;
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[{"table":"docs","key":"a","version":"1"}],"tables":{"docs":{"inserts":{"a":{}},"deletes":["b"],"transforms":[{"key":"c","operations":[{"op":"$set","path":"status","value":"ready"}]}]}}}
+    );
+    defer request.deinit(alloc);
+    try request.bind(alloc, "docs", "table:original");
+    try std.testing.checkAllAllocationFailures(alloc, checkCatalogBoundRequestClone, .{request});
 }

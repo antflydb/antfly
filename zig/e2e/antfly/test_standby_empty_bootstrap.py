@@ -17,19 +17,21 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
-
 from test_standby import (
-    HACluster,
     DB_API_ROOT,
+    HACluster,
     _primary_lsn,
     _promotion_fence_request,
     _wait_for_standby_applied,
     _wait_for_standby_lookup,
-    ha_cluster,
+)
+from test_standby import (
+    ha_cluster as ha_cluster,  # noqa: PLC0414 - export pytest fixture
 )
 
 pytestmark = pytest.mark.ha_standby
@@ -92,11 +94,11 @@ def _bootstrap_empty(cluster: HACluster) -> None:
         **binding,
     }
     identity = {
-        "ha_cluster_id": 100,
+        "ha_cluster_id": cluster.primary.cluster_id,
         "ha_shard_id": 0,
         "ha_table_id": 0,
-        "ha_timeline_id": 1,
-        "ha_epoch": 1,
+        "ha_timeline_id": cluster.primary.timeline_id,
+        "ha_epoch": cluster.primary.epoch,
     }
 
     def artifact(action, **values):
@@ -108,6 +110,7 @@ def _bootstrap_empty(cluster: HACluster) -> None:
                 action,
                 *flags({**common, **values}),
             ],
+            check=False,
             capture_output=True,
             text=True,
             timeout=90,
@@ -315,16 +318,23 @@ def test_catalog_remote_apply_outage_recovers_without_primary_restart(
     )
 
 
-def test_catalog_replays_when_local_snapshot_lags_wal(ha_cluster: HACluster):
+def test_catalog_replays_when_local_snapshot_lags_wal(ha_cluster: HACluster, tmp_path):
     cluster = ha_cluster
     _bootstrap_empty(cluster)
-    before = cluster.primary.catalog_path.read_bytes()
+    cluster.primary.stop()
+    catalog_store = cluster.primary.catalog_path.with_suffix(
+        cluster.primary.catalog_path.suffix + ".store"
+    )
+    before = tmp_path / "before-catalog.store"
+    shutil.copytree(catalog_store, before)
+    cluster.primary.start()
     cluster.primary.create_table("replay_table")
     cluster.primary.batch_write("replay_table", {"saved": {"title": "durable data"}})
     # Model the startup state after WAL durability but before local catalog
     # publication. Only the disposable fixture catalog is rolled back.
     cluster.primary.stop()
-    cluster.primary.catalog_path.write_bytes(before)
+    shutil.rmtree(catalog_store)
+    shutil.copytree(before, catalog_store)
     cluster.primary.start()
     assert (
         cluster.primary.lookup_key("replay_table", "saved")["title"] == "durable data"
