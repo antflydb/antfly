@@ -11971,6 +11971,11 @@ export interface components {
             /** @description HTTP response timeout in seconds for Inference API calls. */
             timeout?: number;
         };
+        /**
+         * @description OpenAI reasoning effort; model support varies. Omit to use the model default.
+         * @enum {string}
+         */
+        OpenAIReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
         /** @description Configuration for the OpenAI generative AI provider. */
         OpenAIGeneratorConfig: {
             /** @enum {string} */
@@ -11995,6 +12000,13 @@ export interface components {
             temperature?: number;
             /** @description Maximum number of tokens to generate. */
             max_tokens?: number;
+            /**
+             * @description OpenAI completion budget, including visible output and reasoning tokens.
+             *     Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+             */
+            max_completion_tokens?: number;
+            /** @description Optional reasoning effort. Supported values depend on the selected OpenAI model. */
+            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
             /**
              * Format: float
              * @description Nucleus sampling parameter.

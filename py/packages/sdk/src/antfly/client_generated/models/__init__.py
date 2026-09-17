@@ -943,6 +943,7 @@ from .open_ai_embedder_config import OpenAIEmbedderConfig
 from .open_ai_embedder_config_provider import OpenAIEmbedderConfigProvider
 from .open_ai_generator_config import OpenAIGeneratorConfig
 from .open_ai_generator_config_provider import OpenAIGeneratorConfigProvider
+from .open_ai_reasoning_effort import OpenAIReasoningEffort
 from .open_router_embedder_config import OpenRouterEmbedderConfig
 from .open_router_embedder_config_provider import OpenRouterEmbedderConfigProvider
 from .open_router_generator_config import OpenRouterGeneratorConfig
@@ -2202,6 +2203,7 @@ __all__ = (
     "OpenAIEmbedderConfigProvider",
     "OpenAIGeneratorConfig",
     "OpenAIGeneratorConfigProvider",
+    "OpenAIReasoningEffort",
     "OpenRouterEmbedderConfig",
     "OpenRouterEmbedderConfigProvider",
     "OpenRouterGeneratorConfig",
