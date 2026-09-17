@@ -38,7 +38,7 @@ Supporting modules are grouped by role in their names:
 - `gliner2_*` contains shared data and contract helpers.
 - `test_*gliner2*` and the adjacent named tests cover these script contracts.
 
-See `../docs/finetuning/GLINER2.md` for the authoritative workflow. The
+See `../models/gliner2/FINETUNING.md` for the authoritative workflow. The
 generated Unicode tables must be checked with
 `python3.12 gliner2/generate_gliner2_unicode_tables.py --check`.
 

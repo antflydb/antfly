@@ -26,6 +26,9 @@ pub const RouteMatch = struct {
     params: []const RouteParam,
     max_body_size: ?usize,
     stream_request_body: bool,
+    /// Stream the request body regardless of its content type. Requires
+    /// `stream_request_body`.
+    stream_raw_request_body: bool = false,
 };
 
 /// Handler function type — canonical definition lives in server.zig.
@@ -40,6 +43,7 @@ const Route = struct {
     data: ?*anyopaque = null,
     max_body_size: ?usize = null,
     stream_request_body: bool = false,
+    stream_raw_request_body: bool = false,
 };
 
 const Segment = union(enum) {
@@ -93,22 +97,28 @@ pub const Router = struct {
 
     /// Adds a route to the router.
     pub fn add(self: *Self, method: types.Method, pattern: []const u8, handler: anytype) !void {
-        return self.addWithOptions(method, pattern, handler, null, null, false);
+        return self.addWithOptions(method, pattern, handler, null, null, .none);
     }
 
     /// Adds a route with borrowed opaque request data.
     pub fn addWithData(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, data: ?*anyopaque) !void {
-        return self.addWithOptions(method, pattern, handler, data, null, false);
+        return self.addWithOptions(method, pattern, handler, data, null, .none);
     }
 
     pub fn addWithBodyLimit(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, max_body_size: usize) !void {
-        return self.addWithOptions(method, pattern, handler, null, max_body_size, false);
+        return self.addWithOptions(method, pattern, handler, null, max_body_size, .none);
     }
 
     /// Opt a route into dispatch after fixed-length request headers. The
     /// application may then consume the body incrementally through Context.
     pub fn addStreaming(self: *Self, method: types.Method, pattern: []const u8, handler: anytype) !void {
-        return self.addWithOptions(method, pattern, handler, null, null, true);
+        return self.addWithOptions(method, pattern, handler, null, null, .attachments);
+    }
+
+    /// Like `addStreaming`, but every content type streams: the handler owns
+    /// the raw byte stream (audio frames, NDJSON, octet-stream uploads).
+    pub fn addStreamingRaw(self: *Self, method: types.Method, pattern: []const u8, handler: anytype) !void {
+        return self.addWithOptions(method, pattern, handler, null, null, .raw);
     }
 
     fn addWithOptions(
@@ -118,7 +128,7 @@ pub const Router = struct {
         handler: anytype,
         data: ?*anyopaque,
         max_body_size: ?usize,
-        stream_request_body: bool,
+        stream_request_body: StreamRequestBody,
     ) !void {
         const segments = try self.parsePattern(pattern);
         errdefer self.allocator.free(segments);
@@ -132,7 +142,8 @@ pub const Router = struct {
             .handler = Handler.from(handler),
             .data = data,
             .max_body_size = max_body_size,
-            .stream_request_body = stream_request_body,
+            .stream_request_body = stream_request_body != .none,
+            .stream_raw_request_body = stream_request_body == .raw,
         });
         if (max_body_size != null) {
             self.body_limited_route_count += 1;
@@ -221,6 +232,7 @@ pub const Router = struct {
                     .params = params_buf[0..param_count],
                     .max_body_size = route.max_body_size,
                     .stream_request_body = route.stream_request_body,
+                    .stream_raw_request_body = route.stream_raw_request_body,
                 };
             }
         }
@@ -238,12 +250,23 @@ pub const Router = struct {
     }
 
     pub fn streamsRequestBody(self: *const Self, method: types.Method, path: []const u8) bool {
+        return self.requestBodyStreaming(method, path) != .none;
+    }
+
+    pub const StreamRequestBody = enum { none, attachments, raw };
+
+    /// How a matching route wants its request body delivered: buffered,
+    /// streamed for framed attachment envelopes only, or streamed for every
+    /// content type.
+    pub fn requestBodyStreaming(self: *const Self, method: types.Method, path: []const u8) StreamRequestBody {
         var params_buf: [16]RouteParam = undefined;
         for (self.routesForConst(method)) |route| {
-            if (self.matchRoute(route, path, &params_buf) != null)
-                return route.stream_request_body;
+            if (self.matchRoute(route, path, &params_buf) != null) {
+                if (!route.stream_request_body) return .none;
+                return if (route.stream_raw_request_body) .raw else .attachments;
+            }
         }
-        return false;
+        return .none;
     }
 
     pub fn hasBodyLimits(self: *const Self) bool {

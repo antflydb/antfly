@@ -463,16 +463,7 @@ approximate neighbors across an idle repair. Restart alone does not drain it.
 The earlier failures did not demonstrate missing source vectors or migration
 corruption, and repeated immediate queries were not a sufficient baseline gate.
 
-Index status now includes `hbc_posting.refresh_pending`. The bounded refresh
-scanner publishes an atomic certificate only after a clean sweep at the current
-mutation epoch. A partial/changed sweep stays pending, a write or abort
-invalidates the certificate, and reopen starts uncertified. Lightweight status,
-cached-status overlays and detailed diagnostics expose the same constant-cost
-observation; they do not scan the corpus to count dirty postings. Shard
-aggregation remains pending if any reported shard is pending or lacks the new
-observation. Read-only verification progress also invalidates runtime status so
-the final clean transition can be published without another repair. Query
-readiness and optional-maintenance scheduling remain separate.
+> **Relocated:** The `hbc_posting.refresh_pending` status-field semantics are documented in [DENSE_INDEXING_LIFECYCLE.md](DENSE_INDEXING_LIFECYCLE.md#status-and-metrics) (Status and metrics).
 
 The E2E fixture first activates the lazily opened owner with a query, then waits
 for fresh, complete status and a clean refresh certificate. Status-only cold

@@ -107,6 +107,7 @@ export type {
   ExtractRelation,
   ExtractRequest,
   ExtractResponse,
+  ExtractV2Request,
   GenerateChunk,
   GenerateRequest,
   GenerateResponse,

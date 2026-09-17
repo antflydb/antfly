@@ -1,0 +1,2037 @@
+{
+  "format_version": 1,
+  "generator_sha256": "61bbf4544a21111dbfbd643ed2392b1d9723498493b3fa6832154d6e1dc42752",
+  "manifest_sha256": "918005508a57d2c558c18a78167637f39c54e7c2c6d67814be15fc6714c4152f",
+  "model": {
+    "directory": "/private/tmp/antfly-gliner25-models/base",
+    "files": {
+      "config.json": {
+        "sha256": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+        "size_bytes": 3150
+      },
+      "encoder_config/config.json": {
+        "sha256": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+        "size_bytes": 857
+      },
+      "model.safetensors": {
+        "sha256": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+        "size_bytes": 774366564
+      },
+      "tokenizer.json": {
+        "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "size_bytes": 8341713
+      },
+      "tokenizer_config.json": {
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+        "size_bytes": 645
+      }
+    },
+    "model_id": "fastino/gliner2.5-base-v1",
+    "revision": "72ac19b486cd4557424c8d61114e7530c243e9b0"
+  },
+  "native_runtime_qualified": false,
+  "provenance": {
+    "checkout": "/private/tmp/antfly-gliner25-upstream",
+    "commit": "3c913c7369301133d3b7699252074c4303ada50e",
+    "device": "cpu",
+    "dtype": "float32",
+    "imports": {
+      "gliner2": "/private/tmp/antfly-gliner25-upstream/gliner2/__init__.py",
+      "gliner2.api_client": "/private/tmp/antfly-gliner25-upstream/gliner2/api_client.py",
+      "gliner2.auto": "/private/tmp/antfly-gliner25-upstream/gliner2/auto.py",
+      "gliner2.configuration": "/private/tmp/antfly-gliner25-upstream/gliner2/configuration.py",
+      "gliner2.inference": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/__init__.py",
+      "gliner2.inference.candidate_decoder": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/candidate_decoder.py",
+      "gliner2.inference.chunking": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/chunking.py",
+      "gliner2.inference.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/engine.py",
+      "gliner2.inference.overlap": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/overlap.py",
+      "gliner2.inference.runtime": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/runtime.py",
+      "gliner2.inference.schema": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema.py",
+      "gliner2.inference.schema_model": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema_model.py",
+      "gliner2.layers": "/private/tmp/antfly-gliner25-upstream/gliner2/layers.py",
+      "gliner2.models": "/private/tmp/antfly-gliner25-upstream/gliner2/models/__init__.py",
+      "gliner2.models.base": "/private/tmp/antfly-gliner25-upstream/gliner2/models/base.py",
+      "gliner2.models.boundary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/__init__.py",
+      "gliner2.models.boundary.constants": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/constants.py",
+      "gliner2.models.boundary.content": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/content.py",
+      "gliner2.models.boundary.encoding": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/encoding.py",
+      "gliner2.models.boundary.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/engine.py",
+      "gliner2.models.boundary.heads": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/heads.py",
+      "gliner2.models.boundary.indexing": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/indexing.py",
+      "gliner2.models.boundary.losses": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/losses.py",
+      "gliner2.models.boundary.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/model.py",
+      "gliner2.models.boundary.pool": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/pool.py",
+      "gliner2.models.boundary.proposal": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/proposal.py",
+      "gliner2.models.boundary.records": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/records.py",
+      "gliner2.models.boundary.relations": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/relations.py",
+      "gliner2.models.boundary.rotary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/rotary.py",
+      "gliner2.models.boundary.scoring": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/scoring.py",
+      "gliner2.models.boundary.targets_device": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/targets_device.py",
+      "gliner2.models.boundary.validation": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/validation.py",
+      "gliner2.models.candidates": "/private/tmp/antfly-gliner25-upstream/gliner2/models/candidates.py",
+      "gliner2.models.loading": "/private/tmp/antfly-gliner25-upstream/gliner2/models/loading.py",
+      "gliner2.models.outputs": "/private/tmp/antfly-gliner25-upstream/gliner2/models/outputs.py",
+      "gliner2.models.span": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/__init__.py",
+      "gliner2.models.span.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/model.py",
+      "gliner2.processing": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/__init__.py",
+      "gliner2.processing.layouts": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/layouts.py",
+      "gliner2.processing.records": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/records.py",
+      "gliner2.processing.targets": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/targets.py",
+      "gliner2.processing.word_splitter": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/word_splitter.py",
+      "gliner2.processor": "/private/tmp/antfly-gliner25-upstream/gliner2/processor.py",
+      "gliner2.training": "/private/tmp/antfly-gliner25-upstream/gliner2/training/__init__.py",
+      "gliner2.training.data": "/private/tmp/antfly-gliner25-upstream/gliner2/training/data.py",
+      "gliner2.training.matching": "/private/tmp/antfly-gliner25-upstream/gliner2/training/matching.py",
+      "gliner2.training.sampler": "/private/tmp/antfly-gliner25-upstream/gliner2/training/sampler.py",
+      "gliner2.training.trainer": "/private/tmp/antfly-gliner25-upstream/gliner2/training/trainer.py",
+      "gliner2.utils": "namespace:/private/tmp/antfly-gliner25-upstream/gliner2/utils",
+      "gliner2.utils.device_errors": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/device_errors.py",
+      "gliner2.utils.sync_probe": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/sync_probe.py"
+    },
+    "platform": {
+      "machine": "arm64",
+      "system": "Darwin"
+    },
+    "runtime": {
+      "packages": {
+        "PyYAML": "6.0.3",
+        "accelerate": "1.10.1",
+        "huggingface-hub": "0.36.0",
+        "numpy": "2.3.5",
+        "packaging": "25.0",
+        "peft": "0.17.1",
+        "psutil": "7.1.3",
+        "pydantic": "2.12.3",
+        "requests": "2.32.5",
+        "safetensors": "0.7.0",
+        "scipy": "1.16.3",
+        "tokenizers": "0.21.4",
+        "torch": "2.9.1",
+        "transformers": "4.55.4",
+        "urllib3": "2.5.0"
+      },
+      "python": "3.12.3",
+      "unicode": "15.0.0"
+    },
+    "threads": 1
+  },
+  "real_model_qualified": false,
+  "requests": [
+    {
+      "end_mappings": [
+        [
+          4,
+          10,
+          13,
+          19,
+          20,
+          26,
+          32,
+          35,
+          42,
+          43
+        ]
+      ],
+      "id": "mixed_tasks",
+      "kind": "extract",
+      "output": {
+        "entities": {
+          "organization": [
+            {
+              "confidence": 0.999278724193573,
+              "end": 19,
+              "start": 14,
+              "text": "Apple"
+            },
+            {
+              "confidence": 0.9990744590759277,
+              "end": 42,
+              "start": 36,
+              "text": "Google"
+            }
+          ],
+          "person": [
+            {
+              "confidence": 0.9969325065612793,
+              "end": 4,
+              "start": 0,
+              "text": "John"
+            },
+            {
+              "confidence": 0.9779892563819885,
+              "end": 26,
+              "start": 21,
+              "text": "Alice"
+            }
+          ]
+        },
+        "relation_extraction": {
+          "works_for": [
+            {
+              "head": {
+                "confidence": 0.8720568418502808,
+                "end": 4,
+                "start": 0,
+                "text": "John"
+              },
+              "tail": {
+                "confidence": 0.8720568418502808,
+                "end": 19,
+                "start": 14,
+                "text": "Apple"
+              }
+            },
+            {
+              "head": {
+                "confidence": 0.5069210529327393,
+                "end": 26,
+                "start": 21,
+                "text": "Alice"
+              },
+              "tail": {
+                "confidence": 0.5069210529327393,
+                "end": 19,
+                "start": 14,
+                "text": "Apple"
+              }
+            },
+            {
+              "head": {
+                "confidence": 0.7726740837097168,
+                "end": 26,
+                "start": 21,
+                "text": "Alice"
+              },
+              "tail": {
+                "confidence": 0.7726740837097168,
+                "end": 42,
+                "start": 36,
+                "text": "Google"
+              }
+            }
+          ]
+        },
+        "sentiment": {
+          "confidence": 0.9477832913398743,
+          "label": "positive"
+        }
+      },
+      "queries": [
+        [
+          {
+            "field_index": 0,
+            "field_name": "person",
+            "group_index": 0,
+            "task_name": "entities",
+            "task_type": "entities"
+          },
+          {
+            "field_index": 1,
+            "field_name": "organization",
+            "group_index": 0,
+            "task_name": "entities",
+            "task_type": "entities"
+          },
+          {
+            "field_index": 0,
+            "field_name": "head",
+            "group_index": 1,
+            "task_name": "works_for",
+            "task_type": "relations"
+          },
+          {
+            "field_index": 1,
+            "field_name": "tail",
+            "group_index": 1,
+            "task_name": "works_for",
+            "task_type": "relations"
+          }
+        ]
+      ],
+      "start_mappings": [
+        [
+          0,
+          5,
+          11,
+          14,
+          19,
+          21,
+          27,
+          33,
+          36,
+          42
+        ]
+      ],
+      "tensor_capture": {
+        "file": "mixed_tasks.safetensors",
+        "sha256": "66aabcbf9df9a48109755abdf09f58bcef3256b0f8a93fa79595185d928be41b",
+        "size_bytes": 61366,
+        "tensors": {
+          "candidate.indices": {
+            "dtype": "int64",
+            "numel": 1536,
+            "shape": [
+              1,
+              4,
+              192,
+              2
+            ]
+          },
+          "candidate.logits": {
+            "dtype": "float32",
+            "numel": 768,
+            "shape": [
+              1,
+              4,
+              192
+            ]
+          },
+          "candidate.mask": {
+            "dtype": "bool",
+            "numel": 768,
+            "shape": [
+              1,
+              4,
+              192
+            ]
+          },
+          "encoded.query": {
+            "dtype": "float32",
+            "numel": 3072,
+            "shape": [
+              1,
+              4,
+              768
+            ]
+          },
+          "encoded.query_mask": {
+            "dtype": "bool",
+            "numel": 4,
+            "shape": [
+              1,
+              4
+            ]
+          },
+          "encoded.text": {
+            "dtype": "float32",
+            "numel": 7680,
+            "shape": [
+              1,
+              10,
+              768
+            ]
+          },
+          "encoded.text_mask": {
+            "dtype": "bool",
+            "numel": 10,
+            "shape": [
+              1,
+              10
+            ]
+          },
+          "input.attention_mask": {
+            "dtype": "int64",
+            "numel": 46,
+            "shape": [
+              1,
+              46
+            ]
+          },
+          "input.ids": {
+            "dtype": "int64",
+            "numel": 46,
+            "shape": [
+              1,
+              46
+            ]
+          },
+          "marginal.end": {
+            "dtype": "float32",
+            "numel": 44,
+            "shape": [
+              1,
+              4,
+              11
+            ]
+          },
+          "marginal.inside": {
+            "dtype": "float32",
+            "numel": 40,
+            "shape": [
+              1,
+              4,
+              10
+            ]
+          },
+          "marginal.start": {
+            "dtype": "float32",
+            "numel": 44,
+            "shape": [
+              1,
+              4,
+              11
+            ]
+          }
+        }
+      },
+      "text_tokens": [
+        [
+          "john",
+          "works",
+          "at",
+          "apple",
+          ".",
+          "alice",
+          "works",
+          "at",
+          "google",
+          "."
+        ]
+      ]
+    },
+    {
+      "end_mappings": [
+        [
+          4,
+          10,
+          13,
+          19,
+          22,
+          25,
+          26,
+          28,
+          34,
+          41,
+          46,
+          48,
+          49,
+          50
+        ]
+      ],
+      "id": "unicode_offsets",
+      "kind": "extract",
+      "output": {
+        "entities": {
+          "location": [
+            {
+              "confidence": 0.9923305511474609,
+              "end": 25,
+              "start": 23,
+              "text": "東京"
+            }
+          ],
+          "person": [
+            {
+              "confidence": 0.990368127822876,
+              "end": 4,
+              "start": 0,
+              "text": "İpek"
+            },
+            {
+              "confidence": 0.9893039464950562,
+              "end": 34,
+              "start": 29,
+              "text": "Alice"
+            }
+          ]
+        }
+      },
+      "queries": [
+        [
+          {
+            "field_index": 0,
+            "field_name": "person",
+            "group_index": 0,
+            "task_name": "entities",
+            "task_type": "entities"
+          },
+          {
+            "field_index": 1,
+            "field_name": "location",
+            "group_index": 0,
+            "task_name": "entities",
+            "task_type": "entities"
+          }
+        ]
+      ],
+      "start_mappings": [
+        [
+          0,
+          5,
+          11,
+          14,
+          20,
+          23,
+          25,
+          27,
+          29,
+          35,
+          42,
+          47,
+          48,
+          49
+        ]
+      ],
+      "tensor_capture": {
+        "file": "unicode_offsets.safetensors",
+        "sha256": "7e6ba3347a381dd32a564b8206ab61b09fba431c7428b3f7353db2349c8331b2",
+        "size_bytes": 59216,
+        "tensors": {
+          "candidate.indices": {
+            "dtype": "int64",
+            "numel": 768,
+            "shape": [
+              1,
+              2,
+              192,
+              2
+            ]
+          },
+          "candidate.logits": {
+            "dtype": "float32",
+            "numel": 384,
+            "shape": [
+              1,
+              2,
+              192
+            ]
+          },
+          "candidate.mask": {
+            "dtype": "bool",
+            "numel": 384,
+            "shape": [
+              1,
+              2,
+              192
+            ]
+          },
+          "encoded.query": {
+            "dtype": "float32",
+            "numel": 1536,
+            "shape": [
+              1,
+              2,
+              768
+            ]
+          },
+          "encoded.query_mask": {
+            "dtype": "bool",
+            "numel": 2,
+            "shape": [
+              1,
+              2
+            ]
+          },
+          "encoded.text": {
+            "dtype": "float32",
+            "numel": 10752,
+            "shape": [
+              1,
+              14,
+              768
+            ]
+          },
+          "encoded.text_mask": {
+            "dtype": "bool",
+            "numel": 14,
+            "shape": [
+              1,
+              14
+            ]
+          },
+          "input.attention_mask": {
+            "dtype": "int64",
+            "numel": 42,
+            "shape": [
+              1,
+              42
+            ]
+          },
+          "input.ids": {
+            "dtype": "int64",
+            "numel": 42,
+            "shape": [
+              1,
+              42
+            ]
+          },
+          "marginal.end": {
+            "dtype": "float32",
+            "numel": 30,
+            "shape": [
+              1,
+              2,
+              15
+            ]
+          },
+          "marginal.inside": {
+            "dtype": "float32",
+            "numel": 28,
+            "shape": [
+              1,
+              2,
+              14
+            ]
+          },
+          "marginal.start": {
+            "dtype": "float32",
+            "numel": 30,
+            "shape": [
+              1,
+              2,
+              15
+            ]
+          }
+        }
+      },
+      "text_tokens": [
+        [
+          "i̇pek",
+          "works",
+          "at",
+          "apple",
+          "in",
+          "東京",
+          ".",
+          "🙂",
+          "alice",
+          "visits",
+          "café",
+          "e",
+          "́",
+          "."
+        ]
+      ]
+    },
+    {
+      "end_mappings": [
+        [
+          3,
+          10,
+          17,
+          20,
+          25,
+          26,
+          30,
+          38,
+          41,
+          45,
+          46
+        ]
+      ],
+      "id": "entity_attributes",
+      "kind": "extract",
+      "output": {
+        "entities": {
+          "product": [
+            {
+              "condition": [],
+              "confidence": 0.9502612352371216,
+              "end": 17,
+              "sentiment": {
+                "confidence": 0.5583068132400513,
+                "label": "positive"
+              },
+              "start": 4,
+              "text": "iPhone camera"
+            },
+            {
+              "condition": [
+                {
+                  "confidence": 0.7922473549842834,
+                  "label": "broken"
+                }
+              ],
+              "confidence": 0.7353109121322632,
+              "end": 38,
+              "sentiment": {
+                "confidence": 0.9942480325698853,
+                "label": "negative"
+              },
+              "start": 31,
+              "text": "battery"
+            }
+          ]
+        }
+      },
+      "queries": [
+        [
+          {
+            "field_index": 0,
+            "field_name": "product",
+            "group_index": 0,
+            "task_name": "entities",
+            "task_type": "entities"
+          },
+          {
+            "field_index": 1,
+            "field_name": "condition: broken",
+            "group_index": 0,
+            "task_name": "entities",
+            "task_type": "entities"
+          },
+          {
+            "field_index": 2,
+            "field_name": "condition: working",
+            "group_index": 0,
+            "task_name": "entities",
+            "task_type": "entities"
+          },
+          {
+            "field_index": 3,
+            "field_name": "sentiment: negative",
+            "group_index": 0,
+            "task_name": "entities",
+            "task_type": "entities"
+          },
+          {
+            "field_index": 4,
+            "field_name": "sentiment: neutral",
+            "group_index": 0,
+            "task_name": "entities",
+            "task_type": "entities"
+          },
+          {
+            "field_index": 5,
+            "field_name": "sentiment: positive",
+            "group_index": 0,
+            "task_name": "entities",
+            "task_type": "entities"
+          }
+        ]
+      ],
+      "start_mappings": [
+        [
+          0,
+          4,
+          11,
+          18,
+          21,
+          25,
+          27,
+          31,
+          39,
+          42,
+          45
+        ]
+      ],
+      "tensor_capture": {
+        "file": "entity_attributes.safetensors",
+        "sha256": "5f159b2751177967af0220747f2dbcc02528b5c0333b3e4f4c4539654a7099a4",
+        "size_bytes": 78881,
+        "tensors": {
+          "candidate.indices": {
+            "dtype": "int64",
+            "numel": 2304,
+            "shape": [
+              1,
+              6,
+              192,
+              2
+            ]
+          },
+          "candidate.logits": {
+            "dtype": "float32",
+            "numel": 1152,
+            "shape": [
+              1,
+              6,
+              192
+            ]
+          },
+          "candidate.mask": {
+            "dtype": "bool",
+            "numel": 1152,
+            "shape": [
+              1,
+              6,
+              192
+            ]
+          },
+          "encoded.query": {
+            "dtype": "float32",
+            "numel": 4608,
+            "shape": [
+              1,
+              6,
+              768
+            ]
+          },
+          "encoded.query_mask": {
+            "dtype": "bool",
+            "numel": 6,
+            "shape": [
+              1,
+              6
+            ]
+          },
+          "encoded.text": {
+            "dtype": "float32",
+            "numel": 8448,
+            "shape": [
+              1,
+              11,
+              768
+            ]
+          },
+          "encoded.text_mask": {
+            "dtype": "bool",
+            "numel": 11,
+            "shape": [
+              1,
+              11
+            ]
+          },
+          "input.attention_mask": {
+            "dtype": "int64",
+            "numel": 40,
+            "shape": [
+              1,
+              40
+            ]
+          },
+          "input.ids": {
+            "dtype": "int64",
+            "numel": 40,
+            "shape": [
+              1,
+              40
+            ]
+          },
+          "marginal.end": {
+            "dtype": "float32",
+            "numel": 72,
+            "shape": [
+              1,
+              6,
+              12
+            ]
+          },
+          "marginal.inside": {
+            "dtype": "float32",
+            "numel": 66,
+            "shape": [
+              1,
+              6,
+              11
+            ]
+          },
+          "marginal.start": {
+            "dtype": "float32",
+            "numel": 72,
+            "shape": [
+              1,
+              6,
+              12
+            ]
+          }
+        }
+      },
+      "text_tokens": [
+        [
+          "the",
+          "iphone",
+          "camera",
+          "is",
+          "good",
+          ".",
+          "the",
+          "battery",
+          "is",
+          "bad",
+          "."
+        ]
+      ]
+    },
+    {
+      "end_mappings": [
+        [
+          4,
+          10,
+          13,
+          19,
+          20,
+          26,
+          32,
+          35,
+          42,
+          43
+        ]
+      ],
+      "id": "legacy_structure",
+      "kind": "extract",
+      "output": {
+        "employment": [
+          {
+            "organization": [
+              {
+                "confidence": 0.9980384707450867,
+                "end": 19,
+                "start": 14,
+                "text": "Apple"
+              },
+              {
+                "confidence": 0.9973280429840088,
+                "end": 42,
+                "start": 36,
+                "text": "Google"
+              }
+            ],
+            "person": {
+              "confidence": 0.9956012964248657,
+              "end": 4,
+              "start": 0,
+              "text": "John"
+            }
+          }
+        ]
+      },
+      "queries": [
+        [
+          {
+            "field_index": 0,
+            "field_name": "person",
+            "group_index": 0,
+            "task_name": "employment",
+            "task_type": "json_structures"
+          },
+          {
+            "field_index": 1,
+            "field_name": "organization",
+            "group_index": 0,
+            "task_name": "employment",
+            "task_type": "json_structures"
+          }
+        ]
+      ],
+      "start_mappings": [
+        [
+          0,
+          5,
+          11,
+          14,
+          19,
+          21,
+          27,
+          33,
+          36,
+          42
+        ]
+      ],
+      "tensor_capture": {
+        "file": "legacy_structure.safetensors",
+        "sha256": "a56cd9012842ed4337319ed1c830d264d38fb84533980034e0ca90dc787eed61",
+        "size_bytes": 46508,
+        "tensors": {
+          "candidate.indices": {
+            "dtype": "int64",
+            "numel": 768,
+            "shape": [
+              1,
+              2,
+              192,
+              2
+            ]
+          },
+          "candidate.logits": {
+            "dtype": "float32",
+            "numel": 384,
+            "shape": [
+              1,
+              2,
+              192
+            ]
+          },
+          "candidate.mask": {
+            "dtype": "bool",
+            "numel": 384,
+            "shape": [
+              1,
+              2,
+              192
+            ]
+          },
+          "encoded.query": {
+            "dtype": "float32",
+            "numel": 1536,
+            "shape": [
+              1,
+              2,
+              768
+            ]
+          },
+          "encoded.query_mask": {
+            "dtype": "bool",
+            "numel": 2,
+            "shape": [
+              1,
+              2
+            ]
+          },
+          "encoded.text": {
+            "dtype": "float32",
+            "numel": 7680,
+            "shape": [
+              1,
+              10,
+              768
+            ]
+          },
+          "encoded.text_mask": {
+            "dtype": "bool",
+            "numel": 10,
+            "shape": [
+              1,
+              10
+            ]
+          },
+          "input.attention_mask": {
+            "dtype": "int64",
+            "numel": 22,
+            "shape": [
+              1,
+              22
+            ]
+          },
+          "input.ids": {
+            "dtype": "int64",
+            "numel": 22,
+            "shape": [
+              1,
+              22
+            ]
+          },
+          "marginal.end": {
+            "dtype": "float32",
+            "numel": 22,
+            "shape": [
+              1,
+              2,
+              11
+            ]
+          },
+          "marginal.inside": {
+            "dtype": "float32",
+            "numel": 20,
+            "shape": [
+              1,
+              2,
+              10
+            ]
+          },
+          "marginal.start": {
+            "dtype": "float32",
+            "numel": 22,
+            "shape": [
+              1,
+              2,
+              11
+            ]
+          }
+        }
+      },
+      "text_tokens": [
+        [
+          "john",
+          "works",
+          "at",
+          "apple",
+          ".",
+          "alice",
+          "works",
+          "at",
+          "google",
+          "."
+        ]
+      ]
+    },
+    {
+      "end_mappings": [
+        [
+          4,
+          10,
+          13,
+          19,
+          20,
+          26,
+          32,
+          35,
+          42,
+          43
+        ]
+      ],
+      "id": "record_natural",
+      "kind": "extract",
+      "output": {
+        "employment": [
+          {
+            "organization": {
+              "confidence": 0.8459343314170837,
+              "end": 19,
+              "start": 14,
+              "text": "Apple"
+            },
+            "person": {
+              "confidence": 0.9956012964248657,
+              "end": 4,
+              "start": 0,
+              "text": "John"
+            }
+          },
+          {
+            "organization": {
+              "confidence": 0.853733241558075,
+              "end": 42,
+              "start": 36,
+              "text": "Google"
+            },
+            "person": {
+              "confidence": 0.9839866161346436,
+              "end": 26,
+              "start": 21,
+              "text": "Alice"
+            }
+          }
+        ]
+      },
+      "queries": [
+        [
+          {
+            "field_index": 0,
+            "field_name": "person",
+            "group_index": 0,
+            "task_name": "employment",
+            "task_type": "json_structures"
+          },
+          {
+            "field_index": 1,
+            "field_name": "organization",
+            "group_index": 0,
+            "task_name": "employment",
+            "task_type": "json_structures"
+          }
+        ]
+      ],
+      "start_mappings": [
+        [
+          0,
+          5,
+          11,
+          14,
+          19,
+          21,
+          27,
+          33,
+          36,
+          42
+        ]
+      ],
+      "tensor_capture": {
+        "file": "record_natural.safetensors",
+        "sha256": "a56cd9012842ed4337319ed1c830d264d38fb84533980034e0ca90dc787eed61",
+        "size_bytes": 46508,
+        "tensors": {
+          "candidate.indices": {
+            "dtype": "int64",
+            "numel": 768,
+            "shape": [
+              1,
+              2,
+              192,
+              2
+            ]
+          },
+          "candidate.logits": {
+            "dtype": "float32",
+            "numel": 384,
+            "shape": [
+              1,
+              2,
+              192
+            ]
+          },
+          "candidate.mask": {
+            "dtype": "bool",
+            "numel": 384,
+            "shape": [
+              1,
+              2,
+              192
+            ]
+          },
+          "encoded.query": {
+            "dtype": "float32",
+            "numel": 1536,
+            "shape": [
+              1,
+              2,
+              768
+            ]
+          },
+          "encoded.query_mask": {
+            "dtype": "bool",
+            "numel": 2,
+            "shape": [
+              1,
+              2
+            ]
+          },
+          "encoded.text": {
+            "dtype": "float32",
+            "numel": 7680,
+            "shape": [
+              1,
+              10,
+              768
+            ]
+          },
+          "encoded.text_mask": {
+            "dtype": "bool",
+            "numel": 10,
+            "shape": [
+              1,
+              10
+            ]
+          },
+          "input.attention_mask": {
+            "dtype": "int64",
+            "numel": 22,
+            "shape": [
+              1,
+              22
+            ]
+          },
+          "input.ids": {
+            "dtype": "int64",
+            "numel": 22,
+            "shape": [
+              1,
+              22
+            ]
+          },
+          "marginal.end": {
+            "dtype": "float32",
+            "numel": 22,
+            "shape": [
+              1,
+              2,
+              11
+            ]
+          },
+          "marginal.inside": {
+            "dtype": "float32",
+            "numel": 20,
+            "shape": [
+              1,
+              2,
+              10
+            ]
+          },
+          "marginal.start": {
+            "dtype": "float32",
+            "numel": 22,
+            "shape": [
+              1,
+              2,
+              11
+            ]
+          }
+        }
+      },
+      "text_tokens": [
+        [
+          "john",
+          "works",
+          "at",
+          "apple",
+          ".",
+          "alice",
+          "works",
+          "at",
+          "google",
+          "."
+        ]
+      ]
+    },
+    {
+      "end_mappings": [
+        [
+          4,
+          10,
+          13,
+          19,
+          20,
+          26,
+          32,
+          35,
+          42,
+          43
+        ]
+      ],
+      "id": "record_latent",
+      "kind": "extract",
+      "output": {
+        "employment": [
+          {
+            "organization": {
+              "confidence": 0.9382851719856262,
+              "end": 42,
+              "start": 36,
+              "text": "Google"
+            },
+            "person": null
+          },
+          {
+            "organization": {
+              "confidence": 0.7269876003265381,
+              "end": 19,
+              "start": 14,
+              "text": "Apple"
+            },
+            "person": {
+              "confidence": 0.802109956741333,
+              "end": 4,
+              "start": 0,
+              "text": "John"
+            }
+          },
+          {
+            "organization": {
+              "confidence": 0.9614768624305725,
+              "end": 19,
+              "start": 14,
+              "text": "Apple"
+            },
+            "person": {
+              "confidence": 0.961789608001709,
+              "end": 4,
+              "start": 0,
+              "text": "John"
+            }
+          },
+          {
+            "organization": {
+              "confidence": 0.7744337916374207,
+              "end": 42,
+              "start": 36,
+              "text": "Google"
+            },
+            "person": {
+              "confidence": 0.5924288630485535,
+              "end": 4,
+              "start": 0,
+              "text": "John"
+            }
+          },
+          {
+            "organization": {
+              "confidence": 0.853733241558075,
+              "end": 42,
+              "start": 36,
+              "text": "Google"
+            },
+            "person": {
+              "confidence": 0.845417857170105,
+              "end": 26,
+              "start": 21,
+              "text": "Alice"
+            }
+          },
+          {
+            "organization": {
+              "confidence": 0.5626275539398193,
+              "end": 42,
+              "start": 36,
+              "text": "Google"
+            },
+            "person": {
+              "confidence": 0.6042893528938293,
+              "end": 4,
+              "start": 0,
+              "text": "John"
+            }
+          },
+          {
+            "organization": {
+              "confidence": 0.9142481684684753,
+              "end": 19,
+              "start": 14,
+              "text": "Apple"
+            },
+            "person": {
+              "confidence": 0.9046096205711365,
+              "end": 4,
+              "start": 0,
+              "text": "John"
+            }
+          },
+          {
+            "organization": {
+              "confidence": 0.6320874094963074,
+              "end": 19,
+              "start": 14,
+              "text": "Apple"
+            },
+            "person": {
+              "confidence": 0.9642244577407837,
+              "end": 4,
+              "start": 0,
+              "text": "John"
+            }
+          },
+          {
+            "organization": {
+              "confidence": 0.6847800016403198,
+              "end": 19,
+              "start": 14,
+              "text": "Apple"
+            },
+            "person": {
+              "confidence": 0.9271669387817383,
+              "end": 4,
+              "start": 0,
+              "text": "John"
+            }
+          },
+          {
+            "organization": {
+              "confidence": 0.7759064435958862,
+              "end": 42,
+              "start": 36,
+              "text": "Google"
+            },
+            "person": {
+              "confidence": 0.7323372960090637,
+              "end": 26,
+              "start": 21,
+              "text": "Alice"
+            }
+          }
+        ]
+      },
+      "queries": [
+        [
+          {
+            "field_index": 0,
+            "field_name": "person",
+            "group_index": 0,
+            "task_name": "employment",
+            "task_type": "json_structures"
+          },
+          {
+            "field_index": 1,
+            "field_name": "organization",
+            "group_index": 0,
+            "task_name": "employment",
+            "task_type": "json_structures"
+          }
+        ]
+      ],
+      "start_mappings": [
+        [
+          0,
+          5,
+          11,
+          14,
+          19,
+          21,
+          27,
+          33,
+          36,
+          42
+        ]
+      ],
+      "tensor_capture": {
+        "file": "record_latent.safetensors",
+        "sha256": "a56cd9012842ed4337319ed1c830d264d38fb84533980034e0ca90dc787eed61",
+        "size_bytes": 46508,
+        "tensors": {
+          "candidate.indices": {
+            "dtype": "int64",
+            "numel": 768,
+            "shape": [
+              1,
+              2,
+              192,
+              2
+            ]
+          },
+          "candidate.logits": {
+            "dtype": "float32",
+            "numel": 384,
+            "shape": [
+              1,
+              2,
+              192
+            ]
+          },
+          "candidate.mask": {
+            "dtype": "bool",
+            "numel": 384,
+            "shape": [
+              1,
+              2,
+              192
+            ]
+          },
+          "encoded.query": {
+            "dtype": "float32",
+            "numel": 1536,
+            "shape": [
+              1,
+              2,
+              768
+            ]
+          },
+          "encoded.query_mask": {
+            "dtype": "bool",
+            "numel": 2,
+            "shape": [
+              1,
+              2
+            ]
+          },
+          "encoded.text": {
+            "dtype": "float32",
+            "numel": 7680,
+            "shape": [
+              1,
+              10,
+              768
+            ]
+          },
+          "encoded.text_mask": {
+            "dtype": "bool",
+            "numel": 10,
+            "shape": [
+              1,
+              10
+            ]
+          },
+          "input.attention_mask": {
+            "dtype": "int64",
+            "numel": 22,
+            "shape": [
+              1,
+              22
+            ]
+          },
+          "input.ids": {
+            "dtype": "int64",
+            "numel": 22,
+            "shape": [
+              1,
+              22
+            ]
+          },
+          "marginal.end": {
+            "dtype": "float32",
+            "numel": 22,
+            "shape": [
+              1,
+              2,
+              11
+            ]
+          },
+          "marginal.inside": {
+            "dtype": "float32",
+            "numel": 20,
+            "shape": [
+              1,
+              2,
+              10
+            ]
+          },
+          "marginal.start": {
+            "dtype": "float32",
+            "numel": 22,
+            "shape": [
+              1,
+              2,
+              11
+            ]
+          }
+        }
+      },
+      "text_tokens": [
+        [
+          "john",
+          "works",
+          "at",
+          "apple",
+          ".",
+          "alice",
+          "works",
+          "at",
+          "google",
+          "."
+        ]
+      ]
+    },
+    {
+      "end_mappings": [
+        [
+          4,
+          10,
+          13,
+          19,
+          20,
+          26,
+          32,
+          35,
+          42,
+          43
+        ]
+      ],
+      "id": "record_anchorless",
+      "kind": "extract",
+      "output": {},
+      "queries": [
+        [
+          {
+            "field_index": 0,
+            "field_name": "person",
+            "group_index": 0,
+            "task_name": "employment",
+            "task_type": "json_structures"
+          },
+          {
+            "field_index": 1,
+            "field_name": "organization",
+            "group_index": 0,
+            "task_name": "employment",
+            "task_type": "json_structures"
+          }
+        ]
+      ],
+      "start_mappings": [
+        [
+          0,
+          5,
+          11,
+          14,
+          19,
+          21,
+          27,
+          33,
+          36,
+          42
+        ]
+      ],
+      "tensor_capture": {
+        "file": "record_anchorless.safetensors",
+        "sha256": "a56cd9012842ed4337319ed1c830d264d38fb84533980034e0ca90dc787eed61",
+        "size_bytes": 46508,
+        "tensors": {
+          "candidate.indices": {
+            "dtype": "int64",
+            "numel": 768,
+            "shape": [
+              1,
+              2,
+              192,
+              2
+            ]
+          },
+          "candidate.logits": {
+            "dtype": "float32",
+            "numel": 384,
+            "shape": [
+              1,
+              2,
+              192
+            ]
+          },
+          "candidate.mask": {
+            "dtype": "bool",
+            "numel": 384,
+            "shape": [
+              1,
+              2,
+              192
+            ]
+          },
+          "encoded.query": {
+            "dtype": "float32",
+            "numel": 1536,
+            "shape": [
+              1,
+              2,
+              768
+            ]
+          },
+          "encoded.query_mask": {
+            "dtype": "bool",
+            "numel": 2,
+            "shape": [
+              1,
+              2
+            ]
+          },
+          "encoded.text": {
+            "dtype": "float32",
+            "numel": 7680,
+            "shape": [
+              1,
+              10,
+              768
+            ]
+          },
+          "encoded.text_mask": {
+            "dtype": "bool",
+            "numel": 10,
+            "shape": [
+              1,
+              10
+            ]
+          },
+          "input.attention_mask": {
+            "dtype": "int64",
+            "numel": 22,
+            "shape": [
+              1,
+              22
+            ]
+          },
+          "input.ids": {
+            "dtype": "int64",
+            "numel": 22,
+            "shape": [
+              1,
+              22
+            ]
+          },
+          "marginal.end": {
+            "dtype": "float32",
+            "numel": 22,
+            "shape": [
+              1,
+              2,
+              11
+            ]
+          },
+          "marginal.inside": {
+            "dtype": "float32",
+            "numel": 20,
+            "shape": [
+              1,
+              2,
+              10
+            ]
+          },
+          "marginal.start": {
+            "dtype": "float32",
+            "numel": 22,
+            "shape": [
+              1,
+              2,
+              11
+            ]
+          }
+        }
+      },
+      "text_tokens": [
+        [
+          "john",
+          "works",
+          "at",
+          "apple",
+          ".",
+          "alice",
+          "works",
+          "at",
+          "google",
+          "."
+        ]
+      ]
+    },
+    {
+      "end_mappings": [
+        [
+          3,
+          10,
+          17,
+          20,
+          25,
+          26
+        ]
+      ],
+      "id": "enum_field",
+      "kind": "extract",
+      "output": {
+        "review": [
+          {
+            "product": {
+              "confidence": 0.9744067192077637,
+              "end": 17,
+              "start": 4,
+              "text": "iPhone camera"
+            },
+            "sentiment": {
+              "confidence": 0.9993060827255249,
+              "text": "positive"
+            }
+          }
+        ]
+      },
+      "queries": [
+        [
+          {
+            "field_index": 0,
+            "field_name": "product",
+            "group_index": 0,
+            "task_name": "review",
+            "task_type": "json_structures"
+          },
+          {
+            "field_index": 1,
+            "field_name": "sentiment",
+            "group_index": 0,
+            "task_name": "review",
+            "task_type": "json_structures"
+          }
+        ]
+      ],
+      "start_mappings": [
+        [
+          0,
+          4,
+          11,
+          18,
+          21,
+          25
+        ]
+      ],
+      "tensor_capture": {
+        "file": "enum_field.safetensors",
+        "sha256": "d9c721517017899ffccf27486aa1fe3b059edf6792b904e4b3a0610e7995a5f3",
+        "size_bytes": 62073,
+        "tensors": {
+          "candidate.indices": {
+            "dtype": "int64",
+            "numel": 768,
+            "shape": [
+              1,
+              2,
+              192,
+              2
+            ]
+          },
+          "candidate.logits": {
+            "dtype": "float32",
+            "numel": 384,
+            "shape": [
+              1,
+              2,
+              192
+            ]
+          },
+          "candidate.mask": {
+            "dtype": "bool",
+            "numel": 384,
+            "shape": [
+              1,
+              2,
+              192
+            ]
+          },
+          "encoded.query": {
+            "dtype": "float32",
+            "numel": 1536,
+            "shape": [
+              1,
+              2,
+              768
+            ]
+          },
+          "encoded.query_mask": {
+            "dtype": "bool",
+            "numel": 2,
+            "shape": [
+              1,
+              2
+            ]
+          },
+          "encoded.text": {
+            "dtype": "float32",
+            "numel": 11520,
+            "shape": [
+              1,
+              15,
+              768
+            ]
+          },
+          "encoded.text_mask": {
+            "dtype": "bool",
+            "numel": 15,
+            "shape": [
+              1,
+              15
+            ]
+          },
+          "input.attention_mask": {
+            "dtype": "int64",
+            "numel": 27,
+            "shape": [
+              1,
+              27
+            ]
+          },
+          "input.ids": {
+            "dtype": "int64",
+            "numel": 27,
+            "shape": [
+              1,
+              27
+            ]
+          },
+          "marginal.end": {
+            "dtype": "float32",
+            "numel": 32,
+            "shape": [
+              1,
+              2,
+              16
+            ]
+          },
+          "marginal.inside": {
+            "dtype": "float32",
+            "numel": 30,
+            "shape": [
+              1,
+              2,
+              15
+            ]
+          },
+          "marginal.start": {
+            "dtype": "float32",
+            "numel": 32,
+            "shape": [
+              1,
+              2,
+              16
+            ]
+          }
+        }
+      },
+      "text_tokens": [
+        [
+          "(",
+          "review:",
+          "sentiment",
+          "(",
+          "positive",
+          "|",
+          "negative",
+          ")",
+          ")",
+          "the",
+          "iphone",
+          "camera",
+          "is",
+          "good",
+          "."
+        ]
+      ]
+    },
+    {
+      "id": "constrained_classification",
+      "kind": "classification",
+      "logits": {
+        "effects": {
+          "delete": 8.17405891418457,
+          "read_only": -10.73825740814209
+        },
+        "intent": {
+          "delete": 8.015456199645996,
+          "read": -10.023263931274414
+        }
+      },
+      "output": {
+        "_meta": {
+          "decoder": "exact",
+          "exact": true,
+          "feasible": true,
+          "objective": 16.189515113830566,
+          "violations": []
+        },
+        "effects": {
+          "confidence": 0.9999999938837478,
+          "probabilities": {
+            "delete": 0.9999999938837478,
+            "read_only": 6.116252109386747e-09
+          },
+          "value": "delete"
+        },
+        "intent": {
+          "confidence": 0.9999999853484565,
+          "probabilities": {
+            "delete": 0.9999999853484565,
+            "read": 1.465154354541112e-08
+          },
+          "value": "delete"
+        }
+      },
+      "schema_fingerprint": "ea30e56405ff0d9463b4dc83023718f4beafed8970183c0fa8a24ee091bc6834"
+    },
+    {
+      "feasible": true,
+      "id": "joint_ie",
+      "kind": "joint_ie",
+      "output": {
+        "entities": [
+          {
+            "confidence": 0.997024534627765,
+            "end": 4,
+            "id": "e1",
+            "start": 0,
+            "text": "John",
+            "type": "person"
+          },
+          {
+            "confidence": 0.9985848215496579,
+            "end": 19,
+            "id": "e2",
+            "start": 14,
+            "text": "Apple",
+            "type": "organization"
+          },
+          {
+            "confidence": 0.9864922723879817,
+            "end": 26,
+            "id": "e3",
+            "start": 21,
+            "text": "Alice",
+            "type": "person"
+          },
+          {
+            "confidence": 0.9981437884157629,
+            "end": 42,
+            "id": "e4",
+            "start": 36,
+            "text": "Google",
+            "type": "organization"
+          }
+        ],
+        "relations": [
+          {
+            "confidence": 0.8422008484894733,
+            "head": "e1",
+            "tail": "e2",
+            "type": "works_for"
+          },
+          {
+            "confidence": 0.8097893141350528,
+            "head": "e3",
+            "tail": "e4",
+            "type": "works_for"
+          }
+        ]
+      }
+    }
+  ],
+  "requests_sha256": "030c979419cee5fd209ba6a6f23f2e0cc7744e396d4bf3357925651293f5fe5f",
+  "scope": "pretrained_reference",
+  "status": "captured",
+  "training_qualified": false
+}

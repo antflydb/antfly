@@ -25,6 +25,7 @@ const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const SpecialTokens = @import("tokenizer.zig").SpecialTokens;
 const PriorityQueue = @import("priority_queue.zig").PriorityQueue;
 const unicode_classes = @import("unicode_classes.zig");
+const unicode_normalizer = @import("unicode_normalizer.zig");
 
 const ModelType = enum { word_piece, bpe, unigram };
 
@@ -85,6 +86,11 @@ pub const HfTokenizer = struct {
     wrap_specials_explicit: bool,
     do_lowercase: bool,
     replace_space_with: ?[]const u8,
+    unigram_normalizer: unicode_normalizer.Profile = .{},
+    unigram_min_score: f64 = std.math.inf(f64),
+    // A generic unsupported normalizer keeps the complete legacy encoding
+    // behavior. This is selected internally, never by a strict load option.
+    unigram_encoding: UnigramEncoding = .tokenizers_v1,
     pre_tokenizer_type: PreTokenizerType,
     byte_level_pretokenizer: ByteLevelPretokenizer,
     // WordPiece fields
@@ -141,9 +147,12 @@ pub const HfTokenizer = struct {
 
     const UnigramPiece = struct {
         token: []const u8,
-        score: f32,
+        score: f64,
+        legacy_score: f32,
         id: i32,
     };
+
+    const UnigramEncoding = enum { tokenizers_v1, legacy_unsupported_normalizer };
 
     const PackedBpeMerge = struct {
         rank: u32,
@@ -746,6 +755,10 @@ pub const HfTokenizer = struct {
 
     pub fn encodeWithOffsets(self: *HfTokenizer, allocator: std.mem.Allocator, text: []const u8) !?EncodingWithOffsets {
         if (text.len > std.math.maxInt(u32)) return null;
+        // The normalizer can compose/reorder codepoints and collapse spaces.
+        // Until normalized alignment tracking is implemented, do not expose
+        // offsets from the unnormalized fast path. GLiNER owns its word maps.
+        if (self.unigram_normalizer.len != 0) return null;
         if (self.model_type == .word_piece and self.pre_tokenizer_type == .bert) {
             return try self.encodeWordPieceWithOffsets(allocator, text);
         }
@@ -816,17 +829,28 @@ pub const HfTokenizer = struct {
 
     /// Parse tokenizer.json content from memory.
     pub fn loadFromBytes(allocator: std.mem.Allocator, json_bytes: []const u8) !*HfTokenizer {
-        return loadFromBytesConfigured(allocator, json_bytes, false);
+        return loadFromBytesWithOptions(allocator, json_bytes, .{});
+    }
+
+    pub const LoadOptions = struct {
+        /// Boundary models require every Unigram normalization step to be
+        /// implemented. Generic loaders retain their existing compatibility
+        /// behavior for legacy profiles such as SentencePiece Precompiled.
+        strict_unigram_normalizer: bool = false,
+    };
+
+    pub fn loadFromBytesWithOptions(allocator: std.mem.Allocator, json_bytes: []const u8, options: LoadOptions) !*HfTokenizer {
+        return loadFromBytesConfigured(allocator, json_bytes, false, options);
     }
 
     /// Parse generated tokenizer JSON whose vocab may contain duplicate token
     /// strings. GGUF keeps every token ID, while encoding resolves duplicates
     /// to the last ID.
     pub fn loadFromBytesAllowDuplicateFields(allocator: std.mem.Allocator, json_bytes: []const u8) !*HfTokenizer {
-        return loadFromBytesConfigured(allocator, json_bytes, true);
+        return loadFromBytesConfigured(allocator, json_bytes, true, .{});
     }
 
-    fn loadFromBytesConfigured(allocator: std.mem.Allocator, json_bytes: []const u8, allow_duplicate_fields: bool) !*HfTokenizer {
+    fn loadFromBytesConfigured(allocator: std.mem.Allocator, json_bytes: []const u8, allow_duplicate_fields: bool, options: LoadOptions) !*HfTokenizer {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{
             .duplicate_field_behavior = if (allow_duplicate_fields) .use_last else .@"error",
         });
@@ -931,8 +955,9 @@ pub const HfTokenizer = struct {
         // Parse normalizer
         if (root.object.get("normalizer")) |norm| {
             if (norm == .object) {
-                self.parseNormalizer(norm.object);
-            }
+                try self.parseNormalizer(norm.object, options.strict_unigram_normalizer);
+            } else if (options.strict_unigram_normalizer and self.model_type == .unigram and norm != .null)
+                return error.InvalidTokenizerNormalizer;
         }
 
         // Parse added_tokens
@@ -1244,38 +1269,53 @@ pub const HfTokenizer = struct {
 
     fn parseUnigramModel(self: *HfTokenizer, obj: std.json.ObjectMap) !void {
         if (obj.get("unk_id")) |v| {
-            if (v == .integer) self.unigram_unk_id = @intCast(v.integer);
+            if (v != .integer) return error.InvalidTokenizerJson;
+            self.unigram_unk_id = std.math.cast(i32, v.integer) orelse return error.InvalidTokenizerJson;
+        }
+        if (obj.get("byte_fallback")) |v| {
+            if (v != .bool) return error.InvalidTokenizerJson;
+            self.byte_fallback = v.bool;
         }
 
-        if (obj.get("vocab")) |vocab_val| {
-            if (vocab_val == .array) {
-                for (vocab_val.array.items, 0..) |item, idx| {
-                    if (item == .array and item.array.items.len >= 2) {
-                        const token_val = item.array.items[0];
-                        const score_val = item.array.items[1];
-                        if (token_val == .string) {
-                            const score: f32 = switch (score_val) {
-                                .float => @floatCast(score_val.float),
-                                .integer => @floatFromInt(score_val.integer),
-                                else => 0.0,
-                            };
-                            const id: i32 = @intCast(idx);
-                            const token = try self.dupeArenaString(token_val.string);
-                            try self.unigram_vocab.append(self.allocator, .{
-                                .token = token,
-                                .score = score,
-                                .id = id,
-                            });
-                            try self.vocab.put(self.allocator, token, id);
-                            try self.id_to_token.put(self.allocator, id, token);
-                            try self.unigram_trie.insert(self.allocator, token, id);
-                        }
-                    }
-                }
-            }
+        const vocab_val = obj.get("vocab") orelse return error.InvalidTokenizerJson;
+        if (vocab_val != .array or vocab_val.array.items.len > std.math.maxInt(i32))
+            return error.InvalidTokenizerJson;
+        for (vocab_val.array.items, 0..) |item, idx| {
+            if (item != .array or item.array.items.len != 2) return error.InvalidTokenizerJson;
+            const token_val = item.array.items[0];
+            const score_val = item.array.items[1];
+            if (token_val != .string or token_val.string.len == 0 or !std.unicode.utf8ValidateSlice(token_val.string))
+                return error.InvalidTokenizerJson;
+            const score: f64 = switch (score_val) {
+                .float => score_val.float,
+                .integer => @floatFromInt(score_val.integer),
+                else => return error.InvalidTokenizerJson,
+            };
+            if (!std.math.isFinite(score)) return error.InvalidTokenizerJson;
+            // Keep the original direct conversion for the private legacy
+            // profile, including integer scores which can double-round via f64.
+            const legacy_score: f32 = switch (score_val) {
+                .float => @floatCast(score_val.float),
+                .integer => @floatFromInt(score_val.integer),
+                else => unreachable,
+            };
+            self.unigram_min_score = @min(self.unigram_min_score, score);
+            const id: i32 = @intCast(idx);
+            const token = try self.dupeArenaString(token_val.string);
+            try self.unigram_vocab.append(self.allocator, .{
+                .token = token,
+                .score = score,
+                .legacy_score = legacy_score,
+                .id = id,
+            });
+            try self.vocab.put(self.allocator, token, id);
+            try self.id_to_token.put(self.allocator, id, token);
+            try self.unigram_trie.insert(self.allocator, token, id);
         }
 
         // Set unk special token
+        if (self.unigram_unk_id < 0 or @as(usize, @intCast(self.unigram_unk_id)) >= self.unigram_vocab.items.len)
+            return error.InvalidTokenizerJson;
         self.special.unk_id = self.unigram_unk_id;
         self.unk_token_seen = true;
     }
@@ -1353,14 +1393,35 @@ pub const HfTokenizer = struct {
         }
     }
 
-    fn parseNormalizer(self: *HfTokenizer, obj: std.json.ObjectMap) void {
+    fn parseNormalizer(self: *HfTokenizer, obj: std.json.ObjectMap, strict_unigram: bool) error{ InvalidTokenizerNormalizer, UnsupportedTokenizerNormalizer }!void {
+        if (self.model_type == .unigram) {
+            // Parse transactionally. A legacy Sequence may have supported
+            // steps before Precompiled/Lowercase; retaining just that prefix
+            // would change its old tokenization while discarding later steps.
+            var profile = unicode_normalizer.Profile{};
+            profile.parse(.{ .object = obj }) catch |err| switch (err) {
+                error.UnsupportedTokenizerNormalizer => {
+                    if (strict_unigram) return err;
+                    self.parseLegacyNormalizer(obj);
+                    self.unigram_encoding = .legacy_unsupported_normalizer;
+                    return;
+                },
+                else => return err,
+            };
+            self.unigram_normalizer = profile;
+            return;
+        }
+        self.parseLegacyNormalizer(obj);
+    }
+
+    fn parseLegacyNormalizer(self: *HfTokenizer, obj: std.json.ObjectMap) void {
         if (obj.get("type")) |t| {
             if (t == .string) {
                 if (std.mem.eql(u8, t.string, "Sequence")) {
                     if (obj.get("normalizers")) |normalizers| {
                         if (normalizers == .array) {
                             for (normalizers.array.items) |item| {
-                                if (item == .object) self.parseNormalizer(item.object);
+                                if (item == .object) self.parseLegacyNormalizer(item.object);
                             }
                         }
                     }
@@ -1682,6 +1743,13 @@ pub const HfTokenizer = struct {
         const cache_reader = self.enterBpeCacheRead();
         defer if (cache_reader) |cache| self.leaveBpeCacheRead(cache);
 
+        if (self.unigram_normalizer.len != 0) {
+            var ids = std.ArrayListUnmanaged(i32).empty;
+            errdefer ids.deinit(allocator);
+            try self.encodeNormalizedUnigram(allocator, text, null, &ids);
+            return ids.toOwnedSlice(allocator);
+        }
+
         // Skip the buffer-reuse layer in the dedicated single-shot path:
         // we avoid a redundant ensureUnusedCapacity wraparound and the
         // toOwnedSlice resize that would chase it. Body mirrors `encodeInto`.
@@ -1714,6 +1782,9 @@ pub const HfTokenizer = struct {
     ) !void {
         const cache_reader = self.enterBpeCacheRead();
         defer if (cache_reader) |cache| self.leaveBpeCacheRead(cache);
+
+        if (self.unigram_normalizer.len != 0)
+            return self.encodeNormalizedUnigram(allocator, text, null, ids);
 
         if (!self.do_lowercase and self.replace_space_with == null) {
             return self.encodeWithAddedTokens(allocator, text, ids);
@@ -3661,6 +3732,64 @@ pub const HfTokenizer = struct {
         ids: *std.ArrayListUnmanaged(i32),
     ) !void {
         return self.encodeWithAddedTokensMetaspaceOverride(allocator, text, null, ids);
+    }
+
+    fn encodeNormalizedUnigram(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        metaspace_override: ?MetaspacePrependScheme,
+        ids: *std.ArrayListUnmanaged(i32),
+    ) !void {
+        // HF protects added tokens before normalizing each remaining segment.
+        // In particular Strip(right=true) applies immediately before a marker,
+        // and Metaspace(always) prefixes text immediately after a marker.
+        var cursor: usize = 0;
+        while (cursor < text.len) {
+            if (self.matchAddedTokenAt(text[cursor..])) |match| {
+                try ids.append(allocator, match.id);
+                cursor += match.len;
+                continue;
+            }
+            const end = self.findNextAddedToken(text, cursor) orelse text.len;
+            const normalized = try self.unigram_normalizer.normalize(allocator, text[cursor..end]);
+            defer allocator.free(normalized);
+            const scheme: ?MetaspacePrependScheme = if (cursor > 0 and self.metaspace_prepend_scheme == .first)
+                .never
+            else
+                metaspace_override;
+            if (self.pre_tokenizer_type == .metaspace) {
+                try self.encodeNormalizedMetaspace(allocator, normalized, scheme orelse self.metaspace_prepend_scheme, ids);
+            } else try self.encodeUnigramWithMetaspaceScheme(allocator, normalized, scheme, ids);
+            cursor = end;
+        }
+    }
+
+    fn encodeNormalizedMetaspace(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        scheme: MetaspacePrependScheme,
+        ids: *std.ArrayListUnmanaged(i32),
+    ) !void {
+        if (text.len == 0) return;
+        const replacement = self.metaspace_replacement;
+        if (replacement.len == 0) return error.InvalidTokenizerJson;
+        var prepared = std.ArrayListUnmanaged(u8).empty;
+        defer prepared.deinit(allocator);
+        if (scheme != .never and text[0] != ' ' and !std.mem.startsWith(u8, text, replacement))
+            try prepared.appendSlice(allocator, replacement);
+        for (text) |byte| {
+            if (byte == ' ') try prepared.appendSlice(allocator, replacement) else try prepared.append(allocator, byte);
+        }
+        if (!self.metaspace_split) return self.unigramEncodeWord(allocator, prepared.items, ids);
+        var cursor: usize = 0;
+        while (cursor < prepared.items.len) {
+            const search_from = cursor + @as(usize, if (std.mem.startsWith(u8, prepared.items[cursor..], replacement)) replacement.len else 0);
+            const end = std.mem.indexOfPos(u8, prepared.items, search_from, replacement) orelse prepared.items.len;
+            try self.unigramEncodeWord(allocator, prepared.items[cursor..end], ids);
+            cursor = end;
+        }
     }
 
     fn encodeWithAddedTokensMetaspaceOverride(
@@ -6985,7 +7114,10 @@ pub const HfTokenizer = struct {
             // lock-free BPE cache.
             const cache_reader = self.enterBpeCacheRead();
             defer if (cache_reader) |cache| self.leaveBpeCacheRead(cache);
-            try self.encodeWithAddedTokensMetaspaceOverride(allocator, text, .never, &raw);
+            if (self.unigram_normalizer.len != 0)
+                try self.encodeNormalizedUnigram(allocator, text, .never, &raw)
+            else
+                try self.encodeWithAddedTokensMetaspaceOverride(allocator, text, .never, &raw);
         } else {
             try self.encodeInto(allocator, text, &raw);
         }
@@ -6996,6 +7128,7 @@ pub const HfTokenizer = struct {
         const available = if (prepend_bos) max_length - 1 else max_length;
         const token_count = @min(raw_ids.len, available);
         const ids = try allocator.alloc(i32, max_length);
+        errdefer allocator.free(ids);
         const mask = try allocator.alloc(i32, max_length);
 
         var pos: usize = 0;
@@ -7027,7 +7160,7 @@ pub const HfTokenizer = struct {
             defer raw.deinit(allocator);
             return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length);
         }
-        if (self.model_type == .unigram and self.pre_tokenizer_type == .metaspace and self.metaspace_split) {
+        if (self.model_type == .unigram and self.pre_tokenizer_type == .metaspace and self.metaspace_split and self.unigram_normalizer.len == 0) {
             var raw = try self.encodeUnigramWithOffsets(allocator, text);
             defer raw.deinit(allocator);
             return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length);
@@ -7043,6 +7176,7 @@ pub const HfTokenizer = struct {
             const max_tokens = if (max_length > wrap_len) max_length - wrap_len else 0;
             const token_count = @min(raw_ids.len, max_tokens);
             const ids = try allocator.alloc(i32, max_length);
+            errdefer allocator.free(ids);
             const mask = try allocator.alloc(i32, max_length);
 
             var pos: usize = 0;
@@ -7107,52 +7241,47 @@ pub const HfTokenizer = struct {
         return .{ .prepend = &.{}, .append = &.{} };
     }
 
-    fn unigramEncodeWord(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32)) !void {
-        if (word.len == 0) return;
+    const UnigramSegment = struct { start: usize, end: usize, id: i32 };
 
-        // Check added tokens
-        if (self.added_tokens.get(word)) |id| {
-            try ids.append(allocator, id);
-            return;
+    fn legacyUnigramPieceId(self: *HfTokenizer, piece: []const u8) i32 {
+        if (self.vocab.get(piece)) |id| return id;
+        // Legacy encoding used an available byte piece even when the
+        // tokenizer's byte_fallback flag was false, and did not fuse unknowns.
+        if (piece.len == 1) {
+            var buffer: [6]u8 = undefined;
+            const key = std.fmt.bufPrint(&buffer, "<0x{X:0>2}>", .{piece[0]}) catch unreachable;
+            if (self.vocab.get(key)) |id| return id;
         }
+        return self.unigram_unk_id;
+    }
 
-        // Viterbi algorithm for best segmentation
-        const n = word.len;
-
-        // best_score[i] = best log probability for word[0..i]
-        const best_score = try allocator.alloc(f32, n + 1);
+    fn legacyUnigramSegments(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8) ![]UnigramSegment {
+        // Preserve the pre-boundary Viterbi profile for unsupported legacy
+        // normalizers: f32 vocabulary/path scores, a 128-byte trie walk and
+        // single-byte fallback only at otherwise unreachable end positions.
+        // Both ordinary and offset encoding consume these same byte ranges.
+        const count = try std.math.add(usize, word.len, 1);
+        const best_score = try allocator.alloc(f32, count);
         defer allocator.free(best_score);
-        // best_len[i] = length of token ending at position i in best path
-        const best_len = try allocator.alloc(usize, n + 1);
+        const best_len = try allocator.alloc(usize, count);
         defer allocator.free(best_len);
-
         best_score[0] = 0;
         best_len[0] = 0;
-        for (1..n + 1) |i| {
-            best_score[i] = -std.math.inf(f32);
-            best_len[i] = 1; // default: single byte fallback
+        for (1..count) |index| {
+            best_score[index] = -std.math.inf(f32);
+            best_len[index] = 1;
         }
-
-        // Forward pass: walk the vocab trie from each position to enumerate
-        // every token that can start there in a single pass, then relax the
-        // Viterbi score for each. This avoids the O(max_len) hashmap probe
-        // miss that the previous (start, len) double-loop incurred for the
-        // common case where most prefixes have no continuation.
-        for (0..n) |start| {
+        for (0..word.len) |start| {
             if (start > 0 and best_score[start] == -std.math.inf(f32)) continue;
-
-            const trie_nodes = self.unigram_trie.nodes.items;
-            const vocab_items = self.unigram_vocab.items;
             const start_score = best_score[start];
-            var node_idx: u32 = 0;
-            const limit = @min(n - start, 128);
+            var node_index: u32 = 0;
+            const limit = @min(word.len - start, 128);
             var len: usize = 0;
             while (len < limit) : (len += 1) {
-                const child = trie_nodes[node_idx].children.get(word[start + len]) orelse break;
-                node_idx = child;
-                const tok_id = trie_nodes[node_idx].token_id;
-                if (tok_id < 0) continue;
-                const score = vocab_items[@intCast(tok_id)].score;
+                node_index = self.unigram_trie.nodes.items[node_index].children.get(word[start + len]) orelse break;
+                const id = self.unigram_trie.nodes.items[node_index].token_id;
+                if (id < 0) continue;
+                const score = self.unigram_vocab.items[@intCast(id)].legacy_score;
                 const end = start + len + 1;
                 const candidate = start_score + score;
                 if (candidate > best_score[end]) {
@@ -7160,61 +7289,128 @@ pub const HfTokenizer = struct {
                     best_len[end] = len + 1;
                 }
             }
-
-            // Single-byte fallback (<0xNN>) for positions the trie didn't cover
-            // with a one-byte token.
-            const end1 = start + 1;
-            if (best_score[end1] == -std.math.inf(f32)) {
-                var buf: [6]u8 = undefined;
-                const hex = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{word[start]}) catch continue;
-                if (self.vocab.contains(hex)) {
-                    const candidate = best_score[start] + (-10.0);
-                    if (candidate > best_score[end1]) {
-                        best_score[end1] = candidate;
-                        best_len[end1] = 1;
+            const end = start + 1;
+            if (best_score[end] == -std.math.inf(f32)) {
+                var buffer: [6]u8 = undefined;
+                const key = std.fmt.bufPrint(&buffer, "<0x{X:0>2}>", .{word[start]}) catch unreachable;
+                if (self.vocab.contains(key)) {
+                    const candidate = start_score + (-10.0);
+                    if (candidate > best_score[end]) {
+                        best_score[end] = candidate;
+                        best_len[end] = 1;
                     }
                 }
             }
         }
+        var segments = std.ArrayListUnmanaged(UnigramSegment).empty;
+        errdefer segments.deinit(allocator);
+        var end = word.len;
+        while (end > 0) {
+            const len = best_len[end];
+            // Every nonzero end has length one or a reachable trie match.
+            std.debug.assert(len > 0 and len <= end);
+            const start = end - len;
+            try segments.append(allocator, .{ .start = start, .end = end, .id = self.legacyUnigramPieceId(word[start..end]) });
+            end = start;
+        }
+        std.mem.reverse(UnigramSegment, segments.items);
+        return segments.toOwnedSlice(allocator);
+    }
 
-        // Backward pass: reconstruct best path
-        var segments = std.ArrayListUnmanaged([]const u8).empty;
-        defer segments.deinit(allocator);
+    fn unigramSegments(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8) ![]UnigramSegment {
+        if (self.unigram_encoding == .legacy_unsupported_normalizer)
+            return self.legacyUnigramSegments(allocator, word);
+        // Tokenizers 0.21.4 uses f64 path scores, one unknown transition per
+        // Unicode scalar only when no single-scalar vocabulary node exists,
+        // and fuses consecutive unknown transitions before byte fallback.
+        const Node = struct { score: f64 = 0, start: ?usize = null, id: i32 = 0 };
+        const nodes = try allocator.alloc(Node, try std.math.add(usize, word.len, 1));
+        defer allocator.free(nodes);
+        @memset(nodes, .{});
+        const view = try std.unicode.Utf8View.init(word);
+        var iter = view.iterator();
+        while (iter.i < word.len) {
+            const start = iter.i;
+            _ = iter.nextCodepoint().?;
+            const scalar_len = iter.i - start;
+            var single = false;
+            var node_index: u32 = 0;
+            var position = start;
+            while (position < word.len) : (position += 1) {
+                node_index = self.unigram_trie.nodes.items[node_index].children.get(word[position]) orelse break;
+                const id = self.unigram_trie.nodes.items[node_index].token_id;
+                if (id < 0) continue;
+                const end = position + 1;
+                const score = nodes[start].score + self.unigram_vocab.items[@intCast(id)].score;
+                if (nodes[end].start == null or score > nodes[end].score)
+                    nodes[end] = .{ .score = score, .start = start, .id = id };
+                if (end - start == scalar_len) single = true;
+            }
+            if (!single) {
+                const end = start + scalar_len;
+                const score = (self.unigram_min_score - 10.0) + nodes[start].score;
+                if (nodes[end].start == null or score > nodes[end].score)
+                    nodes[end] = .{ .score = score, .start = start, .id = self.unigram_unk_id };
+            }
+        }
+        var segments = std.ArrayListUnmanaged(UnigramSegment).empty;
+        errdefer segments.deinit(allocator);
+        var end = word.len;
+        while (end > 0) {
+            const node = nodes[end];
+            const start = node.start orelse return error.InvalidUnigramPath;
+            if (start >= end) return error.InvalidUnigramPath;
+            if (node.id == self.unigram_unk_id and segments.items.len > 0 and
+                segments.items[segments.items.len - 1].id == self.unigram_unk_id)
+            {
+                segments.items[segments.items.len - 1].start = start;
+            } else try segments.append(allocator, .{ .start = start, .end = end, .id = node.id });
+            end = start;
+        }
+        std.mem.reverse(UnigramSegment, segments.items);
+        return segments.toOwnedSlice(allocator);
+    }
 
-        var pos: usize = n;
-        while (pos > 0) {
-            const len = best_len[pos];
-            if (len == 0) {
-                // Shouldn't happen, but safety: emit unk and break
-                try ids.append(allocator, self.unigram_unk_id);
+    fn appendUnigramPiece(self: *HfTokenizer, allocator: std.mem.Allocator, piece: []const u8, ids: *std.ArrayListUnmanaged(i32)) !void {
+        if (self.vocab.get(piece)) |id| {
+            try ids.append(allocator, id);
+            return;
+        }
+        if (self.byte_fallback) {
+            var complete = true;
+            for (piece) |byte| {
+                var buffer: [6]u8 = undefined;
+                const key = try std.fmt.bufPrint(&buffer, "<0x{X:0>2}>", .{byte});
+                if (!self.vocab.contains(key)) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (complete) {
+                for (piece) |byte| {
+                    var buffer: [6]u8 = undefined;
+                    const key = try std.fmt.bufPrint(&buffer, "<0x{X:0>2}>", .{byte});
+                    try ids.append(allocator, self.vocab.get(key).?);
+                }
                 return;
             }
-            try segments.append(allocator, word[pos - len .. pos]);
-            pos -= len;
         }
+        try ids.append(allocator, self.unigram_unk_id);
+    }
 
-        // Segments are in reverse order
-        var i = segments.items.len;
-        while (i > 0) {
-            i -= 1;
-            const piece = segments.items[i];
-            if (self.vocab.get(piece)) |id| {
-                try ids.append(allocator, id);
-            } else if (piece.len == 1) {
-                // Byte fallback
-                var buf: [6]u8 = undefined;
-                const hex = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{piece[0]}) catch {
-                    try ids.append(allocator, self.unigram_unk_id);
-                    continue;
-                };
-                if (self.vocab.get(hex)) |id| {
-                    try ids.append(allocator, id);
-                } else {
-                    try ids.append(allocator, self.unigram_unk_id);
-                }
-            } else {
-                try ids.append(allocator, self.unigram_unk_id);
-            }
+    fn unigramEncodeWord(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32)) !void {
+        if (word.len == 0) return;
+        if (self.added_tokens.get(word)) |id| {
+            try ids.append(allocator, id);
+            return;
+        }
+        const segments = try self.unigramSegments(allocator, word);
+        defer allocator.free(segments);
+        for (segments) |segment| {
+            if (self.unigram_encoding == .legacy_unsupported_normalizer)
+                try ids.append(allocator, segment.id)
+            else
+                try self.appendUnigramPiece(allocator, word[segment.start..segment.end], ids);
         }
     }
 
@@ -7227,112 +7423,22 @@ pub const HfTokenizer = struct {
         result: *RawWordPieceEncoding,
     ) !void {
         if (word.len == 0) return;
-
         if (self.added_tokens.get(word)) |id| {
             try result.ids.append(allocator, id);
-            try result.offsets.append(allocator, .{
-                @intCast(word_start),
-                @intCast(word_start + word.len - clampedPrefixLen(prefix_len, word.len)),
-            });
+            try result.offsets.append(allocator, .{ @intCast(word_start), @intCast(word_start + word.len - clampedPrefixLen(prefix_len, word.len)) });
             return;
         }
-
-        const n = word.len;
-        const best_score = try allocator.alloc(f32, n + 1);
-        defer allocator.free(best_score);
-        const best_len = try allocator.alloc(usize, n + 1);
-        defer allocator.free(best_len);
-
-        best_score[0] = 0;
-        best_len[0] = 0;
-        for (1..n + 1) |i| {
-            best_score[i] = -std.math.inf(f32);
-            best_len[i] = 1;
-        }
-
-        for (0..n) |start| {
-            if (start > 0 and best_score[start] == -std.math.inf(f32)) continue;
-
-            const trie_nodes = self.unigram_trie.nodes.items;
-            const vocab_items = self.unigram_vocab.items;
-            const start_score = best_score[start];
-            var node_idx: u32 = 0;
-            const limit = @min(n - start, 128);
-            var len: usize = 0;
-            while (len < limit) : (len += 1) {
-                const child = trie_nodes[node_idx].children.get(word[start + len]) orelse break;
-                node_idx = child;
-                const tok_id = trie_nodes[node_idx].token_id;
-                if (tok_id < 0) continue;
-                const score = vocab_items[@intCast(tok_id)].score;
-                const end = start + len + 1;
-                const candidate = start_score + score;
-                if (candidate > best_score[end]) {
-                    best_score[end] = candidate;
-                    best_len[end] = len + 1;
-                }
-            }
-
-            const end1 = start + 1;
-            if (best_score[end1] == -std.math.inf(f32)) {
-                var buf: [6]u8 = undefined;
-                const hex = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{word[start]}) catch continue;
-                if (self.vocab.contains(hex)) {
-                    const candidate = best_score[start] + (-10.0);
-                    if (candidate > best_score[end1]) {
-                        best_score[end1] = candidate;
-                        best_len[end1] = 1;
-                    }
-                }
-            }
-        }
-
-        var segments = std.ArrayListUnmanaged([2]usize).empty;
-        defer segments.deinit(allocator);
-
-        var pos: usize = n;
-        while (pos > 0) {
-            const len = best_len[pos];
-            if (len == 0) {
-                try result.ids.append(allocator, self.unigram_unk_id);
-                try result.offsets.append(allocator, .{
-                    @intCast(word_start),
-                    @intCast(word_start + word.len - clampedPrefixLen(prefix_len, word.len)),
-                });
-                return;
-            }
-            try segments.append(allocator, .{ pos - len, pos });
-            pos -= len;
-        }
-
-        var i = segments.items.len;
-        while (i > 0) {
-            i -= 1;
-            const range = segments.items[i];
-            const piece = word[range[0]..range[1]];
-            if (self.vocab.get(piece)) |id| {
-                try result.ids.append(allocator, id);
-            } else if (piece.len == 1) {
-                var buf: [6]u8 = undefined;
-                const hex = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{piece[0]}) catch {
-                    try result.ids.append(allocator, self.unigram_unk_id);
-                    continue;
-                };
-                if (self.vocab.get(hex)) |id| {
-                    try result.ids.append(allocator, id);
-                } else {
-                    try result.ids.append(allocator, self.unigram_unk_id);
-                }
-            } else {
-                try result.ids.append(allocator, self.unigram_unk_id);
-            }
-
-            const local_start = adjustedOffset(range[0], prefix_len, word.len);
-            const local_end = adjustedOffset(range[1], prefix_len, word.len);
-            try result.offsets.append(allocator, .{
-                @intCast(word_start + local_start),
-                @intCast(word_start + local_end),
-            });
+        const segments = try self.unigramSegments(allocator, word);
+        defer allocator.free(segments);
+        for (segments) |segment| {
+            const before = result.ids.items.len;
+            if (self.unigram_encoding == .legacy_unsupported_normalizer)
+                try result.ids.append(allocator, segment.id)
+            else
+                try self.appendUnigramPiece(allocator, word[segment.start..segment.end], &result.ids);
+            const start = word_start + adjustedOffset(segment.start, prefix_len, word.len);
+            const end = word_start + adjustedOffset(segment.end, prefix_len, word.len);
+            for (before..result.ids.items.len) |_| try result.offsets.append(allocator, .{ @intCast(start), @intCast(end) });
         }
     }
 
@@ -7350,7 +7456,9 @@ pub const HfTokenizer = struct {
         const max_tokens = if (max_length > wrap_len) max_length - wrap_len else 0;
         const token_count = @min(raw_ids.len, max_tokens);
         const ids = try allocator.alloc(i32, max_length);
+        errdefer allocator.free(ids);
         const mask = try allocator.alloc(i32, max_length);
+        errdefer allocator.free(mask);
         const offsets = try allocator.alloc([2]u32, max_length);
 
         var pos: usize = 0;
@@ -7748,6 +7856,11 @@ fn metaspacePreTokenizeWithOffsets(
 ) ![]PreTokenSpan {
     var words = std.ArrayListUnmanaged(PreTokenSpan).empty;
 
+    errdefer {
+        for (words.items) |word| allocator.free(word.text);
+        words.deinit(allocator);
+    }
+
     if (!split) {
         var prepared = std.ArrayListUnmanaged(u8).empty;
         defer prepared.deinit(allocator);
@@ -7763,11 +7876,15 @@ fn metaspacePreTokenizeWithOffsets(
             }
         }
 
-        try words.append(allocator, .{
-            .text = try prepared.toOwnedSlice(allocator),
-            .start = 0,
-            .end = text.len,
-        });
+        {
+            const transformed = try prepared.toOwnedSlice(allocator);
+            errdefer allocator.free(transformed);
+            try words.append(allocator, .{
+                .text = transformed,
+                .start = 0,
+                .end = text.len,
+            });
+        }
         return try words.toOwnedSlice(allocator);
     }
 
@@ -7787,6 +7904,7 @@ fn metaspacePreTokenizeWithOffsets(
                         try std.fmt.allocPrint(allocator, "{s}{s}", .{ replacement, segment })
                     else
                         try allocator.dupe(u8, segment);
+                    errdefer allocator.free(transformed);
                     try words.append(allocator, .{
                         .text = transformed,
                         .start = start_idx,
@@ -11339,6 +11457,198 @@ test "unigram encode basic" {
     // With metaspace "always" prepend, this becomes "▁abc" which won't match
     // So it will fall back to bytes. Let's just verify it doesn't crash.
     try std.testing.expect(ids.len > 0);
+}
+
+test "GLiNER2.5 ordered normalization and Unigram match pinned Python fixtures" {
+    const a = std.testing.allocator;
+    const fixture = @import("normalizer_fixtures.zig");
+    const tok = try HfTokenizer.loadFromBytes(a, fixture.tiny_tokenizer_json);
+    defer tok.deinitSelf();
+    var reused = std.ArrayListUnmanaged(i32).empty;
+    defer reused.deinit(a);
+    for (fixture.cases) |case| {
+        const normalized = try tok.unigram_normalizer.normalize(a, case.text);
+        defer a.free(normalized);
+        try std.testing.expectEqualStrings(case.normalized, normalized);
+        const ids = try tok.encode(a, case.text);
+        defer a.free(ids);
+        try std.testing.expectEqualSlices(i32, case.ids, ids);
+        reused.clearRetainingCapacity();
+        try tok.encodeInto(a, case.text, &reused);
+        try std.testing.expectEqualSlices(i32, case.ids, reused.items);
+        // Composition changes byte positions. Explicitly decline the old raw
+        // offset path instead of silently returning coordinates for other IDs.
+        try std.testing.expect((try tok.encodeWithOffsets(a, case.text)) == null);
+    }
+}
+
+test "strict Unigram rejects unsupported normalizer instead of ignoring checkpoint semantics" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.UnsupportedTokenizerNormalizer, HfTokenizer.loadFromBytesWithOptions(a,
+        \\{"model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0]]},"normalizer":{"type":"Precompiled","precompiled_charsmap":""}}
+    , .{ .strict_unigram_normalizer = true }));
+    try std.testing.expectError(error.InvalidTokenizerNormalizer, HfTokenizer.loadFromBytesWithOptions(a,
+        \\{"model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0]]},"normalizer":"NFC"}
+    , .{ .strict_unigram_normalizer = true }));
+}
+
+const legacy_unigram_normalizer_fixture =
+    \\{"model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0],["▁",-2],["a",-1],["A",-1],["é",-1],["é",-1]]},"pre_tokenizer":{"type":"Metaspace","replacement":"▁","prepend_scheme":"always","split":true},"normalizer":{"type":"Sequence","normalizers":[{"type":"Strip","strip_left":true,"strip_right":true},{"type":"NFC"},{"type":"Precompiled","precompiled_charsmap":""},{"type":"Lowercase"}]}}
+;
+
+fn exerciseLegacyUnigramNormalizer(a: std.mem.Allocator) !void {
+    const tok = try HfTokenizer.loadFromBytes(a, legacy_unigram_normalizer_fixture);
+    defer tok.deinitSelf();
+    // Legacy profiles must not keep a successfully parsed prefix and skip
+    // the later Lowercase. These IDs retain the pre-boundary behavior, even
+    // for decomposed accents that a partial NFC profile would change.
+    try std.testing.expectEqual(@as(usize, 0), tok.unigram_normalizer.len);
+    try std.testing.expectEqual(.legacy_unsupported_normalizer, tok.unigram_encoding);
+    try std.testing.expect(tok.do_lowercase);
+    const ids = try tok.encode(a, "A e\u{301}");
+    defer a.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 1, 5 }, ids);
+    var reused = std.ArrayListUnmanaged(i32).empty;
+    defer reused.deinit(a);
+    try tok.encodeInto(a, "A e\u{301}", &reused);
+    try std.testing.expectEqualSlices(i32, ids, reused.items);
+}
+
+test "legacy Unigram normalization is compatible and never publishes a partial strict profile" {
+    try exerciseLegacyUnigramNormalizer(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseLegacyUnigramNormalizer, .{});
+    try std.testing.expectError(error.UnsupportedTokenizerNormalizer, HfTokenizer.loadFromBytesWithOptions(std.testing.allocator, legacy_unigram_normalizer_fixture, .{ .strict_unigram_normalizer = true }));
+}
+
+const legacy_unigram_encoding_model =
+    \\{"model":{"type":"Unigram","unk_id":0,"byte_fallback":false,"vocab":[["<unk>",0],["▁",-1],["a",-1],["<0x0A>",0],["<0x09>",0],["<0xC3>",0]]},"pre_tokenizer":{"type":"Metaspace","replacement":"▁","prepend_scheme":"always","split":true},
+;
+const legacy_unigram_encoding_fixture = legacy_unigram_encoding_model ++
+    \\"normalizer":{"type":"Sequence","normalizers":[{"type":"NFC"},{"type":"Precompiled","precompiled_charsmap":""}]}}
+;
+
+fn exerciseLegacyUnigramEncoding(a: std.mem.Allocator) !void {
+    const tok = try HfTokenizer.loadFromBytes(a, legacy_unigram_encoding_fixture);
+    defer tok.deinitSelf();
+    try std.testing.expectEqual(.legacy_unsupported_normalizer, tok.unigram_encoding);
+    try std.testing.expect(!tok.byte_fallback);
+    const cases = [_]struct { text: []const u8, ids: []const i32, offsets: []const [2]u32 }{
+        // Newline/tab remain separate byte pieces despite byte_fallback=false.
+        // A partial UTF-8 byte vocabulary retains each legacy byte interval;
+        // the fully supported profile never takes this compatibility branch.
+        .{ .text = "a\n\té", .ids = &.{ 1, 2, 3, 4, 5, 0 }, .offsets = &.{ .{ 0, 0 }, .{ 0, 1 }, .{ 1, 2 }, .{ 2, 3 }, .{ 3, 4 }, .{ 4, 5 } } },
+        .{ .text = "é🙂", .ids = &.{ 1, 5, 0, 0, 0, 0, 0 }, .offsets = &.{ .{ 0, 0 }, .{ 0, 1 }, .{ 1, 2 }, .{ 2, 3 }, .{ 3, 4 }, .{ 4, 5 }, .{ 5, 6 } } },
+        // Multiple words exercise retained-prefix cleanup when a later word
+        // or the final list allocation fails in the offset pre-tokenizer.
+        .{ .text = "a a", .ids = &.{ 1, 2, 1, 2 }, .offsets = &.{ .{ 0, 0 }, .{ 0, 1 }, .{ 2, 2 }, .{ 2, 3 } } },
+    };
+    for (cases) |case| {
+        const ids = try tok.tokenizer().encode(a, case.text);
+        defer a.free(ids);
+        try std.testing.expectEqualSlices(i32, case.ids, ids);
+        var reused = std.ArrayListUnmanaged(i32).empty;
+        defer reused.deinit(a);
+        try tok.tokenizer().encodeInto(a, case.text, &reused);
+        try std.testing.expectEqualSlices(i32, case.ids, reused.items);
+        var raw = (try tok.encodeWithOffsets(a, case.text)) orelse return error.TestUnexpectedResult;
+        defer raw.deinit(a);
+        try std.testing.expectEqualSlices(i32, case.ids, raw.ids.items);
+        try std.testing.expectEqual(case.offsets.len, raw.offsets.items.len);
+        for (case.offsets, raw.offsets.items) |expected, actual|
+            try std.testing.expectEqualSlices(u32, &expected, &actual);
+        var encoded = try tok.tokenizer().encodeForModel(a, case.text, case.ids.len + 2);
+        defer encoded.deinit();
+        try std.testing.expectEqualSlices(i32, case.ids, encoded.ids[0..case.ids.len]);
+        for (encoded.attention_mask[0..case.ids.len]) |mask| try std.testing.expectEqual(@as(i32, 1), mask);
+        try std.testing.expectEqualSlices(i32, &.{ 0, 0 }, encoded.attention_mask[case.ids.len..]);
+        for (case.offsets, encoded.offsets.?[0..case.ids.len]) |expected, actual|
+            try std.testing.expectEqualSlices(u32, &expected, &actual);
+    }
+}
+
+test "legacy Unigram unsupported profiles preserve byte fallback UTF8 fragments and offsets" {
+    const a = std.testing.allocator;
+    try exerciseLegacyUnigramEncoding(a);
+    try std.testing.expectError(error.UnsupportedTokenizerNormalizer, HfTokenizer.loadFromBytesWithOptions(a, legacy_unigram_encoding_fixture, .{ .strict_unigram_normalizer = true }));
+    const supported = legacy_unigram_encoding_model ++
+        \\"normalizer":{"type":"NFC"}}
+    ;
+    const tok = try HfTokenizer.loadFromBytesWithOptions(a, supported, .{ .strict_unigram_normalizer = true });
+    defer tok.deinitSelf();
+    try std.testing.expectEqual(.tokenizers_v1, tok.unigram_encoding);
+    const ids = try tok.tokenizer().encode(a, "a\n\té");
+    defer a.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 0 }, ids);
+    try std.testing.expect((try tok.encodeWithOffsets(a, "a\n\té")) == null);
+}
+
+test "legacy Unigram unsupported profiles preserve f32 segmentation ties" {
+    const a = std.testing.allocator;
+    const prefix =
+        \\{"model":{"type":"Unigram","unk_id":0,"byte_fallback":false,"vocab":[["<unk>",0],["a",-1.00000001],["b",-1],["ab",-2.000000015]]},"pre_tokenizer":{"type":"Metaspace","replacement":"▁","prepend_scheme":"never","split":true},
+    ;
+    const legacy = try HfTokenizer.loadFromBytes(a, prefix ++
+        \\"normalizer":{"type":"Precompiled","precompiled_charsmap":""}}
+    );
+    defer legacy.deinitSelf();
+    const legacy_ids = try legacy.tokenizer().encode(a, "ab");
+    defer a.free(legacy_ids);
+    try std.testing.expectEqualSlices(i32, &.{3}, legacy_ids);
+    const supported = try HfTokenizer.loadFromBytesWithOptions(a, prefix ++
+        \\"normalizer":{"type":"NFC"}}
+    , .{ .strict_unigram_normalizer = true });
+    defer supported.deinitSelf();
+    const current_ids = try supported.tokenizer().encode(a, "ab");
+    defer a.free(current_ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2 }, current_ids);
+}
+
+test "legacy Unigram unsupported profile encoding cleans up every failed allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseLegacyUnigramEncoding, .{});
+}
+
+test "strict Unigram normalization preserves every pinned boundary token fixture" {
+    const a = std.testing.allocator;
+    const fixture = @import("normalizer_fixtures.zig");
+    const tok = try HfTokenizer.loadFromBytesWithOptions(a, fixture.tiny_tokenizer_json, .{ .strict_unigram_normalizer = true });
+    defer tok.deinitSelf();
+    for (fixture.cases) |case| {
+        const ids = try tok.encode(a, case.text);
+        defer a.free(ids);
+        try std.testing.expectEqualSlices(i32, case.ids, ids);
+    }
+}
+
+test "Unigram rejects malformed vocabulary without corrupting index routing" {
+    const invalid = [_][]const u8{
+        \\{"model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0],null,["a",-1]]}}
+        ,
+        \\{"model":{"type":"Unigram","unk_id":2147483648,"vocab":[["<unk>",0]]}}
+        ,
+        \\{"model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0],["a"]]}}
+        ,
+    };
+    for (invalid) |json| try std.testing.expectError(error.InvalidTokenizerJson, HfTokenizer.loadFromBytes(std.testing.allocator, json));
+}
+
+fn exerciseNormalizedUnigramAllocations(a: std.mem.Allocator, tok: *HfTokenizer) !void {
+    const text = "e\u{301}  東京 🙂🙂[SEP]a";
+    const ids = try tok.encode(a, text);
+    defer a.free(ids);
+    var reused = std.ArrayListUnmanaged(i32).empty;
+    defer reused.deinit(a);
+    try tok.encodeInto(a, text, &reused);
+    var model = try HfTokenizer.encodeForModel(tok, a, text, 16);
+    defer model.deinit();
+    var generation = try HfTokenizer.encodeGeneration(tok, a, text, 16, true);
+    defer generation.deinit();
+}
+
+test "normalized Unigram encoding cleans up every failed allocation" {
+    const fixture = @import("normalizer_fixtures.zig");
+    const tok = try HfTokenizer.loadFromBytes(std.testing.allocator, fixture.tiny_tokenizer_json);
+    defer tok.deinitSelf();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseNormalizedUnigramAllocations, .{tok});
 }
 
 test "metaspace pre-tokenizer" {

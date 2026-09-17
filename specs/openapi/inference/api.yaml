@@ -749,6 +749,378 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+  /dictate:
+    post:
+      summary: Dictate speech into clean written text
+      description: |
+        Push-to-talk dictation. Transcribes one recorded clip with a Whisper
+        transcriber, then rewrites the transcript as clean written text with a
+        generator model: fillers, false starts, and repeated words are removed,
+        punctuation and paragraphing are added, and preferred spellings from
+        `dictionary` are applied. Clips longer than the 30 s Whisper window
+        are transcribed in windows cut at the quietest pause near the boundary.
+
+        Set `cleanup_model` to the generator that rewrites the transcript.
+        Without it, or with `style: verbatim`, the response carries the raw
+        transcript and no generation runs.
+
+        The framed attachment transport is accepted: send the JSON as the
+        envelope metadata with `"audio": "attachment:0"` and the clip as the
+        single attachment.
+
+        With `stream: true` the response is Server-Sent Events. The stream
+        emits one `dictation.transcript` event as soon as transcription
+        finishes, then `dictation.delta` events with cleaned-text tokens,
+        then `dictation.completed` with the full cleaned text, then `[DONE]`.
+
+        ```json
+        {
+          "model": "openai/whisper-tiny",
+          "cleanup_model": "ggml-org/gemma-4-E4B-it-GGUF",
+          "audio": "UklGRi...",
+          "dictionary": ["Antfly", "Colony"],
+          "context": "reply in a Slack thread",
+          "stream": true
+        }
+        ```
+      operationId: dictate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DictateRequest'
+      responses:
+        '200':
+          description: |
+            Dictation result. Returns JSON for non-streaming requests, or
+            Server-Sent Events for streaming requests (stream: true).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DictateResponse'
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/DictationEvent'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Audio exceeds the configured size limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+  /transcription/sessions:
+    post:
+      summary: Open a streaming transcription session
+      description: |
+        Creates a server-side session that accepts audio in chunks and returns
+        transcript events as speech is endpointed. Append audio with
+        `POST /transcription/sessions/{session_id}/audio`; each append runs
+        voice activity detection over the buffered audio and returns the
+        events it produced:
+
+        - `partial`: the open speech segment decoded again. `stable_text` is
+          the word prefix that agreed with the previous hypothesis and can be
+          rendered as committed text.
+        - `final`: a segment closed by `vad.min_silence_ms` of silence, by
+          `max_segment_ms` of continuous speech, or by `commit: true`.
+
+        Sessions expire after `ttl_seconds` without appends and are closed
+        with `DELETE`.
+      operationId: createTranscriptionSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TranscriptionSessionRequest'
+      responses:
+        '200':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranscriptionSession'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Session limit reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+  /transcription/sessions/{session_id}:
+    get:
+      summary: Inspect a streaming transcription session
+      operationId: getTranscriptionSession
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Session state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranscriptionSession'
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Close a streaming transcription session
+      description: Discards buffered audio that has not been committed.
+      operationId: deleteTranscriptionSession
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Session closed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranscriptionSessionDeleted'
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Session is processing an append
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /transcription/sessions/{session_id}/events:
+    get:
+      summary: Subscribe to a session's transcript events
+      description: |
+        Long-lived Server-Sent Events stream that pushes every `partial` and
+        `final` event the session produces, whether they came from
+        `POST .../audio` appends or a `POST .../stream` upload. Clients that
+        append from one connection and render from another use this instead
+        of reading the append responses. A `ping` is sent after 15 s of
+        silence. The stream ends with `session.closed` and `[DONE]` when the
+        session is deleted or expires.
+      operationId: streamTranscriptionSessionEvents
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/TranscriptionStreamMessage'
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /transcription/sessions/{session_id}/stream:
+    post:
+      summary: Stream raw audio into a session and receive events as they occur
+      description: |
+        Full-duplex transcription over one request. The request body is raw
+        little-endian mono PCM (`format` selects 16-bit or float32 samples at
+        `sample_rate`), sent as it is captured. The server decodes as chunks
+        arrive and writes `transcription.event` messages on the response while
+        the upload continues. At end of body, buffered speech is finalized
+        when `commit` is true (the default).
+
+        Over HTTP/2 the body is read incrementally. Over HTTP/1.1 the body is
+        read after it has fully arrived, so use `/audio` appends there for
+        live results. Appends to the same session are refused with 409 while
+        a stream is open.
+      operationId: streamTranscriptionAudio
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - pcm16
+              - pcm_f32
+          description: Raw sample format. Default pcm16.
+        - name: sample_rate
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Sample rate of the raw stream. Default 16000.
+        - name: commit
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: Finalize open speech at end of body. Default true.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/TranscriptionStreamMessage'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Session or model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Session is processing another request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+  /transcription/sessions/{session_id}/audio:
+    post:
+      summary: Append audio to a streaming transcription session
+      description: |
+        Appends one chunk of audio and runs endpointing and decoding over the
+        session buffer. The response lists the events produced by this
+        append, in order. Appends to one session must be sequential; a
+        concurrent append is rejected with 409.
+
+        `audio` is base64. With `format: auto` (default) the bytes are a
+        container the runtime can decode (WAV, Opus, MP3, FLAC, ...). With
+        `format: pcm16` or `pcm_f32` the bytes are raw little-endian mono
+        samples at `sample_rate`, which lets a client send microphone frames
+        without re-encoding. Chunks of 250 ms to 1 s balance latency and
+        decoder work.
+
+        `commit: true` finalizes buffered speech even without trailing
+        silence. It may be sent without `audio` to flush at the end of a
+        recording.
+
+        The framed attachment transport is accepted: send the JSON as the
+        envelope metadata with `"audio": "attachment:0"` and the bytes as the
+        single attachment.
+      operationId: appendTranscriptionAudio
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TranscriptionAudioAppend'
+      responses:
+        '200':
+          description: Events produced by this append
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranscriptionEventList'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Session or model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Session is processing another append
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Audio exceeds the session buffer or size limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
   /extract:
     post:
       summary: Extract entities, relations, classifications, and structures
@@ -757,6 +1129,13 @@ paths:
         canonical public API for named entity recognition, relation extraction,
         text/document classification, token classification, and structured
         document extraction.
+
+        Set `schema_version: 2` for strict mixed-task schemas, span attributes,
+        constrained classification, typed records and JointIE. Each input may
+        replace the shared schema/options. Offsets default to half-open UTF-8
+        bytes, and text content parts are joined by a single newline. Inputs
+        are validated atomically. Unsupported features and long documents are
+        rejected explicitly; windowing requires runtime support.
 
         Image-backed extraction uses the same byte-reserving and image-count-weighted
         admission policy as `/read`, before model resolution or download. Text-only
@@ -794,7 +1173,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '413':
-          description: Media content exceeds the configured size limit
+          description: Media, text, schema, candidate graph, or output exceeds a configured size/work limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: Extraction hard constraints are infeasible, required record fields are missing, or bounded search exhausted without an accepted feasible witness
           content:
             application/json:
               schema:
@@ -1047,6 +1432,14 @@ components:
           type: integer
           minimum: 0
           description: Minimum retry delay in milliseconds
+        input_index:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Input whose atomic extraction validation or decoding failed, when known
+        stage:
+          type: string
+          description: Extraction failure stage, when known
     TransientCapacityError:
       type: object
       description: Actionable retry contract for temporary inference-capacity failures.
@@ -2055,7 +2448,7 @@ components:
         audio:
           type: string
           format: byte
-          description: Base64-encoded audio data (WAV, MP3, FLAC, etc.)
+          description: Base64-encoded audio data (WAV, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
         language:
           type: string
           description: Force specific language for transcription (optional, model-dependent)
@@ -2105,6 +2498,470 @@ components:
           type: string
           description: Detected or forced language
           example: en
+    DictationStyle:
+      type: string
+      description: |
+        How the cleanup pass rewrites the transcript. `clean` removes fillers
+        and fixes punctuation while keeping the speaker's wording; `formal`
+        and `casual` also adjust register; `verbatim` skips the generator and
+        returns the raw transcript.
+      enum:
+        - clean
+        - formal
+        - casual
+        - verbatim
+    DictateRequest:
+      type: object
+      required:
+        - model
+        - audio
+      properties:
+        model:
+          type: string
+          minLength: 1
+          description: Transcriber model from models_dir/transcribers/.
+          example: openai/whisper-tiny
+        audio:
+          type: string
+          format: byte
+          description: Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows.
+        language:
+          type: string
+          description: Force the transcript language (ISO 639-1). Omit for automatic detection.
+          example: en
+        cleanup_model:
+          type: string
+          description: Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
+          example: ggml-org/gemma-4-E4B-it-GGUF
+        style:
+          $ref: '#/components/schemas/DictationStyle'
+        dictionary:
+          type: array
+          items:
+            type: string
+          maxItems: 256
+          description: Preferred spellings for names and terms the recognizer tends to miss.
+        context:
+          type: string
+          maxLength: 4096
+          description: Where the text will be inserted, for example "email to a customer". Steers tone and formatting.
+        instructions:
+          type: string
+          maxLength: 4096
+          description: Extra cleanup instructions appended to the built-in rules.
+        transcript_prompt:
+          type: string
+          maxLength: 1024
+          description: Text the recognizer treats as preceding context, so it prefers these spellings and this style. Defaults to the dictionary entries joined by commas.
+        vad:
+          $ref: '#/components/schemas/VadConfig'
+        audio_context:
+          $ref: '#/components/schemas/AudioContext'
+        stream:
+          type: boolean
+          default: false
+          description: Stream the response as Server-Sent Events.
+        max_tokens:
+          type: integer
+          minimum: 1
+          description: Output budget for the cleanup pass. Defaults to about twice the transcript length.
+    DictationWord:
+      type: object
+      required:
+        - word
+        - start_ms
+        - end_ms
+      properties:
+        word:
+          type: string
+        start_ms:
+          type: integer
+        end_ms:
+          type: integer
+    DictationSegment:
+      type: object
+      description: One phrase bracketed by Whisper timestamp tokens (about 20 ms resolution).
+      required:
+        - text
+        - start_ms
+        - end_ms
+        - words
+      properties:
+        text:
+          type: string
+        start_ms:
+          type: integer
+          description: Phrase start offset in the clip, in milliseconds.
+        end_ms:
+          type: integer
+          description: Phrase end offset in the clip, in milliseconds.
+        words:
+          type: array
+          items:
+            $ref: '#/components/schemas/DictationWord'
+          description: Word spans estimated inside the phrase by distributing its duration over word lengths.
+    DictationTranscript:
+      type: object
+      required:
+        - text
+        - duration_ms
+        - segments
+      properties:
+        text:
+          type: string
+          description: Raw transcript before cleanup.
+        language:
+          type: string
+          description: Detected or forced language.
+        duration_ms:
+          type: integer
+          description: Decoded clip duration in milliseconds.
+        segments:
+          type: array
+          items:
+            $ref: '#/components/schemas/DictationSegment'
+          description: Timestamped phrases in clip order.
+    DictateResponse:
+      type: object
+      required:
+        - object
+        - id
+        - created
+        - model
+        - transcript
+        - text
+        - usage
+      properties:
+        object:
+          type: string
+          enum:
+            - dictation
+        id:
+          type: string
+        created:
+          type: integer
+          description: Unix timestamp (seconds).
+        model:
+          type: string
+          description: Transcriber model used.
+        cleanup_model:
+          type: string
+          description: Generator model used for cleanup, when one ran.
+        transcript:
+          $ref: '#/components/schemas/DictationTranscript'
+        text:
+          type: string
+          description: Cleaned text, or the raw transcript when no cleanup ran.
+        usage:
+          $ref: '#/components/schemas/GenerateUsage'
+    DictationEvent:
+      type: object
+      description: |
+        One Server-Sent Event of a streaming dictation. `dictation.transcript`
+        carries `transcript`; `dictation.delta` carries `delta`;
+        `dictation.completed` carries `text` and `usage`; `error` carries
+        `error` and `message`. The stream ends with the literal `[DONE]`.
+      required:
+        - type
+        - id
+      properties:
+        type:
+          type: string
+          enum:
+            - dictation.transcript
+            - dictation.delta
+            - dictation.completed
+            - error
+        id:
+          type: string
+        model:
+          type: string
+        cleanup_model:
+          type: string
+        transcript:
+          $ref: '#/components/schemas/DictationTranscript'
+        delta:
+          type: string
+        text:
+          type: string
+        usage:
+          $ref: '#/components/schemas/GenerateUsage'
+        error:
+          type: string
+        message:
+          type: string
+    AudioContext:
+      type: string
+      description: |
+        How much of Whisper's 30 s window the encoder processes. `full` pads
+        every clip to 30 s, which is what the model was trained on and gives
+        the most accurate transcripts. `dynamic` trims the encoder to the
+        audio actually present (plus one second), which cuts encoder time
+        roughly in proportion for short clips at a small accuracy cost on
+        some models. Dictation defaults to `full`; streaming sessions default
+        to `dynamic` because partials re-decode short open segments many times.
+      enum:
+        - full
+        - dynamic
+    VadConfig:
+      type: object
+      description: |
+        Voice activity detection. Without `model`, frames are classified by
+        RMS energy against `threshold`. With `model` naming a pulled Silero
+        VAD export (`antfly inference pull onnx-community/silero-vad --tasks vad`),
+        512-sample frames at 16 kHz are scored by the neural model, which
+        separates speech from tones, music, and keyboard noise that the
+        energy rule accepts.
+      properties:
+        model:
+          type: string
+          description: Silero VAD model directory name from models_dir, for example `onnx-community/silero-vad`.
+          example: onnx-community/silero-vad
+        silero_threshold:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: Speech probability at or above which a Silero frame counts as speech. Default 0.5.
+        threshold:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: RMS amplitude on [-1, 1] PCM at or above which a 20 ms frame counts as speech. Default 0.012 (about -38 dBFS).
+        min_speech_ms:
+          type: integer
+          minimum: 0
+          description: Consecutive speech needed to open a segment. Default 120.
+        min_silence_ms:
+          type: integer
+          minimum: 1
+          description: Continuous silence that closes a segment. Default 600.
+        speech_pad_ms:
+          type: integer
+          minimum: 0
+          description: Padding kept on both sides of each segment. Default 120.
+    TranscriptionSessionRequest:
+      type: object
+      required:
+        - model
+      properties:
+        model:
+          type: string
+          minLength: 1
+          description: Transcriber model from models_dir/transcribers/.
+          example: openai/whisper-tiny
+        language:
+          type: string
+          description: Force the transcript language (ISO 639-1). Omit for automatic detection.
+        vad:
+          $ref: '#/components/schemas/VadConfig'
+        audio_context:
+          $ref: '#/components/schemas/AudioContext'
+        partial_interval_ms:
+          type: integer
+          minimum: 1
+          description: Minimum new audio before the open segment is decoded again for a partial. Each partial is a full Whisper pass, so lower values raise decoder load. Default 2000.
+        max_segment_ms:
+          type: integer
+          minimum: 1
+          maximum: 30000
+          description: Continuous speech that forces a segment boundary. Default 25000.
+        emit_partials:
+          type: boolean
+          default: true
+          description: Emit partial hypotheses for the open segment.
+        dictionary:
+          type: array
+          items:
+            type: string
+          maxItems: 256
+          description: Preferred spellings for names and terms; joined into the recognizer's preceding-context prompt.
+        transcript_prompt:
+          type: string
+          maxLength: 1024
+          description: Explicit preceding-context text for the recognizer. Overrides `dictionary`.
+        ttl_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          description: Idle time after which the session expires. Default 300.
+    TranscriptionSession:
+      type: object
+      required:
+        - object
+        - id
+        - model
+        - created
+        - expires_at
+        - buffered_ms
+        - total_ms
+        - finals
+        - partials
+      properties:
+        object:
+          type: string
+          enum:
+            - transcription.session
+        id:
+          type: string
+        model:
+          type: string
+        language:
+          type: string
+        created:
+          type: integer
+          description: Unix timestamp (seconds).
+        expires_at:
+          type: integer
+          description: Unix timestamp (seconds) after which the session is reclaimed unless audio is appended.
+        buffered_ms:
+          type: integer
+          description: Audio held for the open segment.
+        total_ms:
+          type: integer
+          description: Audio appended over the session lifetime.
+        finals:
+          type: integer
+        partials:
+          type: integer
+    TranscriptionSessionDeleted:
+      type: object
+      required:
+        - object
+        - id
+        - deleted
+      properties:
+        object:
+          type: string
+          enum:
+            - transcription.session.deleted
+        id:
+          type: string
+        deleted:
+          type: boolean
+    TranscriptionAudioFormat:
+      type: string
+      enum:
+        - auto
+        - pcm16
+        - pcm_f32
+    TranscriptionAudioAppend:
+      type: object
+      properties:
+        audio:
+          type: string
+          format: byte
+          description: Base64 audio chunk. Optional when `commit` is true.
+        format:
+          $ref: '#/components/schemas/TranscriptionAudioFormat'
+        sample_rate:
+          type: integer
+          minimum: 8000
+          maximum: 192000
+          description: Sample rate of raw `pcm16` / `pcm_f32` chunks. Default 16000. Ignored for containers.
+        commit:
+          type: boolean
+          default: false
+          description: Finalize buffered speech even without trailing silence.
+    TranscriptionEvent:
+      type: object
+      required:
+        - object
+        - type
+        - sequence
+        - text
+        - stable_text
+        - start_ms
+        - end_ms
+      properties:
+        object:
+          type: string
+          enum:
+            - transcription.event
+        type:
+          type: string
+          enum:
+            - partial
+            - final
+        sequence:
+          type: integer
+          description: Monotonic per-session event counter.
+        text:
+          type: string
+          description: Current hypothesis for the segment.
+        stable_text:
+          type: string
+          description: Prefix of `text` that agreed with the previous hypothesis. Equals `text` for final events.
+        start_ms:
+          type: integer
+          description: Segment start in the session timeline, in milliseconds.
+        end_ms:
+          type: integer
+        language:
+          type: string
+        words:
+          type: array
+          items:
+            $ref: '#/components/schemas/DictationWord'
+          description: Word spans on the session timeline. Empty for partial events.
+    TranscriptionStreamMessage:
+      type: object
+      description: |
+        One Server-Sent Event on a session event stream. `session.open` starts
+        the stream, `transcription.event` carries `event`, `ping` keeps the
+        connection alive, `session.closed` ends it, and `error` carries
+        `error` and `message`. The stream ends with the literal `[DONE]`.
+      required:
+        - type
+        - session_id
+      properties:
+        type:
+          type: string
+          enum:
+            - session.open
+            - transcription.event
+            - ping
+            - session.closed
+            - error
+        session_id:
+          type: string
+        event:
+          $ref: '#/components/schemas/TranscriptionEvent'
+        buffered_ms:
+          type: integer
+        total_ms:
+          type: integer
+        error:
+          type: string
+        message:
+          type: string
+    TranscriptionEventList:
+      type: object
+      required:
+        - object
+        - session_id
+        - model
+        - data
+        - buffered_ms
+        - total_ms
+      properties:
+        object:
+          type: string
+          enum:
+            - list
+        session_id:
+          type: string
+        model:
+          type: string
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/TranscriptionEvent'
+        buffered_ms:
+          type: integer
+        total_ms:
+          type: integer
     ModelInfo:
       type: object
       description: Information about a model including its capabilities
@@ -3002,8 +3859,8 @@ components:
       properties:
         enabled:
           type: boolean
-          description: Enable inference-native prompt KV cache reuse for generator requests.
-          default: false
+          description: Enable inference-native prompt KV cache reuse for generator requests. On by default; set false to disable.
+          default: true
         mode:
           type: string
           description: |

@@ -1049,6 +1049,7 @@ fn formatGlinerBundleDryRunReport(
 ) ![]u8 {
     var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
     defer manifest.deinit();
+    try requireLegacyGlinerExportProfile(manifest);
 
     var access = try tensor_access_mod.openFromManifest(allocator, manifest);
     defer access.deinit();
@@ -1097,6 +1098,7 @@ fn exportGlinerBundleToGguf(
 ) !void {
     var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
     defer manifest.deinit();
+    try requireLegacyGlinerExportProfile(manifest);
 
     var access = try tensor_access_mod.openFromManifest(allocator, manifest);
     defer access.deinit();
@@ -1106,6 +1108,22 @@ fn exportGlinerBundleToGguf(
     defer allocator.free(head_output_path);
     try writeGlinerHeadGguf(allocator, head_output_path, access, quantization, filter);
     try copyGlinerBundleAssets(allocator, model_dir, output_path);
+}
+
+/// Boundary artifacts need their own versioned bundle and precision policy:
+/// the legacy exporter parses wrapper config.json as a DeBERTa config, writes
+/// a span-head family marker, and quantizes arbitrary head matrices. Reject
+/// before opening output files until the boundary converter is qualified.
+fn requireLegacyGlinerExportProfile(manifest: manifest_mod.ModelManifest) !void {
+    if (manifest.gliner_architecture == .boundary or std.mem.eql(u8, manifest.gliner_model_type, "gliner2.5"))
+        return error.UnsupportedGlinerBoundaryExport;
+}
+
+test "gliner boundary export cannot write a legacy span bundle" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryExport, requireLegacyGlinerExportProfile(.{ .allocator = a, .gliner_architecture = .boundary }));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryExport, requireLegacyGlinerExportProfile(.{ .allocator = a, .gliner_model_type = "gliner2.5" }));
+    try requireLegacyGlinerExportProfile(.{ .allocator = a, .gliner_model_type = "gliner2" });
 }
 
 fn defaultGlinerHeadOutputPath(allocator: std.mem.Allocator, output_path: []const u8) ![]u8 {
@@ -2128,10 +2146,11 @@ fn buildWhisperPlannedExport(
             try reversedDimsFromShape(allocator, record.descriptor.shape);
         errdefer allocator.free(dimensions);
 
+        const requested_quantization = whisperTensorQuantization(quantization, output_name_result.name);
         const tensor_quantization = if (source_is_gguf)
             .none
         else
-            supportedQuantizationForDescriptor(source_is_gguf, quantization, record.descriptor, .none);
+            supportedQuantizationForDescriptor(source_is_gguf, requested_quantization, record.descriptor, .none);
         const filtered_quantization = if (!source_is_gguf and quantizationFilterMatches(filter, record.descriptor.name, output_name_result.name))
             tensor_quantization
         else
@@ -2936,6 +2955,44 @@ fn mapDenseTensorNameToT5Gguf(allocator: std.mem.Allocator, source_name: []const
         return .{ .name = try allocator.dupe(u8, name), .owned = true };
     }
     return error.UnsupportedTensorNameForGgufExport;
+}
+
+/// Whisper's own quantization policy, applied before the prefix filters:
+/// position tables stay dense; the token table (also the tied output head)
+/// and the whole encoder never go below q8_0; the decoder layers take the
+/// requested format. Below 8 bits the token table breaks language
+/// detection on the small checkpoints, and q4_0 across all 32 encoder
+/// layers of large-v3-turbo yields nonsense (any 16 of them are fine, and
+/// q4_1, q5_0 and q4_k survive, so it is accumulated q4_0 error, not a
+/// kernel). The encoder is compute-bound, so q8_0 is also its fastest
+/// quantized form on Metal. `--quantize-include` and `--quantize-exclude`
+/// still apply on top.
+fn whisperTensorQuantization(requested: QuantizationMode, output_name: []const u8) QuantizationMode {
+    if (requested == .none) return .none;
+    if (std.mem.endsWith(u8, output_name, "embed_positions.weight")) return .none;
+    const floor_at_q8 = std.mem.eql(u8, output_name, "model.decoder.embed_tokens.weight") or
+        std.mem.eql(u8, output_name, "proj_out.weight") or
+        std.mem.startsWith(u8, output_name, "model.encoder.");
+    if (!floor_at_q8) return requested;
+    return switch (requested) {
+        .q1_0, .q2_k, .q3_k, .q4_0, .q4_1, .q5_0, .q5_1, .q4_k, .q5_k, .q6_k => .q8_0,
+        .q8_0, .q8_1, .q8_k, .none => requested,
+    };
+}
+
+test "whisper export keeps position tables dense and the encoder and token table at q8_0 or better" {
+    try std.testing.expectEqual(QuantizationMode.none, whisperTensorQuantization(.q4_0, "model.encoder.embed_positions.weight"));
+    try std.testing.expectEqual(QuantizationMode.none, whisperTensorQuantization(.q8_0, "model.decoder.embed_positions.weight"));
+    try std.testing.expectEqual(QuantizationMode.q8_0, whisperTensorQuantization(.q4_0, "model.decoder.embed_tokens.weight"));
+    try std.testing.expectEqual(QuantizationMode.q8_0, whisperTensorQuantization(.q4_k, "proj_out.weight"));
+    try std.testing.expectEqual(QuantizationMode.q8_0, whisperTensorQuantization(.q4_0, "model.encoder.layers.31.fc2.weight"));
+    try std.testing.expectEqual(QuantizationMode.q8_0, whisperTensorQuantization(.q6_k, "model.encoder.layers.0.fc1.weight"));
+    try std.testing.expectEqual(QuantizationMode.q8_0, whisperTensorQuantization(.q6_k, "model.decoder.embed_tokens.weight"));
+    try std.testing.expectEqual(QuantizationMode.q6_k, whisperTensorQuantization(.q6_k, "model.decoder.layers.0.fc1.weight"));
+    try std.testing.expectEqual(QuantizationMode.q8_k, whisperTensorQuantization(.q8_k, "model.encoder.layers.0.fc1.weight"));
+    try std.testing.expectEqual(QuantizationMode.q8_1, whisperTensorQuantization(.q8_1, "proj_out.weight"));
+    try std.testing.expectEqual(QuantizationMode.q4_0, whisperTensorQuantization(.q4_0, "model.decoder.layers.0.self_attn.q_proj.weight"));
+    try std.testing.expectEqual(QuantizationMode.none, whisperTensorQuantization(.none, "model.decoder.layers.0.self_attn.q_proj.weight"));
 }
 
 fn mapDenseTensorNameToWhisperGguf(allocator: std.mem.Allocator, source_name: []const u8) !OutputName {
@@ -4720,10 +4777,51 @@ fn appendHfTokenizerMetadata(
     try appendMetadataArrayEntry(allocator, entries, "tokenizer.ggml.tokens", .string, tokens);
     try appendMetadataArrayEntry(allocator, entries, "tokenizer.ggml.scores", .f32, scores);
     try appendMetadataArrayEntry(allocator, entries, "tokenizer.ggml.token_type", .i32, token_types);
+    try appendHfBpeMergesMetadata(allocator, entries, tokenizer_json);
     try appendTokenizerIdMetadata(allocator, entries, "tokenizer.ggml.bos_token_id", hf.special.cls_id);
     try appendTokenizerIdMetadata(allocator, entries, "tokenizer.ggml.eos_token_id", hf.special.sep_id);
     try appendTokenizerIdMetadata(allocator, entries, "tokenizer.ggml.unknown_token_id", hf.special.unk_id);
     try appendTokenizerIdMetadata(allocator, entries, "tokenizer.ggml.padding_token_id", hf.special.pad_id);
+}
+
+/// Byte-level BPE tokenizers (GPT-2, Whisper) cannot be rebuilt from the
+/// vocabulary alone: the loader's `tokenizer.ggml.merges` is required to
+/// segment text. Merges are copied in the tokenizer.json form ("Ġ t"), the
+/// same encoding the exported token strings use.
+fn appendHfBpeMergesMetadata(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayListUnmanaged(gguf_mod.format.MetadataEntry),
+    tokenizer_json: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, tokenizer_json, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const model = parsed.value.object.get("model") orelse return;
+    if (model != .object) return;
+    const merges_value = model.object.get("merges") orelse return;
+    if (merges_value != .array or merges_value.array.items.len == 0) return;
+
+    var merges = std.ArrayListUnmanaged(gguf_mod.format.MetadataValue).empty;
+    errdefer {
+        for (merges.items) |*value| value.deinit(allocator);
+        merges.deinit(allocator);
+    }
+    for (merges_value.array.items) |item| {
+        const merge = switch (item) {
+            .string => |value| try allocator.dupe(u8, value),
+            .array => |pair| blk: {
+                if (pair.items.len < 2 or pair.items[0] != .string or pair.items[1] != .string) continue;
+                break :blk try std.fmt.allocPrint(allocator, "{s} {s}", .{ pair.items[0].string, pair.items[1].string });
+            },
+            else => continue,
+        };
+        errdefer allocator.free(merge);
+        try merges.append(allocator, .{ .string = merge });
+    }
+    if (merges.items.len == 0) return;
+    const owned = try merges.toOwnedSlice(allocator);
+    errdefer freeMetadataValueArray(allocator, owned);
+    try appendMetadataArrayEntry(allocator, entries, "tokenizer.ggml.merges", .string, owned);
 }
 
 fn hfTokenType(hf: *const hf_tokenizer_mod.HfTokenizer, token_id: i32, token: []const u8) i32 {
@@ -6516,6 +6614,39 @@ test "dense siglip text export preserves siglip family metadata" {
     try std.testing.expectEqualStrings("siglip", view.getString("clip.family").?);
 }
 
+test "hf byte-level bpe tokenizer export carries merges" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "native-export-gguf-bpe-merges");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    try writeTestFileInDir(
+        allocator,
+        dir_path,
+        "tokenizer.json",
+        \\{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2,"Ġ":3,"Ġab":4},"merges":["a b","Ġ ab"]},"pre_tokenizer":{"type":"ByteLevel"},"decoder":{"type":"ByteLevel"},"added_tokens":[]}
+        ,
+    );
+
+    var entries = std.ArrayListUnmanaged(gguf_mod.format.MetadataEntry).empty;
+    defer {
+        for (entries.items) |*entry| entry.deinit(allocator);
+        entries.deinit(allocator);
+    }
+    try appendHfTokenizerMetadata(allocator, &entries, dir_path);
+
+    var merges: ?gguf_mod.format.MetadataValue = null;
+    for (entries.items) |entry| {
+        if (std.mem.eql(u8, entry.key, "tokenizer.ggml.merges")) merges = entry.value;
+    }
+    const array = merges.?.array;
+    try std.testing.expectEqual(gguf_mod.format.MetadataValueType.string, array.element_type);
+    try std.testing.expectEqual(@as(usize, 2), array.values.len);
+    try std.testing.expectEqualStrings("a b", array.values[0].string);
+    try std.testing.expectEqualStrings("Ġ ab", array.values[1].string);
+}
+
 test "dense whisper export writes whisper metadata and tensors" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "native-export-gguf-whisper");
@@ -6566,6 +6697,116 @@ test "dense whisper export writes whisper metadata and tensors" {
     try std.testing.expect(catalog.find("model.encoder.embed_positions.weight") != null);
     try std.testing.expect(catalog.find("model.decoder.embed_tokens.weight") != null);
     try std.testing.expect(catalog.find("proj_out.weight") != null);
+}
+
+fn writeWhisperQuantFixture(allocator: std.mem.Allocator, dir_path: []const u8) !void {
+    // Row widths of 32 so every 2-D weight is eligible for the 32-block formats.
+    const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
+    defer allocator.free(config_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = config_path,
+        .data =
+        \\{"model_type":"whisper","d_model":32,"encoder_layers":1,"decoder_layers":1,"encoder_attention_heads":2,"decoder_attention_heads":2,"encoder_ffn_dim":64,"decoder_ffn_dim":64,"num_mel_bins":80,"vocab_size":64,"max_source_positions":1500,"max_target_positions":448,"decoder_start_token_id":2}
+        ,
+    });
+    const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
+    defer allocator.free(st_path);
+    var square: [32 * 32]f32 = undefined;
+    for (&square, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) / 8.0;
+    try writeSafetensorsFixture(allocator, st_path, &.{
+        .{ .name = "model.encoder.conv1.weight", .shape = &.{ 32, 80, 3 }, .data = &([_]f32{0.0} ** (32 * 80 * 3)) },
+        .{ .name = "model.encoder.conv1.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
+        .{ .name = "model.encoder.embed_positions.weight", .shape = &.{ 1500, 32 }, .data = &([_]f32{0.0} ** (1500 * 32)) },
+        .{ .name = "model.encoder.layers.0.self_attn.q_proj.weight", .shape = &.{ 32, 32 }, .data = &square },
+        .{ .name = "model.encoder.layers.0.self_attn.q_proj.bias", .shape = &.{32}, .data = &([_]f32{0.0} ** 32) },
+        .{ .name = "model.encoder.layer_norm.weight", .shape = &.{32}, .data = &([_]f32{1.0} ** 32) },
+        .{ .name = "model.decoder.embed_tokens.weight", .shape = &.{ 64, 32 }, .data = &([_]f32{0.0} ** (64 * 32)) },
+        .{ .name = "model.decoder.embed_positions.weight", .shape = &.{ 448, 32 }, .data = &([_]f32{0.0} ** (448 * 32)) },
+        .{ .name = "model.decoder.layers.0.self_attn.q_proj.weight", .shape = &.{ 32, 32 }, .data = &square },
+        .{ .name = "model.decoder.layers.0.fc1.weight", .shape = &.{ 64, 32 }, .data = &([_]f32{0.0} ** (64 * 32)) },
+        .{ .name = "model.decoder.layer_norm.weight", .shape = &.{32}, .data = &([_]f32{1.0} ** 32) },
+        .{ .name = "proj_out.weight", .shape = &.{ 64, 32 }, .data = &([_]f32{0.0} ** (64 * 32)) },
+    });
+}
+
+const WhisperExportedTypes = struct {
+    encoder_q: gguf_mod.tensor_types.TensorType,
+    encoder_positions: gguf_mod.tensor_types.TensorType,
+    conv1: gguf_mod.tensor_types.TensorType,
+    embed_tokens: gguf_mod.tensor_types.TensorType,
+    decoder_positions: gguf_mod.tensor_types.TensorType,
+    decoder_q: gguf_mod.tensor_types.TensorType,
+    decoder_fc1: gguf_mod.tensor_types.TensorType,
+    proj_out: gguf_mod.tensor_types.TensorType,
+};
+
+fn whisperExportedTypes(allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8, quantization: QuantizationMode, filter: QuantizationFilter) !WhisperExportedTypes {
+    const out_path = try std.fs.path.join(allocator, &.{ dir_path, name });
+    defer allocator.free(out_path);
+    try exportModelDirToGgufFiltered(allocator, dir_path, out_path, quantization, filter);
+    const raw = try c_file.readFile(allocator, out_path);
+    defer allocator.free(raw);
+    var parsed = try gguf_mod.format.parse(allocator, raw);
+    defer parsed.deinit(allocator);
+    const catalog = gguf_mod.tensor_catalog.Catalog.init(&parsed);
+    return .{
+        .encoder_q = catalog.find("model.encoder.layers.0.self_attn.q_proj.weight").?.tensor_type,
+        .encoder_positions = catalog.find("model.encoder.embed_positions.weight").?.tensor_type,
+        .conv1 = catalog.find("model.encoder.conv1.weight").?.tensor_type,
+        .embed_tokens = catalog.find("model.decoder.embed_tokens.weight").?.tensor_type,
+        .decoder_positions = catalog.find("model.decoder.embed_positions.weight").?.tensor_type,
+        .decoder_q = catalog.find("model.decoder.layers.0.self_attn.q_proj.weight").?.tensor_type,
+        .decoder_fc1 = catalog.find("model.decoder.layers.0.fc1.weight").?.tensor_type,
+        .proj_out = catalog.find("proj_out.weight").?.tensor_type,
+    };
+}
+
+test "whisper export applies its quantization policy and honors the prefix filters" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "native-export-gguf-whisper-quant");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    try writeWhisperQuantFixture(allocator, dir_path);
+    const F32 = gguf_mod.tensor_types.TensorType{ .known = .F32 };
+    const Q8_0 = gguf_mod.tensor_types.TensorType{ .known = .Q8_0 };
+    const Q4_0 = gguf_mod.tensor_types.TensorType{ .known = .Q4_0 };
+
+    // q4_0: decoder layers at q4_0, encoder and token tables floored at q8_0,
+    // position tables and the conv front end dense.
+    const q4 = try whisperExportedTypes(allocator, dir_path, "q4.gguf", .q4_0, .{});
+    try std.testing.expectEqual(Q8_0, q4.encoder_q);
+    try std.testing.expectEqual(F32, q4.encoder_positions);
+    try std.testing.expectEqual(F32, q4.conv1);
+    try std.testing.expectEqual(Q8_0, q4.embed_tokens);
+    try std.testing.expectEqual(F32, q4.decoder_positions);
+    try std.testing.expectEqual(Q4_0, q4.decoder_q);
+    try std.testing.expectEqual(Q4_0, q4.decoder_fc1);
+    try std.testing.expectEqual(Q8_0, q4.proj_out);
+
+    // q8_0 everywhere the policy allows.
+    const q8 = try whisperExportedTypes(allocator, dir_path, "q8.gguf", .q8_0, .{});
+    try std.testing.expectEqual(Q8_0, q8.encoder_q);
+    try std.testing.expectEqual(F32, q8.encoder_positions);
+    try std.testing.expectEqual(Q8_0, q8.embed_tokens);
+    try std.testing.expectEqual(Q8_0, q8.decoder_q);
+    try std.testing.expectEqual(Q8_0, q8.proj_out);
+
+    // Exclusions win over the policy; the rest is unchanged.
+    const excluded = try whisperExportedTypes(allocator, dir_path, "q4-exclude.gguf", .q4_0, .{ .exclude_prefixes_csv = "model.decoder.layers,proj_out" });
+    try std.testing.expectEqual(F32, excluded.decoder_q);
+    try std.testing.expectEqual(F32, excluded.decoder_fc1);
+    try std.testing.expectEqual(F32, excluded.proj_out);
+    try std.testing.expectEqual(Q8_0, excluded.encoder_q);
+    try std.testing.expectEqual(Q8_0, excluded.embed_tokens);
+
+    // Inclusions limit quantization to the named prefixes.
+    const included = try whisperExportedTypes(allocator, dir_path, "q4-include.gguf", .q4_0, .{ .include_prefixes_csv = "model.decoder.layers" });
+    try std.testing.expectEqual(Q4_0, included.decoder_q);
+    try std.testing.expectEqual(F32, included.encoder_q);
+    try std.testing.expectEqual(F32, included.embed_tokens);
+    try std.testing.expectEqual(F32, included.proj_out);
 }
 
 test "dense clap export writes clap metadata and tensors" {

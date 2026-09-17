@@ -85,6 +85,9 @@ scripts/__pycache__/
 .pnpm-store/
 .worktrees/
 .tools/
+/.codex/
+/.turbo/
+/output/
 
 /datasets/
 

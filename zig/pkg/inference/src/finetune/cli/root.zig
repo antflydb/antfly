@@ -46,6 +46,7 @@ const materialize_gemma4_lora = @import("../tools/materialize_gemma4_lora.zig").
 const materialize_gemma4_recursive_base = @import("../tools/materialize_gemma4_recursive_base.zig").Command(@import("inference_internal"));
 const materialize_gemma4_teacher_targets = @import("../tools/materialize_gemma4_teacher_targets.zig");
 const materialize_gliner2_lora = @import("../tools/materialize_gliner2_lora.zig").Command(@import("inference_internal"));
+const materialize_gliner25_adapter = @import("../tools/materialize_gliner25_adapter.zig");
 const materialize_layoutlmv3_checkpoint = @import("../tools/materialize_layoutlmv3_checkpoint.zig").Command(@import("inference_internal"));
 const materialize_reranker_head = @import("../tools/materialize_reranker_head.zig").Command(@import("inference_internal"));
 const materialize_reranker_lora = @import("../tools/materialize_reranker_lora.zig").Command(@import("inference_internal"));
@@ -79,6 +80,11 @@ const train_eval_reranker_lora_surrogate = @import("../train/train_eval_reranker
 const train_eval_reranker_lora_surrogate_cached = @import("../train/train_eval_reranker_lora_surrogate_cached.zig");
 const train_eval_reranker_lora_top_layer_cached_surrogate = @import("../train/train_eval_reranker_lora_top_layer_cached_surrogate.zig");
 const train_gliner2_autodiff = @import("../train/train_gliner2_autodiff.zig");
+const train_gliner25 = @import("../train/train_gliner25.zig");
+
+test {
+    _ = train_gliner25;
+}
 const train_layoutlmv3_lora_one_step = @import("../train/train_layoutlmv3_lora_one_step.zig");
 const validate_gliner2_autodiff_run = @import("../tools/validate_gliner2_autodiff_run.zig").Command(@import("inference_internal"));
 
@@ -94,6 +100,7 @@ const Command = struct {
 };
 
 const commands = [_]Command{
+    .{ .domain = "train", .action = "run", .subject = "gliner25", .adapter_argv0 = "train-gliner25", .main_fn = train_gliner25.main },
     .{ .domain = "dataset", .action = "generate", .subject = "gemma4-pilot", .adapter_argv0 = "generate-gemma4-pilot-dataset", .main_fn = generate_gemma4_pilot_dataset.main },
     .{ .domain = "dataset", .action = "generate", .subject = "gemma4-multimodal-pilot", .adapter_argv0 = "generate-gemma4-multimodal-pilot-dataset", .main_fn = generate_gemma4_multimodal_pilot_dataset.main },
     .{ .domain = "dataset", .action = "inspect", .subject = "gliner2", .adapter_argv0 = "inspect-gliner2-dataset", .main_fn = inspect_gliner2_dataset.main },
@@ -126,6 +133,7 @@ const commands = [_]Command{
     .{ .domain = "adapter", .action = "materialize", .subject = "gemma4", .adapter_argv0 = "materialize-gemma4-lora", .main_fn = materialize_gemma4_lora.main },
     .{ .domain = "adapter", .action = "materialize", .subject = "gemma4-recursive-base", .adapter_argv0 = "materialize-gemma4-recursive-base", .main_fn = materialize_gemma4_recursive_base.main },
     .{ .domain = "adapter", .action = "materialize", .subject = "gliner2", .adapter_argv0 = "materialize-gliner2-lora", .main_fn = materialize_gliner2_lora.main },
+    .{ .domain = "adapter", .action = "materialize", .subject = "gliner25", .adapter_argv0 = "materialize-gliner25-adapter", .main_fn = materialize_gliner25_adapter.main },
     .{ .domain = "adapter", .action = "materialize", .subject = "colqwen2", .adapter_argv0 = "materialize-colqwen2-lora", .main_fn = materialize_colqwen2_lora.main },
     .{ .domain = "adapter", .action = "materialize", .subject = "layoutlmv3", .adapter_argv0 = "materialize-layoutlmv3-checkpoint", .main_fn = materialize_layoutlmv3_checkpoint.main },
     .{ .domain = "adapter", .action = "materialize", .subject = "reranker-head", .adapter_argv0 = "materialize-reranker-head", .main_fn = materialize_reranker_head.main },
@@ -306,29 +314,48 @@ fn normalizeGemma4MultimodalPilotArgs(allocator: std.mem.Allocator, args: []cons
     return normalized;
 }
 
+const CommandArguments = struct {
+    allocator: std.mem.Allocator,
+    owned: [][:0]u8,
+    vector: [][*:0]const u8,
+
+    fn init(allocator: std.mem.Allocator, argv0: []const u8, args: []const []const u8) !CommandArguments {
+        const count = try std.math.add(usize, args.len, 1);
+        const owned = try allocator.alloc([:0]u8, count);
+        errdefer allocator.free(owned);
+        var initialized: usize = 0;
+        errdefer for (owned[0..initialized]) |argument| allocator.free(argument);
+        const vector = try allocator.alloc([*:0]const u8, count);
+        errdefer allocator.free(vector);
+        owned[0] = try allocator.dupeZ(u8, argv0);
+        initialized += 1;
+        vector[0] = owned[0].ptr;
+        for (args, 1..) |argument, index| {
+            owned[index] = try allocator.dupeZ(u8, argument);
+            initialized += 1;
+            vector[index] = owned[index].ptr;
+        }
+        return .{ .allocator = allocator, .owned = owned, .vector = vector };
+    }
+
+    fn deinit(self: *CommandArguments) void {
+        for (self.owned) |argument| self.allocator.free(argument);
+        self.allocator.free(self.owned);
+        self.allocator.free(self.vector);
+    }
+};
+
 fn runCommand(init: std.process.Init, argv0: []const u8, main_fn: CommandMain, args: []const []const u8) !void {
     if (builtin.os.tag == .windows) {
         @compileError("antfly inference finetune command dispatch needs Windows Args vector construction");
     }
-
-    const allocator = init.gpa;
-    var owned = try allocator.alloc([:0]u8, args.len + 1);
-    defer {
-        for (owned) |arg| allocator.free(arg);
-        allocator.free(owned);
-    }
-    var vector = try allocator.alloc([*:0]const u8, args.len + 1);
-    defer allocator.free(vector);
-
-    owned[0] = try allocator.dupeZ(u8, argv0);
-    vector[0] = owned[0].ptr;
-    for (args, 0..) |arg, idx| {
-        owned[idx + 1] = try allocator.dupeZ(u8, arg);
-        vector[idx + 1] = owned[idx + 1].ptr;
-    }
+    var adapted = try CommandArguments.init(init.gpa, argv0, args);
+    defer adapted.deinit();
 
     var command_init = init;
-    command_init.minimal.args = .{ .vector = vector };
+    command_init.minimal.args = .{ .vector = adapted.vector };
+    if (main_fn == train_gliner25.main) return train_gliner25.mainWithOriginal(command_init, init.minimal.args);
+    if (main_fn == materialize_gliner25_adapter.main) return materialize_gliner25_adapter.mainWithOriginal(command_init, init.minimal.args);
     return main_fn(command_init);
 }
 
@@ -372,6 +399,19 @@ fn usage() void {
 
 test "finetune cli command table has entries" {
     try std.testing.expect(commands.len > 0);
+}
+
+fn exerciseCommandArguments(allocator: std.mem.Allocator) !void {
+    const tail = [_][]const u8{ "/tmp/job with spaces.json", "--stop-after-microbatches", "2" };
+    var adapted = try CommandArguments.init(allocator, "train-gliner25", &tail);
+    defer adapted.deinit();
+    try std.testing.expectEqualStrings("train-gliner25", std.mem.span(adapted.vector[0]));
+    for (tail, 1..) |argument, index| try std.testing.expectEqualStrings(argument, std.mem.span(adapted.vector[index]));
+}
+
+test "finetune cli argument adaptation cleans every allocation failure" {
+    try exerciseCommandArguments(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseCommandArguments, .{});
 }
 
 test "finetune cli command table has unique canonical commands and adapter argv labels" {

@@ -1406,6 +1406,47 @@ test "lite backend native engine can back db primary documents" {
     }
 }
 
+test "lite vector storage isolates containers with the same logical namespace" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path_a = try testPath(allocator, tmp, "vectors-a.aflite");
+    defer allocator.free(path_a);
+    const path_b = try testPath(allocator, tmp, "vectors-b.aflite");
+    defer allocator.free(path_b);
+    var handle_a = try Handle.create(allocator, path_a, true);
+    defer handle_a.deinit();
+    var handle_b = try Handle.create(allocator, path_b, true);
+    defer handle_b.deinit();
+
+    for ([_]?[]const u8{ null, "table/a" }) |namespace| {
+        var opts_a = db_mod.OpenOptions{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false };
+        var opts_b = opts_a;
+        if (namespace) |name| {
+            try handle_a.configureDbOpenOptionsForNamespace(&opts_a, name);
+            try handle_b.configureDbOpenOptionsForNamespace(&opts_b, name);
+        } else {
+            try handle_a.configureDbOpenOptions(&opts_a);
+            try handle_b.configureDbOpenOptions(&opts_b);
+        }
+        var db_a = try db_mod.DB.open(allocator, path_a, opts_a);
+        defer db_a.close();
+        var db_b = try db_mod.DB.open(allocator, path_b, opts_b);
+        defer db_b.close();
+        const storage_a = db_a.core.index_manager.vector_block_storage.?;
+        const storage_b = db_b.core.index_manager.vector_block_storage.?;
+        const probe_path = try std.fs.path.join(allocator, &.{ opts_a.index_base_path.?, "vector-blocks", "isolation-probe" });
+        defer allocator.free(probe_path);
+        try storage_a.createDirPath(std.fs.path.dirname(probe_path).?);
+        try storage_a.writeFileAbsolute(probe_path, "container a");
+        defer storage_a.deleteFileAbsolute(probe_path) catch {};
+        try std.testing.expectError(error.FileNotFound, storage_b.fileSize(probe_path));
+        const value = try handle_a.native_index_storage.?.storage().readFileAlloc(allocator, probe_path, 64);
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("container a", value);
+    }
+}
+
 test "lite backend namespaced db options isolate tables in one file" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

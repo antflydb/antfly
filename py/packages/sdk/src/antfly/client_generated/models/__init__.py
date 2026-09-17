@@ -271,15 +271,112 @@ from .extension_scope import ExtensionScope
 from .extension_scope_kind import ExtensionScopeKind
 from .external_io_connection import ExternalIoConnection
 from .external_io_protocol import ExternalIoProtocol
+from .extraction_attribute_group import ExtractionAttributeGroup
+from .extraction_attribute_label import ExtractionAttributeLabel
 from .extraction_classification import ExtractionClassification
+from .extraction_classification_example_type_0 import ExtractionClassificationExampleType0
 from .extraction_classification_schema import ExtractionClassificationSchema
+from .extraction_classification_schema_activation import ExtractionClassificationSchemaActivation
+from .extraction_classification_schema_label_definitions import ExtractionClassificationSchemaLabelDefinitions
+from .extraction_classification_schema_mode import ExtractionClassificationSchemaMode
+from .extraction_constraint_and import ExtractionConstraintAnd
+from .extraction_constraint_and_type import ExtractionConstraintAndType
+from .extraction_constraint_any_other_selected import ExtractionConstraintAnyOtherSelected
+from .extraction_constraint_any_other_selected_type import ExtractionConstraintAnyOtherSelectedType
+from .extraction_constraint_any_selected import ExtractionConstraintAnySelected
+from .extraction_constraint_any_selected_type import ExtractionConstraintAnySelectedType
+from .extraction_constraint_at_level import ExtractionConstraintAtLevel
+from .extraction_constraint_at_level_type import ExtractionConstraintAtLevelType
+from .extraction_constraint_cardinality import ExtractionConstraintCardinality
+from .extraction_constraint_cardinality_type import ExtractionConstraintCardinalityType
+from .extraction_constraint_exactly_one_of import ExtractionConstraintExactlyOneOf
+from .extraction_constraint_exactly_one_of_type import ExtractionConstraintExactlyOneOfType
+from .extraction_constraint_excludes import ExtractionConstraintExcludes
+from .extraction_constraint_excludes_type import ExtractionConstraintExcludesType
+from .extraction_constraint_iff import ExtractionConstraintIff
+from .extraction_constraint_iff_type import ExtractionConstraintIffType
+from .extraction_constraint_implies import ExtractionConstraintImplies
+from .extraction_constraint_implies_type import ExtractionConstraintImpliesType
+from .extraction_constraint_is_default import ExtractionConstraintIsDefault
+from .extraction_constraint_is_default_type import ExtractionConstraintIsDefaultType
+from .extraction_constraint_label_ref import ExtractionConstraintLabelRef
+from .extraction_constraint_label_ref_type import ExtractionConstraintLabelRefType
+from .extraction_constraint_max_level import ExtractionConstraintMaxLevel
+from .extraction_constraint_max_level_type import ExtractionConstraintMaxLevelType
+from .extraction_constraint_min_level import ExtractionConstraintMinLevel
+from .extraction_constraint_min_level_type import ExtractionConstraintMinLevelType
+from .extraction_constraint_not import ExtractionConstraintNot
+from .extraction_constraint_not_type import ExtractionConstraintNotType
+from .extraction_constraint_or import ExtractionConstraintOr
+from .extraction_constraint_or_type import ExtractionConstraintOrType
+from .extraction_decoder_options import ExtractionDecoderOptions
+from .extraction_decoder_options_algorithm import ExtractionDecoderOptionsAlgorithm
 from .extraction_entity import ExtractionEntity
+from .extraction_entity_attributes import ExtractionEntityAttributes
+from .extraction_entity_definition import ExtractionEntityDefinition
+from .extraction_entity_definition_dtype import ExtractionEntityDefinitionDtype
+from .extraction_entity_definition_type import ExtractionEntityDefinitionType
 from .extraction_input import ExtractionInput
 from .extraction_input_metadata import ExtractionInputMetadata
+from .extraction_joint_constraint_acyclic_relation import ExtractionJointConstraintAcyclicRelation
+from .extraction_joint_constraint_acyclic_relation_type import ExtractionJointConstraintAcyclicRelationType
+from .extraction_joint_constraint_entity_overlap_policy import ExtractionJointConstraintEntityOverlapPolicy
+from .extraction_joint_constraint_entity_overlap_policy_policy import ExtractionJointConstraintEntityOverlapPolicyPolicy
+from .extraction_joint_constraint_entity_overlap_policy_type import ExtractionJointConstraintEntityOverlapPolicyType
+from .extraction_joint_constraint_inverse_relation import ExtractionJointConstraintInverseRelation
+from .extraction_joint_constraint_inverse_relation_type import ExtractionJointConstraintInverseRelationType
+from .extraction_joint_constraint_max_relations_per_head import ExtractionJointConstraintMaxRelationsPerHead
+from .extraction_joint_constraint_max_relations_per_head_type import ExtractionJointConstraintMaxRelationsPerHeadType
+from .extraction_joint_constraint_max_relations_per_tail import ExtractionJointConstraintMaxRelationsPerTail
+from .extraction_joint_constraint_max_relations_per_tail_type import ExtractionJointConstraintMaxRelationsPerTailType
+from .extraction_joint_constraint_no_self_loops import ExtractionJointConstraintNoSelfLoops
+from .extraction_joint_constraint_no_self_loops_type import ExtractionJointConstraintNoSelfLoopsType
+from .extraction_joint_constraint_symmetric_relation import ExtractionJointConstraintSymmetricRelation
+from .extraction_joint_constraint_symmetric_relation_type import ExtractionJointConstraintSymmetricRelationType
+from .extraction_joint_constraint_typed_endpoints import ExtractionJointConstraintTypedEndpoints
+from .extraction_joint_constraint_typed_endpoints_type import ExtractionJointConstraintTypedEndpointsType
+from .extraction_joint_constraint_unique_relation_pair import ExtractionJointConstraintUniqueRelationPair
+from .extraction_joint_constraint_unique_relation_pair_type import ExtractionJointConstraintUniqueRelationPairType
+from .extraction_joint_constraint_unique_relation_slot import ExtractionJointConstraintUniqueRelationSlot
+from .extraction_joint_constraint_unique_relation_slot_slot import ExtractionJointConstraintUniqueRelationSlotSlot
+from .extraction_joint_constraint_unique_relation_slot_type import ExtractionJointConstraintUniqueRelationSlotType
+from .extraction_joint_entity import ExtractionJointEntity
+from .extraction_joint_options import ExtractionJointOptions
+from .extraction_joint_relation import ExtractionJointRelation
+from .extraction_joint_schema import ExtractionJointSchema
+from .extraction_joint_schema_entities import ExtractionJointSchemaEntities
+from .extraction_joint_schema_relations import ExtractionJointSchemaRelations
+from .extraction_label_definition import ExtractionLabelDefinition
+from .extraction_long_document_metadata import ExtractionLongDocumentMetadata
+from .extraction_long_document_metadata_classification_aggregation import (
+    ExtractionLongDocumentMetadataClassificationAggregation,
+)
+from .extraction_long_document_metadata_duplicate_score import ExtractionLongDocumentMetadataDuplicateScore
+from .extraction_long_document_metadata_natural_record_identity import (
+    ExtractionLongDocumentMetadataNaturalRecordIdentity,
+)
+from .extraction_long_document_metadata_other_record_identity import ExtractionLongDocumentMetadataOtherRecordIdentity
+from .extraction_long_document_metadata_solver_optimality_scope import (
+    ExtractionLongDocumentMetadataSolverOptimalityScope,
+)
+from .extraction_long_document_metadata_version import ExtractionLongDocumentMetadataVersion
+from .extraction_long_document_metadata_window_policy import ExtractionLongDocumentMetadataWindowPolicy
+from .extraction_long_document_options import ExtractionLongDocumentOptions
+from .extraction_long_document_options_mode import ExtractionLongDocumentOptionsMode
+from .extraction_long_document_options_record_identity import ExtractionLongDocumentOptionsRecordIdentity
 from .extraction_object import ExtractionObject
+from .extraction_object_structure_metadata import ExtractionObjectStructureMetadata
 from .extraction_object_structures import ExtractionObjectStructures
+from .extraction_offset_unit import ExtractionOffsetUnit
 from .extraction_options import ExtractionOptions
+from .extraction_options_overlap import ExtractionOptionsOverlap
+from .extraction_options_word_splitter import ExtractionOptionsWordSplitter
 from .extraction_reader_options import ExtractionReaderOptions
+from .extraction_record_metadata import ExtractionRecordMetadata
+from .extraction_record_metadata_anchor import ExtractionRecordMetadataAnchor
+from .extraction_regex_validator import ExtractionRegexValidator
+from .extraction_regex_validator_mode import ExtractionRegexValidatorMode
+from .extraction_regex_validator_type import ExtractionRegexValidatorType
 from .extraction_relation import ExtractionRelation
 from .extraction_relation_endpoint import ExtractionRelationEndpoint
 from .extraction_relation_schema import ExtractionRelationSchema
@@ -289,11 +386,21 @@ from .extraction_response import ExtractionResponse
 from .extraction_response_object import ExtractionResponseObject
 from .extraction_response_usage import ExtractionResponseUsage
 from .extraction_schema import ExtractionSchema
+from .extraction_schema_entity_attributes import ExtractionSchemaEntityAttributes
+from .extraction_schema_entity_definitions import ExtractionSchemaEntityDefinitions
 from .extraction_schema_structures import ExtractionSchemaStructures
+from .extraction_schema_version import ExtractionSchemaVersion
+from .extraction_solver_diagnostics import ExtractionSolverDiagnostics
+from .extraction_solver_status import ExtractionSolverStatus
+from .extraction_solver_status_status import ExtractionSolverStatusStatus
 from .extraction_structure_field_type_1 import ExtractionStructureFieldType1
+from .extraction_structure_field_type_1_cardinality import ExtractionStructureFieldType1Cardinality
+from .extraction_structure_field_type_1_dtype import ExtractionStructureFieldType1Dtype
 from .extraction_structure_field_type_1_type import ExtractionStructureFieldType1Type
 from .extraction_structure_schema import ExtractionStructureSchema
 from .extraction_structure_schema_fields import ExtractionStructureSchemaFields
+from .extraction_structure_schema_mode import ExtractionStructureSchemaMode
+from .extraction_structure_schema_occurrence_policy import ExtractionStructureSchemaOccurrencePolicy
 from .extraction_token import ExtractionToken
 from .failed_operation import FailedOperation
 from .failed_operation_operation import FailedOperationOperation
@@ -570,6 +677,7 @@ from .index_type import IndexType
 from .inference_a4b_residency_mode import InferenceA4BResidencyMode
 from .inference_admission_config import InferenceAdmissionConfig
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
+from .inference_audio_context import InferenceAudioContext
 from .inference_backend_runtimes import InferenceBackendRuntimes
 from .inference_batch_execution_report import InferenceBatchExecutionReport
 from .inference_binary_content import InferenceBinaryContent
@@ -588,6 +696,15 @@ from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
+from .inference_dictate_request import InferenceDictateRequest
+from .inference_dictate_response import InferenceDictateResponse
+from .inference_dictate_response_object import InferenceDictateResponseObject
+from .inference_dictation_event import InferenceDictationEvent
+from .inference_dictation_event_type import InferenceDictationEventType
+from .inference_dictation_segment import InferenceDictationSegment
+from .inference_dictation_style import InferenceDictationStyle
+from .inference_dictation_transcript import InferenceDictationTranscript
+from .inference_dictation_word import InferenceDictationWord
 from .inference_embed_request import InferenceEmbedRequest
 from .inference_embed_request_encoding_format import InferenceEmbedRequestEncodingFormat
 from .inference_embed_request_error_policy import InferenceEmbedRequestErrorPolicy
@@ -716,8 +833,23 @@ from .inference_transcribe_object_object import InferenceTranscribeObjectObject
 from .inference_transcribe_request import InferenceTranscribeRequest
 from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
+from .inference_transcription_audio_append import InferenceTranscriptionAudioAppend
+from .inference_transcription_audio_format import InferenceTranscriptionAudioFormat
+from .inference_transcription_event import InferenceTranscriptionEvent
+from .inference_transcription_event_list import InferenceTranscriptionEventList
+from .inference_transcription_event_list_object import InferenceTranscriptionEventListObject
+from .inference_transcription_event_object import InferenceTranscriptionEventObject
+from .inference_transcription_event_type import InferenceTranscriptionEventType
+from .inference_transcription_session import InferenceTranscriptionSession
+from .inference_transcription_session_deleted import InferenceTranscriptionSessionDeleted
+from .inference_transcription_session_deleted_object import InferenceTranscriptionSessionDeletedObject
+from .inference_transcription_session_object import InferenceTranscriptionSessionObject
+from .inference_transcription_session_request import InferenceTranscriptionSessionRequest
+from .inference_transcription_stream_message import InferenceTranscriptionStreamMessage
+from .inference_transcription_stream_message_type import InferenceTranscriptionStreamMessageType
 from .inference_transient_capacity_error import InferenceTransientCapacityError
 from .inference_transient_capacity_error_reason import InferenceTransientCapacityErrorReason
+from .inference_vad_config import InferenceVadConfig
 from .inferenceschemas_config import InferenceschemasConfig
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
@@ -997,6 +1129,7 @@ from .storage_resource_exhausted_error_error import StorageResourceExhaustedErro
 from .storage_runtime_status import StorageRuntimeStatus
 from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
+from .stream_transcription_audio_format import StreamTranscriptionAudioFormat
 from .success_message import SuccessMessage
 from .sync_level import SyncLevel
 from .table import Table
@@ -1390,15 +1523,106 @@ __all__ = (
     "ExtensionScopeKind",
     "ExternalIoConnection",
     "ExternalIoProtocol",
+    "ExtractionAttributeGroup",
+    "ExtractionAttributeLabel",
     "ExtractionClassification",
+    "ExtractionClassificationExampleType0",
     "ExtractionClassificationSchema",
+    "ExtractionClassificationSchemaActivation",
+    "ExtractionClassificationSchemaLabelDefinitions",
+    "ExtractionClassificationSchemaMode",
+    "ExtractionConstraintAnd",
+    "ExtractionConstraintAndType",
+    "ExtractionConstraintAnyOtherSelected",
+    "ExtractionConstraintAnyOtherSelectedType",
+    "ExtractionConstraintAnySelected",
+    "ExtractionConstraintAnySelectedType",
+    "ExtractionConstraintAtLevel",
+    "ExtractionConstraintAtLevelType",
+    "ExtractionConstraintCardinality",
+    "ExtractionConstraintCardinalityType",
+    "ExtractionConstraintExactlyOneOf",
+    "ExtractionConstraintExactlyOneOfType",
+    "ExtractionConstraintExcludes",
+    "ExtractionConstraintExcludesType",
+    "ExtractionConstraintIff",
+    "ExtractionConstraintIffType",
+    "ExtractionConstraintImplies",
+    "ExtractionConstraintImpliesType",
+    "ExtractionConstraintIsDefault",
+    "ExtractionConstraintIsDefaultType",
+    "ExtractionConstraintLabelRef",
+    "ExtractionConstraintLabelRefType",
+    "ExtractionConstraintMaxLevel",
+    "ExtractionConstraintMaxLevelType",
+    "ExtractionConstraintMinLevel",
+    "ExtractionConstraintMinLevelType",
+    "ExtractionConstraintNot",
+    "ExtractionConstraintNotType",
+    "ExtractionConstraintOr",
+    "ExtractionConstraintOrType",
+    "ExtractionDecoderOptions",
+    "ExtractionDecoderOptionsAlgorithm",
     "ExtractionEntity",
+    "ExtractionEntityAttributes",
+    "ExtractionEntityDefinition",
+    "ExtractionEntityDefinitionDtype",
+    "ExtractionEntityDefinitionType",
     "ExtractionInput",
     "ExtractionInputMetadata",
+    "ExtractionJointConstraintAcyclicRelation",
+    "ExtractionJointConstraintAcyclicRelationType",
+    "ExtractionJointConstraintEntityOverlapPolicy",
+    "ExtractionJointConstraintEntityOverlapPolicyPolicy",
+    "ExtractionJointConstraintEntityOverlapPolicyType",
+    "ExtractionJointConstraintInverseRelation",
+    "ExtractionJointConstraintInverseRelationType",
+    "ExtractionJointConstraintMaxRelationsPerHead",
+    "ExtractionJointConstraintMaxRelationsPerHeadType",
+    "ExtractionJointConstraintMaxRelationsPerTail",
+    "ExtractionJointConstraintMaxRelationsPerTailType",
+    "ExtractionJointConstraintNoSelfLoops",
+    "ExtractionJointConstraintNoSelfLoopsType",
+    "ExtractionJointConstraintSymmetricRelation",
+    "ExtractionJointConstraintSymmetricRelationType",
+    "ExtractionJointConstraintTypedEndpoints",
+    "ExtractionJointConstraintTypedEndpointsType",
+    "ExtractionJointConstraintUniqueRelationPair",
+    "ExtractionJointConstraintUniqueRelationPairType",
+    "ExtractionJointConstraintUniqueRelationSlot",
+    "ExtractionJointConstraintUniqueRelationSlotSlot",
+    "ExtractionJointConstraintUniqueRelationSlotType",
+    "ExtractionJointEntity",
+    "ExtractionJointOptions",
+    "ExtractionJointRelation",
+    "ExtractionJointSchema",
+    "ExtractionJointSchemaEntities",
+    "ExtractionJointSchemaRelations",
+    "ExtractionLabelDefinition",
+    "ExtractionLongDocumentMetadata",
+    "ExtractionLongDocumentMetadataClassificationAggregation",
+    "ExtractionLongDocumentMetadataDuplicateScore",
+    "ExtractionLongDocumentMetadataNaturalRecordIdentity",
+    "ExtractionLongDocumentMetadataOtherRecordIdentity",
+    "ExtractionLongDocumentMetadataSolverOptimalityScope",
+    "ExtractionLongDocumentMetadataVersion",
+    "ExtractionLongDocumentMetadataWindowPolicy",
+    "ExtractionLongDocumentOptions",
+    "ExtractionLongDocumentOptionsMode",
+    "ExtractionLongDocumentOptionsRecordIdentity",
     "ExtractionObject",
+    "ExtractionObjectStructureMetadata",
     "ExtractionObjectStructures",
+    "ExtractionOffsetUnit",
     "ExtractionOptions",
+    "ExtractionOptionsOverlap",
+    "ExtractionOptionsWordSplitter",
     "ExtractionReaderOptions",
+    "ExtractionRecordMetadata",
+    "ExtractionRecordMetadataAnchor",
+    "ExtractionRegexValidator",
+    "ExtractionRegexValidatorMode",
+    "ExtractionRegexValidatorType",
     "ExtractionRelation",
     "ExtractionRelationEndpoint",
     "ExtractionRelationSchema",
@@ -1408,11 +1632,21 @@ __all__ = (
     "ExtractionResponseObject",
     "ExtractionResponseUsage",
     "ExtractionSchema",
+    "ExtractionSchemaEntityAttributes",
+    "ExtractionSchemaEntityDefinitions",
     "ExtractionSchemaStructures",
+    "ExtractionSchemaVersion",
+    "ExtractionSolverDiagnostics",
+    "ExtractionSolverStatus",
+    "ExtractionSolverStatusStatus",
     "ExtractionStructureFieldType1",
+    "ExtractionStructureFieldType1Cardinality",
+    "ExtractionStructureFieldType1Dtype",
     "ExtractionStructureFieldType1Type",
     "ExtractionStructureSchema",
     "ExtractionStructureSchemaFields",
+    "ExtractionStructureSchemaMode",
+    "ExtractionStructureSchemaOccurrencePolicy",
     "ExtractionToken",
     "FailedOperation",
     "FailedOperationOperation",
@@ -1689,6 +1923,7 @@ __all__ = (
     "InferenceA4BResidencyMode",
     "InferenceAdmissionConfig",
     "InferenceAudioChunkConfig",
+    "InferenceAudioContext",
     "InferenceBackendRuntimes",
     "InferenceBatchExecutionReport",
     "InferenceBinaryContent",
@@ -1707,6 +1942,15 @@ __all__ = (
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
+    "InferenceDictateRequest",
+    "InferenceDictateResponse",
+    "InferenceDictateResponseObject",
+    "InferenceDictationEvent",
+    "InferenceDictationEventType",
+    "InferenceDictationSegment",
+    "InferenceDictationStyle",
+    "InferenceDictationTranscript",
+    "InferenceDictationWord",
     "InferenceEmbeddingBatchSummary",
     "InferenceEmbeddingItemError",
     "InferenceEmbeddingItemErrorStage",
@@ -1834,8 +2078,23 @@ __all__ = (
     "InferenceTranscribeRequest",
     "InferenceTranscribeResponse",
     "InferenceTranscribeResponseObject",
+    "InferenceTranscriptionAudioAppend",
+    "InferenceTranscriptionAudioFormat",
+    "InferenceTranscriptionEvent",
+    "InferenceTranscriptionEventList",
+    "InferenceTranscriptionEventListObject",
+    "InferenceTranscriptionEventObject",
+    "InferenceTranscriptionEventType",
+    "InferenceTranscriptionSession",
+    "InferenceTranscriptionSessionDeleted",
+    "InferenceTranscriptionSessionDeletedObject",
+    "InferenceTranscriptionSessionObject",
+    "InferenceTranscriptionSessionRequest",
+    "InferenceTranscriptionStreamMessage",
+    "InferenceTranscriptionStreamMessageType",
     "InferenceTransientCapacityError",
     "InferenceTransientCapacityErrorReason",
+    "InferenceVadConfig",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
@@ -2112,6 +2371,7 @@ __all__ = (
     "StorageRuntimeStatus",
     "StorageRuntimeStatusEngine",
     "StorageStatus",
+    "StreamTranscriptionAudioFormat",
     "SuccessMessage",
     "SyncLevel",
     "Table",

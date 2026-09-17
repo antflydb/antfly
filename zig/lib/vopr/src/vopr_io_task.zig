@@ -182,15 +182,21 @@ const Entry = struct {
     task: *Task,
 
     fn entry() callconv(.naked) void {
+        // A fresh fiber has no caller. Terminate both the frame-pointer chain
+        // and the return-address chain: unwind metadata may follow the latter
+        // even with a null frame pointer. A scheduler return address (or an
+        // uninitialized x86 stack slot) would send it outside this task's stack.
         switch (builtin.cpu.arch) {
             .aarch64 => asm volatile (
                 \\ mov x0, sp
+                \\ mov x30, xzr
                 \\ b %[call]
                 :
                 : [call] "X" (&call),
             ),
             .x86_64 => asm volatile (
                 \\ leaq 8(%%rsp), %%rdi
+                \\ movq $0, (%%rsp)
                 \\ jmp %[call:P]
                 :
                 : [call] "X" (&call),
@@ -1144,6 +1150,46 @@ pub const Kernel = struct {
 
     const capability_kernel_id = ids.stable("vopr-io", "task-kernel-v1");
 };
+
+test "task stack unwinding terminates before entering the scheduler stack" {
+    const Probe = struct {
+        const Self = @This();
+        const Args = struct { probe: *Self, kernel: *Kernel };
+        captures: usize = 0,
+
+        noinline fn capture(self: *@This()) void {
+            var addresses: [128]usize = undefined;
+            const trace = std.debug.captureCurrentStackTrace(.{}, &addresses);
+            std.debug.assert(trace.return_addresses.len > 0);
+            std.debug.assert(trace.return_addresses.len < addresses.len);
+            std.debug.assert(trace.skipped == .none);
+            // DebugAllocator captures allocation/free traces too; keep that
+            // instrumentation enabled on the task stack.
+            const allocation = std.testing.allocator.alloc(u8, 17) catch @panic("OOM");
+            std.testing.allocator.free(allocation);
+            self.captures += 1;
+        }
+
+        fn start(context: *const anyopaque, _: *anyopaque) void {
+            const args: *const Args = @ptrCast(@alignCast(context));
+            args.probe.capture();
+            const task = args.kernel.currentTask().?;
+            task.status = .runnable;
+            args.kernel.yieldCurrent(task);
+            args.probe.capture();
+        }
+    };
+    var kernel = try Kernel.init(std.testing.allocator, .{});
+    defer kernel.deinit();
+    var probe = Probe{};
+    const args = Probe.Args{ .probe = &probe, .kernel = &kernel };
+    const task = try kernel.createTask(0, .@"1", std.mem.asBytes(&args), .of(@TypeOf(args)), Probe.start, null);
+    const first = (try kernel.executeReady(task.transitionId())).?;
+    try std.testing.expect(!first.completed);
+    const second = (try kernel.executeReady(task.transitionId())).?;
+    try std.testing.expect(second.completed);
+    try std.testing.expectEqual(@as(usize, 2), probe.captures);
+}
 
 test "inactive futex address reuse starts a new logical contention epoch" {
     var kernel = try Kernel.init(std.testing.allocator, .{});

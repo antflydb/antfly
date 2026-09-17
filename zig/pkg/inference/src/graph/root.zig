@@ -23,6 +23,10 @@ const supports_onnx_compiler = !build_options.enable_wasm;
 
 pub const tracing_compute = @import("tracing_compute.zig");
 pub const interpreter = @import("interpreter.zig");
+pub const seeded_training = @import("seeded_training.zig");
+pub const staged_training = @import("staged_training.zig");
+pub const multi_stage_training = @import("multi_stage_training.zig");
+pub const resident_training_program = @import("resident_training_program.zig");
 pub const runtime = @import("runtime.zig");
 pub const cache = @import("cache.zig");
 pub const executor_stats = @import("executor_stats.zig");
@@ -128,6 +132,11 @@ pub const distributed_training = @import("distributed_training.zig");
 pub const passes = @import("ml").graph.passes;
 
 test {
+    _ = resident_training_program;
+    _ = @import("resident_training_program_test.zig");
+    _ = @import("resident_training_session_test.zig");
+    _ = @import("seeded_no_gradient_test.zig");
+    _ = @import("resident_training_session_failure_test.zig");
     _ = tracing_compute;
     _ = interpreter;
     _ = runtime;

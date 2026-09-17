@@ -26,12 +26,29 @@ pub const LanguageToken = struct {
 /// Immutable prompt metadata prepared once for a loaded Whisper model. Request
 /// handling only performs a small language-token lookup and writes at most
 /// three prompt entries into caller-owned stack storage.
+/// Decoder-side generation settings from `generation_config.json` that the
+/// transcription loop applies to logits: token suppression and timestamp
+/// rules. Defaults match the multilingual Whisper checkpoints.
+pub const DecodeSettings = struct {
+    /// `<|startofprev|>`: prefix token for conditioning text. Null when the
+    /// tokenizer lacks it (then no conditioning is possible).
+    start_of_prev_id: ?i32 = null,
+    /// `<|endoftext|>`.
+    eot_id: i32 = 50257,
+    /// `<|0.00|>`; timestamps are `timestamp_begin_id + offset_ms / 20`.
+    timestamp_begin_id: i32 = 50364,
+    max_initial_timestamp_index: usize = 50,
+    suppress_tokens: []const i32 = &.{},
+    begin_suppress_tokens: []const i32 = &.{},
+};
+
 pub const PromptCache = struct {
     allocator: std.mem.Allocator,
     automatic_ids: []ForcedDecoderId,
     language_tokens: []LanguageToken,
     transcribe_id: i32,
     no_timestamps_id: i32,
+    decode: DecodeSettings = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -88,19 +105,65 @@ pub const PromptCache = struct {
         );
         errdefer allocator.free(automatic_ids);
 
+        // Bundles without the HF sidecars (GGUF exports, whisper.cpp-style
+        // vocabularies) still follow Whisper's fixed token layout:
+        // <|startofprev|> and <|nospeech|> sit two and one slots before
+        // <|notimestamps|>, and <|endoftext|> one before <|startoftranscript|>.
+        var decode = DecodeSettings{
+            .start_of_prev_id = encodeSingleSpecialToken(allocator, tokenizer, "<|startofprev|>") orelse no_timestamps_id - 2,
+            .eot_id = encodeSingleSpecialToken(allocator, tokenizer, "<|endoftext|>") orelse 50257,
+            .timestamp_begin_id = encodeSingleSpecialToken(allocator, tokenizer, "<|0.00|>") orelse no_timestamps_id + 1,
+        };
+        try loadDecodeSettingsFromPaths(allocator, generation_config_path, &decode);
+        errdefer allocator.free(decode.suppress_tokens);
+        errdefer allocator.free(decode.begin_suppress_tokens);
+        if (decode.suppress_tokens.len == 0) {
+            allocator.free(decode.suppress_tokens);
+            decode.suppress_tokens = try nonSpeechTokens(allocator, tokenizer, decode.eot_id);
+        }
+        if (decode.begin_suppress_tokens.len == 0) {
+            allocator.free(decode.begin_suppress_tokens);
+            decode.begin_suppress_tokens = try beginSuppressTokens(allocator, tokenizer, decode.eot_id);
+        }
+
         return .{
             .allocator = allocator,
             .automatic_ids = automatic_ids,
             .language_tokens = language_tokens,
             .transcribe_id = transcribe_id,
             .no_timestamps_id = no_timestamps_id,
+            .decode = decode,
         };
     }
 
     pub fn deinit(self: *PromptCache) void {
         self.allocator.free(self.automatic_ids);
         self.allocator.free(self.language_tokens);
+        self.allocator.free(self.decode.suppress_tokens);
+        self.allocator.free(self.decode.begin_suppress_tokens);
         self.* = undefined;
+    }
+
+    /// Like `resolve`, but with `timestamps` the `<|notimestamps|>` slot is
+    /// dropped so the decoder emits timestamp tokens.
+    pub fn resolveWithTimestamps(
+        self: *const PromptCache,
+        scratch: *[3]ForcedDecoderId,
+        language: ?[]const u8,
+        timestamps: bool,
+    ) ![]const ForcedDecoderId {
+        const ids = try self.resolve(scratch, language);
+        if (!timestamps) return ids;
+        if (ids.len > scratch.len) return error.InvalidWhisperDecoderPrompt;
+        var kept: usize = 0;
+        var copy: [3]ForcedDecoderId = undefined;
+        for (ids) |entry| {
+            if (entry.token_id) |token| if (token == self.no_timestamps_id) continue;
+            copy[kept] = entry;
+            kept += 1;
+        }
+        @memcpy(scratch[0..kept], copy[0..kept]);
+        return scratch[0..kept];
     }
 
     pub fn resolve(
@@ -125,6 +188,117 @@ pub const PromptCache = struct {
         return error.UnsupportedWhisperLanguage;
     }
 };
+
+fn loadDecodeSettingsFromPaths(
+    allocator: std.mem.Allocator,
+    generation_config_path: ?[]const u8,
+    decode: *DecodeSettings,
+) !void {
+    const path = generation_config_path orelse return;
+    const data = c_file.readFile(allocator, path) catch return;
+    defer allocator.free(data);
+    try parseDecodeSettings(allocator, data, decode);
+}
+
+fn parseDecodeSettings(allocator: std.mem.Allocator, data: []const u8, decode: *DecodeSettings) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch
+        return error.InvalidWhisperDecoderConfig;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidWhisperDecoderConfig;
+    const object = parsed.value.object;
+    if (object.get("suppress_tokens")) |value| decode.suppress_tokens = try parseTokenList(allocator, value);
+    errdefer allocator.free(decode.suppress_tokens);
+    if (object.get("begin_suppress_tokens")) |value| decode.begin_suppress_tokens = try parseTokenList(allocator, value);
+    if (object.get("max_initial_timestamp_index")) |value| if (jsonPosition(value)) |index| {
+        decode.max_initial_timestamp_index = index;
+    };
+    if (object.get("prev_sot_token_id")) |value| if (jsonI32(value)) |id| {
+        decode.start_of_prev_id = id;
+    };
+    if (object.get("eos_token_id")) |value| if (jsonI32(value)) |id| {
+        decode.eot_id = id;
+    };
+}
+
+/// Whisper's non-speech suppression list, derived from the vocabulary the
+/// way the reference implementation does when a bundle ships no explicit
+/// list: single-token symbols and bracket runs, with and without a leading
+/// space, plus the musical-note characters.
+pub fn nonSpeechTokens(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, eot_id: i32) ![]const i32 {
+    var out = std.ArrayListUnmanaged(i32).empty;
+    errdefer out.deinit(allocator);
+    const symbols = [_][]const u8{
+        "\"", "#",  "(",   ")",   "*",  "+",   "/",  ":",  ";",  "<",   "=",  ">",  "@",   "[",   "\\",
+        "]",  "^",  "_",   "`",   "{",  "|",   "}",  "~",
+        "「",
+        "」",
+        "『",
+        "』",
+        "<<", ">>", "<<<", ">>>", "--", "---", "-(", "-[", "('", "(\"", "((", "))", "(((", ")))", "[[",
+        "]]", "{{", "}}",
+        "♪♪",
+        "♪♪♪",
+    };
+    const musical = [_][]const u8{ "♩", "♪", "♫", "♬", "♭", "♮", "♯" };
+    for ([_][]const u8{ " -", " '" }) |leading| {
+        if (firstToken(allocator, tokenizer, leading)) |id| try appendUnique(allocator, &out, id);
+    }
+    var spaced_buf: [32]u8 = undefined;
+    for (symbols) |symbol| {
+        if (singleToken(allocator, tokenizer, symbol)) |id| try appendUnique(allocator, &out, id);
+        const spaced = std.fmt.bufPrint(&spaced_buf, " {s}", .{symbol}) catch continue;
+        if (singleToken(allocator, tokenizer, spaced)) |id| try appendUnique(allocator, &out, id);
+    }
+    for (musical) |symbol| {
+        if (firstToken(allocator, tokenizer, symbol)) |id| try appendUnique(allocator, &out, id);
+        const spaced = std.fmt.bufPrint(&spaced_buf, " {s}", .{symbol}) catch continue;
+        if (firstToken(allocator, tokenizer, spaced)) |id| try appendUnique(allocator, &out, id);
+    }
+    // Control tokens never appear inside a transcript.
+    var control: i32 = eot_id + 1;
+    while (control < eot_id + 8) : (control += 1) try appendUnique(allocator, &out, control);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Tokens suppressed at the first free position: a bare space and EOT.
+pub fn beginSuppressTokens(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, eot_id: i32) ![]const i32 {
+    var out = std.ArrayListUnmanaged(i32).empty;
+    errdefer out.deinit(allocator);
+    if (singleToken(allocator, tokenizer, " ")) |id| try appendUnique(allocator, &out, id);
+    try appendUnique(allocator, &out, eot_id);
+    return out.toOwnedSlice(allocator);
+}
+
+fn singleToken(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, text: []const u8) ?i32 {
+    const ids = tokenizer.encode(allocator, text) catch return null;
+    defer allocator.free(ids);
+    if (ids.len != 1 or ids[0] == tokenizer.specialTokens().unk_id) return null;
+    return ids[0];
+}
+
+fn firstToken(allocator: std.mem.Allocator, tokenizer: tokenizer_mod.Tokenizer, text: []const u8) ?i32 {
+    const ids = tokenizer.encode(allocator, text) catch return null;
+    defer allocator.free(ids);
+    if (ids.len == 0 or ids[0] == tokenizer.specialTokens().unk_id) return null;
+    return ids[0];
+}
+
+fn appendUnique(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(i32), id: i32) !void {
+    for (out.items) |existing| if (existing == id) return;
+    try out.append(allocator, id);
+}
+
+pub fn languageTokenForCode(language_tokens: []const LanguageToken, code: []const u8) ?i32 {
+    return findLanguageToken(language_tokens, code);
+}
+
+fn parseTokenList(allocator: std.mem.Allocator, value: std.json.Value) ![]const i32 {
+    if (value != .array) return &.{};
+    const out = try allocator.alloc(i32, value.array.items.len);
+    errdefer allocator.free(out);
+    for (value.array.items, 0..) |item, i| out[i] = jsonI32(item) orelse return error.InvalidWhisperDecoderConfig;
+    return out;
+}
 
 pub fn loadForcedDecoderIds(allocator: std.mem.Allocator, model_dir: []const u8) !?[]ForcedDecoderId {
     const generation_config_path = try std.fs.path.join(
@@ -381,4 +555,51 @@ test "prompt cache resolves automatic and explicit languages without request tok
     try std.testing.expectEqual(@as(?i32, 12), spanish[1].token_id);
     try std.testing.expectEqual(@as(?i32, 13), spanish[2].token_id);
     try std.testing.expectError(error.UnsupportedWhisperLanguage, cache.resolve(&scratch, "zz"));
+}
+
+test "decode settings parse suppression and timestamp fields" {
+    const allocator = std.testing.allocator;
+    var decode = DecodeSettings{};
+    try parseDecodeSettings(allocator, "{\"suppress_tokens\":[1,2,3],\"begin_suppress_tokens\":[220,50257],\"max_initial_timestamp_index\":25,\"prev_sot_token_id\":50361,\"eos_token_id\":50257}", &decode);
+    defer allocator.free(decode.suppress_tokens);
+    defer allocator.free(decode.begin_suppress_tokens);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3 }, decode.suppress_tokens);
+    try std.testing.expectEqualSlices(i32, &.{ 220, 50257 }, decode.begin_suppress_tokens);
+    try std.testing.expectEqual(@as(usize, 25), decode.max_initial_timestamp_index);
+    try std.testing.expectEqual(@as(?i32, 50361), decode.start_of_prev_id);
+}
+
+test "resolveWithTimestamps drops the notimestamps slot and keeps the rest" {
+    const allocator = std.testing.allocator;
+    const ids = try allocator.alloc(ForcedDecoderId, 3);
+    ids[0] = .{ .position = 1, .token_id = null };
+    ids[1] = .{ .position = 2, .token_id = 12 };
+    ids[2] = .{ .position = 3, .token_id = 13 };
+    var cache = PromptCache{
+        .allocator = allocator,
+        .automatic_ids = ids,
+        .language_tokens = try allocator.alloc(LanguageToken, 0),
+        .transcribe_id = 12,
+        .no_timestamps_id = 13,
+        .decode = .{ .suppress_tokens = try allocator.alloc(i32, 0), .begin_suppress_tokens = try allocator.alloc(i32, 0) },
+    };
+    defer cache.deinit();
+    var scratch: [3]ForcedDecoderId = undefined;
+    const plain = try cache.resolveWithTimestamps(&scratch, null, false);
+    try std.testing.expectEqual(@as(usize, 3), plain.len);
+    const timed = try cache.resolveWithTimestamps(&scratch, null, true);
+    try std.testing.expectEqual(@as(usize, 2), timed.len);
+    try std.testing.expectEqual(@as(?i32, null), timed[0].token_id);
+    try std.testing.expectEqual(@as(?i32, 12), timed[1].token_id);
+}
+
+test "decode settings fall back to the fixed Whisper token layout" {
+    // <|notimestamps|> at 13 implies <|startofprev|> at 11 and <|0.00|> at 14.
+    var decode = DecodeSettings{
+        .start_of_prev_id = null,
+        .timestamp_begin_id = 13 + 1,
+    };
+    decode.start_of_prev_id = decode.start_of_prev_id orelse 13 - 2;
+    try std.testing.expectEqual(@as(?i32, 11), decode.start_of_prev_id);
+    try std.testing.expectEqual(@as(i32, 14), decode.timestamp_begin_id);
 }

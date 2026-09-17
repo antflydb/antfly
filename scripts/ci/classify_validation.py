@@ -81,6 +81,7 @@ RELEASE_FILES = {
     ".github/dependabot.yml",
 }
 FORMAT_INFRASTRUCTURE = {
+    "ruff.toml",
     "scripts/format.sh",
     "py/packages/sdk/pyproject.toml",
     "py/packages/sdk/uv.lock",

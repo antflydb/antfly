@@ -182,6 +182,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const platform_test_step = b.step("lib-platform-test", "Run supervisor unit and process-lifecycle tests (Python 3 on POSIX)");
     platform_test_step.dependOn(&platform_tests.unit.step);
     if (platform_tests.process) |process| platform_test_step.dependOn(process);
+    platform_test_step.dependOn(&platform_tests.one_shot_unit.step);
+    if (platform_tests.one_shot_process) |process| platform_test_step.dependOn(process);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, true, false);
@@ -831,6 +833,11 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_json_tests = b.addRunArtifact(lib_json_tests);
     const lib_json_test_step = b.step("lib-json-test", "Run standalone lib/json tests");
     lib_json_test_step.dependOn(&run_lib_json_tests.step);
+
+    const lib_ml_tests = b.addTest(.{ .root_module = inference_ml_mod });
+    const run_lib_ml_tests = b.addRunArtifact(lib_ml_tests);
+    const lib_ml_test_step = b.step("lib-ml-test", "Run standalone lib/ml graph and optimizer tests");
+    lib_ml_test_step.dependOn(&run_lib_ml_tests.step);
 
     const lib_ml_tabular_tests = b.addTest(.{
         .root_module = ml_tabular_mod,

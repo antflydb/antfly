@@ -3,7 +3,7 @@
 
 The runner keeps adapter processes alive, correctness-gates every query before
 timing, retains raw per-query samples, and writes the artifact bundle specified
-by FULL_TEXT_PERFORMANCE.md.  A comparator is optional for local regression
+by zig/bench/full_text/BENCHMARK.md.  A comparator is optional for local regression
 runs and mandatory for cross-engine claims.
 """
 

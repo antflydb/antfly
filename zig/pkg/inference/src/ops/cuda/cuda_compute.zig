@@ -4465,7 +4465,7 @@ fn cudaHybridQ4Bf16WeightsEnabled() bool {
 
 // Qualified-performance target: production parity and performance evidence
 // for the default-on BF16 prefill mirrors and fused DeBERTa attention is
-// exact to NVIDIA L4 / SM89 (see GLINER2_CUDA.md). Other architectures keep
+// exact to NVIDIA L4 / SM89 (see models/gliner2/CUDA.md). Other architectures keep
 // the conservative route by default and opt in through the env switches.
 fn cudaQualifiedPerfTarget(compute_major: i32, compute_minor: i32) bool {
     return compute_major == 8 and compute_minor == 9;
