@@ -518,11 +518,18 @@ fn encodeSingleAudio(
     var per_dim_slices = std.ArrayListUnmanaged([]const f32).empty;
     defer per_dim_slices.deinit(allocator);
     for (0..cfg.block_count) |layer| {
+        // Each item is owned by its list as soon as the append succeeds, so
+        // the local cleanup must not outlive the append.
         const name = try std.fmt.allocPrint(allocator, "a.blk.{d}.per_dim_scale.weight", .{layer});
-        errdefer allocator.free(name);
-        try per_dim_names.append(allocator, name);
-        const per_dim = try loadTensorF32(store.gguf, name);
-        try per_dim_tensors.append(allocator, per_dim);
+        {
+            errdefer allocator.free(name);
+            try per_dim_names.append(allocator, name);
+        }
+        var per_dim = try loadTensorF32(store.gguf, name);
+        {
+            errdefer per_dim.deinit();
+            try per_dim_tensors.append(allocator, per_dim);
+        }
         try per_dim_slices.append(allocator, per_dim_tensors.items[per_dim_tensors.items.len - 1].data);
     }
     var layer_inputs = try AudioLayerInputs.init(cb, allocator, cfg, subsampled.valid_mask, per_dim_slices.items);
@@ -1349,22 +1356,34 @@ const AudioLayerInputs = struct {
         }
         for (per_dim_scales) |per_dim| {
             if (per_dim.len != head_dim) return error.InvalidTensorShape;
+            // Each item is owned by its list as soon as the append succeeds,
+            // so the local cleanup must not outlive the append.
             const host = try audioQueryDimScales(allocator, head_dim, per_dim);
-            errdefer allocator.free(host);
-            try scales_host.append(allocator, host);
+            {
+                errdefer allocator.free(host);
+                try scales_host.append(allocator, host);
+            }
             const scales_shape = [_]i32{@intCast(head_dim)};
             const ct = try deviceResidentFromFloat32(cb, host, &scales_shape);
-            errdefer cb.free(ct);
-            try scales.append(allocator, ct);
+            {
+                errdefer cb.free(ct);
+                try scales.append(allocator, ct);
+            }
         }
+        const scales_host_slice = try scales_host.toOwnedSlice(allocator);
+        errdefer {
+            for (scales_host_slice) |item| allocator.free(item);
+            allocator.free(scales_host_slice);
+        }
+        const scales_slice = try scales.toOwnedSlice(allocator);
         return .{
             .allocator = allocator,
             .valid_mask = valid_mask,
             .rel_in = rel_in,
             .valid_ct = valid_ct,
             .ones = ones,
-            .scales_host = try scales_host.toOwnedSlice(allocator),
-            .scales = try scales.toOwnedSlice(allocator),
+            .scales_host = scales_host_slice,
+            .scales = scales_slice,
         };
     }
 
@@ -3432,4 +3451,44 @@ test "model-owned projector store serves requests with their own allocators" {
     const spec = (try projector.clampSpec("a.blk.0.ffn_up")) orelse return error.TestUnexpectedResult;
     try std.testing.expect(!spec.clipsInput() and !spec.clipsOutput());
     try std.testing.expectEqual(@as(usize, 1), projector.clamp_specs.count());
+}
+
+fn initAudioLayerInputsUnderAllocationFaults(
+    allocator: std.mem.Allocator,
+    cfg: AudioConfig,
+    valid_mask: []const bool,
+    per_dim: []const []const f32,
+) !void {
+    const native_compute = @import("../ops/native_compute.zig");
+    var store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer native_compute.deinitPrefetchQueue(&store);
+    var compute = native_compute.NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var inputs = try AudioLayerInputs.init(&cb, allocator, cfg, valid_mask, per_dim);
+    inputs.deinit(&cb);
+}
+
+// Every allocation in the layer-input setup fails once; each item must be
+// released exactly once whichever step fails (a local cleanup that outlived
+// its list append used to free the item twice).
+test "audio layer inputs survive allocation failures without leaks or double frees" {
+    const cfg = AudioConfig{
+        .text_hidden = 8,
+        .audio_hidden = 16,
+        .output_hidden = 8,
+        .intermediate_size = 8,
+        .block_count = 3,
+        .head_count = 2,
+        .mel_bins = 128,
+        .layer_norm_eps = 1e-6,
+    };
+    const valid_mask = [_]bool{ true, true, false };
+    const per_dim_row = [_]f32{ 0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 0.7, 0.8 };
+    const per_dim = [_][]const f32{ &per_dim_row, &per_dim_row, &per_dim_row };
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        initAudioLayerInputsUnderAllocationFaults,
+        .{ cfg, @as([]const bool, &valid_mask), @as([]const []const f32, &per_dim) },
+    );
 }
