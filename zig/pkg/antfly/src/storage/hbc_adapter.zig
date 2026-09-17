@@ -26755,7 +26755,9 @@ test "wide native external update query results survive reopening unchanged" {
 fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
     const vector_count = if (dims == 1536) 4096 else 512;
     const query_k = if (dims == 1536) 100 else 10;
-    const alloc = std.testing.allocator;
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -28531,6 +28533,58 @@ test "batch insert options can defer quantized rebuild until finish" {
     switch (quantized.ptr().*) {
         .nonquant, .rabit => {},
     }
+}
+
+test "deferred quantized relocation publishes payloads only at batch finish" {
+    const alloc = std.testing.allocator;
+    var path: TestPath = .{};
+    const tmp_path = path.init();
+    defer path.cleanup();
+    var idx = try HBCIndex.open(alloc, tmp_path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = true,
+    });
+    defer idx.close();
+    const vectors = [_][2]f32{
+        .{ 0.0, 0.0 },   .{ 0.1, 0.0 }, .{ 0.2, 0.0 }, .{ 0.3, 0.0 },
+        .{ 8.0, 8.0 },   .{ 8.1, 8.0 }, .{ 8.2, 8.0 }, .{ 8.3, 8.0 },
+        .{ 16.0, 16.0 },
+    };
+    var items: [vectors.len]BatchInsertItem = undefined;
+    for (&items, 0..) |*item, i| item.* = .{ .vector_id = i + 1, .vector = &vectors[i], .metadata = "doc" };
+    try idx.bulkBuildWithMetadata(&items);
+    const update = [_]BatchInsertItem{.{ .vector_id = 1, .vector = &.{ 16.05, 16.0 }, .metadata = "updated" }};
+    const options: BatchInsertOptions = .{
+        .defer_quantized_rebuild = true,
+        .suppress_quantized_payload_persist = true,
+        .centroid_only_routing = true,
+    };
+    var txn = try idx.beginWriteTxn();
+    var active = true;
+    errdefer if (active) txn.abort();
+    const source = try idx.getVecLeaf(&txn, 1);
+    const target = try idx.getVecLeaf(&txn, 9);
+    try std.testing.expect(source != target);
+    idx.resetWriteProfile();
+    try idx.batchInsertWithMetadataTxnOptions(&txn, &update, options);
+    try std.testing.expectEqual(target, try idx.getVecLeaf(&txn, 1));
+    // Both the removed-from and inserted-into leaves must honor the batch's
+    // publication boundary, rather than rebuilding per relocated vector.
+    try std.testing.expectEqual(@as(u64, 0), idx.getWriteProfile().ns_quant_put_calls);
+    try std.testing.expect(idx.deferred_quantized_nodes.contains(source));
+    try std.testing.expect(idx.deferred_quantized_nodes.contains(target));
+    try idx.finishWriteTxnOptions(&txn, options);
+    active = false;
+    try std.testing.expect(idx.getWriteProfile().ns_quant_put_calls > 0);
+    try std.testing.expect(idx.getWriteProfile().ns_quant_put_calls <= idx.metadata.node_count);
+    try std.testing.expectEqual(@as(u32, 0), idx.deferred_quantized_nodes.count());
+    var result = try idx.search(update[0].vector, 1);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.getHits().len);
+    try std.testing.expectEqual(@as(u64, 1), result.getHits()[0].vector_id);
 }
 
 test "deferred quantized rebuild refreshes touched nodes only" {

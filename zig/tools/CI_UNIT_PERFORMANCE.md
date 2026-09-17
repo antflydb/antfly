@@ -208,13 +208,10 @@ next storage work:
 | Relational deferred-discovery scheduler, 8,192 rows | 55.70 s | 1.408 s |
 | Wide external-vector updates and reopen, 4,096 vectors x 1,536 dimensions | 68.28 s | 20.820 s |
 
-The scheduler belongs in the diagnostic-overhead batch; its boundary need not
-be reduced to recover most of the time. The vector case still has substantial
-work after diagnostics are removed. Keep that representative workload in a
-scale/performance suite, preserve a smaller regression that crosses the actual
-tree/cache/update boundaries, and profile the remaining work before promising
-a production optimization. The existing narrow-vector variant does not by
-itself prove the wide-vector regression is covered.
+The scheduler's diagnostic change is now applied. The vector follow-up below
+profiles its remaining work and fixes a production relocation inefficiency.
+The original wide-vector workload remains in the unit gate: the narrow-vector
+variant does not establish the same cache and native-generation coverage.
 
 ### Completed broad validation and CI status
 
@@ -307,8 +304,8 @@ than assuming that identical executable names imply identical coverage.
    durations were primarily allocator diagnostics (see follow-up). Physical
    churn also checks pinned-reader correctness and payload ownership, despite
    its benchmark name. Do not relocate it solely because it reports timings.
-   The wide-vector case still takes 20.8 s without backtraces and needs a
-   separate boundary and production-profile investigation before changing it.
+   The wide-vector follow-up below preserves all 4,096 x 1,536 values and
+   identifies repeated source-leaf quantization during relocation.
 4. **Optimize demonstrated production work.** Profile the remaining workload
    after tracing is off. For graph setup, distinguish individual edge commits
    from metric calculation. For vectors, measure update/quantization/search
@@ -398,3 +395,92 @@ passed 20/20 steps and all six selected bodies. All nine changed training
 fixtures and all six storage fixtures also passed with backtraces enabled.
 The initializer change passed both diagnostic modes with the original
 cancellation, accumulation, and durable-resume assertions.
+
+## Wide-vector relocation and paired HITS follow-up
+
+Both regressions retain their original input sizes and assertions. Allocation
+backtraces are opt-in with `ANTFLY_TEST_ALLOCATOR_TRACES=1`; allocator safety
+and leak detection remain enabled. Temporary phase instrumentation and CPU
+samples separate fixture setup from production work.
+
+### HITS: fixture setup, not a metric-kernel change
+
+The historical traced fixture took 23.73 s. With backtraces disabled and the
+original individual writes, it takes 1.94 s: two graph setups total 1.085 s,
+the local metric takes 0.038 s, and paired workers take 0.741 s. Using one
+public `batchApply` per graph seeds the same 131 edges and 132 nodes in
+0.015 s total; the instrumented whole test takes 0.724 s. Both fan-outs still
+cross the 64-unit test page boundary, the self-edge remains, both workers
+must complete pages, and local/planned authority and hub scores and cleanup
+are still compared. Added count assertions guard the batched fixture shape.
+
+### Wide vectors: a production relocation inefficiency
+
+The 4,096-vector, 1,536-dimensional fixture inserts 16 batches, updates eight
+batches, and verifies 64 queries across warm cache, cleared cache, checkpoint,
+state overlays, and reopen. Before the production change, with allocation
+backtraces off, Debug phase totals were:
+
+| Phase | Seconds |
+| --- | ---: |
+| Generate fixture vectors | 0.236 |
+| Initial insertions | 1.041 |
+| Existing-vector updates | 15.251 |
+| Batch persistence | 1.961 |
+| Queries after each batch | 0.278 |
+| Each 64-query verification pass | approximately 0.61–0.63 |
+| Explicit checkpoint | 0.059 |
+| Reopen and activate | 0.003 |
+| Entire regression | 21.981 |
+
+Sampling caught `removeFromLeaf` rebuilding the source leaf's quantized
+payload on each relocated vector. It saved with default options, dropping
+the enclosing batch's deferred-rebuild policy. Relocation now carries the
+batch options through source-leaf saves, sibling merges, parent updates, and
+single-child collapse. Direct removal retains its existing default behavior.
+The deferred-node set and finalization machinery perform the eventual rebuild.
+Single and grouped append paths also preserve an explicitly requested payload
+publication suppression instead of overwriting it with the leaf-split flag;
+the relocation contract caught this second option loss after the source fix.
+
+A nine-vector regression checks that a real cross-leaf update with deferred
+publication writes zero quantized payloads before batch finish, registers both
+touched leaves, drains the deferred set, bounds final publications by node
+count, and returns the updated vector. Against the original implementation,
+it fails with `expected 0, found 2` before finalization. This is a work-count
+contract, not a timing threshold. The original full-size cache/checkpoint/
+overlay/reopen regression remains in the unit gate.
+
+Three alternating ReleaseFast before/after runs, with the same phase
+instrumentation and allocation backtraces disabled, produced:
+
+| Median duration | Original code | Fixed code |
+| --- | ---: | ---: |
+| Update phase | 2.364 s | 1.718 s |
+| Entire regression | 3.057 s | 2.422 s |
+
+That is about 27% less update time and 21% less whole-regression time in this
+optimized local workload. Instrumented Debug runs measured 21.98 s before
+and 16.08 s after; the first fixed update phase measured 8.83 s versus 15.25 s
+before. A final clean Debug run took 21.80 s while other builds were active,
+so use the alternating optimized measurements rather than those individual
+Debug wall times to quantify the production improvement. These are local
+workload measurements, not CI wall-time or general throughput claims. Remaining relocation
+work includes centroid reconstruction; changing that needs separate routing
+and previous-vector correctness analysis, not simply skipping refreshes.
+
+The broader `antfly-storage-test` target also runs storage-owner executables.
+Before these production changes, its `opaque storage owner performs coarse
+batch and query on one live DB` test failed at the `doc:bulk` query assertion;
+it failed again with a fresh dedicated cache. The focused vector regressions
+are validated independently using the compiler command emitted by the build.
+That separate storage-owner failure remains unresolved by this performance
+change; the broader target is not claimed green.
+
+Final code without phase instrumentation passed all 23 selected vector test
+executions (including import-only roots), covering deferred rebuilds, narrow
+and wide native reopen, coalesced centroids, external previous-vector handling,
+delete, and merge ownership cleanup. The final HITS build passed 19/19 steps;
+its clean test took 0.903 s. Formatting and whitespace checks also passed.
+The final HITS case and narrow/wide native reopen plus the new relocation
+contract also passed with allocator backtraces enabled, with no leaks.

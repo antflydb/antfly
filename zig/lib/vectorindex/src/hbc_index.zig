@@ -8091,7 +8091,7 @@ pub fn insertWithMetadataTxnOptions(
                     return;
                 }
             } else {
-                removeFromLeaf(self, txn, existing_leaf_id, vector_id) catch |err| switch (err) {
+                removeFromLeafWithOptions(self, txn, existing_leaf_id, vector_id, batch_insert_options) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
                 };
@@ -8165,7 +8165,7 @@ pub fn insertWithMetadataTxnOptions(
     const leaf_overflows = leaf.members.len > self.config.leaf_size;
     const defer_leaf_split = shouldDeferOversizedLeafSplit(self, &leaf, batch_insert_options);
     var save_options = batch_insert_options;
-    save_options.suppress_quantized_payload_persist = defer_leaf_split;
+    save_options.suppress_quantized_payload_persist = save_options.suppress_quantized_payload_persist or defer_leaf_split;
 
     if (metadata_value.len > 0) {
         var range_changed = false;
@@ -8358,6 +8358,10 @@ fn existingVectorMatchesNoOp(
 }
 
 pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64) !void {
+    return removeFromLeafWithOptions(self, txn, leaf_id, vector_id, .{});
+}
+
+fn removeFromLeafWithOptions(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64, options: hbc_runtime.BatchInsertOptions) !void {
     try self.bindTxnLike(txn);
     var leaf = try loadNode(self, txn, leaf_id);
     defer leaf.deinit(self.alloc);
@@ -8386,16 +8390,19 @@ pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64)
         try parent.ensureUnbacked(self.alloc);
         if (try removeChildLink(self, &parent, leaf_id)) {
             try recomputeInternalCentroid(self, txn, &parent);
-            try self.saveNodeWithOptionsMode(txn, &parent, .{}, false);
+            try self.saveNodeWithOptionsMode(txn, &parent, options, false);
             try deleteNode(self, txn, leaf_id);
-            try collapseSingleChildParents(self, txn, leaf.parent);
+            try collapseSingleChildParentsOptions(self, txn, leaf.parent, options);
         } else {
             try deleteNode(self, txn, leaf_id);
         }
         return;
     }
 
-    try self.saveNodeWithOptionsMode(txn, &leaf, .{}, false);
+    // Relocation is part of the enclosing batch: source leaves must retain
+    // its deferred payload policy just like destination leaves do. Rebuild
+    // touched nodes once at finalization, not once for every moved vector.
+    try self.saveNodeWithOptionsMode(txn, &leaf, options, false);
 
     if (leaf.parent != 0 and leaf.members.len < minLeafOccupancy(self)) {
         var parent = loadNode(self, txn, leaf.parent) catch |err| {
@@ -8443,14 +8450,14 @@ pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64)
             // transfer, including every subsequent error path.
             merged_owned = false;
             try posting.PostingStore.recomputeCentroid(self, txn, &sibling);
-            try self.saveNodeWithOptionsMode(txn, &sibling, .{}, false);
+            try self.saveNodeWithOptionsMode(txn, &sibling, options, false);
             for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
             if (try removeChildLink(self, &parent, leaf_id)) {
                 try recomputeInternalCentroid(self, txn, &parent);
-                try self.saveNodeWithOptionsMode(txn, &parent, .{}, false);
+                try self.saveNodeWithOptionsMode(txn, &parent, options, false);
                 try deleteNode(self, txn, leaf_id);
-                try collapseSingleChildParents(self, txn, leaf.parent);
+                try collapseSingleChildParentsOptions(self, txn, leaf.parent, options);
             } else {
                 try deleteNode(self, txn, leaf_id);
             }
@@ -9896,7 +9903,7 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
         } else {
             const save_start = now_fn();
             var save_options = options;
-            save_options.suppress_quantized_payload_persist = defer_leaf_split;
+            save_options.suppress_quantized_payload_persist = save_options.suppress_quantized_payload_persist or defer_leaf_split;
             try saveExistingNodeBodyWithAddedVectorsOptions(self, txn, &leaf, added_vectors, group_len, save_options, now_fn_u64_adapter(now_fn), elapsed_fn_u64_adapter(elapsed_fn));
             self.write_profile.save_node_ns += elapsed_fn(save_start);
             self.write_profile.save_node_calls += 1;

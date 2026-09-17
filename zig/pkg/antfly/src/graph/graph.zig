@@ -32595,7 +32595,36 @@ test "graph hits reduce pages only write their planned node range" {
 }
 
 test "graph hits planned build drains partitioned paired pages across workers" {
-    const alloc = std.testing.allocator;
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const Fixture = struct {
+        fn seed(graph: *GraphIndex) !void {
+            // Preserve both fan-outs beyond the scan-page boundary. This test
+            // exercises metric workers, so seed the identical topology in one
+            // public batch rather than committing once per edge.
+            const count = graph_metric_build_target_scan_page_units + 1;
+            var sources: [count][64]u8 = undefined;
+            var targets: [count][64]u8 = undefined;
+            var writes: [2 * count + 1]BatchWrite = undefined;
+            for (0..count) |i| {
+                writes[2 * i] = .{
+                    .source = try std.fmt.bufPrint(&sources[i], "doc-hub-{d:0>3}", .{i}),
+                    .target = "doc-authority",
+                    .edge_type = "cites",
+                };
+                writes[2 * i + 1] = .{
+                    .source = "doc-shared-hub",
+                    .target = try std.fmt.bufPrint(&targets[i], "doc-target-{d:0>3}", .{i}),
+                    .edge_type = "cites",
+                };
+            }
+            writes[2 * count] = .{ .source = "doc-authority", .target = "doc-authority", .edge_type = "cites" };
+            try graph.batchApply(&writes, &.{});
+            try std.testing.expectEqual(@as(u64, writes.len), graph.edge_count);
+            try std.testing.expectEqual(@as(u64, 2 * count + 2), graph.node_count);
+        }
+    };
     const metrics = [_]GraphMetricConfig{
         .{
             .name = "hits_authority",
@@ -32624,15 +32653,7 @@ test "graph hits planned build drains partitioned paired pages across workers" {
     var local_graph = try openTestGraphIndex(alloc, &local_store, local_rev_path, "links", .{ .metric_configs = &metrics });
     defer local_graph.close();
 
-    for (0..graph_metric_build_target_scan_page_units + 1) |i| {
-        var source_buf: [64]u8 = undefined;
-        const source = try std.fmt.bufPrint(&source_buf, "doc-hub-{d:0>3}", .{i});
-        try local_graph.addEdge(source, "doc-authority", "cites", 1.0, 0, 0, "");
-        var target_buf: [64]u8 = undefined;
-        const target = try std.fmt.bufPrint(&target_buf, "doc-target-{d:0>3}", .{i});
-        try local_graph.addEdge("doc-shared-hub", target, "cites", 1.0, 0, 0, "");
-    }
-    try local_graph.addEdge("doc-authority", "doc-authority", "cites", 1.0, 0, 0, "");
+    try Fixture.seed(&local_graph);
 
     var local_status = try local_graph.runGraphMetric("hits_authority");
     defer local_status.deinit(alloc);
@@ -32653,15 +32674,7 @@ test "graph hits planned build drains partitioned paired pages across workers" {
     var planned_graph = try openTestGraphIndex(alloc, &planned_store, planned_rev_path, "links", .{ .metric_configs = &metrics });
     defer planned_graph.close();
 
-    for (0..graph_metric_build_target_scan_page_units + 1) |i| {
-        var source_buf: [64]u8 = undefined;
-        const source = try std.fmt.bufPrint(&source_buf, "doc-hub-{d:0>3}", .{i});
-        try planned_graph.addEdge(source, "doc-authority", "cites", 1.0, 0, 0, "");
-        var target_buf: [64]u8 = undefined;
-        const target = try std.fmt.bufPrint(&target_buf, "doc-target-{d:0>3}", .{i});
-        try planned_graph.addEdge("doc-shared-hub", target, "cites", 1.0, 0, 0, "");
-    }
-    try planned_graph.addEdge("doc-authority", "doc-authority", "cites", 1.0, 0, 0, "");
+    try Fixture.seed(&planned_graph);
 
     try planned_graph.acquireGraphMetricBuildLease("hits_authority", planned_graph.edge_generation);
     defer planned_graph.releaseGraphMetricBuildLease("hits_authority") catch {};
