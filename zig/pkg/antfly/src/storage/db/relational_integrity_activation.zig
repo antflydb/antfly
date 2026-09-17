@@ -105,10 +105,14 @@ pub fn requireReady(txn: anytype, catalog: catalog_mod.Catalog) !void {
     }
 }
 
-/// Repairs retain an exact-value read guard on failed activation. A concurrent
-/// retry cannot scan around repaired rows or publish coverage from an old cut.
+/// Repairs retain an exact-value read guard on failed or diagnosed activation.
+/// MATCH PARTIAL missing-parent diagnostics cannot be terminal (there is no
+/// negative witness lock), but must still admit constraint-checked repairs.
+/// Concurrent validation/retry cannot publish coverage from an old cut.
 pub fn repairPredicate(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catalog) !transactions.VersionPredicate {
-    if (!hasActive(catalog) or (try status(txn, catalog)).state != .invalid) return error.InvalidConstraintActivation;
+    if (!hasActive(catalog)) return error.InvalidConstraintActivation;
+    const progress = try status(txn, catalog);
+    if (progress.state != .invalid and !(progress.state == .validating and std.mem.eql(u8, progress.failure, "ForeignKeyParentMissing"))) return error.InvalidConstraintActivation;
     const current = (try optional(txn, key)) orelse return error.ConstraintActivationChanged;
     return .{ .key = key, .comparison = .exact_value, .expected_value = try alloc.dupe(u8, current) };
 }
@@ -249,6 +253,10 @@ pub const Page = struct {
             };
         };
         errdefer page_rows.deinit();
+        // This is a proposed successful checkpoint. Its publication still
+        // requires the worker's constraint checks and exact checkpoint CAS;
+        // a previous retryable diagnostic must not poison successful coverage.
+        progress.failure = "";
         progress.rows_scanned = std.math.add(u64, progress.rows_scanned, page_rows.rows.len) catch return error.InvalidConstraintActivation;
         progress.cursor = if (page_rows.more) try owned.dupe(u8, reader.after.items) else "";
         if (!page_rows.more) {

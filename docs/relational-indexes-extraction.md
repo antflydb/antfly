@@ -1286,3 +1286,24 @@ from the pinned store snapshot, never a process-wide version-number cache.
 This keeps alternating historical/current rows from recompiling a layout per
 row while bounding retention under schema churn. Work-count regressions cover
 512 alternating rows, eviction across ten epochs, and allocation-failure cleanup.
+
+Retained transaction aborts deliver to the complete participant cohort, even
+when this invocation never reached a follower or its BEGIN was not proposed.
+Only fresh transaction IDs can use invocation-local contact evidence to skip
+delivery. Failed delivery (including a missing follower record) stays enlisted
+for durable recovery rather than acknowledging away an earlier execution.
+
+Administrator repair also admits a validating `ForeignKeyParentMissing`
+diagnostic. It keeps ordinary writes gated, applies normal constraint checks,
+and guards the exact activation checkpoint through commit. Successful validation
+clears the diagnostic; repairs never themselves advance coverage. Hidden restore
+cohorts remain immutable and continue to reject invalid data before publication.
+
+Index construction visits one document prefix per primary pass, seeking past
+unrelated artifact/index companions. Forward verification scans the target
+generation prefix; reverse verification scans its generation-local ownership
+records. The primary pass also checks reverse-only orphans without ownership,
+so this optimization does not abandon repair after a lost companion. Retired
+generations use their own bounded GC jobs. A persisted-LSM regression with
+64 rows and 1/8/32 populated indexes asserts exactly 192 scan records per index
+across all three phases, independent of unrelated generation count.

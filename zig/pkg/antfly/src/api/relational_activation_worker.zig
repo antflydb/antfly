@@ -446,6 +446,98 @@ test "distributed txn activation admission reaches singleton in bounded reductio
     try std.testing.expectEqual(@as(u32, 1), budget.rows);
 }
 
+test "distributed txn MATCH PARTIAL diagnostic admits guarded deletion and correction then resumes coverage" {
+    const db_mod = @import("../storage/db/db.zig");
+    const types = @import("../storage/db/types.zig");
+    const gate = @import("../raft/read_gate.zig");
+    const alloc = std.testing.allocator;
+    const initial =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer","nullable":true},"b":{"type":"integer","nullable":true},"x":{"type":"integer","nullable":true},"y":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    const declaration =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["a","b"]}],"relational_indexes":[{"name":"by_a","keys":[{"column":"a"}]},{"name":"by_b","keys":[{"column":"b"}]}],"foreign_keys":[{"name":"fk","child_columns":["x","y"],"parent_table":"rows","parent_columns":["a","b"],"match":"partial"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer","nullable":true},"b":{"type":"integer","nullable":true},"x":{"type":"integer","nullable":true},"y":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    for ([_]bool{ false, true }) |remove| {
+        var directory = try @import("../common/test_directory.zig").TestDirectory.init("partial-diagnostic-repair");
+        defer directory.cleanup();
+        const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 500, .shard_id = 501 }, .primary_backend = .{ .lsm = .{} } };
+        var db = try db_mod.DB.open(alloc, directory.path(), options);
+        defer db.close();
+        try db.setSchemaJson(alloc, initial);
+        try db.batch(.{ .writes = &.{.{ .key = "orphan", .value = "{\"a\":9,\"b\":9,\"x\":99,\"y\":null}" }} });
+        try db.setSchemaJson(alloc, declaration);
+        inline for (.{ "by_a", "by_b" }) |index| {
+            for (0..16) |_| {
+                if ((try db.relationalIndexBuildStatus(index)).state == .ready) break;
+                try db.buildRelationalIndexStep(index, .{});
+            } else return error.IndexBuildDidNotConverge;
+        }
+        const Fixture = struct {
+            db: *db_mod.DB,
+            sequence: u8 = 0,
+            fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, _: gate.ReadConsistency) !?reads.LookupResponse {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const result = (try self.db.lookup(allocator, key, opts)) orelse return null;
+                return .{ .json = result.json, .version = result.version orelse 0, .expected_content_digest = result.expected_content_digest };
+            }
+            fn scan(ptr: *anyopaque, allocator: Allocator, _: []const u8, from: []const u8, to: []const u8, opts: types.ScanOptions, _: gate.ReadConsistency) !?reads.ScanResponse {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                var result = try self.db.scan(allocator, from, to, opts);
+                defer result.deinit(allocator);
+                return .{ .ndjson = try @import("local_query_contract.zig").encodeStorageKernelScanNdjson(allocator, result, opts.include_documents) };
+            }
+            fn commit(ptr: *anyopaque, _: Allocator, requests: []const contract.TableCommitRequest, _: types.SyncLevel, _: CancellationToken) !?contract.CommitOutcome {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                try std.testing.expectEqual(@as(usize, 1), requests.len);
+                const request = requests[0];
+                self.sequence += 1;
+                const stamp = @as(u64, self.sequence) * 1000;
+                const txn = try self.db.beginTransactionWithId(@splat(self.sequence), stamp);
+                errdefer self.db.abortTransaction(txn, stamp + 1) catch {};
+                try self.db.writeTransaction(txn, .{ .relational_schema_version = request.relational_schema_version, .relational_integrity_generation_set = request.relational_integrity_generation_set, .relational_repair = request.relational_repair, .writes = request.writes, .deletes = request.deletes, .predicates = request.predicates, .integrity = request.integrity, .integrity_commands = request.integrity_commands, .relational_activation = request.relational_activation });
+                try self.db.commitTransaction(txn, stamp + 1);
+                return .{ .committed = .{ .participant_count = 1 } };
+            }
+        };
+        var fixture: Fixture = .{ .db = &db };
+        const reader: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = Fixture.scan, .query = undefined } };
+        const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = undefined, .commit_batch_with_cancellation = Fixture.commit } };
+        const tables = [_]records.TableRecord{.{ .table_id = 500, .name = "rows", .placement_role = "data", .schema_json = declaration }};
+        const owners = [_]records.RangeRecord{.{ .group_id = 501, .table_id = 500, .start_key = "" }};
+        for (0..16) |_| {
+            _ = try runPage(alloc, reader, writer, &tables, &owners, owners[0]);
+            const raw = (try db.core.getStoreValue(alloc, activation.key)).?;
+            defer alloc.free(raw);
+            const progress = try activation.Progress.decode(raw);
+            if (progress.failure.len != 0) {
+                try std.testing.expectEqual(activation.State.validating, progress.state);
+                try std.testing.expectEqualStrings("ForeignKeyParentMissing", progress.failure);
+                break;
+            }
+        } else return error.DiagnosticNotPublished;
+        db.close();
+        db = try db_mod.DB.open(alloc, directory.path(), options);
+        const request: contract.TableCommitRequest = .{ .table_name = "rows", .relational_schema_version = 2, .deletes = if (remove) &.{"orphan"} else &.{}, .writes = if (remove) &.{} else &.{.{ .key = "orphan", .value = "{\"a\":9,\"b\":9,\"x\":null,\"y\":null}" }} };
+        var repair = try planner.prepareRepair(alloc, reader, &tables, &owners, request, .{});
+        defer repair.deinit();
+        var ordinary = repair.tables[0];
+        ordinary.relational_repair = false;
+        try std.testing.expectError(error.ConstraintActivationInProgress, writer.commitBatchWithCancellation(alloc, &.{ordinary}, .write, .none));
+        _ = try writer.commitBatchWithCancellation(alloc, repair.tables, .write, .none);
+        for (0..16) |_| {
+            if (!try runPage(alloc, reader, writer, &tables, &owners, owners[0])) break;
+        } else return error.ActivationDidNotConverge;
+        const raw = (try db.core.getStoreValue(alloc, activation.key)).?;
+        defer alloc.free(raw);
+        const progress = try activation.Progress.decode(raw);
+        try std.testing.expectEqual(activation.State.enforced, progress.state);
+        try std.testing.expectEqualStrings("", progress.failure);
+        // A stale repair cannot bypass healthy coverage after the diagnostic
+        // has been cleared, even though it was planned before publication.
+        try std.testing.expectError(error.InvalidConstraintActivation, writer.commitBatchWithCancellation(alloc, repair.tables, .write, .none));
+    }
+}
+
 test "distributed txn CHECK activation shares durable repair retry and physical source guards" {
     const db_mod = @import("../storage/db/db.zig");
     const types = @import("../storage/db/types.zig");

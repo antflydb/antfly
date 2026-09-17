@@ -1759,6 +1759,56 @@ test "relational index system standby replays schema churn and rebuilds ready ge
     try std.testing.expectEqual(@as(usize, 3), (try scan(&replica, true)).count);
 }
 
+test "relational index system LSM build work is linear in rows times indexes" {
+    const jobs = @import("relational_index_jobs.zig");
+    const count = 64;
+    for ([_]usize{ 1, 8, 32 }) |index_count| {
+        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("index-build-scaling");
+        defer directory.cleanup();
+        const options: db_mod.OpenOptions = .{ .primary_backend = .{ .lsm = .{ .flush_threshold = 128 } }, .start_index_workers = false, .start_optional_runtimes = false };
+        var db = try db_mod.DB.open(alloc, directory.path(), options);
+        defer db.close();
+        const single = try schema(1, true);
+        defer alloc.free(single);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, single, .{});
+        defer parsed.deinit();
+        const owned = parsed.arena.allocator();
+        const indexes = parsed.value.object.getPtr("relational_indexes").?;
+        const template = indexes.array.items[0];
+        for (1..index_count) |i| {
+            var item = template;
+            item.object = try template.object.clone(owned);
+            try item.object.put(owned, "name", .{ .string = try std.fmt.allocPrint(owned, "index_{d}", .{i}) });
+            try indexes.array.append(item);
+        }
+        const declaration = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        defer alloc.free(declaration);
+        try db.setSchemaJson(alloc, declaration);
+        for (0..count) |i| try write(&db, i, i % 4);
+        // Reopen against persisted LSM data. Every unrelated generation is
+        // populated before measuring even the first target's verification.
+        db.close();
+        db = try db_mod.DB.open(alloc, directory.path(), options);
+        const started = time.monotonicNs();
+        var examined: usize = 0;
+        for (indexes.array.items) |item| {
+            const name = item.object.get("name").?.string;
+            var target_examined: usize = 0;
+            for (0..256) |_| {
+                var page = (try jobs.Page.prepare(alloc, std.testing.io, db.core, name, .{ .records = 7 })) orelse break;
+                defer page.deinit();
+                target_examined += page.records_examined;
+                try page.commit(db.core);
+            } else return error.IndexBuildDidNotConverge;
+            try std.testing.expectEqual(@as(usize, 3 * count), target_examined);
+            try std.testing.expectEqual(.ready, (try db.relationalIndexBuildStatus(name)).state);
+            examined += target_examined;
+        }
+        try std.testing.expectEqual(3 * count * index_count, examined);
+        std.debug.print("LSM generation-local build indexes={d} rows={d} examined={d} elapsed_us={d}\n", .{ index_count, count, examined, (time.monotonicNs() - started) / 1000 });
+    }
+}
+
 test "relational index system LSM write rebuild query and churn work benchmark" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

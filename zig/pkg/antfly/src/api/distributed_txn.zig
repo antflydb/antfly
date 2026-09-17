@@ -1265,7 +1265,7 @@ fn executeMultiTableCommitOnce(
                 commit_version,
                 participants.items,
                 participant_ids,
-                begun_count,
+                if (options.retain_terminal) participants.items.len else begun_count,
             ) catch {};
         }
     }
@@ -1318,8 +1318,9 @@ fn executeMultiTableCommitOnce(
                 return .{ .conflict = participantUnavailableConflict(participant, .begin) };
             }
             // The failed call may have applied before its response failed,
-            // so include it in abort delivery. Participants after it were
-            // never contacted and can be acknowledged without an RPC.
+            // so include it in abort delivery. A retained ID may also have
+            // prepared followers in an earlier execution: only fresh IDs can
+            // use this invocation's contact evidence to elide phase two.
             abort_on_error = false;
             try abortParticipants(
                 alloc,
@@ -1328,7 +1329,7 @@ fn executeMultiTableCommitOnce(
                 commit_version,
                 participants.items,
                 participant_ids,
-                1,
+                if (options.retain_terminal) participants.items.len else 1,
             );
             std.log.warn("transaction begin failed table={s} group_id={} err={s}", .{
                 participant.table_name, participant.group_id, @errorName(err),
@@ -1366,6 +1367,7 @@ fn executeMultiTableCommitOnce(
                 participants.items,
                 participant_ids,
                 fanout_slots,
+                options.retain_terminal,
             );
             return switch (failure) {
                 error.UnknownGroup, error.PreDecisionNotProposed => .{ .conflict = participantUnavailableConflict(participants.items[participant_index], .begin) },
@@ -3139,9 +3141,14 @@ fn abortParticipantsWithContactMask(
     participants: []const ParticipantTxn,
     participant_ids: []const []const u8,
     slots: []const ParticipantFanoutSlot,
+    retained: bool,
 ) !void {
     if (participants.len == 0) return;
     std.debug.assert(participant_ids.len == participants.len and slots.len == participants.len);
+    // Contact evidence is invocation-local, not transaction-local. In a
+    // retained replay even a definitely unproposed BEGIN can have old intents.
+    // Resolve the entire durable cohort; unavailable followers remain enlisted.
+    if (retained) return abortParticipants(alloc, worker, txn_id, timestamp, participants, participant_ids, participants.len);
 
     const coordinator = participants[0];
     worker.resolveGroup(alloc, coordinator.group_id, coordinator.table_name, .{
@@ -5150,7 +5157,12 @@ fn consumerTests() type {
 
             const Recorder = struct {
                 begin_error: anyerror = error.DecisionConflict,
+                failed_begin_group: u64 = 7001,
                 status_error: ?anyerror = null,
+                observed_status: db_mod.types.TxnStatus = .committed,
+                follower_resolve_error: ?anyerror = null,
+                follower_resolved: bool = false,
+                follower_acknowledged: bool = false,
                 begin_calls: usize = 0,
                 prepare_calls: usize = 0,
                 resolve_calls: usize = 0,
@@ -5164,15 +5176,16 @@ fn consumerTests() type {
                             .prepare_group = prepare,
                             .resolve_group = resolve,
                             .status_group = status,
+                            .acknowledge_group = acknowledge,
                         },
                     };
                 }
 
-                fn begin(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnBeginRequest) !void {
+                fn begin(ptr: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, req: TxnBeginRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.begin_calls += 1;
                     try std.testing.expect(req.retain_terminal);
-                    return self.begin_error;
+                    if (group == self.failed_begin_group) return self.begin_error;
                 }
 
                 fn prepare(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
@@ -5180,18 +5193,30 @@ fn consumerTests() type {
                     self.prepare_calls += 1;
                 }
 
-                fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
+                fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, req: TxnResolveRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.resolve_calls += 1;
-                    try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+                    try std.testing.expectEqual(if (self.observed_status == .pending) db_mod.types.TxnStatus.aborted else self.observed_status, req.status);
                     try std.testing.expectEqual(@as(u64, 0), req.topology_epoch);
+                    if (group == 7002) {
+                        if (self.follower_resolve_error) |err| return err;
+                        self.follower_resolved = true;
+                    }
+                }
+
+                fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnAcknowledgeRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (std.mem.endsWith(u8, req.participant, ":7002")) {
+                        try std.testing.expect(self.follower_resolved);
+                        self.follower_acknowledged = true;
+                    }
                 }
 
                 fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.status_calls += 1;
                     if (self.status_error) |err| return err;
-                    return .committed;
+                    return self.observed_status;
                 }
             };
 
@@ -5245,6 +5270,30 @@ fn consumerTests() type {
                 try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
                 try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
                 try std.testing.expectEqual(@as(usize, 0), recorder.resolve_calls);
+            }
+            // Model an earlier interrupted execution with a prepared follower.
+            // Neither coordinator BEGIN failure nor a follower's explicit
+            // not-proposed result proves that old participant has no intents.
+            for ([_]u64{ 7001, 7002 }) |failed_group| {
+                for ([_]?anyerror{ null, error.Timeout, error.TxnNotFound }) |resolve_error| {
+                    var recorder = Recorder{ .failed_begin_group = failed_group, .begin_error = error.PreDecisionNotProposed, .observed_status = .pending, .follower_resolve_error = resolve_error };
+                    const result = executeMultiTableCommitWithOptions(
+                        std.testing.allocator,
+                        FakeCatalog.iface(),
+                        recorder.worker(),
+                        @splat(7),
+                        10_000,
+                        10_001,
+                        &.{.{ .table_name = "docs", .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }},
+                        .write,
+                        null,
+                        .{ .retain_terminal = true },
+                    );
+                    if (failed_group == 7001) try std.testing.expectError(error.TransactionBeginFailed, result) else try std.testing.expect((try result) == .conflict);
+                    try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
+                    try std.testing.expectEqual(resolve_error == null, recorder.follower_resolved);
+                    try std.testing.expectEqual(resolve_error == null, recorder.follower_acknowledged);
+                }
             }
         }
 

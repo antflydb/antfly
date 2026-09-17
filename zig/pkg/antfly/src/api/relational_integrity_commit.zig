@@ -1027,7 +1027,7 @@ test "distributed txn partial witness scan translates distinct clock epochs with
 /// Administrative recovery may edit invalid rows, not bypass new-value checks.
 /// Only the target table's incomplete historical coverage is exempted; every
 /// external parent still needs global UNIQUE coverage. Native prepares require
-/// failed activation and lock its exact checkpoint through the repair decision.
+/// failed/diagnosed activation and lock its exact checkpoint through the repair decision.
 pub fn prepareRepair(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, request: contract.TableCommitRequest, control: RequestContext) !Prepared {
     _ = try metadataRequiresCoordination(alloc, metadata, &.{request});
     if (!try requiresActivation(alloc, (for (metadata) |table| {

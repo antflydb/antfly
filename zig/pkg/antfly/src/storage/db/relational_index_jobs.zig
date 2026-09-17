@@ -42,6 +42,19 @@ fn digest(bytes: []const u8) Digest {
     return result;
 }
 
+fn prefixEnd(alloc: Allocator, prefix: []const u8) ![]const u8 {
+    var len = prefix.len;
+    while (len > 0) {
+        len -= 1;
+        if (prefix[len] != 255) {
+            const end = try alloc.dupe(u8, prefix[0 .. len + 1]);
+            end[len] += 1;
+            return end;
+        }
+    }
+    return error.InvalidRelationalIndexProgress;
+}
+
 pub const State = enum(u8) { building = 0, ready = 1, failed = 2 };
 pub const Failure = enum(u8) { none = 0, incompatible_schema = 1, invalid_row = 2 };
 
@@ -206,8 +219,8 @@ pub fn progressDigest(txn: *docstore.DocStore.Txn, index: plans.BoundIndex) !Dig
 }
 
 pub const Budget = struct {
-    /// Includes artifact records skipped between primary rows, preventing a
-    /// high-fanout document from monopolizing the planner.
+    /// Document prefixes in primary construction, generation-local records
+    /// in verification. Artifact/index fanout is skipped by a prefix seek.
     records: usize = 256,
     bytes: usize = 1024 * 1024,
     time_ns: u64 = 5 * std.time.ns_per_ms,
@@ -229,6 +242,8 @@ pub const Page = struct {
     candidates: []const Candidate,
     failed_source: ?FailedSource = null,
     consumed: bool = false,
+    /// Logical scan work, independent of payload size and unrelated indexes.
+    records_examined: usize = 0,
 
     const Candidate = struct {
         primary: ?[]const u8 = null,
@@ -329,26 +344,40 @@ pub const Page = struct {
         var exhausted = true;
         var failed_source: ?FailedSource = null;
         var entry = try cursor.seekAtOrAfter(if (after.len == 0) lower else after);
-        while (entry) |kv| : (entry = try cursor.next()) {
+        while (entry) |kv| : (entry = try cursor.seekAtOrAfter(after)) {
             if (io) |runtime_io| try runtime_io.checkCancel();
-            if (progress.cursor.len != 0 and std.mem.order(u8, kv.key, progress.cursor) != .gt) continue;
             if (std.mem.order(u8, kv.key, upper) != .lt) break;
             if (kv.key.len > max_cursor_bytes) return error.InvalidRelationalIndexProgress;
             inspected += 1;
             bytes +|= kv.key.len;
-            after = try page_alloc.dupe(u8, kv.key);
-            if (internal.isRelationalRowKey(kv.key)) {
-                bytes +|= kv.value.len;
-                const payload = prepareTuple(alloc, page_alloc, core, pinned, index, kv.value, &source, &projected, &projected_cover, &projected_predicate, &encoded) catch |err| {
+            // Visit each document once, not each of its M index/artifact
+            // companions. The successor is an exclusive document-prefix cut;
+            // it is safe to persist and seek after cancellation/reopen.
+            const term = internal.findComponentTerminator(kv.key, 1) orelse return error.InvalidRelationalIndexProgress;
+            after = try prefixEnd(page_alloc, kv.key[0 .. term + 2]);
+            const document = (try internal.decodeDocumentComponentAlloc(page_alloc, kv.key)).?;
+            const primary = try internal.relationalRowKeyAlloc(page_alloc, document);
+            const row = if (std.mem.eql(u8, kv.key, primary)) kv.value else try getOptional(&read, primary);
+            if (row) |raw| {
+                bytes +|= raw.len;
+                const payload = prepareTuple(alloc, page_alloc, core, pinned, index, raw, &source, &projected, &projected_cover, &projected_predicate, &encoded) catch |err| {
                     progress.failure = classifyRowFailure(err) orelse return err;
                     progress.state = .failed;
-                    failed_source = .{ .primary = after, .hash = digest(kv.value) };
+                    failed_source = .{ .primary = primary, .hash = digest(raw) };
                     candidates.clearRetainingCapacity();
                     break;
                 };
-                const document = (try internal.decodeStoredDocumentRowKeyAlloc(page_alloc, kv.key)).?;
-                try candidates.append(page_alloc, .{ .primary = after, .document = document, .hash = digest(kv.value), .tuple = if (payload != null) try page_alloc.dupe(u8, encoded.items) else null, .payload = payload orelse "", .nonmember = payload == null });
+                try candidates.append(page_alloc, .{ .primary = primary, .document = document, .hash = digest(raw), .tuple = if (payload != null) try page_alloc.dupe(u8, encoded.items) else null, .payload = payload orelse "", .nonmember = payload == null });
                 progress.rows_scanned = try std.math.add(u64, progress.rows_scanned, 1);
+            } else {
+                // Also repair reverse-only orphans whose ownership record was
+                // lost. This shares the primary pass, never a second global scan.
+                var reverse = std.ArrayList(u8).empty;
+                try records.appendReverseKey(page_alloc, &reverse, index.id(), document);
+                if (try getOptional(&read, reverse.items)) |raw| {
+                    bytes +|= raw.len;
+                    try candidates.append(page_alloc, .{ .primary = primary, .observed_key = reverse.items, .observed_hash = digest(raw), .delete_observed = true });
+                }
             }
             if (inspected >= budget.records or bytes >= budget.bytes or platform_time.monotonicNs() - started >= budget.time_ns) {
                 exhausted = false;
@@ -358,7 +387,7 @@ pub const Page = struct {
         if (failed_source == null and exhausted) progress.phase = .forward;
         progress.cursor = if (failed_source == null and exhausted) "" else after;
         transferred = true;
-        return .{ .arena = arena, .pinned = pinned, .index_offset = index_offset, .namespace_generation = namespace_generation, .expected = expected, .control = .{ .epoch = proof.maintenance_epoch, .last_request = proof.last_maintenance_request }, .next = progress, .candidates = candidates.items, .failed_source = failed_source };
+        return .{ .arena = arena, .pinned = pinned, .index_offset = index_offset, .namespace_generation = namespace_generation, .expected = expected, .control = .{ .epoch = proof.maintenance_epoch, .last_request = proof.last_maintenance_request }, .next = progress, .candidates = candidates.items, .failed_source = failed_source, .records_examined = inspected };
     }
 
     fn prepareDerived(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget) !?Page {
@@ -380,10 +409,11 @@ pub const Page = struct {
         if (progress.state != .building or progress.phase == .primary) return null;
         const expected = if (try getOptional(&read, &progressKey(index.id()))) |raw| try page_alloc.dupe(u8, raw) else null;
         const range = try range_state.decodeRangeAlloc(page_alloc, (try getOptional(&read, range_state.range_key)) orelse &full_range);
-        var active = std.AutoHashMapUnmanaged(u128, void).empty;
-        for (pinned.plan.boundIndexes()) |bound| try active.put(page_alloc, bound.id().mapKey(), {});
-        const lower: []const u8 = if (progress.phase == .forward) records.forward_namespace else &.{internal.user_namespace};
-        const upper: []const u8 = if (progress.phase == .forward) "\x00\x00R\x02" else &.{internal.user_namespace + 1};
+        // Both verification passes are generation-local. Retirement has its
+        // own durable GC queue; building one index must not scrub all others.
+        const prefix = if (progress.phase == .forward) try records.forwardPrefix(index.id()) else try records.ownershipPrefix(index.id());
+        const lower: []const u8 = &prefix;
+        const upper = try prefixEnd(page_alloc, lower);
         if (progress.cursor.len != 0 and (std.mem.order(u8, progress.cursor, lower) == .lt or std.mem.order(u8, progress.cursor, upper) != .lt)) return error.InvalidRelationalIndexProgress;
         var cursor = try read.openCursor();
         defer cursor.close();
@@ -419,23 +449,6 @@ pub const Page = struct {
                 var document_key: []const u8 = undefined;
                 var observed_tuple: ?[]const u8 = null;
                 if (progress.phase == .forward) {
-                    if (kv.key.len < records.forward_prefix_len) {
-                        candidate.delete_observed = true;
-                        try candidates.append(page_alloc, candidate);
-                        break :examine;
-                    }
-                    const id = records.Id.decode(kv.key[records.forward_namespace.len..records.forward_prefix_len]) catch {
-                        candidate.delete_observed = true;
-                        try candidates.append(page_alloc, candidate);
-                        break :examine;
-                    };
-                    if (id.mapKey() != index.id().mapKey()) {
-                        if (!active.contains(id.mapKey())) {
-                            candidate.delete_observed = true;
-                            try candidates.append(page_alloc, candidate);
-                        }
-                        break :examine;
-                    }
                     const owner = records.forwardOwnership(kv.key) catch {
                         candidate.delete_observed = true;
                         try candidates.append(page_alloc, candidate);
@@ -447,21 +460,15 @@ pub const Page = struct {
                     @memcpy(raw_key[1..], owner.document_component);
                     document_key = raw_key;
                 } else {
-                    const term = internal.findComponentTerminator(kv.key, 1) orelse break :examine;
-                    if (term + 2 >= kv.key.len or kv.key[term + 2] != internal.relational_index_reverse_kind) break :examine;
-                    const reverse = records.parseReverseKey(kv.key) catch {
+                    const document_component = records.ownershipDocument(kv.key) catch {
                         candidate.delete_observed = true;
                         try candidates.append(page_alloc, candidate);
                         break :examine;
                     };
-                    if (reverse.id.mapKey() != index.id().mapKey()) {
-                        if (!active.contains(reverse.id.mapKey())) {
-                            candidate.delete_observed = true;
-                            try candidates.append(page_alloc, candidate);
-                        }
-                        break :examine;
-                    }
-                    document_key = kv.key;
+                    const raw_key = try page_alloc.alloc(u8, document_component.len + 1);
+                    raw_key[0] = internal.user_namespace;
+                    @memcpy(raw_key[1..], document_component);
+                    document_key = raw_key;
                 }
                 const document = (try internal.decodeDocumentComponentAlloc(page_alloc, document_key)) orelse return error.InvalidRelationalIndexForwardKey;
                 if (!range.contains(document)) {
@@ -508,7 +515,7 @@ pub const Page = struct {
             progress.cursor = "";
         } else progress.cursor = after;
         transferred = true;
-        return .{ .arena = arena, .pinned = pinned, .index_offset = offset, .namespace_generation = namespace, .expected = expected, .control = .{ .epoch = proof.maintenance_epoch, .last_request = proof.last_maintenance_request }, .next = progress, .candidates = candidates.items, .failed_source = failed_source };
+        return .{ .arena = arena, .pinned = pinned, .index_offset = offset, .namespace_generation = namespace, .expected = expected, .control = .{ .epoch = proof.maintenance_epoch, .last_request = proof.last_maintenance_request }, .next = progress, .candidates = candidates.items, .failed_source = failed_source, .records_examined = inspected };
     }
 
     /// Caller holds apply-exclusive and rechecks its HA/ownership authority.
@@ -561,6 +568,16 @@ pub const Page = struct {
 };
 
 fn deleteDerived(alloc: Allocator, txn: anytype, key: []const u8) !void {
+    if (records.isOwnershipKey(key)) {
+        var reverse = std.ArrayList(u8).empty;
+        defer reverse.deinit(alloc);
+        // Malformed ownership keys have no reconstructible companion.
+        records.appendReverseFromOwnership(alloc, &reverse, key) catch |err| switch (err) {
+            error.InvalidRelationalIndexReverseKey, error.InvalidRelationalIndexId => {},
+            else => return err,
+        };
+        if (reverse.items.len != 0) try deleteDerived(alloc, txn, reverse.items);
+    }
     if (internal.isRelationalIndexReverseKey(key)) {
         var ownership_key = std.ArrayList(u8).empty;
         defer ownership_key.deinit(alloc);
