@@ -69303,7 +69303,10 @@ test "relational columnar bootstrap yields across artifact-only owners" {
 }
 
 test "relational columnar scheduler batches deferred discovery before ready work and persists timers" {
-    const alloc = std.testing.allocator;
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -69920,7 +69923,10 @@ test "relational columnar late materialization pins snapshots and releases visit
 }
 
 test "relational columnar sequential selection preserves dirty owners bounds and limits" {
-    const alloc = std.testing.allocator;
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
@@ -70199,7 +70205,10 @@ test "relational columnar production LSM physical churn benchmark" {
 }
 
 fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
-    const alloc = std.testing.allocator;
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     var path_tmp = try TestDirectory.init("db");
@@ -71357,7 +71366,10 @@ test "relational columnar typed masks avoid vector expansion and eliminated colu
 }
 
 test "relational columnar bounded compaction splits empty ranges and resumes canceled staging" {
-    const alloc = std.testing.allocator;
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     // The explicit block limit below, not elapsed wall time, defines quanta.
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
@@ -76142,7 +76154,10 @@ test "db dense and sparse vector searches apply stored symbolic filters before f
 }
 
 test "db dense stored symbolic filter candidate window covers offset pagination" {
-    const alloc = std.testing.allocator;
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -128941,7 +128956,10 @@ test "db graph ownership restore cursor resumes one artifact index exactly" {
 }
 
 test "db graph ownership restore materializes large artifacts in published segments" {
-    const alloc = std.testing.allocator;
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;

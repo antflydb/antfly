@@ -140,14 +140,14 @@ measurement predates the new training tests and is not the current baseline.
 Compilation peaked at 7.2 GiB, above its old 7 GiB estimate; the build now
 reserves 9 GiB for this artifact. The inference gate passed with that estimate.
 
-### Next batch: training test diagnostics
+### Training test diagnostics: initial experiments
 
 Controlled experiments replaced the allocator in the following fixtures with
 `DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false })`,
 asserting leak-free deinitialization. Dimensions, iterations, ownership checks,
 failure-injection loops, cancellation checks, and resume assertions stayed the
 same. These experimental source edits were reverted after measuring; they are
-recommendations for the next change, not optimizations already shipped here.
+historical measurements. The follow-up below now applies and validates these changes.
 
 | Test | Current full-suite profile | Traces disabled, focused run |
 | --- | ---: | ---: |
@@ -165,9 +165,9 @@ not a measured new whole-suite time or a production throughput improvement.
 Sampling the runtime-failure test confirmed repeated graph compilation and
 allocator stack unwinding on its hot path.
 
-Start by applying the existing opt-in allocation-backtrace convention to these
-fixtures, preserving their exhaustive failure coverage. Then profile remaining
-training ownership and manifest tests: regional/staged-head ownership failure
+The follow-up applies the existing opt-in allocation-backtrace convention to these
+fixtures, preserving their exhaustive failure coverage, and also measures the
+remaining training ownership and manifest tests: regional/staged-head ownership failure
 coverage took 36.64 seconds, inactive-adapter accumulation/resume 29.35 seconds,
 and GLiNER boundary manifest loading/listing 24.80 seconds. Do not remove
 allocation failures or shrink the integration scenarios before measuring the
@@ -290,29 +290,25 @@ than assuming that identical executable names imply identical coverage.
 
 ## Ranked remaining work
 
-1. **Allocator diagnostics, preserving test coverage.** The five largest
-   measured training cases plus the relational scheduler sum to 311 seconds
-   with normal test backtraces and about 4 seconds in the no-backtrace
-   experiments. Apply the existing opt-in trace convention first; keep leak
-   checks, exhaustive failure injection, cancellation, and durable resume.
-   This is about five minutes of local test work, not a promised CI wall-time
-   reduction. Continue the same comparison for the remaining training and
-   storage failure-injection tests before changing their fixtures.
+1. **Continue evidence-based diagnostics comparisons.** The training and six
+   storage fixtures in the follow-up below now keep allocator backtraces opt-in.
+   Leak checks, exhaustive failure injection, cancellation, durable resume, and
+   fixture sizes remain intact. Apply the same comparison to other expensive
+   ownership tests before changing their coverage.
 2. **Keep aggregate ownership enforced.** The compiled audit above removes
    1,256 repeated named executions across all four gates and rejects new
    overlap. The earlier Antfly timing sample estimated about 211 seconds of
    duplicate process work; that is not a promised CI wall-time saving. Focused
    targets remain available, with correctness and configuration coverage
    preserved in the aggregate.
-3. **Separate scale from correctness boundaries.** The wide-vector case still
-   takes 20.8 seconds without backtraces. Remaining large Antfly observations
-   include dense-filter pagination (41.5 s), physical-churn benchmark (38.3 s),
-   canceled compaction staging (35.6 s), sequential relational selection
-   (32.4 s), and graph artifact restore (30.7 s). Compare diagnostics first,
-   then retain representative workloads in `release-scale-test` and exercise
-   the same block/page/threshold transitions with bounded unit fixtures.
-   The optional CI `>1M chunks` job is a different scale suite; removing its
-   PR label does not remove these retained regression cases.
+3. **Preserve correctness boundaries; classify by purpose, not runtime.**
+   Pagination, canceled compaction, sequential selection, and graph restore
+   remain in the unit gate with their original fixtures. Their former 30–42 s
+   durations were primarily allocator diagnostics (see follow-up). Physical
+   churn also checks pinned-reader correctness and payload ownership, despite
+   its benchmark name. Do not relocate it solely because it reports timings.
+   The wide-vector case still takes 20.8 s without backtraces and needs a
+   separate boundary and production-profile investigation before changing it.
 4. **Optimize demonstrated production work.** Profile the remaining workload
    after tracing is off. For graph setup, distinguish individual edge commits
    from metric calculation. For vectors, measure update/quantization/search
@@ -332,3 +328,73 @@ inference (480 s), storage engine (302 s), graph release-blocker (227 s), and
 serverless (195 s). These are individual process/partition-step observations,
 not additive wall time. The diagnostic and duplicate-work estimates also need
 to be recomputed after each change so overlapping savings are not counted twice.
+
+## Follow-up: retain regression boundaries and make diagnostics opt-in
+
+Local macOS ARM64, Zig 0.16.0, Debug, Metal/CUDA disabled. The same compiled
+executables were run with `ANTFLY_TEST_ALLOCATOR_TRACES=1` and `=0`.
+Backtraces are now opt-in in these fixtures; DebugAllocator safety and leak
+checks remain enabled. Exhaustive allocation-failure loops, original data
+sizes, cancellation checks, and persisted-state assertions are unchanged.
+No test was removed, renamed, or moved to a scale suite.
+
+### Training
+
+These are individual process durations including startup and cleanup, not
+parallel CI wall time. The inactive-adapter row first isolates diagnostics;
+its additional initializer improvement is described below.
+
+| Fixture | Backtraces on | Backtraces off |
+| --- | ---: | ---: |
+| Regional recomputation / cancellation / resume | 70.31 s | 0.87 s |
+| Full and heads / cancellation / resume | 55.10 s | 0.59 s |
+| Replay attention / cancellation / resume | 54.33 s | 0.55 s |
+| Runtime allocation failures / retry | 51.53 s | 0.41 s |
+| Compilation allocation failures | 22.67 s | 0.26 s |
+| Head admission allocation failures | 2.13 s | 0.04 s |
+| Regional / staged-head ownership failures | 36.03 s | 0.31 s |
+| Inactive adapter accumulation / resume | 29.41 s | 13.97 s |
+| Manifest loading / listing failures | 24.23 s | 1.80 s |
+
+The nine unchanged workloads sum to 345.75 s with traces and 18.80 s without.
+Sampling the remaining inactive-adapter time found repeated parameter-name
+classification inside the per-weight initializer. Hoisting those invariant
+checks preserves every generated value and reduces that fixture from 13.97 s
+to 9.34 s without backtraces (25.24 s with them). The remaining Debug sample
+is dominated by native `primDotGeneralOp` / `rank2TensorRead`, not stack
+unwinding. Its classifier keeps the published 384-wide dimensions; they were
+not reduced merely to improve test time.
+The unchanged final fixture passes in ReleaseFast in 0.61 s, compared with
+9.34 s in Debug. The Debug matrix-multiplication hotspot alone therefore does
+not establish a production bottleneck. The ReleaseFast build finished 14/14
+steps; the bounded runner recovered an underestimated 64 MiB build-helper
+run reservation (observed 102.78 MB). No production kernel was changed.
+
+### Storage
+
+Durations are from the runner's per-test TIMING records, including cleanup.
+
+| Fixture | Backtraces on | Backtraces off | Preserved boundary |
+| --- | ---: | ---: | --- |
+| Physical churn | 38.98 s | 4.37 s | Both GC settings; 16 update rounds; pinned reader and payload ownership |
+| Sequential selection | 33.08 s | 4.33 s | 768 wide rows; both backends; dirty owners, bounds and all limits |
+| Canceled compaction | 35.73 s | 1.89 s | 800 original + 800 inserted rows; two-block quanta; race, cancellation and reopen |
+| Deferred-discovery scheduler | 55.92 s | 1.47 s | 8,192 rows / 32 blocks; bounded passes and unchanged idle commit count |
+| Graph artifact restore | 30.39 s | 0.81 s | 2,050 edges cross the 2,048-item page; rollback and parse-once assertions |
+| Dense pagination | 41.52 s | 0.74 s | 2,200 vectors; offset 1,024; exact candidate and hit-count assertions |
+
+The six cases sum to 235.62 s with backtraces and 13.61 s without. This is
+predominantly diagnostic overhead, not evidence that production operations
+normally take 30–55 seconds. Selection still reconstructs and compares wide
+JSON documents; churn still compresses, checksums, and persists real LSM data.
+Samples identify those as remaining work but do not establish redundant work
+or production regressions. Benchmark optimized builds before changing those
+paths. The existing work-count and correctness contracts remain in the unit
+gate; a benchmark name or elapsed duration alone does not make a scale test.
+
+Validation: the focused inference build passed 14/14 steps (24 selected test
+bodies passed, four Metal cases skipped, plus 23 build-helper tests); storage
+passed 20/20 steps and all six selected bodies. All nine changed training
+fixtures and all six storage fixtures also passed with backtraces enabled.
+The initializer change passed both diagnostic modes with the original
+cancellation, accumulation, and durable-resume assertions.
