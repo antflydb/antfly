@@ -1300,7 +1300,7 @@ test "db graph metric runtime lease ownership blocks duplicate owners and allows
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -1447,7 +1447,7 @@ test "db graph metric runtime lease releases durable owner lease on deinit" {
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -1556,7 +1556,7 @@ test "db graph metric runtime lease stale deinit preserves replacement owner lea
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -1724,7 +1724,7 @@ test "db graph metric runtime role leases allow split owners and block duplicate
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -1929,7 +1929,7 @@ test "db graph metric runtime role worker leases are scoped by worker identity" 
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -2083,7 +2083,7 @@ test "db graph metric runtime role worker pool leases are scoped by worker ident
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -2219,7 +2219,7 @@ test "db graph metric runtime role planned worker pools reject duplicate worker 
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -2264,7 +2264,7 @@ test "db graph metric runtime role owned runtime worker calls are bound to confi
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -2422,7 +2422,7 @@ test "db graph metric runtime role automatic coordinator and worker loops stay s
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -2587,7 +2587,7 @@ test "db graph metric runtime role distinct worker owners complete separate acti
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -2870,7 +2870,7 @@ test "db graph metric runtime background skips paused metrics" {
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -2994,7 +2994,7 @@ test "db graph metric runtime background idles after synchronously cleaning a sm
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -3133,7 +3133,7 @@ test "db graph metric runtime background skips paused active planned builds" {
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -3302,7 +3302,7 @@ test "db graph metric runtime background starts automatically and drains notifie
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -3410,7 +3410,7 @@ test "db graph metric runtime background open-configured split owners publish de
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -3619,7 +3619,7 @@ test "db graph metric runtime background separates coordinator and worker ticks"
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -3741,7 +3741,7 @@ test "db graph metric runtime background coordinator and worker loops publish de
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -3887,7 +3887,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -4048,7 +4048,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -4198,7 +4198,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -4348,7 +4348,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -4511,7 +4511,7 @@ test "db graph metric runtime background worker pool survives separate reopened 
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -4760,7 +4760,7 @@ test "db graph metric runtime background open-configured pagerank worker pool su
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -4986,7 +4986,7 @@ test "db graph metric runtime background open-configured eigenvector worker pool
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -5210,7 +5210,7 @@ test "db graph metric runtime background open-configured hits worker pool surviv
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -5453,7 +5453,7 @@ test "db graph metric runtime background split ticks survive reopened pagerank h
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -5751,7 +5751,7 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -6105,7 +6105,7 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -6459,7 +6459,7 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -6835,7 +6835,7 @@ test "db graph metric runtime background cycles multiple worker ids across plann
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6943,7 +6943,7 @@ test "db graph metric runtime planned scheduler does not auto retry failed graph
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -7059,7 +7059,7 @@ test "db graph metric runtime planned scheduler boundary completes degree by nam
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -7149,7 +7149,7 @@ test "db graph metric runtime planned scheduler sweeps active degree work" {
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -7249,7 +7249,7 @@ test "db graph metric runtime planned scheduler sweeps active pagerank work" {
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -7349,7 +7349,7 @@ test "db graph metric runtime planned paired hits failed planned rebuild preserv
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -7670,7 +7670,7 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -7816,7 +7816,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -8027,7 +8027,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -8238,7 +8238,7 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var target_generation: u64 = 0;
@@ -8487,7 +8487,7 @@ test "db graph metric runtime planned maintenance drains background pagerank wor
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -8560,7 +8560,7 @@ test "db graph metric runtime background drains pagerank through planned mainten
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -8701,7 +8701,7 @@ test "db graph metric runtime planned maintenance reports budget exhaustion and 
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -8837,7 +8837,7 @@ test "db graph metric runtime planned pagerank production budget matches local o
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -8976,7 +8976,7 @@ test "db graph metric runtime planned eigenvector production budget matches loca
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -9116,10 +9116,10 @@ test "db graph metric runtime planned hits production budget matches local oracl
     const alloc = allocator_state.allocator();
 
     var local_path_buf: [256]u8 = undefined;
-    const local_path = TestHelpers.tempPath(&local_path_buf);
+    const local_path = TestHelpers.fastTempPath(&local_path_buf);
     defer TestHelpers.cleanupTempDir(local_path);
     var planned_path_buf: [256]u8 = undefined;
-    const planned_path = TestHelpers.tempPath(&planned_path_buf);
+    const planned_path = TestHelpers.fastTempPath(&planned_path_buf);
     defer TestHelpers.cleanupTempDir(planned_path);
 
     var local_db = try DB.open(alloc, std.mem.span(local_path), .{
@@ -9311,7 +9311,7 @@ test "db graph metric runtime planned maintenance drains background centrality f
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -9423,7 +9423,7 @@ test "db graph metric runtime planned scheduler sweeps active eigenvector work" 
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -9514,7 +9514,7 @@ test "db graph metric runtime planned scheduler sweeps active hits work" {
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -9625,7 +9625,7 @@ test "db graph metric runtime query public reads fail not ready before first pub
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -9714,7 +9714,7 @@ test "db graph metric runtime query freshness distinguishes published stale scor
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -9883,7 +9883,7 @@ test "db graph metric runtime query rerank applies published metric scores to se
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10093,7 +10093,7 @@ test "db graph metric runtime query not ready semantics distinguish projection f
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10187,7 +10187,7 @@ test "db graph metric runtime query freshness distinguishes stale projection fro
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10372,7 +10372,7 @@ test "db graph metric runtime degree canary gate tracks queued active and capped
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10442,7 +10442,7 @@ test "db graph metric runtime degree canary gate blocks non degree queued work" 
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10481,7 +10481,7 @@ test "db graph metric runtime degree canary runUntilIdle uses planned maintenanc
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10551,7 +10551,7 @@ test "db graph metric runtime degree canary planned maintenance reports bounded 
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10626,7 +10626,7 @@ test "db graph metric runtime degree canary runUntilIdle preserves published sco
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10810,7 +10810,7 @@ test "db graph metric runtime degree canary runUntilIdle fails fast when active 
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10871,7 +10871,7 @@ test "db graph metric runtime degree canary runUntilIdle falls back to local ora
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10948,7 +10948,7 @@ test "db graph metric runtime default gate runUntilIdle publishes configured gra
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -11107,7 +11107,7 @@ test "db graph metric runtime operations manual refresh rebuild and delete opera
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -11193,7 +11193,7 @@ test "db graph metric runtime operations pause and resume controls background ma
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -11366,7 +11366,7 @@ test "db graph metric runtime default gate runUntilIdle can use planned graph me
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -11430,7 +11430,7 @@ test "db graph metric runtime default gate runUntilIdle planned graph metric mai
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -11514,7 +11514,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -11590,7 +11590,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -11674,7 +11674,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -11750,7 +11750,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -11837,7 +11837,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -11927,7 +11927,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -12005,7 +12005,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -12094,7 +12094,7 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -12180,7 +12180,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -12252,7 +12252,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -12322,7 +12322,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -12394,7 +12394,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -12477,7 +12477,7 @@ test "db graph metric runtime default gate prepares topology while numerical cap
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -12541,7 +12541,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -12617,7 +12617,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -12693,7 +12693,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -12769,7 +12769,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -12857,7 +12857,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -12947,7 +12947,7 @@ test "db graph metric runtime default gate standalone HITS lanes use resumable p
     const alloc = allocator_state.allocator();
     for ([_]graph_mod.GraphMetricKind{ .hits_authority, .hits_hub }) |kind| {
         var path_buf: [256]u8 = undefined;
-        const path = TestHelpers.tempPath(&path_buf);
+        const path = TestHelpers.fastTempPath(&path_buf);
         defer TestHelpers.cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{
             .start_index_workers = false,
@@ -12981,7 +12981,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -13069,7 +13069,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -13171,7 +13171,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -13258,7 +13258,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -13345,7 +13345,7 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
     const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
-    const path = TestHelpers.tempPath(&path_buf);
+    const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{

@@ -27076,6 +27076,10 @@ fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
         const work = idx.getWriteProfile();
         // At most one routing traversal for each of the 24 x 256 mutations.
         try std.testing.expect(work.insert_find_leaf_calls <= 24 * 256);
+        if (dims == 1536) {
+            try std.testing.expect(work.centroid_delta_removals > 0);
+            try std.testing.expect(work.centroid_recompute_members_total < 160_000);
+        }
         if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
             std.debug.print("\nWORK external-update dims={d} routes={d} centroid_recomputes={d} centroid_members={d}\n", .{ dims, work.insert_find_leaf_calls, work.centroid_recompute_calls, work.centroid_recompute_members_total });
         for (&expected, 0..) |*ids, query_id| {
@@ -27277,6 +27281,7 @@ test "posting WAL mutation capture aborts without publishing partial state" {
 }
 
 test "authoritative external-vector HBC detaches legacy LSM and reopens native first" {
+    @import("../test_error_logs.zig").expectErrorLogs(1);
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
@@ -32928,6 +32933,74 @@ test "coalesced centroid deltas survive a later member moving to another leaf" {
     }
 }
 
+test "external relocation sums are batch scoped and covering radii remain conservative" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    for ([_]vec.DistanceMetric{ .cosine, .l2_squared, .inner_product }) |metric| {
+        var path: TestPath = .{};
+        var idx = try HBCIndex.open(alloc, path.init(), .{
+            .dims = 2,
+            .metric = metric,
+            .leaf_size = 64,
+            .branching_factor = 2,
+            .use_quantization = false,
+            .lazy_posting_maintenance = false,
+            .stable_posting_origin_max_mutations = 0,
+        });
+        defer path.cleanup();
+        defer idx.close();
+        const Source = struct {
+            vectors: [128][2]f32,
+            fn load(raw: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return a.dupe(f32, &self.vectors[id - 1]);
+            }
+        };
+        var source: Source = undefined;
+        var items: [128]BatchInsertItem = undefined;
+        for (&source.vectors, &items, 0..) |*vector, *item, i| {
+            vector.* = .{ if (i < 64) -2 else 2, @as(f32, @floatFromInt(i % 64)) / 1000 };
+            item.* = .{ .vector_id = i + 1, .vector = vector, .metadata = "doc" };
+        }
+        try idx.bulkBuildWithMetadata(&items);
+        idx.setExternalVectorLoader(&source, Source.load);
+        idx.setBypassExternalVectorCache(true);
+        // Two primary revisions: no sum may survive the batch boundary.
+        for (0..2) |revision| {
+            var updates: [8]BatchInsertItem = undefined;
+            for (&updates, 0..) |*item, i| {
+                // An in-place update between removals changes the source
+                // version without replacing the cache entry's leaf identity.
+                const id = if (i == 2) 63 else revision * 8 + i;
+                if (i == 2) source.vectors[id][1] += 0.001 else source.vectors[id][0] = 2;
+                item.* = .{ .vector_id = id + 1, .vector = &source.vectors[id], .metadata = "doc" };
+            }
+            const before = idx.getWriteProfile().centroid_delta_removals;
+            try idx.batchInsertWithMetadataOptions(&updates, .{ .skip_vector_store = true, .defer_quantized_rebuild = true });
+            try std.testing.expect(idx.getWriteProfile().centroid_delta_removals > before);
+            var txn = try idx.beginReadTxn();
+            defer txn.abort();
+            const source_id = try idx.getVecLeaf(&txn, 64);
+            var leaf = try idx.loadNode(&txn, source_id);
+            defer leaf.deinit(alloc);
+            const matrix = try alloc.alloc(f32, leaf.members.len * 2);
+            defer alloc.free(matrix);
+            var expected: [2]f32 = @splat(0);
+            for (leaf.members, 0..) |id, row| {
+                const transformed = matrix[row * 2 ..][0..2];
+                _ = idx.transformVector(&source.vectors[id - 1], transformed);
+                for (&expected, transformed) |*sum, value| sum.* += value;
+            }
+            for (&expected) |*value| value.* /= @floatFromInt(leaf.members.len);
+            if (metric == .cosine) _ = vec.normalize(&expected);
+            for (expected, leaf.centroid) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+            const exact_radius = vectorindex_posting.coveringRadiusForMatrix(metric, leaf.centroid, matrix, leaf.members.len);
+            if (std.math.isFinite(exact_radius)) try std.testing.expect(leaf.covering_radius + 0.00001 >= exact_radius);
+        }
+    }
+}
+
 test "batched external vector relocations route once per mutation" {
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
@@ -34965,22 +35038,20 @@ test "HBC runtime batch mode preserves bulk only for non-direct LSM bulk session
 // ============================================================================
 
 const TestPath = struct {
-    buf: [256]u8 = undefined,
+    directory: ?@import("../common/test_directory.zig").TestDirectory = null,
 
     fn init(self: *TestPath) [*:0]const u8 {
-        const ts = platform_time.monotonicNs();
-        const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
-        const slice = std.fmt.bufPrint(&self.buf, "/tmp/antfly-hbc-test-{d}-{d}\x00", .{ ts, nonce }) catch unreachable;
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch {};
-        return @ptrCast(slice.ptr);
+        self.directory = @import("../common/test_directory.zig").TestDirectory.initFast("hbc") catch @panic("cannot create HBC fixture");
+        return self.directory.?.path().ptr;
+    }
+
+    fn initDisk(self: *TestPath) [*:0]const u8 {
+        self.directory = @import("../common/test_directory.zig").TestDirectory.init("hbc") catch @panic("cannot create HBC durability fixture");
+        return self.directory.?.path().ptr;
     }
 
     fn cleanup(self: *TestPath) void {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(&self.buf)))) catch {};
+        self.directory.?.cleanup();
     }
 };
 

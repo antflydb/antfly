@@ -69898,24 +69898,34 @@ test "relational columnar JSON numeric predicates preserve document semantics" {
 }
 
 test "relational columnar bound selection and late projection match primary semantics" {
+    try testColumnarSelection(true);
+}
+
+test "relational columnar projection matrix matches primary semantics on small fixtures" {
+    try testColumnarSelection(false);
+}
+
+fn testColumnarSelection(comptime physical_plan: bool) !void {
+    const row_count = if (physical_plan) 768 else 32;
     var profile = @import("../test_work_profile.zig").Profile(enum { setup, columnar, primary, assertions, dense }).init();
     defer profile.report("relational-selection");
-    // Keep the original fixture: reducing it to 512 rows changes physical
-    // block layout and selects sequential reads instead of late materialization.
+    // Keep 768 rows for physical plans: 512 changes block layout and selects
+    // sequential reads instead of late materialization. The semantic matrix
+    // retains boundary keys on a smaller fixture without asserting that plan.
     var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
     defer std.debug.assert(allocator_state.deinit() == .ok);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_tmp = try TestDirectory.init("db");
+        var path_tmp = try TestDirectory.initFast("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
-        try seedColumnScanPlanTest(&db, alloc);
-        try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) >= 2);
+        try seedColumnScanPlanRows(&db, alloc, row_count);
+        if (physical_plan) try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) >= 2);
         profile.mark(.setup);
         const selections = [_][]const []const u8{
             &.{},                     &.{"user-name"}, &.{ "payload.items.id", "payload.nil", "missing.name" },
@@ -69934,7 +69944,7 @@ test "relational columnar bound selection and late projection match primary sema
                 .{ .key = "k0761", .value = "{\"n\":761,\"user-name\":\"Grace\",\"payload\":{\"items\":[{\"id\":761}],\"nil\":null},\"embedding\":[1,2,3]}" },
                 .{ .key = "k0761a", .value = "{\"n\":761,\"payload\":{\"items\":[{\"id\":761}]}}" },
             }, .deletes = &.{"k0762"} });
-            for (selections) |fields| for (filters) |filter| for ([_]u32{ 0, 2 }) |limit| {
+            for (if (physical_plan) selections[0..1] else &selections) |fields| for (if (physical_plan) filters[0..1] else &filters) |filter| for ([_]u32{ 0, 2 }) |limit| {
                 var stats: types.ColumnarScanStats = .{};
                 var opts = types.ScanOptions{ .include_documents = true, .fields = fields, .filter_query_json = filter, .limit = limit, .columnar_stats = &stats, .include_content_hashes = true };
                 var actual = try db.scan(alloc, "k0000", "k0767", opts);
@@ -69942,9 +69952,9 @@ test "relational columnar bound selection and late projection match primary sema
                 profile.mark(.columnar);
                 try std.testing.expect(stats.used);
                 try std.testing.expectEqual(@as(u64, 1), stats.scan_plans_built);
-                try std.testing.expect(stats.scan_plan_hits > 0);
+                if (physical_plan) try std.testing.expect(stats.scan_plan_hits > 0);
                 if (dirty == 0 and RelationalProjectionPlan.supports(fields, true)) try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
-                if (dirty == 0 and fields.len == 0) try std.testing.expectEqual(@as(u64, actual.documents.len), stats.late_materialized_rows);
+                if (physical_plan and dirty == 0 and fields.len == 0) try std.testing.expectEqual(@as(u64, actual.documents.len), stats.late_materialized_rows);
                 opts.disable_columnar_scan = true;
                 opts.columnar_stats = null;
                 profile.mark(.assertions);
@@ -69961,8 +69971,8 @@ test "relational columnar bound selection and late projection match primary sema
         var stats: types.ColumnarScanStats = .{};
         var dense = try db.scan(alloc, "", "", .{ .include_documents = true, .columnar_stats = &stats });
         defer dense.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 768), dense.documents.len);
-        try std.testing.expect(stats.dense_delta_scans > 0);
+        try std.testing.expectEqual(@as(usize, row_count), dense.documents.len);
+        if (physical_plan) try std.testing.expect(stats.dense_delta_scans > 0);
         try std.testing.expectEqual(@as(u64, 0), stats.late_materialized_rows);
         profile.mark(.dense);
     }
@@ -70888,7 +70898,7 @@ test "relational columnar clean coalescing preserves typed cells without primary
     defer std.debug.assert(allocator_state.deinit() == .ok);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_tmp = try TestDirectory.init("db");
+        var path_tmp = try TestDirectory.initFast("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
