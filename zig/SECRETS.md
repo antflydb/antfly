@@ -1,18 +1,128 @@
-# Antfly Zig Secrets Store
+# Antfly Secret Sources and Native Store
 
 ## Goal
 
-Antfly-zig needs a small local secrets store for standalone mode. The store backs the
-`/secrets` API, resolves `${secret:key}` references in configuration, and lets
-operators keep provider credentials out of ordinary config files.
+Antfly resolves `${secret:key}` references through an ordered resolver and backs
+the `/secrets` API with an optional Antfly-managed native store. Operators can
+keep credentials outside ordinary configuration and combine native overrides,
+externally managed sources, and environment fallback.
 
-The implementation is intentionally simple: one JSON file on local disk is held
-as an in-memory snapshot. Reads refresh that snapshot when the file changes, and
-API writes refresh first, stage a replacement snapshot, persist it atomically,
-then publish the new in-memory state.
+The current backends are JSON files and the process environment. File snapshots
+refresh on changes; native writes persist atomically before publishing new state.
+This document describes that implementation and the remaining rotation roadmap.
 
-This document captures the current design, what is already implemented, and the
-remaining plan for runtime secret rotation.
+## Source configuration and ownership
+
+The `secrets` section configures the resolver before ordinary configuration
+references are resolved:
+
+```json
+{
+  "secrets": {
+    "native": {
+      "name": "native",
+      "path": "/var/lib/antfly/secrets.json"
+    },
+    "sources": [
+      {
+        "name": "tenant",
+        "type": "file",
+        "path": "/run/secrets/tenant/secrets.json"
+      },
+      {
+        "name": "platform",
+        "type": "file",
+        "path": "/run/secrets/platform/secrets.json"
+      }
+    ],
+    "environment": true
+  }
+}
+```
+
+Resolution is deterministic: a native override wins, then the first matching
+source in array order, then the environment if enabled. An empty value is a
+present value, not a reason to fall through. A source's last-known-good snapshot
+retains its precedence when a refresh fails.
+
+- `native` is optional and is the only store the secret API can write. Its name
+  defaults to `native`. The name describes Antfly ownership, not storage topology.
+  This first implementation requires `path` and is file-backed and node-local;
+  it does **not** replicate API mutations across a distributed cluster.
+- `sources` defaults to `[]`. Entries require a unique `name`, a `type`, and
+  provider-specific settings. Only `type: "file"` is implemented now. These are
+  externally managed and read-only to Antfly, regardless of filesystem permissions.
+- `environment` defaults to `true`, including when `secrets` is `{}`. It is a
+  final fallback, not an entry implicitly inserted into the ordered source array.
+  `false` disables environment lookup for `${secret:...}` and environment secret
+  discovery. It does not disable unrelated environment configuration, explicit
+  provider environment defaults/settings, or cloud SDK workload identity.
+- An explicit section without `native` disables secret API writes. In particular,
+  `{"secrets":{"environment":false}}` creates an empty resolver that cannot fall
+  back to the process environment. No default native file is added.
+- Names use ASCII letters, digits, dots, underscores, or hyphens; `environment`
+  is reserved. Duplicate names (including the native name), empty paths, unknown
+  source types/properties, and secret-reference paths are configuration errors.
+  A native path must not also be an external source. Exact duplicate paths are
+  rejected; operators must also avoid aliases or symlinks to the same file.
+- Paths are literal and relative paths use the process working directory. Keep
+  configured logical paths for reads so projected-volume symlink rotation works.
+  Native atomic writes follow the current target without replacing the symlink;
+  dangling targets fail rather than replacing the link.
+
+Source membership, ordering, names, and environment policy are startup-only.
+Restart to change them; the existing file-content rotation behavior stays live.
+Standalone, metadata, data, and serverless startup all use this bootstrap parser.
+
+### Compatibility and migration
+
+When `secrets` is absent, preserve existing deployment defaults and
+`--secret-store-path` behavior: standalone uses `<base>/secrets.json` by default,
+other modes have no file store by default, and explicit legacy paths use the
+first file as the writable store and remaining files as fallbacks. Environment
+fallback remains enabled. Serverless's legacy `ANTFLY_SECRET_STORE_PATH` also
+continues to work.
+
+Do not combine an explicit `secrets` section with legacy secret-store flags (or
+serverless's legacy path environment variable); startup rejects the ambiguity.
+For projected Kubernetes volumes, migrate every projected file into `sources`.
+Add a separate native path only when node-local overrides are desired.
+
+### API and dashboard
+
+Ownership is per source, not a per-key read/write permission. Values remain
+write-only through the API:
+
+- `GET /secrets` includes `writable`, indicating whether this server has a native
+  write destination. Each effective key includes `source` (winning source name)
+  and `managed` (whether a native override exists), alongside existing metadata.
+  File paths and secret values are not returned. Legacy file/env status fields
+  remain compatible; `configured_both` only considers enabled environment fallback.
+- `PUT /secrets/{key}` creates or replaces a native override. It never mutates
+  the external source that currently supplies the key. Without native, return 503.
+- `DELETE /secrets/{key}` removes only the native override; any external or
+  environment value becomes effective immediately. Return 404 when there is no
+  native override, even if an external value exists, and 503 without native.
+  There are no deletion tombstones that hide external values.
+- The dashboard uses the returned capability, displays the winning source, and
+  offers deletion only for managed keys. Its delete confirmation explains that
+  a fallback may become active. Adding an existing key creates an override.
+
+### Extension boundary
+
+Keep resolution policy separate from source ownership. A future source provider
+should supply lookup, metadata, refresh/health, and revision information; only
+native storage needs mutation support. The current `FileStore` uses explicit
+writable/environment policy and ordered file snapshots, retaining its existing
+cross-archive callback boundary. It is not yet a generic remote-provider engine.
+
+Remote source types can extend the tagged `sources` entries without changing
+precedence or `${secret:key}` syntax. Define authentication, timeout, caching,
+last-known-good, and revision semantics before adding a provider. A distributed
+native backend can later implement the same override behavior, but needs explicit
+replication and consistency semantics; the `native` name makes no distribution
+promise today. Same-open-file metadata/read snapshots remain a separate hardening
+step for rotations that occur between the current stat and read operations.
 
 ## Status Summary
 
@@ -103,7 +213,8 @@ the file itself must be protected by filesystem permissions.
 
 Startup:
 
-1. Standalone runtime resolves the store path, normally `<base>/secrets.json`.
+1. Runtime bootstraps the explicit `secrets` section, or resolves legacy paths
+   and deployment defaults when the section is absent.
 2. `FileStore.init(alloc, path)` duplicates the path and calls `load()`.
 3. `load()` reads and parses the JSON file if it exists.
 4. Parsed entries are copied into `entries`.
@@ -115,8 +226,8 @@ Reads:
    `resolveValueOwned()`, and `resolveValueWithGenerationOwned()` refresh from
    disk first if the file metadata changed.
 3. `getOwned()` returns the stored value if present.
-4. If the key is not stored, `getOwned()` maps the key to an environment variable
-   and returns the environment value if set.
+4. If no configured file contains the key, `getOwned()` uses environment fallback
+   only when enabled.
 5. `resolveValueOwned()` resolves `${secret:key}` references through `getOwned()`.
 6. `resolveReferenceOwned()` resolves through a `FileStore` when one is supplied,
    or through environment variables only when there is no store.
@@ -130,15 +241,16 @@ Writes:
 2. `delete()` refreshes from disk, stages removal from `entries`, persists it,
    publishes the staged entries, and returns whether an entry existed.
 3. `persist()` serializes all entries, writes a temporary file, then renames it
-   over the configured store path.
+   over the current native target, preserving any configured symlink.
 
 The `/secrets` API is wired through:
 
 - `zig/pkg/antfly/src/api/http_server.zig`
 - `zig/pkg/antfly/src/api/httpx_handler.zig`
 
-In standalone mode those handlers receive `ApiHttpServerConfig.secret_store`. In
-multi-node mode the store is absent and secret management writes return 503.
+The handlers receive `ApiHttpServerConfig.secret_store` where a resolver is
+configured. Writes require its native write capability, independently of deployment
+mode. A file-backed native store on one node does not update other nodes.
 
 ## Environment Fallback
 
@@ -157,8 +269,9 @@ can both exist; the list API reports that as `configured_both`.
 
 Lookup precedence is:
 
-1. File store entry
-2. Environment variable fallback
+1. Native override, if configured
+2. First matching external source in configured order
+3. Environment variable fallback, enabled by default
 
 ## Current Limitation
 
@@ -241,7 +354,7 @@ only when the file changed.
 
 ### Write Paths
 
-`put()` and `delete()` should continue to update the in-memory map first and
+`put()` and `delete()` stage a replacement map and
 persist atomically, but they need conflict handling around external edits.
 
 Recommended flow:
@@ -532,14 +645,15 @@ The public API should continue to avoid returning secret values.
 
 - refresh before applying the write
 - validate the key
-- update or add exactly that key
+- require a native store and update or add exactly that key there
 - persist successfully before returning 200
 
 `DELETE /secrets/{key}` should:
 
 - refresh before applying the delete
 - persist successfully before returning 204
-- return 404 if the key is absent after refresh
+- return 404 if the native override is absent after refresh, without touching sources
+- reveal the next matching source or environment value after removal
 
 ## Testing Plan
 

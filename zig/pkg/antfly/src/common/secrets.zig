@@ -22,6 +22,73 @@ const c_env = if (builtin.link_libc and builtin.os.tag != .windows) struct {
     extern "c" var environ: [*:null]?[*:0]u8;
 } else struct {};
 
+/// Startup-only resolver configuration. Sources are ordered and never API-writable.
+pub const Config = struct {
+    pub const Native = struct { name: []const u8 = "native", path: []const u8 };
+    pub const Source = struct { name: []const u8, type: enum { file }, path: []const u8 };
+    native: ?Native = null,
+    sources: []const Source = &.{},
+    environment: bool = true,
+
+    pub fn validate(self: Config) !void {
+        if (self.native) |native| {
+            try validateSourceName(native.name);
+            try validateSourcePath(native.path);
+        }
+        for (self.sources, 0..) |source, index| {
+            try validateSourceName(source.name);
+            try validateSourcePath(source.path);
+            if (self.native) |native| {
+                if (std.mem.eql(u8, native.name, source.name) or std.mem.eql(u8, native.path, source.path)) return error.InvalidConfig;
+            }
+            for (self.sources[0..index]) |previous| {
+                if (std.mem.eql(u8, previous.name, source.name)) return error.InvalidConfig;
+            }
+        }
+    }
+
+    fn validateSourceName(name: []const u8) !void {
+        if (name.len == 0 or std.mem.eql(u8, name, "environment")) return error.InvalidConfig;
+        for (name) |ch| {
+            if (!std.ascii.isAlphanumeric(ch) and ch != '-' and ch != '_' and ch != '.') return error.InvalidConfig;
+        }
+    }
+
+    fn validateSourcePath(path: []const u8) !void {
+        if (path.len == 0 or std.mem.indexOf(u8, path, "${") != null) return error.InvalidConfig;
+    }
+};
+
+pub fn parseConfig(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Parsed(Config) {
+    var parsed = std.json.parseFromValue(Config, alloc, value, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidConfig,
+    };
+    errdefer parsed.deinit();
+    try parsed.value.validate();
+    return parsed;
+}
+
+/// Bootstrap before resolving any credential references in the main config.
+/// Explicit configuration and legacy flags are mutually exclusive.
+pub fn initFromConfigPathWithIo(alloc: std.mem.Allocator, io: std.Io, config_path: ?[]const u8, legacy_paths: []const []const u8) !?FileStore {
+    if (config_path) |path| {
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
+        defer alloc.free(raw);
+        var tree = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer tree.deinit();
+        if (tree.value != .object) return error.InvalidConfig;
+        if (tree.value.object.get("secrets")) |value| {
+            if (legacy_paths.len != 0) return error.InvalidConfig;
+            var parsed = try parseConfig(alloc, value);
+            defer parsed.deinit();
+            return try FileStore.initConfiguredWithIo(alloc, io, parsed.value);
+        }
+    }
+    if (legacy_paths.len > 0) return try FileStore.initLayeredWithIo(alloc, io, legacy_paths);
+    return null;
+}
+
 pub const SecretStatus = enum {
     configured_file,
     configured_env,
@@ -31,12 +98,15 @@ pub const SecretStatus = enum {
 pub const ListedSecret = struct {
     key: []u8,
     status: SecretStatus,
+    source: ?[]u8 = null,
+    managed: bool = false,
     env_var: ?[]u8 = null,
     created_at: ?[]u8 = null,
     updated_at: ?[]u8 = null,
 
     pub fn deinit(self: *ListedSecret, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
+        if (self.source) |source| alloc.free(source);
         if (self.env_var) |env_var| alloc.free(env_var);
         if (self.created_at) |created_at| alloc.free(created_at);
         if (self.updated_at) |updated_at| alloc.free(updated_at);
@@ -261,6 +331,10 @@ pub const FileStore = struct {
     operations: Operations = .{},
     dispatch: Boundary.Dispatch = Boundary.local_dispatch,
     path: []u8,
+    has_file: bool = true,
+    writable: bool = true,
+    environment_enabled: bool = true,
+    source_name: ?[]u8 = null,
     fallbacks: []FileStore = &.{},
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.StringArrayHashMapUnmanaged(StoredSecret) = .{},
@@ -311,10 +385,40 @@ pub const FileStore = struct {
             }
             for (paths[1..]) |path| {
                 store.fallbacks[initialized] = try FileStore.initWithIo(alloc, io, path);
+                store.fallbacks[initialized].writable = false;
                 initialized += 1;
             }
         }
 
+        return store;
+    }
+
+    pub fn initConfiguredWithIo(alloc: std.mem.Allocator, io: std.Io, cfg: Config) !FileStore {
+        try cfg.validate();
+        const count = cfg.sources.len + @as(usize, if (cfg.native != null) 1 else 0);
+        // A pathless resolver enforces environment:false even without file sources.
+        var paths = try alloc.alloc([]const u8, count);
+        defer alloc.free(paths);
+        if (cfg.native) |native| paths[0] = native.path;
+        const offset: usize = if (cfg.native != null) 1 else 0;
+        for (cfg.sources, offset..) |source, i| paths[i] = source.path;
+        var store = if (count > 0)
+            try initLayeredWithIo(alloc, io, paths)
+        else
+            FileStore{ .alloc = alloc, .io = io, .path = try alloc.dupe(u8, ""), .has_file = false };
+        errdefer store.deinit();
+        store.writable = cfg.native != null;
+        store.environment_enabled = cfg.environment;
+        if (cfg.native) |native| {
+            store.source_name = try alloc.dupe(u8, native.name);
+        } else if (cfg.sources.len > 0) {
+            store.source_name = try alloc.dupe(u8, cfg.sources[0].name);
+        }
+        for (store.fallbacks, 0..) |*fallback, i| {
+            fallback.writable = false;
+            fallback.environment_enabled = cfg.environment;
+            fallback.source_name = try alloc.dupe(u8, cfg.sources[i + 1 - offset].name);
+        }
         return store;
     }
 
@@ -324,6 +428,7 @@ pub const FileStore = struct {
         deinitEntries(self.alloc, &self.entries);
         self.entries.deinit(self.alloc);
         self.alloc.free(self.path);
+        if (self.source_name) |name| self.alloc.free(name);
         self.* = undefined;
     }
 
@@ -432,18 +537,19 @@ pub const FileStore = struct {
         }
         var it = self.entries.iterator();
         while (it.next()) |entry| {
-            try out.append(alloc, try describeStored(alloc, entry.key_ptr.*, entry.value_ptr.*));
+            try out.append(alloc, try self.describeStored(alloc, entry.key_ptr.*, entry.value_ptr.*));
         }
 
         for (self.fallbacks) |*fallback| try fallback.appendFileEntriesForList(alloc, &out);
 
-        const env_only = try listEnvironmentSecrets(alloc);
+        const env_only = if (self.environment_enabled) try listEnvironmentSecrets(alloc) else try alloc.alloc(ListedSecret, 0);
         defer freeListedSecrets(alloc, env_only);
         for (env_only) |item| {
             if (listedSecretsContain(out.items, item.key)) continue;
             try out.append(alloc, .{
                 .key = try alloc.dupe(u8, item.key),
                 .status = item.status,
+                .source = try alloc.dupe(u8, "environment"),
                 .env_var = if (item.env_var) |env_var| try alloc.dupe(u8, env_var) else null,
                 .created_at = null,
                 .updated_at = null,
@@ -459,6 +565,7 @@ pub const FileStore = struct {
     }
 
     fn putLocal(self: *FileStore, alloc: std.mem.Allocator, key: []const u8, value: []const u8) !ListedSecret {
+        if (!self.writable) return error.WriteUnavailable;
         try validateKey(key);
         self.lock();
         defer self.unlock();
@@ -498,6 +605,7 @@ pub const FileStore = struct {
     }
 
     fn deleteLocal(self: *FileStore, key: []const u8) !bool {
+        if (!self.writable) return error.WriteUnavailable;
         self.lock();
         defer self.unlock();
         _ = try self.refreshIfChangedLocked();
@@ -533,6 +641,7 @@ pub const FileStore = struct {
         for (self.fallbacks) |*fallback| {
             if (try fallback.getOwnedFromFilesNoEnv(alloc, key)) |value| return value;
         }
+        if (!self.environment_enabled) return null;
         const env_var = try envVarForKey(alloc, key);
         defer alloc.free(env_var);
         return envValueOwned(alloc, env_var);
@@ -563,6 +672,7 @@ pub const FileStore = struct {
                 };
             }
         }
+        if (!self.environment_enabled) return error.SecretNotFound;
         const env_var = try envVarForKey(alloc, key);
         defer alloc.free(env_var);
         const value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound;
@@ -587,9 +697,23 @@ pub const FileStore = struct {
         return try self.getOwnedWithGeneration(alloc, key);
     }
 
+    fn describeStored(self: *FileStore, alloc: std.mem.Allocator, key: []const u8, stored: StoredSecret) !ListedSecret {
+        const env_var = try envVarForKey(alloc, key);
+        const has_env = self.environment_enabled and hasEnvVar(env_var);
+        return .{
+            .source = try alloc.dupe(u8, self.source_name orelse if (self.writable) "native" else "file"),
+            .managed = self.writable,
+            .key = try alloc.dupe(u8, key),
+            .status = if (has_env) .configured_both else .configured_file,
+            .env_var = env_var,
+            .created_at = if (stored.created_at_ns > 0) try formatTimestampOwned(alloc, stored.created_at_ns) else null,
+            .updated_at = if (stored.updated_at_ns > 0) try formatTimestampOwned(alloc, stored.updated_at_ns) else null,
+        };
+    }
+
     fn describeOneLocked(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !ListedSecret {
         const stored = self.entries.get(key) orelse return error.SecretNotFound;
-        return try describeStored(alloc, key, stored);
+        return try self.describeStored(alloc, key, stored);
     }
 
     fn appendFileEntriesForList(self: *FileStore, alloc: std.mem.Allocator, out: *std.ArrayList(ListedSecret)) !void {
@@ -600,7 +724,7 @@ pub const FileStore = struct {
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             if (listedSecretsContain(out.items, entry.key_ptr.*)) continue;
-            try out.append(alloc, try describeStored(alloc, entry.key_ptr.*, entry.value_ptr.*));
+            try out.append(alloc, try self.describeStored(alloc, entry.key_ptr.*, entry.value_ptr.*));
         }
         for (self.fallbacks) |*fallback| try fallback.appendFileEntriesForList(alloc, out);
     }
@@ -668,6 +792,7 @@ pub const FileStore = struct {
     }
 
     fn refreshIfChangedLocked(self: *FileStore) !bool {
+        if (!self.has_file) return false;
         const metadata = statFileMetadataWithIo(self.io, self.path) catch |err| switch (err) {
             error.FileNotFound => {
                 if (self.observed_metadata != null) {
@@ -803,7 +928,7 @@ pub const FileStore = struct {
         return .{
             .generation = self.generation_value,
             .content_hash = self.content_hash,
-            .supports_source_generation = self.fallbacks.len == 0,
+            .supports_source_generation = self.has_file and self.fallbacks.len == 0,
             .source_generation = if (self.fallbacks.len == 0) self.source_generation else null,
             .entry_count = self.entries.count(),
             .last_reload_failed = self.last_reload_failed,
@@ -1025,18 +1150,6 @@ pub fn validateKey(key: []const u8) !void {
             prev_dot = false;
         }
     }
-}
-
-fn describeStored(alloc: std.mem.Allocator, key: []const u8, stored: StoredSecret) !ListedSecret {
-    const env_var = try envVarForKey(alloc, key);
-    const has_env = hasEnvVar(env_var);
-    return .{
-        .key = try alloc.dupe(u8, key),
-        .status = if (has_env) .configured_both else .configured_file,
-        .env_var = env_var,
-        .created_at = if (stored.created_at_ns > 0) try formatTimestampOwned(alloc, stored.created_at_ns) else null,
-        .updated_at = if (stored.updated_at_ns > 0) try formatTimestampOwned(alloc, stored.updated_at_ns) else null,
-    };
 }
 
 fn secretKeyForEnvVar(alloc: std.mem.Allocator, env_var: []const u8) ?[]u8 {
@@ -1693,4 +1806,115 @@ test "environment secret discovery maps API key env vars" {
     const key = secretKeyForEnvVar(alloc, "ANTHROPIC_API_KEY").?;
     defer alloc.free(key);
     try std.testing.expectEqualStrings("anthropic.api_key", key);
+}
+
+test "file secret store configured secret sources preserve order and native ownership" {
+    const alloc = std.testing.allocator;
+    const native_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-native-{d}.json", .{nowNs()});
+    defer alloc.free(native_path);
+    defer deleteFile(native_path) catch {};
+    const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-source-{d}.json", .{nowNs()});
+    defer alloc.free(source_path);
+    defer deleteFile(source_path) catch {};
+    const other_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-other-source-{d}.json", .{nowNs()});
+    defer alloc.free(other_path);
+    defer deleteFile(other_path) catch {};
+    try writeFileAtomically(source_path,
+        \\{"secrets":[{"key":"test.token","value":"external","created_at_ns":1,"updated_at_ns":1}]}
+    );
+    try writeFileAtomically(other_path,
+        \\{"secrets":[{"key":"test.token","value":"lower-priority","created_at_ns":1,"updated_at_ns":1}]}
+    );
+    const sources = [_]Config.Source{
+        .{ .name = "tenant", .type = .file, .path = source_path },
+        .{ .name = "system", .type = .file, .path = other_path },
+    };
+    var store = try FileStore.initConfiguredWithIo(alloc, std.Options.debug_io, .{
+        .native = .{ .path = native_path },
+        .sources = &sources,
+        .environment = false,
+    });
+    defer store.deinit();
+    const first = (try store.getOwned(alloc, "test.token")).?;
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("external", first);
+    try std.testing.expect(!try store.delete("test.token"));
+    var written = try store.put(alloc, "test.token", "override");
+    defer written.deinit(alloc);
+    try std.testing.expect(written.managed);
+    try std.testing.expectEqualStrings("native", written.source.?);
+    const overridden = (try store.getOwned(alloc, "test.token")).?;
+    defer alloc.free(overridden);
+    try std.testing.expectEqualStrings("override", overridden);
+    try std.testing.expect(try store.delete("test.token"));
+    const listed = try store.list(alloc);
+    defer freeListedSecrets(alloc, listed);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings("tenant", listed[0].source.?);
+    try std.testing.expect(!listed[0].managed);
+    try std.testing.expectError(error.WriteUnavailable, store.fallbacks[0].put(alloc, "test.token", "bad"));
+    var readonly = try FileStore.initConfiguredWithIo(alloc, std.Options.debug_io, .{ .sources = &sources });
+    defer readonly.deinit();
+    try std.testing.expect(!readonly.writable);
+    try std.testing.expectError(error.WriteUnavailable, readonly.put(alloc, "test.token", "bad"));
+    try std.testing.expectError(error.WriteUnavailable, readonly.delete("test.token"));
+    const fallback = try readonly.getOwnedWithGeneration(alloc, "test.token");
+    defer alloc.free(fallback.value);
+    try std.testing.expectEqualStrings("external", fallback.value);
+    // Rotation still follows the external file and invalidates its generation.
+    try writeFileAtomically(source_path, "{\"secrets\":[]}");
+    const rotated = try readonly.getOwnedWithGeneration(alloc, "test.token");
+    defer alloc.free(rotated.value);
+    try std.testing.expectEqualStrings("lower-priority", rotated.value);
+    try std.testing.expect(rotated.generation != fallback.generation);
+}
+
+test "file secret store configured secret environment defaults enabled and can be disabled without files" {
+    const alloc = std.testing.allocator;
+    var enabled = try FileStore.initConfiguredWithIo(alloc, std.Options.debug_io, .{});
+    defer enabled.deinit();
+    try std.testing.expect(enabled.environment_enabled);
+    try std.testing.expect(!enabled.writable);
+    var disabled = try FileStore.initConfiguredWithIo(alloc, std.Options.debug_io, .{ .environment = false });
+    defer disabled.deinit();
+    const listed = try disabled.list(alloc);
+    defer freeListedSecrets(alloc, listed);
+    try std.testing.expectEqual(@as(usize, 0), listed.len);
+    try std.testing.expect((try disabled.getOwned(alloc, "path")) == null);
+    try std.testing.expectError(error.SecretNotFound, disabled.getOwnedWithGeneration(alloc, "path"));
+    const path = envValueOwned(alloc, "PATH") orelse return error.SkipZigTest;
+    defer alloc.free(path);
+    const resolved = (try enabled.getOwned(alloc, "path")).?;
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings(path, resolved);
+}
+
+test "file secret store source configuration rejects ambiguity and bootstraps before reference resolution" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "null",
+        "{\"environment\":null}",
+        "{\"environment\":\"false\"}",
+        "{\"files\":[]}",
+        "{\"native\":{\"path\":\"${secret:path}\"}}",
+        "{\"sources\":[{\"name\":\"environment\",\"type\":\"file\",\"path\":\"a\"}]}",
+        "{\"sources\":[{\"name\":\"x\",\"type\":\"vault\",\"path\":\"a\"}]}",
+        "{\"sources\":[{\"name\":\"x\",\"type\":\"file\",\"path\":\"a\"},{\"name\":\"x\",\"type\":\"file\",\"path\":\"b\"}]}",
+        "{\"native\":{\"path\":\"a\"},\"sources\":[{\"name\":\"native\",\"type\":\"file\",\"path\":\"b\"}]}",
+        "{\"native\":{\"path\":\"a\"},\"sources\":[{\"name\":\"external\",\"type\":\"file\",\"path\":\"a\"}]}",
+    }) |raw| {
+        var tree = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer tree.deinit();
+        try std.testing.expectError(error.InvalidConfig, parseConfig(alloc, tree.value));
+    }
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-config-{d}.json", .{nowNs()});
+    defer alloc.free(path);
+    defer deleteFile(path) catch {};
+    try writeFileAtomically(path, "{\"secrets\":{\"environment\":false},\"unresolved\":\"${secret:missing}\"}");
+    var store = (try initFromConfigPathWithIo(alloc, std.Options.debug_io, path, &.{})).?;
+    defer store.deinit();
+    try std.testing.expect(!store.environment_enabled);
+    try std.testing.expectError(error.InvalidConfig, initFromConfigPathWithIo(alloc, std.Options.debug_io, path, &.{"legacy.json"}));
+    try writeFileAtomically(path, "{}");
+    try std.testing.expect((try initFromConfigPathWithIo(alloc, std.Options.debug_io, path, &.{})) == null);
 }

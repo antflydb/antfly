@@ -23,10 +23,48 @@ letters, numbers, `.`, `_`, and `-`.
 
 ## Sources and precedence
 
-For a referenced key, Antfly checks:
+Configure an optional Antfly-managed native override store and ordered read-only
+sources:
 
-1. each `--secret-store-path` file in command-line order;
-2. the corresponding environment variable.
+```json
+{
+  "secrets": {
+    "native": {
+      "name": "native",
+      "path": "/var/lib/antfly/secrets.json"
+    },
+    "sources": [
+      {
+        "name": "tenant",
+        "type": "file",
+        "path": "/run/secrets/tenant/secrets.json"
+      },
+      {
+        "name": "platform",
+        "type": "file",
+        "path": "/run/secrets/platform/secrets.json"
+      }
+    ],
+    "environment": true
+  }
+}
+```
+
+For a referenced key, Antfly checks native first, then sources in array order,
+then the environment. `environment` defaults to `true`; set it to `false` to
+disable environment fallback for secret references and discovery. Omitting
+`native` disables API writes. PUT creates a native override; DELETE removes only
+that override and can reveal an external value again. Native storage is currently
+file-backed and node-local, even in a distributed deployment.
+
+This section is startup-only; file contents can still rotate live. Paths are
+literal (relative to the working directory). Source names must be unique and
+`environment` is reserved. Keep the native file separate from external files,
+including symlink aliases. Only `type: "file"` is supported today.
+
+When the section is absent, legacy path flags and deployment defaults continue
+to apply. Do not combine it with `--secret-store-path` or the serverless legacy
+`ANTFLY_SECRET_STORE_PATH` setting.
 
 The environment name is the uppercased key with punctuation replaced by `_`.
 For example, `openai.api_key` maps to `OPENAI_API_KEY`.
@@ -56,9 +94,7 @@ container and restrict it to the Antfly service account:
 ```
 
 ```console
-antfly standalone \
-  --config /etc/antfly/config.json \
-  --secret-store-path /run/secrets/antfly/secrets.json
+antfly standalone --config /etc/antfly/config.json
 ```
 
 The service account should own the file with mode `0600`; the containing
@@ -67,15 +103,10 @@ replace the mounted file atomically, never rewrite it in place. Antfly notices
 the metadata change and reloads it while retaining the previous snapshot if
 the replacement is malformed.
 
-Multiple paths provide explicit fallback layers. Put the most specific and
-most frequently rotated source first:
-
-```console
-antfly standalone \
-  --config /etc/antfly/config.json \
-  --secret-store-path /run/secrets/tenant/secrets.json \
-  --secret-store-path /run/secrets/platform/secrets.json
-```
+Put projected secret files in `secrets.sources`, with the most specific source
+first. Omit `native` for deployments where all credentials are externally managed.
+Legacy repeated `--secret-store-path` flags remain supported, but designate their
+first file as writable; prefer explicit source configuration for mounted volumes.
 
 Environment variables are convenient for local development and platform
 workload identity. Avoid process arguments because they may be visible in
