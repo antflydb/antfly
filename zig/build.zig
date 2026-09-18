@@ -6584,6 +6584,7 @@ pub fn build(b: *std.Build) void {
             "coordinator prunes the final score domain before paging",
             "profiled composed dense query preserves exact route telemetry",
             "aggregation completeness requires exact total relation",
+            "aggregation full-result rerun includes newly published text documents at the same identity generation",
             "aggregation context rejects non-current identity generation",
             "aggregation text analysis selects the named full text index",
             "collect significant terms field requests gathers unique field terms from hits",
@@ -6946,6 +6947,7 @@ pub fn build(b: *std.Build) void {
     const run_api_transactions_docid_tests = addFilteredTestRunArtifact(b, api_transactions_docid_tests);
     const run_api_table_writes_docid_tests = addFilteredTestRunArtifact(b, api_table_writes_docid_tests);
     const run_api_table_reads_docid_tests = addFilteredTestRunArtifact(b, api_table_reads_docid_tests);
+    b.step("antfly-api-table-read-test", "Run table-read routing and aggregation contracts").dependOn(&run_api_table_reads_docid_tests.step);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = addFilteredTestRunArtifact(b, raft_transition_runtime_docid_tests);
     const api_table_writes_production_regression_tests = b.addTest(.{

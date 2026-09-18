@@ -13990,11 +13990,7 @@ fn aggregationCanUseCurrentResult(req: db_mod.types.SearchRequest, result: db_mo
 fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !u32 {
     try checkQueryDeadline(req);
     const budget = aggregationFullResultBudget();
-    // An inexact first page is a lower bound, not a safe allocation size.
-    // Rerun up to the configured budget and require that execution to prove
-    // completeness before computing aggregations.
-    if (result.total_hits_relation != .exact) return budget;
-    if (result.total_hits > budget) {
+    if (result.total_hits_relation == .exact and result.total_hits > budget) {
         std.log.warn("query aggregation full-result rerun budget exceeded operation={s} total_hits={d} budget={d}", .{
             operation,
             result.total_hits,
@@ -14002,7 +13998,12 @@ fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.ty
         });
         return error.QueryCandidateBudgetExceeded;
     }
-    return result.total_hits;
+    // Even an exact first-page count only describes that execution's text
+    // snapshot. Derived indexing can publish more already committed documents
+    // before the rerun without advancing the primary identity generation.
+    // Collect up to the budget, then prove completeness against the rerun's
+    // own total instead of truncating to the earlier snapshot's count.
+    return budget;
 }
 
 fn requireCompleteAggregationFullResult(
@@ -14117,7 +14118,7 @@ test "aggregation completeness requires exact total relation" {
         .identity_read_generation = 99,
     }, "test");
     try std.testing.expectEqual(@as(u32, 0), full_req.offset);
-    try std.testing.expectEqual(@as(u32, 1), full_req.limit);
+    try std.testing.expectEqual(aggregationFullResultBudget(), full_req.limit);
     try std.testing.expect(!full_req.count_only);
     try std.testing.expect(full_req.include_stored);
     try std.testing.expectEqual(@as(?u64, 99), full_req.identity_read_generation);
@@ -14137,12 +14138,93 @@ test "aggregation completeness requires exact total relation" {
         .total_hits_relation = .exact,
         .identity_read_generation = 101,
     }, "grouped-test");
-    try std.testing.expectEqual(@as(u32, 200), grouped_full_req.limit);
+    try std.testing.expectEqual(aggregationFullResultBudget(), grouped_full_req.limit);
     try std.testing.expectEqual(db_mod.types.ReturnMode.parent, grouped_full_req.return_mode);
     try std.testing.expect(!grouped_full_req.hierarchy_grouped_matches);
     try std.testing.expectEqual(@as(u32, 0), grouped_full_req.max_chunks_per_parent);
     try std.testing.expectEqual(@as(?u64, 101), grouped_full_req.identity_read_generation);
     try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(grouped_full_req));
+
+    // A wider rerun still must reject partial results and enforce the
+    // candidate budget when the newer snapshot grows beyond it.
+    try std.testing.expectError(error.UnsupportedQueryRequest, requireCompleteAggregationFullResult(full_req, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 2,
+    }, "test-incomplete"));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, requireCompleteAggregationFullResult(full_req, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = aggregationFullResultBudget() + 1,
+    }, "test-over-budget"));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, requireCompleteAggregationFullResult(full_req, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 1,
+        .total_hits_relation = .gte,
+    }, "test-inexact"));
+}
+
+test "aggregation full-result rerun includes newly published text documents at the same identity generation" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("antfly-api-aggregation-text-publication");
+    defer path_tmp.cleanup();
+    var db = try db_mod.DB.open(alloc, path_tmp.path(), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{.{ .key = "old", .value = "{\"age\":18}" }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try db.batch(.{
+        .writes = &.{.{ .key = "new", .value = "{\"node_type\":\"NewDocument\"}" }},
+        .sync_level = .write,
+    });
+
+    const req = try db.searchRequestAtCurrentIdentityGeneration(.{
+        .index_name = "text",
+        .full_text = .{ .match_all = {} },
+        .count_only = true,
+        .limit = 0,
+        .aggregations_json =
+        \\{"terms":{"type":"terms","field":"age"},"stats":{"type":"stats","field":"age"}}
+        ,
+    });
+    var first = try db.search(alloc, req);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u32, 1), first.total_hits);
+    first.identity_read_generation = req.identity_read_generation;
+
+    // Publishing already committed writes changes the text snapshot,
+    // without changing the primary document identity generation.
+    try db.runUntilIdle();
+    const current_req = try db.searchRequestAtCurrentIdentityGeneration(.{});
+    try std.testing.expectEqual(req.identity_read_generation, current_req.identity_read_generation);
+    const full_req = try aggregationFullResultRequest(req, first, "test-text-publication");
+    var full = try db.search(alloc, full_req);
+    defer full.deinit();
+    try std.testing.expectEqual(req.identity_read_generation, full_req.identity_read_generation);
+    try std.testing.expectEqual(@as(u32, 2), full.total_hits);
+    try requireCompleteAggregationFullResult(full_req, full, "test-text-publication");
+    try std.testing.expectEqual(@as(usize, 2), full.hits.len);
+
+    var meta: query_api.QueryResponseMeta = .{};
+    defer meta.deinit(alloc);
+    try applyAggregationResults(alloc, full_req, full, .{}, &meta);
+    try std.testing.expectEqual(@as(usize, 2), meta.aggregation_results.len);
+    for (meta.aggregation_results) |aggregation| {
+        if (std.mem.eql(u8, aggregation.name, "terms")) {
+            try std.testing.expectEqual(@as(usize, 1), aggregation.buckets.len);
+            try std.testing.expectEqualStrings("\"18\"", aggregation.buckets[0].key_json);
+            try std.testing.expectEqual(@as(i64, 1), aggregation.buckets[0].count);
+        } else {
+            const Stats = struct { count: i64, sum: f64, min: f64, max: f64, avg: f64 };
+            var stats = try std.json.parseFromSlice(Stats, alloc, aggregation.value_json.?, .{ .ignore_unknown_fields = true });
+            defer stats.deinit();
+            try std.testing.expectEqual(Stats{ .count = 1, .sum = 18, .min = 18, .max = 18, .avg = 18 }, stats.value);
+        }
+    }
 }
 
 fn applyBoundQueryAggregations(
