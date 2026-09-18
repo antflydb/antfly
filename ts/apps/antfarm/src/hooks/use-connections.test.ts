@@ -209,6 +209,38 @@ describe("useConnectionsWithModels revalidation", () => {
     unmount();
   });
 
+  it("does not apply a background poll after switching API endpoints", async () => {
+    listConnections.mockResolvedValueOnce({
+      connections: [providerConnection({ id: "endpoint-a" })],
+    });
+    const view = renderRecording();
+    await waitFor(() => expect(view.result.current.connections[0]?.id).toBe("endpoint-a"));
+
+    let resolvePollA!: (value: { connections: Connection[] }) => void;
+    listConnections.mockReturnValueOnce(new Promise((done) => (resolvePollA = done)));
+    await revalidate();
+    await waitFor(() => expect(listConnections).toHaveBeenCalledTimes(2));
+
+    apiUrlRef.current = `${apiUrlRef.current}-b`;
+    let resolveEndpointB!: (value: { connections: Connection[] }) => void;
+    listConnections.mockReturnValueOnce(new Promise((done) => (resolveEndpointB = done)));
+    view.rerender();
+    await waitFor(() => expect(listConnections).toHaveBeenCalledTimes(3));
+
+    await act(async () => {
+      resolveEndpointB({ connections: [providerConnection({ id: "endpoint-b" })] });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.result.current.connections[0]?.id).toBe("endpoint-b"));
+
+    await act(async () => {
+      resolvePollA({ connections: [providerConnection({ id: "endpoint-a-late" })] });
+      await Promise.resolve();
+    });
+    expect(view.result.current.connections[0]?.id).toBe("endpoint-b");
+    view.unmount();
+  });
+
   it("does not force a provider refetch, leaving the server cache to bound staleness", async () => {
     listConnections.mockResolvedValue({ connections: [] });
     const { result, unmount } = renderRecording();

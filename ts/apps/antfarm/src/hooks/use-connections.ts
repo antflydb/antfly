@@ -211,6 +211,11 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
   useEffect(() => {
     if (!includeModels) return;
 
+    // A poll belongs to this endpoint's effect lifetime. Without this signal,
+    // a response started for a previous endpoint can resolve after a switch
+    // and update the newly mounted consumer with the old inventory.
+    const controller = new AbortController();
+
     const revalidate = () => {
       if (document.visibilityState === "hidden") return;
       const entry = connectionsCache.get(cacheKey);
@@ -218,7 +223,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
       if (entry && isFresh(entry)) return;
       // A forced refresh is already fetching authoritative data for this key.
       if (connectionsInFlight.has(`${cacheKey}|refresh=true`)) return;
-      void fetchConnections(undefined, { background: true });
+      void fetchConnections(controller.signal, { background: true });
     };
 
     const timer = window.setInterval(revalidate, REVALIDATE_TICK_MS);
@@ -226,6 +231,7 @@ function useConnectionsInternal(includeModels: boolean): ConnectionsState {
     // rather than leaving a stale list on screen for a further tick.
     document.addEventListener("visibilitychange", revalidate);
     return () => {
+      controller.abort();
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", revalidate);
     };
