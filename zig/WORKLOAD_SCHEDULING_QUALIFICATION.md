@@ -30,10 +30,20 @@ factor 3, and a separate 2 GiB metadata disk per metadata node. The selected CPU
 and memory values apply per node, not to the six-node cluster as a whole.
 Optional hot standby adds a data node; it does not increase primary capacity.
 
-Gate all three single-node packages. Gate the Starter and Pro replicated
-topologies for coordination, fan-out, cancellation, fencing, recovery, and
-rolling-upgrade behavior. Gate Standard with hot standby for drain/failover and
-irrevocable-write recovery. Record actual container resource limits, CPU quota,
+Correctness does not require Cloud-sized nodes. Use small local multi-process
+or container clusters and deliberately small scheduling budgets for coordination,
+fan-out, cancellation, fencing, recovery, rolling peer versions, and standby
+failure schedules. Preserve the required replica count for quorum and leader-loss
+tests, while reducing each process/container resource budget. A three-process
+metadata/data/API fixture covers routing and attempt recovery; it does not prove
+replicated failover. Retain the topology and budgets; these runs establish only
+correctness for the exercised cases.
+
+For performance claims, gate all three single-node packages. Replicated Starter
+and Pro performance qualification uses the six-node resource envelopes above;
+Standard with hot standby additionally measures drain/failover and irrevocable
+write recovery under the declared resource policy. Larger-topology performance
+is a separate unqualified row when sufficient hardware is unavailable. Record actual container resource limits, CPU quota,
 architecture, disk class, and resource-manager budgets for each run. A local
 development configuration is not evidence for a paid package. Container CPU
 quota must govern automatic sizing; host CPU count is not its substitute.
