@@ -2319,6 +2319,7 @@ fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*Storag
         .max_queued_tasks = request.dense_max_queued_tasks,
         .max_wait_ms = request.dense_max_wait_ms,
         .max_working_bytes = request.dense_max_working_bytes,
+        .max_suspended_io = request.dense_max_suspended_io,
     });
     var runtime_config = db_mod.background_runtime.Config{};
     if (context.io_receiver) |*io| runtime_config = .{
@@ -2437,6 +2438,12 @@ pub fn storageOwnerContextMetrics(
         .dense_outstanding = dense.outstanding,
         .dense_queued = dense.queued,
         .dense_max_working_bytes = dense.max_working_bytes,
+        .dense_max_suspended_io = dense.max_suspended_io,
+        .dense_suspended_io = dense.suspended_io,
+        .dense_effective_max_suspended_io = if (owner_context.resources.resource_manager.dense_execution) |runtime|
+            runtime.effectiveSuspendedIo(owner_context.backend_runtime.ptr().io() orelse std.Io.Threaded.global_single_threaded.io())
+        else
+            0,
         .dense_working_bytes = dense.working_bytes,
     };
     return .ok;

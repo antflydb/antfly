@@ -2271,6 +2271,8 @@ pub const HealthSource = struct {
                     .max_queued_tasks = metrics.dense_max_queued_tasks,
                     .max_wait_ms = metrics.dense_max_wait_ms,
                     .max_working_bytes = metrics.dense_max_working_bytes,
+                    .max_suspended_io = metrics.dense_max_suspended_io,
+                    .suspended_io = metrics.dense_suspended_io,
                     .working_bytes = metrics.dense_working_bytes,
                     .runnable = metrics.dense_runnable,
                     .outstanding = metrics.dense_outstanding,
@@ -2992,9 +2994,11 @@ fn writeDenseExecutionMetrics(writer: *std.Io.Writer, stats: resource_manager_mo
     try health_metrics.appendPromMetric(writer, "antfly_dense_execution_max_wait_ms", "gauge", "Maximum dense execution queue waiting time in milliseconds", stats.max_wait_ms);
     try health_metrics.appendPromMetric(writer, "antfly_dense_execution_runnable", "gauge", "Dense drivers and helpers owning runnable leases", stats.runnable);
     try health_metrics.appendPromMetric(writer, "antfly_dense_execution_outstanding", "gauge", "Dense drivers and helpers owning request leases", stats.outstanding);
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_queued", "gauge", "Dense drivers waiting for runnable leases", stats.queued);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_queued", "gauge", "Fresh dense drivers waiting for runnable leases; resumptions retain existing ownership", stats.queued);
     try health_metrics.appendPromMetric(writer, "antfly_dense_execution_working_bytes_limit", "gauge", "Hard byte ceiling for participating dense workspaces", stats.max_working_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_dense_execution_working_bytes", "gauge", "Actual allocated bytes in participating dense workspaces", stats.working_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_suspended_io_limit", "gauge", "Maximum native reads that release runnable capacity", stats.max_suspended_io);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_suspended_io", "gauge", "Native reads currently holding suspended I/O ownership", stats.suspended_io);
 }
 
 fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.ResourceManager) !void {
@@ -19716,6 +19720,7 @@ pub const DataServer = struct {
                     .dense_max_queued_tasks = dense.max_queued_tasks,
                     .dense_max_wait_ms = dense.max_wait_ms,
                     .dense_max_working_bytes = dense.max_working_bytes,
+                    .dense_max_suspended_io = dense.max_suspended_io,
                 };
                 if (backend_runtime.?.usesBorrowedIo()) {
                     const services = @import("../storage/kernel_runtime_services.zig");

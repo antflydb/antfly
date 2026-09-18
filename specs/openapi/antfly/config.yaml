@@ -825,9 +825,21 @@ components:
           default: 0
           description: >-
             Hard aggregate ceiling for dense memory participating in scheduler
-            accounting. Currently covers scoped exact-search workspaces; pooled
+            accounting. Covers scoped exact-search and opted-in native read arenas; pooled
             HBC scratch and result ownership keep their existing memory policy.
             Zero preserves the legacy memory path. Requires a nonzero task limit.
+        max_suspended_io:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: >-
+            Maximum native exact positional reads that can release runnable
+            capacity during synchronous I/O. Enables scoped native read arenas;
+            requires working memory and waiting budgets. Zero keeps coarse
+            driver ownership. Requires a runtime that keeps callers on their
+            original thread during I/O; other runtimes remain coarse. The
+            operating-system read is not preemptible.
         max_outstanding_tasks:
           type: integer
           minimum: 0
@@ -939,8 +951,9 @@ components:
       description: |
         Opt-in bounded admission waiting. Configure all queue limits together.
         Zero max_wait_ms keeps fail-fast behavior. Request payload reservations
-        survive admission until the active lease is released; execution working
-        memory and transport body limits remain independently enforced.
+        and tracked query, planning, and output allocations remain charged
+        through response retirement. Other execution, storage, and transport
+        memory remains independently bounded.
       properties:
         max_queued_requests:
           type: integer
@@ -957,7 +970,7 @@ components:
           minimum: 0
           maximum: 9007199254740991
           default: 0
-          description: Payload and admission metadata reservations across queued and active requests; must cover max_queued_bytes.
+          description: Payload, admission metadata, and tracked query, planning, and output allocations through response retirement; must cover max_queued_bytes. Other execution, storage, and transport memory remains independently bounded.
         max_wait_ms:
           type: integer
           minimum: 0

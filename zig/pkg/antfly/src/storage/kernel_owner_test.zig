@@ -1431,6 +1431,7 @@ test "opaque storage context activates and validates dense execution policy" {
         .dense_max_queued_tasks = 4,
         .dense_max_wait_ms = 25,
         .dense_max_working_bytes = 65536,
+        .dense_max_suspended_io = 1,
     }, &context));
     defer _ = abi.antfly_storage_context_destroy(context);
     var metrics: abi.ContextMetricsResult = undefined;
@@ -1440,9 +1441,33 @@ test "opaque storage context activates and validates dense execution policy" {
     try std.testing.expectEqual(@as(u32, 4), metrics.dense_max_queued_tasks);
     try std.testing.expectEqual(@as(u32, 25), metrics.dense_max_wait_ms);
     try std.testing.expectEqual(@as(u64, 65536), metrics.dense_max_working_bytes);
+    try std.testing.expectEqual(@as(u32, 1), metrics.dense_max_suspended_io);
+    try std.testing.expectEqual(@as(u64, 0), metrics.dense_suspended_io);
     try std.testing.expectEqual(@as(u64, 0), metrics.dense_working_bytes);
     try std.testing.expectEqual(@as(u64, 0), metrics.dense_runnable);
     try std.testing.expectEqual(@as(u64, 0), metrics.dense_outstanding);
+}
+
+test "opaque storage context dense execution policy preserves imported runtime affinity" {
+    const services = @import("kernel_runtime_services.zig");
+    var unknown_vtable = std.testing.io.vtable.*;
+    const unknown_io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &unknown_vtable };
+    for ([_]std.Io{ std.testing.io, unknown_io }, 0..) |io, i| {
+        var borrow = services.executor.Borrow.init(&io);
+        var context = client.Context{};
+        try context.ensureWithRuntime(.{ .context = .{
+            .dense_max_runnable_tasks = 1,
+            .dense_max_outstanding_tasks = 2,
+            .dense_max_queued_tasks = 1,
+            .dense_max_wait_ms = 5000,
+            .dense_max_working_bytes = 65536,
+            .dense_max_suspended_io = 1,
+        }, .io = &borrow });
+        defer context.deinit();
+        const metrics = try context.metrics();
+        try std.testing.expectEqual(@as(u32, 1), metrics.dense_max_suspended_io);
+        try std.testing.expectEqual(@as(u32, if (i == 0) 1 else 0), metrics.dense_effective_max_suspended_io);
+    }
 }
 
 test "opaque storage context enforces owner lifetime and shares process storage state" {

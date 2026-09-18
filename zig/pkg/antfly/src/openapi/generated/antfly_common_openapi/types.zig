@@ -57,11 +57,11 @@ pub const AdmissionConfig = struct {
     }
 };
 
-/// Opt-in bounded admission waiting. Configure all queue limits together. Zero max_wait_ms keeps fail-fast behavior. Request payload reservations survive admission until the active lease is released; execution working memory and transport body limits remain independently enforced.
+/// Opt-in bounded admission waiting. Configure all queue limits together. Zero max_wait_ms keeps fail-fast behavior. Request payload reservations and tracked query, planning, and output allocations remain charged through response retirement. Other execution, storage, and transport memory remains independently bounded.
 pub const AdmissionWaitingConfig = struct {
     max_queued_requests: ?i64 = null,
     max_queued_bytes: ?i64 = null,
-    /// Payload and admission metadata reservations across queued and active requests; must cover max_queued_bytes.
+    /// Payload, admission metadata, and tracked query, planning, and output allocations through response retirement; must cover max_queued_bytes. Other execution, storage, and transport memory remains independently bounded.
     max_retained_bytes: ?i64 = null,
     /// Maximum admission wait within the original request deadline; zero disables queueing.
     max_wait_ms: ?i64 = null,
@@ -719,8 +719,10 @@ pub const ConnectionKind = enum {
 pub const DenseExecutionConfig = struct {
     /// Maximum combined dense callers and helpers; zero disables this scheduler.
     max_runnable_tasks: ?i64 = null,
-    /// Hard aggregate ceiling for dense memory participating in scheduler accounting. Currently covers scoped exact-search workspaces; pooled HBC scratch and result ownership keep their existing memory policy. Zero preserves the legacy memory path. Requires a nonzero task limit.
+    /// Hard aggregate ceiling for dense memory participating in scheduler accounting. Covers scoped exact-search and opted-in native read arenas; pooled HBC scratch and result ownership keep their existing memory policy. Zero preserves the legacy memory path. Requires a nonzero task limit.
     max_working_bytes: ?i64 = null,
+    /// Maximum native exact positional reads that can release runnable capacity during synchronous I/O. Enables scoped native read arenas; requires working memory and waiting budgets. Zero keeps coarse driver ownership. Requires a runtime that keeps callers on their original thread during I/O; other runtimes remain coarse. The operating-system read is not preemptible.
+    max_suspended_io: ?i64 = null,
     /// Hard bound on active and queued dense tasks; must cover runnable capacity.
     max_outstanding_tasks: ?i64 = null,
     /// Waiting dense callers; helpers never queue. Must not exceed outstanding capacity.
@@ -732,6 +734,7 @@ pub const DenseExecutionConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "max_runnable_tasks", "max_runnable_tasks", true },
         .{ "max_working_bytes", "max_working_bytes", true },
+        .{ "max_suspended_io", "max_suspended_io", true },
         .{ "max_outstanding_tasks", "max_outstanding_tasks", true },
         .{ "max_queued_tasks", "max_queued_tasks", true },
         .{ "max_wait_ms", "max_wait_ms", true },
@@ -753,6 +756,10 @@ pub const DenseExecutionConfig = struct {
         }
         if (self.max_working_bytes) |value| {
             try jw.objectField("max_working_bytes");
+            try jw.write(value);
+        }
+        if (self.max_suspended_io) |value| {
+            try jw.objectField("max_suspended_io");
             try jw.write(value);
         }
         if (self.max_outstanding_tasks) |value| {

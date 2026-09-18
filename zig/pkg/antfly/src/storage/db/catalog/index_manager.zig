@@ -27252,16 +27252,29 @@ pub const IndexManager = struct {
         profile: ?*hbc_mod.SearchProfile,
     ) !void {
         const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
-        const pooled = if (active_dense_vector_load_session) |session|
+        const driver = if (error_bounds == null) blk: {
+            const active = scratch.execution_owner orelse break :blk null;
+            const manager = loader.manager.resource_manager orelse break :blk null;
+            if (active.runtime != manager.dense_execution) break :blk null;
+            if (active.runtime.?.effectiveSuspendedIo(active.options.?.io) == 0 or
+                !@import("../../../runtime_io_abi.zig").callerThreadPinned(loader.manager.checkpointIo())) break :blk null;
+            break :blk active;
+        } else null;
+        var scoped_memory: ?workload_memory.WorkingMemory = if (driver) |owner|
+            try workload_memory.WorkingMemory.init(loader.manager.resource_manager.?, .dense_search_working_set, &owner.runtime.?.ledger, &owner.request.?, loader.manager.alloc, 0)
+        else
+            null;
+        defer if (scoped_memory) |*memory| memory.deinit();
+        const pooled = if (driver == null) (if (active_dense_vector_load_session) |session|
             if (session.context == loader and session.working_slice == .dense_search_working_set)
                 try loader.manager.native_read_scratch.acquire()
             else
                 null
         else
-            null;
+            null) else null;
         defer if (pooled) |slot| loader.manager.native_read_scratch.release(slot);
-        scoreDenseVectorsForHbcBatchImpl(ctx, vector_ids, metadata, query, query_measure, metric, distances, error_bounds, batch_scratch, dims, scratch, profile, pooled) catch |err|
-            return if (pooled) |slot| slot.allocationError(err) else err;
+        scoreDenseVectorsForHbcBatchImpl(ctx, vector_ids, metadata, query, query_measure, metric, distances, error_bounds, batch_scratch, dims, scratch, profile, pooled, if (scoped_memory) |*memory| memory else null, driver) catch |err|
+            return if (scoped_memory) |*memory| memory.allocationFailure(err) else if (pooled) |slot| slot.allocationError(err) else err;
     }
 
     fn scoreDenseVectorsForHbcBatchImpl(
@@ -27278,6 +27291,8 @@ pub const IndexManager = struct {
         scratch: hbc_mod.HBCIndex.ExternalVectorBatchDistanceScratch,
         profile: ?*hbc_mod.SearchProfile,
         pooled: ?*native_read_scratch_pool.Pool.Slot,
+        scoped_memory: ?*workload_memory.WorkingMemory,
+        driver: ?*@import("../../dense_execution.zig").Runtime.Lease,
     ) !void {
         const loader: *DenseVectorLoadContext = @ptrCast(@alignCast(ctx));
         const manager = loader.manager;
@@ -27361,7 +27376,7 @@ pub const IndexManager = struct {
         // Queries reuse an admitted, reclaimable arena across batches and
         // requests. Non-query native callers keep lifetime-scoped OS backing;
         // primary-only key lookups retain their ordinary small-object allocator.
-        var key_arena = std.heap.ArenaAllocator.init(if (vector_block_generation != null) std.heap.page_allocator else manager.alloc);
+        var key_arena = std.heap.ArenaAllocator.init(if (scoped_memory) |memory| memory.allocator() else if (vector_block_generation != null) std.heap.page_allocator else manager.alloc);
         defer key_arena.deinit();
         const use_pool = pooled != null and vector_block_generation != null;
         const key_alloc = if (use_pool) pooled.?.allocator() else key_arena.allocator();
@@ -27376,7 +27391,7 @@ pub const IndexManager = struct {
                 0;
             vector_block_payload_stride = std.math.add(usize, vector_bytes, residual_bytes) catch return error.BufferTooSmall;
             const payload_bytes = std.math.mul(usize, vector_block_payload_stride, vector_ids.len) catch return error.BufferTooSmall;
-            if (!use_pool) if (load_session) |session| {
+            if (!use_pool and scoped_memory == null) if (load_session) |session| {
                 const io_request_bytes: usize = if (error_bounds != null)
                     @sizeOf(vector_block_store_mod.ProjectionReadRequest)
                 else
@@ -27624,7 +27639,10 @@ pub const IndexManager = struct {
                     };
                 }
                 const residual_stats = try generation.opened.readExactResidualsIntoBatch(manager.io, residual_requests[0..residual_request_count]);
-                const read_stats = try generation.opened.readExactIntoBatch(manager.io, exact_requests[0..request_count]);
+                const read_stats = if (driver) |owner|
+                    try generation.opened.readExactIntoBatchScheduled(exact_requests[0..request_count], owner)
+                else
+                    try generation.opened.readExactIntoBatch(manager.io, exact_requests[0..request_count]);
                 if (profile) |p| {
                     p.rerank_vector_physical_reads +|= residual_stats.physical_reads +| read_stats.physical_reads;
                     p.rerank_read_batches +|= read_stats.dispatch.batches;

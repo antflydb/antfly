@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 62;
+pub const abi_version: u32 = 63;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -303,6 +303,7 @@ pub const ContextRequest = extern struct {
     dense_max_queued_tasks: u32 = 0,
     dense_max_wait_ms: u32 = 0,
     dense_max_working_bytes: u64 = 0,
+    dense_max_suspended_io: u32 = 0,
 };
 
 /// One low-volume engine namespace used by control-plane metadata or durable
@@ -420,6 +421,9 @@ pub const ContextMetricsResult = extern struct {
     dense_outstanding: u64 = 0,
     dense_queued: u64 = 0,
     dense_max_working_bytes: u64 = 0,
+    dense_max_suspended_io: u32 = 0,
+    dense_suspended_io: u64 = 0,
+    dense_effective_max_suspended_io: u32 = 0,
     dense_working_bytes: u64 = 0,
 };
 
