@@ -1430,6 +1430,7 @@ test "opaque storage context activates and validates dense execution policy" {
         .dense_max_outstanding_tasks = 8,
         .dense_max_queued_tasks = 4,
         .dense_max_wait_ms = 25,
+        .dense_max_working_bytes = 65536,
     }, &context));
     defer _ = abi.antfly_storage_context_destroy(context);
     var metrics: abi.ContextMetricsResult = undefined;
@@ -1438,6 +1439,8 @@ test "opaque storage context activates and validates dense execution policy" {
     try std.testing.expectEqual(@as(u32, 8), metrics.dense_max_outstanding_tasks);
     try std.testing.expectEqual(@as(u32, 4), metrics.dense_max_queued_tasks);
     try std.testing.expectEqual(@as(u32, 25), metrics.dense_max_wait_ms);
+    try std.testing.expectEqual(@as(u64, 65536), metrics.dense_max_working_bytes);
+    try std.testing.expectEqual(@as(u64, 0), metrics.dense_working_bytes);
     try std.testing.expectEqual(@as(u64, 0), metrics.dense_runnable);
     try std.testing.expectEqual(@as(u64, 0), metrics.dense_outstanding);
 }

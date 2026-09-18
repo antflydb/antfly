@@ -3041,6 +3041,7 @@ pub fn runFromIterator(
             .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
             .dense_max_queued_tasks = dense.max_queued_tasks,
             .dense_max_wait_ms = dense.max_wait_ms,
+            .dense_max_working_bytes = dense.max_working_bytes,
         });
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);

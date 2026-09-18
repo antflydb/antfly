@@ -18,6 +18,25 @@ pub const WorkingMemory = struct {
     live_bytes: u64 = 0,
     last_failure: ?anyerror = null,
 
+    /// Optional physical allocator for scoped dense state. The driver retains
+    /// its request until all allocations are freed and this owner is retired.
+    pub fn forDenseDriver(manager: ?*resource_manager.ResourceManager, driver: *const resource_manager.ResourceManager.DenseDriverLease, backing: std.mem.Allocator) !?WorkingMemory {
+        const owner = manager orelse return null;
+        const runtime = owner.dense_execution orelse return null;
+        if (runtime.config.max_working_bytes == 0) return null;
+        const request = if (driver.scheduled.request) |*value| value else return error.InvalidLease;
+        return try init(owner, .dense_search_working_set, &runtime.ledger, request, backing, 0);
+    }
+
+    pub fn allocationFailure(self: *const WorkingMemory, err: anyerror) anyerror {
+        if (err != error.OutOfMemory) return err;
+        return switch (self.last_failure orelse err) {
+            error.ResourceRequestTooLarge => error.AdmissionRequestTooLarge,
+            error.ResourceTemporarilyUnavailable, error.ResourceBudgetExceeded => error.AdmissionBytesExhausted,
+            else => err,
+        };
+    }
+
     pub fn init(manager: *resource_manager.ResourceManager, slice: resource_manager.Slice, ledger: *resources.Ledger, request: *const resources.RequestLease, backing: std.mem.Allocator, minimum: u64) !WorkingMemory {
         var state = try ledger.acquire(.retained_state, request, .{ .retained_bytes = minimum });
         errdefer state.release() catch unreachable;

@@ -1681,6 +1681,7 @@ fn denseExecutionFromOpenApi(input: ?common_openapi.DenseExecutionConfig) !@impo
         .max_outstanding_tasks = std.math.cast(u32, value.max_outstanding_tasks orelse 0) orelse return error.InvalidConfig,
         .max_queued_tasks = std.math.cast(u32, value.max_queued_tasks orelse 0) orelse return error.InvalidConfig,
         .max_wait_ms = std.math.cast(u32, value.max_wait_ms orelse 0) orelse return error.InvalidConfig,
+        .max_working_bytes = std.math.cast(u64, value.max_working_bytes orelse 0) orelse return error.InvalidConfig,
     };
     try config.validate();
     return config;
@@ -2609,11 +2610,12 @@ test "common config preserves disabled foreground admission" {
 
 test "common config validates opt-in fixed dense execution" {
     var cfg = try Config.parseFromSlice(std.testing.allocator,
-        \\{"admission":{"dense_execution":{"max_runnable_tasks":2,"max_outstanding_tasks":8,"max_queued_tasks":4,"max_wait_ms":25}}}
+        \\{"admission":{"dense_execution":{"max_runnable_tasks":2,"max_outstanding_tasks":8,"max_queued_tasks":4,"max_wait_ms":25,"max_working_bytes":65536}}}
     );
     defer cfg.deinit();
     try std.testing.expectEqual(@as(u32, 2), cfg.admission.dense_execution.max_runnable_tasks);
     try std.testing.expectEqual(@as(u32, 4), cfg.admission.dense_execution.max_queued_tasks);
+    try std.testing.expectEqual(@as(u64, 65536), cfg.admission.dense_execution.max_working_bytes);
     inline for (.{
         \\{"admission":{"dense_execution":{"max_runnable_tasks":2,"max_outstanding_tasks":1}}}
         ,

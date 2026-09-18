@@ -18357,6 +18357,17 @@ pub const HBCIndex = struct {
         return @max(@min(@max(baseline_scan_bytes, layout_scan_bytes), max_possible_scan_bytes), 1);
     }
 
+    /// Exact scorers share the configured dense task budget without changing
+    /// legacy exact routing's admission behavior when the scheduler is off.
+    pub fn acquireDenseExecutionDriver(self: *HBCIndex, req: SearchRequest) !resource_manager_mod.ResourceManager.DenseDriverLease {
+        const manager = self.resource_manager orelse return .{};
+        if (manager.dense_execution == null) return .{};
+        return manager.acquireDenseDriver(self.runtimeIo(), if (req.cancellation) |token|
+            .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn }
+        else
+            null);
+    }
+
     pub fn acquireSearchAdmission(
         self: *HBCIndex,
         active_count: u64,

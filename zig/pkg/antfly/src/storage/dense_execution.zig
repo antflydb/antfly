@@ -2,8 +2,9 @@
 // Licensed under the Elastic License 2.0 (ELv2); see https://www.antfly.io/licensing/ELv2-license.
 
 //! First operator binding for the common scheduler. Dense drivers retain a
-//! coarse runnable lease through scan/rerank and helper join. No cooperative
-//! isolation or working-memory coverage is claimed by this binding.
+//! coarse runnable lease through scan/rerank and helper join. Scoped exact
+//! workspaces can opt into allocator accounting; pooled HBC scratch keeps its
+//! existing owner. No cooperative isolation is claimed by this binding.
 const std = @import("std");
 const resources = @import("../common/workload_resources.zig");
 const scheduling = @import("../common/workload_scheduler.zig");
@@ -14,14 +15,15 @@ pub const Config = struct {
     max_outstanding_tasks: u32 = 0,
     max_queued_tasks: u32 = 0,
     max_wait_ms: u32 = 0,
+    max_working_bytes: u64 = 0,
 
     pub fn validate(self: Config) !void {
         if (self.max_runnable_tasks == 0) {
-            if (self.max_outstanding_tasks != 0 or self.max_queued_tasks != 0 or self.max_wait_ms != 0) return error.InvalidConfig;
+            if (self.max_outstanding_tasks != 0 or self.max_queued_tasks != 0 or self.max_wait_ms != 0 or self.max_working_bytes != 0) return error.InvalidConfig;
             return;
         }
         if (self.max_outstanding_tasks < self.max_runnable_tasks or self.max_outstanding_tasks > 65_536 or
-            self.max_queued_tasks > self.max_outstanding_tasks or self.max_wait_ms > 60_000 or
+            self.max_queued_tasks > self.max_outstanding_tasks or self.max_wait_ms > 60_000 or self.max_working_bytes > 1_099_511_627_776 or
             ((self.max_wait_ms == 0) != (self.max_queued_tasks == 0))) return error.InvalidConfig;
     }
 };
@@ -31,6 +33,8 @@ pub const Stats = struct {
     max_outstanding_tasks: u32 = 0,
     max_queued_tasks: u32 = 0,
     max_wait_ms: u32 = 0,
+    max_working_bytes: u64 = 0,
+    working_bytes: u64 = 0,
     runnable: u64 = 0,
     outstanding: u64 = 0,
     queued: u64 = 0,
@@ -59,13 +63,14 @@ pub const Runtime = struct {
         if (config.max_runnable_tasks == 0) return error.InvalidConfig;
         const self = try allocator.create(Runtime);
         errdefer allocator.destroy(self);
-        // One request handle plus one runnable/queued handle per task. Fixed
+        // One request, runnable/queued, and working-state handle per task. Fixed
         // preallocation bounds scheduler metadata before publishing the owner.
         const total: resources.Bundle = .{
-            .handles = @as(u64, config.max_outstanding_tasks) * 2,
+            .handles = @as(u64, config.max_outstanding_tasks) * 3,
             .requests = config.max_outstanding_tasks,
             .queued = config.max_queued_tasks,
             .runnable = config.max_runnable_tasks,
+            .retained_bytes = config.max_working_bytes,
         };
         self.* = .{
             .allocator = allocator,
@@ -91,6 +96,8 @@ pub const Runtime = struct {
             .max_outstanding_tasks = self.config.max_outstanding_tasks,
             .max_queued_tasks = self.config.max_queued_tasks,
             .max_wait_ms = self.config.max_wait_ms,
+            .max_working_bytes = self.config.max_working_bytes,
+            .working_bytes = snapshot.total.retained_bytes,
             .runnable = snapshot.total.runnable,
             .outstanding = snapshot.total.requests,
             .queued = snapshot.total.queued,

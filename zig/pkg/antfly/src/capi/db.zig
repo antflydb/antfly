@@ -2318,6 +2318,7 @@ fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*Storag
         .max_outstanding_tasks = request.dense_max_outstanding_tasks,
         .max_queued_tasks = request.dense_max_queued_tasks,
         .max_wait_ms = request.dense_max_wait_ms,
+        .max_working_bytes = request.dense_max_working_bytes,
     });
     var runtime_config = db_mod.background_runtime.Config{};
     if (context.io_receiver) |*io| runtime_config = .{
@@ -2435,6 +2436,8 @@ pub fn storageOwnerContextMetrics(
         .dense_runnable = dense.runnable,
         .dense_outstanding = dense.outstanding,
         .dense_queued = dense.queued,
+        .dense_max_working_bytes = dense.max_working_bytes,
+        .dense_working_bytes = dense.working_bytes,
     };
     return .ok;
 }

@@ -25,6 +25,7 @@ const doc_set = @import("../doc_set.zig");
 const doc_identity = @import("../doc_identity.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
 const dense_exact = @import("../dense_exact.zig");
+const workload_memory = @import("../../workload_memory.zig");
 const graph_exec = @import("graph_exec.zig");
 const result_shape = @import("result_shape.zig");
 const search_mod = @import("../../../search/search.zig");
@@ -14189,8 +14190,18 @@ fn exactScoreNativeDenseFilter(
     req: vectorindex_mod.SearchRequest,
 ) !dense_exact.SearchOutcome {
     try checkVectorSearchCancelled(req);
+    var driver = try entry.index.acquireDenseExecutionDriver(req);
+    defer driver.release();
+    var memory = try workload_memory.WorkingMemory.forDenseDriver(entry.index.resource_manager, &driver, alloc);
+    defer if (memory) |*owner| owner.deinit();
+    return exactScoreNativeDenseFilterAllocated(alloc, entry, req, if (memory) |*owner| owner.allocator() else alloc) catch |err| {
+        return if (memory) |*owner| owner.allocationFailure(err) else err;
+    };
+}
+
+fn exactScoreNativeDenseFilterAllocated(alloc: Allocator, entry: *index_manager_mod.IndexManager.DenseIndex, req: vectorindex_mod.SearchRequest, work_alloc: Allocator) !dense_exact.SearchOutcome {
     const prepare_start_ns = platform_time.monotonicNs();
-    var candidates = try dense_exact.CandidateDifference.init(alloc, req.filter_ids, req.exclude_ids);
+    var candidates = try dense_exact.CandidateDifference.init(work_alloc, req.filter_ids, req.exclude_ids);
     defer candidates.deinit();
     const unique_candidate_ids = candidates.values;
     var exact_profile: dense_exact.SearchOutcome.Profile = .{
@@ -14211,17 +14222,17 @@ fn exactScoreNativeDenseFilter(
 
     var txn = try entry.index.beginReadTxn();
     defer txn.abort();
-    var vector_cursor = entry.index.openNamespacedCursor(alloc, &txn, .vecs) catch |err| switch (err) {
+    var vector_cursor = entry.index.openNamespacedCursor(work_alloc, &txn, .vecs) catch |err| switch (err) {
         error.Unsupported => null,
         else => return err,
     };
     defer if (vector_cursor) |*cursor| cursor.close();
 
-    const candidate_metadata = try alloc.alloc(
+    const candidate_metadata = try work_alloc.alloc(
         ?[]const u8,
         if (req.filter_prefix.len > 0) unique_candidate_ids.len else 0,
     );
-    defer alloc.free(candidate_metadata);
+    defer work_alloc.free(candidate_metadata);
     if (candidate_metadata.len > 0) {
         const metadata_start_ns = platform_time.monotonicNs();
         @memset(candidate_metadata, null);
@@ -14240,8 +14251,8 @@ fn exactScoreNativeDenseFilter(
         exact_profile.metadata_lookup_ns = platform_time.monotonicNs() - metadata_start_ns;
     }
 
-    const vector_scratch = try alloc.alloc(f32, entry.dims);
-    defer alloc.free(vector_scratch);
+    const vector_scratch = try work_alloc.alloc(f32, entry.dims);
+    defer work_alloc.free(vector_scratch);
     const query_measure = vector_mod.norm(req.query);
     var vectors_scored: u64 = 0;
     var matching_vectors: u64 = 0;

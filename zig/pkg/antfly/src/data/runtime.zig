@@ -2270,6 +2270,8 @@ pub const HealthSource = struct {
                     .max_outstanding_tasks = metrics.dense_max_outstanding_tasks,
                     .max_queued_tasks = metrics.dense_max_queued_tasks,
                     .max_wait_ms = metrics.dense_max_wait_ms,
+                    .max_working_bytes = metrics.dense_max_working_bytes,
+                    .working_bytes = metrics.dense_working_bytes,
                     .runnable = metrics.dense_runnable,
                     .outstanding = metrics.dense_outstanding,
                     .queued = metrics.dense_queued,
@@ -2991,6 +2993,8 @@ fn writeDenseExecutionMetrics(writer: *std.Io.Writer, stats: resource_manager_mo
     try health_metrics.appendPromMetric(writer, "antfly_dense_execution_runnable", "gauge", "Dense drivers and helpers owning runnable leases", stats.runnable);
     try health_metrics.appendPromMetric(writer, "antfly_dense_execution_outstanding", "gauge", "Dense drivers and helpers owning request leases", stats.outstanding);
     try health_metrics.appendPromMetric(writer, "antfly_dense_execution_queued", "gauge", "Dense drivers waiting for runnable leases", stats.queued);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_working_bytes_limit", "gauge", "Hard byte ceiling for participating dense workspaces", stats.max_working_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_working_bytes", "gauge", "Actual allocated bytes in participating dense workspaces", stats.working_bytes);
 }
 
 fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.ResourceManager) !void {
@@ -19711,6 +19715,7 @@ pub const DataServer = struct {
                     .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
                     .dense_max_queued_tasks = dense.max_queued_tasks,
                     .dense_max_wait_ms = dense.max_wait_ms,
+                    .dense_max_working_bytes = dense.max_working_bytes,
                 };
                 if (backend_runtime.?.usesBorrowedIo()) {
                     const services = @import("../storage/kernel_runtime_services.zig");

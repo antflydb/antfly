@@ -719,6 +719,8 @@ pub const ConnectionKind = enum {
 pub const DenseExecutionConfig = struct {
     /// Maximum combined dense callers and helpers; zero disables this scheduler.
     max_runnable_tasks: ?i64 = null,
+    /// Hard aggregate ceiling for dense memory participating in scheduler accounting. Currently covers scoped exact-search workspaces; pooled HBC scratch and result ownership keep their existing memory policy. Zero preserves the legacy memory path. Requires a nonzero task limit.
+    max_working_bytes: ?i64 = null,
     /// Hard bound on active and queued dense tasks; must cover runnable capacity.
     max_outstanding_tasks: ?i64 = null,
     /// Waiting dense callers; helpers never queue. Must not exceed outstanding capacity.
@@ -729,6 +731,7 @@ pub const DenseExecutionConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "max_runnable_tasks", "max_runnable_tasks", true },
+        .{ "max_working_bytes", "max_working_bytes", true },
         .{ "max_outstanding_tasks", "max_outstanding_tasks", true },
         .{ "max_queued_tasks", "max_queued_tasks", true },
         .{ "max_wait_ms", "max_wait_ms", true },
@@ -746,6 +749,10 @@ pub const DenseExecutionConfig = struct {
         try jw.beginObject();
         if (self.max_runnable_tasks) |value| {
             try jw.objectField("max_runnable_tasks");
+            try jw.write(value);
+        }
+        if (self.max_working_bytes) |value| {
+            try jw.objectField("max_working_bytes");
             try jw.write(value);
         }
         if (self.max_outstanding_tasks) |value| {

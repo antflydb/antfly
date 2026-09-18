@@ -76,6 +76,7 @@ const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
 const typed_dv = @import("../../../section/typed_doc_values.zig");
 const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
 const dense_exact = @import("../dense_exact.zig");
+const workload_memory = @import("../../workload_memory.zig");
 const snappy = @import("../../../encoding/snappy.zig");
 const merger_mod = @import("../../../merger.zig");
 const index_mod = @import("../../../index.zig");
@@ -16041,6 +16042,17 @@ pub const IndexManager = struct {
         req: hbc_mod.SearchRequest,
     ) !dense_exact.SearchOutcome {
         try checkDenseSearchCancelled(req);
+        var driver = try entry.index.acquireDenseExecutionDriver(req);
+        defer driver.release();
+        var memory = try workload_memory.WorkingMemory.forDenseDriver(entry.index.resource_manager, &driver, self.alloc);
+        defer if (memory) |*owner| owner.deinit();
+        return self.exactScoreDenseEntryAllocated(entry, req, if (memory) |*owner| owner else null) catch |err| {
+            return if (memory) |*owner| owner.allocationFailure(err) else err;
+        };
+    }
+
+    fn exactScoreDenseEntryAllocated(self: *IndexManager, entry: *DenseIndex, req: hbc_mod.SearchRequest, memory: ?*workload_memory.WorkingMemory) !dense_exact.SearchOutcome {
+        const work_alloc = if (memory) |owner| owner.allocator() else self.alloc;
         const previous_load_session = active_dense_vector_load_session;
         var vector_load_session: ?DenseVectorLoadSession = null;
         defer {
@@ -16079,12 +16091,12 @@ pub const IndexManager = struct {
         if (!self.tryObserveDenseWorkingBytes(
             .dense_search_working_set,
             &workspace_accounted,
-            preflight_workspace_bytes,
+            if (memory != null) result_capacity_bytes else preflight_workspace_bytes,
         )) return error.ResourceBudgetExceeded;
         defer self.observeDenseWorkingBytes(.dense_search_working_set, &workspace_accounted, 0);
 
         const prepare_start_ns = platform_time.monotonicNs();
-        var candidates = try dense_exact.CandidateDifference.init(self.alloc, req.filter_ids, req.exclude_ids);
+        var candidates = try dense_exact.CandidateDifference.init(work_alloc, req.filter_ids, req.exclude_ids);
         defer candidates.deinit();
         const unique_candidate_ids = candidates.values;
         var exact_profile: dense_exact.SearchOutcome.Profile = .{
@@ -16123,8 +16135,8 @@ pub const IndexManager = struct {
         // backend's ordered batch/cursor APIs. The old loop performed one
         // metadata probe and could open one primary-store transaction per
         // candidate, which dominated highly selective filtered searches.
-        const candidate_metadata = try self.alloc.alloc(?[]const u8, unique_candidate_ids.len);
-        defer self.alloc.free(candidate_metadata);
+        const candidate_metadata = try work_alloc.alloc(?[]const u8, unique_candidate_ids.len);
+        defer work_alloc.free(candidate_metadata);
         @memset(candidate_metadata, null);
         const metadata_lookup_start_ns = platform_time.monotonicNs();
         var metadata_start: usize = 0;
@@ -16144,12 +16156,12 @@ pub const IndexManager = struct {
         exact_profile.metadata_lookup_ns = platform_time.monotonicNs() - metadata_lookup_start_ns;
         try checkDenseSearchCancelled(req);
 
-        const fallback_doc_keys = try self.alloc.alloc(?[]u8, unique_candidate_ids.len);
+        const fallback_doc_keys = try work_alloc.alloc(?[]u8, unique_candidate_ids.len);
         defer {
             for (fallback_doc_keys) |maybe_doc_key| {
-                if (maybe_doc_key) |doc_key| self.alloc.free(doc_key);
+                if (maybe_doc_key) |doc_key| work_alloc.free(doc_key);
             }
-            self.alloc.free(fallback_doc_keys);
+            work_alloc.free(fallback_doc_keys);
         }
         @memset(fallback_doc_keys, null);
 
@@ -16163,7 +16175,7 @@ pub const IndexManager = struct {
         if (needs_primary_metadata) {
             if (self.primary_store) |store| {
                 var legacy_vector_ordinals = std.AutoHashMapUnmanaged(u64, doc_identity.DocOrdinal).empty;
-                defer legacy_vector_ordinals.deinit(self.alloc);
+                defer legacy_vector_ordinals.deinit(work_alloc);
                 var needs_legacy_reverse = false;
                 for (unique_candidate_ids, candidate_metadata, 0..) |vector_id, maybe_metadata, i| {
                     if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
@@ -16173,7 +16185,7 @@ pub const IndexManager = struct {
                     }
                 }
                 if (needs_legacy_reverse) {
-                    try legacy_vector_ordinals.ensureTotalCapacity(self.alloc, entry.ordinal_vector_ids.count());
+                    try legacy_vector_ordinals.ensureTotalCapacity(work_alloc, entry.ordinal_vector_ids.count());
                     var reverse_it = entry.ordinal_vector_ids.iterator();
                     var reverse_count: usize = 0;
                     while (reverse_it.next()) |item| : (reverse_count += 1) {
@@ -16188,7 +16200,7 @@ pub const IndexManager = struct {
                     if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
                     if (maybe_metadata != null) continue;
                     const ordinal = entry.vector_ordinals.get(vector_id) orelse legacy_vector_ordinals.get(vector_id) orelse continue;
-                    fallback_doc_keys[i] = try doc_identity.lookupDocIdTxn(self.alloc, &identity_txn, ordinal);
+                    fallback_doc_keys[i] = try doc_identity.lookupDocIdTxn(work_alloc, &identity_txn, ordinal);
                 }
             }
         }
@@ -16233,25 +16245,30 @@ pub const IndexManager = struct {
                 @as(u64, entry.dims) *| @sizeOf(f32) +| max_batch_key_bytes +| 4096;
             const total_workspace_bytes = preflight_workspace_bytes +| batch_workspace_bytes;
             exact_profile.workspace_bytes = total_workspace_bytes;
-            if (!self.tryObserveDenseWorkingBytes(.dense_search_working_set, &workspace_accounted, total_workspace_bytes)) {
+            // WorkingMemory charges the actual local arrays; the legacy
+            // observer retains only output and lower-layer batch scratch.
+            // Never charge those local allocations twice to ResourceManager.
+            const untracked_workspace_bytes = result_capacity_bytes +| max_batch_key_bytes +| 4096 +|
+                @as(u64, @intCast(batch_capacity)) *| (@sizeOf(DenseArtifactReadKey) + @sizeOf(usize) + @sizeOf(?[]const u8));
+            if (!self.tryObserveDenseWorkingBytes(.dense_search_working_set, &workspace_accounted, if (memory != null) untracked_workspace_bytes else total_workspace_bytes)) {
                 return error.ResourceBudgetExceeded;
             }
 
-            const batch_ids = try self.alloc.alloc(u64, batch_capacity);
-            defer self.alloc.free(batch_ids);
-            const batch_metadata = try self.alloc.alloc(?[]const u8, batch_capacity);
-            defer self.alloc.free(batch_metadata);
-            const batch_distances = try self.alloc.alloc(f32, batch_capacity);
-            defer self.alloc.free(batch_distances);
-            const artifact_keys = try self.alloc.alloc([]const u8, batch_capacity);
-            defer self.alloc.free(artifact_keys);
-            const raw_values = try self.alloc.alloc(?[]const u8, batch_capacity);
-            defer self.alloc.free(raw_values);
-            const vector_views = try self.alloc.alloc([]const f32, batch_capacity);
-            defer self.alloc.free(vector_views);
+            const batch_ids = try work_alloc.alloc(u64, batch_capacity);
+            defer work_alloc.free(batch_ids);
+            const batch_metadata = try work_alloc.alloc(?[]const u8, batch_capacity);
+            defer work_alloc.free(batch_metadata);
+            const batch_distances = try work_alloc.alloc(f32, batch_capacity);
+            defer work_alloc.free(batch_distances);
+            const artifact_keys = try work_alloc.alloc([]const u8, batch_capacity);
+            defer work_alloc.free(artifact_keys);
+            const raw_values = try work_alloc.alloc(?[]const u8, batch_capacity);
+            defer work_alloc.free(raw_values);
+            const vector_views = try work_alloc.alloc([]const f32, batch_capacity);
+            defer work_alloc.free(vector_views);
             const vector_scratch_len = try std.math.mul(usize, batch_capacity, entry.dims);
-            const vector_scratch = try self.alloc.alloc(f32, vector_scratch_len);
-            defer self.alloc.free(vector_scratch);
+            const vector_scratch = try work_alloc.alloc(f32, vector_scratch_len);
+            defer work_alloc.free(vector_scratch);
 
             var hbc_profile: hbc_mod.SearchProfile = .{};
             var candidate_start: usize = 0;
@@ -16306,13 +16323,13 @@ pub const IndexManager = struct {
             exact_profile.artifact_cache_hits = hbc_profile.rerank_artifact_cache_hits;
             exact_profile.artifact_vectors_loaded = hbc_profile.rerank_artifact_vectors_loaded;
         } else {
-            var vector_cursor = entry.index.openNamespacedCursor(self.alloc, &txn, .vecs) catch |err| switch (err) {
+            var vector_cursor = entry.index.openNamespacedCursor(work_alloc, &txn, .vecs) catch |err| switch (err) {
                 error.Unsupported => null,
                 else => return err,
             };
             defer if (vector_cursor) |*cursor| cursor.close();
-            const vector_scratch = try self.alloc.alloc(f32, entry.dims);
-            defer self.alloc.free(vector_scratch);
+            const vector_scratch = try work_alloc.alloc(f32, entry.dims);
+            defer work_alloc.free(vector_scratch);
             for (unique_candidate_ids, candidate_metadata, fallback_doc_keys, 0..) |vector_id, maybe_metadata, fallback_doc_key, i| {
                 if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
                 const doc_key = maybe_metadata orelse fallback_doc_key;
@@ -35725,6 +35742,72 @@ test "dense vector id uses deterministic key hash with legacy mapping fallback" 
     try std.testing.expect(!second.needs_mapping);
     try std.testing.expectEqual(@as(u64, 42), second.vector_id);
     second_batch.abort();
+}
+
+test "workload admission exact dense allocations share scheduler and ResourceManager ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/dense-memory", .{root}, 0);
+    defer alloc.free(path);
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureDenseExecution(.{ .max_runnable_tasks = 1, .max_outstanding_tasks = 2, .max_working_bytes = 65536 });
+    var manager = try IndexManager.initWithOptions(alloc, root, .{ .resource_manager = &resources });
+    defer manager.deinit();
+    var index = try hbc_mod.HBCIndex.open(alloc, path.ptr, .{ .dims = 2, .leaf_size = 2, .branching_factor = 2 });
+    defer index.close();
+    try index.bulkBuildWithMetadata(&.{
+        .{ .vector_id = 1, .vector = &.{ 0, 0 }, .metadata = "doc:a" },
+        .{ .vector_id = 2, .vector = &.{ 1, 0 }, .metadata = "doc:b" },
+    });
+    index.attachResourceManager(&resources);
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry: IndexManager.DenseIndex = .{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "dense", .kind = .dense_vector, .config_json = "{}" },
+        .field_name = @constCast("embedding"),
+        .dims = 2,
+        .metric = .l2_squared,
+        .external = false,
+        .chunk_name = null,
+        .embedding_name = null,
+        .index = &index,
+    };
+    const Observer = struct {
+        observed: bool = false,
+        fn onLoad(raw: ?*anyopaque, hbc: *hbc_mod.HBCIndex, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const owner = hbc.resource_manager.?;
+            const stats = owner.denseExecutionStats();
+            self.observed = stats.runnable == 1 and stats.working_bytes > 0 and
+                owner.sliceStats(.dense_search_working_set).used_bytes >= stats.working_bytes;
+        }
+    };
+    var observer: Observer = .{};
+    hbc_mod.setTestGetVectorViewOrScratchHook(&observer, Observer.onLoad);
+    defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
+    const baseline = resources.sliceStats(.dense_search_working_set).used_bytes;
+    var outcome = try manager.exactScoreDenseEntryWithRequest(&entry, .{ .query = &.{ 0, 0 }, .k = 2, .filter_ids = &.{ 1, 2 } });
+    defer outcome.results.deinit();
+    try std.testing.expect(observer.observed);
+    try std.testing.expectEqual(@as(usize, 2), outcome.results.getHits().len);
+    try std.testing.expectEqual(@as(u64, 0), resources.denseExecutionStats().working_bytes);
+    try std.testing.expectEqual(@as(u64, 0), resources.denseExecutionStats().outstanding);
+    try std.testing.expectEqual(baseline, resources.sliceStats(.dense_search_working_set).used_bytes);
+    const too_many = try alloc.alloc(u64, 8193);
+    defer alloc.free(too_many);
+    @memset(too_many, 1);
+    try std.testing.expectError(error.AdmissionRequestTooLarge, manager.exactScoreDenseEntryWithRequest(&entry, .{
+        .query = &.{ 0, 0 },
+        .k = 2,
+        .filter_ids = too_many,
+    }));
+    try std.testing.expectEqual(@as(u64, 0), resources.denseExecutionStats().working_bytes);
+    try std.testing.expectEqual(@as(u64, 0), resources.denseExecutionStats().outstanding);
+    try std.testing.expectEqual(baseline, resources.sliceStats(.dense_search_working_set).used_bytes);
 }
 
 test "production exact dense scorer cancels during bounded vector work" {

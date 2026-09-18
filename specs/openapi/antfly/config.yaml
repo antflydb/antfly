@@ -818,6 +818,16 @@ components:
           maximum: 65536
           default: 0
           description: Maximum combined dense callers and helpers; zero disables this scheduler.
+        max_working_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+          description: >-
+            Hard aggregate ceiling for dense memory participating in scheduler
+            accounting. Currently covers scoped exact-search workspaces; pooled
+            HBC scratch and result ownership keep their existing memory policy.
+            Zero preserves the legacy memory path. Requires a nonzero task limit.
         max_outstanding_tasks:
           type: integer
           minimum: 0
