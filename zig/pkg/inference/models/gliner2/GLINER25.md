@@ -116,20 +116,32 @@ this machine does not have those checkpoints pulled.
 
 `extractors/gliner_boundary_qualification.zig`'s
 `"gliner boundary qualification measures pinned base checkpoint production
-geometry"` test tokenizes the same ten fixtures plus the shortest
-("Delete the temporary file.") and longest (the `/ai/v1/extract` repro
-below) reviewed requests through the pinned tokenizer and prints the exact
-observed range:
+geometry"` test tokenizes the ten canonical fixtures, the shortest and the
+`/ai/v1/extract` repro requests, and (after the follow-up in section 8 below)
+`examples/dogfood`'s real 11-entity/6-relation production schema against
+both its own short repro text and a realistic 107-word/610-byte corpus
+paragraph (`zig/ENRICHMENTS.md`), through the pinned tokenizer, and prints
+the exact observed range:
 
 ```
-document_bytes=[26,97] document_words=[5,15] window_words=[5,15] padded_sequence_tokens=[14,56]
+document_bytes=[26,610] document_words=[5,112] window_words=[5,112] padded_sequence_tokens=[14,218]
 ```
 
 The production row's `LengthContract` uses exactly this range (plus
 `request_items=[1,1]` and `window_count=[1,1]`, since every measured case was
-a single-item, single-window request). Widening any bound requires new
-measurement -- this file is the place to add it, and to re-run the geometry
-test to update the row.
+a single-item, single-window request). The wider dogfood schema alone
+roughly doubles `padded_sequence_tokens` versus the original 3-entity/2-
+relation rows at the same document length (56 -> 118): the schema's own
+entity/relation vocabulary is encoded as a prefix ahead of the document, so
+a bigger schema costs real sequence budget independent of document size.
+Widening any bound requires new measurement -- this file is the place to add
+it, and to re-run the geometry test to update the row. A document needing
+more single-window budget than this measured range -- most of
+`examples/dogfood`'s longer design-doc sections -- still requires
+long-document windowing, which remains unqualified for this checkpoint
+(`.long_document` is not in the feature set) and correctly fails closed with
+`error.UnsupportedGlinerBoundaryRuntime` rather than silently truncating or
+misbehaving.
 
 ### 4. Throughput
 
@@ -210,27 +222,20 @@ repro rather than only unit tests:
   `!gliner_boundary.runtime_available` instead of the model family name
   outright.
 - The documented plain extraction request (no `"schema_version"` field, as
-  used throughout this file and in `zig/EXTRACT.md`) is dispatched by
-  `extractJSON` to a pre-boundary legacy handler
-  (`extractEntitiesAndRelationsDirectJsonAlloc`) that treats any manifest
-  with a non-empty `gliner_model_type` as the old span-architecture GLiNER
-  pipeline (`LoadedModel.isGlinerModel()` only checks
-  `gliner_model_type.len > 0`, which is also true for `"gliner2.5"`), which
-  cannot execute a boundary session and fails deep inside `session_factory.zig`
-  with `error.BoundaryExtractionRequiresSchema`. Fixed with a new
-  `Node.boundaryUpgradeRequestJsonIfNeeded` helper: before schema-version
-  detection, `extractJSON` cheaply resolves the named model's listing
-  manifest, and if it is boundary-architecture and the request has no
-  `schema_version`, re-serializes the request with `"schema_version":2`
-  stamped on so it is routed through `extractV2InMemory` ->
-  `boundary_executor` instead. Any failure in that peek (bad JSON, unknown
-  model, non-boundary model, already-versioned request) falls through to the
-  prior, unmodified behavior. Covered by "gliner boundary v2 upgrades a plain
-  extraction request without schema_version for the pinned base checkpoint"
-  in `server/gliner_boundary_service_test.zig`.
+  used throughout this file, in `zig/EXTRACT.md`, and by
+  `examples/dogfood`'s producer JSON) is dispatched to a pre-boundary legacy
+  code path that treats any manifest with a non-empty `gliner_model_type` as
+  the old span-architecture GLiNER pipeline
+  (`LoadedModel.isGlinerModel()` only checks `gliner_model_type.len > 0`,
+  which is also true for `"gliner2.5"`), which cannot execute a boundary
+  session and fails deep inside `session_factory.zig` with
+  `error.BoundaryExtractionRequiresSchema`. See section 8 for the full fix:
+  the upgrade to `schema_version:2` now lives in `extractWithAdmission`, the
+  one entry both the HTTP handler and the in-process provider's
+  `extractDirect`/`extractDirectWithControl` share.
 
-All three fixes only ever *widen* what a *qualified* artifact can do; they
-add no new path to bypass `hasQualifiedIdentity`/`require()`'s exact-digest
+These fixes only ever *widen* what a *qualified* artifact can do; they add
+no new path to bypass `hasQualifiedIdentity`/`require()`'s exact-digest
 enforcement for an unqualified one.
 
 ### 7. Memory budget
@@ -246,6 +251,68 @@ succeeded. Operators serving this checkpoint should size these flags (or the
 equivalent `antfly standalone` config) generously; this is a capacity
 planning note, not a qualification bound -- it does not appear in the
 production row's `LengthContract`.
+
+### 8. Follow-up: the in-process provider entry, and widening for the real dogfood schema
+
+The fix in section 6 lived in `extractJSON` (the HTTP handler) only. The
+in-process worker's provider "extract" operation
+(`host.linkedInferenceInvokeProvider` in
+`antfly/src/standalone/inference_host.zig`) never calls `extractJSON`; it
+calls `Node.extractDirectWithControl` directly, which calls the shared
+`extractWithAdmission`. Running `examples/dogfood` in-process (real
+enrichment drain, `-extract-model fastino/gliner2.5-base-v1`) still hit
+`error.BoundaryExtractionRequiresSchema` on every extraction call.
+
+**Fix**: moved the upgrade into `extractWithAdmission` itself --
+`extracting_api.Request` already carries a `schema_version: ?u32` field, and
+`extractWithAdmission` already branches on it
+(`if (schema_version == 2) return self.extractV2WithAdmission(...)`) before
+any legacy dispatch. A new `Node.resolvesToBoundaryArchitecture(io,
+model_name)` helper backs both this check and `extractJSON`'s existing
+JSON-level `boundaryUpgradeRequestJsonIfNeeded`, so the peek logic exists
+once even though it currently runs from two call sites (HTTP's raw-JSON
+path intercepts earlier, before HTTP's own legacy `entities_relations`/
+`classifications` ctx-based handlers, which do not otherwise reach
+`extractWithAdmission`; the provider path has no such earlier interception
+point). Covered by "gliner boundary provider extractDirect upgrades a plain
+request for the qualified base checkpoint" in
+`server/gliner_boundary_service_test.zig`, which calls
+`Node.extractDirect` the same way the provider does, against the real
+checkpoint at its standard pulled location.
+
+**Verification**: ran `examples/dogfood ingest -reset` in-process
+(`ANTFLY_INFERENCE_WORKER=zig-out/bin/antfly`, no HTTP) against the real
+1,202-section corpus, twice. `error.BoundaryExtractionRequiresSchema`: 1,195
+of 1,202 sections before the fix (per the original handoff), 0 of 1,202
+after. Ingest completed both times (`INGEST_EXIT=0`).
+
+**New finding from that run**: `examples/dogfood`'s actual schema (11
+entities, 6 relations -- `knowledgeGraphIndexJSON` in
+`examples/dogfood/index_config.go`) is wider than this qualification's
+original 3-entity/2-relation evidence, and real design-doc sections range
+up to tens of KB. Against the qualified checkpoint, most extraction calls
+initially still failed -- now with `error.BoundaryTextLimitExceeded` /
+`error.UnsupportedGlinerBoundaryRuntime`-class rejections (the qualification
+gate correctly refusing geometry outside the measured `LengthContract`) or,
+for a few of the largest sections, `error.MemoryBudgetExceeded` -- rather
+than the routing crash. Section 3 above records the widened bounds measured
+for the real dogfood schema. This still does not qualify long documents:
+sections longer than roughly 110 words need long-document windowing
+(unqualified), and will continue to correctly fail closed rather than run
+un-reviewed. Making the rest of the corpus succeed is follow-up work,
+tracked by widening `production_entries` further with new measured
+long-document evidence, not by relaxing this gate.
+
+The remaining `error.MemoryBudgetExceeded` failures for the largest sections
+are a capacity-planning matter (section 7): the in-process/embedded worker
+path does not currently expose an equivalent of `antfly inference run`'s
+`--host-budget-mb`/`--backend-budget-mb`/`--scratch-budget-mb`/
+`--combined-budget-mb`/`--kv-budget-mb` flags (only the whole-process
+`ANTFLY_(INFERENCE_)PROCESS_MEMORY_BUDGET_MB` env vars exist, which did not
+change the outcome in testing), so operators embedding this checkpoint
+in-process cannot currently raise these specific generation budgets the way
+`antfly inference run`'s CLI flags allow. That gap is in the embedded
+worker/`antflylite` configuration surface, outside this file's ownership.
 
 ## How to re-qualify a different or wider artifact
 

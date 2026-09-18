@@ -15,6 +15,7 @@ const pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
 const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
 const factory = @import("../architectures/session_factory.zig");
 const memory = @import("../runtime/tier/memory.zig");
+const extracting_api = @import("antfly_extracting");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
@@ -432,4 +433,55 @@ test "gliner boundary v2 upgrades a plain extraction request without schema_vers
     var versioned_response = try dispatch(a, &node, versioned_body);
     defer versioned_response.deinit();
     try std.testing.expectEqual(@as(u16, 200), versioned_response.status.code);
+}
+
+// The in-process worker's provider "extract" operation
+// (host.linkedInferenceInvokeProvider in antfly/src/standalone/inference_host.zig)
+// calls Node.extractDirectWithControl directly, never through extractJSON.
+// It sends a typed extracting_api.Request built from the enrichment runtime's
+// producer_json config (examples/dogfood/index_config.go's
+// knowledgeGraphIndexJSON: {"provider":"antfly","model":...,"schema":
+// {"entities":[...],"relations":[{"type":...}]},"options":{...}}, rendered
+// by zig/lib/extracting without ever setting "schema_version"), so
+// request.schema_version is null. Before the extractJSON-level upgrade was
+// moved into extractWithAdmission (the entry both extractJSON's "structures"
+// operation and extractDirect share), this fell into the pre-boundary
+// legacy dispatch and failed with error.BoundaryExtractionRequiresSchema.
+// This checks the real production model directory directly (not the
+// ANTFLY_GLINER25_BASE_MODEL_DIR override above), matching how an operator
+// would actually have it pulled.
+test "gliner boundary provider extractDirect upgrades a plain request for the qualified base checkpoint" {
+    const home = platform.env.getenv("HOME") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const directory = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino", "gliner2.5-base-v1" });
+    defer a.free(directory);
+    std.Io.Dir.cwd().access(std.testing.io, directory, .{}) catch return error.SkipZigTest;
+    const models_dir = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino" });
+    defer a.free(models_dir);
+
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+
+    const content_json = try std.json.Stringify.valueAlloc(a, "The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection.", .{});
+    defer a.free(content_json);
+    const request = extracting_api.Request{
+        .inputs = &.{.{ .id = "1", .content_json = content_json }},
+        .schema_json =
+        \\{"entities":["component","subsystem","test"],"relations":[{"type":"depends_on"},{"type":"tested_by"}]}
+        ,
+        .options_json =
+        \\{"include_confidence":true,"include_spans":true}
+        ,
+    };
+    try std.testing.expect(request.schema_version == null);
+    var response = try node.extractDirect(a, "gliner2.5-base-v1", request);
+    defer response.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"entities\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"relations\":[") != null);
 }

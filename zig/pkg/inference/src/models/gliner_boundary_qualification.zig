@@ -201,14 +201,24 @@ const fastino_gliner25_base_v1_features = Features.initMany(&.{
 });
 
 // Exact min/max observed by the geometry-measuring test cited above: the
-// ten canonical fixtures plus the shortest and longest reviewed requests.
+// ten canonical fixtures, the shortest and longest reviewed short requests,
+// and examples/dogfood's real production schema (11 entities, 6 relations)
+// against both its own short repro text and a realistic 107-word/610-byte
+// corpus paragraph (zig/ENRICHMENTS.md). The wider schema alone roughly
+// doubles padded_sequence_tokens versus the earlier 3-entity/2-relation
+// rows at the same document length (56 -> 118), which is why this bound
+// widened well past the document-length increase alone. A document needing
+// more than this measured single-window range -- most of examples/dogfood's
+// longer design-doc sections -- still requires long-document windowing,
+// which remains unqualified (.long_document is not in the feature set
+// above) and correctly fails closed with UnsupportedGlinerBoundaryRuntime.
 const fastino_gliner25_base_v1_lengths = LengthContract{
     .request_items = .{ .min = 1, .max = 1 },
-    .document_bytes = .{ .min = 26, .max = 97 },
-    .document_words = .{ .min = 5, .max = 15 },
+    .document_bytes = .{ .min = 26, .max = 610 },
+    .document_words = .{ .min = 5, .max = 112 },
     .window_count = .{ .min = 1, .max = 1 },
-    .window_words = .{ .min = 5, .max = 15 },
-    .padded_sequence_tokens = .{ .min = 14, .max = 56 },
+    .window_words = .{ .min = 5, .max = 112 },
+    .padded_sequence_tokens = .{ .min = 14, .max = 218 },
 };
 
 const production_entries: []const Entry = &.{

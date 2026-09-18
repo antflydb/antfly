@@ -765,6 +765,20 @@ test "gliner boundary qualification measures pinned base checkpoint production g
             \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","test"],"relations":[{"type":"depends_on"},{"type":"tested_by"}]},"options":{"include_confidence":true,"include_spans":true},"inputs":[{"content":"The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection."}]}
             ,
         },
+        .{
+            .name = "examples/dogfood real production schema (11 entities, 6 relations) on the repro text",
+            .text = "The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection.",
+            .body =
+            \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]},"options":{"include_confidence":true,"include_spans":true},"inputs":[{"content":"The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection."}]}
+            ,
+        },
+        .{
+            .name = "examples/dogfood real production schema on a realistic corpus paragraph (ENRICHMENTS.md, 734 bytes/107 words)",
+            .text = "Both lanes are handed the same document group's classified work and, when both have real work for the quantum, are scheduled with `Io.concurrent` so their provider round trips overlap; the calling task runs the dense lane inline while awaiting the concurrently spawned asset lane. If the `Io` backend does not support concurrency (for example a deterministic single-flow VOPR/simulation harness), both lanes still run, just sequentially, with identical outcomes -- concurrency is a scheduling optimization, not a correctness requirement. In-flight work is bounded to exactly one preparation quantum per stream.",
+            .body =
+            \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]},"options":{"include_confidence":true,"include_spans":true},"inputs":[{"content":"Both lanes are handed the same document group's classified work and, when both have real work for the quantum, are scheduled with `Io.concurrent` so their provider round trips overlap; the calling task runs the dense lane inline while awaiting the concurrently spawned asset lane. If the `Io` backend does not support concurrency (for example a deterministic single-flow VOPR/simulation harness), both lanes still run, just sequentially, with identical outcomes -- concurrency is a scheduling optimization, not a correctness requirement. In-flight work is bounded to exactly one preparation quantum per stream."}]}
+            ,
+        },
     };
     var min = policy.LengthContract{
         .request_items = policy.Range.exact(1),

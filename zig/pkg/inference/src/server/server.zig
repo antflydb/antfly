@@ -8664,10 +8664,26 @@ pub const Node = struct {
         self: *Node,
         allocator: std.mem.Allocator,
         model_name: []const u8,
-        request: extracting_api.Request,
+        supplied_request: extracting_api.Request,
         admission_owner: ExtractionAdmissionOwner,
         supplied_control: ?InferenceExecutionControl,
     ) !extracting_api.Response {
+        // A boundary-architecture model (e.g. a qualified GLiNER2.5
+        // checkpoint) is only ever executed through the schema_version:2
+        // path below (extractV2WithAdmission -> extractV2InMemory ->
+        // boundary_executor); the legacy dispatch beneath this check cannot
+        // run it. This is the one entry point shared by both the HTTP
+        // "structures" operation and extractDirect/extractDirectWithControl
+        // (the entry the in-process worker's provider operation calls), so
+        // upgrading here -- exactly once, before any manifest is resolved
+        // for real -- covers both without either caller needing to know
+        // this internal detail. Any resolution failure (bad model name,
+        // non-boundary model) leaves the request unmodified.
+        var request = supplied_request;
+        if (request.schema_version == null) upgrade: {
+            const io = self.session_manager.io orelse break :upgrade;
+            if (self.resolvesToBoundaryArchitecture(io, model_name)) request.schema_version = 2;
+        }
         const schema_version = request.schema_version orelse 1;
         if (schema_version == 2) {
             var failure = extraction_v2.FailureContext{};
@@ -18218,6 +18234,26 @@ pub const Node = struct {
         return !ctx.isCancellationRequested();
     }
 
+    /// True if `model_name` resolves to a boundary-architecture manifest
+    /// (e.g. a qualified GLiNER2.5 checkpoint). Used only to decide whether a
+    /// request that omits an explicit schema version must be upgraded onto
+    /// the schema_version:2 path before any operation-specific dispatch;
+    /// this grants no execution permission by itself -- Gate/require() still
+    /// independently enforce the exact identity, backend, feature set, and
+    /// geometry once a session loads. Fails closed to `false` (leave the
+    /// request alone) on any resolution error, so it can never itself turn a
+    /// valid request into a rejection.
+    fn resolvesToBoundaryArchitecture(self: *Node, io: std.Io, model_name: []const u8) bool {
+        if (model_name.len == 0) return false;
+        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const model_path = self.resolveRequestModelPath(scratch, io, model_name, "extractors") catch return false;
+        var manifest = manifest_mod.loadListingFromDir(scratch, model_path) catch return false;
+        defer manifest.deinit();
+        return manifest.gliner_architecture == .boundary;
+    }
+
     /// If `request_json` names a boundary-architecture model and does not
     /// already declare a schema version, returns a new allocation (owned by
     /// `result_allocator`) with `"schema_version":2` stamped on, so
@@ -18227,6 +18263,17 @@ pub const Node = struct {
     /// model, non-boundary model, already-versioned request) so the caller
     /// falls through to its existing, unmodified behavior; this must never
     /// itself decide extraction is unsupported.
+    ///
+    /// This is the HTTP-side counterpart of the same upgrade applied to the
+    /// typed request in extractWithAdmission below (used by
+    /// extractDirect/extractDirectWithControl, the entry the in-process
+    /// worker's provider operation calls). Both exist because HTTP's legacy
+    /// (schema_version-less) dispatch for the "entities_relations" and
+    /// "classifications" operations does not otherwise pass through
+    /// extractWithAdmission; upgrading the raw JSON here, before that
+    /// operation switch, is what keeps this file's one other legacy
+    /// entities/relations implementation (extractEntitiesAndRelations) out
+    /// of the boundary architecture's path entirely.
     fn boundaryUpgradeRequestJsonIfNeeded(
         self: *Node,
         result_allocator: std.mem.Allocator,
@@ -18244,10 +18291,7 @@ pub const Node = struct {
         if (parsed.value.object.contains("schema_version")) return null;
         const model_value = parsed.value.object.get("model") orelse return null;
         if (model_value != .string or model_value.string.len == 0) return null;
-        const model_path = self.resolveRequestModelPath(scratch, io, model_value.string, "extractors") catch return null;
-        var manifest = manifest_mod.loadListingFromDir(scratch, model_path) catch return null;
-        defer manifest.deinit();
-        if (manifest.gliner_architecture != .boundary) return null;
+        if (!self.resolvesToBoundaryArchitecture(io, model_value.string)) return null;
         parsed.value.object.put(scratch, "schema_version", .{ .integer = 2 }) catch return null;
         return std.json.Stringify.valueAlloc(result_allocator, parsed.value, .{}) catch null;
     }
