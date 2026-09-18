@@ -20698,3 +20698,135 @@ test "metadata service store report workload benchmark reconciliation view first
         std.debug.print("GROUP_CACHE_FIRST_READER_BENCH groups={d} p50_ms={d:.6}\n", .{ count, @as(f64, @floatFromInt(samples[4])) / 1e6 });
     }
 }
+
+test "workload admission table storage rejects proposals before decoder activation" {
+    const Factory = struct {
+        alloc: std.mem.Allocator,
+        store: *raft_engine.core.MemoryStorage,
+
+        fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
+            return .{ .ptr = self, .vtable = &.{ .build_descriptor = buildDescriptor, .free_descriptor = freeDescriptor } };
+        }
+
+        fn buildDescriptor(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, &[_]raft_engine.core.types.NodeId{record.local_node_id});
+            return .{
+                .group = .{
+                    .group_id = record.group_id,
+                    .local_node_id = record.local_node_id,
+                    .raft_config = .{
+                        .id = record.local_node_id,
+                        .group_id = record.group_id,
+                        .peers = peers,
+                        .election_tick = 5,
+                        .heartbeat_tick = 1,
+                        .pre_vote = false,
+                        .check_quorum = true,
+                    },
+                    .storage = self.store.storage(),
+                },
+                .bootstrap = switch (record.bootstrap_mode) {
+                    .empty => .empty,
+                    .persisted => .persisted,
+                    .fetch_snapshot => .persisted,
+                },
+            };
+        }
+
+        fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = alloc;
+            self.alloc.free(desc.group.raft_config.peers);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+
+    var svc = try MetadataHttpService.init(std.testing.allocator, .{
+        .http = .{
+            .host = .{
+                .local_node_id = 1,
+                .metadata_group_id = 2900,
+                .replica_root_dir = replica_root,
+                .replica_catalog_path = replica_catalog_path,
+            },
+            .transport = .{
+                .snapshot = .{ .root_dir = snapshot_root },
+            },
+        },
+    }, .{
+        .http = .{
+            .http = .{
+                .host = .{
+                    .descriptor_factory = factory.iface(),
+                },
+            },
+        },
+    }, .{
+        .observe_local_replica_root = false,
+    });
+    defer svc.deinit();
+
+    _ = try svc.ensureMetadataReplica(.{
+        .group_id = 2900,
+        .replica_id = 1,
+        .local_node_id = 1,
+        .bootstrap_mode = .empty,
+    });
+    try svc.campaignMetadataGroup();
+    const active: metadata_table_manager.TableRecord = .{
+        .table_id = 42,
+        .name = "table:42",
+        .storage = .{ .transaction_recovery = .{ .protocol_version = 1, .max_count = 4, .max_bytes = 4194304, .max_transaction_bytes = 1048576 } },
+    };
+    const commands = [_]metadata_storage.TransitionCommand{.{ .upsert_table = active }};
+    const initial_index = try store.storage().lastIndex();
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, svc.proposeTransitionCommandWithReceipt(commands[0]));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, svc.proposeTransitionCommandsWithReceipt(&commands));
+    try std.testing.expectEqual(initial_index, try store.storage().lastIndex());
+    var rounds: usize = 0;
+    while (try svc.metadataIncarnation() == null and rounds < 32) : (rounds += 1) try svc.runRound();
+    const incarnation = (try svc.metadataIncarnation()) orelse return error.MissingMetadataIncarnation;
+    const raft_status = svc.raft.host.http_host.host.raftStatus(2900).?;
+    const members = try collectReallocationBarrierNodeIds(std.testing.allocator, raft_status.conf_state, svc.reallocation_protocol_peers);
+    defer std.testing.allocator.free(members);
+    const ready = try tableTopologyProtocolReadiness(raft_status.hard.current_term, metadata_topology_protocol.table_storage_version, incarnation, members);
+    const activation: metadata_topology_protocol.Activation = .{
+        .version = metadata_topology_protocol.table_storage_version,
+        .incarnation = incarnation,
+        .member_count = ready.protected_member_count,
+        .membership_fingerprint = ready.protected_membership_fingerprint,
+    };
+    var old = activation;
+    old.version -= 1;
+    const old_bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, old, .{});
+    defer std.testing.allocator.free(old_bytes);
+    const old_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .activate_topology_protocol = old_bytes });
+    try svc.waitForTransitionApplied(old_receipt);
+    const before_rejection = try store.storage().lastIndex();
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, svc.proposeTransitionCommandWithReceipt(commands[0]));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, svc.proposeTransitionCommandsWithReceipt(&commands));
+    try std.testing.expectEqual(before_rejection, try store.storage().lastIndex());
+    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, activation, .{});
+    defer std.testing.allocator.free(bytes);
+    const activated = try svc.proposeTransitionCommandWithReceipt(.{ .activate_topology_protocol = bytes });
+    try svc.waitForTransitionApplied(activated);
+    const receipt = try svc.proposeTransitionCommandsWithReceipt(&commands);
+    try svc.waitForTransitionApplied(receipt);
+    const projected = try svc.listProjectedTables(std.testing.allocator);
+    defer svc.freeProjectedTables(std.testing.allocator, projected);
+    try std.testing.expectEqual(@as(usize, 1), projected.len);
+    try std.testing.expectEqualDeep(active.storage, projected[0].storage);
+}
