@@ -68,6 +68,17 @@ pub fn add(
                 .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
             });
             tests.executable.root_module.addObject(test_metadata.object);
+            if (index == 0) {
+                const fixture_module = b.createModule(.{
+                    .root_source_file = b.path("pkg/antfly/src/storage_backend_read_boundary_fixture.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                });
+                owner_imports.configureStorage(b, fixture_module, true);
+                owner_imports.storage_boundary.configureProfile(fixture_module, true, true, .owner);
+                const fixture = b.addObject(.{ .name = "backend-read-boundary-fixture", .root_module = fixture_module });
+                tests.executable.root_module.addObject(fixture);
+            }
             runs[index] = tests.run(b);
             if (index == 0)
                 b.step("antfly-storage-owner-test", "Run tests through the compiled storage owner boundary").dependOn(&runs[index].step);

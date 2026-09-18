@@ -232,19 +232,21 @@ pub const ReadScope = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     const VTable = struct {
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         close: *const fn (Allocator, *anyopaque) void,
     };
     pub fn get(self: *@This(), key: []const u8) ![]const u8 {
-        return self.vtable.get(self.ptr, key);
+        return BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
     /// Results share the scope lifetime, not the parent snapshot's lifetime.
     pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
-        if (self.vtable.get_many_sorted) |get_many| return get_many(self.ptr, keys, values);
+        if (self.vtable.get_many_sorted) |get_many| return BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many, .{ self.ptr, keys, values });
         for (keys, values) |key, *value| value.* = self.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -307,6 +309,8 @@ pub const ReadTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -323,14 +327,14 @@ pub const ReadTxn = struct {
     }
 
     pub fn get(self: *ReadTxn, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
 
     pub fn getManySorted(self: *ReadTxn, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
-            return try get_many_sorted(self.ptr, keys, values);
+            return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values });
         }
         for (keys, 0..) |key, i| {
             values[i] = self.get(key) catch |err| blk: {
@@ -341,14 +345,14 @@ pub const ReadTxn = struct {
     }
 
     pub fn openCursor(self: *ReadTxn) !Cursor {
-        return try self.vtable.open_cursor(self.allocator, self.ptr);
+        return try BoundaryAbi.call("open_cursor", self.boundary_dispatch, self.vtable.open_cursor, .{ self.allocator, self.ptr });
     }
 
     /// Owns the same immutable snapshot, with independent read/cursor scratch.
     /// The original handle may be aborted before this handle or its cursors.
     pub fn forkRead(self: *ReadTxn) !ReadTxn {
         const fork = self.vtable.fork_read orelse return error.ReadSnapshotForkUnsupported;
-        return fork(self.allocator, self.ptr);
+        return BoundaryAbi.call("fork_read", self.boundary_dispatch, fork, .{ self.allocator, self.ptr });
     }
 
     pub fn forkBorrowedRead(self: *ReadTxn) !ReadTxn {
@@ -356,7 +360,7 @@ pub const ReadTxn = struct {
     }
 
     pub fn openReadScope(self: *ReadTxn, alloc: Allocator) !ReadScope {
-        if (self.vtable.open_read_scope) |open| return open(alloc, self.ptr);
+        if (self.vtable.open_read_scope) |open| return BoundaryAbi.call("open_read_scope", self.boundary_dispatch, open, .{ alloc, self.ptr });
         var cursor = try self.openCursor();
         errdefer cursor.close();
         return cursorReadScope(alloc, cursor);
@@ -367,6 +371,8 @@ pub const ProbeTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         /// One get_many_sorted call observes a single committed view. Separate
@@ -386,20 +392,21 @@ pub const ProbeTxn = struct {
     }
 
     pub fn get(self: *ProbeTxn, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
 
     /// May pin an immutable generation until abort. Prefer get for long-lived
     /// probes; use this for a short-lived point projection.
     pub fn getLeased(self: *ProbeTxn, key: []const u8) ![]const u8 {
-        return try (self.vtable.get_leased orelse self.vtable.get)(self.ptr, key);
+        if (self.vtable.get_leased) |get_leased| return BoundaryAbi.call("get_leased", self.boundary_dispatch, get_leased, .{ self.ptr, key });
+        return self.get(key);
     }
 
     pub fn getManySorted(self: *ProbeTxn, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
-            return try get_many_sorted(self.ptr, keys, values);
+            return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values });
         }
         for (keys, 0..) |key, i| {
             values[i] = self.get(key) catch |err| blk: {
@@ -418,7 +425,7 @@ pub const ProbeTxn = struct {
         if (keys.len != values.len) return error.InvalidBatch;
         if (self.vtable.get_many_sorted_with_block_cache_admission) |get_many_sorted| {
             @memset(values, null);
-            return try get_many_sorted(self.ptr, keys, values, admission);
+            return try BoundaryAbi.call("get_many_sorted_with_block_cache_admission", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values, admission });
         }
         return try self.getManySorted(keys, values);
     }
@@ -450,6 +457,8 @@ pub const NamespaceReadTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -464,14 +473,14 @@ pub const NamespaceReadTxn = struct {
     }
 
     pub fn get(self: *NamespaceReadTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, namespace, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key });
     }
 
     pub fn getManySorted(self: *NamespaceReadTxn, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
-            return try get_many_sorted(self.ptr, namespace, keys, values);
+            return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, namespace, keys, values });
         }
         for (keys, 0..) |key, i| {
             values[i] = self.get(namespace, key) catch |err| blk: {
@@ -483,7 +492,7 @@ pub const NamespaceReadTxn = struct {
 
     pub fn openCursor(self: *NamespaceReadTxn, namespace: backend_types.Namespace) !Cursor {
         const open_cursor = self.vtable.open_cursor orelse return error.Unsupported;
-        return try open_cursor(self.allocator, self.ptr, namespace);
+        return try BoundaryAbi.call("open_cursor", self.boundary_dispatch, open_cursor, .{ self.allocator, self.ptr, namespace });
     }
 };
 
@@ -553,6 +562,8 @@ pub const NamespaceWriteTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -571,20 +582,20 @@ pub const NamespaceWriteTxn = struct {
     }
 
     pub fn commit(self: *NamespaceWriteTxn) !void {
-        try self.vtable.commit(self.allocator, self.ptr);
+        try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
         self.* = undefined;
     }
 
     pub fn get(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, namespace, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key });
     }
 
     pub fn getManySorted(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
-        if (self.vtable.get_many_sorted) |get_many_sorted| return try get_many_sorted(self.ptr, namespace, keys, values);
+        if (self.vtable.get_many_sorted) |get_many_sorted| return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, namespace, keys, values });
         @memset(values, null);
         for (keys, values) |key, *value| {
-            value.* = self.vtable.get(self.ptr, namespace, key) catch |err| switch (err) {
+            value.* = BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key }) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
@@ -592,21 +603,21 @@ pub const NamespaceWriteTxn = struct {
     }
 
     pub fn put(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
-        try self.vtable.put(self.ptr, namespace, key, value);
+        try BoundaryAbi.call("put", self.boundary_dispatch, self.vtable.put, .{ self.ptr, namespace, key, value });
     }
 
     pub fn appendPut(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
         const append_put = self.vtable.append_put orelse return error.Unsupported;
-        try append_put(self.ptr, namespace, key, value);
+        try BoundaryAbi.call("append_put", self.boundary_dispatch, append_put, .{ self.ptr, namespace, key, value });
     }
 
     pub fn delete(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8) !void {
-        try self.vtable.delete(self.ptr, namespace, key);
+        try BoundaryAbi.call("delete", self.boundary_dispatch, self.vtable.delete, .{ self.ptr, namespace, key });
     }
 
     pub fn openCursor(self: *NamespaceWriteTxn, namespace: backend_types.Namespace) !Cursor {
         const open_cursor = self.vtable.open_cursor orelse return error.Unsupported;
-        return try open_cursor(self.allocator, self.ptr, namespace);
+        return try BoundaryAbi.call("open_cursor", self.boundary_dispatch, open_cursor, .{ self.allocator, self.ptr, namespace });
     }
 };
 
@@ -614,7 +625,9 @@ pub const Batch = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
     write_gate: ?*std.atomic.Mutex = null,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -637,13 +650,13 @@ pub const Batch = struct {
     }
 
     pub fn commit(self: *Batch) !void {
-        try self.vtable.commit(self.allocator, self.ptr);
+        try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
         if (self.write_gate) |mutex| mutex.unlock();
         self.* = undefined;
     }
 
     pub fn get(self: *Batch, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
 
     /// Return presence only. Native backends avoid retained value payloads and
@@ -652,7 +665,7 @@ pub const Batch = struct {
         if (keys.len != present.len) return error.InvalidBatch;
         for (keys, 0..) |key, i| if (i != 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
         @memset(present, false);
-        if (self.vtable.contains_many_sorted) |contains| return contains(self.ptr, keys, present);
+        if (self.vtable.contains_many_sorted) |contains| return BoundaryAbi.call("contains_many_sorted", self.boundary_dispatch, contains, .{ self.ptr, keys, present });
         for (keys, present) |key, *exists| exists.* = if (self.get(key)) |_| true else |err| switch (err) {
             error.NotFound => false,
             else => return err,
@@ -663,7 +676,7 @@ pub const Batch = struct {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
-            return try get_many_sorted(self.ptr, keys, values);
+            return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values });
         }
         for (keys, 0..) |key, i| {
             values[i] = self.get(key) catch |err| blk: {
@@ -674,26 +687,26 @@ pub const Batch = struct {
     }
 
     pub fn put(self: *Batch, key: []const u8, value: []const u8) !void {
-        try self.vtable.put(self.ptr, key, value);
+        try BoundaryAbi.call("put", self.boundary_dispatch, self.vtable.put, .{ self.ptr, key, value });
     }
 
     pub fn appendPut(self: *Batch, key: []const u8, value: []const u8) !void {
         const append_put = self.vtable.append_put orelse return error.Unsupported;
-        try append_put(self.ptr, key, value);
+        try BoundaryAbi.call("append_put", self.boundary_dispatch, append_put, .{ self.ptr, key, value });
     }
 
     pub fn delete(self: *Batch, key: []const u8) !void {
-        try self.vtable.delete(self.ptr, key);
+        try BoundaryAbi.call("delete", self.boundary_dispatch, self.vtable.delete, .{ self.ptr, key });
     }
 
     pub fn openCursor(self: *Batch) !Cursor {
         const open_cursor = self.vtable.open_cursor orelse return error.Unsupported;
-        return try open_cursor(self.allocator, self.ptr);
+        return try BoundaryAbi.call("open_cursor", self.boundary_dispatch, open_cursor, .{ self.allocator, self.ptr });
     }
 
     pub fn setReplayOpaque(self: *Batch, sequence: u64, payload: []const u8) !void {
         const set_replay_opaque = self.vtable.set_replay_opaque orelse return error.Unsupported;
-        try set_replay_opaque(self.ptr, sequence, payload);
+        try BoundaryAbi.call("set_replay_opaque", self.boundary_dispatch, set_replay_opaque, .{ self.ptr, sequence, payload });
     }
 };
 
@@ -701,6 +714,8 @@ pub const NamespaceBatch = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -718,20 +733,20 @@ pub const NamespaceBatch = struct {
     }
 
     pub fn commit(self: *NamespaceBatch) !void {
-        try self.vtable.commit(self.allocator, self.ptr);
+        try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
         self.* = undefined;
     }
 
     pub fn get(self: *NamespaceBatch, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, namespace, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key });
     }
 
     pub fn getManySorted(self: *NamespaceBatch, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
-        if (self.vtable.get_many_sorted) |get_many_sorted| return try get_many_sorted(self.ptr, namespace, keys, values);
+        if (self.vtable.get_many_sorted) |get_many_sorted| return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, namespace, keys, values });
         @memset(values, null);
         for (keys, values) |key, *value| {
-            value.* = self.vtable.get(self.ptr, namespace, key) catch |err| switch (err) {
+            value.* = BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key }) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
@@ -739,16 +754,16 @@ pub const NamespaceBatch = struct {
     }
 
     pub fn put(self: *NamespaceBatch, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
-        try self.vtable.put(self.ptr, namespace, key, value);
+        try BoundaryAbi.call("put", self.boundary_dispatch, self.vtable.put, .{ self.ptr, namespace, key, value });
     }
 
     pub fn appendPut(self: *NamespaceBatch, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
         const append_put = self.vtable.append_put orelse return error.Unsupported;
-        try append_put(self.ptr, namespace, key, value);
+        try BoundaryAbi.call("append_put", self.boundary_dispatch, append_put, .{ self.ptr, namespace, key, value });
     }
 
     pub fn delete(self: *NamespaceBatch, namespace: backend_types.Namespace, key: []const u8) !void {
-        try self.vtable.delete(self.ptr, namespace, key);
+        try BoundaryAbi.call("delete", self.boundary_dispatch, self.vtable.delete, .{ self.ptr, namespace, key });
     }
 };
 
@@ -1029,6 +1044,8 @@ pub const NamespaceStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
@@ -1050,27 +1067,27 @@ pub const NamespaceStore = struct {
     }
 
     pub fn beginRead(self: *NamespaceStore) !NamespaceReadTxn {
-        return try self.vtable.begin_read(self.allocator, self.ptr);
+        return try BoundaryAbi.call("begin_read", self.boundary_dispatch, self.vtable.begin_read, .{ self.allocator, self.ptr });
     }
 
     pub fn beginProbe(self: *NamespaceStore) !NamespaceReadTxn {
         if (self.vtable.begin_probe) |begin_probe| {
-            return try begin_probe(self.allocator, self.ptr);
+            return try BoundaryAbi.call("begin_probe", self.boundary_dispatch, begin_probe, .{ self.allocator, self.ptr });
         }
         return try self.beginRead();
     }
 
     pub fn beginWrite(self: *NamespaceStore) !NamespaceWriteTxn {
-        return try self.vtable.begin_write(self.allocator, self.ptr);
+        return try BoundaryAbi.call("begin_write", self.boundary_dispatch, self.vtable.begin_write, .{ self.allocator, self.ptr });
     }
 
     pub fn beginBatch(self: *NamespaceStore) !NamespaceBatch {
-        return try self.vtable.begin_batch(self.allocator, self.ptr);
+        return try BoundaryAbi.call("begin_batch", self.boundary_dispatch, self.vtable.begin_batch, .{ self.allocator, self.ptr });
     }
 
     pub fn beginBatchWithOptions(self: *NamespaceStore, options: backend_types.BatchOptions) !NamespaceBatch {
         if (self.vtable.begin_batch_with_options) |begin_batch_with_options| {
-            return try begin_batch_with_options(self.allocator, self.ptr, options);
+            return try BoundaryAbi.call("begin_batch_with_options", self.boundary_dispatch, begin_batch_with_options, .{ self.allocator, self.ptr, options });
         }
         return try self.beginBatch();
     }

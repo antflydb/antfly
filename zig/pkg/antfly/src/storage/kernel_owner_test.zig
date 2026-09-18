@@ -2201,3 +2201,52 @@ test "opaque storage context activates shared read policy and rejects competing 
     try std.testing.expectEqual(@as(u64, 0), metrics.read_bounded_outstanding);
     try std.testing.expectEqual(@as(u64, 0), metrics.read_transition_outstanding);
 }
+
+extern fn antfly_test_backend_read(*const @import("../runtime_native_abi.zig").TypeContract, *anyopaque) callconv(.c) @import("../runtime_error_abi.zig").Status;
+extern fn antfly_test_backend_probe(*const @import("../runtime_native_abi.zig").TypeContract, *anyopaque) callconv(.c) @import("../runtime_error_abi.zig").Status;
+extern fn antfly_test_backend_not_found_ordinal() callconv(.c) u32;
+
+test "compiled backend read callbacks preserve semantic errors and child ownership" {
+    const erased = @import("backend_erased.zig");
+    const native = @import("../runtime_native_abi.zig");
+    const callback = @import("../runtime_callback_abi.zig");
+    var read: erased.ReadTxn = undefined;
+    const contract = native.TypeContract.of(erased.ReadTxn);
+    var old_contract = contract;
+    old_contract.version -= 1;
+    try std.testing.expect(!antfly_test_backend_read(&old_contract, &read).isOk());
+    try std.testing.expect(antfly_test_backend_read(&contract, &read).isOk());
+    var read_live = true;
+    defer if (read_live) read.abort();
+    // These assertions prove this isn't accidentally a same-unit test whose
+    // raw Zig error values happen to be interpreted correctly.
+    try std.testing.expect(read.boundary_dispatch != callback.Boundary(erased.ReadTxn.VTable).local_dispatch);
+    try std.testing.expect(antfly_test_backend_not_found_ordinal() != @intFromError(error.NotFound));
+    try std.testing.expectError(error.NotFound, read.get("missing"));
+    try std.testing.expectEqualStrings("value", try read.get("present"));
+    var values: [2]?[]const u8 = undefined;
+    try read.getManySorted(&.{ "missing", "present" }, &values);
+    try std.testing.expect(values[0] == null);
+    try std.testing.expectEqualStrings("value", values[1].?);
+    var fork = try read.forkRead();
+    defer fork.abort();
+    var scope = try read.openReadScope(std.testing.allocator);
+    defer scope.close();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    read.abort();
+    read_live = false;
+    try std.testing.expectError(error.NotFound, fork.get("missing"));
+    try std.testing.expectError(error.NotFound, scope.get("missing"));
+    try std.testing.expect((try cursor.first()) == null);
+    try std.testing.expectError(error.InvalidArgument, cursor.next());
+    var probe: erased.ProbeTxn = undefined;
+    const probe_contract = native.TypeContract.of(erased.ProbeTxn);
+    try std.testing.expect(antfly_test_backend_probe(&probe_contract, &probe).isOk());
+    defer probe.abort();
+    try std.testing.expectError(error.NotFound, probe.get("missing"));
+    try std.testing.expectError(error.NotFound, probe.getLeased("missing"));
+    try probe.getManySorted(&.{ "missing", "present" }, &values);
+    try std.testing.expect(values[0] == null);
+    try std.testing.expectEqualStrings("value", values[1].?);
+}
