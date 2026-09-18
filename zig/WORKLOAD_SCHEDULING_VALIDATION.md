@@ -250,8 +250,9 @@ release, API/join allocation-failure sweeps, durable coordinator uncertainty,
 worker namespace/restart fencing, protected authenticated control ingress, and
 compiled callback ownership. It includes metrics-cache age and table-policy
 identity checks. It does not qualify full LSM/backend completion memory or
-optimized performance. Production Debug build and native coordinator fault
-qualification are pending for these new sources.
+optimized performance. The production Debug build subsequently passed at
+`0ac3f0af89bbc85a7074ab50ae81d3d44a25649d`; native coordinator fault
+qualification remains pending as described below.
 
 Development failures were retained in checkpoint logs 5 through 8: generated
 nullable projection and join-default compiler errors, a shadowed local, missing
@@ -266,3 +267,49 @@ earlier frozen `3f9d2c481e` Debug binary. The fixed-policy plan stage passed 53
 tests with one optional skip. These are harness checks, not evidence that the
 new coordinator has passed native fault qualification or that a Cloud release
 performance row is qualified.
+
+
+### Small-node correctness follow-up
+
+Correctness runs use small local processes and tight resource budgets. Cloud
+package sizes are performance qualification targets, not correctness prerequisites.
+
+The production Debug binary at `0ac3f0af89` built successfully, SHA-256
+`3dc77f9d9e9da972c1e0c29e37cc79d8a5345df08cf28f1ee8fa8744a34e8c62`.
+Evidence: `/tmp/workload-recovery-production-debug-receipt.json` and
+`/tmp/workload-recovery-production-debug.log`.
+
+Fresh three-process runs found two failures before coordinator fault injection:
+
+- Recovery-enabled table creation returned HTTP 409 with `unknown-v1`. The
+  metadata binary codec omitted storage policy. Commit `c10e602778` preserves
+  nondefault settings, validates the extension in full and projected readers,
+  and gates replicated admission on membership-bound decoder capability 11.
+  Default records retain their existing wire bytes and capability floor.
+- A fresh policy-free table created and accepted a batch, but lookup returned
+  HTTP 500 reporting `MetadataIncarnationMismatch`. Captured metadata identities
+  agree across head, status, catalog and routing responses. A debugger breakpoint
+  at the sole identity-mismatch guard did not fire. Error-boundary diagnosis is
+  ongoing; this is not evidence of an actual metadata identity change.
+
+Receipts are retained under `/tmp/workload-policy-routing-0ac3f0af89-receipts`,
+`/tmp/workload-metadata-identity-0ac3f0af89-receipts`, and
+`/tmp/workload-metadata-debug-0ac3f0af89-receipts`. Unknown writes were not replayed.
+Owned test processes exited cleanly.
+
+The request/runtime admission artifact passed **213 tests, one optional skip,
+zero failures/leaks**, with six expected and zero unexpected error logs
+(`/tmp/workload-recovery-coordination-checkpoint10.log`). The separate metadata
+artifact passed **64 tests, zero failures/leaks**, including actual catalog apply,
+extended record roundtrips and capability classification
+(`/tmp/workload-recovery-metadata-checkpoint12.log`). These artifacts have
+shared tests; their counts must not be added as distinct coverage. The combined
+admission gate now depends on both artifacts. Checkpoint 11 exposed a missing
+extension decoder in identity/query projections; checkpoint 12 includes its fix.
+
+Commit `f8c71099cd` adds the unused prepaid completion-credit ownership primitive.
+Its focused Debug and ReleaseSafe checks each passed 11 tests. It provides atomic
+reservation-to-observer accounting, canonical publication state, stale-copy
+rejection and retained-allocation ownership. It is not yet connected to durable
+transaction tickets or the LSM/WAL publication path, and therefore does not
+establish bounded backend completion under foreground exhaustion.
