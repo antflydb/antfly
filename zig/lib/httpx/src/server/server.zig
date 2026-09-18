@@ -3760,6 +3760,66 @@ test "wrapped handlers preserve the supplied handler target" {
     try std.testing.expectEqual(@as(usize, 1), wrapper.calls);
 }
 
+test "H1 retained large body preserves framing and retires after GET and HEAD" {
+    const State = struct {
+        var retired = std.atomic.Value(usize).init(0);
+        var identity: u8 = 0;
+        const payload = [_]u8{'x'} ** (16 * 1024);
+
+        fn retire(_: *anyopaque) void {
+            _ = retired.fetchAdd(1, .release);
+        }
+
+        fn handle(ctx: *Context) !Response {
+            var response = try ctx.text(&payload);
+            response.retirement = .{ .ptr = &identity, .release = retire };
+            return response;
+        }
+    };
+    State.retired.store(0, .release);
+    const alloc = std.testing.allocator;
+    var runtime = std.Io.Threaded.init(alloc, .{});
+    defer runtime.deinit();
+    var server = Server.initWithConfig(alloc, runtime.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.get("/body", State.handle);
+    try server.head("/body", State.handle);
+    var listener = Server.ListenerTask.init(&server);
+    try listener.start();
+    defer {
+        listener.requestStop();
+        listener.join() catch {};
+    }
+
+    var client = try Socket.connect(server.boundAddress().?, std.Io.Threaded.global_single_threaded.io());
+    defer client.close();
+    try client.setRecvTimeout(5000);
+    try client.sendAll("GET /body HTTP/1.1\r\nHost: test\r\n\r\nHEAD /body HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    var received: [State.payload.len + 4096]u8 = undefined;
+    var length: usize = 0;
+    while (true) {
+        if (length == received.len) return error.UnexpectedResponseSize;
+        const read = try client.recv(received[length..]);
+        if (read == 0) break;
+        length += read;
+    }
+    const wire = received[0..length];
+    const first_body = (mem.indexOf(u8, wire, "\r\n\r\n") orelse return error.MissingHeaders) + 4;
+    try std.testing.expect(mem.startsWith(u8, wire, "HTTP/1.1 200 "));
+    try std.testing.expectEqualStrings(&State.payload, wire[first_body..][0..State.payload.len]);
+    const second = wire[first_body + State.payload.len ..];
+    try std.testing.expect(mem.startsWith(u8, second, "HTTP/1.1 200 "));
+    try std.testing.expect(mem.indexOf(u8, second, "Content-Length: 16384\r\n") != null);
+    try std.testing.expectEqual(second.len, (mem.indexOf(u8, second, "\r\n\r\n") orelse return error.MissingHeaders) + 4);
+    listener.requestStop();
+    try listener.join();
+    try std.testing.expectEqual(@as(usize, 2), State.retired.load(.acquire));
+}
+
 test "Context response helpers" {
     const allocator = std.testing.allocator;
     var req = try Request.init(allocator, .GET, "/test");

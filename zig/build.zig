@@ -964,6 +964,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .filters = &.{
             "H2 response serialization strips connection-specific headers",
             "HTTP streaming headers and automatic preflight preserve middleware policy",
+            "H1 retained large body preserves framing and retires after GET and HEAD",
         },
     });
     const run_httpx_transport_regression_tests = b.addRunArtifact(httpx_transport_regression_tests);
