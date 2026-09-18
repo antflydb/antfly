@@ -769,6 +769,7 @@ const BatchReservationIdentity = struct {
 
 const ObserverIdentity = struct {
     current: u64,
+    metadata_pin_identity: u64 = 0,
     completion_pins: usize = 0,
     completion_reservation_identity: u64 = 0,
     completion_published: bool = false,
@@ -930,6 +931,8 @@ pub const ResourceManager = struct {
     capacity_source: ?CapacitySource = null,
     identity_allocator: std.mem.Allocator,
     next_identity: u64 = 1,
+    next_observer_metadata_pin_identity: u64 = 1,
+    observer_metadata_pins: usize = 0,
     reservation_identities: IdentityLedger(u64, ReservationIdentity) = .empty,
     batch_reservation_identities: IdentityLedger(u64, BatchReservationIdentity) = .empty,
     observer_identities: IdentityLedger(ObserverKey, ObserverIdentity) = .empty,
@@ -1690,6 +1693,8 @@ pub const ResourceManager = struct {
         self.reservation_identities = .empty;
         self.batch_reservation_identities.deinit(self.identity_allocator);
         self.batch_reservation_identities = .empty;
+        if (self.observer_metadata_pins != 0)
+            @panic("resource manager deinitialized with live observer metadata pins");
         self.observer_identities.deinit(self.identity_allocator);
         self.observer_identities = .empty;
     }
@@ -2771,7 +2776,7 @@ pub const ResourceManager = struct {
             self.memory.soft_limit_events +|= 1;
         if (!enforce_limits and self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)
             self.memory.hard_limit_rejections +|= 1;
-        if (next == 0 and owned.completion_pins == 0) _ = self.observer_identities.remove(key);
+        if (next == 0 and owned.completion_pins == 0 and owned.metadata_pin_identity == 0) _ = self.observer_identities.remove(key);
         self.pressure_change.advance();
     }
 
@@ -2921,12 +2926,14 @@ pub const ResourceManager = struct {
             return error.ResourceBudgetExceeded;
         }
 
-        if (source_next == 0) {
+        if (source_next == 0 and source_owned.metadata_pin_identity == 0) {
             _ = self.observer_identities.remove(source_key);
         } else {
             self.observer_identities.getPtr(source_key).?.current = source_next;
         }
-        if (destination_next == 0) {
+        if (destination_next == 0 and
+            (self.observer_identities.get(destination_key) orelse ObserverIdentity{ .current = 0 }).metadata_pin_identity == 0)
+        {
             _ = self.observer_identities.remove(destination_key);
         } else {
             self.observer_identities.getPtr(destination_key).?.current = destination_next;
@@ -2949,6 +2956,36 @@ pub const ResourceManager = struct {
         defer self.mutex.unlock();
         try self.reconcileUsageLocked(slice, @intFromPtr(current), current.*, next, true);
         current.* = next;
+    }
+
+    /// Prepare the bookkeeping for a stable-address observer before a sealed
+    /// operation. This owns metadata only: it grants no usage/admission credit.
+    /// Exactly one pin may live on an observer; generic accounting may still
+    /// change its usage, including through zero, without allocating its entry.
+    pub fn pinObserverMetadata(self: *ResourceManager, slice: Slice, current: *u64) !ObserverMetadataPin {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.next_observer_metadata_pin_identity == std.math.maxInt(u64))
+            return error.ObserverMetadataIdentityExhausted;
+        const key = ObserverKey{ .slice = slice, .identity = @intFromPtr(current) };
+        const existing = self.observer_identities.get(key);
+        if (existing) |owned| {
+            if (owned.current != current.* or owned.completion_pins != 0) {
+                self.memory.accounting_errors +|= 1;
+                return error.ResourceAccountingMismatch;
+            }
+            if (owned.metadata_pin_identity != 0) return error.ObserverMetadataAlreadyPinned;
+        } else if (current.* != 0) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        const entry = try self.observer_identities.getOrPut(self.identity_allocator, key);
+        if (!entry.found_existing) entry.value_ptr.* = .{ .current = 0 };
+        const identity = self.next_observer_metadata_pin_identity;
+        self.next_observer_metadata_pin_identity += 1;
+        entry.value_ptr.metadata_pin_identity = identity;
+        self.observer_metadata_pins += 1;
+        return .{ .manager = self, .slice = slice, .current = current, .identity = identity };
     }
 
     pub fn observeUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) void {
@@ -3413,6 +3450,37 @@ fn hbcClockEntries(budget_bytes: u64, estimated_entry_bytes: u64) usize {
     const entries = @min(hbc_max_clock_entries, @max(@as(u64, 1), budget_bytes / estimated_entry_bytes));
     return @intCast(entries);
 }
+
+/// Exclusive metadata lifetime for an ordinary observer. The manager and
+/// counter must outlive this pin. Copies do not acquire ownership: canonical
+/// generations reject stale releases even if the observer address is reused.
+pub const ObserverMetadataPin = struct {
+    manager: *ResourceManager,
+    slice: Slice,
+    current: *u64,
+    identity: u64,
+
+    pub fn release(self: *ObserverMetadataPin) !void {
+        const manager = self.manager;
+        lockAtomic(&manager.mutex);
+        defer manager.mutex.unlock();
+        const key = ObserverKey{ .slice = self.slice, .identity = @intFromPtr(self.current) };
+        const owned = manager.observer_identities.getPtr(key) orelse {
+            manager.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        };
+        if (self.identity == 0 or owned.metadata_pin_identity != self.identity or
+            owned.current != self.current.* or owned.completion_pins != 0)
+        {
+            manager.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        owned.metadata_pin_identity = 0;
+        manager.observer_metadata_pins -= 1;
+        if (owned.current == 0) _ = manager.observer_identities.remove(key);
+        self.identity = 0;
+    }
+};
 
 /// Prepaid ownership for one completion allocation/publication lifetime.
 /// The manager and tracked counter must remain at stable addresses, and the
@@ -6039,4 +6107,84 @@ test "resource manager records index repair activation pause separately from cle
     try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), stats.last_pause_ns);
     try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), stats.max_pause_ns);
     try std.testing.expectEqual(@as(u64, 25 * std.time.ns_per_ms), stats.last_budget_ns);
+}
+
+test "observer metadata pin admits bookkeeping before allocation-free zero transitions" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator(), .memory_budget = .{ .hard_limit_bytes = 32 } });
+    defer manager.deinit(std.testing.allocator);
+    var current: u64 = 0;
+    var pin = try manager.pinObserverMetadata(.lsm_in_memory_state, &current);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.ObserverMetadataAlreadyPinned, manager.pinObserverMetadata(.lsm_in_memory_state, &current));
+    failing.fail_index = failing.alloc_index;
+    try manager.adjustUsage(.lsm_in_memory_state, &current, 32);
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.adjustUsage(.lsm_in_memory_state, &current, 33));
+    try manager.adjustUsage(.lsm_in_memory_state, &current, 0);
+    try manager.adjustUsage(.lsm_in_memory_state, &current, 16);
+    manager.memory.budget.hard_limit_bytes = 1;
+    manager.observeUsage(.lsm_in_memory_state, &current, 8);
+    manager.observeUsage(.lsm_in_memory_state, &current, 0);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), manager.observer_identities.count());
+    try pin.release();
+    try std.testing.expectEqual(@as(usize, 0), manager.observer_identities.count());
+}
+
+test "observer metadata pin canonical generation rejects copied stale release and completion owner" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var current: u64 = 0;
+    var pin = try manager.pinObserverMetadata(.lsm_in_memory_state, &current);
+    try std.testing.expectError(error.ResourceAccountingMismatch, CompletionCredit.init(&manager, .lsm_in_memory_state, 16, &current));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.reservation_identities.count());
+    var stale = pin;
+    try pin.release();
+    var replacement = try manager.pinObserverMetadata(.lsm_in_memory_state, &current);
+    try std.testing.expectError(error.ResourceAccountingMismatch, stale.release());
+    try std.testing.expectEqual(@as(usize, 1), manager.observer_metadata_pins);
+    try manager.adjustUsage(.lsm_in_memory_state, &current, 8);
+    try replacement.release();
+    try std.testing.expectEqual(@as(u64, 8), current);
+    manager.observeUsage(.lsm_in_memory_state, &current, 0);
+    var credit = try CompletionCredit.init(&manager, .lsm_in_memory_state, 16, &current);
+    try std.testing.expectError(error.ResourceAccountingMismatch, manager.pinObserverMetadata(.lsm_in_memory_state, &current));
+    try credit.deinit();
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "observer metadata pin preserves atomic transfer endpoints without post-seal allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator(), .memory_budget = .{ .hard_limit_bytes = 32 } });
+    defer manager.deinit(std.testing.allocator);
+    var source: u64 = 0;
+    var destination: u64 = 0;
+    var source_pin = try manager.pinObserverMetadata(.lsm_wal_retention, &source);
+    defer source_pin.release() catch unreachable;
+    var destination_pin = try manager.pinObserverMetadata(.lsm_wal_retention, &destination);
+    defer destination_pin.release() catch unreachable;
+    try manager.adjustUsage(.lsm_wal_retention, &source, 32);
+    manager.memory.budget.hard_limit_bytes = 1;
+    failing.fail_index = failing.alloc_index;
+    try manager.transferUsage(.lsm_wal_retention, &source, 0, &destination, 32);
+    try std.testing.expectEqual(@as(u64, 32), manager.snapshot().memory.used_bytes);
+    try manager.transferUsage(.lsm_wal_retention, &destination, 0, &source, 32);
+    manager.observeUsage(.lsm_wal_retention, &source, 0);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 2), manager.observer_identities.count());
+}
+
+test "observer metadata pin allocation failure rolls back bookkeeping and identity exhaustion fails closed" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator() });
+    defer manager.deinit(std.testing.allocator);
+    var current: u64 = 0;
+    try std.testing.expectError(error.OutOfMemory, manager.pinObserverMetadata(.lsm_wal_retention, &current));
+    try std.testing.expectEqual(@as(usize, 0), manager.observer_metadata_pins);
+    try std.testing.expectEqual(@as(usize, 0), manager.observer_identities.count());
+    failing.fail_index = std.math.maxInt(usize);
+    manager.next_observer_metadata_pin_identity = std.math.maxInt(u64);
+    try std.testing.expectError(error.ObserverMetadataIdentityExhausted, manager.pinObserverMetadata(.lsm_wal_retention, &current));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
