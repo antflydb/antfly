@@ -68,7 +68,7 @@ pub fn withTools(alloc: std.mem.Allocator, chain: []const generating.ChainLink, 
     for (copy) |*link| {
         // These providers preserve both function definitions and tool history.
         switch (link.generator.provider) {
-            .antfly, .openai => {},
+            .antfly, .openai, .openrouter => {},
             else => return error.UnsupportedAgentToolProvider,
         }
         // A finished graph walk can leave no available tools. Omit both
@@ -79,6 +79,19 @@ pub fn withTools(alloc: std.mem.Allocator, chain: []const generating.ChainLink, 
         link.generator.tool_choice_json = if (has_tools) "\"auto\"" else null;
     }
     return copy;
+}
+
+test "agent tools accept OpenRouter generators" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const chain = try withTools(arena_impl.allocator(), &.{.{ .generator = .{
+        .provider = .openrouter,
+        .model = "test-model",
+        .url = "https://openrouter.ai/api/v1",
+    } }}, "{\"type\":\"object\"}");
+    try std.testing.expectEqual(.openrouter, chain[0].generator.provider);
+    try std.testing.expect(chain[0].generator.tools_json != null);
+    try std.testing.expectEqualStrings("\"auto\"", chain[0].generator.tool_choice_json.?);
 }
 
 test "agent conversation rejects duplicate IDs and parallel budget overflow" {
