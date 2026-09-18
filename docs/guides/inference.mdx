@@ -108,6 +108,11 @@ antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --task
 antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
 ```
 
+Pull publishes the model atomically, and the running process discovers it on the
+next model-list or inference request. No restart or refresh call is needed. The
+Antfarm dashboard refreshes its model list about every 30 seconds, so allow up
+to a minute for a newly pulled model to appear there.
+
 `--tasks` records what the model is for, which decides where it is discovered and which endpoints serve it. Text generation supports a specific set of decoder architectures, so check [Local Model Compatibility](/docs/guides/supported-models) before pulling a generator.
 
 `--projector auto` is the default. Gemma 4's unified projector enables image and audio inputs and is recorded in the generated model manifest. Use `--projector none` for a text-only installation.
