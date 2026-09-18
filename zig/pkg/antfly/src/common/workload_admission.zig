@@ -75,6 +75,7 @@ pub const MemoryAccount = struct {
     mutex: std.atomic.Mutex = .unlocked,
     controller: ?*Controller,
     retained_bytes: usize = 0,
+    outstanding_requests: usize = 0,
 
     fn lock(self: *MemoryAccount) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -87,9 +88,36 @@ pub const MemoryAccount = struct {
 
     pub fn release(self: *MemoryAccount) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
-        std.debug.assert(self.controller == null and self.retained_bytes == 0);
+        std.debug.assert(self.controller == null and self.retained_bytes == 0 and self.outstanding_requests == 0);
         self.allocator.destroy(self);
     }
+
+    /// Nonwaiting ingress reservation. Unlike a controller lease this may
+    /// survive controller teardown while the transport drains an exported body.
+    pub fn acquireOutstanding(self: *MemoryAccount) !OutstandingLease {
+        self.lock();
+        defer self.mutex.unlock();
+        const controller = self.controller orelse return error.AdmissionClosed;
+        if (!controller.tryAcquire()) return if (controller.stats().draining) error.AdmissionClosed else error.AdmissionFull;
+        self.outstanding_requests += 1;
+        self.retain();
+        return .{ .account = self };
+    }
+
+    pub const OutstandingLease = struct {
+        account: ?*MemoryAccount,
+
+        pub fn release(self: *OutstandingLease) void {
+            const account = self.account orelse return;
+            self.account = null;
+            account.lock();
+            std.debug.assert(account.outstanding_requests > 0);
+            account.outstanding_requests -= 1;
+            if (account.controller) |controller| controller.release();
+            account.mutex.unlock();
+            account.release();
+        }
+    };
 
     pub fn reserve(self: *MemoryAccount, bytes: usize) !void {
         self.lock();
@@ -818,4 +846,21 @@ test "workload admission bursts through C80 stay bounded and drain without rejec
         try std.testing.expectEqual(@as(u64, 0), drained.rejected_total);
         try std.testing.expectEqual(@as(u64, concurrency -| 32), drained.waited_total);
     }
+}
+
+test "workload admission outstanding leases survive transport drain and controller teardown" {
+    var gate = Controller.init(1);
+    const account = try gate.memoryAccount(std.testing.allocator);
+    defer account.release();
+    var first = try account.acquireOutstanding();
+    try std.testing.expectEqual(@as(usize, 1), gate.stats().in_flight);
+    try std.testing.expectError(error.AdmissionFull, account.acquireOutstanding());
+    first.release();
+    first.release();
+    try std.testing.expectEqual(@as(usize, 0), gate.stats().in_flight);
+    var escaped = try account.acquireOutstanding();
+    gate.deinitMemory();
+    try std.testing.expectError(error.AdmissionClosed, account.acquireOutstanding());
+    escaped.release();
+    try std.testing.expectEqual(@as(usize, 0), account.outstanding_requests);
 }
