@@ -258,6 +258,100 @@ Authenticated internal RPCs authorize each worker's scope and required secret.
 Publish invalidations after commit and periodically reconcile revisions so missed
 notifications cannot leave permanent stale caches.
 
+#### Distributed secret delivery to data nodes (planned)
+
+Metadata nodes implement the authoritative `NativeStore`; every data node hosts
+a read-only remote `Source` backed by internal RPCs and a memory cache. Metadata
+Raft replicates durable encrypted AFSE records. Data nodes obtain values needed
+by their assigned work and authorized scopes. Cluster-wide secrets may be
+available to all nodes, while tenant secrets require tenant-specific access.
+Having a node identity alone does not grant access to every scope or key.
+
+The initial delivery model decrypts on the metadata service and sends resolved
+values over mutually authenticated TLS. Only metadata nodes need KMS/key-provider
+access. Data nodes keep resolved values in memory, with no plaintext disk cache;
+responses and errors must not put secret values in logs or tracing. Direct AFSE
+delivery is a possible later alternative, but would require each recipient to
+have authorized unwrap access and separately provisioned key-provider credentials.
+Node identity, transport trust, and metadata key-provider credentials come from
+bootstrap configuration, not from the native store they unlock.
+
+The mutation and delivery sequence is:
+
+1. Encrypt the mutation and durably commit/apply it through metadata Raft,
+   advancing the scope revision and recording the changed entry revision.
+2. Publish an invalidation containing scope, key, committed revision, and change
+   kind (update or deletion). Notifications contain no secret values.
+3. An affected data node resolves the key through an authenticated internal RPC,
+   requiring at least the notified scope revision. The service authorizes the
+   node's scope/key access before returning a value or authoritative absence.
+4. The node publishes the refreshed cache entry and advances the relevant local
+   consumer generation. Provider clients, connection pools, and workers apply
+   the subsystem-specific rotation rules described later in this document.
+
+The intended internal protocol is:
+
+| Operation | Semantics |
+| --- | --- |
+| `ResolveSecret(scope, key, min_revision)` | Return an authorized value with its entry revision, or authoritative absence, plus the observed scope revision. |
+| `WatchSecrets(scope, after_revision)` | Deliver ordered committed changes/deletions after a scope revision, or explicitly report that replay history is unavailable. |
+| `GetSecretRevision(scope)` | Read an authorized current scope revision for periodic reconciliation. |
+
+Authoritative reads need a Raft read barrier or equivalent leader-confirmed
+freshness. Merely satisfying a caller's old minimum revision on an isolated
+follower must not renew a cache's freshness indefinitely. A node that cannot
+serve the requested revision and freshness must wait, forward, or return an
+availability error. Watch publication follows commit; reconnect/reconciliation
+must recover changes even if a leader fails between commit and notification.
+
+Watch delivery is an optimization, not the sole correctness mechanism. At
+startup, on reconnect, and after a watch-history gap, nodes reconcile their
+cached keys against authoritative metadata. Periodic revision checks catch
+missed notifications. Use a snapshot/cursor handoff or replay from the fetched
+snapshot revision so changes during reconciliation are not lost. Receiving a
+new scope revision does not by itself mark every cached entry as refreshed;
+advance a fully reconciled revision only after processing all changes through
+that revision or reconciling the affected cache. Reject stale responses that
+would overwrite newer values or deletion knowledge.
+
+Cache both values and authoritative absence with bounded freshness. The
+distributed adapter must specify the freshness duration and whether still-valid
+cached values may serve during an outage before runtime integration is enabled.
+Use monotonic elapsed time for local expiry. Expired entries fail resolution if
+metadata cannot revalidate them; unavailability must never cause source fallback.
+Once a change notification establishes that a cached answer is outdated, that
+answer cannot satisfy reads requiring the notified revision. Evict cached values
+when their scope assignment or authorization is withdrawn, and perform best-effort
+plaintext cleanup when replacing or removing owned buffers.
+
+A deletion invalidates the native override, including any cached value. Only
+after confirming authoritative absence may ordered resolution expose an external
+source or the environment. External files and environment variables remain
+separately provisioned sources; this protocol distributes native secrets and
+does not make node-local fallback configurations consistent automatically.
+
+Mutation success means durable metadata commit, not acknowledgement from every
+data node. Return the committed revision and separately expose each node's
+observed/reconciled revision and relevant consumer activation status. Do not
+claim that a consumer has switched credentials merely because its node fetched
+the new value. A caller needing coordinated rollout can wait for the required
+nodes/consumers to report readiness without making every write depend on all
+nodes being available.
+
+Rotation is not instantaneous revocation: a partitioned node may use an allowed
+cached value until its freshness deadline, and an in-flight request may already
+hold the old credential. Revoking that credential at the external provider is a
+separate operation. Rollout should account for that overlap and for rebuilding
+long-lived clients or sessions where changing a cached string is insufficient.
+
+Distributed delivery tests must cover unauthorized scope/key access, node join
+and reassignment, leader failure between commit and notification, reconnect and
+watch-history gaps, missed/deferred invalidations, out-of-order fetch responses,
+negative-cache invalidation on create, deletion revealing fallback, partitioned
+freshness expiry, stale follower reads, and consumer activation acknowledgements.
+
+#### Lite persistence
+
 **Lite (implemented):** A reserved metadata catalog namespace stores encrypted
 records inside the existing native file. A single catalog batch commits
 ciphertext, entry revision, and scope revision through the existing writer lock
@@ -327,6 +421,8 @@ records; ordinary document reads/exports do not include them. File backups still
 need separately provisioned key access. Whole-file rollback has the restore and
 freshness limitations described above; restoring a backup is not a monotonic
 secret revision update.
+
+#### Serverless persistence
 
 **Serverless:** Store immutable encrypted records or, initially, a small encrypted
 record collection under a dedicated per-scope prefix. Upload objects before
