@@ -227,6 +227,17 @@ and must be protected by normal authentication and admin authorization. Use a
 platform secret manager rather than the API when the mounted file is
 read-only.
 
+For a writable store configured through a file symlink, API updates preserve
+the link and atomically replace its current target. Reads continue through the
+configured path, and each write resolves the target again. A missing symlink
+target causes the write to fail without replacing the link.
+
+Use one writer per store. Do not update a store through the API while an
+external publisher is rotating or replacing it; these operations do not share
+a locking protocol. To combine API-managed values with externally published
+secrets, configure a separate writable file first and the external files as
+fallbacks. Deleting a local value exposes any matching fallback value.
+
 ## Storage credentials and remote-read credentials
 
 Primary database storage and user-provided remote content are separate trust

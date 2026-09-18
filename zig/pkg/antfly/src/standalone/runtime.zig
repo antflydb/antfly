@@ -4297,11 +4297,9 @@ fn resolveDefaultSecretStorePathBeforeConfig(alloc: std.mem.Allocator, cli: CliC
     else
         try antfly.common.config.defaultLocalBaseDir(alloc);
     defer alloc.free(raw_base);
-    const base = try normalizeResolvedPathAlloc(alloc, raw_base);
-    defer alloc.free(base);
-    const joined = try std.fs.path.join(alloc, &.{ base, "secrets.json" });
-    defer alloc.free(joined);
-    return try normalizeResolvedPathAlloc(alloc, joined);
+    // Preserve symlinks in both the base directory and secrets.json so reloads
+    // continue through the configured path after a projected-volume rotation.
+    return try std.fs.path.join(alloc, &.{ raw_base, "secrets.json" });
 }
 
 fn resolvePaths(
@@ -4349,12 +4347,9 @@ fn resolvePaths(
     const extension_package_store_dir = try resolveExtensionPackageStoreDir(alloc, cli.extension_package_store_dir, local_base);
     errdefer alloc.free(extension_package_store_dir);
     const secret_store_path = if (cli.primarySecretStorePath()) |path|
-        try normalizeResolvedPathAlloc(alloc, path)
-    else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{local_base});
-        defer alloc.free(raw);
-        break :blk try normalizeResolvedPathAlloc(alloc, raw);
-    };
+        try alloc.dupe(u8, path)
+    else
+        try std.fs.path.join(alloc, &.{ cli.data_dir orelse local_base, "secrets.json" });
     errdefer alloc.free(secret_store_path);
     const auth_store_root_dir = blk: {
         const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{metadata_base});
@@ -4374,21 +4369,21 @@ fn resolvePaths(
     };
 }
 
+test "standalone runtime secret store follows projected symlink rotation" {
+    try @import("../common/secret_projection_test_support.zig").expectRuntimeRotation(initLayeredSecretStore);
+}
+
+test "standalone runtime secret store writes preserve symlinks across target rotation" {
+    try @import("../common/secret_projection_test_support.zig").expectRuntimeWrites(initLayeredSecretStore);
+}
+
 fn initLayeredSecretStore(
     alloc: std.mem.Allocator,
     raw_paths: []const []const u8,
 ) !antfly.common.secrets.FileStore {
-    var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (normalized_paths.items) |path| alloc.free(path);
-        normalized_paths.deinit(alloc);
-    }
-    for (raw_paths) |raw_path| {
-        const normalized_path = try normalizeResolvedPathAlloc(alloc, raw_path);
-        errdefer alloc.free(normalized_path);
-        try normalized_paths.append(alloc, normalized_path);
-    }
-    return try antfly.common.secrets.FileStore.initLayered(alloc, normalized_paths.items);
+    // FileStore owns these paths and must follow their current symlink targets
+    // on reload, including Kubernetes projected-volume generation switches.
+    return try antfly.common.secrets.FileStore.initLayered(alloc, raw_paths);
 }
 
 fn resolveExtensionPackageStoreDir(
@@ -8422,9 +8417,7 @@ test "standalone runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings(expected_local_metadata, resolved.local_metadata_catalog_path);
     try std.testing.expectEqualStrings(expected_snapshot_root, resolved.snapshot_root_dir);
     try std.testing.expectEqualStrings(expected_extension_store, resolved.extension_package_store_dir);
-    const expected_secret_store = try normalizeResolvedPathAlloc(alloc, "/tmp/antflydb/secrets.json");
-    defer alloc.free(expected_secret_store);
-    try std.testing.expectEqualStrings(expected_secret_store, resolved.secret_store_path);
+    try std.testing.expectEqualStrings("/tmp/antflydb/secrets.json", resolved.secret_store_path);
 }
 
 test "standalone resolves the default secret store before full config parsing" {
@@ -8461,6 +8454,51 @@ test "standalone runtime resolves extension package store env before local defau
     const cli_resolved = try resolveExtensionPackageStoreDirWithEnv(alloc, "/antfly-cli-extensions", "/tmp/antflydb", "/antfly-extension-env");
     defer alloc.free(cli_resolved);
     try std.testing.expectEqualStrings("/antfly-cli-extensions", cli_resolved);
+}
+
+test "standalone default secret store follows projected symlink rotation" {
+    const projection_test = @import("../common/secret_projection_test_support.zig");
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    // Cover both a symlinked secrets.json and a symlink in the base directory.
+    for ([_]bool{ false, true }) |from_config| {
+        var projection = try projection_test.Projection.init(io_impl.io(), "projected.default");
+        defer projection.deinit();
+        const base_dir = if (from_config)
+            try std.fs.path.join(alloc, &.{ projection.root, "..data" })
+        else
+            try alloc.dupe(u8, projection.root);
+        defer alloc.free(base_dir);
+        const config_path = try std.fs.path.join(alloc, &.{ projection.root, "config.json" });
+        defer alloc.free(config_path);
+        const config_json = try std.fmt.allocPrint(alloc,
+            \\{{"storage":{{"local":{{"base_dir":"{s}"}}}}}}
+        , .{base_dir});
+        defer alloc.free(config_json);
+        try projection.tmp.dir.writeFile(io_impl.io(), .{ .sub_path = "config.json", .data = config_json });
+        const cli: CliConfig = if (from_config) .{ .config_path = config_path } else .{ .data_dir = base_dir };
+        const path = try resolveDefaultSecretStorePathBeforeConfig(alloc, cli);
+        defer alloc.free(path);
+        var store = try antfly.common.secrets.FileStore.init(alloc, path);
+        defer store.deinit();
+        try projection_test.expectValue(&store, "projected.default", "first");
+        const initial_generation = store.generation();
+        try projection.rotate();
+        try projection_test.expectValue(&store, "projected.default", "other");
+        try projection_test.expectHealthyRotation(&store, initial_generation);
+
+        var cfg = antfly.common.config.Config{
+            .registry = antfly.common.provider_registry.Registry.init(alloc),
+            .transcribers = antfly.transcribing.Registry.init(alloc),
+            .readers = antfly.readers.Registry.init(alloc),
+            .text_to_speech = antfly.synthesizing.Registry.init(alloc),
+            .storage = .{ .local_base_dir = base_dir },
+        };
+        const resolved = try resolvePaths(alloc, cli, if (from_config) &cfg else null);
+        defer resolved.deinit(alloc);
+        try std.testing.expectEqualStrings(path, resolved.secret_store_path);
+    }
 }
 
 test "standalone runtime resolves explicit secret store path" {
