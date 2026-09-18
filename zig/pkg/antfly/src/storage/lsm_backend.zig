@@ -22514,6 +22514,78 @@ fn implementationTests() type {
             try std.testing.expectEqualStrings("old-b", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "b"));
         }
 
+        test "workload admission lsm alternate publication allocator survives reader retirement" {
+            const alloc = std.testing.allocator;
+            var counted = std.testing.FailingAllocator.init(alloc, .{});
+            var backend = Backend.init(alloc, .{ .flush_threshold = 1000 });
+            {
+                var txn = try backend.beginWrite();
+                errdefer txn.abort();
+                try txn.put(.{}, "a", "old-a");
+                try txn.put(.{}, "b", "old-b");
+                try txn.commit();
+            }
+            var old = try backend.beginRead();
+            var incoming = ActiveMemTable{ .ordered_enabled = false };
+            try incoming.upsert(alloc, .{}, "a", "new-a", false);
+            // This in-memory backend fixture exercises allocation ownership,
+            // not WAL/manifest admission or a public completion-ticket path.
+            var candidate = try backend.mutable.preparePublication(counted.allocator(), &incoming);
+            backend.invalidateMutableReadSnapshot();
+            backend.mutable.publishPrepared(&candidate);
+            candidate.deinit(alloc);
+            incoming.deinit(alloc);
+            var retained = try backend.beginRead();
+            {
+                var txn = try backend.beginWrite();
+                errdefer txn.abort();
+                try txn.put(.{}, "a", "final-a");
+                try txn.put(.{}, "b", "final-b");
+                try txn.commit();
+            }
+            try std.testing.expectEqualStrings("old-a", try old.get(.{}, "a"));
+            try std.testing.expectEqualStrings("new-a", try retained.get(.{}, "a"));
+            try std.testing.expect(counted.allocated_bytes > counted.freed_bytes);
+            old.abort();
+            retained.abort();
+            backend.close();
+            try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+        }
+
+        test "workload admission lsm alternate candidate allocation failure keeps live reader" {
+            const alloc = std.testing.allocator;
+            var failures: usize = 0;
+            var successes: usize = 0;
+            for (0..32) |offset| {
+                var backend = Backend.init(alloc, .{ .flush_threshold = 1000 });
+                defer backend.close();
+                {
+                    var txn = try backend.beginWrite();
+                    errdefer txn.abort();
+                    try txn.put(.{}, "a", "old-a");
+                    try txn.commit();
+                }
+                var reader = try backend.beginRead();
+                defer reader.abort();
+                var incoming = ActiveMemTable{ .ordered_enabled = false };
+                defer incoming.deinit(alloc);
+                try incoming.upsert(alloc, .{}, "a", "new-a", false);
+                var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = offset });
+                var candidate = backend.mutable.preparePublication(failing.allocator(), &incoming) catch |err| {
+                    try std.testing.expectEqual(error.OutOfMemory, err);
+                    try std.testing.expectEqualStrings("old-a", try backend.mutable.get(.{}, "a"));
+                    try std.testing.expectEqualStrings("old-a", try reader.get(.{}, "a"));
+                    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                    failures += 1;
+                    continue;
+                };
+                candidate.deinit(alloc);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                successes += 1;
+            }
+            try std.testing.expect(failures > 1 and successes > 1);
+        }
+
         test "graph metric sorted batch presence avoids value retention and respects overlays" {
             const alloc = std.testing.allocator;
             var storage = storage_io.MemoryStorage.init(alloc);

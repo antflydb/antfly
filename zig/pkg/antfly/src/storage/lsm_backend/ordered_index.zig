@@ -33,6 +33,9 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             const Summary = if (SummaryPolicy != void and @hasDecl(SummaryPolicy, "Summary")) SummaryPolicy.Summary else void;
             summary: Summary = if (Summary == void) {} else .{},
             account: ?*Account = null,
+            /// Roots can mix nodes from several publication allocators. The
+            /// allocator context must outlive this node's final reader pin.
+            allocation_allocator: std.mem.Allocator,
             refs: std.atomic.Value(usize) = .init(1),
             entry: Entry,
             left: ?*Node = null,
@@ -48,11 +51,12 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
 
             pub fn release(self: *Node, allocator: std.mem.Allocator) void {
                 if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+                const owned_allocator = self.allocation_allocator;
                 if (self.left) |node| node.release(allocator);
                 if (self.right) |node| node.release(allocator);
                 self.entry.deinit(allocator);
                 if (self.account) |account| account.discharge(@sizeOf(Node));
-                allocator.destroy(self);
+                owned_allocator.destroy(self);
             }
 
             fn refresh(self: *Node) void {
@@ -92,6 +96,8 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
         root: ?*Node = null,
         account: ?*Account = null,
         spare: std.ArrayListUnmanaged(*Node) = .empty,
+        /// Vector ownership is independent of the individual spare nodes.
+        spare_allocator: ?std.mem.Allocator = null,
 
         /// Borrowed cursor: its owner pins the immutable root. AVL height is
         /// less than twice the key-count bit width. Sequential access walks
@@ -153,10 +159,11 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             if (self.root) |root| root.release(allocator);
             for (self.spare.items) |node| {
+                const owned_allocator = node.allocation_allocator;
                 if (self.account) |account| account.discharge(@sizeOf(Node));
-                allocator.destroy(node);
+                owned_allocator.destroy(node);
             }
-            self.spare.deinit(allocator);
+            self.spare.deinit(self.spare_allocator orelse allocator);
             if (self.account) |account| account.release();
             self.* = .{};
         }
@@ -187,6 +194,7 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                     self.len -= 1;
                     const node = self.pending[self.len];
                     if (node.refs.fetchSub(1, .acq_rel) != 1) continue;
+                    const owned_allocator = node.allocation_allocator;
                     if (node.left) |child| {
                         self.pending[self.len] = child;
                         self.len += 1;
@@ -197,17 +205,18 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                     }
                     node.entry.deinit(allocator);
                     if (node.account) |account| account.discharge(@sizeOf(Node));
-                    allocator.destroy(node);
+                    owned_allocator.destroy(node);
                 }
                 if (self.len != 0) return false;
                 while (credits.* != 0) {
                     const node = self.owned.spare.pop() orelse break;
                     credits.* -= 1;
+                    const owned_allocator = node.allocation_allocator;
                     if (self.owned.account) |account| account.discharge(@sizeOf(Node));
-                    allocator.destroy(node);
+                    owned_allocator.destroy(node);
                 }
                 if (self.owned.spare.items.len != 0) return false;
-                self.owned.spare.deinit(allocator);
+                self.owned.spare.deinit(self.owned.spare_allocator orelse allocator);
                 if (self.owned.account) |account| account.release();
                 self.owned = .{};
                 self.complete = true;
@@ -247,9 +256,26 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             if (edits == 0) return;
             if (self.account == null) self.account = try Account.create(allocator);
             const needed = try self.preparedNodeCount(edits);
-            try self.spare.ensureTotalCapacity(allocator, needed);
+            if (self.spare_allocator) |previous| {
+                if (previous.ptr != allocator.ptr or previous.vtable != allocator.vtable) {
+                    // A vector's allocator also identifies every unused node
+                    // in that pool. Drop old spares before changing domains;
+                    // retained live nodes keep their individual provenance.
+                    for (self.spare.items) |node| {
+                        const owned_allocator = node.allocation_allocator;
+                        self.account.?.discharge(@sizeOf(Node));
+                        owned_allocator.destroy(node);
+                    }
+                    self.spare.deinit(previous);
+                    self.spare = .empty;
+                    self.spare_allocator = null;
+                }
+            }
+            if (self.spare_allocator == null) self.spare_allocator = allocator;
+            try self.spare.ensureTotalCapacity(self.spare_allocator.?, needed);
             while (self.spare.items.len < needed) {
                 const node = try allocator.create(Node);
+                node.allocation_allocator = allocator;
                 self.account.?.charge(@sizeOf(Node));
                 self.spare.appendAssumeCapacity(node);
             }
@@ -258,7 +284,8 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
         fn unique(self: *Self, allocator: std.mem.Allocator, node: *Node) *Node {
             if (node.refs.load(.acquire) == 1) return node;
             const copy = self.spare.pop().?;
-            copy.* = .{ .account = self.account, .entry = node.entry.retainShared(), .left = if (node.left) |child| child.retain() else null, .right = if (node.right) |child| child.retain() else null, .count = node.count, .height = node.height, .bytes = node.bytes, .summary = node.summary };
+            const owned_allocator = copy.allocation_allocator;
+            copy.* = .{ .account = self.account, .allocation_allocator = owned_allocator, .entry = node.entry.retainShared(), .left = if (node.left) |child| child.retain() else null, .right = if (node.right) |child| child.retain() else null, .count = node.count, .height = node.height, .bytes = node.bytes, .summary = node.summary };
             node.release(allocator);
             return copy;
         }
@@ -284,7 +311,8 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
         fn insert(self: *Self, allocator: std.mem.Allocator, old: ?*Node, entry: Entry) *Node {
             const root = if (old) |node| self.unique(allocator, node) else {
                 const node = self.spare.pop().?;
-                node.* = .{ .account = self.account, .entry = entry.retainShared() };
+                const owned_allocator = node.allocation_allocator;
+                node.* = .{ .account = self.account, .allocation_allocator = owned_allocator, .entry = entry.retainShared() };
                 node.refresh();
                 return node;
             };

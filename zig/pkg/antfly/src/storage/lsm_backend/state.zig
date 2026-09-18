@@ -690,10 +690,18 @@ pub const ActiveMemTable = struct {
 
     /// Build the complete successor before WAL append. The live root is never
     /// edited, including when any allocation fails halfway through the batch.
+    /// Allocation contexts must outlive every retained generation allocated
+    /// through them. Provenance is preserved; this does not retain the context
+    /// or exempt these allocations from the shared memory Account.
     pub fn preparePublication(self: *ActiveMemTable, allocator: Allocator, incoming: *const ActiveMemTable) !ActiveMemTable {
         std.debug.assert(self.ordered_enabled);
         var candidate = ActiveMemTable{ .ordered = self.ordered.fork(), .logical_bytes = self.logical_bytes };
-        std.mem.swap(std.ArrayListUnmanaged(*OrderedIndex.Node), &candidate.ordered.spare, &self.ordered.spare);
+        if (self.ordered.spare_allocator) |spare_allocator| {
+            if (spare_allocator.ptr == allocator.ptr and spare_allocator.vtable == allocator.vtable) {
+                std.mem.swap(std.ArrayListUnmanaged(*OrderedIndex.Node), &candidate.ordered.spare, &self.ordered.spare);
+                std.mem.swap(?Allocator, &candidate.ordered.spare_allocator, &self.ordered.spare_allocator);
+            }
+        }
         errdefer candidate.deinit(allocator);
         for (0..incoming.entryCount()) |i| {
             var entry = try cloneEntry(allocator, incoming.entryAt(i));
@@ -1255,6 +1263,61 @@ test "prepared mutable publication is atomic at every allocation failure" {
         successes += 1;
     }
     try std.testing.expect(failures > 1 and successes > 1);
+}
+
+test "workload admission mixed allocator publication preserves pinned reclamation provenance" {
+    const alloc = std.testing.allocator;
+    var counted = std.testing.FailingAllocator.init(alloc, .{});
+    var live: ActiveMemTable = .{};
+    try live.upsert(alloc, .{}, "a", "old", false);
+    var old = try live.snapshot(alloc);
+    var incoming: ActiveMemTable = .{ .ordered_enabled = false };
+    try incoming.upsert(alloc, .{}, "a", "new", false);
+    var candidate = try live.preparePublication(counted.allocator(), &incoming);
+    live.publishPrepared(&candidate);
+    candidate.deinit(alloc);
+    incoming.deinit(alloc);
+    try std.testing.expectEqualStrings("old", try old.get(.{}, "a"));
+    try std.testing.expectEqualStrings("new", try live.get(.{}, "a"));
+    const pass = memory_account.nextPass();
+    const shared = live.accountedMemoryBytes(pass);
+    try std.testing.expect(shared >= counted.allocated_bytes - counted.freed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), old.accountedMemoryBytes(pass));
+    const retained = try live.snapshot(alloc);
+    live.deinit(alloc);
+    old.deinit(alloc);
+    try std.testing.expect(counted.allocated_bytes > counted.freed_bytes);
+    var retirement = State.Reclaimer.init(retained);
+    while (true) {
+        var credits: usize = 1;
+        if (retirement.step(alloc, &credits)) break;
+    }
+    try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+}
+
+test "workload admission publication spare pool changes allocator domains atomically" {
+    const alloc = std.testing.allocator;
+    var counted = std.testing.FailingAllocator.init(alloc, .{});
+    var live: ActiveMemTable = .{};
+    defer live.deinit(alloc);
+    try live.upsert(alloc, .{}, "a", "old", false);
+    const account = live.ordered.account.?;
+    const alternate = counted.allocator();
+    try live.ordered.prepareEdits(alternate, 2);
+    try std.testing.expectEqual(account, live.ordered.account.?);
+    for (live.ordered.spare.items) |node| {
+        try std.testing.expectEqual(alternate.ptr, node.allocation_allocator.ptr);
+        try std.testing.expectEqual(alternate.vtable, node.allocation_allocator.vtable);
+    }
+    counted.fail_index = counted.alloc_index;
+    try live.ordered.prepareEdits(alloc, 2);
+    try std.testing.expectEqual(account, live.ordered.account.?);
+    for (live.ordered.spare.items) |node| {
+        try std.testing.expectEqual(alloc.ptr, node.allocation_allocator.ptr);
+        try std.testing.expectEqual(alloc.vtable, node.allocation_allocator.vtable);
+    }
+    try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+    try std.testing.expectEqualStrings("old", try live.get(.{}, "a"));
 }
 
 test "ordered generations account shared allocations once and rotate without allocation" {
