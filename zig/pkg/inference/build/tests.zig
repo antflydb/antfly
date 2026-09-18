@@ -33,9 +33,11 @@ pub fn create(ctx: Context) Suite {
         .path = ctx.path("src/test_runner_filter.zig"),
         .mode = .simple,
     };
-    // Full CPU inference tests measured about 6 GiB to compile.
+    // Full CPU inference tests including GLiNER2.5 measured 7.2 GiB to
+    // compile. Reserve headroom so the bounded build scheduler can account
+    // for this artifact without rejecting a successful compilation.
     const tests = b.addTest(.{
-        .max_rss = 7 * 1024 * 1024 * 1024,
+        .max_rss = 9 * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,

@@ -327,7 +327,11 @@ fn exerciseWithBoundaryAttention(a: std.mem.Allocator, execution: controller.Exe
 }
 
 test "boundary native trainer composes immutable batches full and heads training cancellation and durable partial resume" {
-    try exercise(std.testing.allocator, .native, .materialized_v1);
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const test_allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    try exercise(test_allocator, .native, .materialized_v1);
 }
 
 test "boundary native trainer resident Metal composes tiny full and heads jobs with exact durable resume" {
@@ -337,7 +341,11 @@ test "boundary native trainer resident Metal composes tiny full and heads jobs w
 }
 
 test "boundary native trainer replay attention full and heads jobs preserve cancellation and partial resume identity" {
-    try exercise(std.testing.allocator, .native, .replay_tiled_v1);
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const test_allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    try exercise(test_allocator, .native, .replay_tiled_v1);
 }
 
 test "boundary native trainer replay attention resident Metal full and heads jobs preserve partial resume identity" {
@@ -347,7 +355,11 @@ test "boundary native trainer replay attention resident Metal full and heads job
 }
 
 test "boundary native trainer regional recomputation two layers full and heads preserve cancellation and exact partial resume" {
-    try exerciseWithActivation(std.testing.allocator, .native, .replay_tiled_v1, .layer_recompute_v1);
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const test_allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    try exerciseWithActivation(test_allocator, .native, .replay_tiled_v1, .layer_recompute_v1);
 }
 
 test "boundary native trainer regional recomputation resident Metal two layers full and heads preserve exact partial resume" {

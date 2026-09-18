@@ -5892,7 +5892,16 @@ pub const Fixture = struct {
                 retiring = true;
             };
             if (!retiring and try self.standbyReplicaCountConverged(2)) break;
-        } else return error.ProductionStandbyBaselineDrainTimeout;
+        } else {
+            if (self.metadata.?.cluster.currentMetadataLeaderIndex()) |leader| {
+                var snapshot = try self.metadata.?.cluster.node(leader).adminSnapshot();
+                defer self.metadata.?.cluster.node(leader).freeAdminSnapshot(&snapshot);
+                const encoded = try std.json.Stringify.valueAlloc(self.alloc, snapshot, .{});
+                defer self.alloc.free(encoded);
+                std.debug.print("standby baseline drain cutoff catalog={s}\n", .{encoded});
+            }
+            return error.ProductionStandbyBaselineDrainTimeout;
+        }
         self.beginStandbyScalingOperation("stop drained owner");
         try self.stopDataServerForRestart(2);
         self.beginStandbyScalingOperation("start standalone primary");

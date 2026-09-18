@@ -186,7 +186,11 @@ fn construction(a: A) !void {
 }
 
 test "recomputed training compilation has bounded ownership at every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, construction, .{});
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const test_allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    try std.testing.checkAllAllocationFailures(test_allocator, construction, .{});
 }
 
 test "recomputed training admission charges checkpoints compilation head and complete optimizer before forward" {
@@ -227,8 +231,8 @@ fn cycle(plan: *recomputed.Plan, cb: *const ops.ComputeBackend, bindings: []cons
     try std.testing.expectEqual(@as(usize, 3), result.parameter_ids.len);
 }
 
-fn runtimeFailure(fail_offset: ?usize) !usize {
-    var failure = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+fn runtimeFailure(backing: A, fail_offset: ?usize) !usize {
+    var failure = std.testing.FailingAllocator.init(backing, .{});
     const a = failure.allocator();
     var example = try Example.init(a);
     defer example.graph.deinit();
@@ -278,9 +282,13 @@ fn runtimeFailure(fail_offset: ?usize) !usize {
 }
 
 test "recomputed training runtime allocation failure consumes tapes preserves inputs and retries" {
-    const allocations = try runtimeFailure(null);
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const test_allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const allocations = try runtimeFailure(test_allocator, null);
     try std.testing.expect(allocations > 50 and allocations < 4096);
-    for (0..allocations) |index| _ = try runtimeFailure(index);
+    for (0..allocations) |index| _ = try runtimeFailure(test_allocator, index);
 }
 
 const Cancellation = struct {
