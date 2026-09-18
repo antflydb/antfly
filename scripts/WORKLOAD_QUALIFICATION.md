@@ -2,8 +2,8 @@
 
 `workload_qualification.py` runs paired, fresh Antfly lifecycles using direct
 processes or Docker. It currently exercises bounded document lookups, small
-match-all queries, and identical-value writes with deterministic offered mixes.
-It does not qualify vector recall, graph/aggregation isolation, remote ownership,
+match-all queries, identical-value writes with deterministic offered mixes, and
+independently calibrated vector queries. It does not qualify graph/aggregation isolation, remote ownership,
 durable recovery, or the full release matrix in `zig/WORKLOAD_SCHEDULING_QUALIFICATION.md`.
 
 ```sh
@@ -66,6 +66,55 @@ binary for a declared build. Generator drops, including drops during overload,
 invalidate coverage and require a generator with sufficient capacity before
 using the results as qualification evidence.
 
+For a separate deterministic vector smoke fixture:
+
+```sh
+python3 scripts/workload_qualification.py template --runtime docker --vector --output /tmp/vector-plan.json
+# Pin both image arms, revision/mode declarations and host storage description.
+python3 scripts/workload_qualification.py run /tmp/vector-plan.json --output /tmp/vector-receipts
+```
+
+The synthetic fixture generates normalized float32 vectors and separate query
+vectors, computes exact cosine neighbors over the entire small corpus, and
+retains the corpus digest, query vectors, ground truth and split indices. This
+fixture is explicitly separate from the retained benchmark datasets and cannot
+be used with `purpose: qualification`.
+
+Prepared vector plans in `scripts/workload-vector-qualification-plans/` cover
+50K × 1,536 and 1M × 768, both at top-100, on each of the three tiers. Generate copies with
+`release-plans --vectors` and the same image/revision arguments above. These
+plans additionally require paths and SHA-256 hashes for the original retained
+`shuffle_train.parquet` (`id`, `emb`), `test.parquet` (`emb`), and
+`neighbors.parquet` (`neighbors_id`) files plus their original receipt reference.
+Use an environment with PyArrow installed, as the existing VectorDBBench
+profilers do. The harness streams training batches, verifies complete training
+ID coverage and exact row counts, and checks file hashes before and after the
+experiment. It retains the selected query/neighbor rows and input provenance.
+Do not substitute another dataset with the same dimensions. The large plans
+are specifications, not evidence that these workloads were run.
+
+Each fresh vector lifecycle tests an explicit effort grid including 0, .01,
+.025, .05 and higher values through 1. Every effort receives warmup and at least
+three timing trials (at least 10 seconds each in full plans); order rotates/reverses between trials. Selection uses the
+highest median completed QPS among efforts with zero errors and at least 95%
+recall in **every** calibration trial. Trial rates and ranges expose timing
+noise. This is the fastest observed grid setting at the declared calibration
+concurrency (30 in full plans), not proof of the globally optimal setting or of
+generator headroom. Calibration uses bounded closed-loop workers and records
+every attempted query; failed/rejected requests invalidate that setting.
+
+The chosen setting must then pass a disjoint held-out query split at 95% recall;
+failure stops the lifecycle without retuning against the held-out answers.
+Performance points reuse only held-out queries and freeze the chosen effort for
+that arm/lifecycle. Raw responses retain result IDs and measured recall; point
+comparisons also require the recall floor. Separate profiled probes retain
+actual search-work counters without including profiling overhead in calibration
+timings. Flat recall, identical sampled IDs, and identical available work counters
+are reported separately; they are diagnostic observations, not a product-bug
+verdict. Current vector plans measure warm storage only. Cold storage, mixed
+vector/ingestion isolation and the remaining release matrix still require
+separate experiments.
+
 The first baseline's fastest error-free measured closed-loop rate fixes all
 open-loop offered rates for that workload. Later pairs alternate arm order.
 Open arrivals retain their original scheduled submission time. The generator
@@ -88,5 +137,5 @@ analysis against queue/ownership metrics before claiming the recovery gate.
 Run the offline harness checks with:
 
 ```sh
-python3 -m unittest discover -s scripts -p test_workload_qualification.py
+python3 -B -m unittest discover -s scripts -p 'test_workload*qualification.py'
 ```

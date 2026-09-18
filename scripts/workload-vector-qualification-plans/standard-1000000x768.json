@@ -1,0 +1,142 @@
+{
+  "arms": {
+    "baseline": {
+      "config": {
+        "admission": {
+          "query": {
+            "max_concurrent_requests": 80,
+            "waiting": {
+              "max_queued_bytes": 67108864,
+              "max_queued_requests": 160,
+              "max_retained_bytes": 536870912,
+              "max_wait_ms": 1000
+            }
+          },
+          "write": {
+            "max_concurrent_requests": 80,
+            "waiting": {
+              "max_queued_bytes": 67108864,
+              "max_queued_requests": 160,
+              "max_retained_bytes": 536870912,
+              "max_wait_ms": 1000
+            }
+          }
+        }
+      },
+      "image": null,
+      "optimization": "ReleaseFast",
+      "revision": "64f1afbb373d5da0a932f08e456116da139e9e9a"
+    },
+    "candidate": {
+      "config": {
+        "admission": {
+          "query": {
+            "max_concurrent_requests": 80,
+            "waiting": {
+              "max_queued_bytes": 67108864,
+              "max_queued_requests": 160,
+              "max_retained_bytes": 536870912,
+              "max_wait_ms": 1000
+            }
+          },
+          "write": {
+            "max_concurrent_requests": 80,
+            "waiting": {
+              "max_queued_bytes": 67108864,
+              "max_queued_requests": 160,
+              "max_retained_bytes": 536870912,
+              "max_wait_ms": 1000
+            }
+          }
+        }
+      },
+      "image": null,
+      "optimization": "ReleaseFast",
+      "revision": null
+    }
+  },
+  "concurrency": [
+    1,
+    5,
+    10,
+    20,
+    30,
+    40,
+    60,
+    80
+  ],
+  "documents": 4096,
+  "generator_queue": 320,
+  "generator_workers": 160,
+  "note": "Prepared retained vector workload specification, not executed. Pin the original dataset file hashes/provenance and final ReleaseFast images before running. Each fresh lifecycle independently calibrates repeated measured throughput at 95% recall, verifies held-out queries, and freezes effort. Warm runs only; cold-storage and full release matrix remain separate.",
+  "open_factors": [
+    0.5,
+    0.8,
+    1.0,
+    1.25,
+    2.0
+  ],
+  "overload_seconds": 60,
+  "purpose": "qualification",
+  "recovery_seconds": 60,
+  "request_timeout": 30,
+  "runs": 3,
+  "runtime": "docker",
+  "schema": 1,
+  "seconds": 300,
+  "storage_description": "REPLACE_WITH_ACTUAL_HOST_DISK_AND_FILESYSTEM",
+  "tier": "standard",
+  "vector": {
+    "calibration_concurrency": 30,
+    "calibration_queries": 200,
+    "calibration_repeats": 5,
+    "calibration_seconds": 10,
+    "calibration_trials": 3,
+    "dimensions": 768,
+    "efforts": [
+      0,
+      0.01,
+      0.025,
+      0.05,
+      0.1,
+      0.15,
+      0.2,
+      0.25,
+      0.3,
+      0.35,
+      0.5,
+      0.75,
+      1
+    ],
+    "files": {
+      "neighbors": {
+        "path": null,
+        "sha256": null
+      },
+      "test": {
+        "path": null,
+        "sha256": null
+      },
+      "train": {
+        "path": null,
+        "sha256": null
+      }
+    },
+    "held_out_queries": 200,
+    "k": 100,
+    "metric": "cosine",
+    "profile_queries": 4,
+    "provenance": "REPLACE_WITH_RETAINED_BENCHMARK_DATASET_RECEIPT_REFERENCE",
+    "recall_floor": 0.95,
+    "rows": 1000000,
+    "seed": 72319,
+    "source": "vdbbench_parquet"
+  },
+  "warmup_seconds": 60,
+  "workloads": [
+    {
+      "kind": "vector",
+      "name": "vector"
+    }
+  ]
+}

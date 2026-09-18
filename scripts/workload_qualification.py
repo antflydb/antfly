@@ -26,6 +26,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import workload_vector_qualification as vectors
+
 TIERS = {
     "starter": (1, 4 << 30, 50 << 30),
     "standard": (2, 4 << 30, 100 << 30),
@@ -262,9 +264,19 @@ def validate(plan: dict[str, Any]) -> None:
         ):
             raise ValueError("workload names must be unique safe filenames")
         names.add(workload["name"])
+        if workload.get("kind") == "vector":
+            if "vector" not in plan:
+                raise ValueError(
+                    "vector workloads require an explicit fixture specification"
+                )
+            continue
         for field in ("read_percent", "query_percent_of_reads"):
             if type(workload.get(field)) is not int or not 0 <= workload[field] <= 100:
                 raise ValueError(f"{field} must be an integer percentage")
+    if "vector" in plan:
+        vectors.validate(
+            plan["vector"], qualification=plan["purpose"] == "qualification"
+        )
 
 
 def free_port() -> int:
@@ -370,6 +382,19 @@ def operation(
     # Independent permutations give exact long-run offered mixes, independent of
     # completion rates. Updates rewrite identical values so expected reads stay fixed.
     index = sequence % documents
+    if workload.get("kind") == "vector":
+        fixture = workload["_fixture"]
+        query_id = (
+            fixture.spec["calibration_queries"]
+            + sequence % fixture.spec["held_out_queries"]
+        )
+        return (
+            "vector",
+            "POST",
+            f"/db/v1/tables/{vectors.TABLE}/query",
+            fixture.query(query_id, workload["_effort"]),
+            query_id,
+        )
     if sequence % 100 >= workload["read_percent"]:
         return (
             "write",
@@ -476,6 +501,8 @@ def run_load(
     started = time.monotonic()
     end = started + seconds
     completed_in_window = 0
+    vector_matches = 0
+    vector_completed = 0
     peak_outstanding = 0
     outstanding = 0
     phases = rate_schedule or [("measurement", seconds, rate or 0)]
@@ -484,7 +511,7 @@ def run_load(
     with path.open("w") as raw:
 
         def record(sample: dict[str, Any]) -> None:
-            nonlocal completed_in_window
+            nonlocal completed_in_window, vector_matches, vector_completed
             with lock:
                 phase_counts[sample.get("arrival_phase", "measurement")][
                     sample["outcome"]
@@ -494,6 +521,9 @@ def run_load(
                 counts[outcome] += 1
                 class_counts[kind][outcome] += 1
                 if outcome == "completed":
+                    if kind == "vector":
+                        vector_matches += sample["matched_neighbors"]
+                        vector_completed += 1
                     latencies[kind].append(sample["latency_ms"])
                     windows[int(sample["finished_s"] // 5)][kind] += 1
                     if sample["finished_s"] <= seconds:
@@ -530,10 +560,34 @@ def run_load(
                     if connection.sock:
                         connection.sock.settimeout(remaining)
                     status, data, headers = local.client.request(method, route, body)
-                    sample.update(
-                        status=status,
-                        outcome=classify(kind, index, status, data, plan["documents"]),
-                    )
+                    if kind == "vector" and status == 200:
+                        sample["status"] = status
+                        try:
+                            result = workload["_fixture"].result(index, status, data)
+                            sample.update(
+                                outcome="completed",
+                                query_id=index,
+                                ids=result["ids"],
+                                recall=result["recall"],
+                                matched_neighbors=result["matched_neighbors"],
+                                search_effort=workload["_effort"],
+                            )
+                        except (ValueError, TypeError, KeyError, IndexError):
+                            sample["outcome"] = "invalid_result"
+                    elif kind == "vector":
+                        sample.update(
+                            status=status,
+                            outcome="rejected"
+                            if status == 429
+                            else "unexpected_http_error",
+                        )
+                    else:
+                        sample.update(
+                            status=status,
+                            outcome=classify(
+                                kind, index, status, data, plan["documents"]
+                            ),
+                        )
                     if sample["outcome"] != "completed":
                         sample.update(
                             error_body=data[:16384].decode(errors="replace"),
@@ -621,6 +675,21 @@ def run_load(
             client.close()
     all_latencies = [value for values in latencies.values() for value in values]
     return {
+        "vector": {
+            "search_effort": workload["_effort"],
+            "completed_queries": vector_completed,
+            "recall": vector_matches
+            / (vector_completed * workload["_fixture"].spec["k"])
+            if vector_completed
+            else None,
+            "recall_floor_pass": bool(
+                vector_completed
+                and vector_matches / (vector_completed * workload["_fixture"].spec["k"])
+                >= 0.95
+            ),
+        }
+        if workload.get("kind") == "vector"
+        else None,
         "seconds": seconds,
         "elapsed_including_drain": time.monotonic() - started,
         "offered": sum(counts.values()),
@@ -869,8 +938,12 @@ def launch(plan: dict[str, Any], arm: dict[str, Any], directory: Path):
 
 
 def successful_baseline(point: dict[str, Any]) -> bool:
-    return point["counts"].get("completed", 0) > 0 and all(
-        count == 0 or kind == "completed" for kind, count in point["counts"].items()
+    return (
+        (point.get("vector") is None or point["vector"]["recall_floor_pass"])
+        and point["counts"].get("completed", 0) > 0
+        and all(
+            count == 0 or kind == "completed" for kind, count in point["counts"].items()
+        )
     )
 
 
@@ -966,6 +1039,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=False)
     save(output / "plan.json", plan)
     shutil.copy2(__file__, output / "workload_qualification.py")
+    shutil.copy2(vectors.__file__, output / "workload_vector_qualification.py")
     save(
         output / "host.json",
         {
@@ -985,7 +1059,11 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
     lifecycles: list[dict[str, Any]] = []
     error = None
     baseline_rates: dict[str, float] = {}
+    vector_fixture = None
     try:
+        if "vector" in plan:
+            vector_fixture = vectors.Fixture(plan["vector"])
+            vector_fixture.retain(output)
         execution_plan = freeze_artifacts(plan, output)
         # The first baseline establishes offered rates. Subsequent pairs alternate
         # order to expose host drift while retaining identical fixed offered rates.
@@ -1002,8 +1080,27 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                 ) as runtime:
                     lifecycles.append(runtime)
                     port = runtime["port"]
-                    seed(port, plan["documents"], directory)
-                    for workload in plan["workloads"]:
+                    if any(
+                        workload.get("kind") != "vector"
+                        for workload in plan["workloads"]
+                    ):
+                        seed(port, plan["documents"], directory)
+                    vector_effort = None
+                    if vector_fixture is not None:
+                        vectors.seed(HTTP, port, vector_fixture, directory)
+                        vector_effort = vectors.calibrate(
+                            HTTP,
+                            port,
+                            vector_fixture,
+                            directory,
+                            plan["request_timeout"],
+                        )
+                    for configured_workload in plan["workloads"]:
+                        workload = configured_workload.copy()
+                        if workload.get("kind") == "vector":
+                            workload.update(
+                                _fixture=vector_fixture, _effort=vector_effort
+                            )
                         name = workload["name"]
                         for concurrency in plan["concurrency"]:
                             prefix = f"{name}-closed-{concurrency}"
@@ -1111,6 +1208,8 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                         )
                         points.append(point)
                     save(output / "points.json", points)
+        if vector_fixture is not None:
+            vector_fixture.verify_files()
     except BaseException as failure:
         error = f"{type(failure).__name__}: {failure}"
         raise
@@ -1128,7 +1227,11 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
             else [],
             "lifecycles": lifecycles,
             "unmeasured_gates": [
-                "vector recall/calibration",
+                "vector recall/calibration"
+                if vector_fixture is None
+                else "retained vector datasets and cold storage"
+                if vector_fixture.spec["source"] == "deterministic_cosine"
+                else "cold vector storage",
                 "graph/aggregation/scan isolation",
                 "slow output and inference",
                 "per-stage ownership ceilings",
@@ -1174,6 +1277,7 @@ def main() -> None:
     create = sub.add_parser("template")
     create.add_argument("--runtime", choices=("process", "docker"), default="process")
     create.add_argument("--output", type=Path, required=True)
+    create.add_argument("--vector", action="store_true")
     execute = sub.add_parser("run")
     execute.add_argument("plan", type=Path)
     execute.add_argument("--output", type=Path, required=True)
@@ -1182,14 +1286,38 @@ def main() -> None:
     releases.add_argument("--baseline-image")
     releases.add_argument("--candidate-image")
     releases.add_argument("--candidate-revision")
+    releases.add_argument("--vectors", action="store_true")
     args = parser.parse_args()
     if args.command == "template":
         if args.output.exists():
             parser.error("template output already exists")
-        save(args.output, template(args.runtime))
+        plan = template(args.runtime)
+        if args.vector:
+            plan.update(
+                vector=vectors.specification(),
+                workloads=[{"name": "vector", "kind": "vector"}],
+            )
+        save(args.output, plan)
     elif args.command == "release-plans":
         args.output.mkdir(parents=True, exist_ok=False)
         for tier in TIERS:
+            if args.vectors:
+                for rows, dimensions in ((50_000, 1536), (1_000_000, 768)):
+                    plan = release_plan(
+                        tier,
+                        args.baseline_image,
+                        args.candidate_image,
+                        args.candidate_revision,
+                    )
+                    plan.update(
+                        vector=vectors.specification(rows, dimensions),
+                        workloads=[{"name": "vector", "kind": "vector"}],
+                    )
+                    plan["note"] = (
+                        "Prepared retained vector workload specification, not executed. Pin the original dataset file hashes/provenance and final ReleaseFast images before running. Each fresh lifecycle independently calibrates repeated measured throughput at 95% recall, verifies held-out queries, and freezes effort. Warm runs only; cold-storage and full release matrix remain separate."
+                    )
+                    save(args.output / f"{tier}-{rows}x{dimensions}.json", plan)
+                continue
             save(
                 args.output / f"{tier}.json",
                 release_plan(
