@@ -298,8 +298,15 @@ pub const QueryRuntime = struct {
     }
 
     pub fn openVersionSession(self: *QueryRuntime, namespace: []const u8, version: u64) !QuerySession {
-        var manifest = try self.manifests.getAlloc(namespace, version);
-        errdefer manifest.deinit(self.alloc);
+        return self.openVersionSessionUsingAllocator(self.alloc, namespace, version);
+    }
+
+    /// Request-owned manifests and read buffers use the caller's allocator;
+    /// shared cache entries, metrics and lease-cache synchronization stay owned
+    /// by the runtime. Never copy a live QueryRuntime to change its allocator.
+    pub fn openVersionSessionUsingAllocator(self: *QueryRuntime, alloc: Allocator, namespace: []const u8, version: u64) !QuerySession {
+        var manifest = try self.manifests.vtable.get_alloc(self.manifests.ptr, alloc, namespace, version);
+        errdefer manifest.deinit(alloc);
         var lease: ?read_lease.Lease = null;
         for (manifest.artifacts) |artifact| {
             if (artifact.kind == .document_facts or (artifact.kind == .graph_segment and artifact.metadata_version == graph_segment_mod.page_graph.Root.metadata_version)) {
@@ -308,7 +315,7 @@ pub const QueryRuntime = struct {
             }
         }
         return .{
-            .alloc = self.alloc,
+            .alloc = alloc,
             .artifacts = self.artifacts,
             .cache = self.cache,
             .manifest = manifest,
@@ -317,9 +324,13 @@ pub const QueryRuntime = struct {
     }
 
     pub fn openHeadSession(self: *QueryRuntime, namespace: []const u8) !QuerySession {
+        return self.openHeadSessionUsingAllocator(self.alloc, namespace);
+    }
+
+    pub fn openHeadSessionUsingAllocator(self: *QueryRuntime, alloc: Allocator, namespace: []const u8) !QuerySession {
         var version = try self.progress.getHead(namespace);
         for (0..3) |_| {
-            return self.openVersionSession(namespace, version) catch |err| switch (err) {
+            return self.openVersionSessionUsingAllocator(alloc, namespace, version) catch |err| switch (err) {
                 error.FileNotFound, error.ManifestVersionRetired => {
                     const next = try self.progress.getHead(namespace);
                     if (next == version) return err;

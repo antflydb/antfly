@@ -931,7 +931,7 @@ pub const HttpHandler = struct {
         };
         defer if (namespace) |value| self.alloc.free(value);
         var maybe_session: ?query_mod.QuerySession = if (namespace) |value|
-            self.query.openHeadSession(value) catch |err| switch (err) {
+            self.query.openHeadSessionUsingAllocator(self.alloc, value) catch |err| switch (err) {
                 error.FileNotFound => null,
                 else => return err,
             }
@@ -1408,7 +1408,7 @@ pub const HttpHandler = struct {
         }
         try self.resolveSemanticQueryRequest(table_name, &plan, cancellation);
 
-        var session = try self.query.openHeadSession(namespace);
+        var session = try self.query.openHeadSessionUsingAllocator(self.alloc, namespace);
         errdefer session.deinit();
         session.setCancellation(cancellation);
         session.setDiagnostics(diagnostics);
@@ -1433,6 +1433,41 @@ pub const HttpHandler = struct {
             .requested_limit = requested_limit,
             .profile_requested = plan.profile_requested,
         };
+    }
+
+    fn executePublicTableQueryUsingAllocator(self: *HttpHandler, alloc: Allocator, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
+        if (alloc.ptr == self.alloc.ptr and alloc.vtable == self.alloc.vtable)
+            return self.executePublicTableQueryJsonAlloc(table_name, body, cancellation);
+        // Borrow stateless storage facades with a request result allocator.
+        // Shared owners, cache entries, metrics and admission locks are never
+        // copied or mutated. These facades and all request-only services remain
+        // live until execution and its children have completely unwound.
+        var artifacts = self.catalog.artifacts.*;
+        artifacts.allocator = alloc;
+        var manifests = self.manifests.*;
+        manifests.allocator = alloc;
+        var wal = self.api.wal.*;
+        wal.allocator = alloc;
+        var builder = self.catalog.builder.*;
+        builder.alloc = alloc;
+        builder.artifacts = &artifacts;
+        builder.manifests = &manifests;
+        builder.wal = &wal;
+        var catalog = catalog_mod.CatalogService.init(alloc, &artifacts, &manifests, self.progress, &wal, &builder, self.catalog.store);
+        catalog.external_source_plan_resolver = self.catalog.external_source_plan_resolver;
+        defer catalog.deinit();
+        var api = api_service.Service.init(alloc, &wal, &builder);
+        var execution = HttpHandler.init(alloc, &api, &catalog, &manifests, self.progress, self.query, self.runtime_status);
+        execution.query_cache = self.query_cache;
+        execution.managed_query_embedder = self.managed_query_embedder;
+        execution.embedding_provider_runtime = self.embedding_provider_runtime;
+        execution.remote_content = self.remote_content;
+        execution.io = self.io;
+        execution.foreign_registry = self.foreign_registry;
+        execution.published_search_sources = self.published_search_sources;
+        execution.runtime_metrics = self.runtime_metrics;
+        execution.graph_execution_limits = self.graph_execution_limits;
+        return execution.executePublicTableQueryJsonAlloc(table_name, body, cancellation);
     }
 
     fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
@@ -2697,7 +2732,7 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(join.right_table) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionUsingAllocator(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => return error.FileNotFound,
             else => return err,
         };
@@ -2978,7 +3013,7 @@ pub const HttpHandler = struct {
             },
         };
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionUsingAllocator(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => return error.FileNotFound,
             else => return err,
         };
@@ -3244,7 +3279,7 @@ pub const HttpHandler = struct {
                 });
             }
         } else {
-            session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+            session = self.query.openHeadSessionUsingAllocator(self.alloc, namespace) catch |err| switch (err) {
                 error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
                 else => return err,
             };
@@ -4238,7 +4273,7 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionUsingAllocator(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -4256,7 +4291,7 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionUsingAllocator(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -4274,7 +4309,7 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionUsingAllocator(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -4326,7 +4361,7 @@ pub const HttpHandler = struct {
         };
         defer req.deinit(self.alloc);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionUsingAllocator(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -4341,7 +4376,7 @@ pub const HttpHandler = struct {
         };
         defer req.deinit(self.alloc);
 
-        var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
+        var session = self.query.openVersionSessionUsingAllocator(self.alloc, namespace, version) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5222,7 +5257,7 @@ pub const HttpHandler = struct {
         };
         defer req.deinit(self.alloc);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionUsingAllocator(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5237,7 +5272,7 @@ pub const HttpHandler = struct {
         };
         defer req.deinit(self.alloc);
 
-        var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
+        var session = self.query.openVersionSessionUsingAllocator(self.alloc, namespace, version) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5252,7 +5287,7 @@ pub const HttpHandler = struct {
         };
         defer req.deinit(self.alloc);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionUsingAllocator(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5267,7 +5302,7 @@ pub const HttpHandler = struct {
         };
         defer req.deinit(self.alloc);
 
-        var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
+        var session = self.query.openVersionSessionUsingAllocator(self.alloc, namespace, version) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5433,7 +5468,7 @@ pub const HttpHandler = struct {
     }
 
     fn handleQueryHead(self: *HttpHandler, namespace: []const u8, cancellation: CancellationToken) !HttpResponse {
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionUsingAllocator(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5443,7 +5478,7 @@ pub const HttpHandler = struct {
     }
 
     fn handleQueryLatest(self: *HttpHandler, namespace: []const u8, cancellation: CancellationToken) !HttpResponse {
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionUsingAllocator(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5459,7 +5494,7 @@ pub const HttpHandler = struct {
     }
 
     fn handleQueryVersion(self: *HttpHandler, namespace: []const u8, version: u64, cancellation: CancellationToken) !HttpResponse {
-        var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
+        var session = self.query.openVersionSessionUsingAllocator(self.alloc, namespace, version) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5469,7 +5504,7 @@ pub const HttpHandler = struct {
     }
 
     fn handleQueryHeadArtifact(self: *HttpHandler, namespace: []const u8, artifact_index: usize, cancellation: CancellationToken) !HttpResponse {
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionUsingAllocator(self.alloc, namespace) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5479,7 +5514,7 @@ pub const HttpHandler = struct {
     }
 
     fn handleQueryVersionArtifact(self: *HttpHandler, namespace: []const u8, version: u64, artifact_index: usize, cancellation: CancellationToken) !HttpResponse {
-        var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
+        var session = self.query.openVersionSessionUsingAllocator(self.alloc, namespace, version) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -6164,10 +6199,9 @@ pub const HttpHandler = struct {
         row_filter_json: ?[]const u8,
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteQueryError![]u8 {
-        _ = alloc;
         _ = row_filter_json;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        return self.executePublicTableQueryJsonAlloc(table_name, body, request.cancellation) catch |err| switch (err) {
+        return self.executePublicTableQueryUsingAllocator(alloc, table_name, body, request.cancellation) catch |err| switch (err) {
             error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
@@ -6429,7 +6463,7 @@ pub const HttpHandler = struct {
             return try query_materializer.materializeAlloc(self.alloc, overlay);
         }
 
-        var session = try self.query.openHeadSession(namespace);
+        var session = try self.query.openHeadSessionUsingAllocator(self.alloc, namespace);
         defer session.deinit();
         const published = try self.allocPublishedDocumentsAlloc(&session);
         errdefer query_materializer.freeDocuments(self.alloc, published);
@@ -12650,6 +12684,119 @@ test "serverless index catalog rejects artifact-backed sources before publicatio
     try validateServerlessIndexCatalog(alloc,
         \\{"full_text_index_v0":{"type":"full_text"},"body_search":{"type":"full_text","field":"body"}}
     );
+}
+
+test "workload admission serverless query execution uses retained allocator" {
+    const alloc = std.testing.allocator;
+
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    var catalog_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-query-memory");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-query-memory");
+    const wal_root = tmpPath(&wal_root_buf, "wal-query-memory");
+    const catalog_root = tmpPath(&catalog_root_buf, "catalog-query-memory");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+    defer cleanupTmp(catalog_root);
+
+    var fs_artifacts = try @import("../artifacts/mod.zig").FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+
+    var fs_progress = try @import("../catalog/fs_progress_store.zig").FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+
+    var fs_wal = try @import("../wal/mod.zig").FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+
+    var fs_catalog = try @import("../catalog/fs_store.zig").FsStore.init(alloc, std.mem.span(catalog_root));
+    var catalog_store = fs_catalog.catalogStore();
+    defer catalog_store.deinit();
+
+    var builder = build_mod.Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var api = api_service.Service.init(alloc, &wal_store, &builder);
+    var catalog = catalog_mod.CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &catalog_store);
+    defer catalog.deinit();
+    var query = query_mod.QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
+    defer query.deinit();
+    var runtime_status = api_types.RuntimeStatusResult{
+        .role = .combined,
+        .tick_interval_ms = 1,
+        .validated = true,
+        .targets = try alloc.alloc(api_types.RuntimeStorageTarget, 0),
+    };
+    defer runtime_status.deinit(alloc);
+    var handler = HttpHandler.init(alloc, &api, &catalog, &manifest_store, &progress_store, &query, &runtime_status);
+
+    defer handler.query_admission.deinitMemory();
+    try handler.query_admission.configure(.{ .max_retained_bytes = 16 * 1024 * 1024 });
+
+    var create = try handler.handle(.{
+        .method = .put,
+        .path = "/tables/docs",
+        .body = "{}",
+    });
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), create.status);
+    const padding = try alloc.alloc(u8, 128 * 1024);
+    defer alloc.free(padding);
+    @memset(padding, 'x');
+    const ingest_body = try std.fmt.allocPrint(alloc,
+        \\{{"timestamp_ns":456,"mutations":[{{"kind":"upsert","doc_id":"doc-a","document":{{"body":"alpha","padding":"{s}"}}}}]}}
+    , .{padding});
+    defer alloc.free(ingest_body);
+    var ingest = try handler.handle(.{
+        .method = .put,
+        .path = "/tables/docs/ingest-batch",
+        .body = ingest_body,
+    });
+    defer ingest.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), ingest.status);
+    var build = try handler.handle(.{
+        .method = .post,
+        .path = "/internal/v1/tables/docs/build",
+    });
+    defer build.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), build.status);
+
+    const request = HttpRequest{
+        .method = .post,
+        .path = "/tables/docs/query",
+        .body = "{\"full_text_search\":{\"query\":\"body:alpha\"},\"fields\":[\"body\"],\"limit\":1}",
+    };
+    // Exercise the actual catalog, manifest/session, artifact/search and JSON
+    // output path, then keep the body alive after admission has been released.
+    {
+        var response = try handler.handle(request);
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        try std.testing.expect(std.mem.indexOf(u8, response.body, "doc-a") != null);
+        try std.testing.expect(response.memory_owner != null);
+        try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().in_flight);
+        try std.testing.expect(handler.query_admission.stats().retained_bytes >= response.body.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().retained_bytes);
+
+    // The tiny returned projection fits this ceiling; reading and searching
+    // its large source document does not. This catches output-only accounting.
+    try handler.query_admission.configure(.{ .max_retained_bytes = 64 * 1024 });
+    @import("../../test_error_logs.zig").expectErrorLogs(3);
+    var rejected = try handler.handle(request);
+    defer rejected.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), rejected.status);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.body, "resource_exhausted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejected.body, "\"execution_started\":true") != null);
+    try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().retained_bytes);
 }
 
 test "serverless http handler serves the table public lifecycle and consistency routes" {
