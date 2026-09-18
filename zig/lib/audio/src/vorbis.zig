@@ -629,6 +629,14 @@ pub fn demuxPacketsAlloc(allocator: std.mem.Allocator, packets: []const ogg.Pack
     var total_decoded_samples: u64 = 0;
     var previous_blocksize: ?u16 = null;
     var last_granule: ?u64 = null;
+    // Decoded sample count and granule at the previous granule-bearing
+    // packet. libvorbis resynchronises its running position to each page
+    // granule and, on the final page, strips only the samples decoded past
+    // the granule delta since the previous page. That matters when packets
+    // were dropped (e.g. an invalid mode number): the stream's granules run
+    // ahead of what was decoded and a plain min() would keep every sample.
+    var granule_base: u64 = 0;
+    var granule_base_decoded: u64 = 0;
 
     for (source_audio_packets) |packet| {
         const header = parseAudioPacketHeader(packet.bytes, headers) catch continue;
@@ -637,10 +645,21 @@ pub fn demuxPacketsAlloc(allocator: std.mem.Allocator, packets: []const ogg.Pack
         else
             @intCast(header.blocksize / 2);
 
-        total_decoded_samples += decoded_sample_count;
-        const packet_granule = if (packet.granule_applies) packet.page_granule_position else null;
+        // The first packet only primes the overlap (Vorbis I 4.3.8), so its
+        // half block is not audio and must not count against the granules.
+        if (previous_blocksize != null) total_decoded_samples += decoded_sample_count;
+        const packet_granule = if (packet.granule_applies and packet.page_granule_position != std.math.maxInt(u64))
+            packet.page_granule_position
+        else
+            null;
         if (packet_granule) |granule| {
-            last_granule = @min(granule, total_decoded_samples);
+            const expected = if (granule >= granule_base)
+                granule_base_decoded +| (granule - granule_base)
+            else
+                granule;
+            last_granule = @min(expected, total_decoded_samples);
+            granule_base = granule;
+            granule_base_decoded = total_decoded_samples;
         }
 
         try audio_packets.append(allocator, .{
@@ -824,11 +843,14 @@ pub fn decodeDemuxedInterleavedAlloc(allocator: std.mem.Allocator, demuxed: Demu
         );
     }
 
+    // Vorbis I 4.3.8: the first packet only primes the overlap, so decoded
+    // audio starts at its centre; the granule position counts from there.
+    const first_frame = packet_centers[0];
     const playable_frames = std.math.cast(usize, demuxed.playable_samples) orelse return error.UnsupportedAudioFormat;
-    if (playable_frames > total_frames) return error.UnsupportedAudioFormat;
+    if (first_frame + playable_frames > total_frames) return error.UnsupportedAudioFormat;
 
     const samples = try allocator.alloc(f32, playable_frames * channels);
-    @memcpy(samples, timeline[0 .. playable_frames * channels]);
+    @memcpy(samples, timeline[first_frame * channels .. (first_frame + playable_frames) * channels]);
     return .{
         .samples = samples,
         .sample_rate = demuxed.headers.identification.sample_rate,
@@ -886,12 +908,13 @@ fn decodeAudioPacketBlockAlloc(
     var reader = BitReader.init(packet);
     _ = try reader.readBits(u1, 1);
     _ = try reader.readBits(u8, ilog(headers.setup.modes.len - 1));
-    if (packet_header.blocksize == headers.identification.blocksize_large) {
+    const mode = headers.setup.modes[packet_header.mode_number];
+    if (mode.block_flag) {
         _ = try reader.readBits(u1, 1);
         _ = try reader.readBits(u1, 1);
     }
 
-    const mapping = headers.setup.mappings[headers.setup.modes[packet_header.mode_number].mapping];
+    const mapping = headers.setup.mappings[mode.mapping];
     const half_block = blocksize / 2;
 
     const floor_decodes = try scratch.ensureFloorDecodes(channels);
@@ -1180,10 +1203,12 @@ fn parseFloor(allocator: std.mem.Allocator, reader: *BitReader, codebooks: []con
                 }
                 const subclass_books = @as(usize, 1) << @intCast(subclasses);
                 for (0..subclass_books) |j| {
+                    // Vorbis I 7.2.2: the book number is stored plus one so
+                    // that 0 means "no book" for that subclass.
                     const raw_book = try reader.readBits(u8, 8);
-                    floor.subclass_books[i][j] = if (raw_book == 255) null else blk: {
-                        if (raw_book >= codebooks.len) return error.UnsupportedAudioFormat;
-                        break :blk raw_book;
+                    floor.subclass_books[i][j] = if (raw_book == 0) null else blk: {
+                        if (raw_book - 1 >= codebooks.len) return error.UnsupportedAudioFormat;
+                        break :blk raw_book - 1;
                     };
                 }
             }
@@ -2091,9 +2116,76 @@ fn renderLine(x0: usize, y0: u16, x1: usize, y1: u16, values: []u16) void {
     }
 }
 
+/// Vorbis I 7.2.4: floor1 amplitude-to-linear table (256 entries).
+const floor1_inverse_db_table = [256]f32{
+    1.0649863e-07, 1.1341951e-07, 1.2079015e-07, 1.2863978e-07,
+    1.3699951e-07, 1.4590251e-07, 1.5538408e-07, 1.6548181e-07,
+    1.7623575e-07, 1.8768855e-07, 1.9988561e-07, 2.1287530e-07,
+    2.2670913e-07, 2.4144197e-07, 2.5713223e-07, 2.7384213e-07,
+    2.9163793e-07, 3.1059021e-07, 3.3077411e-07, 3.5226968e-07,
+    3.7516214e-07, 3.9954229e-07, 4.2550680e-07, 4.5315863e-07,
+    4.8260743e-07, 5.1396998e-07, 5.4737065e-07, 5.8294187e-07,
+    6.2082472e-07, 6.6116941e-07, 7.0413592e-07, 7.4989464e-07,
+    7.9862701e-07, 8.5052630e-07, 9.0579828e-07, 9.6466216e-07,
+    1.0273513e-06, 1.0941144e-06, 1.1652161e-06, 1.2409384e-06,
+    1.3215816e-06, 1.4074654e-06, 1.4989305e-06, 1.5963394e-06,
+    1.7000785e-06, 1.8105592e-06, 1.9282195e-06, 2.0535261e-06,
+    2.1869758e-06, 2.3290978e-06, 2.4804557e-06, 2.6416497e-06,
+    2.8133190e-06, 2.9961443e-06, 3.1908506e-06, 3.3982101e-06,
+    3.6190449e-06, 3.8542308e-06, 4.1047004e-06, 4.3714470e-06,
+    4.6555282e-06, 4.9580707e-06, 5.2802740e-06, 5.6234160e-06,
+    5.9888572e-06, 6.3780469e-06, 6.7925283e-06, 7.2339451e-06,
+    7.7040476e-06, 8.2047000e-06, 8.7378876e-06, 9.3057248e-06,
+    9.9104632e-06, 1.0554501e-05, 1.1240392e-05, 1.1970856e-05,
+    1.2748789e-05, 1.3577278e-05, 1.4459606e-05, 1.5399272e-05,
+    1.6400004e-05, 1.7465768e-05, 1.8600792e-05, 1.9809576e-05,
+    2.1096914e-05, 2.2467911e-05, 2.3928002e-05, 2.5482978e-05,
+    2.7139006e-05, 2.8902651e-05, 3.0780908e-05, 3.2781225e-05,
+    3.4911534e-05, 3.7180282e-05, 3.9596466e-05, 4.2169667e-05,
+    4.4910090e-05, 4.7828601e-05, 5.0936773e-05, 5.4246931e-05,
+    5.7772202e-05, 6.1526565e-05, 6.5524908e-05, 6.9783085e-05,
+    7.4317983e-05, 7.9147585e-05, 8.4291040e-05, 8.9768747e-05,
+    9.5602426e-05, 0.00010181521, 0.00010843174, 0.00011547824,
+    0.00012298267, 0.00013097477, 0.00013948625, 0.00014855085,
+    0.00015820453, 0.00016848555, 0.00017943469, 0.00019109536,
+    0.00020351382, 0.00021673929, 0.00023082423, 0.00024582449,
+    0.00026179955, 0.00027881276, 0.00029693158, 0.00031622787,
+    0.00033677814, 0.00035866388, 0.00038197188, 0.00040679456,
+    0.00043323036, 0.00046138411, 0.00049136745, 0.00052329927,
+    0.00055730621, 0.00059352311, 0.00063209358, 0.00067317058,
+    0.00071691700, 0.00076350630, 0.00081312324, 0.00086596457,
+    0.00092223983, 0.00098217216, 0.0010459992,  0.0011139742,
+    0.0011863665,  0.0012634633,  0.0013455702,  0.0014330129,
+    0.0015261382,  0.0016253153,  0.0017309374,  0.0018434235,
+    0.0019632195,  0.0020908006,  0.0022266726,  0.0023713743,
+    0.0025254795,  0.0026895994,  0.0028643847,  0.0030505286,
+    0.0032487691,  0.0034598925,  0.0036847358,  0.0039241906,
+    0.0041792066,  0.0044507950,  0.0047400328,  0.0050480668,
+    0.0053761186,  0.0057254891,  0.0060975636,  0.0064938176,
+    0.0069158225,  0.0073652516,  0.0078438871,  0.0083536271,
+    0.0088964928,  0.009474637,   0.010090352,   0.010746080,
+    0.011444421,   0.012188144,   0.012980198,   0.013823725,
+    0.014722068,   0.015678791,   0.016697687,   0.017782797,
+    0.018938423,   0.020169149,   0.021479854,   0.022875735,
+    0.024362330,   0.025945531,   0.027631618,   0.029427276,
+    0.031339626,   0.033376252,   0.035545228,   0.037855157,
+    0.040315199,   0.042935108,   0.045725273,   0.048696758,
+    0.051861348,   0.055231591,   0.058820850,   0.062643361,
+    0.066714279,   0.071049749,   0.075666962,   0.080584227,
+    0.085821044,   0.091398179,   0.097337747,   0.10366330,
+    0.11039993,    0.11757434,    0.12521498,    0.13335215,
+    0.14201813,    0.15124727,    0.16107617,    0.17154380,
+    0.18269168,    0.19456402,    0.20720788,    0.22067342,
+    0.23501402,    0.25028656,    0.26655159,    0.28387361,
+    0.30232132,    0.32196786,    0.34289114,    0.36517414,
+    0.38890521,    0.41417847,    0.44109412,    0.46975890,
+    0.50028648,    0.53279791,    0.56742212,    0.60429640,
+    0.64356699,    0.68538959,    0.72993007,    0.77736504,
+    0.82788260,    0.88168307,    0.9389798,     1.0,
+};
+
 fn inverseDbApprox(value: u16) f32 {
-    const clamped = @min(value, 255);
-    return @exp((@as(f32, @floatFromInt(clamped)) - 255.0) * 0.063025);
+    return floor1_inverse_db_table[@min(value, 255)];
 }
 
 fn buildFloor0LinearMapAlloc(allocator: std.mem.Allocator, n: usize, floor: Floor) ![]u16 {
@@ -2191,7 +2283,10 @@ fn decodeResidueAlloc(
         }
     }
 
-    const actual_size = channel_len;
+    // Vorbis I 8.6.4: residue type 2 codes all channels of the submap as one
+    // interleaved vector, so its begin/end limits apply to the interleaved
+    // length. Unused channels still occupy their interleave slots.
+    const actual_size = if (residue.kind == 2) channel_len * channel_indices.len else channel_len;
     const limit_begin = @min(@as(usize, @intCast(residue.begin)), actual_size);
     const limit_end = @min(@as(usize, @intCast(residue.end)), actual_size);
     if (limit_end <= limit_begin) return;
@@ -2227,8 +2322,10 @@ fn decodeResidueAlloc(
                     var i = classwords_per_codeword;
                     while (i > 0) {
                         i -= 1;
-                        if (partition_count + i >= partitions_to_read) continue;
-                        classifications[partition_count + i] = @intCast(temp % residue.classifications);
+                        // Slots past the last partition still consume a digit.
+                        if (partition_count + i < partitions_to_read) {
+                            classifications[partition_count + i] = @intCast(temp % residue.classifications);
+                        }
                         temp = @divTrunc(temp, residue.classifications);
                     }
                 } else {
@@ -2241,9 +2338,10 @@ fn decodeResidueAlloc(
                         var i = classwords_per_codeword;
                         while (i > 0) {
                             i -= 1;
-                            if (partition_count + i >= partitions_to_read) continue;
-                            classifications[j * partitions_to_read + partition_count + i] =
-                                @intCast(temp % residue.classifications);
+                            if (partition_count + i < partitions_to_read) {
+                                classifications[j * partitions_to_read + partition_count + i] =
+                                    @intCast(temp % residue.classifications);
+                            }
                             temp = @divTrunc(temp, residue.classifications);
                         }
                     }
@@ -2263,8 +2361,9 @@ fn decodeResidueAlloc(
                             residue.kind,
                             spectra,
                             channel_len,
-                            active_channel_indices,
-                            active_channel_indices[0],
+                            channel_indices,
+                            do_not_decode,
+                            channel_indices[0],
                             start,
                             partition_value_count,
                         ) catch |err| {
@@ -2285,7 +2384,8 @@ fn decodeResidueAlloc(
                             residue.kind,
                             spectra,
                             channel_len,
-                            active_channel_indices,
+                            channel_indices,
+                            do_not_decode,
                             channel,
                             start,
                             partition_size,
@@ -2308,7 +2408,8 @@ fn decodeResiduePartition(
     residue_kind: u16,
     spectra: []f32,
     channel_len: usize,
-    active_channel_indices: []const u8,
+    channel_indices: []const u8,
+    do_not_decode: []const bool,
     channel: u8,
     start: usize,
     partition_size: usize,
@@ -2348,10 +2449,10 @@ fn decodeResiduePartition(
                 for (vector_buf[0..dims]) |value| {
                     if (cursor >= partition_size) break;
                     const flat_index = start + cursor;
-                    const target_channel = active_channel_indices[flat_index % active_channel_indices.len];
-                    const target_index = flat_index / active_channel_indices.len;
-                    if (target_index < channel_len) {
-                        spectra[target_channel * channel_len + target_index] += value;
+                    const slot = flat_index % channel_indices.len;
+                    const target_index = flat_index / channel_indices.len;
+                    if (!do_not_decode[slot] and target_index < channel_len) {
+                        spectra[@as(usize, channel_indices[slot]) * channel_len + target_index] += value;
                     }
                     cursor += 1;
                 }
@@ -2401,6 +2502,10 @@ fn imdctIntoWithScratch(out: []f32, coefficients: []const f32, plan: ImdctPlan, 
     if (out.len != coefficients.len * 2 or out.len != plan.n) return error.UnsupportedAudioFormat;
     const work = try scratch.ensureImdctWork(plan.fft_len);
     try fast_imdct.imdctInto(out, coefficients, &plan, work);
+    // The shared kernel is normalised by 2/N; the Vorbis I IMDCT (section
+    // 1.3.2) carries no normalisation, the window pair sums to one instead.
+    const scale: f32 = @as(f32, @floatFromInt(out.len)) / 2.0;
+    for (out) |*sample| sample.* *= scale;
 }
 
 fn imdctIntoNaive(out: []f32, coefficients: []const f32) !void {
@@ -2498,28 +2603,35 @@ fn vorbisWindowValue(index: usize, width: usize) f32 {
 fn buildCanonicalCodewords(codeword_lengths: []const u8, codewords: []u32) !u8 {
     if (codeword_lengths.len != codewords.len) return error.UnsupportedAudioFormat;
 
-    var counts = [_]u32{0} ** 33;
+    // Vorbis I 3.2.1: entries are assigned, in entry order, the lowest
+    // codeword of their length that is not a prefix (or extension) of an
+    // already assigned one. This is not the same as the DEFLATE canonical
+    // assignment, which sorts by length first. `available[k]` holds the
+    // next free codeword of length k, left-aligned in 32 bits; 0 means none.
+    var available = [_]u32{0} ** 33;
     var max_len: u8 = 0;
-    for (codeword_lengths) |length| {
-        if (length == 0) continue;
-        if (length >= counts.len) return error.UnsupportedAudioFormat;
-        counts[length] += 1;
-        max_len = @max(max_len, length);
-    }
-    if (max_len == 0) return 0;
-
-    var next_code = [_]u32{0} ** 33;
-    var code: u32 = 0;
-    for (1..counts.len) |bits| {
-        code = (code + counts[bits - 1]) << 1;
-        next_code[bits] = code;
-    }
+    var first = true;
     for (codeword_lengths, 0..) |length, i| {
         if (length == 0) continue;
-        codewords[i] = bitReverse(next_code[length], length);
-        next_code[length] += 1;
+        if (length >= 32) return error.UnsupportedAudioFormat;
+        max_len = @max(max_len, length);
+        if (first) {
+            first = false;
+            codewords[i] = 0;
+            for (1..@as(usize, length) + 1) |k| available[k] = @as(u32, 1) << @intCast(32 - k);
+            continue;
+        }
+        var z: usize = length;
+        while (z > 0 and available[z] == 0) z -= 1;
+        if (z == 0) return error.UnsupportedAudioFormat;
+        const res = available[z];
+        available[z] = 0;
+        codewords[i] = bitReverse(res >> @intCast(32 - @as(u32, length)), length);
+        var y: usize = length;
+        while (y > z) : (y -= 1) {
+            available[y] = res + (@as(u32, 1) << @intCast(32 - y));
+        }
     }
-
     return max_len;
 }
 
@@ -2827,7 +2939,8 @@ test "decode chained vorbis logical streams with stable format" {
 
     try std.testing.expectEqual(@as(u32, 16000), decoded.sample_rate);
     try std.testing.expectEqual(@as(u8, 2), decoded.channels);
-    try std.testing.expectEqual(@as(usize, 16000 * 2 * 2 * 2), decoded.samples.len);
+    // Two chained copies of the one-second stereo fixture.
+    try std.testing.expectEqual(@as(usize, 2 * 16000 * 2), decoded.samples.len);
 }
 
 test "optimized vorbis imdct stays close to naive transform" {
@@ -2920,8 +3033,8 @@ test "decode checked-in vorbis fixtures to interleaved pcm" {
         try std.testing.expectEqual(@as(u8, 2), decoded.channels);
         try std.testing.expectEqual(@as(usize, 32000), decoded.samples.len);
 
-        // The Vorbis decoder is a known gap (its output does not match the
-        // reference yet); only the shape and finiteness are pinned here.
+        // Reference closeness is asserted by the codec corpus test in
+        // mod.zig; this pins the shape and that nothing went non-finite.
         for (decoded.samples) |sample| try std.testing.expect(std.math.isFinite(sample));
     }
 }

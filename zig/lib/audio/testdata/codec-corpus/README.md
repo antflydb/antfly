@@ -21,9 +21,9 @@ Current status:
 - The stereo fixtures were made from the mono tone with ffmpeg, whose
   mono-to-stereo matrix places the tone at -3 dB in each channel; the corpus
   test scales the tone reference by 1/sqrt(2) for stereo fixtures.
-- The Vorbis fixtures (`tone-stereo.ogg`, `tone-stereo.oga`) are marked as a
-  known decoder gap in `conformance.zig`: the pure-Zig Vorbis decoder does not
-  reproduce the reference yet, so the corpus test only checks their shape.
+- The Vorbis fixtures (`tone-stereo.ogg`, `tone-stereo.oga`) are held to the
+  same reference closeness as every other codec; the pure-Zig Vorbis decoder
+  matches ffmpeg at about 120 dB SNR on them.
 - The shared unsupported lane is intentionally separate from this directory and
   currently only covers synthetic unknown bytes in code.
 - The `lib/audio` tests verify both that every encoded fixture here is present

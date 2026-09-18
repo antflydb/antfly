@@ -51,10 +51,6 @@ pub fn CodecCase(comptime EncodedFormat: type) type {
         /// source: the first quarter second, downmixed to mono, as 16-bit
         /// little-endian PCM at `expected_sample_rate` (ffmpeg output).
         reference_excerpt_pcm16_mono: ?[]const u8 = null,
-        /// Set when the pure-Zig decoder is known not to reproduce the
-        /// reference yet: the corpus test still checks the shape and that
-        /// the output is finite, but skips the closeness assertion.
-        known_decoder_gap: ?[]const u8 = null,
     };
 }
 
@@ -318,7 +314,6 @@ pub fn buildCheckedInCodecCases(comptime EncodedFormat: type, fixtures: anytype)
             .min_compared = 12000,
             .min_correlation = 0.995,
             .max_mean_abs_error = 0.05,
-            .known_decoder_gap = "the pure-Zig Vorbis decoder does not reproduce the reference yet",
         },
         .{
             .name = "tone-stereo.oga",
@@ -329,7 +324,6 @@ pub fn buildCheckedInCodecCases(comptime EncodedFormat: type, fixtures: anytype)
             .min_compared = 12000,
             .min_correlation = 0.995,
             .max_mean_abs_error = 0.05,
-            .known_decoder_gap = "the pure-Zig Vorbis decoder does not reproduce the reference yet",
         },
         .{
             .name = "tone-stereo.opus",

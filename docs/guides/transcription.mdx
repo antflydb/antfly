@@ -51,7 +51,7 @@ antfly inference list
 
 `whisper-small` is the smallest checkpoint that is reliably accurate on meeting audio; `whisper-tiny` is faster and fine for clean dictation but drops words in cross-talk. Any Whisper checkpoint on the [Local Model Compatibility](/docs/guides/supported-models) page works, and the `openai` and `vertex` providers work without a local model.
 
-Recordings arrive as `http://`, `https://`, `s3://`, or `data:` URLs. The runtime decodes WAV, FLAC, MP3, AAC-LC in ADTS/M4A/MP4 (iPhone and macOS voice memos, most exported meeting recordings), ALAC, and Opus in Ogg or WebM/Matroska (browser recorders, Zoom, OBS) natively; the Opus decoder reproduces the libopus reference output on the RFC 8251 test vectors and the AAC decoder matches ffmpeg on the checked-in corpus. AIFF, CAF, and AU containers are read as well. Vorbis in Ogg or WebM is demuxed but its decoder is not yet qualified, so convert Vorbis recordings to FLAC or Opus first. A recording may be up to 128 MiB by default (about one hour of 128 kbps MP3), and length is not otherwise limited: audio over 30 seconds is transcribed in windows cut at pauses, with each window conditioned on the previous one.
+Recordings arrive as `http://`, `https://`, `s3://`, or `data:` URLs. The runtime decodes WAV, FLAC, MP3, AAC-LC in ADTS/M4A/MP4 (iPhone and macOS voice memos, most exported meeting recordings), ALAC, and Opus or Vorbis in Ogg or WebM/Matroska (browser recorders, Zoom, OBS) natively; the Opus decoder reproduces the libopus reference output on the RFC 8251 test vectors, the Vorbis decoder matches libvorbis on the Xiph test vectors, and the AAC decoder matches ffmpeg on the checked-in corpus. AIFF, CAF, and AU containers are read as well. A recording may be up to 128 MiB by default (about one hour of 128 kbps MP3), and length is not otherwise limited: audio over 30 seconds is transcribed in windows cut at pauses, with each window conditioned on the previous one.
 
 ## Build It
 
@@ -134,17 +134,27 @@ The chunk is cut on a character boundary, so it can start or end mid-word; its t
 
 | Provider | Timestamps | Speaker labels | Notes |
 |----------|------------|----------------|-------|
-| `antfly` | Phrase timestamps from Whisper, word spans estimated | No | Local, no network. `model` is required. |
+| `antfly` | Phrase timestamps from Whisper, word spans estimated | Yes, with `"diarization": true` | Local, no network. `model` is required. Speaker labels come from a local speaker-embedding model (see below). |
 | `openai` | Segment timestamps (`verbose_json`) | No | `whisper-1` only; 25 MB request limit on their side. |
 | `vertex` | Word offsets | Yes, with `"diarization": true` | Speech-to-Text v2 `recognize`; one minute of audio per request on Google's side. Each speaker turn becomes its own segment with a `speaker` label. |
 
 `timestamps` defaults to true. Setting it to false tells `vertex` not to request word offsets, which leaves the transcript as one untimed unit; the `antfly` and `openai` routes always return their phrase timing.
 
+### Local Speaker Labels
+
+With `"diarization": true` on the `antfly` provider (or on `/ai/v1/transcribe`), each phrase is labelled `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance, and the response lists the speakers found. The labels come from a speaker verification model run in-process: 3 s windows every 1.5 s over the spoken parts of the recording are embedded with 3D-Speaker's CAM++, the embeddings are clustered by voice similarity, each word takes the speaker of the window nearest to it, and a phrase whose words change speaker is split at the change. So a turn change that Whisper folded into one phrase still comes out as two segments. Pull the model once:
+
+```bash
+antfly inference pull csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx
+```
+
+Without it, a diarization request fails with `SPEAKER_MODEL_UNAVAILABLE` rather than silently returning an unlabelled transcript. Diarization adds roughly a tenth of a second per phrase on CPU. A transcript produced as text (rather than JSON) keeps the turns as `SPEAKER_00: ...` lines; the JSON form carries `speaker` on each segment and a `speakers` list. Labels are per recording: `SPEAKER_00` in one file is not the same person as `SPEAKER_00` in another.
+
 ## Tradeoffs
 
 The decision is how the transcript is chunked, because a chunk is what search returns and what an embedding represents. `chunk_size` counts characters of transcript for the default chunker; 256 is about fifteen seconds of speech and gives one idea per hit with a tight time range, while 1024 keeps a whole topic together for an answer agent at the cost of a range that spans a minute or more. Chunks are cut on text boundaries, not silence, so a chunk can straddle a topic change; the timing on each chunk spans from the first sentence it overlaps to the last, which is what a player needs even when the cut is imperfect.
 
-The other decision is where transcription runs. The local `antfly` provider keeps audio on the machine and costs decoder time: `whisper-small` transcribes a minute of audio in about nine seconds on an M-series laptop and `whisper-tiny` in about one, so a one hour call costs a worker about nine minutes with `small` and about a minute with `tiny`. Local transcription runs one recording at a time per worker because the model state is shared; the `openai` and `vertex` routes fan out up to eight recordings concurrently per batch. A slow first pass is paid once per recording.
+The other decision is where transcription runs. The local `antfly` provider keeps audio on the machine and costs decoder time: `whisper-small` transcribes a minute of audio in about nine seconds on an M-series laptop and `whisper-tiny` in about one, so a one hour call costs a worker about nine minutes with `small` and about a minute with `tiny`. Local transcription overlaps two recordings per worker: the model runs one at a time because its state is shared, but one recording's decoding and feature extraction proceed while the model is busy with the other. The `openai` and `vertex` routes fan out up to eight recordings per batch. A slow first pass is paid once per recording.
 
 ## Use Agent Skills
 

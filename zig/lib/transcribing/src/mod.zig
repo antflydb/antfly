@@ -276,6 +276,66 @@ pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
     cfg.* = undefined;
 }
 
+/// The transcript as one line per phrase prefixed with its speaker label
+/// (`SPEAKER_00: ...`) when diarization labelled any segment; otherwise the
+/// plain text. Caller frees the result.
+pub fn speakerAttributedTextAlloc(alloc: Allocator, response: *const Response) ![]u8 {
+    const segments = response.segments orelse return try alloc.dupe(u8, response.text orelse "");
+    var any_speaker = false;
+    for (segments) |segment| {
+        if (segment.speaker != null) any_speaker = true;
+    }
+    if (!any_speaker) return try alloc.dupe(u8, response.text orelse "");
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    var previous_speaker: ?[]const u8 = null;
+    var line_open = false;
+    for (segments) |segment| {
+        const text = std.mem.trim(u8, segment.text orelse "", " \t\r\n");
+        if (text.len == 0) continue;
+        const same_speaker = if (segment.speaker) |speaker|
+            (if (previous_speaker) |previous| std.mem.eql(u8, speaker, previous) else false)
+        else
+            previous_speaker == null and line_open;
+        if (same_speaker) {
+            try out.append(alloc, ' ');
+        } else {
+            if (line_open) try out.append(alloc, '\n');
+            if (segment.speaker) |speaker| {
+                try out.appendSlice(alloc, speaker);
+                try out.appendSlice(alloc, ": ");
+            }
+            previous_speaker = segment.speaker;
+            line_open = true;
+        }
+        try out.appendSlice(alloc, text);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+test "speaker attributed text joins consecutive phrases of one speaker" {
+    const segments = [_]Segment{
+        .{ .text = "Hello there.", .speaker = "SPEAKER_00" },
+        .{ .text = "How are you?", .speaker = "SPEAKER_00" },
+        .{ .text = "Fine, thanks.", .speaker = "SPEAKER_01" },
+        .{ .text = "(unlabelled)", .speaker = null },
+        .{ .text = "Good.", .speaker = "SPEAKER_00" },
+    };
+    const response = Response{ .text = "ignored", .segments = &segments };
+    const text = try speakerAttributedTextAlloc(std.testing.allocator, &response);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings(
+        "SPEAKER_00: Hello there. How are you?\nSPEAKER_01: Fine, thanks.\n(unlabelled)\nSPEAKER_00: Good.",
+        text,
+    );
+
+    const plain = Response{ .text = "plain", .segments = &[_]Segment{.{ .text = "plain" }} };
+    const plain_text = try speakerAttributedTextAlloc(std.testing.allocator, &plain);
+    defer std.testing.allocator.free(plain_text);
+    try std.testing.expectEqualStrings("plain", plain_text);
+}
+
 pub fn deinitResponse(alloc: Allocator, response: *Response) void {
     freeOpt(alloc, response.text);
     freeOpt(alloc, response.language);

@@ -74,6 +74,7 @@ const streaming_transcription = @import("../pipelines/streaming_transcription.zi
 const dictation_mod = @import("../pipelines/dictation.zig");
 const vad_mod = @import("../pipelines/vad.zig");
 const silero_vad_mod = @import("../pipelines/silero_vad.zig");
+const speaker_embedding_mod = @import("../pipelines/speaker_embedding.zig");
 const transcription_sessions = @import("transcription_sessions.zig");
 const readers_mod = @import("../readers/reader.zig");
 const qwen3vl_reader_mod = @import("../readers/qwen3vl.zig");
@@ -3555,6 +3556,10 @@ pub const Node = struct {
     /// for the node's lifetime; session configs point into this cache.
     silero_weights: std.StringHashMapUnmanaged(*silero_vad_mod.Weights) = .empty,
     silero_weights_lock: std.atomic.Mutex = .unlocked,
+    /// Speaker-embedding models for diarization by resolved ONNX path,
+    /// loaded on first use and kept for the node's lifetime.
+    speaker_embedders: std.StringHashMapUnmanaged(*speaker_embedding_mod.Embedder) = .empty,
+    speaker_embedders_lock: std.atomic.Mutex = .unlocked,
     /// Lazily allocates only while compatible native executor work is queued.
     /// Ownership is here, rather than the storage BackendRuntime, because Node
     /// owns resolved model generations and concrete fused executor callbacks.
@@ -3803,6 +3808,13 @@ pub const Node = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.silero_weights.deinit(self.allocator);
+        var speaker_it = self.speaker_embedders.iterator();
+        while (speaker_it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.speaker_embedders.deinit(self.allocator);
         // The refresher borrows Node, its allocator, and the models directory.
         // Cancel and join it before releasing any of those dependencies.
         if (self.readiness_refresh_io) |io| self.readiness_refresh_group.cancel(io);
@@ -8406,7 +8418,92 @@ pub const Node = struct {
         // 30 seconds.
         var result = try long_transcription.transcribeLong(allocator, &pipeline, decoded.samples, decoded.sample_rate, .{});
         defer result.deinit();
+        if (request.diarization orelse false) {
+            try control.update(.executing, 0, 0);
+            try self.assignTranscriptSpeakers(allocator, &result, decoded.samples, decoded.sample_rate);
+        }
         return try transcriptionResponseAlloc(allocator, &result);
+    }
+
+    /// Where the default speaker-embedding model lives once pulled: the
+    /// registry's variant leaf for the explicit `.onnx` file name, or that
+    /// file directly under the repository directory. Caller frees.
+    fn resolveSpeakerModelPath(self: *Node) ![]const u8 {
+        const ref = try registry_mod.ModelRef.parse(speaker_embedding_mod.default_model_ref);
+        const variant_dir = try registry_mod.modelInstallDirAlloc(self.allocator, self.config.models_dir, ref);
+        defer self.allocator.free(variant_dir);
+        const candidates = [_][]const u8{ variant_dir, self.config.models_dir };
+        for (candidates, 0..) |dir, i| {
+            const path = if (i == 0)
+                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, speaker_embedding_mod.default_model_file })
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}/{s}", .{ dir, ref.owner, ref.name, speaker_embedding_mod.default_model_file });
+            if (dirExists(path)) return path;
+            self.allocator.free(path);
+        }
+        return error.SpeakerModelUnavailable;
+    }
+
+    /// The loaded default speaker model, shared across requests. The graph
+    /// import takes seconds, so it runs outside the map lock; a concurrent
+    /// first request may import twice and the later copy is dropped.
+    fn speakerEmbedder(self: *Node) !*speaker_embedding_mod.Embedder {
+        const model_path = try self.resolveSpeakerModelPath();
+        defer self.allocator.free(model_path);
+        {
+            spinLock(&self.speaker_embedders_lock);
+            defer self.speaker_embedders_lock.unlock();
+            if (self.speaker_embedders.get(model_path)) |embedder| return embedder;
+        }
+        var loaded = try speaker_embedding_mod.Embedder.load(self.allocator, model_path);
+        errdefer loaded.deinit();
+        const owned = try self.allocator.create(speaker_embedding_mod.Embedder);
+        errdefer self.allocator.destroy(owned);
+        owned.* = loaded;
+        const key = try self.allocator.dupe(u8, model_path);
+        errdefer self.allocator.free(key);
+        spinLock(&self.speaker_embedders_lock);
+        defer self.speaker_embedders_lock.unlock();
+        if (self.speaker_embedders.get(model_path)) |existing| {
+            self.allocator.free(key);
+            owned.deinit();
+            self.allocator.destroy(owned);
+            return existing;
+        }
+        try self.speaker_embedders.put(self.allocator, key, owned);
+        return owned;
+    }
+
+    /// Local diarization: replaces the phrases of `result` with
+    /// speaker-attributed ones (`Segment.speaker_index`), splitting a phrase
+    /// where the voice changes. `result` must own its segments through
+    /// `allocator`.
+    fn assignTranscriptSpeakers(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        result: *long_transcription.Result,
+        samples: []const f32,
+        sample_rate: u32,
+    ) !void {
+        if (result.segments.len == 0) return;
+        const embedder = try self.speakerEmbedder();
+        const pcm = try audio_mod.copyOrResample(allocator, samples, sample_rate, speaker_embedding_mod.sample_rate);
+        defer allocator.free(pcm);
+        const labelled = try speaker_embedding_mod.diarizeSegmentsAlloc(allocator, embedder, pcm, result.segments, .{});
+        long_transcription.freeSegments(result.allocator, result.segments);
+        result.segments = labelled;
+    }
+
+    /// Distinct speaker labels of a transcript in order of first appearance;
+    /// empty when diarization did not run. Caller frees.
+    fn transcriptSpeakerLabelsAlloc(allocator: std.mem.Allocator, result: *const long_transcription.Result) ![]const []const u8 {
+        var count: usize = 0;
+        for (result.segments) |segment| {
+            if (segment.speaker_index) |index| count = @max(count, @as(usize, index) + 1);
+        }
+        const labels = try allocator.alloc([]const u8, count);
+        for (labels, 0..) |*label, i| label.* = speaker_embedding_mod.speakerLabelStatic(@intCast(i));
+        return labels;
     }
 
     /// The transcript as the shared STT response, with timestamped segments
@@ -8423,6 +8520,7 @@ pub const Node = struct {
         errdefer {
             for (segments[0..filled]) |segment| {
                 if (segment.text) |text| allocator.free(text);
+                if (segment.speaker) |speaker| allocator.free(speaker);
                 if (segment.words) |words| {
                     for (words) |word| if (word.word) |value| allocator.free(value);
                     allocator.free(words);
@@ -8452,8 +8550,32 @@ pub const Node = struct {
                 .words = words,
             };
             filled += 1;
+            if (segment.speaker_index) |index| {
+                segments[i].speaker = try allocator.dupe(u8, speaker_embedding_mod.speakerLabelStatic(index));
+            }
         }
         response.segments = segments;
+
+        const labels = try transcriptSpeakerLabelsAlloc(allocator, result);
+        defer allocator.free(labels);
+        if (labels.len > 0) {
+            const speakers = try allocator.alloc(transcribing_api.Speaker, labels.len);
+            var speakers_filled: usize = 0;
+            errdefer {
+                for (speakers[0..speakers_filled]) |speaker| {
+                    if (speaker.id) |id| allocator.free(id);
+                    if (speaker.label) |label| allocator.free(label);
+                }
+                allocator.free(speakers);
+            }
+            for (speakers, labels) |*speaker, label| {
+                const id = try allocator.dupe(u8, label);
+                errdefer allocator.free(id);
+                speaker.* = .{ .id = id, .label = try allocator.dupe(u8, label) };
+                speakers_filled += 1;
+            }
+            response.speakers = speakers;
+        }
         return response;
     }
 
@@ -16842,9 +16964,22 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
         };
         defer result.deinit();
+        if (body.diarization orelse false) {
+            self.assignTranscriptSpeakers(ctx.allocator, &result, pcm, audio_mod.WHISPER_SAMPLE_RATE) catch |err| switch (err) {
+                error.SpeakerModelUnavailable => return ctx.status(422).json(.{
+                    .@"error" = "SPEAKER_MODEL_UNAVAILABLE",
+                    .message = "diarization needs the local speaker model: antfly inference pull " ++ speaker_embedding_mod.default_model_ref,
+                }),
+                error.OutOfMemory => return err,
+                error.Timeout, error.Cancelled, error.Canceled => return inferenceFailureResponse(ctx, err),
+                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+            };
+        }
 
         var api_segments = try dictationTranscriptSegments(ctx.allocator, &result);
         defer api_segments.deinit(ctx.allocator);
+        const speaker_labels = try transcriptSpeakerLabelsAlloc(ctx.allocator, &result);
+        defer ctx.allocator.free(speaker_labels);
         const data = [_]api.TranscribeObject{.{
             .object = "transcription",
             .index = 0,
@@ -16852,6 +16987,7 @@ pub const Node = struct {
             .language = result.language,
             .duration_ms = std.math.cast(i64, result.duration_ms) orelse std.math.maxInt(i64),
             .segments = api_segments.segments,
+            .speakers = if (speaker_labels.len > 0) speaker_labels else null,
         }};
         return ctx.json(api.TranscribeResponse{
             .object = "list",
@@ -17142,6 +17278,7 @@ pub const Node = struct {
                 .start_ms = @intCast(segment.start_ms),
                 .end_ms = @intCast(segment.end_ms),
                 .words = span,
+                .speaker = if (segment.speaker_index) |index| speaker_embedding_mod.speakerLabelStatic(index) else null,
             };
         }
         return .{ .segments = segments, .words = words };
@@ -28291,6 +28428,7 @@ fn dirContainsModel(path: []const u8) bool {
         while (iter.next(std.Options.debug_io) catch null) |entry| {
             const name = entry.name;
             if (name.len > 5 and std.mem.endsWith(u8, name, ".gguf")) return true;
+            if (name.len > 5 and std.mem.endsWith(u8, name, ".onnx")) return true;
         }
         return false;
     }
@@ -28305,6 +28443,7 @@ fn dirContainsModel(path: []const u8) bool {
         const name_z: [*:0]const u8 = @ptrCast(&entry.*.d_name);
         const name = std.mem.span(name_z);
         if (name.len > 5 and std.mem.endsWith(u8, name, ".gguf")) return true;
+        if (name.len > 5 and std.mem.endsWith(u8, name, ".onnx")) return true;
     }
 
     return false;

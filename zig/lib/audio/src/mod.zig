@@ -2131,12 +2131,6 @@ test "checked-in codec corpus decodes and stays close to its reference" {
         try std.testing.expectEqual(case.expected_sample_rate, mono.sample_rate);
         try std.testing.expect(mono.samples.len >= case.expected_sample_rate * 9 / 10);
 
-        if (case.known_decoder_gap) |gap| {
-            for (mono.samples) |sample| try std.testing.expect(std.math.isFinite(sample));
-            std.debug.print("codec corpus case {s}: skipping reference closeness ({s})\n", .{ case.name, gap });
-            continue;
-        }
-
         // Fixtures cut from a transient or noise source carry their own
         // ffmpeg reference excerpt; everything else was made from the tone.
         if (case.reference_excerpt_pcm16_mono) |excerpt| {

@@ -190,8 +190,16 @@ pub fn parsePacketStreamsAlloc(allocator: std.mem.Allocator, ogg_bytes: []const 
             saw_truncated_final_page = true;
         }
 
+        // The page granule position describes the last packet *completed*
+        // on this page, which is not necessarily the packet that ends at the
+        // page boundary: a trailing lace of 255 spills into the next page.
+        var last_completed_lace: ?usize = null;
+        for (lacing_values, 0..) |lace, lace_index| {
+            if (lace < 255) last_completed_lace = lace_index;
+        }
+
         var page_data_cursor = page_data_start;
-        for (lacing_values) |lace| {
+        for (lacing_values, 0..) |lace, lace_index| {
             const lace_len = @as(usize, lace);
             const remaining_page_bytes = ogg_bytes.len -| page_data_cursor;
             const available_lace_len = @min(lace_len, remaining_page_bytes);
@@ -205,7 +213,7 @@ pub fn parsePacketStreamsAlloc(allocator: std.mem.Allocator, ogg_bytes: []const 
             current_packet_is_eos = current_packet_is_eos or is_eos;
             if (available_lace_len < lace_len) break;
             if (lace < 255) {
-                const granule_applies = !truncated_page and page_data_cursor == page_data_end;
+                const granule_applies = !truncated_page and lace_index == last_completed_lace.?;
                 try packets.append(allocator, .{
                     .bytes = try current_packet.toOwnedSlice(allocator),
                     .page_granule_position = current_packet_page_granule,
