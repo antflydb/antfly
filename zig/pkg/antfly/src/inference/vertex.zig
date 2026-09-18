@@ -40,6 +40,8 @@ pub const GeminiProvider = struct {
     attempt_observer: ?httpx.AttemptObserver = null,
     base_url: []const u8,
     api_key_header: [2][]const u8,
+    tools_json: ?[]const u8 = null,
+    tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
     temperature: ?f32 = null,
     top_p: ?f32 = null,
@@ -119,6 +121,11 @@ pub const GeminiProvider = struct {
         return try copyEmbeddingValues(alloc, parsed.value.embeddings);
     }
 
+    pub fn setToolOptions(self: *GeminiProvider, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) void {
+        self.tools_json = tools_json;
+        self.tool_choice_json = tool_choice_json;
+    }
+
     pub fn setMaxTokens(self: *GeminiProvider, max_tokens: i64) void {
         self.max_tokens = max_tokens;
     }
@@ -145,6 +152,8 @@ pub const GeminiProvider = struct {
         defer self.allocator.free(url);
 
         const json_body = try vertexGenerateRequestJsonAlloc(alloc, messages, .{
+            .tools_json = self.tools_json,
+            .tool_choice_json = self.tool_choice_json,
             .max_tokens = self.max_tokens,
             .temperature = self.temperature,
             .top_p = self.top_p,
@@ -163,7 +172,7 @@ pub const GeminiProvider = struct {
         });
         defer resp.deinit();
         if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
-        return try parseGenerateResponseAlloc(alloc, resp.body orelse return error.EmptyResponse);
+        return try parseGenerateResponseAlloc(alloc, resp.body orelse return error.EmptyResponse, messages.len);
     }
 
     const generator_vtable = inference.Generator.VTable{
@@ -196,6 +205,8 @@ pub const Provider = struct {
     auth_header: ?[2][]const u8 = null,
     token_source: ?*google_auth.CachedTokenSource = null,
     owns_token_source: bool = false,
+    tools_json: ?[]const u8 = null,
+    tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
     temperature: ?f32 = null,
     top_p: ?f32 = null,
@@ -450,6 +461,11 @@ pub const Provider = struct {
         return try copyEmbeddingValues(alloc, values);
     }
 
+    pub fn setToolOptions(self: *Provider, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) void {
+        self.tools_json = tools_json;
+        self.tool_choice_json = tool_choice_json;
+    }
+
     pub fn setMaxTokens(self: *Provider, max_tokens: i64) void {
         self.max_tokens = max_tokens;
     }
@@ -487,6 +503,8 @@ pub const Provider = struct {
         defer self.allocator.free(url);
 
         const json_body = try vertexGenerateRequestJsonAlloc(alloc, messages, .{
+            .tools_json = self.tools_json,
+            .tool_choice_json = self.tool_choice_json,
             .max_tokens = self.max_tokens,
             .temperature = self.temperature,
             .top_p = self.top_p,
@@ -512,7 +530,7 @@ pub const Provider = struct {
         if (!resp.ok()) return if (resp.status.code == 429) error.RateLimit else error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;
 
-        return try parseGenerateResponseAlloc(alloc, body);
+        return try parseGenerateResponseAlloc(alloc, body, messages.len);
     }
 
     fn vertexModelPathAlloc(self: *const Provider, alloc: Allocator, model: []const u8) ![]u8 {
@@ -601,27 +619,67 @@ test "reranking runtime maps Vertex record IDs back to input order" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.85), scores[1], 0.0001);
 }
 
-fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8) !inference.GenerateResult {
+fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8, history_len: usize) !inference.GenerateResult {
     const Response = struct {
         candidates: []const struct {
-            content: struct {
-                parts: []const struct {
-                    text: ?[]const u8 = null,
-                } = &.{},
-            },
+            content: struct { parts: []const std.json.Value = &.{} },
         } = &.{},
     };
     var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-
     if (parsed.value.candidates.len == 0) return error.GenerateRequestFailed;
+    const parts = parsed.value.candidates[0].content.parts;
     var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    for (parsed.value.candidates[0].content.parts) |part| {
-        if (part.text) |text| try out.appendSlice(alloc, text);
+    defer out.deinit(alloc);
+    var calls = std.ArrayListUnmanaged(inference.ToolCall).empty;
+    errdefer {
+        for (calls.items) |*call| call.deinit(alloc);
+        calls.deinit(alloc);
     }
-    if (out.items.len == 0) return error.GenerateRequestFailed;
-    return .{ .content = try out.toOwnedSlice(alloc), .allocator = alloc };
+    for (parts) |raw| {
+        const Part = struct {
+            text: ?[]const u8 = null,
+            thought: bool = false,
+            functionCall: ?struct {
+                id: ?[]const u8 = null,
+                name: []const u8,
+                args: ?std.json.Value = null,
+            } = null,
+        };
+        const part = try std.json.parseFromValue(Part, alloc, raw, .{ .ignore_unknown_fields = true });
+        defer part.deinit();
+        if (!part.value.thought) {
+            if (part.value.text) |text| try out.appendSlice(alloc, text);
+        }
+        if (part.value.functionCall) |call| {
+            if (call.name.len == 0) return error.InvalidAgentToolCall;
+            if (call.args) |args| if (args != .object) return error.InvalidAgentToolCall;
+            // Older Google models omit IDs. History length separates repeated
+            // calls across turns; the part index separates parallel calls.
+            const id = if (call.id) |id|
+                if (id.len > 0) try alloc.dupe(u8, id) else return error.InvalidAgentToolCall
+            else
+                try std.fmt.allocPrint(alloc, "google_{d}_{d}", .{ history_len, calls.items.len });
+            errdefer alloc.free(id);
+            const name = try alloc.dupe(u8, call.name);
+            errdefer alloc.free(name);
+            const arguments = if (call.args) |args| try std.json.Stringify.valueAlloc(alloc, args, .{}) else try alloc.dupe(u8, "{}");
+            errdefer alloc.free(arguments);
+            try calls.append(alloc, .{ .id = id, .name = name, .arguments = arguments });
+        }
+    }
+    if (out.items.len == 0 and calls.items.len == 0) return error.GenerateRequestFailed;
+    const content = try out.toOwnedSlice(alloc);
+    errdefer alloc.free(content);
+    // Preserve part ordering and thought signatures verbatim for Google replay.
+    const google_parts = try std.json.Stringify.valueAlloc(alloc, parts, .{});
+    errdefer alloc.free(google_parts);
+    return .{
+        .content = content,
+        .tool_calls = try calls.toOwnedSlice(alloc),
+        .google_parts_json = google_parts,
+        .allocator = alloc,
+    };
 }
 
 fn vertexGenerateRequestJsonAlloc(alloc: Allocator, messages: []const inference.ChatMessage, options: inference.ChatRequestOptions) ![]u8 {
@@ -643,13 +701,27 @@ fn vertexGenerateRequestJsonAlloc(alloc: Allocator, messages: []const inference.
     if (wrote_system) try out.append(alloc, ',');
     try out.appendSlice(alloc, "\"contents\":[");
     var count: usize = 0;
-    for (messages) |message| {
+    var i: usize = 0;
+    while (i < messages.len) : (i += 1) {
+        const message = messages[i];
         if (message.role == .system) continue;
         if (count > 0) try out.append(alloc, ',');
-        try appendVertexContent(alloc, &out, message);
+        if (message.role == .tool) {
+            // Parallel function responses belong to one user content turn.
+            try out.appendSlice(alloc, "{\"role\":\"user\",\"parts\":[");
+            var response_count: usize = 0;
+            while (i < messages.len and messages[i].role == .tool) : (i += 1) {
+                if (response_count > 0) try out.append(alloc, ',');
+                try appendVertexToolResponse(alloc, &out, messages[0..i], messages[i]);
+                response_count += 1;
+            }
+            i -= 1;
+            try out.appendSlice(alloc, "]}");
+        } else try appendVertexContent(alloc, &out, message);
         count += 1;
     }
     try out.append(alloc, ']');
+    try appendVertexTools(alloc, &out, options);
     if (options.max_tokens != null or options.temperature != null or options.top_p != null or options.top_k != null) {
         try out.appendSlice(alloc, ",\"generationConfig\":{");
         var generation_fields: usize = 0;
@@ -694,12 +766,158 @@ fn appendVertexContent(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), messa
         else => "user",
     });
     try out.appendSlice(alloc, ",\"parts\":");
-    if (message.content) |content| {
-        try appendVertexParts(alloc, out, content);
+    if (message.role == .assistant and message.google_parts_json != null) {
+        try out.appendSlice(alloc, message.google_parts_json.?);
     } else {
-        try out.appendSlice(alloc, "[]");
+        try out.append(alloc, '[');
+        var count: usize = 0;
+        if (message.content) |content| {
+            switch (content) {
+                .text => |text| {
+                    try appendVertexPart(alloc, out, .{ .text = text });
+                    count += 1;
+                },
+                .parts => |parts| for (parts) |part| {
+                    if (count > 0) try out.append(alloc, ',');
+                    try appendVertexPart(alloc, out, part);
+                    count += 1;
+                },
+            }
+        }
+        if (message.tool_calls) |calls| for (calls) |call| {
+            if (count > 0) try out.append(alloc, ',');
+            const args = try std.json.parseFromSlice(std.json.Value, alloc, call.arguments, .{});
+            defer args.deinit();
+            if (args.value != .object) return error.InvalidAgentToolCall;
+            const part = try std.json.Stringify.valueAlloc(alloc, .{ .functionCall = .{
+                .id = call.id,
+                .name = call.name,
+                .args = args.value,
+            } }, .{});
+            defer alloc.free(part);
+            try out.appendSlice(alloc, part);
+            count += 1;
+        };
+        try out.append(alloc, ']');
     }
     try out.append(alloc, '}');
+}
+
+fn appendVertexToolResponse(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), history: []const inference.ChatMessage, message: inference.ChatMessage) !void {
+    const id = message.tool_call_id orelse return error.InvalidAgentToolCall;
+    var name: ?[]const u8 = null;
+    var wire_id: ?[]const u8 = id;
+    var raw_parts: ?std.json.Parsed([]const std.json.Value) = null;
+    defer if (raw_parts) |*parts| parts.deinit();
+    var i = history.len;
+    search: while (i > 0) {
+        i -= 1;
+        const previous = history[i];
+        if (previous.tool_calls) |calls| for (calls, 0..) |call, index| {
+            if (!std.mem.eql(u8, call.id, id)) continue;
+            name = call.name;
+            if (previous.google_parts_json) |json| {
+                raw_parts = try std.json.parseFromSlice([]const std.json.Value, alloc, json, .{});
+                wire_id = null;
+                var call_index: usize = 0;
+                for (raw_parts.?.value) |part| {
+                    if (part.object.get("functionCall")) |function| {
+                        if (call_index == index) {
+                            if (function.object.get("id")) |value| wire_id = value.string;
+                            break;
+                        }
+                        call_index += 1;
+                    }
+                }
+            }
+            break :search;
+        };
+    }
+    const content = message.content orelse return error.InvalidAgentToolCall;
+    const text = switch (content) {
+        .text => |text| text,
+        else => return error.InvalidAgentToolCall,
+    };
+    // Tool results may be arbitrary text or JSON, but Google requires an object.
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
+    defer if (parsed) |value| value.deinit();
+    const response = if (parsed) |value| value.value else std.json.Value{ .string = text };
+    const response_json = if (response == .object)
+        try std.json.Stringify.valueAlloc(alloc, response, .{})
+    else
+        try std.json.Stringify.valueAlloc(alloc, .{ .result = response }, .{});
+    defer alloc.free(response_json);
+    try out.appendSlice(alloc, "{\"functionResponse\":{\"name\":");
+    try appendJsonString(alloc, out, name orelse return error.InvalidAgentToolCall);
+    if (wire_id) |value| {
+        try out.appendSlice(alloc, ",\"id\":");
+        try appendJsonString(alloc, out, value);
+    }
+    try out.appendSlice(alloc, ",\"response\":");
+    try out.appendSlice(alloc, response_json);
+    try out.appendSlice(alloc, "}}");
+}
+
+fn appendVertexTools(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), options: inference.ChatRequestOptions) !void {
+    if (options.tools_json) |json| {
+        const Tool = struct {
+            type: []const u8,
+            function: struct {
+                name: []const u8,
+                description: ?[]const u8 = null,
+                parameters: ?std.json.Value = null,
+            },
+        };
+        const tools = try std.json.parseFromSlice([]const Tool, alloc, json, .{ .ignore_unknown_fields = true });
+        defer tools.deinit();
+        if (tools.value.len > 0) {
+            try out.appendSlice(alloc, ",\"tools\":[{\"functionDeclarations\":[");
+            for (tools.value, 0..) |tool, i| {
+                if (!std.mem.eql(u8, tool.type, "function") or tool.function.name.len == 0) return error.InvalidGeneratorConfig;
+                if (i > 0) try out.append(alloc, ',');
+                const declaration = try std.json.Stringify.valueAlloc(alloc, .{
+                    .name = tool.function.name,
+                    .description = tool.function.description,
+                    .parametersJsonSchema = tool.function.parameters,
+                }, .{ .emit_null_optional_fields = false });
+                defer alloc.free(declaration);
+                try out.appendSlice(alloc, declaration);
+            }
+            try out.appendSlice(alloc, "]}]");
+        }
+    }
+    if (options.tool_choice_json) |json| {
+        const choice = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer choice.deinit();
+        var mode: []const u8 = undefined;
+        var function_name: ?[]const u8 = null;
+        defer if (function_name) |name| alloc.free(name);
+        switch (choice.value) {
+            .string => |value| {
+                mode = if (std.mem.eql(u8, value, "auto")) "AUTO" else if (std.mem.eql(u8, value, "none")) "NONE" else if (std.mem.eql(u8, value, "required")) "ANY" else return error.InvalidGeneratorConfig;
+            },
+            .object => {
+                const Forced = struct { type: []const u8, function: struct { name: []const u8 } };
+                const forced = try std.json.parseFromValue(Forced, alloc, choice.value, .{});
+                defer forced.deinit();
+                if (!std.mem.eql(u8, forced.value.type, "function") or forced.value.function.name.len == 0) return error.InvalidGeneratorConfig;
+                mode = "ANY";
+                function_name = try alloc.dupe(u8, forced.value.function.name);
+            },
+            else => return error.InvalidGeneratorConfig,
+        }
+        try out.appendSlice(alloc, ",\"toolConfig\":{\"functionCallingConfig\":{\"mode\":");
+        try appendJsonString(alloc, out, mode);
+        if (function_name) |name| {
+            try out.appendSlice(alloc, ",\"allowedFunctionNames\":[");
+            try appendJsonString(alloc, out, name);
+            try out.append(alloc, ']');
+        }
+        try out.appendSlice(alloc, "}}");
+    }
 }
 
 fn appendVertexParts(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), content: inference.ChatMessageContent) !void {
@@ -1163,4 +1381,95 @@ fn fakeVertexCredentialsJsonAlloc(alloc: Allocator, token_uri: []const u8) ![]u8
     ,
         .{ fake_vertex_private_key_json, token_uri },
     );
+}
+
+test "vertex provider tools preserve parallel calls signatures and repeated turns" {
+    const alloc = std.testing.allocator;
+    const response =
+        \\{"candidates":[{"content":{"parts":[{"text":"private","thought":true,"thoughtSignature":"text-signature"},{"functionCall":{"name":"search","args":{"query":"one"}},"thoughtSignature":"call-signature"},{"functionCall":{"id":"native-id","name":"search","args":{"query":"two"}}}]}}]}
+    ;
+    var first = try parseGenerateResponseAlloc(alloc, response, 1);
+    defer first.deinit();
+    var second = try parseGenerateResponseAlloc(alloc, response, 4);
+    defer second.deinit();
+    try std.testing.expectEqualStrings("", first.content);
+    try std.testing.expectEqual(@as(usize, 2), first.tool_calls.len);
+    try std.testing.expect(!std.mem.eql(u8, first.tool_calls[0].id, second.tool_calls[0].id));
+    try std.testing.expectEqualStrings("native-id", first.tool_calls[1].id);
+    const messages = [_]inference.ChatMessage{
+        .{ .role = .user, .content = .{ .text = "search" } },
+        .{ .role = .assistant, .tool_calls = first.tool_calls, .google_parts_json = first.google_parts_json },
+        .{ .role = .tool, .tool_call_id = first.tool_calls[0].id, .content = .{ .text = "{\"hits\":[]}" } },
+        .{ .role = .tool, .tool_call_id = first.tool_calls[1].id, .content = .{ .text = "plain text" } },
+    };
+    const body = try vertexGenerateRequestJsonAlloc(alloc, &messages, .{});
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const contents = parsed.value.object.get("contents").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), contents.len);
+    const parts = contents[1].object.get("parts").?.array.items;
+    try std.testing.expectEqualStrings("text-signature", parts[0].object.get("thoughtSignature").?.string);
+    try std.testing.expectEqualStrings("call-signature", parts[1].object.get("thoughtSignature").?.string);
+    try std.testing.expect(!parts[1].object.get("functionCall").?.object.contains("id"));
+    const results = contents[2].object.get("parts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    const one = results[0].object.get("functionResponse").?.object;
+    try std.testing.expectEqualStrings("search", one.get("name").?.string);
+    try std.testing.expect(!one.contains("id"));
+    try std.testing.expect(one.get("response").?.object.contains("hits"));
+    const two = results[1].object.get("functionResponse").?.object;
+    try std.testing.expectEqualStrings("native-id", two.get("id").?.string);
+    try std.testing.expectEqualStrings("plain text", two.get("response").?.object.get("result").?.string);
+    try std.testing.expectError(error.InvalidAgentToolCall, vertexGenerateRequestJsonAlloc(alloc, messages[2..], .{}));
+}
+
+test "vertex provider tools translate schemas and all tool choices" {
+    const alloc = std.testing.allocator;
+    const schema =
+        \\[{"type":"function","function":{"name":"search","description":"Search","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}}]
+    ;
+    const cases = [_]struct { choice: []const u8, mode: []const u8 }{
+        .{ .choice = "\"auto\"", .mode = "AUTO" },
+        .{ .choice = "\"none\"", .mode = "NONE" },
+        .{ .choice = "\"required\"", .mode = "ANY" },
+        .{ .choice = "{\"type\":\"function\",\"function\":{\"name\":\"search\"}}", .mode = "ANY" },
+    };
+    for (cases, 0..) |case, i| {
+        const body = try vertexGenerateRequestJsonAlloc(alloc, &.{}, .{ .tools_json = schema, .tool_choice_json = case.choice });
+        defer alloc.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        const declaration = parsed.value.object.get("tools").?.array.items[0].object.get("functionDeclarations").?.array.items[0].object;
+        try std.testing.expectEqualStrings("search", declaration.get("name").?.string);
+        try std.testing.expectEqualStrings("query", declaration.get("parametersJsonSchema").?.object.get("required").?.array.items[0].string);
+        const config = parsed.value.object.get("toolConfig").?.object.get("functionCallingConfig").?.object;
+        try std.testing.expectEqualStrings(case.mode, config.get("mode").?.string);
+        if (i == 3) try std.testing.expectEqualStrings("search", config.get("allowedFunctionNames").?.array.items[0].string);
+    }
+    const empty = try vertexGenerateRequestJsonAlloc(alloc, &.{}, .{ .tools_json = "[]" });
+    defer alloc.free(empty);
+    try std.testing.expect(std.mem.indexOf(u8, empty, "tools") == null);
+    try std.testing.expectError(error.InvalidGeneratorConfig, vertexGenerateRequestJsonAlloc(alloc, &.{}, .{ .tool_choice_json = "\"invalid\"" }));
+    try std.testing.expectError(error.InvalidAgentToolCall, parseGenerateResponseAlloc(alloc,
+        \\{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":[]}}]}}]}
+    , 1));
+}
+
+test "vertex provider tools release partial allocations" {
+    const Check = struct {
+        fn roundTrip(alloc: Allocator) !void {
+            var result = try parseGenerateResponseAlloc(alloc,
+                \\{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search","args":{}}},{"functionCall":{"name":"search","args":{}}}]}}]}
+            , 1);
+            defer result.deinit();
+            const body = try vertexGenerateRequestJsonAlloc(alloc, &.{
+                .{ .role = .assistant, .tool_calls = result.tool_calls, .google_parts_json = result.google_parts_json },
+                .{ .role = .tool, .tool_call_id = result.tool_calls[0].id, .content = .{ .text = "{\"hits\":[]}" } },
+                .{ .role = .tool, .tool_call_id = result.tool_calls[1].id, .content = .{ .text = "text" } },
+            }, .{ .tool_choice_json = "{\"type\":\"function\",\"function\":{\"name\":\"search\"}}" });
+            defer alloc.free(body);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.roundTrip, .{});
 }
