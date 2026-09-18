@@ -779,6 +779,47 @@ pub const Store = struct {
 
     pub const ReplayCallback = *const fn (*anyopaque, u64, []const u8) anyerror!void;
 
+    /// Replay visitors are synchronous borrows. Only a stop bit crosses runtime
+    /// units; the original error (including private replay sentinels) remains
+    /// in the consuming unit's stack until the provider has fully unwound.
+    pub const ReplayVisitor = *const fn (*anyopaque, u64, [*]const u8, usize) callconv(.c) bool;
+
+    fn ReplayConsumer(comptime Context: type, comptime callback: fn (Context, u64, []const u8) anyerror!void) type {
+        return struct {
+            ctx: Context,
+            failure: ?anyerror = null,
+
+            fn visit(ptr: *anyopaque, sequence: u64, payload: [*]const u8, len: usize) callconv(.c) bool {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.failure != null) return false;
+                callback(self.ctx, sequence, payload[0..len]) catch |err| {
+                    self.failure = err;
+                    return false;
+                };
+                return true;
+            }
+
+            fn complete(self: *@This(), result: anytype) @TypeOf(result) {
+                const value = result catch |err| return self.failure orelse err;
+                if (self.failure) |err| return err;
+                return value;
+            }
+        };
+    }
+
+    const ReplayRelay = struct {
+        ctx: *anyopaque,
+        visitor: ReplayVisitor,
+
+        fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Concrete iterators propagate callback errors immediately. This
+            // registered marker unwinds provider-local code only; complete()
+            // restores the consumer's exact error after the synchronous call.
+            if (!self.visitor(self.ctx, sequence, payload.ptr, payload.len)) return error.Cancelled;
+        }
+    };
+
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         capabilities: *const fn (*anyopaque) backend_types.Capabilities,
@@ -798,9 +839,9 @@ pub const Store = struct {
         next_replay_sequence: ?*const fn (*anyopaque, u64) u64 = null,
         append_replay_opaque: ?*const fn (Allocator, *anyopaque, u64, []const u8) anyerror!void = null,
         iterate_replay_from: ?*const fn (Allocator, *anyopaque, u64) anyerror![]ReplayEntry = null,
-        for_each_replay_from: ?*const fn (*anyopaque, u64, *anyopaque, ReplayCallback) anyerror!void = null,
-        for_each_replay_lane_from: ?*const fn (*anyopaque, u8, u64, usize, *anyopaque, ReplayCallback) anyerror!backend_types.ReplayLaneIterationStats = null,
-        for_each_replay_from_matching_hint_mask: ?*const fn (*anyopaque, u64, u8, *anyopaque, ReplayCallback) anyerror!void = null,
+        for_each_replay_from: ?*const fn (*anyopaque, u64, *anyopaque, ReplayVisitor) anyerror!void = null,
+        for_each_replay_lane_from: ?*const fn (*anyopaque, u8, u64, usize, *anyopaque, ReplayVisitor) anyerror!backend_types.ReplayLaneIterationStats = null,
+        for_each_replay_from_matching_hint_mask: ?*const fn (*anyopaque, u64, u8, *anyopaque, ReplayVisitor) anyerror!void = null,
         truncate_replay_up_to: ?*const fn (Allocator, *anyopaque, u64) anyerror!void = null,
         // Append-only optional ABI extensions: older stores retain their
         // original transaction layout and fall back to ordinary admission.
@@ -957,13 +998,9 @@ pub const Store = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !void {
         if (self.vtable.for_each_replay_from) |f| {
-            const Adapter = struct {
-                fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
-                    const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
-                    return try callback(typed_ctx, sequence, payload);
-                }
-            };
-            return try BoundaryAbi.call("for_each_replay_from", self.boundary_dispatch, f, .{ self.ptr, from_sequence, ctx, Adapter.call });
+            const Consumer = ReplayConsumer(@TypeOf(ctx), callback);
+            var consumer: Consumer = .{ .ctx = ctx };
+            return try consumer.complete(BoundaryAbi.call("for_each_replay_from", self.boundary_dispatch, f, .{ self.ptr, from_sequence, &consumer, Consumer.visit }));
         }
 
         const entries = try self.iterateReplayFrom(self.allocator, from_sequence);
@@ -982,28 +1019,20 @@ pub const Store = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !void {
         if (self.vtable.for_each_replay_from_matching_hint_mask) |f| {
-            const Adapter = struct {
-                fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
-                    const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
-                    return try callback(typed_ctx, sequence, payload);
-                }
-            };
-            return try BoundaryAbi.call("for_each_replay_from_matching_hint_mask", self.boundary_dispatch, f, .{ self.ptr, from_sequence, required_hint_mask, ctx, Adapter.call });
+            const Consumer = ReplayConsumer(@TypeOf(ctx), callback);
+            var consumer: Consumer = .{ .ctx = ctx };
+            return try consumer.complete(BoundaryAbi.call("for_each_replay_from_matching_hint_mask", self.boundary_dispatch, f, .{ self.ptr, from_sequence, required_hint_mask, &consumer, Consumer.visit }));
         }
         if (self.vtable.for_each_replay_lane_from) |f| {
-            const Adapter = struct {
-                fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
-                    const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
-                    return try callback(typed_ctx, sequence, payload);
-                }
-            };
+            const Consumer = ReplayConsumer(@TypeOf(ctx), callback);
+            var consumer: Consumer = .{ .ctx = ctx };
             const lane_ordinal = if (required_hint_mask == 0)
                 internal_keys.replay_all_kind
             else if (replayHintOrdinalFromSingleMask(required_hint_mask)) |ordinal|
                 ordinal
             else
                 return error.Unsupported;
-            _ = try BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, 0, ctx, Adapter.call });
+            _ = try consumer.complete(BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, 0, &consumer, Consumer.visit }));
             return;
         }
 
@@ -1025,13 +1054,9 @@ pub const Store = struct {
         comptime callback: fn (@TypeOf(ctx), u64, []const u8) anyerror!void,
     ) !backend_types.ReplayLaneIterationStats {
         const f = self.vtable.for_each_replay_lane_from orelse return error.Unsupported;
-        const Adapter = struct {
-            fn call(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
-                const typed_ctx: @TypeOf(ctx) = @ptrCast(@alignCast(ptr));
-                return try callback(typed_ctx, sequence, payload);
-            }
-        };
-        return try BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, max_entries, ctx, Adapter.call });
+        const Consumer = ReplayConsumer(@TypeOf(ctx), callback);
+        var consumer: Consumer = .{ .ctx = ctx };
+        return try consumer.complete(BoundaryAbi.call("for_each_replay_lane_from", self.boundary_dispatch, f, .{ self.ptr, lane_ordinal, from_sequence, max_entries, &consumer, Consumer.visit }));
     }
 
     pub fn truncateReplayUpTo(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {
@@ -1898,15 +1923,11 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             ptr: *anyopaque,
             from_sequence: u64,
             callback_ctx: *anyopaque,
-            callback: Store.ReplayCallback,
+            callback: Store.ReplayVisitor,
         ) anyerror!void {
-            if (Handle == Store) {
-                const state = unbox(ptr);
-                if (state.handle.vtable.for_each_replay_from) |f| {
-                    return try f(state.handle.ptr, from_sequence, callback_ctx, callback);
-                }
-            } else if (@hasDecl(Handle, "forEachReplayFrom")) {
-                return try unbox(ptr).handle.forEachReplayFrom(from_sequence, callback_ctx, callback);
+            var relay: Store.ReplayRelay = .{ .ctx = callback_ctx, .visitor = callback };
+            if (@hasDecl(Handle, "forEachReplayFrom")) {
+                return try unbox(ptr).handle.forEachReplayFrom(from_sequence, @as(*anyopaque, @ptrCast(&relay)), Store.ReplayRelay.consume);
             }
             if (@hasDecl(Handle, "iterateReplayFrom")) {
                 const state = unbox(ptr);
@@ -1915,9 +1936,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
                     for (entries) |*entry| entry.deinit(state.allocator);
                     state.allocator.free(entries);
                 }
-                for (entries) |entry| {
-                    try callback(callback_ctx, entry.sequence, entry.payload);
-                }
+                for (entries) |entry| try Store.ReplayRelay.consume(&relay, entry.sequence, entry.payload);
                 return;
             }
             return error.Unsupported;
@@ -1928,25 +1947,11 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             from_sequence: u64,
             required_hint_mask: u8,
             callback_ctx: *anyopaque,
-            callback: Store.ReplayCallback,
+            callback: Store.ReplayVisitor,
         ) anyerror!void {
-            if (Handle == Store) {
-                const state = unbox(ptr);
-                if (state.handle.vtable.for_each_replay_from_matching_hint_mask) |f| {
-                    return try f(state.handle.ptr, from_sequence, required_hint_mask, callback_ctx, callback);
-                }
-                if (state.handle.vtable.for_each_replay_lane_from) |f| {
-                    const lane_ordinal = if (required_hint_mask == 0)
-                        internal_keys.replay_all_kind
-                    else if (replayHintOrdinalFromSingleMask(required_hint_mask)) |ordinal|
-                        ordinal
-                    else
-                        return error.Unsupported;
-                    _ = try f(state.handle.ptr, lane_ordinal, from_sequence, 0, callback_ctx, callback);
-                    return;
-                }
-            } else if (@hasDecl(Handle, "forEachReplayFromMatchingHintMask")) {
-                return try unbox(ptr).handle.forEachReplayFromMatchingHintMask(from_sequence, required_hint_mask, callback_ctx, callback);
+            var relay: Store.ReplayRelay = .{ .ctx = callback_ctx, .visitor = callback };
+            if (@hasDecl(Handle, "forEachReplayFromMatchingHintMask")) {
+                return try unbox(ptr).handle.forEachReplayFromMatchingHintMask(from_sequence, required_hint_mask, @as(*anyopaque, @ptrCast(&relay)), Store.ReplayRelay.consume);
             } else if (@hasDecl(Handle, "forEachReplayLaneFrom")) {
                 const lane_ordinal = if (required_hint_mask == 0)
                     internal_keys.replay_all_kind
@@ -1954,7 +1959,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
                     ordinal
                 else
                     return error.Unsupported;
-                _ = try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, 0, callback_ctx, callback);
+                _ = try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, 0, @as(*anyopaque, @ptrCast(&relay)), Store.ReplayRelay.consume);
                 return;
             }
             return error.Unsupported;
@@ -1966,15 +1971,11 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             from_sequence: u64,
             max_entries: usize,
             callback_ctx: *anyopaque,
-            callback: Store.ReplayCallback,
+            callback: Store.ReplayVisitor,
         ) anyerror!backend_types.ReplayLaneIterationStats {
-            if (Handle == Store) {
-                const state = unbox(ptr);
-                if (state.handle.vtable.for_each_replay_lane_from) |f| {
-                    return try f(state.handle.ptr, lane_ordinal, from_sequence, max_entries, callback_ctx, callback);
-                }
-            } else if (@hasDecl(Handle, "forEachReplayLaneFrom")) {
-                return try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, max_entries, callback_ctx, callback);
+            var relay: Store.ReplayRelay = .{ .ctx = callback_ctx, .visitor = callback };
+            if (@hasDecl(Handle, "forEachReplayLaneFrom")) {
+                return try unbox(ptr).handle.forEachReplayLaneFrom(lane_ordinal, from_sequence, max_entries, @as(*anyopaque, @ptrCast(&relay)), Store.ReplayRelay.consume);
             }
             return error.Unsupported;
         }

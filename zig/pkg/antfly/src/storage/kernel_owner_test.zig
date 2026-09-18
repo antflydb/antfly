@@ -2250,3 +2250,57 @@ test "compiled backend read callbacks preserve semantic errors and child ownersh
     try std.testing.expect(values[0] == null);
     try std.testing.expectEqualStrings("value", values[1].?);
 }
+
+extern fn antfly_test_backend_replay_store(*const @import("../runtime_native_abi.zig").TypeContract, *anyopaque) callconv(.c) @import("../runtime_error_abi.zig").Status;
+
+test "compiled backend replay visitors preserve consumer errors" {
+    const erased = @import("backend_erased.zig");
+    const native = @import("../runtime_native_abi.zig");
+    var store: erased.Store = undefined;
+    const contract = native.TypeContract.of(erased.Store);
+    try std.testing.expect(antfly_test_backend_replay_store(&contract, &store).isOk());
+    defer store.deinit();
+    const Consumer = struct {
+        calls: usize = 0,
+        failure: ?anyerror = error.ConsumerPrivateStop,
+        fn consume(self: *@This(), sequence: u64, payload: []const u8) anyerror!void {
+            self.calls += 1;
+            if (sequence == 7) {
+                try std.testing.expectEqualStrings("replay", payload);
+            } else {
+                try std.testing.expectEqual(@as(u64, 8), sequence);
+                try std.testing.expectEqualStrings("unreachable", payload);
+            }
+            if (self.failure) |err| return err;
+        }
+    };
+    var consumer: Consumer = .{};
+    try std.testing.expectError(error.ConsumerPrivateStop, store.forEachReplayFrom(1, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 1), consumer.calls);
+    try std.testing.expectError(error.ConsumerPrivateStop, store.forEachReplayFromMatchingHintMask(1, 1, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 2), consumer.calls);
+    try std.testing.expectError(error.ConsumerPrivateStop, store.forEachReplayLaneFrom(1, 1, 0, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 3), consumer.calls);
+    // Successful callbacks and provider errors are not replaced by a stale
+    // consumer failure; every call owns a fresh synchronous bridge.
+    consumer = .{ .failure = null };
+    try store.forEachReplayFrom(1, &consumer, Consumer.consume);
+    try std.testing.expectEqual(@as(usize, 2), consumer.calls);
+    consumer.calls = 0;
+    try std.testing.expectError(error.InvalidArgument, store.forEachReplayFrom(99, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 0), consumer.calls);
+    try std.testing.expectError(error.InvalidArgument, store.forEachReplayFrom(98, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 1), consumer.calls);
+    consumer = .{};
+    try std.testing.expectError(error.ConsumerPrivateStop, store.forEachReplayFrom(98, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 1), consumer.calls);
+    // Re-erasing a foreign store must use its dispatcher, not a direct foreign
+    // vtable call; the private error stays with the outermost consumer.
+    var nested = try erased.storeFrom(std.testing.allocator, store);
+    defer nested.deinit();
+    consumer = .{};
+    try std.testing.expectError(error.ConsumerPrivateStop, nested.forEachReplayFrom(1, &consumer, Consumer.consume));
+    try std.testing.expectError(error.ConsumerPrivateStop, nested.forEachReplayFromMatchingHintMask(1, 1, &consumer, Consumer.consume));
+    try std.testing.expectError(error.ConsumerPrivateStop, nested.forEachReplayLaneFrom(1, 1, 0, &consumer, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 3), consumer.calls);
+}
