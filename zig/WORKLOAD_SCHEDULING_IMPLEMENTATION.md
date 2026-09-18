@@ -148,16 +148,20 @@ separate work.
 ### Backend completion boundary still to implement
 
 The protected row/metadata lanes above reserve preparation and recovery-record
-work. They do not reserve the full physical LSM write. `CompletionCredit`
-(`f8c71099cd`) supplies atomic accounting transfer into retained ownership, but
-is deliberately not activated in the write path yet.
+work. They do not reserve the full physical persistent LSM write.
+`CompletionCredit` (`f8c71099cd`) is now connected to an internal, memory-only
+sealed point-batch path (`013b533924`). Preparation charges incoming and
+copy-on-write allocations before allocation; publication requires the original
+pinned root and performs no allocation. Exact ordinary-allocation accounting
+avoids counting prepaid bytes twice, and a retained allocator owner keeps bytes
+charged through the final reader. Stale tickets retire historical roots in
+bounded slices outside the writer lock. Debug and ReleaseSafe each passed 27
+focused tests. See [the backend stage contract](WORKLOAD_LSM_COMPLETION.md).
 
-The next backend stage must charge incoming and copy-on-write candidate memory
-before allocation, retain that ownership until the final snapshot reader frees
-it, and avoid counting the same allocation in both the credit and the backend
-observer. WAL, manifest and flush capacity must remain admitted. A backend-only
-point-batch stage cannot promise mandatory transaction completion until those
-other domains also have prepaid capacity.
+This entry point rejects persistent storage before reserving capacity. WAL,
+manifest and flush capacity still need prepaid ownership, with explicit handling
+of uncertain storage I/O. The internal point-batch path therefore does not yet
+promise mandatory transaction completion or activate a public transaction ticket.
 
 A public completion ticket must be stored atomically with intents and the
 prepared vote, bound to transaction revision, schema, backend namespace and a
