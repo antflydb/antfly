@@ -352,7 +352,10 @@ fn deinitConfigValue(alloc: Allocator, cfg: Config) void {
     deinitConfig(alloc, &owned);
 }
 
-fn deinitSegment(alloc: Allocator, segment: *Segment) void {
+/// Frees one segment's owned text, speaker label and word list. Exposed so
+/// callers that build segments themselves can unwind a partial batch with
+/// the same rules the response teardown uses.
+pub fn deinitSegment(alloc: Allocator, segment: *Segment) void {
     freeOpt(alloc, segment.text);
     freeOpt(alloc, segment.speaker);
     if (segment.words) |words| {
@@ -1007,7 +1010,15 @@ fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Res
             last_end_ms = @max(end_ms, last_end_ms);
             continue;
         }
-        // One segment per run of words with the same speaker label.
+        // One segment per run of words with the same speaker label. Each
+        // run's text is sliced out of the provider's own transcript rather
+        // than rebuilt from its words: rebuilding would join with spaces,
+        // which is wrong for a language that does not write them (a Chinese
+        // transcript would come back with spaces inserted) and loses the
+        // transcript's punctuation. The text has to be a verbatim substring
+        // of the transcript, because that is how the enrichment locates a
+        // phrase to give it timing and a speaker.
+        var transcript_cursor: usize = 0;
         var run_start: usize = 0;
         while (run_start < alternative.words.len) {
             const speaker = alternative.words[run_start].speakerLabel;
@@ -1023,10 +1034,20 @@ fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Res
                 for (words[0..filled]) |*word| deinitWordTimestamp(alloc, word);
                 alloc.free(words);
             }
+            var slice_start: ?usize = null;
+            var slice_end: usize = transcript_cursor;
+            var scan = transcript_cursor;
             for (run) |word| {
                 const spelled = std.mem.trim(u8, word.word orelse "", " ");
                 if (phrase.items.len > 0 and spelled.len > 0) try phrase.append(alloc, ' ');
                 try phrase.appendSlice(alloc, spelled);
+                if (spelled.len > 0) {
+                    if (std.mem.indexOfPos(u8, transcript, scan, spelled)) |found| {
+                        if (slice_start == null) slice_start = found;
+                        scan = found + spelled.len;
+                        slice_end = scan;
+                    }
+                }
                 const start_ms = if (word.startOffset) |offset| vertexDurationToMs(offset) orelse last_end_ms else last_end_ms;
                 const end_ms = if (word.endOffset) |offset| vertexDurationToMs(offset) orelse start_ms else start_ms;
                 words[filled] = .{
@@ -1039,7 +1060,13 @@ fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Res
             }
             const start_ms = words[0].start_ms orelse last_end_ms;
             const end_ms = words[filled - 1].end_ms orelse start_ms;
-            const segment_text = try phrase.toOwnedSlice(alloc);
+            // Fall back to the joined words only when the run cannot be
+            // found in the transcript at all, which means the provider's
+            // words and transcript disagree.
+            const segment_text = if (slice_start) |begin| blk: {
+                transcript_cursor = slice_end;
+                break :blk try alloc.dupe(u8, transcript[begin..slice_end]);
+            } else try phrase.toOwnedSlice(alloc);
             errdefer alloc.free(segment_text);
             const speaker_id = try dupOpt(alloc, speaker);
             errdefer freeOpt(alloc, speaker_id);
@@ -1128,6 +1155,65 @@ test "vertex recognize response yields speaker turns with word timing" {
     try std.testing.expectEqual(@as(?[]const u8, null), segments[2].speaker);
     try std.testing.expectEqual(@as(usize, 2), response.speakers.?.len);
     try std.testing.expectEqualStrings("2", response.speakers.?[1].id.?);
+}
+
+test "vertex segments are sliced from the transcript, not rebuilt from words" {
+    const alloc = std.testing.allocator;
+    // Chinese is written without spaces between words. Rebuilding a phrase
+    // by joining the provider's words would insert them, and the enrichment
+    // locates a phrase by searching the transcript for it verbatim, so the
+    // whole transcript would lose its timing and speaker attribution.
+    var response = try parseVertexRecognizeResponseAlloc(alloc,
+        \\{"results":[{"alternatives":[{"transcript":"你好世界再见",
+        \\"words":[{"startOffset":"0s","endOffset":"0.400s","word":"你好","speakerLabel":"1"},
+        \\{"startOffset":"0.400s","endOffset":"0.900s","word":"世界","speakerLabel":"1"},
+        \\{"startOffset":"1s","endOffset":"1.400s","word":"再见","speakerLabel":"2"}]}],
+        \\"languageCode":"cmn-Hans-CN","resultEndOffset":"1.400s"}]}
+    );
+    defer deinitResponse(alloc, &response);
+
+    const text = response.text.?;
+    try std.testing.expectEqualStrings("你好世界再见", text);
+    const segments = response.segments.?;
+    try std.testing.expectEqual(@as(usize, 2), segments.len);
+    try std.testing.expectEqualStrings("你好世界", segments[0].text.?);
+    try std.testing.expectEqualStrings("再见", segments[1].text.?);
+    // Which is what makes both phrases findable in the transcript, the
+    // property the enrichment's span lookup depends on.
+    var cursor: usize = 0;
+    for (segments) |segment| {
+        const found = std.mem.indexOfPos(u8, text, cursor, segment.text.?) orelse
+            return error.PhraseNotFoundInTranscript;
+        cursor = found + segment.text.?.len;
+    }
+    // The words themselves keep their own timing and speaker runs.
+    try std.testing.expectEqual(@as(?i64, 0), segments[0].start_ms);
+    try std.testing.expectEqual(@as(?i64, 900), segments[0].end_ms);
+    try std.testing.expectEqualStrings("1", segments[0].speaker.?);
+    try std.testing.expectEqualStrings("2", segments[1].speaker.?);
+}
+
+test "vertex segments keep the transcript's punctuation" {
+    const alloc = std.testing.allocator;
+    // Vertex reports words without punctuation but punctuates the
+    // transcript, so a rebuilt phrase would not appear in it verbatim.
+    var response = try parseVertexRecognizeResponseAlloc(alloc,
+        \\{"results":[{"alternatives":[{"transcript":"Hello, there! How are you?",
+        \\"words":[{"startOffset":"0s","endOffset":"0.400s","word":"Hello","speakerLabel":"1"},
+        \\{"startOffset":"0.400s","endOffset":"0.900s","word":"there","speakerLabel":"1"},
+        \\{"startOffset":"1s","endOffset":"1.200s","word":"How","speakerLabel":"2"},
+        \\{"startOffset":"1.200s","endOffset":"1.400s","word":"are","speakerLabel":"2"},
+        \\{"startOffset":"1.400s","endOffset":"1.600s","word":"you","speakerLabel":"2"}]}],
+        \\"languageCode":"en-US","resultEndOffset":"1.600s"}]}
+    );
+    defer deinitResponse(alloc, &response);
+    const segments = response.segments.?;
+    try std.testing.expectEqual(@as(usize, 2), segments.len);
+    try std.testing.expectEqualStrings("Hello, there", segments[0].text.?);
+    try std.testing.expectEqualStrings("How are you", segments[1].text.?);
+    const text = response.text.?;
+    try std.testing.expect(std.mem.indexOf(u8, text, segments[0].text.?) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, segments[1].text.?) != null);
 }
 
 test "vertex durations parse protobuf seconds" {

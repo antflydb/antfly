@@ -754,7 +754,12 @@ pub fn transcriptSpansFromSegmentsAlloc(alloc: Allocator, text: []const u8, segm
     for (segments) |segment| {
         const phrase = std.mem.trim(u8, segment.text, " \t\r\n");
         if (phrase.len == 0) continue;
-        const start = std.mem.indexOfPos(u8, text, cursor, phrase) orelse break;
+        // A phrase the provider worded differently from the transcript it
+        // also returned cannot be located. Skipping it costs that phrase its
+        // timing; abandoning the walk would cost every later phrase too, and
+        // the ones after it still match at or beyond the cursor, so their
+        // offsets stay right.
+        const start = std.mem.indexOfPos(u8, text, cursor, phrase) orelse continue;
         const end = start + phrase.len;
         const segment_end_ms = @max(segment.end_ms, segment.start_ms);
         const speaker_index = speakers.indexOf(segment.speaker);
@@ -5122,6 +5127,27 @@ test "recordings in video containers take the transcription route" {
     // Documents still are not audio.
     try std.testing.expect(!isAudioContent("application/pdf", "report.pdf", "", "%PDF-1.4"));
     try std.testing.expect(!isAudioContent("text/plain", "notes.txt", "", "hello"));
+}
+
+test "an unlocatable phrase costs only its own timing" {
+    const alloc = std.testing.allocator;
+    const text = "alpha alpha alpha. gamma gamma gamma.";
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = "alpha alpha alpha.", .start_ms = 0, .end_ms = 1000, .speaker = "A" },
+        // The provider reworded this one, so it appears nowhere in the text.
+        .{ .text = "beta beta beta.", .start_ms = 1000, .end_ms = 2000, .speaker = "B" },
+        .{ .text = "gamma gamma gamma.", .start_ms = 2000, .end_ms = 3000, .speaker = "A" },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+
+    try std.testing.expectEqual(@as(usize, 2), spans.len);
+    try std.testing.expectEqual(@as(u32, 0), spans[0].char_start);
+    try std.testing.expectEqual(@as(u64, 2000), spans[1].start_ms);
+    try std.testing.expectEqual(@as(u32, 19), spans[1].char_start);
+    // Both located phrases are the same speaker, numbered from what was found.
+    try std.testing.expectEqual(@as(?u8, 0), spans[0].speaker_index);
+    try std.testing.expectEqual(@as(?u8, 0), spans[1].speaker_index);
 }
 
 test "diarized phrases carry their speaker into spans and chunks" {

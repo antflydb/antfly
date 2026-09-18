@@ -498,6 +498,101 @@ fn generationStreamWriteIsPeerDisconnect(err: anyerror) bool {
     };
 }
 
+test "transcription response survives an allocation failure at any step" {
+    // Every owned string here has two plausible owners: the builder that is
+    // part-way through a batch, and the response teardown once the batch is
+    // attached. Running the conversion under every failing allocation is
+    // what proves only one of them ever frees it.
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var words = [_]long_transcription.Word{
+                .{ .word = @constCast("hello"), .start_ms = 0, .end_ms = 400 },
+                .{ .word = @constCast("there"), .start_ms = 400, .end_ms = 900 },
+            };
+            var second_words = [_]long_transcription.Word{
+                .{ .word = @constCast("fine"), .start_ms = 1000, .end_ms = 1500 },
+            };
+            var segments = [_]long_transcription.Segment{
+                .{
+                    .text = @constCast("hello there"),
+                    .start_ms = 0,
+                    .end_ms = 900,
+                    .words = &words,
+                    .speaker_index = 0,
+                },
+                .{
+                    .text = @constCast("fine"),
+                    .start_ms = 1000,
+                    .end_ms = 1500,
+                    .words = &second_words,
+                    .speaker_index = 1,
+                },
+            };
+            const result = long_transcription.Result{
+                .allocator = allocator,
+                .segments = &segments,
+                .text = @constCast("hello there fine"),
+                .language = @constCast("en"),
+                .duration_ms = 1500,
+                .windows = 1,
+            };
+
+            var response = try Node.transcriptionResponseAlloc(allocator, &result);
+            transcribing_api.deinitResponse(allocator, &response);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "transcription response carries every speaker it labelled" {
+    const alloc = std.testing.allocator;
+    var words = [_]long_transcription.Word{
+        .{ .word = @constCast("hello"), .start_ms = 0, .end_ms = 400 },
+    };
+    var segments = [_]long_transcription.Segment{
+        .{ .text = @constCast("hello"), .start_ms = 0, .end_ms = 400, .words = &words, .speaker_index = 1 },
+        .{ .text = @constCast("there"), .start_ms = 400, .end_ms = 900, .words = &.{}, .speaker_index = 0 },
+    };
+    const result = long_transcription.Result{
+        .allocator = alloc,
+        .segments = &segments,
+        .text = @constCast("hello there"),
+        .language = null,
+        .duration_ms = 900,
+        .windows = 1,
+    };
+
+    var response = try Node.transcriptionResponseAlloc(alloc, &result);
+    defer transcribing_api.deinitResponse(alloc, &response);
+
+    const api_segments = response.segments orelse return error.MissingSegments;
+    try std.testing.expectEqual(@as(usize, 2), api_segments.len);
+    try std.testing.expectEqualStrings("SPEAKER_01", api_segments[0].speaker.?);
+    try std.testing.expectEqualStrings("SPEAKER_00", api_segments[1].speaker.?);
+    // The roster covers every index used, not only the ones seen first.
+    const speakers = response.speakers orelse return error.MissingSpeakers;
+    try std.testing.expectEqual(@as(usize, 2), speakers.len);
+    try std.testing.expectEqualStrings("SPEAKER_00", speakers[0].label.?);
+    try std.testing.expectEqualStrings("SPEAKER_01", speakers[1].label.?);
+
+    // An undiarized transcript reports no speakers at all.
+    var plain = [_]long_transcription.Segment{
+        .{ .text = @constCast("hello"), .start_ms = 0, .end_ms = 400, .words = &.{} },
+    };
+    const plain_result = long_transcription.Result{
+        .allocator = alloc,
+        .segments = &plain,
+        .text = @constCast("hello"),
+        .language = null,
+        .duration_ms = 400,
+        .windows = 1,
+    };
+    var plain_response = try Node.transcriptionResponseAlloc(alloc, &plain_result);
+    defer transcribing_api.deinitResponse(alloc, &plain_response);
+    try std.testing.expectEqual(@as(?[]const transcribing_api.Speaker, null), plain_response.speakers);
+    try std.testing.expectEqual(@as(?[]const u8, null), (plain_response.segments orelse return error.MissingSegments)[0].speaker);
+}
+
 test "generation pipeline session lookup is field safe" {
     var pipeline = struct {}{};
     try std.testing.expect(generationPipelineSession(&pipeline) == null);
@@ -8509,6 +8604,11 @@ pub const Node = struct {
 
     /// The transcript as the shared STT response, with timestamped segments
     /// and word spans so callers can link text back to a moment.
+    ///
+    /// Each piece is built complete before it is attached to `response`, so
+    /// exactly one cleanup owns it at any moment: the builder's own until it
+    /// returns, `deinitResponse` after. Sharing those two would double-free
+    /// on an allocation failure part-way through.
     fn transcriptionResponseAlloc(allocator: std.mem.Allocator, result: *const long_transcription.Result) !transcribing_api.Response {
         var response = transcribing_api.Response{
             .text = try allocator.dupe(u8, result.text),
@@ -8516,68 +8616,101 @@ pub const Node = struct {
         };
         errdefer transcribing_api.deinitResponse(allocator, &response);
         if (result.language) |language| response.language = try allocator.dupe(u8, language);
-        const segments = try allocator.alloc(transcribing_api.Segment, result.segments.len);
+        response.segments = try transcriptionSegmentsAlloc(allocator, result.segments);
+        response.speakers = try transcriptionSpeakersAlloc(allocator, result.segments);
+        return response;
+    }
+
+    /// The transcript's phrases as API segments. Caller owns the result.
+    fn transcriptionSegmentsAlloc(
+        allocator: std.mem.Allocator,
+        segments: []const long_transcription.Segment,
+    ) ![]transcribing_api.Segment {
+        const out = try allocator.alloc(transcribing_api.Segment, segments.len);
         var filled: usize = 0;
         errdefer {
-            for (segments[0..filled]) |segment| {
-                if (segment.text) |text| allocator.free(text);
-                if (segment.speaker) |speaker| allocator.free(speaker);
-                if (segment.words) |words| {
-                    for (words) |word| if (word.word) |value| allocator.free(value);
-                    allocator.free(words);
-                }
+            for (out[0..filled]) |segment| {
+                var owned = segment;
+                transcribing_api.deinitSegment(allocator, &owned);
             }
-            allocator.free(segments);
+            allocator.free(out);
         }
-        for (result.segments, 0..) |segment, i| {
-            const words = try allocator.alloc(transcribing_api.WordTimestamp, segment.words.len);
-            var words_filled: usize = 0;
+        for (segments, out) |segment, *slot| {
+            const words = try transcriptionWordsAlloc(allocator, segment.words);
             errdefer {
-                for (words[0..words_filled]) |word| if (word.word) |value| allocator.free(value);
+                for (words) |word| if (word.word) |value| allocator.free(value);
                 allocator.free(words);
             }
-            for (segment.words, 0..) |word, j| {
-                words[j] = .{
-                    .word = try allocator.dupe(u8, word.word),
-                    .start_ms = std.math.cast(i64, word.start_ms) orelse std.math.maxInt(i64),
-                    .end_ms = std.math.cast(i64, word.end_ms) orelse std.math.maxInt(i64),
-                };
-                words_filled += 1;
-            }
-            segments[i] = .{
-                .text = try allocator.dupe(u8, segment.text),
+            const text = try allocator.dupe(u8, segment.text);
+            errdefer allocator.free(text);
+            const speaker: ?[]const u8 = if (segment.speaker_index) |index|
+                try allocator.dupe(u8, speaker_embedding_mod.speakerLabelStatic(index))
+            else
+                null;
+            // Nothing below may fail: the slot takes ownership of all three.
+            slot.* = .{
+                .text = text,
                 .start_ms = std.math.cast(i64, segment.start_ms) orelse std.math.maxInt(i64),
                 .end_ms = std.math.cast(i64, segment.end_ms) orelse std.math.maxInt(i64),
                 .words = words,
+                .speaker = speaker,
             };
             filled += 1;
-            if (segment.speaker_index) |index| {
-                segments[i].speaker = try allocator.dupe(u8, speaker_embedding_mod.speakerLabelStatic(index));
-            }
         }
-        response.segments = segments;
+        return out;
+    }
 
-        const labels = try transcriptSpeakerLabelsAlloc(allocator, result);
-        defer allocator.free(labels);
-        if (labels.len > 0) {
-            const speakers = try allocator.alloc(transcribing_api.Speaker, labels.len);
-            var speakers_filled: usize = 0;
-            errdefer {
-                for (speakers[0..speakers_filled]) |speaker| {
-                    if (speaker.id) |id| allocator.free(id);
-                    if (speaker.label) |label| allocator.free(label);
-                }
-                allocator.free(speakers);
-            }
-            for (speakers, labels) |*speaker, label| {
-                const id = try allocator.dupe(u8, label);
-                errdefer allocator.free(id);
-                speaker.* = .{ .id = id, .label = try allocator.dupe(u8, label) };
-                speakers_filled += 1;
-            }
-            response.speakers = speakers;
+    fn transcriptionWordsAlloc(
+        allocator: std.mem.Allocator,
+        words: []const long_transcription.Word,
+    ) ![]transcribing_api.WordTimestamp {
+        const out = try allocator.alloc(transcribing_api.WordTimestamp, words.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |word| if (word.word) |value| allocator.free(value);
+            allocator.free(out);
         }
-        return response;
+        for (words, out) |word, *slot| {
+            slot.* = .{
+                .word = try allocator.dupe(u8, word.word),
+                .start_ms = std.math.cast(i64, word.start_ms) orelse std.math.maxInt(i64),
+                .end_ms = std.math.cast(i64, word.end_ms) orelse std.math.maxInt(i64),
+            };
+            filled += 1;
+        }
+        return out;
+    }
+
+    /// The speakers a diarized transcript names, in order of first
+    /// appearance; null when diarization did not run. Caller owns the result.
+    fn transcriptionSpeakersAlloc(
+        allocator: std.mem.Allocator,
+        segments: []const long_transcription.Segment,
+    ) !?[]transcribing_api.Speaker {
+        var count: usize = 0;
+        for (segments) |segment| {
+            if (segment.speaker_index) |index| count = @max(count, @as(usize, index) + 1);
+        }
+        if (count == 0) return null;
+
+        const out = try allocator.alloc(transcribing_api.Speaker, count);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |speaker| {
+                if (speaker.id) |id| allocator.free(id);
+                if (speaker.label) |label| allocator.free(label);
+            }
+            allocator.free(out);
+        }
+        for (out, 0..) |*slot, i| {
+            const label = speaker_embedding_mod.speakerLabelStatic(@intCast(i));
+            const id = try allocator.dupe(u8, label);
+            errdefer allocator.free(id);
+            const owned_label = try allocator.dupe(u8, label);
+            slot.* = .{ .id = id, .label = owned_label };
+            filled += 1;
+        }
+        return out;
     }
 
     pub fn extractDirect(
