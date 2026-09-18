@@ -30652,11 +30652,12 @@ fn implementationTests() type {
         }
 
         test "hosted cross-range graph metric fan-in merges compatible hits pair" {
-            const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
-            defer tmp.cleanup();
-            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-cross-range-graph-metric-hits-pair", .{tmp.sub_path});
-            defer alloc.free(path);
+            var allocator_state: @import("../storage/test_allocator.zig").TestAllocator = .{};
+            defer allocator_state.deinit();
+            const alloc = allocator_state.allocator();
+            var path_tmp = try TestDirectory.initFast("hosted-cross-range-graph-metric-hits-pair");
+            defer path_tmp.cleanup();
+            const path = path_tmp.path();
             const shard_count = 8;
             const group_ids = [_]u64{ 7311, 7312, 7313, 7314, 7315, 7316, 7317, 7318 };
             const prefixes = [_][]const u8{ "j", "k", "l", "m", "n", "o", "p", "q" };
