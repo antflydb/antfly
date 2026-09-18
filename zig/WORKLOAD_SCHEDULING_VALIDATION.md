@@ -289,8 +289,11 @@ Fresh three-process runs found two failures before coordinator fault injection:
 - A fresh policy-free table created and accepted a batch, but lookup returned
   HTTP 500 reporting `MetadataIncarnationMismatch`. Captured metadata identities
   agree across head, status, catalog and routing responses. A debugger breakpoint
-  at the sole identity-mismatch guard did not fire. Error-boundary diagnosis is
-  ongoing; this is not evidence of an actual metadata identity change.
+  at the sole identity-mismatch guard did not fire. The retained native error
+  trace instead proves an LSM `NotFound` crossed `backend_erased.ReadTxn.get`
+  without error translation into the API kernel, where its numeric code meant
+  `MetadataIncarnationMismatch`. The read-family callback boundary fix is under
+  validation; the metadata identity guard remains unchanged.
 
 Receipts are retained under `/tmp/workload-policy-routing-0ac3f0af89-receipts`,
 `/tmp/workload-metadata-identity-0ac3f0af89-receipts`, and
@@ -313,3 +316,22 @@ reservation-to-observer accounting, canonical publication state, stale-copy
 rejection and retained-allocation ownership. It is not yet connected to durable
 transaction tickets or the LSM/WAL publication path, and therefore does not
 establish bounded backend completion under foreground exhaustion.
+
+
+The production Debug rebuild at product revision `c10e602778` passed, SHA-256
+`5ca232f17a0a42e8fbeeb4f55177a870029c1573c6fe5e25f6f34d6159a53ad5`.
+Receipt: `/tmp/workload-recovery-c10-production-debug-receipt.json`.
+The cross-boundary error's original trace is retained in
+`/tmp/workload-metadata-debug-origin-lldb.log`; its fresh lifecycle receipts are
+`/tmp/workload-metadata-debug-origin-0ac3f0af89-receipts`.
+
+The broad compiled storage-owner fixture initially failed its bulk-search
+assertion. Its preceding artifact fixture had left a chunk-backed index with
+its child range moved away; parent-only rows did not belong to that index even
+before bulk ingest. Commit `f45dd86e94` configures and explicitly queries an
+ordinary text index, preserving the bulk search-publication assertion. That
+assertion now passes. The focused fixture then fails a later native-backup
+quiescence guard (`NativeBackupRepairStateNotQuiescent`), with zero leaks;
+therefore the storage-owner gate is **not passed**. Evidence:
+`/tmp/workload-storage-bulk-context.log` and
+`/tmp/workload-storage-bulk-final.log`. No backup guard was weakened.
