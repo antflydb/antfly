@@ -74,6 +74,33 @@ def classify(result):
     )
 
 
+def validate_dispatch(results, submitted, maximum_ms):
+    first = min(row["dispatch_monotonic"] for row in results)
+    last = max(row["dispatch_monotonic"] for row in results)
+    span_ms, latest_ms = (last - first) * 1000, (last - submitted) * 1000
+    if first < submitted or span_ms > maximum_ms or latest_ms > maximum_ms:
+        raise GeneratorInvalid(
+            f"dispatch span {span_ms:.3f}ms, latest after submission {latest_ms:.3f}ms"
+        )
+    return {
+        "dispatch_span_ms": span_ms,
+        "latest_dispatch_after_submission_ms": latest_ms,
+    }
+
+
+def control_overlap(pending_before, pending_after, started, finished):
+    if pending_before <= 0 or pending_after <= 0 or finished < started:
+        raise AssertionError("API control probes did not overlap pending burst clients")
+    return {
+        "event": "frontend_control_overlap",
+        "pending_clients_before": pending_before,
+        "pending_clients_after": pending_after,
+        "started_monotonic": started,
+        "finished_monotonic": finished,
+        "scope": "API probes completed while burst clients remained pending; server saturation independently sampled",
+    }
+
+
 def metric_action(config, timeout=1, idle=False):
     expected = {
         "antfly_admission_query_diagnostics_available": 1,
@@ -210,6 +237,8 @@ class FrontendCluster(isolation.IsolationCluster):
                 if active == 4 and queued == 8:
                     saturated = True
                     if not control_checked:
+                        probe_started = time.monotonic()
+                        pending_before = sum(not future.done() for future in futures)
                         for path, status in (("/healthz", "ok"), ("/readyz", "ready")):
                             self.call(
                                 "GET",
@@ -217,19 +246,22 @@ class FrontendCluster(isolation.IsolationCluster):
                                 checks=[{"path": ["status"], "equals": status}],
                                 timeout=1,
                             )
+                        overlap = control_overlap(
+                            pending_before,
+                            sum(not future.done() for future in futures),
+                            probe_started,
+                            time.monotonic(),
+                        )
+                        self.record({"concurrency": concurrency, **overlap})
                         control_checked = True
                 time.sleep(0.1)
             results = [future.result() for future in futures]
         finished = time.monotonic()
         self.fault({"node": "data", "action": "heal"})
-        dispatch_span = max(row["dispatch_monotonic"] for row in results) - min(
-            row["dispatch_monotonic"] for row in results
-        )
         outcomes = [classify(row) for row in results]
-        if dispatch_span * 1000 > self.plan["max_dispatch_span_ms"]:
-            raise GeneratorInvalid(
-                f"C{concurrency} dispatch span {dispatch_span * 1000:.3f}ms"
-            )
+        timing = validate_dispatch(
+            results, submitted[0], self.plan["max_dispatch_span_ms"]
+        )
         if (
             not saturated
             or not control_checked
@@ -249,7 +281,7 @@ class FrontendCluster(isolation.IsolationCluster):
             "passed": True,
             "successful_reads": outcomes.count("success"),
             "admission_rejections": outcomes.count("rejected"),
-            "dispatch_span_ms": dispatch_span * 1000,
+            **timing,
             "api_control_progress_during_query_saturation": control_checked,
             "recovery_seconds": time.monotonic() - finished,
             "scope": "correctness and sampled finite caps; no performance qualification",
