@@ -28,7 +28,13 @@ const std = @import("std");
 /// Version 8 adds acknowledged sparse store reports.
 /// Version 9 adds durable membership-bound protocol activation.
 /// Version 10 adds resumable store inventories and atomic schema-progress batches.
-pub const current_version: u16 = 10;
+/// Version 11 preserves nondefault table storage policy in binary records.
+pub const current_version: u16 = 11;
+pub const table_storage_version: u16 = 11;
+
+pub fn tableStorageVersion(settings: @import("../common/table_storage.zig").Settings, minimum: u16) u16 {
+    return if (settings.transaction_recovery != null or settings.dense_embeddings != .primary_lsm) @max(minimum, table_storage_version) else minimum;
+}
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 pub const restore_job_admission_version: u16 = 5;
@@ -193,3 +199,27 @@ pub const store_report_baseline_version: u16 = 10;
 
 /// Atomic, bounded acknowledgements for local schema migration readiness.
 pub const schema_progress_batch_version: u16 = 10;
+
+test "workload admission storage activation requires exact membership incarnation and decoder" {
+    const required: Activation = .{
+        .version = table_storage_version,
+        .incarnation = "0123456789abcdef0123456789abcdef".*,
+        .member_count = 3,
+        .membership_fingerprint = [_]u8{42} ** 32,
+    };
+    try std.testing.expect(required.satisfies(required));
+    var stale = required;
+    stale.version = table_storage_version - 1;
+    try std.testing.expect(!stale.satisfies(required));
+    stale = required;
+    stale.incarnation[0] = '9';
+    try std.testing.expect(!stale.satisfies(required));
+    stale = required;
+    stale.membership_fingerprint[0] ^= 1;
+    try std.testing.expect(!stale.satisfies(required));
+    stale = required;
+    stale.member_count += 1;
+    try std.testing.expect(!stale.satisfies(required));
+    try std.testing.expectEqual(system_catalog_version, tableStorageVersion(.{}, system_catalog_version));
+    try std.testing.expectEqual(table_storage_version, tableStorageVersion(.{ .dense_embeddings = .vector_store }, system_catalog_version));
+}

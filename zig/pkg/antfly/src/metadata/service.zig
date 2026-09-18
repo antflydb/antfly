@@ -2509,8 +2509,69 @@ fn runtimeStatusProtocolSafeCommand(
     }
 }
 
+fn tableRecordNeedsStorageProtocol(table: metadata_table_manager.TableRecord) bool {
+    return metadata_topology_protocol.tableStorageVersion(table.storage, 0) != 0;
+}
+
+/// Covers every command that can persist the extended binary table record,
+/// including commands whose outer framing is JSON rather than binary.
+fn commandNeedsTableStorageProtocol(alloc: std.mem.Allocator, command: metadata_storage.TransitionCommand) !bool {
+    return switch (command) {
+        .upsert_table => |table| tableRecordNeedsStorageProtocol(table),
+        .compare_and_replace_table => |change| tableRecordNeedsStorageProtocol(change.expected) or tableRecordNeedsStorageProtocol(change.replacement),
+        .apply_table_topology => |change| switch (change) {
+            .create => |create| tableRecordNeedsStorageProtocol(create.table),
+            .drop => false,
+        },
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |change| blk: {
+            for (change.upsert_tables) |table| if (tableRecordNeedsStorageProtocol(table)) break :blk true;
+            break :blk false;
+        },
+        .apply_system_catalog => |bytes| blk: {
+            var parsed = try std.json.parseFromSlice(metadata_storage.raft_apply_store.SystemCatalogCommand, alloc, bytes, .{});
+            defer parsed.deinit();
+            if (parsed.value.topology) |topology| switch (topology) {
+                .create => |create| if (tableRecordNeedsStorageProtocol(create.table)) break :blk true,
+                .drop => {},
+            };
+            if (parsed.value.placement_update) |change| {
+                if (tableRecordNeedsStorageProtocol(change.expected) or tableRecordNeedsStorageProtocol(change.replacement)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+test "workload admission extended table writers require decoder activation" {
+    const alloc = std.testing.allocator;
+    const legacy: metadata_table_manager.TableRecord = .{ .table_id = 42, .name = "table:42" };
+    var active = legacy;
+    active.storage.transaction_recovery = .{ .protocol_version = 1, .max_count = 4, .max_bytes = 4194304, .max_transaction_bytes = 1048576 };
+    try std.testing.expect(!try commandNeedsTableStorageProtocol(alloc, .{ .upsert_table = legacy }));
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .upsert_table = active }));
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .compare_and_replace_table = .{ .expected = active, .replacement = legacy } }));
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .compare_and_replace_table = .{ .expected = legacy, .replacement = active } }));
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .apply_extension_lifecycle = .{ .upsert_tables = &.{active} } }));
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{active} } }));
+    const topology: metadata_storage.raft_apply_store.TableTopologyMutation = .{ .create = .{ .expected_transition_generation = 0, .table = active, .ranges = &.{} } };
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .apply_table_topology = topology }));
+    const catalog: metadata_storage.raft_apply_store.SystemCatalogCommand = .{
+        .expected_revision = 0,
+        .mutation = .{ .action = .create, .kind = .table, .name = "docs", .table_id = 42, .storage_name = "table:42" },
+        .topology = topology,
+    };
+    const bytes = try std.json.Stringify.valueAlloc(alloc, catalog, .{});
+    defer alloc.free(bytes);
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .apply_system_catalog = bytes }));
+    var vector = legacy;
+    vector.storage.dense_embeddings = .vector_store;
+    try std.testing.expect(try commandNeedsTableStorageProtocol(alloc, .{ .upsert_table = vector }));
+}
+
 const EncodedTransitionBatch = struct {
     entries: [][]const u8,
+    needs_table_storage_protocol: bool = false,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.entries) |entry| alloc.free(entry);
@@ -2543,6 +2604,7 @@ fn prepareEncodedTransitionBatch(
     }
 
     var total_bytes: usize = 0;
+    var needs_table_storage_protocol = false;
     for (commands) |command| {
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record|
@@ -2552,6 +2614,7 @@ fn prepareEncodedTransitionBatch(
             command,
             &owned_legacy_store,
         );
+        needs_table_storage_protocol = (try commandNeedsTableStorageProtocol(service.alloc, safe_command)) or needs_table_storage_protocol;
         try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
         const encoded = try metadata_storage.encodeTransitionCommand(service.alloc, safe_command);
         total_bytes = std.math.add(usize, total_bytes, encoded.len) catch {
@@ -2569,7 +2632,7 @@ fn prepareEncodedTransitionBatch(
             return err;
         };
     }
-    return .{ .entries = try entries.toOwnedSlice(service.alloc) };
+    return .{ .entries = try entries.toOwnedSlice(service.alloc), .needs_table_storage_protocol = needs_table_storage_protocol };
 }
 
 fn restoreProgressIdentityEqual(
@@ -7405,6 +7468,7 @@ pub const MetadataHttpService = struct {
             raft_status.soft.leader_id == null or
             raft_status.soft.leader_id.? != raft_status.id)
             return error.NotLeader;
+        if (batch.needs_table_storage_protocol) try self.validateTableStorageActivationLocked();
         try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
         var accepted_first_index: ?u64 = null;
         var accepted_last_index: ?u64 = null;
@@ -7450,6 +7514,26 @@ pub const MetadataHttpService = struct {
         return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term);
     }
 
+    /// Called with the runtime lock held immediately before Raft admission.
+    /// It performs no peer I/O and binds durable decoder evidence to the exact
+    /// current membership/incarnation, covering direct CAS and batch writers.
+    fn validateTableStorageActivationLocked(self: *MetadataHttpService) !void {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const incarnation = (try store.getMetadataIncarnation(self.metadata_group_id)) orelse return error.TableTopologyProtocolUpgradeRequired;
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return error.NotLeader;
+        const ids = try collectReallocationBarrierNodeIds(self.alloc, raft_status.conf_state, self.reallocation_protocol_peers);
+        defer self.alloc.free(ids);
+        const readiness = try tableTopologyProtocolReadiness(raft_status.hard.current_term, metadata_topology_protocol.table_storage_version, incarnation, ids);
+        const required: metadata_topology_protocol.Activation = .{
+            .version = metadata_topology_protocol.table_storage_version,
+            .incarnation = incarnation,
+            .member_count = readiness.protected_member_count,
+            .membership_fingerprint = readiness.protected_membership_fingerprint,
+        };
+        const activation = (try store.topologyActivation(self.metadata_group_id)) orelse return error.TableTopologyProtocolUpgradeRequired;
+        if (!activation.satisfies(required)) return error.TableTopologyProtocolUpgradeRequired;
+    }
+
     fn proposeTransitionCommandWithReceiptInExpectedTerm(
         self: *MetadataHttpService,
         command: metadata_storage.TransitionCommand,
@@ -7458,6 +7542,7 @@ pub const MetadataHttpService = struct {
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
         const safe_command = try runtimeStatusProtocolSafeCommand(self, command, &owned_legacy_store);
+        const needs_storage_protocol = try commandNeedsTableStorageProtocol(self.alloc, safe_command);
         self.lockRuntime();
         defer self.unlockRuntime();
         try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
@@ -7469,6 +7554,7 @@ pub const MetadataHttpService = struct {
         if (expected_term) |term| {
             if (raft_status.hard.current_term != term) return error.NotLeader;
         }
+        if (needs_storage_protocol) try self.validateTableStorageActivationLocked();
         const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
         defer self.alloc.free(encoded);
         if (safe_command == .apply_table_topology and

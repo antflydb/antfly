@@ -201,6 +201,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
 
+    // Metadata persistence and proposal guards live outside the request-runtime
+    // test root. Keep them in a separate artifact so the admission gate covers
+    // the real table codec without widening its main compilation root.
+    const workload_metadata_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"workload admission"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_workload_metadata_tests = addFilteredTestRunArtifact(b, workload_metadata_tests);
+    b.step("antfly-workload-admission-metadata-test", "Run workload policy persistence and metadata capability regressions").dependOn(&run_workload_metadata_tests.step);
+    run_workload_admission_tests.step.dependOn(&run_workload_metadata_tests.step);
+
     const store_observer_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[2],
         .filters = &.{"store observer "},

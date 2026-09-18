@@ -10271,7 +10271,13 @@ fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: en
     var fields: [8][]const u8 = undefined;
     var count: usize = 0;
     while (pos < encoded.len) : (count += 1) {
-        if (count == fields.len) return error.InvalidMetadataTransitionEncoding;
+        if (count == fields.len) {
+            if (!std.mem.startsWith(u8, encoded[pos..], table_storage_extension_magic)) return error.InvalidMetadataTransitionEncoding;
+            // Identity/query projections do not own storage settings, but
+            // must validate the same extension as the full record decoder.
+            _ = try readTableStorageExtension(encoded, &pos);
+            break;
+        }
         const length = try readInt(encoded, &pos, u32);
         if (length > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
         fields[count] = encoded[pos..][0..length];
@@ -11690,6 +11696,53 @@ fn appendTableRecord(
     try out.appendSlice(alloc, record.restore_backup_id);
     try appendInt(alloc, out, u32, @intCast(record.restore_location.len));
     try out.appendSlice(alloc, record.restore_location);
+    // Inactive records keep their historical bytes. The extension is gated
+    // by the metadata storage-policy capability before replicated admission.
+    if (record.storage.dense_embeddings != .primary_lsm or record.storage.transaction_recovery != null) {
+        try out.appendSlice(alloc, table_storage_extension_magic);
+        try out.append(alloc, 1);
+        try out.append(alloc, switch (record.storage.dense_embeddings) {
+            .primary_lsm => 0,
+            .vector_store => 1,
+        });
+        try out.append(alloc, @intFromBool(record.storage.transaction_recovery != null));
+        if (record.storage.transaction_recovery) |policy| {
+            try policy.validate();
+            try appendInt(alloc, out, u32, policy.protocol_version);
+            try appendInt(alloc, out, u64, policy.max_count);
+            try appendInt(alloc, out, u64, policy.max_bytes);
+            try appendInt(alloc, out, u64, policy.max_transaction_bytes);
+        }
+    }
+}
+
+const table_storage_extension_magic = "\x00TSTORE\x00";
+
+fn readTableStorageExtension(encoded: []const u8, pos: *usize) !@import("../../common/table_storage.zig").Settings {
+    pos.* += table_storage_extension_magic.len;
+    if (try readInt(encoded, pos, u8) != 1) return error.InvalidMetadataTransitionEncoding;
+    var settings: @import("../../common/table_storage.zig").Settings = .{
+        .dense_embeddings = switch (try readInt(encoded, pos, u8)) {
+            0 => .primary_lsm,
+            1 => .vector_store,
+            else => return error.InvalidMetadataTransitionEncoding,
+        },
+    };
+    switch (try readInt(encoded, pos, u8)) {
+        0 => {},
+        1 => {
+            settings.transaction_recovery = .{
+                .protocol_version = try readInt(encoded, pos, u32),
+                .max_count = try readInt(encoded, pos, u64),
+                .max_bytes = try readInt(encoded, pos, u64),
+                .max_transaction_bytes = try readInt(encoded, pos, u64),
+            };
+            settings.transaction_recovery.?.validate() catch return error.InvalidMetadataTransitionEncoding;
+        },
+        else => return error.InvalidMetadataTransitionEncoding,
+    }
+    if (pos.* != encoded.len) return error.InvalidMetadataTransitionEncoding;
+    return settings;
 }
 
 fn appendFramedTableRecord(
@@ -11963,6 +12016,12 @@ fn readTableRecord(
     const newest_record = readTableRecordWithRestoreIntent(alloc, encoded, pos) catch null;
     if (newest_record) |record| {
         if (pos.* == encoded.len) return record;
+        if (std.mem.startsWith(u8, encoded[pos.*..], table_storage_extension_magic)) {
+            var extended = record;
+            errdefer metadata_table_manager.freeTable(alloc, extended);
+            extended.storage = try readTableStorageExtension(encoded, pos);
+            return extended;
+        }
         metadata_table_manager.freeTable(alloc, record);
         pos.* = start;
     } else {
@@ -18653,7 +18712,7 @@ fn applySystemCatalogTestCommand(store: *RaftApplyStore, index: u64, command: Sy
     try store.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = index, .entries_bytes = entries });
 }
 
-test "system catalog publishes names and table topology atomically and fences stale mutations" {
+test "workload admission system catalog publishes recovery policy and topology atomically and fences stale mutations" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -18663,7 +18722,13 @@ test "system catalog publishes names and table topology atomically and fences st
     defer store.deinit();
     try applySystemCatalogTestCommand(&store, 1, .{ .expected_revision = 0, .mutation = .{ .action = .create, .kind = .database, .name = "analytics" } });
     const large_description = [_]u8{'x'} ** (256 * 1024);
-    const table: metadata.TableRecord = .{ .table_id = 42, .name = "table:42", .description = &large_description, .min_ranges = 1 };
+    const table: metadata.TableRecord = .{
+        .table_id = 42,
+        .name = "table:42",
+        .description = &large_description,
+        .min_ranges = 1,
+        .storage = .{ .transaction_recovery = .{ .protocol_version = 1, .max_count = 4, .max_bytes = 4194304, .max_transaction_bytes = 1048576 } },
+    };
     const ranges = [_]metadata.RangeRecord{.{ .table_id = 42, .group_id = 301, .range_id = 301, .start_key = "" }};
     try applySystemCatalogTestCommand(&store, 2, .{ .expected_revision = 1, .mutation = .{ .action = .create, .kind = .table, .name = "events", .database = "analytics", .table_id = 42, .storage_name = "table:42" }, .topology = .{ .create = .{ .expected_transition_generation = 0, .table = table, .ranges = &ranges } } });
     {
@@ -18671,6 +18736,7 @@ test "system catalog publishes names and table topology atomically and fences st
         defer metadata_table_manager.freeTable(alloc, resolved);
         try std.testing.expectEqual(@as(u64, 42), resolved.table_id);
         try std.testing.expectEqualStrings("table:42", resolved.name);
+        try std.testing.expectEqualDeep(table.storage, resolved.storage);
     }
     {
         const targets = [_]system_catalog.Target{ .{ .database = "analytics", .table = "events" }, .{ .database = "analytics", .table = "missing" } };
@@ -20464,4 +20530,43 @@ test "metadata replay advances new noops without changing catalog authority or o
     const value = (try store.getRestoreJobValue(T.alloc, T.group_id, key)).?;
     defer T.alloc.free(value);
     try std.testing.expectEqualStrings("retained", value);
+}
+
+test "workload admission table record storage extension preserves legacy bytes and framed recovery policy" {
+    const alloc = std.testing.allocator;
+    const legacy: metadata.TableRecord = .{ .table_id = 42, .name = "table:42" };
+    const legacy_bytes = try encodeTableRecord(alloc, legacy);
+    defer alloc.free(legacy_bytes);
+    var legacy_pos: usize = 0;
+    const legacy_decoded = try readTableRecordWithRestoreIntent(alloc, legacy_bytes, &legacy_pos);
+    defer metadata_table_manager.freeTable(alloc, legacy_decoded);
+    try std.testing.expectEqual(legacy_bytes.len, legacy_pos);
+    try std.testing.expectEqualDeep(legacy.storage, legacy_decoded.storage);
+    var active = legacy;
+    active.storage.transaction_recovery = .{ .protocol_version = 1, .max_count = 4, .max_bytes = 4194304, .max_transaction_bytes = 1048576 };
+    const active_bytes = try encodeTableRecord(alloc, active);
+    defer alloc.free(active_bytes);
+    try std.testing.expectEqualSlices(u8, legacy_bytes, active_bytes[0..legacy_bytes.len]);
+    const decoded = try decodeTableRecord(alloc, active_bytes);
+    defer metadata_table_manager.freeTable(alloc, decoded);
+    try std.testing.expectEqualDeep(active.storage, decoded.storage);
+    var identity = try decodeTableIdentity(alloc, active_bytes);
+    defer identity.deinit(alloc);
+    try std.testing.expectEqual(active.table_id, identity.table_id);
+    try std.testing.expectEqualStrings(active.name, identity.name);
+    var query = try decodeTableQueryProjection(alloc, active_bytes, true);
+    defer query.deinit(alloc);
+    try std.testing.expect(query.query_definition != null);
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableIdentity(alloc, active_bytes[0 .. active_bytes.len - 1]));
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(alloc, active_bytes[0 .. active_bytes.len - 1]));
+    var bad_version = try alloc.dupe(u8, active_bytes);
+    defer alloc.free(bad_version);
+    bad_version[legacy_bytes.len + table_storage_extension_magic.len] = 2;
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(alloc, bad_version));
+    const command = try encodeTransitionCommand(alloc, .{ .compare_and_replace_table = .{ .expected = active, .replacement = active } });
+    defer alloc.free(command);
+    var roundtrip = (try decodeTransitionCommand(alloc, command)).?;
+    defer roundtrip.deinit(alloc);
+    try std.testing.expectEqualDeep(active.storage, roundtrip.compare_and_replace_table.expected.storage);
+    try std.testing.expectEqualDeep(active.storage, roundtrip.compare_and_replace_table.replacement.storage);
 }
