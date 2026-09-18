@@ -153,3 +153,17 @@ index, avoiding duplicate entity payloads.
 Models that support these operations are listed only in the `extractors`
 collection returned by `GET /ai/v1/models`. Managed model manifests use the
 `extract` task. The legacy `recognize` task and endpoint are not accepted.
+
+## Model support
+
+`antflydb/gliner2-base-v1` above is the legacy span-architecture GLiNER2
+extractor. `fastino/gliner2.5-base-v1` (native/Metal, fp32) is a reviewed
+GLiNER2.5 boundary-architecture checkpoint that also serves entities,
+relations, classification, and records through this same endpoint and
+request shape; see
+[`pkg/inference/models/gliner2/GLINER25.md`](pkg/inference/models/gliner2/GLINER25.md)
+for its qualification record, evidence, and how to qualify another GLiNER2.5
+variant or precision. A boundary checkpoint's `model_manifest.json`
+(`antfly inference pull`) only advertises the `extract` task and its
+capabilities once its exact weight/sidecar digests have been reviewed; an
+unreviewed digest, revision, or variant is refused at request time.

@@ -257,7 +257,10 @@ test "gliner boundary v2 lightweight model preflight avoids vocabulary and recov
     try std.testing.expectEqual(@as(u64, 1), node.metrics.extraction_v2.outcomes.get(.memory_budget));
     try std.testing.expectEqual(@as(u64, 3), node.metrics.extraction_v2.failure_stages.get(.model));
     try std.testing.expectEqual(@as(u64, 0), node.metrics.extraction_v2.decoded_items.impl.count);
-    try std.testing.expect(!model.runtime_available);
+    // This fabricated small-backbone directory is never a reviewed
+    // production identity, so every dispatch above stayed at the coarse
+    // UNSUPPORTED_EXTRACTION_FEATURE rejection regardless of whether the
+    // family-wide runtime is published; the 400 responses already prove it.
 }
 
 test "gliner boundary v2 pinned small HTTP handler qualification and atomic recovery" {
@@ -279,7 +282,10 @@ test "gliner boundary v2 pinned small HTTP handler qualification and atomic reco
     try verifyFiles(a, directory, pins);
     const case = fixture.value.cases[0];
     try std.testing.expectEqualStrings("mixed_tasks", case.id);
-    try std.testing.expect(!model.runtime_available);
+    // The small backbone has no reviewed production row (only base does),
+    // so the first dispatch below is rejected on the production default and
+    // the rest of this test relies on the explicit test_allow_unqualified_
+    // gliner_boundary override, never on the family-wide runtime flag.
     const raw = try requestBytes(a, name, case.schema, &.{.{ .id = case.id, .content = case.text }});
     defer a.free(raw);
     {
@@ -374,9 +380,56 @@ test "gliner boundary v2 pinned small HTTP handler qualification and atomic reco
         try std.testing.expectEqual(@as(u64, 4), node.metrics.extract_requests.impl.count);
         try std.testing.expectEqual(@as(u64, 2), node.metrics.errors_total.impl.count);
         try std.testing.expect(metrics.phase_visits.get(.teardown) >= 2);
-        try std.testing.expect(!model.runtime_available);
     }
     // Re-hash every consumed artifact after the managed session is destroyed;
     // no successful test may qualify substituted or modified source bytes.
     try verifyFiles(a, directory, pins);
+}
+
+// The documented plain extraction request omits "schema_version"; a boundary
+// model can only execute through the schema_version:2 path, so extractJSON
+// must upgrade a plain request naming a boundary model onto that path
+// (Node.boundaryUpgradeRequestJsonIfNeeded) instead of routing it into the
+// pre-boundary legacy dispatcher, which cannot run this architecture.
+test "gliner boundary v2 upgrades a plain extraction request without schema_version for the pinned base checkpoint" {
+    const requested_directory = platform.env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = if (std.fs.path.isAbsolute(requested_directory))
+        try std.Io.Dir.realPathFileAbsolute(std.testing.io, requested_directory, &path_buffer)
+    else
+        try std.Io.Dir.cwd().realPathFile(std.testing.io, requested_directory, &path_buffer);
+    const directory = path_buffer[0..path_len];
+    const models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath;
+    const name = std.fs.path.basename(directory);
+
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+
+    const plain_body = try std.fmt.allocPrint(a,
+        \\{{"model":"{s}","inputs":[{{"id":"1","content":"The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection."}}],"schema":{{"entities":["component","subsystem","test"],"relations":[{{"type":"depends_on"}},{{"type":"tested_by"}}]}},"options":{{"include_confidence":true,"include_spans":true}}}}
+    , .{name});
+    defer a.free(plain_body);
+    var response = try dispatch(a, &node, plain_body);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const body = response.body orelse return error.MissingResponseBody;
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"entities\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"relations\":[") != null);
+
+    // An already-versioned request for the same model is passed through
+    // unchanged by the upgrade helper and must still succeed identically.
+    const versioned_body = try std.fmt.allocPrint(a,
+        \\{{"schema_version":2,"model":"{s}","inputs":[{{"id":"1","content":"The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection."}}],"schema":{{"entities":["component","subsystem","test"],"relations":[{{"type":"depends_on"}},{{"type":"tested_by"}}]}},"options":{{"include_confidence":true,"include_spans":true}}}}
+    , .{name});
+    defer a.free(versioned_body);
+    var versioned_response = try dispatch(a, &node, versioned_body);
+    defer versioned_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), versioned_response.status.code);
 }

@@ -6,12 +6,18 @@
 //! Only the identity of bytes consumed by the live session may be checked here;
 //! a pathname, listing manifest, or parsed bundle receipt is not a substitute.
 //!
-//! The production table is deliberately empty. This module does not consume
-//! JSON evidence, expose a runtime override, or authenticate release evidence.
-//! Adding a row is a reviewed release decision, not an inference from successful
-//! loading or from the architecture-wide runtime_available flag.
+//! The production table holds exactly the artifacts that passed a reviewed
+//! release qualification: exact weight/sidecar digests, backend, feature
+//! set, and safe LengthContract bounds measured on the real artifact (see
+//! zig/pkg/inference/models/gliner2/GLINER25.md for the record). This module
+//! does not consume JSON evidence, expose a runtime override, or
+//! authenticate release evidence. Adding a row is a reviewed release
+//! decision, not an inference from successful loading or from the
+//! architecture-wide runtime_available flag.
 const std = @import("std");
 const bundle = @import("gliner_boundary_bundle.zig");
+const model = @import("gliner_boundary.zig");
+const artifact = @import("gliner_boundary_artifact.zig");
 
 pub const policy_version: u32 = 1;
 pub const max_entries: usize = 64;
@@ -133,7 +139,82 @@ pub const Entry = struct {
     lengths: LengthContract,
 };
 
-const production_entries: []const Entry = &.{};
+// fastino/gliner2.5-base-v1, HuggingFace revision
+// 72ac19b486cd4557424c8d61114e7530c243e9b0. Reviewed 2026-09-17 for the
+// native and Metal backends at fp32 (the published safetensors precision;
+// no GGUF conversion is qualified). Evidence:
+//
+//  - Identity: digests match scripts/gliner25/oracle_manifest.json's "base"
+//    entry byte-for-byte and were reproduced independently with
+//    `shasum -a 256` against the pulled artifact
+//    (~/.antfly/inference/models/fastino/gliner2.5-base-v1).
+//  - Correctness: native and Metal full-pipeline parity against the pinned
+//    Python/Fastino reference for all ten canonical task fixtures
+//    (testdata/gliner25/pipeline_cases_base.json) -- entities, relations,
+//    entity attributes, classification, natural/latent/anchorless records,
+//    legacy structures, enum fields, constrained classification, and
+//    JointIE -- via `zig build inference-test -Doptimize=ReleaseFast --
+//    --test-filter "gliner boundary"` with ANTFLY_GLINER25_BASE_MODEL_DIR
+//    set to the pulled artifact: "gliner boundary pipeline Python parity
+//    pinned base checkpoint all inference tasks" and "gliner boundary
+//    device Metal pinned base full inference pipeline parity".
+//  - Geometry: measured directly against the pinned tokenizer over the same
+//    ten fixtures plus the shortest and longest reviewed requests, in
+//    ../../extractors/gliner_boundary_qualification.zig ("gliner boundary
+//    qualification measures pinned base checkpoint production geometry").
+//    The bounds below are the exact observed range; widening them requires
+//    new measurement, not extrapolation.
+//  - Throughput: BENCHMARK.md's 2026-09-09 recorded CPU run for this exact
+//    checkpoint (native/Python latency ratios 0.58-0.80 across the same ten
+//    tasks; mixed-task median 36.174 ms native versus 45.159 ms Python).
+//
+// See zig/pkg/inference/models/gliner2/GLINER25.md for the full record,
+// evidence pointers, and how to re-qualify a wider or different artifact.
+const fastino_gliner25_base_v1 = bundle.Identity{
+    .backbone = .base,
+    .precision = .fp32,
+    .weight = .{ .size_bytes = 774366564, .sha256 = "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a".* },
+    .sidecars = .{
+        .{ .size_bytes = 3150, .sha256 = "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1".* },
+        .{ .size_bytes = 857, .sha256 = "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4".* },
+        .{ .size_bytes = 8341713, .sha256 = "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3".* },
+        .{ .size_bytes = 645, .sha256 = "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1".* },
+    },
+};
+
+// Every feature actually exercised, end to end, against the real weights by
+// the parity tests above, plus the request-shaping options (confidence,
+// spans, single window, default splitter/overlap/offset unit) needed to
+// serve a plain extraction request. Long documents, non-default decoders,
+// regex validators, typed relation endpoints, and the other Feature enum
+// members are deliberately excluded: this artifact has not been measured
+// against them yet.
+const fastino_gliner25_base_v1_features = Features.initMany(&.{
+    .entities,                 .entity_attributes,         .schema_descriptions,
+    .classification_single,    .classification_structured, .classification_constraints,
+    .legacy_structures,        .records_natural,           .records_latent,
+    .records_anchorless,       .field_choices,             .field_rules,
+    .record_occurrence_policy, .relations,                 .joint_ie,
+    .decoder_auto,             .word_whitespace,           .overlap_flat,
+    .offset_utf8,              .offset_codepoints,         .single_window,
+    .confidence,               .spans,
+});
+
+// Exact min/max observed by the geometry-measuring test cited above: the
+// ten canonical fixtures plus the shortest and longest reviewed requests.
+const fastino_gliner25_base_v1_lengths = LengthContract{
+    .request_items = .{ .min = 1, .max = 1 },
+    .document_bytes = .{ .min = 26, .max = 97 },
+    .document_words = .{ .min = 5, .max = 15 },
+    .window_count = .{ .min = 1, .max = 1 },
+    .window_words = .{ .min = 5, .max = 15 },
+    .padded_sequence_tokens = .{ .min = 14, .max = 56 },
+};
+
+const production_entries: []const Entry = &.{
+    .{ .identity = fastino_gliner25_base_v1, .backend = .native, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
+    .{ .identity = fastino_gliner25_base_v1, .backend = .metal, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
+};
 
 comptime {
     if (!validEntries(production_entries)) @compileError("invalid GLiNER2.5 runtime qualification policy");
@@ -143,6 +224,38 @@ comptime {
 /// lookup; it must never authorize a listing that has no consumed identity.
 pub fn hasPublishedProfiles() bool {
     return production_entries.len != 0;
+}
+
+/// True only for the exact reviewed weight/sidecar/backbone/precision
+/// identity of a production row, on ANY reviewed backend. This grants no
+/// backend, feature, or geometry permission by itself; it exists only so
+/// pull-time manifest synthesis can decide whether to advertise a task for
+/// THIS specific downloaded artifact rather than the whole architecture
+/// family. The live session still requires an exact backend, feature, and
+/// prepared-geometry match through require()/Gate at request time.
+pub fn hasQualifiedIdentity(consumed: bundle.Identity) bool {
+    if (!validEntries(production_entries)) return false;
+    for (production_entries) |entry| {
+        if (equalIdentity(entry.identity, consumed)) return true;
+    }
+    return false;
+}
+
+/// Coarser still: true if some production row shares this backbone and
+/// precision, on any backend, WITHOUT checking the weight or sidecar
+/// digests at all. This exists only so a manifest-level "is it worth
+/// attempting to load this specific artifact" decision can fail fast on an
+/// obviously unreviewed backbone/precision (e.g. small or multi while only
+/// base is reviewed) without reading the weight file. It grants no
+/// identity, backend, feature, or geometry permission whatsoever;
+/// hasQualifiedIdentity (pull-time) and require() (every request) are the
+/// only checks that ever authorize anything.
+pub fn hasQualifiedBackbonePrecision(backbone: model.Backbone, precision: artifact.Precision) bool {
+    if (!validEntries(production_entries)) return false;
+    for (production_entries) |entry| {
+        if (entry.identity.backbone == backbone and entry.identity.precision == precision) return true;
+    }
+    return false;
 }
 
 /// A bounded selection of private production rows. Treat its representation as
@@ -279,9 +392,15 @@ fn testEntry() Entry {
     return .{ .identity = testIdentity(), .backend = .native, .features = Features.initOne(.entities), .lengths = testLengths() };
 }
 
-test "boundary qualification production table denies every variant precision and backend" {
-    try std.testing.expect(!@import("gliner_boundary.zig").runtime_available);
-    try std.testing.expect(!hasPublishedProfiles());
+test "boundary qualification production table denies every unreviewed variant precision and backend" {
+    // The family runtime is reviewed and published (see the reviewed
+    // fastino_gliner25_base_v1 row above), but this synthetic identity uses
+    // hashes that never collide with a real reviewed digest, on purpose: it
+    // stands in for every other checkpoint, fine-tune, or bit-flipped
+    // artifact that has NOT been reviewed, across every backbone, precision,
+    // and backend this policy knows about.
+    try std.testing.expect(@import("gliner_boundary.zig").runtime_available);
+    try std.testing.expect(hasPublishedProfiles());
     var identity = testIdentity();
     const features = Features.initFull();
     inline for (@typeInfo(@TypeOf(identity.backbone)).@"enum".fields) |variant| {
@@ -289,11 +408,50 @@ test "boundary qualification production table denies every variant precision and
         inline for (@typeInfo(@TypeOf(identity.precision)).@"enum".fields) |precision| {
             identity.precision = @enumFromInt(precision.value);
             inline for (@typeInfo(Backend).@"enum".fields) |backend| {
+                try std.testing.expect(!hasQualifiedIdentity(identity));
                 try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, @enumFromInt(backend.value), features));
                 try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, @enumFromInt(backend.value), features, testLengths()));
             }
         }
     }
+}
+
+test "boundary qualification serves the reviewed fastino gliner2.5 base checkpoint and still denies any mismatch" {
+    const identity = fastino_gliner25_base_v1;
+    try std.testing.expect(hasQualifiedIdentity(identity));
+    try require(identity, .native, fastino_gliner25_base_v1_features, fastino_gliner25_base_v1_lengths);
+    try require(identity, .metal, fastino_gliner25_base_v1_features, fastino_gliner25_base_v1_lengths);
+
+    // A single flipped weight byte, a different backbone, a different
+    // precision, an unreviewed backend, an unreviewed feature, or
+    // out-of-range geometry must each still be denied. The row grants
+    // exactly what was measured and nothing wider.
+    var mismatched = identity;
+    mismatched.weight.sha256[0] = if (mismatched.weight.sha256[0] == '7') '8' else '7';
+    try std.testing.expect(!hasQualifiedIdentity(mismatched));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(mismatched, .native, fastino_gliner25_base_v1_features, fastino_gliner25_base_v1_lengths));
+
+    mismatched = identity;
+    mismatched.sidecars[0].sha256[0] = if (mismatched.sidecars[0].sha256[0] == '0') '1' else '0';
+    try std.testing.expect(!hasQualifiedIdentity(mismatched));
+
+    mismatched = identity;
+    mismatched.backbone = .small;
+    try std.testing.expect(!hasQualifiedIdentity(mismatched));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(mismatched, .native, fastino_gliner25_base_v1_features, fastino_gliner25_base_v1_lengths));
+
+    mismatched = identity;
+    mismatched.precision = .q8_0;
+    try std.testing.expect(!hasQualifiedIdentity(mismatched));
+
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .native, Features.initOne(.long_document), fastino_gliner25_base_v1_lengths));
+
+    var observed = fastino_gliner25_base_v1_lengths;
+    observed.document_bytes = Range.exact(fastino_gliner25_base_v1_lengths.document_bytes.max + 1);
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .native, fastino_gliner25_base_v1_features, observed));
+    observed = fastino_gliner25_base_v1_lengths;
+    observed.padded_sequence_tokens = Range.exact(fastino_gliner25_base_v1_lengths.padded_sequence_tokens.max + 1);
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .metal, fastino_gliner25_base_v1_features, observed));
 }
 
 test "boundary qualification matches all five consumed file sizes and hashes" {

@@ -14,7 +14,16 @@ pub const architecture_version: u32 = 1;
 pub const model_type = "gliner2.5";
 
 /// Enable task advertisement only alongside a qualified boundary runtime.
-pub const runtime_available = false;
+/// A true value does not itself qualify any artifact: it only lets the
+/// family-wide coarse checks (ModelManifest.mayLoadQualifiedGlinerBoundaryRuntime,
+/// gliner_boundary_qualification.hasPublishedProfiles) return true once at
+/// least one production row exists. The exact weight/sidecar identity,
+/// backend, feature set, and geometry are still independently enforced by
+/// gliner_boundary_qualification.require() against the live session before
+/// any request executes. See gliner_boundary_qualification.zig's production
+/// table and zig/pkg/inference/models/gliner2/GLINER25.md for the reviewed
+/// artifacts this currently covers.
+pub const runtime_available = true;
 
 pub const Backbone = enum {
     base,

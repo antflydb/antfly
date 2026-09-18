@@ -731,3 +731,120 @@ test "boundary qualification canonical feature matrix covers every task and opti
         try std.testing.expect(covered.contains(@enumFromInt(field.value)));
     }
 }
+
+// Evidence-gathering, not a synthetic contract check: this measures the exact
+// geometry the pinned base checkpoint's own tokenizer produces for the
+// shortest and longest known qualification requests, using the real
+// preparation path. The production row in ../models/gliner_boundary_qualification.zig
+// is reviewed against these printed numbers; a future narrowing of that row
+// below an observed value here is a release regression, not just a test edit.
+test "gliner boundary qualification measures pinned base checkpoint production geometry" {
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const c_file = @import("../util/c_file.zig");
+    const path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(path);
+    const tokenizer_bytes = try c_file.readFile(a, path);
+    defer a.free(tokenizer_bytes);
+    const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tok.tokenizer().deinitTokenizer();
+
+    const Case = struct { name: []const u8, text: []const u8, body: []const u8 };
+    const cases = [_]Case{
+        .{
+            .name = "shortest canonical fixture (enum_field/constrained_classification length)",
+            .text = "Delete the temporary file.",
+            .body =
+            \\{"schema_version":2,"model":"boundary","schema":{"entities":["object"]},"inputs":[{"content":"Delete the temporary file."}]}
+            ,
+        },
+        .{
+            .name = "repro request (entities + relations + confidence + spans)",
+            .text = "The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection.",
+            .body =
+            \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","test"],"relations":[{"type":"depends_on"},{"type":"tested_by"}]},"options":{"include_confidence":true,"include_spans":true},"inputs":[{"content":"The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection."}]}
+            ,
+        },
+    };
+    var min = policy.LengthContract{
+        .request_items = policy.Range.exact(1),
+        .document_bytes = .{ .min = std.math.maxInt(u64), .max = std.math.maxInt(u64) },
+        .document_words = .{ .min = std.math.maxInt(u64), .max = std.math.maxInt(u64) },
+        .window_count = policy.Range.exact(1),
+        .window_words = .{ .min = std.math.maxInt(u64), .max = std.math.maxInt(u64) },
+        .padded_sequence_tokens = .{ .min = std.math.maxInt(u64), .max = std.math.maxInt(u64) },
+    };
+    var max = policy.LengthContract{
+        .request_items = policy.Range.exact(1),
+        .document_bytes = .{ .min = 0, .max = 0 },
+        .document_words = .{ .min = 0, .max = 0 },
+        .window_count = policy.Range.exact(1),
+        .window_words = .{ .min = 0, .max = 0 },
+        .padded_sequence_tokens = .{ .min = 0, .max = 0 },
+    };
+    for (cases) |case| {
+        var request = try wire.parseJson(a, case.body, .{});
+        defer request.deinit();
+        const words = try sourceWords(a, case.text, .{});
+        var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = case.text, .schema = &request.items[0].compiled }}, .{});
+        defer prepared.deinit();
+        const observed = try lengths(1, case.text.len, words, 1, &prepared);
+        std.debug.print(
+            "gliner boundary base geometry [{s}]: document_bytes={} document_words={} window_words={} padded_sequence_tokens={}\n",
+            .{ case.name, observed.document_bytes.min, observed.document_words.min, observed.window_words.min, observed.padded_sequence_tokens.min },
+        );
+        min.document_bytes.min = @min(min.document_bytes.min, observed.document_bytes.min);
+        min.document_words.min = @min(min.document_words.min, observed.document_words.min);
+        min.window_words.min = @min(min.window_words.min, observed.window_words.min);
+        min.padded_sequence_tokens.min = @min(min.padded_sequence_tokens.min, observed.padded_sequence_tokens.min);
+        max.document_bytes.max = @max(max.document_bytes.max, observed.document_bytes.max);
+        max.document_words.max = @max(max.document_words.max, observed.document_words.max);
+        max.window_words.max = @max(max.window_words.max, observed.window_words.max);
+        max.padded_sequence_tokens.max = @max(max.padded_sequence_tokens.max, observed.padded_sequence_tokens.max);
+    }
+
+    // The ten canonical single-window task fixtures for the pinned base
+    // checkpoint (entities, relations, classification, records, JointIE,
+    // Unicode) are exercised end to end and cross-checked against the Python
+    // reference by the native and Metal parity tests above. Sweep their exact
+    // documents through the same real tokenizer to bound the schema-inflated
+    // encoded sequence length actually produced for this feature set.
+    const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
+    const fixture_bytes = try fixtures.fixtureBytes(a, "pipeline_cases_base.json");
+    defer a.free(fixture_bytes);
+    const parsed = try std.json.parseFromSlice(pipeline.ReferenceFixture, a, fixture_bytes, .{});
+    defer parsed.deinit();
+    const Input = struct { content: []const u8 };
+    const Envelope = struct { schema_version: u32 = 2, model: []const u8 = "boundary", schema: std.json.Value, inputs: []const Input };
+    for (parsed.value.cases) |case| {
+        const body = try std.json.Stringify.valueAlloc(a, Envelope{ .schema = case.schema, .inputs = &.{.{ .content = case.text }} }, .{});
+        defer a.free(body);
+        var request = try wire.parseJson(a, body, .{});
+        defer request.deinit();
+        const words = try sourceWords(a, case.text, .{});
+        var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = case.text, .schema = &request.items[0].compiled }}, .{});
+        defer prepared.deinit();
+        const observed = try lengths(1, case.text.len, words, 1, &prepared);
+        std.debug.print(
+            "gliner boundary base geometry [fixture {s}]: document_bytes={} document_words={} window_words={} padded_sequence_tokens={}\n",
+            .{ case.id, observed.document_bytes.min, observed.document_words.min, observed.window_words.min, observed.padded_sequence_tokens.min },
+        );
+        min.document_bytes.min = @min(min.document_bytes.min, observed.document_bytes.min);
+        min.document_words.min = @min(min.document_words.min, observed.document_words.min);
+        min.window_words.min = @min(min.window_words.min, observed.window_words.min);
+        min.padded_sequence_tokens.min = @min(min.padded_sequence_tokens.min, observed.padded_sequence_tokens.min);
+        max.document_bytes.max = @max(max.document_bytes.max, observed.document_bytes.max);
+        max.document_words.max = @max(max.document_words.max, observed.document_words.max);
+        max.window_words.max = @max(max.window_words.max, observed.window_words.max);
+        max.padded_sequence_tokens.max = @max(max.padded_sequence_tokens.max, observed.padded_sequence_tokens.max);
+    }
+    std.debug.print(
+        "gliner boundary base geometry SUMMARY: document_bytes=[{},{}] document_words=[{},{}] window_words=[{},{}] padded_sequence_tokens=[{},{}]\n",
+        .{
+            min.document_bytes.min,         max.document_bytes.max,
+            min.document_words.min,         max.document_words.max,
+            min.window_words.min,           max.window_words.max,
+            min.padded_sequence_tokens.min, max.padded_sequence_tokens.max,
+        },
+    );
+}

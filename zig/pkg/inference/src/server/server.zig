@@ -43,6 +43,7 @@ const model_manager_mod = @import("model_manager.zig");
 const embedding_trace = @import("../embedding_trace.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
+const gliner_boundary_model = @import("../models/gliner_boundary.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const gpt_model_mod = @import("../models/gpt.zig");
 const model_compatibility = @import("../models/compatibility.zig");
@@ -18217,6 +18218,40 @@ pub const Node = struct {
         return !ctx.isCancellationRequested();
     }
 
+    /// If `request_json` names a boundary-architecture model and does not
+    /// already declare a schema version, returns a new allocation (owned by
+    /// `result_allocator`) with `"schema_version":2` stamped on, so
+    /// extractJSON routes it to the only path that can execute it
+    /// (extractV2InMemory -> boundary_executor) instead of the pre-boundary
+    /// legacy dispatcher. Returns null on any failure (bad JSON, unresolved
+    /// model, non-boundary model, already-versioned request) so the caller
+    /// falls through to its existing, unmodified behavior; this must never
+    /// itself decide extraction is unsupported.
+    fn boundaryUpgradeRequestJsonIfNeeded(
+        self: *Node,
+        result_allocator: std.mem.Allocator,
+        io: std.Io,
+        request_json: []const u8,
+        max_request_bytes: usize,
+    ) !?[]u8 {
+        if (request_json.len == 0 or request_json.len > max_request_bytes) return null;
+        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var parsed = std.json.parseFromSlice(std.json.Value, scratch, request_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        if (parsed.value.object.contains("schema_version")) return null;
+        const model_value = parsed.value.object.get("model") orelse return null;
+        if (model_value != .string or model_value.string.len == 0) return null;
+        const model_path = self.resolveRequestModelPath(scratch, io, model_value.string, "extractors") catch return null;
+        var manifest = manifest_mod.loadListingFromDir(scratch, model_path) catch return null;
+        defer manifest.deinit();
+        if (manifest.gliner_architecture != .boundary) return null;
+        parsed.value.object.put(scratch, "schema_version", .{ .integer = 2 }) catch return null;
+        return std.json.Stringify.valueAlloc(result_allocator, parsed.value, .{}) catch null;
+    }
+
     pub fn extractJSON(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
@@ -18235,7 +18270,21 @@ pub const Node = struct {
             break :blk attachment_envelope.?.metadata;
         } else (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-        const version = extractionSchemaVersion(self, request_json, ctx.max_request_body_size) catch |err| {
+        // A boundary-architecture model (e.g. a qualified GLiNER2.5 checkpoint)
+        // is only ever executed through the schema_version:2 path
+        // (extractV2InMemory -> boundary_executor); the pre-boundary legacy
+        // dispatcher below cannot run it. The documented plain request shape
+        // omits schema_version, so stamp it on for exactly this model family
+        // rather than requiring every caller to know this internal detail.
+        // Any failure here (bad JSON, unknown model, non-boundary model)
+        // falls through to the unchanged existing behavior below.
+        const boundary_upgraded = if (!uses_attachment_envelope)
+            boundaryUpgradeRequestJsonIfNeeded(self, ctx.allocator, ctx.io, request_json, ctx.max_request_body_size) catch null
+        else
+            null;
+        defer if (boundary_upgraded) |bytes| ctx.allocator.free(bytes);
+        const effective_request_json = boundary_upgraded orelse request_json;
+        const version = extractionSchemaVersion(self, effective_request_json, ctx.max_request_body_size) catch |err| {
             self.metrics.extraction_v2.envelopeFailure(err);
             self.metrics.incError();
             return extractionV2FailureResponse(ctx, err, .{});
@@ -18251,7 +18300,7 @@ pub const Node = struct {
                 return extractionV2FailureResponse(ctx, error.UnsupportedExtractionInput, .{});
             };
             var failure = extraction_v2.FailureContext{};
-            var response = self.extractV2WithAdmission(ctx.allocator, .{ .json = request_json }, .http_route, execution_control, &failure, null) catch |err|
+            var response = self.extractV2WithAdmission(ctx.allocator, .{ .json = effective_request_json }, .http_route, execution_control, &failure, null) catch |err|
                 return extractionV2FailureResponse(ctx, err, failure);
             defer response.deinit();
             try ctx.setHeader("content-type", "application/json");
@@ -19881,6 +19930,7 @@ test {
     _ = @import("gliner_boundary_concurrency_test.zig");
     _ = @import("gliner_boundary_metal_socket_test.zig");
     _ = @import("gliner_boundary_queued_cancellation_test.zig");
+    _ = @import("embed_direct_vs_http_bench_test.zig");
 }
 
 test "gliner boundary v2 allocation attribution distinguishes recovery and model backing OOM" {
@@ -21120,8 +21170,15 @@ fn taskMatchesModelListing(
 ) bool {
     // A listing, including an already loaded model rendered through this
     // string-only path, has no exact prepared request qualification. Explicit
-    // tasks/capabilities cannot turn boundary metadata into a serving grant.
-    if (std.mem.eql(u8, gliner_model_type, "gliner2.5")) return false;
+    // tasks/capabilities cannot turn boundary metadata into a serving grant
+    // by themselves. While the family has no reviewed production row at
+    // all, withhold every gliner2.5 listing outright. Once reviewed rows
+    // exist, pull-time synthesis (registry.zig's boundaryIdentityIsQualified)
+    // is the only place permitted to populate a specific artifact's tasks/
+    // capabilities, so an unreviewed digest or variant still falls through
+    // to an empty tasks/capabilities set below and is excluded the same way
+    // every other unsupported model is.
+    if (std.mem.eql(u8, gliner_model_type, "gliner2.5") and !gliner_boundary_model.runtime_available) return false;
     // Classification is a public extraction capability. Keep `classifier` as
     // an internal pipeline kind without publishing a parallel API/catalog task.
     if (std.mem.eql(u8, task, "classifiers")) return false;
@@ -33055,12 +33112,32 @@ fn graphModeEnabled() bool {
     return platform.env.getenvBool("TERMITE_GRAPH_MODE");
 }
 
-test "boundary qualification model listings reject raw explicit tasks and capabilities" {
+test "boundary qualification model listings withhold every unqualified gliner2.5 artifact" {
+    // The family runtime is reviewed and published
+    // (models/gliner_boundary_qualification.zig has a production row), so
+    // this no longer takes the blanket family-closed shortcut. An artifact
+    // whose pull-time synthesis withheld its tasks/capabilities (because
+    // registry.zig's boundaryIdentityIsQualified found no matching
+    // production row for its actual bytes) still has nothing to list here,
+    // exactly like any other model kind with an empty tasks/capabilities set.
+    try std.testing.expect(gliner_boundary_model.runtime_available);
+    // Every real gliner2.5 manifest reports model_type "recognizer"
+    // (parseBoundaryConfigFromCatalog), never "extractor"/"generator": those
+    // other kinds are excluded here only to keep this loop's realistic
+    // "recognizer" case next to the unrelated, kind-name-based pluralization
+    // fallback (task[0..len-1] == model_kind) that a literal kind of
+    // "extractor" would otherwise trigger regardless of gliner_model_type.
     for ([_][]const u8{ "extractors", "generators", "readers" }) |task| {
-        for ([_][]const u8{ "recognizer", "extractor", "generator" }) |kind| {
-            try std.testing.expect(!taskMatchesModelListing(task, kind, "gliner2.5", &.{ "extract", "generate", "read" }, &.{ "extraction", "classification", "relations" }, true));
-        }
+        try std.testing.expect(!taskMatchesModelListing(task, "recognizer", "gliner2.5", &.{}, &.{}, false));
     }
-    try std.testing.expect(!taskMatchesModelListing("extractors", "extractor", "gliner2.5", &.{}, &.{}, false));
+
+    // A reviewed, qualified artifact carries real tasks/capabilities written
+    // by registry.zig and is listed the same way as any other recognizer:
+    // present under "extractors" and its declared capabilities, absent from
+    // categories it never claimed.
+    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2.5", &.{"extract"}, &.{ "extraction", "classification", "relations", "records" }, false));
+    try std.testing.expect(!taskMatchesModelListing("generators", "recognizer", "gliner2.5", &.{"extract"}, &.{ "extraction", "classification", "relations", "records" }, false));
+    try std.testing.expect(!taskMatchesModelListing("readers", "recognizer", "gliner2.5", &.{"extract"}, &.{ "extraction", "classification", "relations", "records" }, false));
+
     try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{"extract"}, &.{"labels"}, true));
 }
