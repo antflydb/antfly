@@ -238,41 +238,32 @@ pub const Registry = struct {
     }
 };
 
+/// Every `?[]const u8` field of `Config` is owned text that a stored copy
+/// must duplicate; every other field is a plain value. Walking the fields
+/// keeps the two in step, so adding an option cannot silently drop it from
+/// a registered provider (which is how `max_download_bytes` was lost).
+fn configOwnsText(comptime T: type) bool {
+    return T == ?[]const u8;
+}
+
 pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
-    return .{
-        .model = try dupOpt(alloc, cfg.model),
-        .api_key = try dupOpt(alloc, cfg.api_key),
-        .bearer_token = try dupOpt(alloc, cfg.bearer_token),
-        .capability_token = try dupOpt(alloc, cfg.capability_token),
-        .capability_revision = try dupOpt(alloc, cfg.capability_revision),
-        .framed_attachments = cfg.framed_attachments,
-        .base_url = try dupOpt(alloc, cfg.base_url),
-        .url = try dupOpt(alloc, cfg.url),
-        .api_url = try dupOpt(alloc, cfg.api_url),
-        .project_id = try dupOpt(alloc, cfg.project_id),
-        .location = try dupOpt(alloc, cfg.location),
-        .credentials_path = try dupOpt(alloc, cfg.credentials_path),
-        .language_code = try dupOpt(alloc, cfg.language_code),
-        .enable_automatic_punctuation = cfg.enable_automatic_punctuation,
-        .use_enhanced = cfg.use_enhanced,
-        .max_response_bytes = cfg.max_response_bytes,
-        .provider = cfg.provider,
-    };
+    var owned = cfg;
+    inline for (@typeInfo(Config).@"struct".fields) |field| {
+        if (comptime configOwnsText(field.type)) @field(owned, field.name) = null;
+    }
+    errdefer deinitConfig(alloc, &owned);
+    inline for (@typeInfo(Config).@"struct".fields) |field| {
+        if (comptime configOwnsText(field.type)) {
+            @field(owned, field.name) = try dupOpt(alloc, @field(cfg, field.name));
+        }
+    }
+    return owned;
 }
 
 pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
-    freeOpt(alloc, cfg.model);
-    freeOpt(alloc, cfg.api_key);
-    freeOpt(alloc, cfg.bearer_token);
-    freeOpt(alloc, cfg.capability_token);
-    freeOpt(alloc, cfg.capability_revision);
-    freeOpt(alloc, cfg.base_url);
-    freeOpt(alloc, cfg.url);
-    freeOpt(alloc, cfg.api_url);
-    freeOpt(alloc, cfg.project_id);
-    freeOpt(alloc, cfg.location);
-    freeOpt(alloc, cfg.credentials_path);
-    freeOpt(alloc, cfg.language_code);
+    inline for (@typeInfo(Config).@"struct".fields) |field| {
+        if (comptime configOwnsText(field.type)) freeOpt(alloc, @field(cfg, field.name));
+    }
     cfg.* = undefined;
 }
 
@@ -430,6 +421,8 @@ const AntflyTranscriberState = struct {
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
     framed_attachments: bool = false,
+    /// Provider-level default for speaker labels; a request may override it.
+    diarization: ?bool = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Transcriber {
         const configured_model = cfg.model orelse return error.InvalidTranscribingConfig;
@@ -468,6 +461,7 @@ const AntflyTranscriberState = struct {
             .timeout_ms = options.timeout_ms,
             .cancellation = options.cancellation,
             .framed_attachments = cfg.framed_attachments,
+            .diarization = cfg.diarization,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
@@ -524,6 +518,9 @@ const AntflyTranscriberState = struct {
             .model = self.model,
             .audio = audio_field,
             .language = req.language orelse self.language_code,
+            // Local and remote execution must honour the same options: the
+            // inference node cannot label speakers it was never asked for.
+            .diarization = req.diarization orelse self.diarization,
         });
         defer alloc.free(body);
 
@@ -587,6 +584,7 @@ const AntflyTranscriberState = struct {
         errdefer deinitResponse(alloc, &response);
         response.language = try dupOpt(alloc, first.language);
         if (first.segments) |api_segments| response.segments = try antflySegmentsAlloc(alloc, api_segments);
+        if (first.speakers) |api_speakers| response.speakers = try antflySpeakersAlloc(alloc, api_speakers);
         return response;
     }
 };
@@ -625,10 +623,31 @@ fn antflySegmentsAlloc(alloc: Allocator, api_segments: []const inference_api.typ
             .start_ms = api_segment.start_ms,
             .end_ms = api_segment.end_ms,
             .words = words,
+            .speaker = try dupOpt(alloc, api_segment.speaker),
         };
         filled += 1;
     }
     return segments;
+}
+
+/// The speakers a diarized inference response reports, in its order.
+fn antflySpeakersAlloc(alloc: Allocator, api_speakers: []const []const u8) ![]Speaker {
+    const speakers = try alloc.alloc(Speaker, api_speakers.len);
+    var filled: usize = 0;
+    errdefer {
+        for (speakers[0..filled]) |speaker| {
+            var owned = speaker;
+            deinitSpeaker(alloc, &owned);
+        }
+        alloc.free(speakers);
+    }
+    for (api_speakers, 0..) |label, i| {
+        const id = try alloc.dupe(u8, label);
+        errdefer alloc.free(id);
+        speakers[i] = .{ .id = id, .label = try alloc.dupe(u8, label) };
+        filled += 1;
+    }
+    return speakers;
 }
 
 const OpenAiTranscriberState = struct {
@@ -713,8 +732,9 @@ const OpenAiTranscriberState = struct {
     }
 };
 
-/// OpenAI's `verbose_json` transcription: seconds become milliseconds and
-/// each segment keeps its text and span.
+/// An OpenAI transcription response. `verbose_json` carries language,
+/// duration and segments (seconds become milliseconds here); `json` carries
+/// only `text`, and every other field stays absent.
 fn parseOpenAiVerboseResponseAlloc(alloc: Allocator, payload: []const u8) !Response {
     const Body = struct {
         text: ?[]const u8 = null,
@@ -1141,6 +1161,18 @@ const MultipartBody = struct {
     body: []u8,
 };
 
+/// OpenAI's transcription models do not share one response format.
+/// `whisper-1` returns `verbose_json`, which carries the segment timing this
+/// library maps to `Response.segments`; the GPT-4o transcription models
+/// reject that format and accept `json`, which carries the transcript alone.
+/// Asking the wrong one of them fails the request outright, so the format
+/// follows the configured model and timing is best-effort.
+fn openAiResponseFormat(model: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, model, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "gpt-4o")) return "json";
+    return "verbose_json";
+}
+
 fn buildOpenAiMultipartAlloc(
     alloc: Allocator,
     model: []const u8,
@@ -1154,7 +1186,7 @@ fn buildOpenAiMultipartAlloc(
 
     try appendMultipartField(&buf, alloc, boundary, "model", model);
     if (language) |lang| try appendMultipartField(&buf, alloc, boundary, "language", lang);
-    try appendMultipartField(&buf, alloc, boundary, "response_format", "verbose_json");
+    try appendMultipartField(&buf, alloc, boundary, "response_format", openAiResponseFormat(model));
     try appendMultipartFile(&buf, alloc, boundary, "file", "audio", audio_content_type, audio_bytes);
     try buf.print(alloc, "--{s}--\r\n", .{boundary});
 
@@ -1622,6 +1654,116 @@ fn expectVertexBearer(req: httpx.testing_mod.RequestInfo) !void {
 fn expectAntflyTranscriberBearer(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqual(httpx.Method.POST, req.method);
     try std.testing.expectEqualStrings("Bearer antfly-secret", req.header("Authorization") orelse return error.MissingHeader);
+}
+
+test "registered provider config keeps every option, not only its strings" {
+    const alloc = std.testing.allocator;
+    var registry = Registry.init(alloc);
+    defer registry.deinit();
+
+    var model_buf = "openai/whisper-base".*;
+    try registry.registerConfig("speech", .{
+        .provider = .antfly,
+        .model = &model_buf,
+        .max_download_bytes = 4096,
+        .max_response_bytes = 8192,
+        .timestamps = false,
+        .diarization = true,
+    });
+
+    const stored = try registry.getConfig("speech");
+    try std.testing.expectEqual(@as(?usize, 4096), stored.max_download_bytes);
+    try std.testing.expectEqual(@as(?usize, 8192), stored.max_response_bytes);
+    try std.testing.expectEqual(@as(?bool, false), stored.timestamps);
+    try std.testing.expectEqual(@as(?bool, true), stored.diarization);
+    // Owned text is copied, so the caller's buffer can go away or change.
+    @memset(&model_buf, 'x');
+    try std.testing.expectEqualStrings("openai/whisper-base", stored.model.?);
+}
+
+test "openai response format follows the model's capability" {
+    // whisper-1 is the only model that returns segment timing.
+    try std.testing.expectEqualStrings("verbose_json", openAiResponseFormat("whisper-1"));
+    try std.testing.expectEqualStrings("verbose_json", openAiResponseFormat("  whisper-1\n"));
+    // The GPT-4o transcription models reject verbose_json.
+    try std.testing.expectEqualStrings("json", openAiResponseFormat("gpt-4o-transcribe"));
+    try std.testing.expectEqualStrings("json", openAiResponseFormat("gpt-4o-mini-transcribe"));
+
+    const multipart = try buildOpenAiMultipartAlloc(std.testing.allocator, "gpt-4o-transcribe", null, "fake", "audio/wav");
+    defer std.testing.allocator.free(multipart.content_type);
+    defer std.testing.allocator.free(multipart.body);
+    try std.testing.expect(std.mem.indexOf(u8, multipart.body, "name=\"response_format\"\r\n\r\njson\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, multipart.body, "verbose_json") == null);
+}
+
+test "a json-only openai response still yields its transcript" {
+    const alloc = std.testing.allocator;
+    var response = try parseOpenAiVerboseResponseAlloc(alloc, "{\"text\":\"hello there\"}");
+    defer deinitResponse(alloc, &response);
+    try std.testing.expectEqualStrings("hello there", response.text.?);
+    try std.testing.expectEqual(@as(?[]const Segment, null), response.segments);
+    try std.testing.expectEqual(@as(?i64, null), response.duration_ms);
+}
+
+test "remote antfly transcription asks for diarization and keeps the labels" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = try httpx.TestServer.start(allocator, io, &.{.{
+        .method = .POST,
+        .path = "/transcribe",
+        .assert_request = expectAntflyTranscriberDiarization,
+        .respond = .{
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"hello there\",\"segments\":[{\"text\":\"hello\",\"start_ms\":0,\"end_ms\":500,\"words\":[],\"speaker\":\"SPEAKER_00\"},{\"text\":\"there\",\"start_ms\":500,\"end_ms\":900,\"words\":[],\"speaker\":\"SPEAKER_01\"}],\"speakers\":[\"SPEAKER_00\",\"SPEAKER_01\"]}],\"model\":\"whisper\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2,\"total_tokens\":2}}",
+        },
+    }});
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(allocator, "{s}", .{server.baseUrl()});
+    defer allocator.free(endpoint);
+    var client = httpx.Client.initWithConfig(allocator, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var response: ?Response = null;
+    defer if (response) |*value| deinitResponse(allocator, value);
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(a: Allocator, http: *httpx.Client, url: []const u8, out: *?Response, err_out: *?anyerror) std.Io.Cancelable!void {
+            out.* = transcribeWithConfig(a, http, .{
+                .provider = .antfly,
+                .model = "whisper",
+                .url = url,
+            }, .{ .url = "data:audio/wav;base64,ZmFrZQ==", .diarization = true }, .{}) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+    group.concurrent(io, Fiber.run, .{ allocator, &client, endpoint, &response, &run_err }) catch return;
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+
+    const value = response.?;
+    try std.testing.expectEqualStrings("hello there", value.text.?);
+    const speakers = value.speakers orelse return error.MissingSpeakers;
+    try std.testing.expectEqual(@as(usize, 2), speakers.len);
+    try std.testing.expectEqualStrings("SPEAKER_00", speakers[0].label.?);
+    try std.testing.expectEqualStrings("SPEAKER_01", speakers[1].id.?);
+    const segments = value.segments orelse return error.MissingSegments;
+    try std.testing.expectEqual(@as(usize, 2), segments.len);
+    try std.testing.expectEqualStrings("SPEAKER_00", segments[0].speaker.?);
+    try std.testing.expectEqualStrings("SPEAKER_01", segments[1].speaker.?);
+
+    // The same transcript, as text, keeps the turns.
+    const attributed = try speakerAttributedTextAlloc(allocator, &value);
+    defer allocator.free(attributed);
+    try std.testing.expectEqualStrings("SPEAKER_00: hello\nSPEAKER_01: there", attributed);
+}
+
+fn expectAntflyTranscriberDiarization(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqual(httpx.Method.POST, req.method);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"diarization\":true") != null);
 }
 
 fn expectAntflyTranscriberFramed(req: httpx.testing_mod.RequestInfo) !void {

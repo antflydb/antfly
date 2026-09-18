@@ -49,11 +49,17 @@ pub const DemuxedAudio = struct {
     seek_pre_roll_ns: u64,
     codec_private: []const u8,
     access_units: [][]const u8,
+    /// Presentation time of each access unit, in nanoseconds from the start
+    /// of the segment: the cluster's timestamp plus the block's relative
+    /// timecode, scaled by TimestampScale. Same length as `access_units`;
+    /// laced frames share their block's time.
+    access_unit_times_ns: []u64,
     discard_padding_ns: i64,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *const DemuxedAudio) void {
         self.allocator.free(self.access_units);
+        self.allocator.free(self.access_unit_times_ns);
     }
 };
 
@@ -84,6 +90,8 @@ const seek_pre_roll_id: u32 = 0x56BB;
 const audio_settings_id: u32 = 0xE1;
 const sampling_frequency_id: u32 = 0xB5;
 const channels_id: u32 = 0x9F;
+const info_id: u32 = 0x1549A966;
+const timestamp_scale_id: u32 = 0x2AD7B1;
 const cluster_id: u32 = 0x1F43B675;
 const timecode_id: u32 = 0xE7;
 const simple_block_id: u32 = 0xA3;
@@ -129,6 +137,7 @@ pub fn demux(allocator: std.mem.Allocator, audio_bytes: []const u8) !DemuxedAudi
 
     var state = DemuxState{};
     errdefer state.access_units.deinit(allocator);
+    errdefer state.access_unit_times_ns.deinit(allocator);
 
     try parseSegment(allocator, segment_payload, &state);
 
@@ -137,13 +146,18 @@ pub fn demux(allocator: std.mem.Allocator, audio_bytes: []const u8) !DemuxedAudi
     if (state.access_units.items.len == 0) return error.UnsupportedAudioFormat;
     if (track.codec_private.len == 0) return error.UnsupportedAudioFormat;
 
+    const access_units = try state.access_units.toOwnedSlice(allocator);
+    errdefer allocator.free(access_units);
+    const access_unit_times_ns = try state.access_unit_times_ns.toOwnedSlice(allocator);
+
     return .{
         .codec = codec,
         .channels = track.channels,
         .codec_delay_ns = track.codec_delay_ns,
         .seek_pre_roll_ns = track.seek_pre_roll_ns,
         .codec_private = track.codec_private,
-        .access_units = try state.access_units.toOwnedSlice(allocator),
+        .access_units = access_units,
+        .access_unit_times_ns = access_unit_times_ns,
         .discard_padding_ns = state.discard_padding_ns,
         .allocator = allocator,
     };
@@ -155,12 +169,23 @@ pub fn decodeInterleaved(allocator: std.mem.Allocator, audio_bytes: []const u8) 
     var demuxed = try demux(allocator, audio_bytes);
     defer demuxed.deinit();
 
-    var decoded = switch (demuxed.codec) {
+    const track = switch (demuxed.codec) {
         .opus => try decodeOpusTrack(allocator, demuxed),
         .vorbis => try decodeVorbisTrack(allocator, demuxed),
         .flac => try decodeFlacTrack(allocator, demuxed),
     };
+    defer if (track.access_unit_frames) |frames| allocator.free(frames);
+    var decoded = track.pcm;
     errdefer decoded.deinit();
+
+    decoded.samples = try placeOnTimelineAlloc(
+        allocator,
+        decoded.samples,
+        decoded.channels,
+        decoded.sample_rate,
+        demuxed.access_unit_times_ns,
+        track.access_unit_frames,
+    );
 
     if (demuxed.discard_padding_ns > 0 and decoded.sample_rate != 0) {
         const trim_frames = nsToFrames(@intCast(demuxed.discard_padding_ns), decoded.sample_rate);
@@ -170,7 +195,123 @@ pub fn decodeInterleaved(allocator: std.mem.Allocator, audio_bytes: []const u8) 
     return decoded;
 }
 
-fn decodeOpusTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !DecodedInterleaved {
+/// A decoded track plus, where the codec makes it exact, how many frames
+/// each access unit contributed. That mapping is what lets a gap in the
+/// container's timeline be reopened in the decoded audio.
+const DecodedTrack = struct {
+    pcm: DecodedInterleaved,
+    access_unit_frames: ?[]usize = null,
+};
+
+/// Silence a decoded track may gain to honour the container's timeline.
+/// Recordings paused for a few minutes are ordinary; a timestamp claiming
+/// hours is broken input, and materialising hours of silence would cost far
+/// more than any transcript of it is worth.
+const max_timeline_silence_seconds: u64 = 600;
+
+/// Puts decoded audio where the recording says it belongs.
+///
+/// Matroska gives every block a presentation time, and a recorder that was
+/// paused, or that starts its audio track after its video, leaves real gaps
+/// between them. Concatenating the packets would pull everything after a gap
+/// earlier, so a transcript offset would no longer point at the moment the
+/// words were said. Silence is inserted instead, bounded by
+/// `max_timeline_silence_seconds` in total.
+///
+/// `access_unit_frames` is how many frames each access unit contributed to
+/// `samples`. Without it only the track's start offset can be honoured,
+/// because there is no way to tell where one packet's audio ends and the
+/// next begins.
+fn placeOnTimelineAlloc(
+    allocator: std.mem.Allocator,
+    samples: []f32,
+    channels: u8,
+    sample_rate: u32,
+    times_ns: []const u64,
+    access_unit_frames: ?[]const usize,
+) ![]f32 {
+    if (channels == 0 or sample_rate == 0 or times_ns.len == 0) return samples;
+    const total_frames = samples.len / channels;
+    if (total_frames == 0) return samples;
+
+    // Rounding a block time to frames can land a frame either side of the
+    // truth; only a gap wider than a millisecond is a real one.
+    const tolerance_frames: usize = @max(1, sample_rate / 1000);
+    var budget_frames: usize = std.math.cast(usize, max_timeline_silence_seconds * sample_rate) orelse
+        std.math.maxInt(usize);
+
+    const frames = access_unit_frames orelse {
+        // Start offset only: everything decoded stays contiguous after it.
+        const offset = nsToFrames(times_ns[0], sample_rate);
+        if (offset <= tolerance_frames) return samples;
+        const lead = @min(offset, budget_frames);
+        const out = try allocator.alloc(f32, (total_frames + lead) * channels);
+        @memset(out[0 .. lead * channels], 0);
+        @memcpy(out[lead * channels ..], samples);
+        allocator.free(samples);
+        return out;
+    };
+    if (frames.len != times_ns.len) return samples;
+
+    // First pass: where each access unit starts in the source and on the
+    // timeline, and how much silence that needs in total.
+    var inserted_total: usize = 0;
+    var source_cursor: usize = 0;
+    var timeline_cursor: usize = 0;
+    for (frames, times_ns) |unit_frames, time_ns| {
+        const want = nsToFrames(time_ns, sample_rate);
+        if (want > timeline_cursor + tolerance_frames) {
+            const gap = @min(want - timeline_cursor, budget_frames);
+            budget_frames -= gap;
+            inserted_total += gap;
+            timeline_cursor += gap;
+        }
+        const available = total_frames -| source_cursor;
+        const copied = @min(unit_frames, available);
+        source_cursor += copied;
+        timeline_cursor += copied;
+    }
+    if (inserted_total == 0) return samples;
+
+    // Second pass: rebuild with the gaps opened up. Anything the access
+    // units did not account for (a decoder's trailing frames) is kept.
+    const out = try allocator.alloc(f32, (total_frames + inserted_total) * channels);
+    errdefer allocator.free(out);
+    @memset(out, 0);
+    budget_frames = std.math.cast(usize, max_timeline_silence_seconds * sample_rate) orelse
+        std.math.maxInt(usize);
+    source_cursor = 0;
+    timeline_cursor = 0;
+    for (frames, times_ns) |unit_frames, time_ns| {
+        const want = nsToFrames(time_ns, sample_rate);
+        if (want > timeline_cursor + tolerance_frames) {
+            const gap = @min(want - timeline_cursor, budget_frames);
+            budget_frames -= gap;
+            timeline_cursor += gap;
+        }
+        const available = total_frames -| source_cursor;
+        const copied = @min(unit_frames, available);
+        if (copied != 0) {
+            @memcpy(
+                out[timeline_cursor * channels ..][0 .. copied * channels],
+                samples[source_cursor * channels ..][0 .. copied * channels],
+            );
+        }
+        source_cursor += copied;
+        timeline_cursor += copied;
+    }
+    if (source_cursor < total_frames) {
+        const rest = total_frames - source_cursor;
+        @memcpy(
+            out[timeline_cursor * channels ..][0 .. rest * channels],
+            samples[source_cursor * channels ..][0 .. rest * channels],
+        );
+    }
+    allocator.free(samples);
+    return out;
+}
+
+fn decodeOpusTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !DecodedTrack {
     const head = try opus.parseHead(demuxed.codec_private);
 
     const packet_tocs = try allocator.alloc(opus.Toc, demuxed.access_units.len);
@@ -190,11 +331,36 @@ fn decodeOpusTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !Decoded
         pre_skip,
         null,
     );
+    errdefer allocator.free(decoded.samples);
+
+    // An Opus packet's duration is in its TOC, so each packet's contribution
+    // to the decoded PCM is exact. The pre-skip comes off the front.
+    const frames = try allocator.alloc(usize, demuxed.access_units.len);
+    errdefer allocator.free(frames);
+    var skip: usize = pre_skip;
+    for (demuxed.access_units, frames) |packet, *unit_frames| {
+        const samples = opus.packetSamples(packet, decoded.sample_rate) catch {
+            allocator.free(frames);
+            return .{ .pcm = .{
+                .samples = decoded.samples,
+                .sample_rate = decoded.sample_rate,
+                .channels = decoded.channels,
+                .allocator = allocator,
+            } };
+        };
+        const dropped = @min(skip, @as(usize, samples));
+        skip -= dropped;
+        unit_frames.* = @as(usize, samples) - dropped;
+    }
+
     return .{
-        .samples = decoded.samples,
-        .sample_rate = decoded.sample_rate,
-        .channels = decoded.channels,
-        .allocator = allocator,
+        .pcm = .{
+            .samples = decoded.samples,
+            .sample_rate = decoded.sample_rate,
+            .channels = decoded.channels,
+            .allocator = allocator,
+        },
+        .access_unit_frames = frames,
     };
 }
 
@@ -209,7 +375,7 @@ fn effectiveOpusPreSkip(head_pre_skip: u16, codec_delay_ns: u64) u16 {
     return std.math.cast(u16, samples) orelse std.math.maxInt(u16);
 }
 
-fn decodeVorbisTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !DecodedInterleaved {
+fn decodeVorbisTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !DecodedTrack {
     const headers = try splitXiphLacedTriple(demuxed.codec_private);
 
     const packets = try buildOggPackets(allocator, headers, demuxed.access_units);
@@ -222,11 +388,31 @@ fn decodeVorbisTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !Decod
     defer vorbis_demuxed.deinit();
 
     const decoded = try vorbis.decodeDemuxedInterleavedAlloc(allocator, vorbis_demuxed);
+    errdefer allocator.free(decoded.samples);
+
+    // The Vorbis demuxer already resolved how much audio each packet adds
+    // (half of the previous and current block sizes). The first packet only
+    // primes the overlap, so it contributes nothing. A packet the demuxer
+    // dropped as unparsable would desync the mapping, so it is only used
+    // when the counts still line up.
+    var frames: ?[]usize = null;
+    errdefer if (frames) |owned| allocator.free(owned);
+    if (vorbis_demuxed.audio_packets.len == demuxed.access_units.len) {
+        const owned = try allocator.alloc(usize, demuxed.access_units.len);
+        for (vorbis_demuxed.audio_packets, owned, 0..) |packet, *unit_frames, i| {
+            unit_frames.* = if (i == 0) 0 else packet.decoded_sample_count;
+        }
+        frames = owned;
+    }
+
     return .{
-        .samples = decoded.samples,
-        .sample_rate = decoded.sample_rate,
-        .channels = decoded.channels,
-        .allocator = allocator,
+        .pcm = .{
+            .samples = decoded.samples,
+            .sample_rate = decoded.sample_rate,
+            .channels = decoded.channels,
+            .allocator = allocator,
+        },
+        .access_unit_frames = frames,
     };
 }
 
@@ -303,7 +489,11 @@ fn buildOggPackets(allocator: std.mem.Allocator, headers: [3][]const u8, access_
 /// FLAC frames. Concatenating the two reconstructs a native FLAC stream the
 /// existing decoder can read as-is, mirroring how the Ogg-FLAC mapping is
 /// reconstructed in ogg.zig.
-fn decodeFlacTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !DecodedInterleaved {
+/// FLAC frame lengths live in each frame's own header, which this module
+/// does not parse, so a FLAC track can only be placed by its start offset:
+/// an internal gap in a WebM/FLAC recording still closes up. No recorder in
+/// the formats this decoder targets writes FLAC that way.
+fn decodeFlacTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !DecodedTrack {
     if (demuxed.codec_private.len < 4 or !std.mem.eql(u8, demuxed.codec_private[0..4], "fLaC")) {
         return error.UnsupportedAudioFormat;
     }
@@ -321,12 +511,12 @@ fn decodeFlacTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !Decoded
     }
 
     const decoded = try flac.decodeInterleaved(allocator, native);
-    return .{
+    return .{ .pcm = .{
         .samples = decoded.samples,
         .sample_rate = decoded.sample_rate,
         .channels = decoded.channels,
         .allocator = allocator,
-    };
+    } };
 }
 
 fn nsToFrames(ns: u64, sample_rate: u32) usize {
@@ -465,9 +655,14 @@ const TrackInfo = struct {
     seek_pre_roll_ns: u64 = 0,
 };
 
+/// Matroska's default TimestampScale: block timecodes count milliseconds.
+const default_timestamp_scale_ns: u64 = 1_000_000;
+
 const DemuxState = struct {
     track: ?TrackInfo = null,
     access_units: std.ArrayList([]const u8) = .empty,
+    access_unit_times_ns: std.ArrayList(u64) = .empty,
+    timestamp_scale_ns: u64 = default_timestamp_scale_ns,
     discard_padding_ns: i64 = 0,
 };
 
@@ -476,6 +671,7 @@ fn parseSegment(allocator: std.mem.Allocator, payload: []const u8, state: *Demux
     while (cursor < payload.len) {
         const elem = try readElementHeader(payload, cursor);
         switch (elem.id) {
+            info_id => try parseInfo(try elementPayload(payload, elem), state),
             tracks_id => try parseTracks(try elementPayload(payload, elem), state),
             cluster_id => {
                 const track = state.track orelse return error.UnsupportedAudioFormat;
@@ -486,12 +682,28 @@ fn parseSegment(allocator: std.mem.Allocator, payload: []const u8, state: *Demux
                     track.number,
                     allocator,
                     &state.access_units,
+                    &state.access_unit_times_ns,
+                    state.timestamp_scale_ns,
                     &state.discard_padding_ns,
                 );
                 cursor = elem.data_start + consumed;
                 continue;
             },
             else => {},
+        }
+        cursor = elem.data_end orelse return error.UnsupportedAudioFormat;
+    }
+}
+
+/// Reads the segment's TimestampScale, which turns cluster and block
+/// timecodes into nanoseconds. Everything else in Info is ignored.
+fn parseInfo(payload: []const u8, state: *DemuxState) !void {
+    var cursor: usize = 0;
+    while (cursor < payload.len) {
+        const elem = try readElementHeader(payload, cursor);
+        if (elem.id == timestamp_scale_id) {
+            const scale = try readUint(try elementPayload(payload, elem));
+            if (scale != 0) state.timestamp_scale_ns = scale;
         }
         cursor = elem.data_end orelse return error.UnsupportedAudioFormat;
     }
@@ -596,6 +808,8 @@ fn parseCluster(
     target_track: u64,
     allocator: std.mem.Allocator,
     access_units: *std.ArrayList([]const u8),
+    access_unit_times_ns: *std.ArrayList(u64),
+    timestamp_scale_ns: u64,
     discard_padding_ns: *i64,
 ) !usize {
     const limit: usize = if (known_size) |sz| blk: {
@@ -605,6 +819,8 @@ fn parseCluster(
     } else remaining.len;
 
     var cursor: usize = 0;
+    // Matroska requires a cluster's Timestamp to precede its blocks.
+    var cluster_ticks: u64 = 0;
     while (cursor < limit) {
         if (known_size == null) {
             const peek = readElementHeader(remaining, cursor) catch break;
@@ -612,17 +828,24 @@ fn parseCluster(
         }
         const elem = try readElementHeader(remaining, cursor);
         switch (elem.id) {
+            timecode_id => cluster_ticks = try readUint(try elementPayload(remaining, elem)),
             simple_block_id => try parseBlockIntoAccessUnits(
                 try elementPayload(remaining, elem),
                 target_track,
                 allocator,
                 access_units,
+                access_unit_times_ns,
+                cluster_ticks,
+                timestamp_scale_ns,
             ),
             block_group_id => try parseBlockGroup(
                 try elementPayload(remaining, elem),
                 target_track,
                 allocator,
                 access_units,
+                access_unit_times_ns,
+                cluster_ticks,
+                timestamp_scale_ns,
                 discard_padding_ns,
             ),
             else => {},
@@ -641,6 +864,9 @@ fn parseBlockGroup(
     target_track: u64,
     allocator: std.mem.Allocator,
     access_units: *std.ArrayList([]const u8),
+    access_unit_times_ns: *std.ArrayList(u64),
+    cluster_ticks: u64,
+    timestamp_scale_ns: u64,
     discard_padding_ns: *i64,
 ) !void {
     var cursor: usize = 0;
@@ -652,7 +878,15 @@ fn parseBlockGroup(
         switch (elem.id) {
             block_id => {
                 const before = access_units.items.len;
-                try parseBlockIntoAccessUnits(try elementPayload(payload, elem), target_track, allocator, access_units);
+                try parseBlockIntoAccessUnits(
+                    try elementPayload(payload, elem),
+                    target_track,
+                    allocator,
+                    access_units,
+                    access_unit_times_ns,
+                    cluster_ticks,
+                    timestamp_scale_ns,
+                );
                 matched = access_units.items.len > before;
             },
             discard_padding_id => pending_discard = try elementPayload(payload, elem),
@@ -666,30 +900,46 @@ fn parseBlockGroup(
     }
 }
 
-/// Parses a Block/SimpleBlock body: a vint track number, a 2-byte relative
-/// timecode (unused when decoding a whole file from the start), a flags
-/// byte, and then zero or more laced frames. Frames belonging to a track
-/// other than `target_track` are ignored entirely.
+/// Parses a Block/SimpleBlock body: a vint track number, a 2-byte signed
+/// relative timecode, a flags byte, and then zero or more laced frames.
+/// Frames belonging to a track other than `target_track` are ignored
+/// entirely. Every frame kept records the block's presentation time, which
+/// is what puts the decoded audio back on the recording's timeline; laced
+/// frames share that time, so they read as one contiguous run.
 fn parseBlockIntoAccessUnits(
     block_bytes: []const u8,
     target_track: u64,
     allocator: std.mem.Allocator,
     access_units: *std.ArrayList([]const u8),
+    access_unit_times_ns: *std.ArrayList(u64),
+    cluster_ticks: u64,
+    timestamp_scale_ns: u64,
 ) !void {
     var cursor: usize = 0;
     const track_vint = try readVint(block_bytes, 0);
     cursor += track_vint.len;
     if (cursor + 3 > block_bytes.len) return error.UnsupportedAudioFormat;
 
+    const relative_ticks = @as(i16, @bitCast(std.mem.readInt(u16, block_bytes[cursor..][0..2], .big)));
     const flags = block_bytes[cursor + 2];
     cursor += 3;
     if (track_vint.value != target_track) return;
+
+    // A block before its cluster's timestamp is clamped to the start; the
+    // alternative is a negative position on the timeline.
+    const absolute_ticks: u64 = if (relative_ticks < 0)
+        cluster_ticks -| @as(u64, @intCast(-@as(i32, relative_ticks)))
+    else
+        cluster_ticks + @as(u64, @intCast(relative_ticks));
+    const time_ns = std.math.mul(u64, absolute_ticks, timestamp_scale_ns) catch
+        return error.UnsupportedAudioFormat;
 
     const lacing: u2 = @intCast((flags & 0x06) >> 1);
     if (lacing == 0) {
         const frame = block_bytes[cursor..];
         if (frame.len == 0) return error.UnsupportedAudioFormat;
         try access_units.append(allocator, frame);
+        try access_unit_times_ns.append(allocator, time_ns);
         return;
     }
 
@@ -757,6 +1007,7 @@ fn parseBlockIntoAccessUnits(
     for (sizes) |size| {
         if (size > block_bytes.len - cursor) return error.UnsupportedAudioFormat;
         try access_units.append(allocator, block_bytes[cursor .. cursor + size]);
+        try access_unit_times_ns.append(allocator, time_ns);
         cursor += size;
     }
 }
@@ -1220,6 +1471,83 @@ test "webm demux decodes real opus packets laced with Xiph and EBML lacing" {
 
         try expectPcmClose(reference.samples, decoded.samples);
     }
+}
+
+test "webm decoding keeps a paused recording's gap on the timeline" {
+    const allocator = std.testing.allocator;
+
+    var ogg_packets = try ogg.parsePacketsAlloc(allocator, tone_opus_bytes);
+    defer ogg_packets.deinit();
+    const opus_head = ogg_packets.packets[0].bytes;
+    const audio_packets = ogg_packets.packets[2..];
+    try std.testing.expect(audio_packets.len >= 4);
+
+    const entry = try buildAudioTrackEntry(allocator, 1, "A_OPUS", opus_head, 2, null);
+    defer allocator.free(entry);
+    const tracks = try buildTracks(allocator, &.{entry});
+    defer allocator.free(tracks);
+
+    // Two clusters of two 20 ms packets each. The recording was paused
+    // between them: the second cluster's timestamp is 200 ms, not the 40 ms
+    // that uninterrupted audio would carry.
+    var blocks: [4][]u8 = undefined;
+    var built: usize = 0;
+    defer for (blocks[0..built]) |block| allocator.free(block);
+    for (audio_packets[0..4]) |packet| {
+        blocks[built] = try buildSimpleBlockNoLacing(allocator, 1, packet.bytes);
+        built += 1;
+    }
+
+    const contiguous = try decodeTwoClusterWebm(allocator, tracks, blocks[0..2], blocks[2..4], 40);
+    defer allocator.free(contiguous.samples);
+    const paused = try decodeTwoClusterWebm(allocator, tracks, blocks[0..2], blocks[2..4], 200);
+    defer allocator.free(paused.samples);
+
+    try std.testing.expectEqual(contiguous.sample_rate, paused.sample_rate);
+    const rate = contiguous.sample_rate;
+    const channels = contiguous.channels;
+    const contiguous_frames = contiguous.samples.len / channels;
+    const paused_frames = paused.samples.len / channels;
+
+    // The 160 ms the recorder spent paused become silence, so every later
+    // word keeps the offset a player would seek to.
+    const expected_gap_frames = 160 * rate / 1000;
+    try std.testing.expectEqual(contiguous_frames + expected_gap_frames, paused_frames);
+
+    // The audio either side of the gap is unchanged.
+    const first_cluster_frames = contiguous_frames / 2;
+    try std.testing.expectEqualSlices(
+        f32,
+        contiguous.samples[0 .. first_cluster_frames * channels],
+        paused.samples[0 .. first_cluster_frames * channels],
+    );
+    const gap_start = first_cluster_frames * channels;
+    for (paused.samples[gap_start .. gap_start + expected_gap_frames * channels]) |sample| {
+        try std.testing.expectEqual(@as(f32, 0), sample);
+    }
+    try std.testing.expectEqualSlices(
+        f32,
+        contiguous.samples[first_cluster_frames * channels ..],
+        paused.samples[(first_cluster_frames + expected_gap_frames) * channels ..],
+    );
+}
+
+/// Decodes a two-cluster WebM/Opus file whose second cluster carries
+/// `second_cluster_timecode` milliseconds. Caller frees `samples`.
+fn decodeTwoClusterWebm(
+    allocator: std.mem.Allocator,
+    tracks: []const u8,
+    first_blocks: []const []u8,
+    second_blocks: []const []u8,
+    second_cluster_timecode: u8,
+) !DecodedInterleaved {
+    const first = try buildCluster(allocator, 0, @ptrCast(first_blocks));
+    defer allocator.free(first);
+    const second = try buildCluster(allocator, second_cluster_timecode, @ptrCast(second_blocks));
+    defer allocator.free(second);
+    const file = try buildWebmFile(allocator, tracks, &.{ first, second });
+    defer allocator.free(file);
+    return decodeInterleaved(allocator, file);
 }
 
 test "webm demux reconstructs frames for all three lacing modes" {
