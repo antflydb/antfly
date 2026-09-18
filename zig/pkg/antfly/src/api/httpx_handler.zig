@@ -5005,7 +5005,6 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const alloc = ctx.allocator;
         const source = self.api_server.table_reads orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -5017,6 +5016,7 @@ pub const AntflyApiHandler = struct {
         var admission_lease: ?RequestAdmission.Lease = null;
         if (try self.acquirePublicOperation(ctx, "retrievalAgent", &admission_lease)) |response| return response;
         defer self.releasePublicOperation("retrievalAgent", &admission_lease);
+        const alloc = ctx.response.bodyAllocator();
 
         const RetrievalQueryRunner = struct {
             server: *ApiHttpServer,
@@ -5084,8 +5084,8 @@ pub const AntflyApiHandler = struct {
             ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
                 try runner.request_context.check();
-                var catalog_identity = try http_server_mod.cloneCatalogIdentity(runner.server.alloc, runner.authenticated_identity);
-                defer if (catalog_identity) |*owned| owned.deinit(runner.server.alloc);
+                var catalog_identity = try http_server_mod.cloneCatalogIdentity(a, runner.authenticated_identity);
+                defer if (catalog_identity) |*owned| owned.deinit(a);
                 const table_name = try runner.server.resolveCatalogNameAlloc(a, .{
                     .deadline_ns = runner.request_context.deadline_ns,
                     .cancellation = runner.request_context.cancellation orelse .none,
@@ -5116,8 +5116,8 @@ pub const AntflyApiHandler = struct {
             ) ![]bool {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
                 try runner.request_context.check();
-                var catalog_identity = try http_server_mod.cloneCatalogIdentity(runner.server.alloc, runner.authenticated_identity);
-                defer if (catalog_identity) |*owned| owned.deinit(runner.server.alloc);
+                var catalog_identity = try http_server_mod.cloneCatalogIdentity(a, runner.authenticated_identity);
+                defer if (catalog_identity) |*owned| owned.deinit(a);
                 const table_name = try runner.server.resolveCatalogNameAlloc(a, .{
                     .deadline_ns = runner.request_context.deadline_ns,
                     .cancellation = runner.request_context.cancellation orelse .none,
@@ -5191,6 +5191,7 @@ pub const AntflyApiHandler = struct {
                 try sink.close();
                 return ctx.response.build();
             }
+            if (try queryMemoryFailureResponse(ctx, err, "execution", true)) |response| return response;
             return switch (err) {
                 error.TreeRootSetTooLarge => {
                     _ = ctx.status(422);
@@ -5202,7 +5203,7 @@ pub const AntflyApiHandler = struct {
                         try public_table_http.rerankerCandidateLimitExceededBody(alloc),
                         false,
                     );
-                    return try respondOwnedApiResponse(ctx, &response);
+                    return try respondOwnedApiResponseWithAllocator(ctx, &response, alloc);
                 },
                 error.InvalidRetrievalAgentRequest, error.UnsupportedRetrievalAgentRequest => {
                     _ = ctx.status(400);
@@ -5216,7 +5217,7 @@ pub const AntflyApiHandler = struct {
                         "embedding index not found",
                         false,
                     );
-                    return try respondOwnedApiResponse(ctx, &response);
+                    return try respondOwnedApiResponseWithAllocator(ctx, &response, alloc);
                 },
                 error.MissingGenerationConfig => {
                     _ = ctx.status(422);
@@ -10344,6 +10345,54 @@ test "workload admission document lookups preserve lifetime and retained output 
     defer rejected.deinit();
     try std.testing.expectEqual(@as(u16, 429), rejected.status.code);
     try std.testing.expectEqual(@as(usize, 9), reads.calls);
+}
+
+test "workload admission retrieval parsing uses retained owner before streaming starts" {
+    const alloc = std.testing.allocator;
+    const Reads = struct {
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnexpectedTestCall;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnexpectedTestCall;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedTestCall;
+        }
+    };
+    var marker: u8 = 0;
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .query_max_concurrent_requests = 1,
+        .query_admission_waiting = .{ .max_retained_bytes = 64 * 1024 },
+    }, source.iface(), .{ .ptr = &marker, .vtable = &.{ .lookup = Reads.lookup, .scan = Reads.scan, .query = Reads.query } }, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const text = try alloc.alloc(u8, 40 * 1024);
+    defer alloc.free(text);
+    @memset(text, 'x');
+    const body = try std.fmt.allocPrint(alloc,
+        \\{{"query":"{s}","stream":true,"queries":[{{"table":"docs","full_text_search":{{"match_all":{{}}}}}}]}}
+    , .{text});
+    defer alloc.free(body);
+    var request = try httpx.Request.init(alloc, .POST, "/db/v1/agents/retrieval");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    var ctx_live = true;
+    defer if (ctx_live) ctx.deinit();
+    var response = try handler.retrievalAgent(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 429), response.status.code);
+    var diagnostic = try std.json.parseFromSlice(std.json.Value, alloc, response.body.?, .{});
+    defer diagnostic.deinit();
+    try std.testing.expectEqualStrings("QueryMemoryExhausted", diagnostic.value.object.get("error").?.string);
+    try std.testing.expectEqualStrings("resource_exhausted", diagnostic.value.object.get("reason").?.string);
+    try std.testing.expect(!ctx.h1_stream_sent and !ctx.h2_stream_sent);
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+    ctx.deinit();
+    ctx_live = false;
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().retained_bytes);
 }
 
 test "httpx query admission releases a cancelled query slot" {

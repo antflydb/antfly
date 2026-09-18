@@ -671,13 +671,15 @@ fn executeInternal(
 ) !EncodedResponse {
     if (body.len == 0) return error.InvalidRetrievalAgentRequest;
 
-    var parsed = std.json.parseFromSlice(RetrievalAgentRequest, alloc, body, .{}) catch {
+    var parsed = std.json.parseFromSlice(RetrievalAgentRequest, alloc, body, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return error.InvalidRetrievalAgentRequest;
     };
     defer parsed.deinit();
     const request = parsed.value;
 
-    var parsed_raw = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch {
+    var parsed_raw = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return error.InvalidRetrievalAgentRequest;
     };
     defer parsed_raw.deinit();
