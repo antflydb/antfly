@@ -255,14 +255,21 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
 //    the corpus-wide range this file's long-document section documents
 //    (95th percentile and max section size across zig/*.md and
 //    work-log/**/*.md): zig/pkg/antfly/src/storage/lsm/LSM.md's "Read And
-//    Scan Work" (6.8KB, 1 window), zig/VOPR.md's "Completion-Claim Audit"
-//    (37KB, 2 windows), and zig/PDF.md's "Review findings and required
-//    fixes" (99KB, the corpus max, 4 windows) -- in
+//    Scan Work" (6.8KB), zig/VOPR.md's "Completion-Claim Audit" (37KB), and
+//    zig/PDF.md's "Review findings and required fixes" (99KB, the corpus
+//    max) -- each swept at window_words=1024 (the wire's default; see
+//    extraction_v2.zig's LongDocument doc comment and GLINER25.md's
+//    throughput section for why) AND window_words=4096 (the widest a
+//    request may still explicitly opt into), in
 //    ../../extractors/gliner_boundary_qualification.zig ("gliner boundary
 //    qualification measures pinned base checkpoint long-document production
-//    geometry"). The bounds below are the exact observed range.
+//    geometry"). The bounds below are the union of both sweeps' exact
+//    observed ranges (window_count differs sharply by window size -- up to
+//    17 windows at 1024 words each versus up to 4 at 4096 -- everything else
+//    the two sweeps measured overlaps).
 //  - Throughput: see GLINER25.md's long-document section for per-window and
-//    per-section batched throughput on Metal.
+//    per-section throughput on Metal, before and after switching the
+//    default window size and adding grouped-window batching.
 //
 // This is a SEPARATE row from fastino_gliner25_base_v1's single-window row
 // above, not a widening of it: the two rows require disjoint features
@@ -277,21 +284,19 @@ const fastino_gliner25_base_v1_long_document_features = Features.initMany(&.{
     .confidence,  .spans,
 });
 
-// Exact min/max observed across every case in the long-document geometry
-// test cited above: the two short single-window-shaped fixtures (still
-// requested with long_document.mode=window, since examples/dogfood now
-// requests it unconditionally -- see index_config.go's
-// knowledgeGraphIndexJSON) through the three real multi-window sections.
-// window_count > 1 only appears once a document's word count exceeds one
-// window's 4096-word body budget (config.max_len for the base backbone);
-// short documents still take exactly one window. A document needing more
-// than this measured range -- window_count > 4, or bytes/words/tokens above
-// the printed maxima -- has not been measured and correctly fails closed.
+// Union of the exact min/max observed at window_words=1024 and
+// window_words=4096 across every case in the long-document geometry test
+// cited above (the two short single-window-shaped fixtures, still requested
+// with long_document.mode=window since examples/dogfood requests it
+// unconditionally -- see index_config.go's knowledgeGraphIndexJSON -- plus
+// the three real multi-window sections). A document needing more than this
+// measured range -- window_count > 17, or bytes/words/tokens above the
+// printed maxima -- has not been measured and correctly fails closed.
 const fastino_gliner25_base_v1_long_document_lengths = LengthContract{
     .request_items = .{ .min = 1, .max = 1 },
     .document_bytes = .{ .min = 26, .max = 99008 },
     .document_words = .{ .min = 5, .max = 15894 },
-    .window_count = .{ .min = 1, .max = 4 },
+    .window_count = .{ .min = 1, .max = 17 },
     .window_words = .{ .min = 5, .max = 4096 },
     .padded_sequence_tokens = .{ .min = 106, .max = 5708 },
 };

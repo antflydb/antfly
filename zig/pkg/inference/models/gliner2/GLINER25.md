@@ -503,6 +503,161 @@ fix needed, in
 lives in `zig/pkg/antfly/**`/`go/pkg/antflylite`, outside this file's
 ownership).
 
+### 10. Follow-up: long-document throughput (window size, batching, precision)
+
+Section 9 qualified long-document windowing correctly, but at the original
+4096-word default window it measured ~2.28 s/window and ~0.25 sections/s on
+real 21-40 KB sections (Metal) -- versus GLiNER2 base's ~7.9 sections/s on
+the same corpus with its own windowing. This section makes it fast.
+
+**Method.** A live `antfly inference run` server (Metal, same generous
+budget flags as section 7) was fed ~40 real sections from `zig/*.md` and
+`work-log/**/*.md` (a mix of 1-8 KB and 20-40 KB, the corpus's typical and
+tail sizes), sequentially (one request in flight at a time -- the "direct"
+baseline), at `long_document.window_words` of 512, 1024, 2048, and 4096,
+each with proportional overlap (`window_words/32`, matching the original
+4096/128 ratio). A 16-section subset (8 small, 8 large, one per distinct
+file) was used for the full four-way sweep to keep total wall time
+reasonable; window_count and per-request latency were recorded for each.
+
+**Window size: the dominant lever.** Attention cost is quadratic in window
+length; the sweep confirmed it directly, on the SAME 16-section subset:
+
+| window_words | total wall time | total windows | sections/s | s/window |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 4.63 s | 20 (8 large sections rejected: window_count exceeded the then-4-window qualified bound) | 3.46 (inflated by fast rejects) | 0.23 |
+| 1024 | 7.42 s | 34 (2 large sections rejected, same reason) | 2.16 (inflated by fast rejects) | 0.22 |
+| 2048 | 14.54 s | 26 (all 16 succeeded) | 1.10 | 0.56 |
+| 4096 (prior default) | 26.68 s | 18 (all 16 succeeded) | 0.60 | 1.48 |
+
+512 and 1024's "sections/s" columns are inflated by near-instant HTTP 400s
+(admission correctly refusing a window count above the qualified bound at
+the time, in ~0.03 s, before any model work) -- not a real throughput win
+for those runs. 2048 and 4096 are the fair comparison (all 16 real): 2048
+was already ~2.4x faster overall. **1024 words was chosen as the new
+default** over 512: once section 9's window_count bound was widened (see
+below) and every section actually completed, 1024 gave the best full-corpus
+result of the sizes measured (see the "after" table below), while 512 would
+need roughly double the windows (and admission bound) for the same
+documents without a measured throughput benefit over 1024 to justify it.
+
+**Default changed, bound stays wide.** `extraction_v2.zig`'s
+`LongDocument.window_words`/`overlap_words` defaults changed from
+4096/128 to **1024/32**; the qualified `window_words` upper bound stays at
+4096 (a request may still explicitly opt into up to 4096, e.g. to trade
+throughput for fewer, larger windows), and `window_count`'s upper bound
+widened from 4 to **17** (the real observed maximum, at 1024 words/window,
+for `zig/PDF.md`'s 99,008-byte corpus-max section -- see the updated
+`fastino_gliner25_base_v1_long_document_lengths` row, which is now the
+union of the 1024-word and 4096-word sweeps' measured ranges). This
+request option was already public (`options.long_document.window_words`);
+only its default value and the qualified bound changed. No
+`examples/dogfood` change was needed for this part (it does not set
+`window_words`, so it picks up the new default automatically).
+
+**Batching windows into one forward pass.** GLiNER2.5's own encoder/head/
+scorer pipeline already accepts a multi-sample `PreparedBatch` in one call
+(`pipeline.runScoredWindows`, `request_device.runWindowsWithOutputAllocator`
+-- `max_admission_batch = 64`); the long executor simply never used more
+than one sample per call. `gliner_boundary_long_executor.zig`'s
+`executeChecked` now groups a document's windows into batches of up to
+`Limits.window_batch_size` (default **4**) and runs one forward pass per
+group instead of one per window, for schemas without classification or
+JointIE (whose per-sample scoring/candidate shapes have not been reviewed
+batched -- see the `batchable` check; they keep the original
+one-window-per-call path unchanged, byte-for-byte). This is bounded and
+independent of document length by construction: peak per-call device/host
+memory scales with the fixed group size, never with the document's total
+window count, preserving the "bounded independent of document length"
+memory story from section 9's design note. `Window.result` (owning one
+window's `WindowResult`) became optional; a batched group's one shared
+`WindowResult` is retained by `executeChecked`'s `batch_results` list
+until merge finishes instead, and `Window.relations` (a plain borrowed
+view, populated for both paths) replaced `mergeAll`'s direct
+`window.result.outputs.samples[0].relations` read, so ordinary relations
+never need `.result` at all; only JointIE's global candidate-graph solve
+still reads `window.result.?.joint_candidates[0]` (guaranteed non-null,
+since JointIE never batches).
+
+Every existing test still passes unchanged (`134` passed, `22` skipped,
+`0` failed after this change; see verification below), including the
+section 9 canonical-shape tests, which now exercise the batched path for
+real (VOPR.md's 37KB section needs 7 windows at the new 1024-word default,
+so `window_batch_size=4` produces two groups, not seven single-window
+calls) -- concrete evidence the batched merge path preserves the same
+canonical envelope shape.
+
+**Measured impact of batching.** On this hardware, with Metal weights
+resident, batching's measured effect was small: per-window latency for the
+16-section subset was ~0.26 s/window whether executed as 4-window groups
+or one-window-per-call (both at the 1024-word default), suggesting
+per-forward-call fixed overhead (Metal command buffer setup/dispatch) is
+already small relative to per-request fixed costs (HTTP handling,
+admission, tokenization, merge) at this window size on this machine --
+window size, not call count, was this workload's bottleneck. Batching is
+kept because it is correct, safe (bounded memory, all tests green), and
+free where it doesn't help; it may matter more on hardware or backends
+where per-call dispatch overhead is a larger fraction of total latency, or
+at larger window sizes where each call does more relative work.
+
+**Before/after, full comparison** (same 16-section subset, all sections
+succeeding both times): prior default (4096, unbatched) took 26.68 s;
+after (1024 default + batching) took **12.82 s** -- ~2.1x faster overall,
+consistent with 1024's fair 2.4x-per-window improvement over 4096 (some of
+that gain is absorbed by the large sections now needing more windows: 4-5
+each at 1024 words versus 1-2 at 4096). Estimated corpus-wide throughput,
+weighting this run's small- and large-section averages (~0.12 s/section
+small, ~1.13 s/section large) by the real corpus's size distribution (p50
+982 B, p90 4,378 B, p95 7,285 B, p99 23,428 B -- the vast majority of
+`examples/dogfood`'s 1,203 sections are small): **~4.5 sections/s**, versus
+~0.25 sections/s before this section's changes and GLiNER2 base's
+~7.9 sections/s reference point on the same corpus. This is a corpus-shape
+estimate from measured per-size-class averages, not a direct 1,203-section
+timed run (the embedded-worker `MemoryBudgetExceeded` gap recorded in
+section 9 still blocks a full in-process ingest timing on this machine;
+the estimate instead composes real `antfly inference run` HTTP timings by
+real corpus section-size frequency).
+
+**A request costs no more through `long_document.mode=window` than through
+the single-window path, for a short document.** A 610-byte document (the
+qualified single-window row's own upper bound) was POSTed against both
+paths, warmed up: 0.044-0.050 s either way -- the long executor's extra
+Plan/merge bookkeeping at `window_count=1` is not measurable overhead here.
+
+**Precision: fp16_encoder investigated, not yet formally qualified.**
+`artifact.Precision` already includes `fp16_encoder`, and
+`gliner25-convert` (`zig build inference-gliner25-convert-build`) converts
+a pulled fp32 bundle to it (774,366,564 bytes fp32 -> 407,861,568 bytes,
+weight-only: the tool reports `activation_precision`/
+`accumulation_precision`/`head_precision` all staying `f32`, only encoder
+weight storage narrows). Converting the qualified
+`fastino/gliner2.5-base-v1` artifact and running
+`gliner25-bundle-check` (`zig build inference-gliner25-bundle-check-build`)
+against all ten canonical fixtures on both native and Metal produced
+outputs matching the fp32 reference fixture to within ~1e-4 on every
+sampled confidence score (e.g. "mixed_tasks"'s `John` entity: fp16
+0.9969311 vs fp32 reference 0.9969325; the `works_for` relation: fp16
+0.8721223 (native) / 0.8422742 (Metal, JointIE case) vs fp32 reference
+0.8720568), with no crashes and structurally identical entities/relations/
+classifications/records across all ten cases on both backends. This is a
+real, positive signal that a lower-precision row is plausible, but it is
+**not** a qualification: this only ran the informal diagnostic comparator
+(`qualification:false` in its own output), not the full pinned Python-
+parity suite (which requires the converted bundle's exact digests recorded
+in a reviewed production row, matching section 3-6's rigor), and no
+Metal-vs-native throughput comparison was run for the converted weights.
+Recommendation: qualifying `fp16_encoder` for this checkpoint looks
+worthwhile (smaller weight footprint should help Metal memory-bandwidth-
+bound dispatch, compounding with the batching work above) and is a
+reasonable next follow-up, but adding a new production row for it needs
+the same reviewed rigor as sections 1-6, which this pass did not attempt.
+
+**Verification.** `zig build inference-test -Doptimize=ReleaseFast --
+--test-filter "gliner boundary"` (native + Metal; `156` selected, `134`
+passed, `22` skipped -- unrelated `small`-backbone tests gated on an unset
+env var --, `0` failed) after every change in this section, including the
+window-size default change and the batching refactor together.
+
 ## How to re-qualify a different or wider artifact
 
 1. Pull the artifact and verify its digests against

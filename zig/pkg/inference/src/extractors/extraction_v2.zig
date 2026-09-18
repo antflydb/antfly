@@ -29,8 +29,16 @@ pub const ParseOptions = struct {
 };
 pub const LongDocument = struct {
     mode: enum { reject, window } = .reject,
-    window_words: usize = 4096,
-    overlap_words: usize = 128,
+    // 1024, not the encoder's declared 4096-word single-window capacity
+    // (config.max_len): attention cost is quadratic in window length, and a
+    // live Metal throughput sweep across real repository sections showed
+    // 1024-word windows completing several times faster overall than
+    // 4096-word windows, even accounting for the extra windows a long
+    // document then needs (see GLINER25.md's long-document throughput
+    // section). The qualified LengthContract's window_words bound stays wide
+    // (a client may still opt into up to 4096); only this default changed.
+    window_words: usize = 1024,
+    overlap_words: usize = 32,
     max_windows: usize = 128,
     record_identity: @import("../pipelines/gliner_boundary_long_document.zig").RecordIdentity = .occurrence,
 };
@@ -260,8 +268,8 @@ pub fn parseOptions(value: Value) !Options {
         const config = try asObject(raw);
         try keys(config, &.{ "mode", "window_words", "overlap_words", "max_windows", "record_identity" });
         options.long_document.mode = try enumeration(@FieldType(LongDocument, "mode"), config, "mode", .reject);
-        options.long_document.window_words = try unsigned(config, "window_words", 4096, 1, 4096);
-        options.long_document.overlap_words = try unsigned(config, "overlap_words", 128, 0, 4095);
+        options.long_document.window_words = try unsigned(config, "window_words", 1024, 1, 4096);
+        options.long_document.overlap_words = try unsigned(config, "overlap_words", 32, 0, 4095);
         options.long_document.max_windows = try unsigned(config, "max_windows", 128, 1, 128);
         options.long_document.record_identity = try enumeration(@FieldType(LongDocument, "record_identity"), config, "record_identity", .occurrence);
         if (options.long_document.mode == .reject and config.count() > @intFromBool(config.contains("mode"))) return error.ConflictingExtractionOptions;

@@ -30,6 +30,18 @@ pub const Limits = struct {
     max_total_attention_work: u64 = 8 * 1024 * 1024 * 1024,
     max_retained_evidence_bytes: usize = 128 * 1024 * 1024,
     max_request_windows: usize = 256,
+    /// A document's windows are executed in groups of up to this many per
+    /// forward pass (the encoder/head/scorer APIs already accept a
+    /// multi-sample PreparedBatch; see request_device.zig's
+    /// runWindowsWithOutputAllocator and pipeline.zig's runScoredWindows),
+    /// instead of one window per call. Bounded and independent of document
+    /// length by construction: peak per-call device/host memory scales with
+    /// this constant group size, never with the document's total window
+    /// count. 1 reproduces the original strictly-serial behavior. Only
+    /// windows for a schema with no classification, records, or JointIE task
+    /// are grouped (see the batchable check in executeChecked); those task
+    /// families keep the original one-window-per-call path unchanged.
+    window_batch_size: usize = 4,
 };
 pub const Options = struct {
     identity: artifact.Identity,
@@ -167,26 +179,40 @@ fn profile(a: Allocator, config: *const model.Config, item: *const wire.Item, op
 }
 
 const Window = struct {
-    result: pipeline.WindowResult,
+    /// Non-null only when this window ran its own single-sample forward pass
+    /// (the unbatched/JointIE path, where document_mod's global JointIE
+    /// solve still needs the raw retained candidate graph via
+    /// `result.joint_candidates[0]`). A batched window's shared
+    /// WindowResult -- one per executed group, covering several windows --
+    /// is owned separately by executeChecked's `batch_results` list, so
+    /// `relations` below (a plain borrowed view, valid for either path) is
+    /// how mergeAll reads ordinary relations without needing `.result`.
+    result: ?pipeline.WindowResult,
+    relations: []const pipeline.Relation,
     logits: []const []const f64,
     mentions: []const document_mod.MentionCandidate,
     mention_values: []const pipeline.Value,
     records: []const document_mod.RecordCandidate,
 };
 
-fn collectWindow(a: Allocator, result: pipeline.WindowResult, prepared: *const processor.PreparedBatch, item: *const wire.Item) !Window {
-    if (result.outputs.samples.len != 1 or result.joint_candidates.len != 1) return error.InvalidExtractionOutput;
-    const sample = result.outputs.samples[0];
+/// `result`/`prepared` may cover several windows at once (a batched group);
+/// `index` selects this window's entry within them. `owns_result` controls
+/// whether this Window becomes responsible for `result`'s lifetime (the
+/// unbatched path, one Window per WindowResult) or not (the batched path,
+/// where the caller retains one shared WindowResult per group instead).
+fn collectWindow(a: Allocator, result: pipeline.WindowResult, index: usize, prepared: *const processor.PreparedBatch, item: *const wire.Item, owns_result: bool) !Window {
+    if (index >= result.outputs.samples.len or index >= result.joint_candidates.len or index >= prepared.samples.len) return error.InvalidExtractionOutput;
+    const sample = result.outputs.samples[index];
     const classes = item.compiled.schema.classifications;
     const rows = try a.alloc([]const f64, classes.len);
     for (classes, rows, 0..) |classification, *row, task_index| {
         const values = try a.alloc(f64, classification.task.labels.len);
         @memset(values, std.math.nan(f64));
         const scores = result.classification_scores orelse return error.InvalidBoundaryScorerOutput;
-        for (prepared.samples[0].classification_labels, 0..) |label, index| {
+        for (prepared.samples[index].classification_labels, 0..) |label, li| {
             if (label.schema_index != task_index) continue;
-            if (label.label_index >= values.len or index >= scores.logits.len or !std.math.isNan(values[label.label_index])) return error.InvalidBoundaryPipelineRouting;
-            values[label.label_index] = scores.logits[index];
+            if (label.label_index >= values.len or li >= scores.logits.len or !std.math.isNan(values[label.label_index])) return error.InvalidBoundaryPipelineRouting;
+            values[label.label_index] = scores.logits[li];
         }
         for (values) |value| if (!std.math.isFinite(value)) return error.InvalidBoundaryPipelineRouting;
         row.* = values;
@@ -206,13 +232,13 @@ fn collectWindow(a: Allocator, result: pipeline.WindowResult, prepared: *const p
     var records = std.ArrayListUnmanaged(document_mod.RecordCandidate).empty;
     for (sample.structures) |group| {
         var structure_index: ?usize = null;
-        for (item.compiled.schema.structures, 0..) |spec, index| if (std.mem.eql(u8, spec.name, group.name)) {
+        for (item.compiled.schema.structures, 0..) |spec, index2| if (std.mem.eql(u8, spec.name, group.name)) {
             if (structure_index != null) return error.InvalidBoundaryPipelineRouting;
-            structure_index = index;
+            structure_index = index2;
         };
         for (group.instances, 0..) |record, record_index| try records.append(a, .{ .structure_index = structure_index orelse return error.InvalidBoundaryPipelineRouting, .record_index = record_index, .record = record });
     }
-    return .{ .result = result, .logits = rows, .mentions = try mentions.toOwnedSlice(a), .mention_values = try values.toOwnedSlice(a), .records = try records.toOwnedSlice(a) };
+    return .{ .result = if (owns_result) result else null, .relations = sample.relations, .logits = rows, .mentions = try mentions.toOwnedSlice(a), .mention_values = try values.toOwnedSlice(a), .records = try records.toOwnedSlice(a) };
 }
 
 const Copier = struct {
@@ -281,7 +307,11 @@ fn mergeAll(allocator: Allocator, result_allocator: Allocator, document: documen
     if (item.compiled.schema.joint_ie) |joint_schema| {
         const inputs = try a.alloc(document_mod.WindowJointCandidates, windows.len);
         for (windows, inputs, 0..) |window, *input, index| {
-            const candidates = window.result.joint_candidates[0] orelse return error.InvalidBoundaryPipelineRouting;
+            // JointIE never takes the batched path (see the batchable check
+            // in executeChecked), so every JointIE window still owns its own
+            // single-sample WindowResult here.
+            const owned = window.result orelse return error.InvalidBoundaryPipelineRouting;
+            const candidates = owned.joint_candidates[0] orelse return error.InvalidBoundaryPipelineRouting;
             input.* = .{ .identity = try document.identity(index), .nodes = candidates.nodes, .edges = candidates.edges };
         }
         var global = try document_mod.solveJoint(allocator, document, &item.compiled, inputs, .{ .merge = merge_options, .solver = options.pipeline.joint_solver, .best_effort = options.pipeline.best_effort });
@@ -321,7 +351,7 @@ fn mergeAll(allocator: Allocator, result_allocator: Allocator, document: documen
         const identity = try document.identity(index);
         mention_windows[index] = .{ .identity = identity, .pre_overlap_candidates = window.mentions };
         class_windows[index] = .{ .identity = identity, .logits = window.logits };
-        relation_windows[index] = .{ .identity = identity, .relations = window.result.outputs.samples[0].relations };
+        relation_windows[index] = .{ .identity = identity, .relations = window.relations };
         record_windows[index] = .{ .identity = identity, .records = window.records };
     }
     var mentions = try document_mod.mergeMentions(allocator, document, &item.compiled, mention_windows, options.pipeline.overlap, options.pipeline.offset_unit, merge_options);
@@ -566,19 +596,52 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
     defer metadata.deinit();
     const windows = metadata.allocator().alloc(Window, document.windows.len) catch |err| return evidenceAllocationError(terminal, err);
     var completed: usize = 0;
-    defer for (windows[0..completed]) |*window| window.result.deinit();
-    for (document.windows, windows) |window, *out| {
+    defer for (windows[0..completed]) |*window| if (window.result) |*r| r.deinit();
+    // Groups share one WindowResult (one forward pass) across up to
+    // window_batch_size windows; each group's shared result is retained here
+    // until merge finishes, independent of `windows[i].result` (see Window's
+    // doc comment). The unbatched path (below) still gives each window its
+    // own WindowResult directly, exactly as before.
+    var batch_results = std.ArrayListUnmanaged(pipeline.WindowResult).empty;
+    defer for (batch_results.items) |*br| br.deinit();
+
+    // Only ordinary entities/relations/legacy-structures windows are grouped
+    // into one forward pass (pipeline.runScoredWindows and
+    // request_device.runWindowsWithOutputAllocator already accept a
+    // multi-sample PreparedBatch): classification and JointIE keep the
+    // original one-window-per-call path, since their scoring/candidate
+    // shapes have not been measured or reviewed batched (see
+    // Limits.window_batch_size's doc comment and GLINER25.md's
+    // long-document throughput section).
+    const batchable = item.compiled.schema.classifications.len == 0 and item.compiled.schema.joint_ie == null;
+    const group_size = if (batchable) @max(1, @min(options.limits.window_batch_size, document.windows.len)) else 1;
+
+    var start: usize = 0;
+    while (start < document.windows.len) {
         try check(options);
+        const end = @min(document.windows.len, start + group_size);
+        const n = end - start;
         observation.emit(options.observer, .{ .phase = .tokenizing });
-        var prepared = try processor.prepare(allocator, tokenizer, &.{.{ .text = try document.windowText(window.index), .schema = &item.compiled }}, process_options);
+        const window_items = allocator.alloc(processor.Item, n) catch |err| return evidenceAllocationError(terminal, err);
+        defer allocator.free(window_items);
+        for (document.windows[start..end], window_items) |window, *wi| {
+            wi.* = .{ .text = try document.windowText(window.index), .schema = &item.compiled };
+        }
+        var prepared = try processor.prepare(allocator, tokenizer, window_items, process_options);
         defer prepared.deinit();
-        if (gate) |active| try active.observe(item.text.len, document.words.len, document.windows.len, &prepared);
+        // Every window's admission already ran through admitWindows above,
+        // one window at a time; grouping their execution here does not
+        // change what was already admitted, so no further gate check runs.
         var pipeline_options = options.pipeline;
         pipeline_options.control = options.control;
         // Retained candidates and final presented outputs have different
         // budgets: a scalar output may need many alternatives for merging.
         pipeline_options.max_output_values = options.limits.merge.max_input_candidates;
         observation.emit(options.observer, .{ .phase = .execution });
+        const SchemaPtr = @TypeOf(&item.compiled);
+        const schemas = allocator.alloc(SchemaPtr, n) catch |err| return evidenceAllocationError(terminal, err);
+        defer allocator.free(schemas);
+        for (schemas) |*s| s.* = &item.compiled;
         var result = switch (cb.kind()) {
             .native => native: {
                 var encoded = try engine.encodeNative(cb, allocator, config, &prepared, engine_options);
@@ -586,15 +649,28 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
                 var headed: ?head.Result = if (prepared.query_width > 0) try head.forwardNative(cb, allocator, config, encoded.asHeadInput(options.control), options.pipeline.head_limits) else null;
                 defer if (headed) |*value| value.deinit();
                 var scorer = pipeline.scoring.NativeContext{ .cb = cb, .config = config, .prepared = &prepared, .core = .{ .text_states = encoded.text_states, .query_states = encoded.query_states, .classification_states = encoded.classification_states, .text_lengths = encoded.text_lengths }, .scores = if (headed) |*value| value else null };
-                break :native pipeline.runScoredWindows(budget.allocator(), config, &prepared, &.{&item.compiled}, if (headed) |*value| pipeline.scoring.CandidateScoreView.fromNative(value) else null, scorer.scorer(), pipeline_options, &.{}) catch |err| return evidenceAllocationError(terminal, err);
+                break :native pipeline.runScoredWindows(budget.allocator(), config, &prepared, schemas, if (headed) |*value| pipeline.scoring.CandidateScoreView.fromNative(value) else null, scorer.scorer(), pipeline_options, &.{}) catch |err| return evidenceAllocationError(terminal, err);
             },
-            .metal => (device_request.runWindowsWithOutputAllocator(cb, allocator, budget.allocator(), config, &prepared, &.{&item.compiled}, device_options) catch |err| return evidenceAllocationError(terminal, err)).outputs,
+            .metal => (device_request.runWindowsWithOutputAllocator(cb, allocator, budget.allocator(), config, &prepared, schemas, device_options) catch |err| return evidenceAllocationError(terminal, err)).outputs,
             else => return error.UnsupportedGlinerBoundaryBackend,
         };
-        errdefer result.deinit();
-        out.* = collectWindow(metadata.allocator(), result, &prepared, item) catch |err| return evidenceAllocationError(terminal, err);
-        completed += 1;
-        observation.emit(options.observer, .window_completed);
+        if (batchable) {
+            batch_results.append(metadata.allocator(), result) catch |err| {
+                result.deinit();
+                return evidenceAllocationError(terminal, err);
+            };
+            for (0..n) |i| {
+                windows[start + i] = collectWindow(metadata.allocator(), result, i, &prepared, item, false) catch |err| return evidenceAllocationError(terminal, err);
+                completed += 1;
+                observation.emit(options.observer, .window_completed);
+            }
+        } else {
+            errdefer result.deinit();
+            windows[start] = collectWindow(metadata.allocator(), result, 0, &prepared, item, true) catch |err| return evidenceAllocationError(terminal, err);
+            completed += 1;
+            observation.emit(options.observer, .window_completed);
+        }
+        start = end;
     }
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -774,7 +850,7 @@ fn fakeWindow(a: Allocator, sample: pipeline.Sample, rows: []const []const f64, 
     samples[0] = sample;
     const joints = try a.alloc(?@import("../pipelines/gliner_boundary_joint.zig").Candidates, 1);
     joints[0] = null;
-    return .{ .result = .{ .allocator = a, .outputs = .{ .arena = arena, .samples = samples }, .classification_scores = null, .joint_candidates = joints }, .logits = rows, .mentions = mentions, .mention_values = values, .records = records };
+    return .{ .result = .{ .allocator = a, .outputs = .{ .arena = arena, .samples = samples }, .classification_scores = null, .joint_candidates = joints }, .relations = sample.relations, .logits = rows, .mentions = mentions, .mention_values = values, .records = records };
 }
 
 /// All packets below are synthetic post-score evidence. No tokenizer, encoder,
@@ -813,7 +889,7 @@ fn exerciseFakeMerge(a: Allocator, mode: FakeMergeMode) !void {
     };
     var windows: [2]Window = undefined;
     var completed: usize = 0;
-    defer for (windows[0..completed]) |*window| window.result.deinit();
+    defer for (windows[0..completed]) |*window| window.result.?.deinit();
     windows[0] = try fakeWindow(a, .{ .relations = &.{.{ .name = "connects", .schema_index = 0, .head = fakeSourceValue(left_text, 3, 4, 0.7), .tail = fakeSourceValue(left_text, 10, 11, 0.7), .confidence = 0.7 }} }, &.{&.{ -2, 2 }}, &.{.{ .entity_type = 0, .source = left_entity.source.?, .probability = left_entity.confidence }}, &.{left_entity}, &left_records);
     completed = 1;
     windows[1] = try fakeWindow(a, .{ .relations = &.{.{ .name = "connects", .schema_index = 0, .head = fakeSourceValue(right_text, 0, 1, 0.9), .tail = fakeSourceValue(right_text, 7, 8, 0.9), .confidence = 0.9 }} }, &.{&.{ 6, -6 }}, &.{.{ .entity_type = 0, .source = right_entity.source.?, .probability = right_entity.confidence }}, &.{right_entity}, &right_records);
@@ -856,7 +932,7 @@ fn exerciseFakeMerge(a: Allocator, mode: FakeMergeMode) !void {
     }
     const output = try mergeAll(a, output_arena.allocator(), document, &windows, item, &config, options);
     // Destroy every source owner before inspecting the assembled response.
-    for (&windows) |*window| window.result.deinit();
+    for (&windows) |*window| window.result.?.deinit();
     completed = 0;
     document.deinit();
     document_live = false;
