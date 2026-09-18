@@ -1554,12 +1554,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-index-status-test", "Run unified relational index readiness and owner coverage contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_index_status_tests).step);
-    const api_relational_topology_contract_tests = b.addTest(.{
+    const api_relational_topology_contract_tests = @import("linked_tests.zig").addPair(b, .{
+        .name = "api-relational-topology-tests",
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{ "internal batch topology control", "relational backup cohort" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
-    });
-    b.step("antfly-api-relational-topology-test", "Run private lifecycle control and backup cohort contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_topology_contract_tests).step);
+    }, write_implementation_tests);
+    b.step("antfly-api-relational-topology-test", "Run private lifecycle control and backup cohort contracts").dependOn(&api_relational_topology_contract_tests.run(b).step);
     const run_raft_transition_runtime_docid_tests = addFilteredTestRunArtifact(b, raft_transition_runtime_docid_tests);
     const api_table_writes_production_regression_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-table-write-lifecycle-tests",
@@ -2006,7 +2007,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_transactions_docid_tests = run_api_transactions_docid_tests,
         .run_api_table_writes_docid_tests = run_api_table_writes_docid_tests,
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

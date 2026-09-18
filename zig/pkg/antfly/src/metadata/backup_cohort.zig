@@ -392,187 +392,199 @@ pub fn step(state: *State, driver: anytype) !Result {
     };
 }
 
-fn testOwner(group: u64, start: []const u8, end: []const u8) Owner {
-    return .{
-        .table_name = "rows",
-        .range_start = start,
-        .range_end = end,
-        .fence = .{
-            .transition_id = 700,
-            .admission_epoch = 1,
-            .attempt = 1,
-            .owner_group_id = group,
-            .peer_group_id = group,
-            .role = .backup_snapshot,
-            .namespace = .{ .table_id = 9, .shard_id = group, .range_id = group },
-            .catalog_digest = @splat(19),
-        },
-        .artifact_id = if (group == 301) "cohort-owner-301" else "cohort-owner-302",
-    };
-}
-
-const TestDriver = struct {
-    fences: [2]?topology.Fence = .{ null, null },
-    drained: bool = false,
-    captures: usize = 0,
-    exports: usize = 0,
-    pins: [2]bool = .{ false, false },
-    published: bool = false,
-    checkpoints: usize = 0,
-    fail_checkpoint: bool = false,
-    lose_publication_reply: bool = false,
-    cancelled: bool = false,
-    cancellations: usize = 0,
-    pin_unavailable: bool = false,
-
-    fn checkpoint(self: *@This(), _: State, _: State) !void {
-        if (self.fail_checkpoint) return error.PersistenceUnavailable;
-        self.checkpoints += 1;
-    }
-    fn control(self: *@This(), owner: Owner, command: topology.Command) !void {
-        const index = owner.fence.owner_group_id - 301;
-        switch (command.action) {
-            .begin => self.fences[index] = command.fence,
-            .release => {
-                try std.testing.expect(self.pins[0] and self.pins[1]);
-                self.fences[index] = null;
-            },
-            .cancel => {
-                try std.testing.expect(self.cancelled and !self.published);
-                self.fences[index] = null;
-                self.cancellations += 1;
-            },
-            else => return error.TestUnexpectedResult,
+pub const consumer_tests = consumerTests();
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const test_owner_root = @import("antfly_source_root");
+    if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
+    const Suite = struct {
+        fn testOwner(group: u64, start: []const u8, end: []const u8) Owner {
+            return .{
+                .table_name = "rows",
+                .range_start = start,
+                .range_end = end,
+                .fence = .{
+                    .transition_id = 700,
+                    .admission_epoch = 1,
+                    .attempt = 1,
+                    .owner_group_id = group,
+                    .peer_group_id = group,
+                    .role = .backup_snapshot,
+                    .namespace = .{ .table_id = 9, .shard_id = group, .range_id = group },
+                    .catalog_digest = @splat(19),
+                },
+                .artifact_id = if (group == 301) "cohort-owner-301" else "cohort-owner-302",
+            };
         }
-    }
-    fn observe(self: *@This(), owner: Owner) !Observation {
-        return .{ .fence = self.fences[owner.fence.owner_group_id - 301], .drained = self.drained };
-    }
-    fn capture(self: *@This(), owner: Owner) !void {
-        try std.testing.expect(self.drained and self.fences[0] != null and self.fences[1] != null);
-        self.pins[owner.fence.owner_group_id - 301] = true;
-        self.captures += 1;
-    }
-    fn exportOwner(self: *@This(), owner: Owner) !void {
-        try std.testing.expect(self.fences[0] == null and self.fences[1] == null);
-        try std.testing.expect(self.pins[owner.fence.owner_group_id - 301]);
-        self.exports += 1;
-    }
-    fn releaseSeal(self: *@This(), owner: Owner) !void {
-        try std.testing.expect(self.published);
-        self.pins[owner.fence.owner_group_id - 301] = false;
-    }
-    fn cancelSeal(self: *@This(), owner: Owner) !void {
-        try std.testing.expect(self.cancelled and !self.published);
-        if (self.pin_unavailable) return error.BackupPinSourceUnavailable;
-        self.pins[owner.fence.owner_group_id - 301] = false;
-    }
-    fn publish(self: *@This(), _: State) !void {
-        if (self.cancelled) return error.BackupCohortCancelled;
-        try std.testing.expectEqual(@as(usize, 2), self.captures);
-        try std.testing.expectEqual(@as(usize, 2), self.exports);
-        try std.testing.expect(self.fences[0] == null and self.fences[1] == null);
-        self.published = true;
-        if (self.lose_publication_reply) return error.ConnectionLost;
-    }
-    fn decideCancellation(self: *@This(), _: State) !bool {
-        if (!self.published) self.cancelled = true;
-        return self.published;
-    }
-};
 
-test "relational backup cohort cancellation releases every write fence before unavailable pin cleanup" {
-    const owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "k", "") };
-    var state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
-    var driver: TestDriver = .{};
-    _ = try step(&state, &driver);
-    _ = try step(&state, &driver);
-    try cancel(&state, &driver);
-    driver.pin_unavailable = true;
-    _ = try step(&state, &driver);
-    _ = try step(&state, &driver);
-    try std.testing.expectEqual(Phase.cancel_reclaiming, state.phase);
-    try std.testing.expect(driver.fences[0] == null and driver.fences[1] == null);
-    try std.testing.expect(!locksTables(state.phase));
-    try std.testing.expectError(error.BackupPinSourceUnavailable, step(&state, &driver));
-    try std.testing.expectEqual(@as(usize, 0), state.cursor);
-    driver.pin_unavailable = false;
-    while (try step(&state, &driver) != .cancelled) {}
+        const TestDriver = struct {
+            fences: [2]?topology.Fence = .{ null, null },
+            drained: bool = false,
+            captures: usize = 0,
+            exports: usize = 0,
+            pins: [2]bool = .{ false, false },
+            published: bool = false,
+            checkpoints: usize = 0,
+            fail_checkpoint: bool = false,
+            lose_publication_reply: bool = false,
+            cancelled: bool = false,
+            cancellations: usize = 0,
+            pin_unavailable: bool = false,
+
+            fn checkpoint(self: *@This(), _: State, _: State) !void {
+                if (self.fail_checkpoint) return error.PersistenceUnavailable;
+                self.checkpoints += 1;
+            }
+            fn control(self: *@This(), owner: Owner, command: topology.Command) !void {
+                const index = owner.fence.owner_group_id - 301;
+                switch (command.action) {
+                    .begin => self.fences[index] = command.fence,
+                    .release => {
+                        try std.testing.expect(self.pins[0] and self.pins[1]);
+                        self.fences[index] = null;
+                    },
+                    .cancel => {
+                        try std.testing.expect(self.cancelled and !self.published);
+                        self.fences[index] = null;
+                        self.cancellations += 1;
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+            }
+            fn observe(self: *@This(), owner: Owner) !Observation {
+                return .{ .fence = self.fences[owner.fence.owner_group_id - 301], .drained = self.drained };
+            }
+            fn capture(self: *@This(), owner: Owner) !void {
+                try std.testing.expect(self.drained and self.fences[0] != null and self.fences[1] != null);
+                self.pins[owner.fence.owner_group_id - 301] = true;
+                self.captures += 1;
+            }
+            fn exportOwner(self: *@This(), owner: Owner) !void {
+                try std.testing.expect(self.fences[0] == null and self.fences[1] == null);
+                try std.testing.expect(self.pins[owner.fence.owner_group_id - 301]);
+                self.exports += 1;
+            }
+            fn releaseSeal(self: *@This(), owner: Owner) !void {
+                try std.testing.expect(self.published);
+                self.pins[owner.fence.owner_group_id - 301] = false;
+            }
+            fn cancelSeal(self: *@This(), owner: Owner) !void {
+                try std.testing.expect(self.cancelled and !self.published);
+                if (self.pin_unavailable) return error.BackupPinSourceUnavailable;
+                self.pins[owner.fence.owner_group_id - 301] = false;
+            }
+            fn publish(self: *@This(), _: State) !void {
+                if (self.cancelled) return error.BackupCohortCancelled;
+                try std.testing.expectEqual(@as(usize, 2), self.captures);
+                try std.testing.expectEqual(@as(usize, 2), self.exports);
+                try std.testing.expect(self.fences[0] == null and self.fences[1] == null);
+                self.published = true;
+                if (self.lose_publication_reply) return error.ConnectionLost;
+            }
+            fn decideCancellation(self: *@This(), _: State) !bool {
+                if (!self.published) self.cancelled = true;
+                return self.published;
+            }
+        };
+
+        test "relational backup cohort cancellation releases every write fence before unavailable pin cleanup" {
+            const owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "k", "") };
+            var state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
+            var driver: TestDriver = .{};
+            _ = try step(&state, &driver);
+            _ = try step(&state, &driver);
+            try cancel(&state, &driver);
+            driver.pin_unavailable = true;
+            _ = try step(&state, &driver);
+            _ = try step(&state, &driver);
+            try std.testing.expectEqual(Phase.cancel_reclaiming, state.phase);
+            try std.testing.expect(driver.fences[0] == null and driver.fences[1] == null);
+            try std.testing.expect(!locksTables(state.phase));
+            try std.testing.expectError(error.BackupPinSourceUnavailable, step(&state, &driver));
+            try std.testing.expectEqual(@as(usize, 0), state.cursor);
+            driver.pin_unavailable = false;
+            while (try step(&state, &driver) != .cancelled) {}
+        }
+
+        test "relational backup cohort freezes every owner and drains before capture" {
+            const owners = [_]Owner{ testOwner(301, "", "\x00"), testOwner(302, "\x00", "") };
+            var state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
+            var driver: TestDriver = .{};
+            try std.testing.expectEqual(.advanced, try step(&state, &driver));
+            try std.testing.expectEqual(.advanced, try step(&state, &driver));
+            try std.testing.expectEqual(.draining, state.phase);
+            try std.testing.expectEqual(.waiting, try step(&state, &driver));
+            try std.testing.expectEqual(@as(usize, 0), driver.captures);
+            driver.drained = true;
+            while (try step(&state, &driver) != .completed) {}
+            try std.testing.expect(driver.published);
+            try std.testing.expect(driver.fences[0] == null and driver.fences[1] == null);
+        }
+
+        test "relational backup cohort retains sealed handles after ambiguous publication" {
+            const owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "k", "") };
+            var state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
+            var driver: TestDriver = .{ .drained = true, .lose_publication_reply = true };
+            while (state.phase != .publishing) _ = try step(&state, &driver);
+            try std.testing.expectError(error.ConnectionLost, step(&state, &driver));
+            try std.testing.expectEqual(.publishing, state.phase);
+            try std.testing.expect(driver.pins[0] and driver.pins[1]);
+            try std.testing.expect(driver.fences[0] == null and driver.fences[1] == null);
+            driver.lose_publication_reply = false;
+            while (try step(&state, &driver) != .completed) {}
+        }
+
+        test "relational backup cohort checkpoint failure cannot skip owner freeze" {
+            const owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "k", "") };
+            var state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
+            var driver: TestDriver = .{ .fail_checkpoint = true };
+            try std.testing.expectError(error.PersistenceUnavailable, step(&state, &driver));
+            try std.testing.expectEqual(@as(usize, 0), state.cursor);
+            try std.testing.expect(driver.fences[0] != null);
+            driver.fail_checkpoint = false;
+            _ = try step(&state, &driver);
+            try std.testing.expectEqual(@as(usize, 1), state.cursor);
+        }
+
+        test "relational backup cohort refuses gaps overlaps and mismatched catalogs" {
+            var owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "l", "") };
+            const state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
+            try std.testing.expectError(error.IncompleteBackupCohort, state.validate());
+            owners[1].range_start = "j";
+            try std.testing.expectError(error.IncompleteBackupCohort, state.validate());
+            owners[1].range_start = "k";
+            owners[1].fence.catalog_digest[0] ^= 1;
+            try std.testing.expectError(error.IncompleteBackupCohort, state.validate());
+        }
+
+        test "relational backup cohort cancellation tombstones unacknowledged owners" {
+            const owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "k", "") };
+            var state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
+            var driver: TestDriver = .{ .fail_checkpoint = true };
+            try std.testing.expectError(error.PersistenceUnavailable, step(&state, &driver));
+            // Owner 301 applied begin, but its acknowledgement was not checkpointed.
+            // Owner 302 never observed begin; both must consume the planned epoch.
+            try cancel(&state, &driver);
+            driver.fail_checkpoint = false;
+            while (try step(&state, &driver) != .cancelled) {}
+            try std.testing.expectEqual(@as(usize, 2), driver.cancellations);
+            try std.testing.expect(driver.fences[0] == null and driver.fences[1] == null);
+        }
+
+        test "relational backup cohort cancellation adopts an ambiguous committed manifest" {
+            const owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "k", "") };
+            var state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
+            var driver: TestDriver = .{ .drained = true, .lose_publication_reply = true };
+            while (state.phase != .publishing) _ = try step(&state, &driver);
+            try std.testing.expectError(error.ConnectionLost, step(&state, &driver));
+            try cancel(&state, &driver);
+            try std.testing.expectEqual(.reclaiming, state.phase);
+            while (try step(&state, &driver) != .completed) {}
+            try std.testing.expectEqual(@as(usize, 0), driver.cancellations);
+        }
+    };
+    return Suite;
 }
-
-test "relational backup cohort freezes every owner and drains before capture" {
-    const owners = [_]Owner{ testOwner(301, "", "\x00"), testOwner(302, "\x00", "") };
-    var state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
-    var driver: TestDriver = .{};
-    try std.testing.expectEqual(.advanced, try step(&state, &driver));
-    try std.testing.expectEqual(.advanced, try step(&state, &driver));
-    try std.testing.expectEqual(.draining, state.phase);
-    try std.testing.expectEqual(.waiting, try step(&state, &driver));
-    try std.testing.expectEqual(@as(usize, 0), driver.captures);
-    driver.drained = true;
-    while (try step(&state, &driver) != .completed) {}
-    try std.testing.expect(driver.published);
-    try std.testing.expect(driver.fences[0] == null and driver.fences[1] == null);
-}
-
-test "relational backup cohort retains sealed handles after ambiguous publication" {
-    const owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "k", "") };
-    var state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
-    var driver: TestDriver = .{ .drained = true, .lose_publication_reply = true };
-    while (state.phase != .publishing) _ = try step(&state, &driver);
-    try std.testing.expectError(error.ConnectionLost, step(&state, &driver));
-    try std.testing.expectEqual(.publishing, state.phase);
-    try std.testing.expect(driver.pins[0] and driver.pins[1]);
-    try std.testing.expect(driver.fences[0] == null and driver.fences[1] == null);
-    driver.lose_publication_reply = false;
-    while (try step(&state, &driver) != .completed) {}
-}
-
-test "relational backup cohort checkpoint failure cannot skip owner freeze" {
-    const owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "k", "") };
-    var state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
-    var driver: TestDriver = .{ .fail_checkpoint = true };
-    try std.testing.expectError(error.PersistenceUnavailable, step(&state, &driver));
-    try std.testing.expectEqual(@as(usize, 0), state.cursor);
-    try std.testing.expect(driver.fences[0] != null);
-    driver.fail_checkpoint = false;
-    _ = try step(&state, &driver);
-    try std.testing.expectEqual(@as(usize, 1), state.cursor);
-}
-
-test "relational backup cohort refuses gaps overlaps and mismatched catalogs" {
-    var owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "l", "") };
-    const state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
-    try std.testing.expectError(error.IncompleteBackupCohort, state.validate());
-    owners[1].range_start = "j";
-    try std.testing.expectError(error.IncompleteBackupCohort, state.validate());
-    owners[1].range_start = "k";
-    owners[1].fence.catalog_digest[0] ^= 1;
-    try std.testing.expectError(error.IncompleteBackupCohort, state.validate());
-}
-
-test "relational backup cohort cancellation tombstones unacknowledged owners" {
-    const owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "k", "") };
-    var state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
-    var driver: TestDriver = .{ .fail_checkpoint = true };
-    try std.testing.expectError(error.PersistenceUnavailable, step(&state, &driver));
-    // Owner 301 applied begin, but its acknowledgement was not checkpointed.
-    // Owner 302 never observed begin; both must consume the planned epoch.
-    try cancel(&state, &driver);
-    driver.fail_checkpoint = false;
-    while (try step(&state, &driver) != .cancelled) {}
-    try std.testing.expectEqual(@as(usize, 2), driver.cancellations);
-    try std.testing.expect(driver.fences[0] == null and driver.fences[1] == null);
-}
-
-test "relational backup cohort cancellation adopts an ambiguous committed manifest" {
-    const owners = [_]Owner{ testOwner(301, "", "k"), testOwner(302, "k", "") };
-    var state: State = .{ .metadata_digest = @splat(3), .owners = &owners };
-    var driver: TestDriver = .{ .drained = true, .lose_publication_reply = true };
-    while (state.phase != .publishing) _ = try step(&state, &driver);
-    try std.testing.expectError(error.ConnectionLost, step(&state, &driver));
-    try cancel(&state, &driver);
-    try std.testing.expectEqual(.reclaiming, state.phase);
-    while (try step(&state, &driver) != .completed) {}
-    try std.testing.expectEqual(@as(usize, 0), driver.cancellations);
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
 }
