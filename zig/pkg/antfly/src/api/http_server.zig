@@ -1383,6 +1383,7 @@ pub const SemanticStatusResolver = struct {
             .query_embedding_deadline_ns = self.query_embedding_deadline_ns,
             .query_cancellation = self.query_cancellation,
         }, alloc, table_name, index_name, semantic_search, embedding_template, limit);
+        errdefer alloc.free(planned.vector);
         try ensureRequestActive(self.query_cancellation);
         return planned;
     }
@@ -11865,18 +11866,17 @@ pub const ApiHttpServer = struct {
             return .{ .json = json };
         }
 
-        const join_req = if (bound_join) |value| value.* else distributed_join.parseBoundJoinRequestWithSecrets(alloc, body, self.cfg.secret_store) catch |err| switch (err) {
+        var join_req = if (bound_join) |value| value.* else distributed_join.parseBoundJoinRequestWithSecrets(alloc, body, self.cfg.secret_store) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             else => {
                 std.log.err("public table join parse failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
             },
         };
+        defer if (bound_join == null) if (join_req) |*owned| owned.deinit(alloc);
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
-        if (join_req) |owned_join| {
-            var parsed_join = owned_join;
-            defer if (bound_join == null) parsed_join.deinit(alloc);
+        if (join_req) |*parsed_join| {
             if (bound_join == null) if (authenticated_identity) |identity| {
                 try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
             };
@@ -49781,6 +49781,140 @@ test "system catalog restore listing shares one projection and honors legacy ren
     defer denied_json.deinit();
     try std.testing.expectEqual(@as(usize, 0), denied_json.value.object.get("jobs").?.array.items.len);
     try std.testing.expectEqual(@as(usize, 2), fake.snapshots);
+}
+
+test "workload admission join planning cancellation retires parsed ownership" {
+    const base_alloc = std.testing.allocator;
+    const Fake = struct {
+        remaining_checks: usize,
+        fn cancelled(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.remaining_checks -|= 1;
+            return self.remaining_checks == 0;
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnexpectedExecution;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnexpectedExecution;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            return error.UnexpectedExecution;
+        }
+    };
+    const body =
+        \\{"full_text_search":{"match_all":{}},"join":{"right_table":"rhs","on":{"left_field":"customer","right_field":"_id"},"nested_join":{"right_table":"nested","on":{"left_field":"owner","right_field":"_id"}}}}
+    ;
+    // Sweep the dispatch checkpoints through the post-parse join boundary.
+    // No storage query may start, and each path must retire all parsed state.
+    for (1..7) |cancel_at| {
+        var fake = Fake{ .remaining_checks = cancel_at };
+        var gate = @import("../common/workload_admission.zig").Controller.initConfigured(1, .{ .max_retained_bytes = 1024 * 1024 });
+        defer gate.deinitMemory();
+        const owner = try @import("../common/workload_allocator.zig").Owner.create(base_alloc, &gate);
+        defer owner.release();
+        var server = ApiHttpServer.init(base_alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status } }, null, null);
+        defer server.deinit();
+        const reads: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
+        try std.testing.expectError(error.Cancelled, server.executePublicTableQueryDispatchWithIdentity(
+            owner.allocator(),
+            reads,
+            "docs",
+            body,
+            null,
+            null,
+            null,
+            .{ .ptr = &fake, .is_cancelled_fn = Fake.cancelled },
+            null,
+            null,
+            null,
+        ));
+        try std.testing.expectEqual(@as(usize, 0), fake.remaining_checks);
+        try std.testing.expectEqual(@as(usize, 0), owner.live.load(.acquire));
+    }
+}
+
+test "workload admission semantic result cancellation retires the produced vector" {
+    const base_alloc = std.testing.allocator;
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(1, .{ .max_retained_bytes = 1024 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(base_alloc, &gate);
+    defer owner.release();
+    const alloc = owner.allocator();
+    const FakeCatalog = struct {
+        cancelled: std.atomic.Value(bool) = .init(false),
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        const indexes_json =
+            \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test-embedder"}}}
+        ;
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 1, .name = "docs_a", .schema_json = "{}", .indexes_json = indexes_json, .placement_role = "data" },
+                    .{ .table_id = 2, .name = "docs_b", .schema_json = "{}", .indexes_json = indexes_json, .placement_role = "data" },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(ptr: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // planSemanticQuery has already produced its owned vector. Cancel
+            // at the return boundary before the resolver transfers ownership.
+            self.cancelled.store(true, .release);
+        }
+    };
+    const FakeProvider = struct {
+        calls: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+            };
+        }
+
+        fn embedDense(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const vectors = try inner_alloc.alloc([]f32, texts.len);
+            errdefer inner_alloc.free(vectors);
+            var initialized: usize = 0;
+            errdefer for (vectors[0..initialized]) |vector| inner_alloc.free(vector);
+            for (vectors) |*vector| {
+                vector.* = try inner_alloc.dupe(f32, &.{ 1, 2, 3 });
+                initialized += 1;
+            }
+            return vectors;
+        }
+
+        fn embedSparse(_: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return try inner_alloc.alloc(@import("../storage/db/enrichment/embedder.zig").SparseEmbedding, 0);
+        }
+    };
+
+    var catalog = FakeCatalog{};
+    var provider = FakeProvider{};
+    var resolver = SemanticStatusResolver{
+        .source = .{ .ptr = &catalog, .vtable = &.{ .status = FakeCatalog.status, .admin_snapshot = FakeCatalog.adminSnapshot, .free_admin_snapshot = FakeCatalog.freeAdminSnapshot } },
+        .antfly_provider = provider.provider(),
+        .query_cancellation = CancellationToken.fromAtomic(&catalog.cancelled),
+    };
+    try std.testing.expectError(error.Cancelled, SemanticStatusResolver.resolveDenseQuery(&resolver, alloc, "docs_a", "semantic_idx", "hello", null, 10));
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expectEqual(@as(usize, 0), owner.live.load(.acquire));
 }
 
 test "workload admission internal query routing preserves the planned request allocator" {
