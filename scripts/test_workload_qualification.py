@@ -119,6 +119,28 @@ class WorkloadQualificationTests(unittest.TestCase):
             ):
                 self.assertEqual(hashes[name], qualification.checksum(output / name))
 
+            # Missing telemetry fails evidence qualification without relabeling
+            # successful product requests as correctness failures.
+            with (
+                patch.object(qualification, "launch", launch),
+                patch.object(qualification, "seed"),
+                patch.object(qualification, "snapshot", return_value={}),
+                patch.object(
+                    qualification,
+                    "run_load",
+                    side_effect=lambda *_args, **_kwargs: {
+                        "counts": {"completed": 1},
+                        "completed_qps": 10,
+                    },
+                ),
+            ):
+                missing = qualification.run(plan, root / "missing-telemetry")
+            self.assertTrue(missing["correctness_passed"])
+            self.assertFalse(missing["telemetry_complete"])
+            self.assertEqual(missing["status"], "telemetry_unavailable")
+            self.assertEqual(missing["exit_code"], 3)
+            self.assertIn("Prometheus telemetry snapshots", missing["unmeasured_gates"])
+
             # Exceptions still finish the lifecycle and checksum final evidence.
             failed_output = root / "exception-receipts"
             with (
@@ -138,7 +160,7 @@ class WorkloadQualificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             plan = Path(temporary) / "plan.json"
             plan.write_text("{}")
-            for code in (0, 1, 2):
+            for code in (0, 1, 2, 3):
                 result = {
                     "status": "test",
                     "exit_code": code,
@@ -180,10 +202,19 @@ class WorkloadQualificationTests(unittest.TestCase):
     def test_cloud_limits_are_exact_and_swap_disabled(self):
         plan = qualification.template("docker")
         argv = qualification.docker_command(
-            plan, plan["arms"]["baseline"], Path("/tmp/fixture"), 1234, "owned-test"
+            plan,
+            plan["arms"]["baseline"],
+            Path("/tmp/fixture"),
+            1234,
+            "owned-test",
+            5678,
         )
         self.assertEqual(argv[argv.index("--cpus") + 1], "1")
         self.assertIn("--no-healthcheck", argv)
+        self.assertIn("127.0.0.1:1234:8080", argv)
+        self.assertIn("127.0.0.1:5678:4200", argv)
+        self.assertEqual(argv[argv.index("--health") + 1], "true")
+        self.assertEqual(argv[argv.index("--health-port") + 1], "4200")
         self.assertEqual(argv[argv.index("--memory") + 1], str(4 << 30))
         self.assertEqual(argv[argv.index("--memory-swap") + 1], str(4 << 30))
         values = {
@@ -196,6 +227,78 @@ class WorkloadQualificationTests(unittest.TestCase):
         self.assertFalse(
             qualification.verify_cgroup({**values, "memory.swap.max": "max"}, "starter")
         )
+
+    def test_process_command_enables_dedicated_metrics_listener(self):
+        argv = qualification.process_command(
+            Path("/tmp/antfly"), Path("/tmp/fixture"), 1234, 5678
+        )
+        self.assertEqual(argv[argv.index("--port") + 1], "1234")
+        self.assertEqual(argv[argv.index("--health") + 1], "true")
+        self.assertEqual(argv[argv.index("--health-port") + 1], "5678")
+
+    def test_snapshots_reject_dashboard_html_and_use_only_metrics_port(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for content_type in ("text/html", "text/plain; version=0.0.4"):
+                runtime = {"pid": 42, "port": 1234, "metrics_port": 5678}
+                with (
+                    patch.object(
+                        qualification,
+                        "command",
+                        return_value=SimpleNamespace(stdout="1024", returncode=0),
+                    ),
+                    patch.object(qualification, "HTTP") as http,
+                ):
+                    http.return_value.request.return_value = (
+                        200,
+                        b"<!doctype html><html>Dashboard</html>",
+                        {"Content-Type": content_type},
+                    )
+                    result = qualification.snapshot(runtime, 1234, directory, "invalid")
+                http.assert_called_once_with(5678, 3)
+                self.assertEqual(result["metrics_status"], 200)
+                self.assertFalse(result["metrics_valid"])
+                self.assertIn("metrics_error", result)
+                self.assertFalse((directory / "invalid.prom").exists())
+                self.assertTrue((directory / "invalid.metrics-invalid.body").exists())
+                self.assertFalse(
+                    qualification.telemetry_summary([runtime])["telemetry_complete"]
+                )
+            metrics = b'# HELP requests Total requests\n# TYPE requests counter\nrequests{route="/query",status="200"} 7\nlatency_sum 1.2e-3\n'
+            runtime = {"pid": 42, "metrics_port": 5678}
+            with (
+                patch.object(
+                    qualification,
+                    "command",
+                    return_value=SimpleNamespace(stdout="1024", returncode=0),
+                ),
+                patch.object(qualification, "HTTP") as http,
+            ):
+                http.return_value.request.return_value = (
+                    200,
+                    metrics,
+                    {"Content-Type": "text/plain; version=0.0.4"},
+                )
+                result = qualification.snapshot(runtime, 1234, directory, "valid")
+            self.assertTrue(result["metrics_valid"])
+            self.assertEqual((directory / "valid.prom").read_bytes(), metrics)
+            self.assertTrue(
+                qualification.telemetry_summary([runtime])["telemetry_complete"]
+            )
+            self.assertFalse(
+                qualification.telemetry_summary([{}])["telemetry_complete"]
+            )
+            self.assertFalse(qualification.telemetry_summary([])["telemetry_complete"])
+            self.assertIsNotNone(
+                qualification.prometheus_error(
+                    200, b"# comments only", {"content-type": "text/plain"}
+                )
+            )
+            self.assertIsNotNone(
+                qualification.prometheus_error(
+                    503, metrics, {"content-type": "text/plain"}
+                )
+            )
 
     def test_offered_operation_mix_is_independent_of_completion(self):
         workload = {"read_percent": 90, "query_percent_of_reads": 50}

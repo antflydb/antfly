@@ -724,7 +724,12 @@ def run_load(
 
 
 def docker_command(
-    plan: dict[str, Any], arm: dict[str, Any], directory: Path, port: int, name: str
+    plan: dict[str, Any],
+    arm: dict[str, Any],
+    directory: Path,
+    port: int,
+    name: str,
+    metrics_port: int,
 ) -> list[str]:
     cpus, memory, _ = TIERS[plan["tier"]]
     return [
@@ -744,6 +749,8 @@ def docker_command(
         "512",
         "--publish",
         f"127.0.0.1:{port}:8080",
+        "--publish",
+        f"127.0.0.1:{metrics_port}:4200",
         "--mount",
         f"type=bind,src={directory / 'config.json'},dst=/qualification/config.json,readonly",
         "--mount",
@@ -757,12 +764,82 @@ def docker_command(
         "--port",
         "8080",
         "--health",
-        "false",
+        "true",
+        "--health-port",
+        "4200",
         "--data-dir",
         "/qualification/data",
         "--config",
         "/qualification/config.json",
     ]
+
+
+def process_command(
+    binary: Path, directory: Path, port: int, metrics_port: int
+) -> list[str]:
+    return [
+        str(binary),
+        "standalone",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--health",
+        "true",
+        "--health-port",
+        str(metrics_port),
+        "--data-dir",
+        str(directory / "data"),
+        "--config",
+        str(directory / "config.json"),
+    ]
+
+
+def prometheus_error(status: int, body: bytes, headers: dict[str, str]) -> str | None:
+    if status != 200:
+        return f"metrics HTTP status {status}"
+    content_type = (
+        {key.lower(): value for key, value in headers.items()}.get("content-type", "")
+        .split(";", 1)[0]
+        .strip()
+        .lower()
+    )
+    if content_type not in {"text/plain", "application/openmetrics-text"}:
+        return f"unexpected metrics content type {content_type!r}"
+    try:
+        lines = body.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return "metrics response is not UTF-8"
+    # Validate actual samples, not just HTTP success or HELP/TYPE comments.
+    sample = re.compile(
+        r'[a-zA-Z_:][a-zA-Z0-9_:]*(?:\{(?:[^"\\}]|"(?:\\.|[^"\\])*")*\})?\s+(?:[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[+-]?Inf|NaN)(?:\s+[0-9]+)?'
+    )
+    samples = [
+        line.strip()
+        for line in lines
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not samples or not all(sample.fullmatch(line) for line in samples):
+        return "metrics response is not valid Prometheus sample text"
+    return None
+
+
+def telemetry_summary(lifecycles: list[dict[str, Any]]) -> dict[str, Any]:
+    missing = []
+    for index, lifecycle in enumerate(lifecycles):
+        snapshots = lifecycle.get("metrics_snapshots", [])
+        if not snapshots:
+            missing.append(
+                {"lifecycle": index, "error": "no metrics snapshots retained"}
+            )
+        for observation in snapshots:
+            if not observation.get("metrics_valid"):
+                missing.append({"lifecycle": index, **observation})
+    return {
+        "telemetry_complete": bool(lifecycles) and not missing,
+        "telemetry_failures": missing,
+        "telemetry_scope": "validated Prometheus snapshots; not a per-stage coverage or release-gate attestation",
+    }
 
 
 CGROUP_FILES = (
@@ -799,15 +876,44 @@ def snapshot(
         result["process_rss_kib"] = command(
             ["ps", "-o", "rss=", "-p", str(runtime["pid"])], check=False
         ).stdout.strip()
-    client = HTTP(port, 3)
+    # Public API /metrics may be a dashboard fallback with HTTP 200.
+    # Only the explicitly launched health listener is a metrics source.
+    del port
+    result.update(metrics_port=runtime.get("metrics_port"), metrics_valid=False)
+    client = None
     try:
-        status, body, _ = client.request("GET", "/metrics")
-        (directory / f"{label}.prom").write_bytes(body)
+        if result["metrics_port"] is None:
+            raise ValueError("dedicated metrics port was not recorded")
+        client = HTTP(result["metrics_port"], 3)
+        status, body, headers = client.request("GET", "/metrics")
         result["metrics_status"] = status
+        result["metrics_content_type"] = {
+            key.lower(): value for key, value in headers.items()
+        }.get("content-type")
+        failure = prometheus_error(status, body, headers)
+        result["metrics_valid"] = failure is None
+        filename = (
+            f"{label}.prom" if failure is None else f"{label}.metrics-invalid.body"
+        )
+        (directory / filename).write_bytes(body)
+        result["metrics_body_file"] = filename
+        if failure is not None:
+            result["metrics_error"] = failure
     except (OSError, ValueError, http.client.HTTPException) as error:
         result["metrics_error"] = str(error)
     finally:
-        client.close()
+        if client is not None:
+            client.close()
+    runtime.setdefault("metrics_snapshots", []).append(
+        {
+            "label": label,
+            **{
+                key: value
+                for key, value in result.items()
+                if key.startswith("metrics_")
+            },
+        }
+    )
     save(directory / f"{label}.resources.json", result)
     return result
 
@@ -834,8 +940,12 @@ def launch(plan: dict[str, Any], arm: dict[str, Any], directory: Path):
         (directory / "data").chmod(0o777)
     save(directory / "config.json", arm["config"])
     port = free_port()
+    metrics_port = free_port()
+    while metrics_port == port:
+        metrics_port = free_port()
     runtime: dict[str, Any] = {
         "port": port,
+        "metrics_port": metrics_port,
         "declared_revision": arm["revision"],
         "declared_optimization": arm["optimization"],
         "config_sha256": checksum(directory / "config.json"),
@@ -852,27 +962,14 @@ def launch(plan: dict[str, Any], arm: dict[str, Any], directory: Path):
             runtime["image_id"] = image["Id"]
             # Run the resolved ID so a mutable tag cannot change between inspection and dispatch.
             argv = docker_command(
-                plan, {**arm, "image": image["Id"]}, directory, port, name
+                plan, {**arm, "image": image["Id"]}, directory, port, name, metrics_port
             )
             runtime["command"] = argv
             runtime["container"] = command(argv).stdout.strip()
         else:
             binary = Path(arm["binary"]).resolve()
             runtime["binary_sha256"] = checksum(binary)
-            argv = [
-                str(binary),
-                "standalone",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--health",
-                "false",
-                "--data-dir",
-                str(directory / "data"),
-                "--config",
-                str(directory / "config.json"),
-            ]
+            argv = process_command(binary, directory, port, metrics_port)
             runtime["command"] = argv
             log = (directory / "server.log").open("w")
             process = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT)
@@ -1344,6 +1441,11 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                 lifecycle.get("resource_limits_verified") for lifecycle in lifecycles
             ),
         }
+        summary.update(telemetry_summary(lifecycles))
+        if not summary["telemetry_complete"]:
+            summary["unmeasured_gates"].append("Prometheus telemetry snapshots")
+            if summary["exit_code"] == 0:
+                summary.update(status="telemetry_unavailable", exit_code=3)
         save(output / "summary.json", summary)
         files = sorted(
             path
