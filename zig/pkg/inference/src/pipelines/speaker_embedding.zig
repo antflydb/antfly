@@ -41,6 +41,7 @@ const long_transcription = @import("long_transcription.zig");
 const onnx_graph = @import("onnx_graph");
 const Tensor = backends.Tensor;
 const Session = @import("../backends/session.zig").Session;
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const sample_rate: u32 = 16_000;
 pub const num_mel_bins: usize = 80;
@@ -237,8 +238,15 @@ pub const Embedder = struct {
     }
 
     /// The unit-norm embedding of exactly `window_samples` 16 kHz samples.
-    /// Caller frees the result.
-    pub fn embedAlloc(self: *Embedder, allocator: std.mem.Allocator, samples: []const f32) ![]f32 {
+    /// `control` carries the request's deadline and cancellation: a caller
+    /// that has given up must not keep the model busy, and waiting for the
+    /// gate is itself interruptible. Caller frees the result.
+    pub fn embedAlloc(
+        self: *Embedder,
+        allocator: std.mem.Allocator,
+        samples: []const f32,
+        control: ?InferenceExecutionControl,
+    ) ![]f32 {
         if (samples.len != window_samples) return error.UnexpectedWindowLength;
         const features = try kaldiFbankAlloc(allocator, samples);
         defer allocator.free(features);
@@ -249,9 +257,13 @@ pub const Embedder = struct {
         var input = try Tensor.initFloat32(allocator, "x", &shape, features);
         defer input.deinit();
 
-        while (!self.run_lock.tryLock()) std.atomic.spinLoopHint();
+        if (control) |active| {
+            try active.lock(&self.run_lock);
+        } else {
+            while (!self.run_lock.tryLock()) std.atomic.spinLoopHint();
+        }
         defer self.run_lock.unlock();
-        const outputs = try self.session.run(&[_]Tensor{input}, allocator);
+        const outputs = try self.session.runWithControl(&[_]Tensor{input}, allocator, control);
         defer {
             for (outputs) |*output| output.deinit();
             allocator.free(outputs);
@@ -512,6 +524,7 @@ pub fn diarizeSegmentsAlloc(
     samples: []const f32,
     segments: []const long_transcription.Segment,
     options: DiarizeOptions,
+    control: ?InferenceExecutionControl,
 ) ![]long_transcription.Segment {
     var out = std.ArrayList(long_transcription.Segment).empty;
     errdefer {
@@ -538,11 +551,15 @@ pub fn diarizeSegmentsAlloc(
     }
     const window = try allocator.alloc(f32, window_samples);
     defer allocator.free(window);
-    for (windows) |w| {
+    for (windows, 0..) |w, i| {
+        // One model run per window, so a cancelled or timed-out request
+        // stops here instead of working through the whole recording.
+        if (control) |active| try active.update(.executing, i, windows.len);
         fillWindow(window, samples, w.start);
-        embeddings[embedded] = try embedder.embedAlloc(allocator, window);
+        embeddings[embedded] = try embedder.embedAlloc(allocator, window, control);
         embedded += 1;
     }
+    if (control) |active| try active.check();
     const labels = try clusterSpeakers(allocator, embeddings, options.similarity_threshold);
     defer allocator.free(labels);
     for (windows, labels) |*w, label| w.label = label;

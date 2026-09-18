@@ -3779,22 +3779,53 @@ fn isImageContent(content_type: []const u8, filename: []const u8, source_url: []
         (std.mem.startsWith(u8, bytes, "RIFF") and bytes.len >= 12 and std.mem.eql(u8, bytes[8..12], "WEBP"));
 }
 
+/// Whether a source is something the transcription route can decode.
+///
+/// Recordings do not always arrive labelled `audio/*`: a browser recorder,
+/// Zoom or OBS writes WebM/Matroska that a server serves as `video/webm`,
+/// and a phone or screen recording arrives as MP4/QuickTime. Those carry an
+/// audio track the decoder reads, so they take the audio route; a container
+/// with no audio track fails there rather than being filed as an
+/// unsupported document.
 fn isAudioContent(content_type: []const u8, filename: []const u8, source_url: []const u8, bytes: []const u8) bool {
     if (contentTypeStartsWith(content_type, "audio/")) return true;
-    if (hasExtension(filename, ".mp3") or hasExtension(source_url, ".mp3") or
-        hasExtension(filename, ".wav") or hasExtension(source_url, ".wav") or
-        hasExtension(filename, ".m4a") or hasExtension(source_url, ".m4a") or
-        hasExtension(filename, ".aac") or hasExtension(source_url, ".aac") or
-        hasExtension(filename, ".ogg") or hasExtension(source_url, ".ogg") or
-        hasExtension(filename, ".opus") or hasExtension(source_url, ".opus") or
-        hasExtension(filename, ".flac") or hasExtension(source_url, ".flac"))
+    // Containers that carry an audio track, whichever way they are labelled.
+    if (contentTypeEquals(content_type, "video/webm") or
+        contentTypeEquals(content_type, "video/x-matroska") or
+        contentTypeEquals(content_type, "video/mp4") or
+        contentTypeEquals(content_type, "video/quicktime") or
+        contentTypeEquals(content_type, "application/ogg") or
+        contentTypeEquals(content_type, "application/x-matroska"))
     {
         return true;
     }
-    return std.mem.startsWith(u8, bytes, "ID3") or
+    const media_extensions = [_][]const u8{
+        ".mp3", ".wav",  ".m4a",  ".m4b",  ".aac",  ".ogg",
+        ".oga", ".opus", ".flac", ".aif",  ".aiff", ".aifc",
+        ".caf", ".au",   ".snd",  ".webm", ".weba", ".mkv",
+        ".mka", ".mp4",  ".m4v",  ".mov",
+    };
+    for (media_extensions) |extension| {
+        if (hasExtension(filename, extension) or hasExtension(source_url, extension)) return true;
+    }
+    if (std.mem.startsWith(u8, bytes, "ID3") or
         std.mem.startsWith(u8, bytes, "OggS") or
         std.mem.startsWith(u8, bytes, "fLaC") or
-        (std.mem.startsWith(u8, bytes, "RIFF") and bytes.len >= 12 and std.mem.eql(u8, bytes[8..12], "WAVE"));
+        // EBML: WebM and Matroska.
+        std.mem.startsWith(u8, bytes, "\x1a\x45\xdf\xa3"))
+    {
+        return true;
+    }
+    if (bytes.len >= 12) {
+        // RIFF/WAVE, ISO base media (MP4, M4A, MOV), AIFF and CAF.
+        if (std.mem.startsWith(u8, bytes, "RIFF") and std.mem.eql(u8, bytes[8..12], "WAVE")) return true;
+        if (std.mem.eql(u8, bytes[4..8], "ftyp")) return true;
+        if (std.mem.startsWith(u8, bytes, "FORM") and
+            (std.mem.eql(u8, bytes[8..12], "AIFF") or std.mem.eql(u8, bytes[8..12], "AIFC"))) return true;
+        if (std.mem.startsWith(u8, bytes, "caff")) return true;
+        if (std.mem.startsWith(u8, bytes, ".snd")) return true;
+    }
+    return false;
 }
 
 fn isDocxContent(content_type: []const u8, filename: []const u8, source_url: []const u8) bool {
@@ -4993,6 +5024,32 @@ test "transcript spans split a timed phrase at sentence ends using its words" {
     defer alloc.free(single);
     try std.testing.expectEqual(@as(usize, 1), single.len);
     try std.testing.expectEqual(TranscriptSpan{ .char_start = 0, .char_end = 57, .start_ms = 0, .end_ms = 4000 }, single[0]);
+}
+
+test "recordings in video containers take the transcription route" {
+    // A browser recorder, Zoom or OBS writes WebM the server labels
+    // video/webm; a phone writes MP4. Both carry the audio track the
+    // decoder reads, so both must route to transcription rather than being
+    // filed as an unsupported document.
+    const ebml = "\x1a\x45\xdf\xa3\x01\x00\x00\x00\x00\x00\x00\x23";
+    const mp4 = "\x00\x00\x00\x20ftypisom";
+    try std.testing.expect(isAudioContent("video/webm", "", "", ebml));
+    try std.testing.expect(isAudioContent("video/x-matroska", "", "", ebml));
+    try std.testing.expect(isAudioContent("video/mp4", "", "", mp4));
+    try std.testing.expect(isAudioContent("video/quicktime", "", "", mp4));
+    // Unlabelled downloads are recognised by name or by signature.
+    try std.testing.expect(isAudioContent("application/octet-stream", "call.webm", "", ""));
+    try std.testing.expect(isAudioContent("application/octet-stream", "", "https://example.com/call.mkv?sig=1", ""));
+    try std.testing.expect(isAudioContent("application/octet-stream", "", "", ebml));
+    try std.testing.expect(isAudioContent("application/octet-stream", "", "", mp4));
+    // The formats that were already routed keep working.
+    try std.testing.expect(isAudioContent("audio/mpeg", "", "", ""));
+    try std.testing.expect(isAudioContent("", "memo.m4a", "", ""));
+    try std.testing.expect(isAudioContent("", "", "", "OggS"));
+    try std.testing.expect(isAudioContent("", "", "", "RIFF\x00\x00\x00\x00WAVE"));
+    // Documents still are not audio.
+    try std.testing.expect(!isAudioContent("application/pdf", "report.pdf", "", "%PDF-1.4"));
+    try std.testing.expect(!isAudioContent("text/plain", "notes.txt", "", "hello"));
 }
 
 test "transcript timing stamps chunks with the phrases they overlap" {

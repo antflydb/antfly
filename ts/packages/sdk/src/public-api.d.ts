@@ -16068,6 +16068,8 @@ export interface components {
              * @example en
              */
             language?: string;
+            /** @description Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance. */
+            diarization?: boolean;
         };
         InferenceTranscribeResponse: {
             /**
@@ -16100,6 +16102,8 @@ export interface components {
             duration_ms?: number;
             /** @description Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip. */
             segments?: components["schemas"]["InferenceDictationSegment"][];
+            /** @description Speaker labels found by diarization, in order of first appearance. Present only when `diarization` was requested. */
+            speakers?: string[];
         };
         /**
          * @description How the cleanup pass rewrites the transcript. `clean` removes fillers
@@ -16163,6 +16167,8 @@ export interface components {
             end_ms: number;
             /** @description Word spans estimated inside the phrase by distributing its duration over word lengths. */
             words: components["schemas"]["InferenceDictationWord"][];
+            /** @description Speaker label from diarization (`SPEAKER_00`, ...). Absent without diarization or when the phrase had no usable audio. */
+            speaker?: string;
         };
         InferenceDictationTranscript: {
             /** @description Raw transcript before cleanup. */

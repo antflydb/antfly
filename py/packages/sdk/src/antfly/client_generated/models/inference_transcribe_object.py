@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -28,6 +28,8 @@ class InferenceTranscribeObject:
         segments (list[InferenceDictationSegment] | Unset): Timestamped phrases in clip order, so a transcript can be
             indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment
             offsets are relative to the whole clip.
+        speakers (list[str] | Unset): Speaker labels found by diarization, in order of first appearance. Present only
+            when `diarization` was requested.
     """
 
     object_: InferenceTranscribeObjectObject
@@ -36,6 +38,7 @@ class InferenceTranscribeObject:
     language: str | Unset = UNSET
     duration_ms: int | Unset = UNSET
     segments: list[InferenceDictationSegment] | Unset = UNSET
+    speakers: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -56,6 +59,10 @@ class InferenceTranscribeObject:
                 segments_item = segments_item_data.to_dict()
                 segments.append(segments_item)
 
+        speakers: list[str] | Unset = UNSET
+        if not isinstance(self.speakers, Unset):
+            speakers = self.speakers
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -71,6 +78,8 @@ class InferenceTranscribeObject:
             field_dict["duration_ms"] = duration_ms
         if segments is not UNSET:
             field_dict["segments"] = segments
+        if speakers is not UNSET:
+            field_dict["speakers"] = speakers
 
         return field_dict
 
@@ -98,6 +107,8 @@ class InferenceTranscribeObject:
 
                 segments.append(segments_item)
 
+        speakers = cast(list[str], d.pop("speakers", UNSET))
+
         inference_transcribe_object = cls(
             object_=object_,
             index=index,
@@ -105,6 +116,7 @@ class InferenceTranscribeObject:
             language=language,
             duration_ms=duration_ms,
             segments=segments,
+            speakers=speakers,
         )
 
         inference_transcribe_object.additional_properties = d

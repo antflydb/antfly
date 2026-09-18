@@ -185,6 +185,7 @@ pub fn decodeInterleaved(allocator: std.mem.Allocator, audio_bytes: []const u8) 
         decoded.sample_rate,
         demuxed.access_unit_times_ns,
         track.access_unit_frames,
+        track.timeline_delay_frames,
     );
 
     if (demuxed.discard_padding_ns > 0 and decoded.sample_rate != 0) {
@@ -201,6 +202,10 @@ pub fn decodeInterleaved(allocator: std.mem.Allocator, audio_bytes: []const u8) 
 const DecodedTrack = struct {
     pcm: DecodedInterleaved,
     access_unit_frames: ?[]usize = null,
+    /// Priming frames the decoder already dropped from the front of `pcm`.
+    /// Matroska subtracts the same delay from a block's timestamp to get its
+    /// presentation time, so the two have to be applied together.
+    timeline_delay_frames: usize = 0,
 };
 
 /// Silence a decoded track may gain to honour the container's timeline.
@@ -222,6 +227,14 @@ const max_timeline_silence_seconds: u64 = 600;
 /// `samples`. Without it only the track's start offset can be honoured,
 /// because there is no way to tell where one packet's audio ends and the
 /// next begins.
+///
+/// `delay_frames` is the priming the decoder already dropped. Matroska
+/// requires CodecDelay to be subtracted from a block's timestamp to get its
+/// presentation time: a block nominally starts one delay *before* the audio
+/// it carries, because that much of it is priming. Placing blocks without
+/// that subtraction leaves the timeline running one delay ahead of the
+/// decoded audio, which shows up as false silence in ordinary,
+/// uninterrupted recordings.
 fn placeOnTimelineAlloc(
     allocator: std.mem.Allocator,
     samples: []f32,
@@ -229,6 +242,7 @@ fn placeOnTimelineAlloc(
     sample_rate: u32,
     times_ns: []const u64,
     access_unit_frames: ?[]const usize,
+    delay_frames: usize,
 ) ![]f32 {
     if (channels == 0 or sample_rate == 0 or times_ns.len == 0) return samples;
     const total_frames = samples.len / channels;
@@ -242,7 +256,7 @@ fn placeOnTimelineAlloc(
 
     const frames = access_unit_frames orelse {
         // Start offset only: everything decoded stays contiguous after it.
-        const offset = nsToFrames(times_ns[0], sample_rate);
+        const offset = nsToFrames(times_ns[0], sample_rate) -| delay_frames;
         if (offset <= tolerance_frames) return samples;
         const lead = @min(offset, budget_frames);
         const out = try allocator.alloc(f32, (total_frames + lead) * channels);
@@ -259,7 +273,7 @@ fn placeOnTimelineAlloc(
     var source_cursor: usize = 0;
     var timeline_cursor: usize = 0;
     for (frames, times_ns) |unit_frames, time_ns| {
-        const want = nsToFrames(time_ns, sample_rate);
+        const want = nsToFrames(time_ns, sample_rate) -| delay_frames;
         if (want > timeline_cursor + tolerance_frames) {
             const gap = @min(want - timeline_cursor, budget_frames);
             budget_frames -= gap;
@@ -283,7 +297,7 @@ fn placeOnTimelineAlloc(
     source_cursor = 0;
     timeline_cursor = 0;
     for (frames, times_ns) |unit_frames, time_ns| {
-        const want = nsToFrames(time_ns, sample_rate);
+        const want = nsToFrames(time_ns, sample_rate) -| delay_frames;
         if (want > timeline_cursor + tolerance_frames) {
             const gap = @min(want - timeline_cursor, budget_frames);
             budget_frames -= gap;
@@ -361,6 +375,7 @@ fn decodeOpusTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !Decoded
             .allocator = allocator,
         },
         .access_unit_frames = frames,
+        .timeline_delay_frames = pre_skip,
     };
 }
 
@@ -413,6 +428,7 @@ fn decodeVorbisTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !Decod
             .allocator = allocator,
         },
         .access_unit_frames = frames,
+        .timeline_delay_frames = nsToFrames(demuxed.codec_delay_ns, decoded.sample_rate),
     };
 }
 
@@ -511,12 +527,15 @@ fn decodeFlacTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !Decoded
     }
 
     const decoded = try flac.decodeInterleaved(allocator, native);
-    return .{ .pcm = .{
-        .samples = decoded.samples,
-        .sample_rate = decoded.sample_rate,
-        .channels = decoded.channels,
-        .allocator = allocator,
-    } };
+    return .{
+        .pcm = .{
+            .samples = decoded.samples,
+            .sample_rate = decoded.sample_rate,
+            .channels = decoded.channels,
+            .allocator = allocator,
+        },
+        .timeline_delay_frames = nsToFrames(demuxed.codec_delay_ns, decoded.sample_rate),
+    };
 }
 
 fn nsToFrames(ns: u64, sample_rate: u32) usize {
@@ -1143,6 +1162,24 @@ fn buildSimpleBlockNoLacing(allocator: std.mem.Allocator, track_number: u8, fram
     return out.toOwnedSlice(allocator);
 }
 
+/// A SimpleBlock carrying an explicit relative timecode, so a fixture can
+/// place its packets along the cluster's timeline.
+fn buildSimpleBlockAt(allocator: std.mem.Allocator, track_number: u8, frame: []const u8, relative_ticks: i16) ![]u8 {
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try body.append(allocator, 0x80 | track_number);
+    var ticks: [2]u8 = undefined;
+    std.mem.writeInt(u16, &ticks, @bitCast(relative_ticks), .big);
+    try body.appendSlice(allocator, &ticks);
+    try body.append(allocator, 0x80); // keyframe, no lacing
+    try body.appendSlice(allocator, frame);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendLeafElement(&out, allocator, &.{0xA3}, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
 fn appendEbmlSignedDelta(list: *std.ArrayList(u8), allocator: std.mem.Allocator, delta: i64) !void {
     // Always encoded as a 2-byte signed vint (bias 2^13 - 1), comfortably
     // wide enough for the small fixtures these tests build.
@@ -1473,6 +1510,61 @@ test "webm demux decodes real opus packets laced with Xiph and EBML lacing" {
     }
 }
 
+test "webm decoding leaves uninterrupted opus alone" {
+    const allocator = std.testing.allocator;
+
+    var ogg_packets = try ogg.parsePacketsAlloc(allocator, tone_opus_bytes);
+    defer ogg_packets.deinit();
+    const opus_head = ogg_packets.packets[0].bytes;
+    const audio_packets = ogg_packets.packets[2..];
+
+    const entry = try buildAudioTrackEntry(allocator, 1, "A_OPUS", opus_head, 2, null);
+    defer allocator.free(entry);
+    const tracks = try buildTracks(allocator, &.{entry});
+    defer allocator.free(tracks);
+
+    // The same packets twice: once as a single block, which carries one
+    // timestamp and so cannot be placed at all, and once as a block per
+    // packet timestamped where a muxer would put it. A recording with no
+    // gaps must decode to exactly the same audio either way. It does not
+    // unless CodecDelay is subtracted from those timestamps: the decoder
+    // drops the stream's pre-skip, so the timeline would otherwise run one
+    // pre-skip ahead of the audio and open a gap that was never there.
+    var frames_list = std.ArrayList([]const u8).empty;
+    defer frames_list.deinit(allocator);
+    for (audio_packets) |packet| try frames_list.append(allocator, packet.bytes);
+    const laced = try buildSimpleBlockLaced(allocator, 1, frames_list.items, .xiph);
+    defer allocator.free(laced);
+    const laced_cluster = try buildCluster(allocator, 0, &.{laced});
+    defer allocator.free(laced_cluster);
+    const laced_file = try buildWebmFile(allocator, tracks, &.{laced_cluster});
+    defer allocator.free(laced_file);
+
+    var blocks = std.ArrayList([]u8).empty;
+    defer {
+        for (blocks.items) |block| allocator.free(block);
+        blocks.deinit(allocator);
+    }
+    var elapsed_samples: u32 = 0;
+    for (audio_packets) |packet| {
+        const relative_ms: i16 = @intCast(elapsed_samples / 48);
+        try blocks.append(allocator, try buildSimpleBlockAt(allocator, 1, packet.bytes, relative_ms));
+        elapsed_samples += try opus.packetSamples(packet.bytes, 48_000);
+    }
+    const timed_cluster = try buildCluster(allocator, 0, @ptrCast(blocks.items));
+    defer allocator.free(timed_cluster);
+    const timed_file = try buildWebmFile(allocator, tracks, &.{timed_cluster});
+    defer allocator.free(timed_file);
+
+    var laced_pcm = try decodeInterleaved(allocator, laced_file);
+    defer laced_pcm.deinit();
+    var timed_pcm = try decodeInterleaved(allocator, timed_file);
+    defer timed_pcm.deinit();
+
+    try std.testing.expectEqual(laced_pcm.samples.len, timed_pcm.samples.len);
+    try std.testing.expectEqualSlices(f32, laced_pcm.samples, timed_pcm.samples);
+}
+
 test "webm decoding keeps a paused recording's gap on the timeline" {
     const allocator = std.testing.allocator;
 
@@ -1487,53 +1579,58 @@ test "webm decoding keeps a paused recording's gap on the timeline" {
     const tracks = try buildTracks(allocator, &.{entry});
     defer allocator.free(tracks);
 
-    // Two clusters of two 20 ms packets each. The recording was paused
-    // between them: the second cluster's timestamp is 200 ms, not the 40 ms
-    // that uninterrupted audio would carry.
+    // Two clusters of two packets each. The recorder was paused between
+    // them: the second cluster is stamped 200 ms, not the 40 ms that
+    // uninterrupted audio would carry.
     var blocks: [4][]u8 = undefined;
     var built: usize = 0;
     defer for (blocks[0..built]) |block| allocator.free(block);
-    for (audio_packets[0..4]) |packet| {
-        blocks[built] = try buildSimpleBlockNoLacing(allocator, 1, packet.bytes);
+    for (audio_packets[0..4], 0..) |packet, i| {
+        const relative_ms: i16 = if (i % 2 == 0) 0 else 20;
+        blocks[built] = try buildSimpleBlockAt(allocator, 1, packet.bytes, relative_ms);
         built += 1;
     }
 
-    const contiguous = try decodeTwoClusterWebm(allocator, tracks, blocks[0..2], blocks[2..4], 40);
-    defer allocator.free(contiguous.samples);
-    const paused = try decodeTwoClusterWebm(allocator, tracks, blocks[0..2], blocks[2..4], 200);
-    defer allocator.free(paused.samples);
+    var contiguous = try decodeTwoClusterWebm(allocator, tracks, blocks[0..2], blocks[2..4], 40);
+    defer contiguous.deinit();
+    var paused = try decodeTwoClusterWebm(allocator, tracks, blocks[0..2], blocks[2..4], 200);
+    defer paused.deinit();
+    // Decoding the first cluster alone says how much audio precedes the gap.
+    var head_only = try decodeTwoClusterWebm(allocator, tracks, blocks[0..2], &.{}, 40);
+    defer head_only.deinit();
 
-    try std.testing.expectEqual(contiguous.sample_rate, paused.sample_rate);
-    const rate = contiguous.sample_rate;
     const channels = contiguous.channels;
-    const contiguous_frames = contiguous.samples.len / channels;
-    const paused_frames = paused.samples.len / channels;
+    const rate = contiguous.sample_rate;
+    const head_frames = head_only.samples.len / channels;
+    const expected_gap_frames = 160 * rate / 1000;
 
     // The 160 ms the recorder spent paused become silence, so every later
     // word keeps the offset a player would seek to.
-    const expected_gap_frames = 160 * rate / 1000;
-    try std.testing.expectEqual(contiguous_frames + expected_gap_frames, paused_frames);
+    try std.testing.expectEqual(
+        contiguous.samples.len + expected_gap_frames * channels,
+        paused.samples.len,
+    );
 
-    // The audio either side of the gap is unchanged.
-    const first_cluster_frames = contiguous_frames / 2;
+    // The audio either side of the gap is untouched.
     try std.testing.expectEqualSlices(
         f32,
-        contiguous.samples[0 .. first_cluster_frames * channels],
-        paused.samples[0 .. first_cluster_frames * channels],
+        contiguous.samples[0 .. head_frames * channels],
+        paused.samples[0 .. head_frames * channels],
     );
-    const gap_start = first_cluster_frames * channels;
+    const gap_start = head_frames * channels;
     for (paused.samples[gap_start .. gap_start + expected_gap_frames * channels]) |sample| {
         try std.testing.expectEqual(@as(f32, 0), sample);
     }
     try std.testing.expectEqualSlices(
         f32,
-        contiguous.samples[first_cluster_frames * channels ..],
-        paused.samples[(first_cluster_frames + expected_gap_frames) * channels ..],
+        contiguous.samples[head_frames * channels ..],
+        paused.samples[(head_frames + expected_gap_frames) * channels ..],
     );
 }
 
 /// Decodes a two-cluster WebM/Opus file whose second cluster carries
-/// `second_cluster_timecode` milliseconds. Caller frees `samples`.
+/// `second_cluster_timecode` milliseconds; an empty `second_blocks` builds
+/// the first cluster alone.
 fn decodeTwoClusterWebm(
     allocator: std.mem.Allocator,
     tracks: []const u8,
@@ -1543,6 +1640,11 @@ fn decodeTwoClusterWebm(
 ) !DecodedInterleaved {
     const first = try buildCluster(allocator, 0, @ptrCast(first_blocks));
     defer allocator.free(first);
+    if (second_blocks.len == 0) {
+        const file = try buildWebmFile(allocator, tracks, &.{first});
+        defer allocator.free(file);
+        return decodeInterleaved(allocator, file);
+    }
     const second = try buildCluster(allocator, second_cluster_timecode, @ptrCast(second_blocks));
     defer allocator.free(second);
     const file = try buildWebmFile(allocator, tracks, &.{ first, second });

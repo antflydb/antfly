@@ -8420,7 +8420,7 @@ pub const Node = struct {
         defer result.deinit();
         if (request.diarization orelse false) {
             try control.update(.executing, 0, 0);
-            try self.assignTranscriptSpeakers(allocator, &result, decoded.samples, decoded.sample_rate);
+            try self.assignTranscriptSpeakers(allocator, &result, decoded.samples, decoded.sample_rate, control);
         }
         return try transcriptionResponseAlloc(allocator, &result);
     }
@@ -8484,12 +8484,13 @@ pub const Node = struct {
         result: *long_transcription.Result,
         samples: []const f32,
         sample_rate: u32,
+        control: ?InferenceExecutionControl,
     ) !void {
         if (result.segments.len == 0) return;
         const embedder = try self.speakerEmbedder();
         const pcm = try audio_mod.copyOrResample(allocator, samples, sample_rate, speaker_embedding_mod.sample_rate);
         defer allocator.free(pcm);
-        const labelled = try speaker_embedding_mod.diarizeSegmentsAlloc(allocator, embedder, pcm, result.segments, .{});
+        const labelled = try speaker_embedding_mod.diarizeSegmentsAlloc(allocator, embedder, pcm, result.segments, .{}, control);
         long_transcription.freeSegments(result.allocator, result.segments);
         result.segments = labelled;
     }
@@ -16965,7 +16966,7 @@ pub const Node = struct {
         };
         defer result.deinit();
         if (body.diarization orelse false) {
-            self.assignTranscriptSpeakers(ctx.allocator, &result, pcm, audio_mod.WHISPER_SAMPLE_RATE) catch |err| switch (err) {
+            self.assignTranscriptSpeakers(ctx.allocator, &result, pcm, audio_mod.WHISPER_SAMPLE_RATE, execution_control) catch |err| switch (err) {
                 error.SpeakerModelUnavailable => return ctx.status(422).json(.{
                     .@"error" = "SPEAKER_MODEL_UNAVAILABLE",
                     .message = "diarization needs the local speaker model: antfly inference pull " ++ speaker_embedding_mod.default_model_ref,
