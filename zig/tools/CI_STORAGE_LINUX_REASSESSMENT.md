@@ -205,3 +205,23 @@ real work; neither is claimed to be eliminated.
 To use an existing fast workspace locally, create its absolute directory and
 set `ANTFLY_TEST_WORKSPACE` when invoking the normal test target. The variable
 does not mount storage itself. Leave it unset to verify the disk fallback.
+
+## Related E2E failure follow-up
+
+CI run 35304355356 passed the unit gate but failed concurrent aggregations
+(read timeouts) and one session savepoint commit (503). Both passed in the
+first focused native ReleaseFast reproduction. Running the complete two
+modules then reproduced the aggregation failure twice: once as readers
+completing only one request within the five-second loop, and once as 15-second
+request timeouts. The transaction module passed throughout.
+
+The aggregation correctness regression now uses two synchronized rounds per
+phase, so every reader exercises both terms and stats regardless of machine
+speed. It retains ten readers, two concurrent writers, three mixed phases,
+all 11,000 seed rows, and every exact bucket/statistic assertion. Request
+timeout matches the harness's ordinary 30-second bound, and barrier abort
+wakes other workers immediately on failure. It no longer imposes a five-second
+throughput minimum or generates a machine-speed-dependent request count.
+Both complete modules passed after this change: 23 tests, with the aggregation
+case taking 6.38 seconds locally. The intermittent transaction 503 was not
+reproduced or claimed fixed; the next Linux CI run must confirm its status.
