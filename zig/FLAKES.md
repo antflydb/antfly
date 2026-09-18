@@ -4,6 +4,204 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-17: standby drain stalled behind status-protocol probing
+
+Both standby-scaling shards in [run 35247508165](https://github.com/antflydb/antfly/actions/runs/35247508165)
+failed `ProductionStandbyBaselineDrainTimeout`. Seed `2713408769` reproduced locally:
+store reports remained at approximately 2.277 seconds while drain reconciliation
+continued. The simulated metadata endpoint exercises compatibility with a peer
+that does not yet support `/status/update`. Its 60-second capability-probe delay
+shared the worker's publication retry timer, suppressing supported full reports
+and leaving drain observations stale.
+
+The worker now separates capability probing from publication retries. Full reports
+continue while the newer protocol is unavailable; actual transport failures and
+pending baselines retain their existing backoff. The borrowed-`VoprIo` regression
+verifies three consecutive full reports, one unsupported probe, and adoption of
+the current protocol when the peer upgrades. All nine runtime VOPR tests pass.
+With the capability timer fixed, seed `2713408769` completed promotion, split,
+merge, scale-in, and exact replay. Seed `11400714822036607254` then exposed a
+second defect: full publication carried a `maxInt(u64)` deadline into HTTP.
+Three socket timeouts advanced virtual time by approximately 149 days before the
+next control round returned `Timeout`. The finding replayed exactly.
+
+Collection now checks cancellation separately and starts a fresh two-second
+network budget after the snapshot is ready. Discovery and publication share a
+bounded allocation for each remaining metadata endpoint, allowing a later healthy
+peer to respond even when the first endpoint stalls. The borrowed-I/O regression
+checks the timeout bound and both stalled-head and stalled-publication failover.
+Schema progress retains its separate bounded quantum after a successful report,
+so slow publication cannot repeatedly exhaust the schema checkpoint budget.
+Failure diagnostics also retain the drain catalog snapshot. On the final macOS
+ARM64 ReleaseSafe executable, both retained seeds completed promotion, split,
+merge, scale-in, and exact replay: 721,262 transitions, two clean histories, zero
+failures, replay divergences, or harness errors. Both histories verified quiet
+teardown with no live tasks, open files, or open sockets. The executable SHA-256 is
+`1f0d8f180d853864057578a5431507f294e62d74bfb7a704d2f9526148d4cb3f`.
+Fresh recordings were required after rebuilding because task identities include
+compiled function offsets; replaying the previous executable's traces stopped
+at the first task identity mismatch, before workload execution. All 48 final
+build steps and all 34 runtime VOPR tests pass. Full Linux CI and the scheduled
+soak remain separate qualification gates.
+
+The same PR's [x86 unit build](https://github.com/antflydb/antfly/actions/runs/35247545305/job/105292308708)
+exposed a separate C API module-root violation: the restore admission helper was
+imported via `../storage` from a module rooted at `capi/db.zig`. Export it from the
+owning C API root and use the existing `antfly` module dependency. The production
+build and all 12 focused C API tests pass with that ownership corrected.
+
+## 2026-09-17: restore leadership recovery lost proposal error identity
+
+The production E2E job in [run 35247508165](https://github.com/antflydb/antfly/actions/runs/35247508165/job/105291344795)
+recorded repeated restore ownership changes and 120-second completion failures.
+The final 100-case run had 16 failures: 11 restore completion timeouts and five
+seed-write failures. Retained metadata logs
+show `MetadataProposalSuperseded`, `MetadataProposalApplyTimeout`, and WAL commits
+around 600 ms. The native 3x3 fixture forced 5 ms Raft and control ticks; it now uses
+the executable's production cadence instead of election deadlines shorter than
+observed storage latency. This does not change any API completion deadline or
+acknowledged-data assertion. Fast virtual schedules remain covered by VOPR.
+
+Proposal supersession and apply-timeout errors were absent from the stable runtime
+error ABI. During restore leadership preparation they could become generic
+persistence failures and HTTP 500. Preserve their exact identity across archives.
+Before public dispatch, leadership preparation may return 503 and rebuild from
+committed rows on the next request, including after an unknown write outcome.
+This broader recovery classification does not apply to an already dispatched
+mutation and does not authorize replay of ambiguous client writes. Restore workers
+also recover their exact durable attempt after these outcomes instead of terminally
+failing a partially published restore.
+
+The deterministic leadership-rebuild regression injects each outcome through the
+real persistence ABI, then verifies successful FIFO recovery. All 29 restore-store
+tests, 19 error-boundary/authority tests, and 46 compiled backup/restore tests pass.
+The latter require local networking; the sandboxed run was not a valid pass.
+A native macOS ARM64 soak of the production recovery changes passed 20/20 cases
+across both variants and descriptor profiles. The subsequent publication-budget
+change is validated separately by the runtime VOPR tests and retained histories.
+See the E2E record for the separate
+stalled-discovery HTTP 500, original-log limitations, and production soak coverage.
+
+## 2026-09-16: 3x3 restore owner admission blocked its own bootstrap
+
+[PR #771's base E2E job](https://github.com/antflydb/antfly/actions/runs/35163796459/job/105028671150)
+failed `test_three_by_three_cluster_backup_restore_through_metadata_public_api`:
+restore job `3531487279743073036` did not finish within 120 seconds. Data node 4
+repeatedly failed Raft admission for group `51491842878582563` with
+`GenerationTransitionActive`. Other replicas completed runtime repair. The logs
+also contain `CorruptLsmWalIndex` while closing old, deleted groups; that diagnostic
+alone does not establish the cause of the restore admission stall.
+
+A local 20-case, two-worker baseline reproduced the same 120-second stall and
+repeated generation-transition admission errors. A deterministic compiled-owner
+regression then forced catalog visibility before bootstrap import: reconciliation
+incorrectly returned `complete` and retained an empty physical owner. Its generation
+reader prevents bootstrap's exclusive import, so retrying bootstrap cannot heal it.
+Both the server point catalog projection and the remote metadata client's owned
+point snapshot stripped the restore binding from range records. A regression using
+the real remote source on `VoprIo` fails before the client fix and verifies that
+both point-read modes and the final owner descriptor retain the exact binding,
+even after warming the compact catalog-wide routing cache.
+
+Owner descriptors now retain the range's restore identity. Before opening a cold
+owner, the storage kernel verifies that the published generation contains the exact
+primary import proof (backup, location, artifact, native manifest, shard path, and
+destination group). It holds the validated generation lease through `DB.open`,
+preventing a check/open race. Missing or different imports yield retryable
+`StorageReadTemporarilyUnavailable` without creating a resident DB. Matching imports
+remain admissible while runtime repair is pending; requiring completed repair would
+create a second circular dependency. Ordinary owner cache hits do not acquire a new
+proof or read a marker. A cached owner with a different or absent admitted restore
+binding drains before reopening, preventing an earlier catalog view from bypassing
+the check. Register `StorageReadTemporarilyUnavailable` in the compiled failure
+registry so this deferral retains its retryable identity across the storage ABI.
+The internal storage-owner ABI advances to version 61.
+
+`restore-admission-vopr-test` explores 256 seeded interleavings across nine replica
+placements and exact replays each history. It uses the production admission helper,
+generation leases, and durable markers on borrowed `VoprIo`. Owner probes compete
+with publication on the same replica, including while its exclusive publication
+lease remains held across scheduler steps. It checks missing and
+mismatched proofs, incomplete primary import, admission before runtime repair
+completion, lease release after rejection, and pinning until an admitted reader
+releases its lease. The compiled-owner regression covers actual owner admission;
+the native soak covers backup import and atomic generation replacement.
+The scheduled qualification runs this target. Native scheduled coverage adds
+`zig-e2e-cluster-restore-soak.sh`: 50 fresh 3x3 clusters each under normal and
+256-descriptor limits, with exact JUnit counts and retained failed roots.
+
+The baseline also exposed two incorrect E2E assumptions: committed deletion may
+return `committed_repair_required`, and restore admission may lose its acknowledgement.
+The test still requires catalog absence and successful restore, but recovers admission
+with one explicit idempotency key and verifies that retries retain the same job ID.
+Timeout diagnostics now refresh metadata and retain observed job states. A fifth
+failure was a transient `TableTopologyProtocolUpgradeRequired` losing its identity
+at the compiled callback boundary and becoming HTTP 500. The merged main catalog
+changes register that identity in both failure formats; boundary regressions verify
+that the existing HTTP 503 path remains available. The
+create harness recognizes the documented text rejections only with explicit
+non-admission headers; uncertain/committed outcomes still fail without replay.
+
+A first post-fix experiment ran both profiles concurrently (four six-process
+clusters), exceeding the scheduled two-cluster concurrency. It was stopped after
+20 completed cases (15 passed, five failed) when the host reached 48,342 TCP sockets
+in `TIME_WAIT`, matching the previously recorded local socket-pressure failure.
+Failures included lost seed connections, replication/election deadlines, a batch
+conflict, and a data control-loop exit with `WriteFailed`; none reproduced the
+original restore admission stall. These results do not qualify the native soak.
+
+The fatal write error exposed a separate HTTP boundary defect. A deterministic
+injected socket reset returned generic `WriteFailed` instead of
+`ConnectionResetByPeer`. The direct HTTP send path now unwraps the network writer's
+stored error and retires the failed connection. It preserves uncertain delivery
+and makes no automatic mutation retry. Generic non-network writer errors retain
+their identity. Executor tests cover GET/POST, one write attempt, delivery state,
+and pool retirement; the VOPR status test covers delayed socket failures and the
+existing backoff/deadline rules. The injected regression establishes this transport
+bug, although the retained process log cannot identify the original socket errno.
+
+An intermediate two-worker run completed 18 cases (16 passed, two setup failures)
+before review found the missing remote client projection. The setup failures were
+explicit uncertain delete and stateless batch outcomes. The harness now observes
+all original table/range identities disappearing after an uncertain delete, and
+requires every seeded document's complete payload to appear after an uncertain
+batch. It never replays those mutations or treats unresolved outcomes as success.
+Five harness regressions cover successful observation, missing/incorrect data,
+missing outcome headers, and exactly one mutation attempt. Partial runs from before
+the final production rebuild are excluded from qualification.
+
+The first run against the merged catalog executable completed 12 cases (11 passed,
+one post-restore assertion failure). The restore job succeeded and all metadata
+nodes reported full replication, but a separate one-second topology probe then
+returned `None`. That helper conflated transport/HTTP failures with missing tables,
+so the exact reason for the extra probe's failure was not captured. The replication
+check now returns the exact table/group identities it validated, requires agreement
+across all three metadata nodes, and avoids the redundant probe. Backup manifests
+must match the captured original groups, and restored documents must still be read
+through every data node. Six harness regressions cover a failed later observation,
+inconsistent identities, missing placement, missing health, and missing snapshots.
+
+The next two-worker macOS run completed 32 cases (31 passed, one unresolved delete)
+under measured host socket exhaustion: Python metadata probes failed with
+`EADDRNOTAVAIL`, data control reported `AddressUnavailable`, metadata nodes lost
+leader visibility, and the host had 51,921 TCP sockets in `TIME_WAIT`. The restore
+had not started. The test correctly failed instead of replaying the uncertain
+delete. These results do not qualify the restore soak. Final local validation uses
+one six-process cluster at a time (`ANTFLY_E2E_REGRESSION_WORKERS=1`,
+`ANTFLY_E2E_REGRESSION_REPEATS=50`) while retaining 100 total cases and both FD
+profiles. Scheduled Linux coverage keeps two workers and 25 repeats per profile;
+local serial results do not establish that parallel macOS runs are reliable.
+
+Final macOS ARM64 ReleaseSafe validation passed all 100 native cases: 50 normal
+and 50 with a 256-descriptor limit, one cluster at a time. JUnit verification found
+no missing, skipped, failed, or errored cases; the production executable SHA-256
+remained `7689b05ded6616b815c904b9e3727c2732fb6573566738ac7ed1427c953f0d15`.
+The merged-main runtime suite passed 34 tests, compiled owner source passed 14,
+error registry passed one, callback/error boundaries passed 20, and Python harness
+and script checks passed 110. All 256 VOPR histories (81 transitions each) and
+exact replays passed, as did the determinism audit. Linux CI and the scheduled
+parallel profile must validate the original platform separately.
+
 ## 2026-09-16: replay-retention fixture timed out on a checkpoint proxy
 
 PR #691's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35176786855/job/105060523520)

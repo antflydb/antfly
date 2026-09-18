@@ -40,6 +40,67 @@ fn cleanup(path: []const u8) void {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 }
 
+test "restore owner admission cannot pin an unimported replica generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/replicas", .{tmp.sub_path});
+    defer alloc.free(root);
+    const Catalog = struct {
+        restoring: bool = true,
+
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .indexes_json = "{}" }}),
+                .ranges = if (!self.restoring) @constCast(&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }}) else @constCast(&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                    .restore_backup_id = "backup",
+                    .restore_location = "file:///backup",
+                    .restore_snapshot_path = "groups/1.afb",
+                    .restore_artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                }}),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var catalog = Catalog{};
+    var source = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, root, .{
+        .ptr = &catalog,
+        .vtable = &.{ .admin_snapshot = Catalog.snapshot, .free_admin_snapshot = Catalog.freeSnapshot },
+    }, read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    // Force the production history: catalog restore intent is visible before
+    // Raft bootstrap imports the generation. Background repair must not create
+    // an empty resident DB that prevents bootstrap's exclusive publication.
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.reconcileTableGroup(7001, "docs"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.warmTableGroup(7001, "docs"));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.restoreState(alloc, 7001, "docs"));
+    try std.testing.expectEqual(@as(usize, 0), source.ownerCountForTest());
+
+    // An owner admitted before the restore intent must not bypass the proof
+    // when the catalog changes. Retirement releases its publication lease.
+    catalog.restoring = false;
+    _ = try source.reconcileTableGroup(7001, "docs");
+    try std.testing.expectEqual(@as(usize, 1), source.ownerCountForTest());
+    catalog.restoring = true;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.warmTableGroup(7001, "docs"));
+    try std.testing.expectEqual(@as(usize, 0), source.ownerCountForTest());
+}
+
 test "provisioned batch lookup scan and query share one opaque live storage owner" {
     const alloc = std.testing.allocator;
     const replica_root = "/tmp/antfly-storage-kernel-provisioned-source";
