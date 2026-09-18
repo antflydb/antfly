@@ -1077,3 +1077,45 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("hosted TTL open error = %v, want %v", err, InvalidArgument)
 	}
 }
+
+// Exercise non-empty edge results through the C ABI without requiring an
+// inference provider. Repeated reads also check that freeing one result does
+// not corrupt the heap used by subsequent calls.
+func TestLiteNativeGraphEdgesDoNotDoubleFree(t *testing.T) {
+	db, err := CreateWithOptions(filepath.Join(t.TempDir(), "graph-edges.aflite"), OpenOptions{
+		Mode:    OpenModeWriter,
+		Profile: ProfileNative,
+	})
+	if err != nil {
+		t.Fatalf("create native database: %v", err)
+	}
+	defer db.Close()
+	if err := db.AddIndexJSON([]byte(`{"name":"graph","kind":"graph","config_json":"{}"}`)); err != nil {
+		t.Fatalf("add graph index: %v", err)
+	}
+	empty, err := db.EdgesJSON("graph", "doc:source", "", 2)
+	if err != nil {
+		t.Fatalf("read empty edges: %v", err)
+	}
+	if bytes.Contains(empty, []byte("edge_type")) {
+		t.Fatalf("unexpected empty edges: %s", empty)
+	}
+	if err := db.Batch([]WriteIntent{
+		{Key: "doc:source", Value: []byte(`{"title":"source","_edges":{"graph":{"links":[{"target":"doc:target","weight":1.0}]}}}`)},
+		{Key: "doc:target", Value: []byte(`{"title":"target"}`)},
+	}, 2); err != nil {
+		t.Fatalf("batch documents: %v", err)
+	}
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatalf("drain graph indexing: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		edges, err := db.EdgesJSON("graph", "doc:source", "", 2)
+		if err != nil {
+			t.Fatalf("read edges %d: %v", i, err)
+		}
+		if !bytes.Contains(edges, []byte(`"edge_type":"links"`)) {
+			t.Fatalf("read edges %d returned no links edge: %s", i, edges)
+		}
+	}
+}
