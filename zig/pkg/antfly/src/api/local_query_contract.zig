@@ -857,13 +857,7 @@ pub fn vectorWorkerFilterConstraintCount(req: db_mod.types.SearchRequest) u32 {
     return count;
 }
 
-pub fn freeObservedDynamicFieldCapabilitySets(
-    alloc: std.mem.Allocator,
-    sets: []ObservedDynamicFieldCapabilitySet,
-) void {
-    for (sets) |*set| set.deinit(alloc);
-    if (sets.len > 0) alloc.free(sets);
-}
+pub const freeObservedDynamicFieldCapabilitySets = table_read_source.freeObservedDynamicFieldCapabilitySets;
 
 pub fn mergeObservedDynamicFieldCapabilitySet(
     alloc: std.mem.Allocator,

@@ -95,6 +95,15 @@ pub const LsmStorageStats = runtime_status.LsmStorageStats;
 pub const ObservedDynamicFieldCapabilitySet = dynamic_field_capability.ObservedDynamicFieldCapabilitySet;
 pub const DynamicFieldObservationQuery = dynamic_field_capability.ObservationQuery;
 
+/// Retire callback results with the same allocator passed to the read source.
+pub fn freeObservedDynamicFieldCapabilitySets(
+    alloc: std.mem.Allocator,
+    sets: []ObservedDynamicFieldCapabilitySet,
+) void {
+    for (sets) |*set| set.deinit(alloc);
+    if (sets.len > 0) alloc.free(sets);
+}
+
 pub const ParsedTextStatsHttpResponse = union(enum) {
     fields: TextStatsResponse,
     background_fields: BackgroundTextStatsResponse,
