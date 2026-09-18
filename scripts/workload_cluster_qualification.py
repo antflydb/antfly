@@ -618,6 +618,16 @@ def request(port, action, timeout, headers=None, submitted=None, *, raw=False):
             headers=dict(response.getheaders()),
             body=data.decode(errors="replace"),
         )
+        # Receiving an explicit unknown-outcome response does not resolve a write.
+        normalized_headers = {
+            key.lower(): value for key, value in receipt["headers"].items()
+        }
+        if (
+            action["is_write"]
+            and normalized_headers.get("x-antfly-raft-mutation-outcome", "").strip()
+            == "unknown-v1"
+        ):
+            receipt["unknown_write_outcome"] = True
         expect = action["expect"]
         if response.status != expect.get("status"):
             receipt["passed"] = False

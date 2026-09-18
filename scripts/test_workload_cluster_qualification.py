@@ -115,6 +115,49 @@ class ClusterTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertTrue(result["unknown_write_outcome"])
 
+    def test_explicit_unknown_mutation_header_remains_unresolved_even_if_status_expected(
+        self,
+    ):
+        class Response:
+            status = 409
+            chunks = [b"observe table state", b""]
+
+            def read1(self, _):
+                return self.chunks.pop(0)
+
+            def getheaders(self):
+                return [("X-Antfly-Raft-Mutation-Outcome", "unknown-v1")]
+
+        class Connection:
+            sock = None
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                pass
+
+        with patch.object(cluster.http.client, "HTTPConnection", Connection):
+            result = cluster.request(
+                1,
+                {
+                    "method": "POST",
+                    "path": "/db/v1/tables/t",
+                    "is_write": True,
+                    "body": {},
+                    "expect": {"status": 409},
+                },
+                1,
+            )
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["unknown_write_outcome"])
+
     def test_queued_request_does_not_restart_original_budget(self):
         class Connection:
             sent = 0
