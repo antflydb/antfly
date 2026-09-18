@@ -2702,6 +2702,11 @@ pub const Backend = struct {
     }
 
     pub fn noteWriteMutationLocked(self: *Backend) void {
+        self.noteWriteMutationDeadlineLocked();
+        self.notePotentialMaintenanceDebtLocked();
+    }
+
+    fn noteWriteMutationDeadlineLocked(self: *Backend) void {
         if (self.options.mutable_idle_flush_after_ns > 0 and
             self.mutable.entryCount() > 0 and
             !self.options.backend.read_only)
@@ -2729,7 +2734,6 @@ pub const Backend = struct {
             self.mutable_idle_flush_deadline_ns = 0;
             self.mutable_idle_flush_max_deadline_ns = 0;
         }
-        self.notePotentialMaintenanceDebtLocked();
     }
 
     /// Apply the mutable-table idle policy to the complete, WAL-backed epochs
@@ -4310,6 +4314,10 @@ pub const Backend = struct {
         }
 
         pub fn deinit(self: *CompletionPointBatch) void {
+            self.deinitWithReclamation(true);
+        }
+
+        fn deinitWithReclamation(self: *CompletionPointBatch, schedule_reclamation: bool) void {
             const backend = self.backend;
             const owner = self.owner;
             const initial_lock = runtime_mod.lockBackend(Backend, backend);
@@ -4327,7 +4335,7 @@ pub const Backend = struct {
             // Return unused credit now, then each slice returns only bytes
             // whose physical buffers it actually freed.
             owner.retire();
-            runtime_mod.unlockBackend(Backend, backend, initial_lock);
+            unlockCompletionBoundary(backend, initial_lock, schedule_reclamation);
             var base_done = false;
             var candidate_done = false;
             while (!base_done or !candidate_done) {
@@ -4338,11 +4346,11 @@ pub const Backend = struct {
                 const locked = runtime_mod.lockBackend(Backend, backend);
                 if (candidate_done) self.candidate.ordered.spare = .empty;
                 backend.syncTrackedInMemoryStateUsageCurrentLocked();
-                runtime_mod.unlockBackend(Backend, backend, locked);
+                unlockCompletionBoundary(backend, locked, schedule_reclamation);
                 if (!base_done or !candidate_done) platform.time.yieldBriefly();
             }
             const final_lock = runtime_mod.lockBackend(Backend, backend);
-            defer runtime_mod.unlockBackend(Backend, backend, final_lock);
+            defer unlockCompletionBoundary(backend, final_lock, schedule_reclamation);
             var link = &backend.completion_batches;
             while (link.* != self) link = &link.*.?.next;
             link.* = self.next;
@@ -4390,6 +4398,152 @@ pub const Backend = struct {
         self.completion_batches = batch;
         self.syncTrackedInMemoryStateUsageCurrentLocked();
         return batch;
+    }
+
+    fn unlockCompletionBoundary(self: *Backend, locked: bool, schedule_reclamation: bool) void {
+        if (schedule_reclamation) {
+            runtime_mod.unlockBackend(Backend, self, locked);
+        } else if (locked) self.mu.unlock();
+    }
+
+    pub var test_completion_wal_sealed_hook: ?*const fn (*Backend, *storage_io.NativeWalCompletionIo) ?storage_io.Storage = null;
+    pub var test_completion_wal_after_append_hook: ?*const fn (*Backend) bool = null;
+
+    /// Internal one-shot native point commit. This seals resources for WAL
+    /// append and in-memory publication only, not SST/manifest completion or
+    /// restart reconstruction. No public transaction policy enables this API.
+    /// Caller must run normal maintenance afterward; this path only marks its
+    /// debt, and never schedules/allocates maintenance after the seal.
+    pub fn applyCompletionPointBatchWithWal(self: *Backend, namespace: backend_types.Namespace, operations: []const CompletionPointOperation, limits: CompletionPointLimits) !void {
+        const native = self.storage_owner orelse return error.UnsupportedCompletionBackend;
+        const root = self.root_dir orelse return error.UnsupportedCompletionBackend;
+        if (!std.fs.path.isAbsolute(root) or std.mem.indexOfScalar(u8, root, 0) != null) return error.UnsupportedCompletionPath;
+        if (!self.options.wal_enabled or self.storage == null or
+            self.storage.?.ptr != native.storage().ptr or self.storage.?.vtable != native.storage().vtable)
+            return error.UnsupportedCompletionBackend;
+        if (self.options.backend.read_only) return error.ReadOnly;
+        const manager = self.options.resource_manager orelse return error.CompletionResourceManagerRequired;
+        if (operations.len == 0 or operations.len > limits.max_operations) return error.CompletionBatchTooLarge;
+        var bounded_input: usize = 0;
+        for (operations) |op| {
+            for ([_]usize{ 25, if (namespace.name) |name| name.len else 0, op.key.len, if (op.value) |value| value.len else 0 }) |part| {
+                bounded_input = std.math.add(usize, bounded_input, part) catch return error.CompletionBatchTooLarge;
+                if (bounded_input > limits.max_encoded_bytes) return error.CompletionBatchTooLarge;
+            }
+        }
+        var batch: ?*CompletionPointBatch = null;
+        var reader_pinned = false;
+        defer {
+            // Candidate/base retirement can be large. Reuse the bounded
+            // off-lock physical cleanup, without scheduling new work.
+            if (batch) |owned| owned.deinitWithReclamation(false);
+            if (reader_pinned) {
+                const cleanup_lock = runtime_mod.lockBackend(Backend, self);
+                self.releaseReaderKind(.write_txn);
+                self.unlockCompletionBoundary(cleanup_lock, false);
+            }
+        }
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer self.unlockCompletionBoundary(locked, false);
+        if (self.closing.load(.acquire)) return error.LsmBackendClosed;
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        if (self.bulkIngestActive()) return error.UnsupportedCompletionBackend;
+        self.retainReaderKind(.write_txn);
+        reader_pinned = true;
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+        // Reserve the complete physical peak before input/COW allocation.
+        // Do not admit the input again once it is inside this owned domain.
+        try self.enforceInMemoryWriteAdmission(limits.physical_capacity);
+        const owner = try completion_allocator.Owner.create(self.allocator, manager, limits.physical_capacity);
+        defer if (batch == null) owner.retire();
+        const alloc = owner.allocator();
+        var incoming = ActiveMemTable{ .ordered_enabled = false };
+        defer incoming.deinit(alloc);
+        for (operations) |op| try incoming.upsert(alloc, namespace, op.key, op.value orelse "", op.value == null);
+        const encoded_bytes: u64 = @intCast(wal_mod.encodedStateRecordLen(&incoming));
+        if (encoded_bytes > limits.max_encoded_bytes) return error.CompletionBatchTooLarge;
+        const admission = try self.admitCommit(&incoming, &@as(State, .{}));
+        var committed_or_uncertain = false;
+        defer {
+            if (committed_or_uncertain or self.manifest_recovery_required) admission.retainDebt();
+            admission.release();
+        }
+        try self.prepareWalAppendForPressureLocked(encoded_bytes);
+        // Both admission paths above can flush/unlock/change the live root.
+        if (self.closing.load(.acquire)) return error.LsmBackendClosed;
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        if (self.bulkIngestActive()) return error.UnsupportedCompletionBackend;
+        try self.prepareWalOperationLockFile();
+        var wal_lock = try self.acquireWalOperationLock(.exclusive);
+        defer wal_lock.release();
+        var memory_metadata = try manager.pinObserverMetadata(.lsm_in_memory_state, &self.tracked_in_memory_state_bytes);
+        defer memory_metadata.release() catch unreachable;
+        var wal_metadata = try manager.pinObserverMetadata(.lsm_wal_retention, &self.tracked_wal_retention_bytes);
+        defer wal_metadata.release() catch unreachable;
+        const retained = try self.cachedWalRetentionLocked();
+        const replay_retained = try self.cachedWalReplayRetentionLocked();
+        self.syncTrackedWalRetentionUsageLocked(retained.bytes +| replay_retained.bytes);
+        // Admit WAL growth before I/O, then atomically move this contribution
+        // into the existing observer. Cap reductions cannot revoke it. An
+        // uncertain append retains the full conservative record charge until
+        // an authoritative retention snapshot/recovery reconciles the bytes.
+        var wal_growth: u64 = 0;
+        try manager.adjustUsage(.lsm_wal_retention, &wal_growth, encoded_bytes);
+        defer manager.observeUsage(.lsm_wal_retention, &wal_growth, 0);
+        const published_retention = std.math.add(u64, self.tracked_wal_retention_bytes, encoded_bytes) catch return error.ResourceBudgetExceeded;
+        const prepared_batch = try alloc.create(CompletionPointBatch);
+        var batch_transferred = false;
+        defer if (!batch_transferred) alloc.destroy(prepared_batch);
+        var base = try self.mutable.snapshot(alloc);
+        defer if (!batch_transferred) base.deinit(alloc);
+        var candidate = try self.mutable.preparePublication(alloc, &incoming);
+        defer if (!batch_transferred) candidate.deinit(alloc);
+        var append = try wal_mod.PreparedAppend.init(alloc, root, &incoming, self.options.wal_sync_on_commit, .{ .segment_bytes = self.options.wal_segment_bytes });
+        defer append.deinit();
+        // Reserve the native bundle after ordinary metadata reads: holding
+        // its permits while entering normal FD admission could self-block at
+        // a small descriptor limit.
+        const io_scope = try storage_io.NativeWalCompletionIo.create(alloc, native, root);
+        defer io_scope.deinit() catch unreachable;
+        // Everything fallible except storage effects is complete. No stale
+        // check or allocator/admission operation follows this seal.
+        prepared_batch.* = .{ .backend = self, .owner = owner, .base = base, .candidate = candidate, .next = self.completion_batches };
+        self.completion_batches = prepared_batch;
+        batch = prepared_batch;
+        batch_transferred = true;
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+        try owner.markPublished();
+        const storage = if (builtin.is_test) blk: {
+            if (test_completion_wal_sealed_hook) |hook| if (hook(self, io_scope)) |injected| break :blk injected;
+            break :blk io_scope.storage();
+        } else io_scope.storage();
+        const start_ns = self.writeStatsNowNs();
+        const outcome = self.wal_retention.appendPrepared(storage, alloc, &append, start_ns) catch unreachable;
+        // Both outcomes consumed the single storage attempt. Unknown is not a
+        // clean rollback, even if the provider reported FileNotFound/OOM.
+        manager.transferUsage(.lsm_wal_retention, &wal_growth, 0, &self.tracked_wal_retention_bytes, published_retention) catch unreachable;
+        committed_or_uncertain = true;
+        const result = switch (outcome) {
+            .appended => |value| value,
+            .uncertain => |err| {
+                self.fenceFailedBulkWal();
+                return err;
+            },
+        };
+        if (builtin.is_test) if (test_completion_wal_after_append_hook) |hook| {
+            if (hook(self)) {
+                self.fenceFailedBulkWal();
+                return error.InjectedCompletionCrashBeforePublication;
+            }
+        };
+        self.noteMutableWalSegment(result.segment);
+        self.invalidateMutableReadSnapshot();
+        self.mutable.publishPrepared(&prepared_batch.candidate);
+        prepared_batch.published = true;
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+        self.recordCompletedWalAppend(incoming.entryCount(), result, start_ns);
+        self.noteWriteMutationDeadlineLocked();
+        self.cached_maintenance_hint.store(1, .release);
     }
 
     pub fn beginBatch(self: *Backend) !NamespaceWriteTxn {
@@ -5962,8 +6116,12 @@ pub const Backend = struct {
         };
         self.noteMutableWalSegment(append_result.segment);
         self.syncTrackedWalRetentionUsageCurrentLocked();
+        self.recordCompletedWalAppend(state.entryCount(), append_result, start_ns);
+    }
+
+    fn recordCompletedWalAppend(self: *Backend, entry_count: usize, append_result: wal_mod.AppendResult, start_ns: u64) void {
         self.write_stats.wal_append_records += 1;
-        self.write_stats.wal_append_entries += @intCast(state.entryCount());
+        self.write_stats.wal_append_entries += @intCast(entry_count);
         self.write_stats.wal_append_bytes += append_result.bytes;
         self.write_stats.wal_segment_syncs += append_result.segment_syncs;
         self.write_stats.wal_index_syncs += append_result.index_syncs;
@@ -22929,6 +23087,297 @@ fn implementationTests() type {
             defer reopened.close();
             try std.testing.expectEqualStrings("old-a", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "a"));
             try std.testing.expectEqualStrings("old-b", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "b"));
+        }
+
+        test "workload admission lsm native prepaid point commit seals heap FD and admission demand before WAL publication" {
+            const Fixture = struct {
+                var allocation: *std.testing.FailingAllocator = undefined;
+                var identity: *std.testing.FailingAllocator = undefined;
+                var cache: *std.testing.FailingAllocator = undefined;
+                var pool: *storage_io.NativeStoragePool = undefined;
+                var manager: *resource_manager_mod.ResourceManager = undefined;
+                var saturation: ?resource_manager_mod.Reservation = null;
+                var owner: ?*completion_allocator.Owner = null;
+                var exhaust: bool = false;
+                fn seal(backend: *Backend, scope: *storage_io.NativeWalCompletionIo) ?storage_io.Storage {
+                    owner = backend.completion_batches.?.owner;
+                    std.debug.assert(scope.permit.active and scope.permit.count == 2);
+                    if (!exhaust) return null;
+                    const remaining = manager.memory.budget.hard_limit_bytes - manager.snapshot().memory.used_bytes;
+                    saturation = manager.reserveWithoutReclaim(.lsm_in_memory_state, remaining) catch unreachable;
+                    manager.memory.budget.hard_limit_bytes = 1;
+                    pool.fd_cache.capacity = 1;
+                    allocation.fail_index = allocation.alloc_index;
+                    identity.fail_index = identity.alloc_index;
+                    cache.fail_index = cache.alloc_index;
+                    return null;
+                }
+            };
+            const alloc = std.testing.allocator;
+            var failing = std.testing.FailingAllocator.init(alloc, .{});
+            var identity = std.testing.FailingAllocator.init(alloc, .{});
+            var cache = std.testing.FailingAllocator.init(alloc, .{});
+            var pool = storage_io.NativeStoragePool.initWithCapacityForTest(cache.allocator(), 32);
+            defer pool.deinit();
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = identity.allocator(), .memory_budget = .{ .hard_limit_bytes = 16 * 1024 * 1024 } });
+            defer manager.deinit(alloc);
+            var path_buffer: [256]u8 = undefined;
+            const root_z = repository_mod.tmpPath(&path_buffer, "native-prepaid-point");
+            const root = std.mem.span(root_z);
+            defer repository_mod.cleanupTmp(root_z);
+            var backend = try Backend.open(failing.allocator(), root, .{ .resource_manager = &manager, .native_storage_pool = &pool, .flush_threshold = 1000, .wal_segment_bytes = 1 });
+            var backend_live = true;
+            defer if (backend_live) backend.close();
+            Fixture.allocation = &failing;
+            Fixture.identity = &identity;
+            Fixture.cache = &cache;
+            Fixture.pool = &pool;
+            Fixture.manager = &manager;
+            Fixture.exhaust = false;
+            Fixture.saturation = null;
+            Backend.test_completion_wal_sealed_hook = Fixture.seal;
+            defer Backend.test_completion_wal_sealed_hook = null;
+            const limits: Backend.CompletionPointLimits = .{ .max_operations = 2, .max_encoded_bytes = 1024, .physical_capacity = 256 * 1024 };
+            try backend.applyCompletionPointBatchWithWal(.{}, &.{ .{ .key = "a", .value = "before" }, .{ .key = "shared", .value = "unchanged" } }, limits);
+            const first_owner = Fixture.owner.?;
+            var old = try backend.beginRead();
+            var old_live = true;
+            defer if (old_live) old.abort();
+            Fixture.exhaust = true;
+            const outcome = backend.applyCompletionPointBatchWithWal(.{}, &.{ .{ .key = "a", .value = "after" }, .{ .key = "b", .value = "new" } }, limits);
+            failing.fail_index = std.math.maxInt(usize);
+            identity.fail_index = std.math.maxInt(usize);
+            cache.fail_index = std.math.maxInt(usize);
+            manager.memory.budget.hard_limit_bytes = 16 * 1024 * 1024;
+            pool.fd_cache.capacity = 32;
+            Fixture.saturation.?.release();
+            try outcome;
+            try std.testing.expect(!failing.has_induced_failure and !identity.has_induced_failure and !cache.has_induced_failure);
+            try std.testing.expect(first_owner.retired and first_owner.tracked > 0);
+            try std.testing.expect(Fixture.owner.?.retired and Fixture.owner.?.tracked > 0);
+            try std.testing.expectEqualStrings("before", try old.get(.{}, "a"));
+            try std.testing.expectEqualStrings("after", try backend.getMergedWithMutable(&backend.mutable, .{}, "a"));
+            try std.testing.expectEqualStrings("unchanged", try backend.getMergedWithMutable(&backend.mutable, .{}, "shared"));
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+            try std.testing.expect(backend.completion_batches == null);
+            try std.testing.expectEqual(@as(usize, 0), manager.observer_metadata_pins);
+            old.abort();
+            old_live = false;
+            backend.abandonAfterCrash();
+            backend_live = false;
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+            var reopened = try Backend.open(alloc, root, .{ .backend = .{ .read_only = true } });
+            defer reopened.close();
+            try std.testing.expectEqualStrings("after", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "a"));
+            try std.testing.expectEqualStrings("new", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "b"));
+        }
+
+        test "workload admission lsm native prepaid point commit fences uncertain append and recovers unpublished durable bytes" {
+            const Fixture = struct {
+                const Fault = enum { partial, missing, synced, before_publication };
+                var fault: Fault = .partial;
+                var backing: storage_io.Storage = undefined;
+                var vtable: storage_io.Storage.VTable = undefined;
+                var append_calls: usize = 0;
+                fn append(_: *anyopaque, path: []const u8, bytes: []const u8, sync: bool) !void {
+                    append_calls += 1;
+                    try backing.appendFileAbsolute(std.testing.allocator, path, if (fault == .synced) bytes else bytes[0 .. bytes.len / 2], sync);
+                    return if (fault == .missing) error.FileNotFound else error.InjectedSealedWalWrite;
+                }
+                fn seal(_: *Backend, scope: *storage_io.NativeWalCompletionIo) ?storage_io.Storage {
+                    if (fault == .before_publication) return null;
+                    backing = scope.storage();
+                    vtable = backing.vtable.*;
+                    vtable.append_file_absolute = append;
+                    return .{ .ptr = backing.ptr, .vtable = &vtable };
+                }
+                fn afterAppend(_: *Backend) bool {
+                    return fault == .before_publication;
+                }
+            };
+            const alloc = std.testing.allocator;
+            Backend.test_completion_wal_sealed_hook = Fixture.seal;
+            defer Backend.test_completion_wal_sealed_hook = null;
+            Backend.test_completion_wal_after_append_hook = Fixture.afterAppend;
+            defer Backend.test_completion_wal_after_append_hook = null;
+            for (std.enums.values(Fixture.Fault)) |fault| {
+                var path_buffer: [256]u8 = undefined;
+                const root_z = repository_mod.tmpPath(&path_buffer, "native-prepaid-fault");
+                const root = std.mem.span(root_z);
+                defer repository_mod.cleanupTmp(root_z);
+                var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+                defer manager.deinit(alloc);
+                {
+                    var backend = try Backend.open(alloc, root, .{ .resource_manager = &manager, .flush_threshold = 1000 });
+                    defer backend.abandonAfterCrash();
+                    var seed = try backend.beginWrite();
+                    errdefer seed.abort();
+                    try seed.put(.{}, "before", "committed");
+                    try seed.commit();
+                    const previous_debt = backend.manifest_unpublished_wire_bytes;
+                    Fixture.fault = fault;
+                    Fixture.append_calls = 0;
+                    const expected = switch (fault) {
+                        .partial, .synced => error.InjectedSealedWalWrite,
+                        .missing => error.FileNotFound,
+                        .before_publication => error.InjectedCompletionCrashBeforePublication,
+                    };
+                    try std.testing.expectError(expected, backend.applyCompletionPointBatchWithWal(.{}, &.{.{ .key = "uncertain", .value = "durable-maybe" }}, .{ .max_operations = 1, .max_encoded_bytes = 256, .physical_capacity = 256 * 1024 }));
+                    try std.testing.expectEqual(@as(usize, if (fault == .before_publication) 0 else 1), Fixture.append_calls);
+                    try std.testing.expect(backend.manifest_recovery_required);
+                    try std.testing.expect(backend.manifest_unpublished_wire_bytes > previous_debt);
+                    try std.testing.expectEqual(@as(usize, 0), backend.manifest_admitted_commits);
+                    try std.testing.expectEqual(@as(usize, 0), manager.observer_metadata_pins);
+                    try std.testing.expect(backend.completion_batches == null);
+                    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "uncertain"));
+                    try std.testing.expectError(error.RecoveryRequired, backend.applyCompletionPointBatchWithWal(.{}, &.{.{ .key = "later", .value = "must-not-ack" }}, .{ .max_operations = 1, .max_encoded_bytes = 256, .physical_capacity = 256 * 1024 }));
+                }
+                try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+                {
+                    var reopened = try Backend.open(alloc, root, .{ .flush_threshold = 1000 });
+                    defer reopened.abandonAfterCrash();
+                    try std.testing.expectEqualStrings("committed", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "before"));
+                    if (fault == .synced or fault == .before_publication) {
+                        try std.testing.expectEqualStrings("durable-maybe", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "uncertain"));
+                    } else try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{}, "uncertain"));
+                    var next = try reopened.beginWrite();
+                    errdefer next.abort();
+                    try next.put(.{}, "after-recovery", "acknowledged");
+                    try next.commit();
+                }
+                {
+                    var reopened = try Backend.open(alloc, root, .{ .backend = .{ .read_only = true } });
+                    defer reopened.close();
+                    try std.testing.expectEqualStrings("acknowledged", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "after-recovery"));
+                }
+            }
+        }
+
+        test "workload admission lsm native prepaid point commit preparation failures release credit and leave WAL untouched" {
+            const alloc = std.testing.allocator;
+            var failing = std.testing.FailingAllocator.init(alloc, .{});
+            var pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 32);
+            defer pool.deinit();
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+            defer manager.deinit(alloc);
+            var path_buffer: [256]u8 = undefined;
+            const root_z = repository_mod.tmpPath(&path_buffer, "native-prepaid-preparation");
+            const root = std.mem.span(root_z);
+            defer repository_mod.cleanupTmp(root_z);
+            var backend = try Backend.open(failing.allocator(), root, .{ .resource_manager = &manager, .native_storage_pool = &pool, .flush_threshold = 1000 });
+            defer backend.close();
+            const operations = [_]Backend.CompletionPointOperation{.{ .key = "key", .value = "value" }};
+            const limits: Backend.CompletionPointLimits = .{ .max_operations = 1, .max_encoded_bytes = 256, .physical_capacity = 256 * 1024 };
+            pool.fd_cache.capacity = pool.fd_cache.persistent_reserve;
+            const fd_failure = backend.applyCompletionPointBatchWithWal(.{}, &operations, limits);
+            pool.fd_cache.capacity = 32;
+            try std.testing.expectError(error.DescriptorAdmissionExhausted, fd_failure);
+            const backlog = backend.options.manifest_commit_backlog_bytes;
+            backend.options.manifest_commit_backlog_bytes = 1;
+            const backlog_failure = backend.applyCompletionPointBatchWithWal(.{}, &operations, limits);
+            backend.options.manifest_commit_backlog_bytes = backlog;
+            try std.testing.expectError(error.ResourceBudgetExceeded, backlog_failure);
+            const wal_limit = backend.options.wal_hard_limit_bytes;
+            backend.options.wal_hard_limit_bytes = 1;
+            const wal_failure = backend.applyCompletionPointBatchWithWal(.{}, &operations, limits);
+            backend.options.wal_hard_limit_bytes = wal_limit;
+            try std.testing.expectError(error.WalRecordTooLarge, wal_failure);
+            const before = manager.snapshot().memory.used_bytes;
+            var reached_success = false;
+            for (0..128) |offset| {
+                failing.fail_index = failing.alloc_index + offset;
+                const outcome = backend.applyCompletionPointBatchWithWal(.{}, &operations, limits);
+                failing.fail_index = std.math.maxInt(usize);
+                if (outcome) |_| {
+                    reached_success = true;
+                    break;
+                } else |err| {
+                    try std.testing.expectEqual(error.OutOfMemory, err);
+                    try std.testing.expect(!backend.manifest_recovery_required);
+                    try std.testing.expect(backend.completion_batches == null);
+                    try std.testing.expectEqual(@as(usize, 0), backend.manifest_admitted_commits);
+                    try std.testing.expectEqual(@as(usize, 0), manager.observer_metadata_pins);
+                    try std.testing.expectEqual(@as(u64, 0), backend.write_stats.wal_append_records);
+                    try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+                }
+            }
+            try std.testing.expect(reached_success);
+            try std.testing.expectEqual(@as(u64, 1), backend.write_stats.wal_append_records);
+        }
+
+        test "workload admission lsm native prepaid point commit rejects unsupported providers and honors WAL pressure before sealing" {
+            const alloc = std.testing.allocator;
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+            defer manager.deinit(alloc);
+            const limits: Backend.CompletionPointLimits = .{ .max_operations = 1, .max_encoded_bytes = 256, .physical_capacity = 256 * 1024 };
+            const operations = [_]Backend.CompletionPointOperation{.{ .key = "key", .value = "value" }};
+            var memory = storage_io.MemoryStorage.init(alloc);
+            defer memory.deinit();
+            var unsupported = try Backend.open(alloc, "/non-native-prepaid", .{ .storage = memory.storage(), .resource_manager = &manager });
+            defer unsupported.close();
+            try std.testing.expectError(error.UnsupportedCompletionBackend, unsupported.applyCompletionPointBatchWithWal(.{}, &operations, limits));
+            var path_buffer: [256]u8 = undefined;
+            const root_z = repository_mod.tmpPath(&path_buffer, "native-prepaid-pressure");
+            const root = std.mem.span(root_z);
+            defer repository_mod.cleanupTmp(root_z);
+            {
+                var backend = try Backend.open(alloc, root, .{ .resource_manager = &manager, .flush_threshold = 1000, .wal_hard_limit_bytes = 80, .wal_segment_bytes = 64 });
+                defer backend.abandonAfterCrash();
+                try backend.applyCompletionPointBatchWithWal(.{}, &operations, limits);
+                try backend.applyCompletionPointBatchWithWal(.{}, &.{.{ .key = "after-pressure", .value = "next" }}, limits);
+                try std.testing.expect(backend.write_stats.wal_pressure_admission_checkpoints > 0);
+                try std.testing.expect(backend.runs.count() > 0);
+                try std.testing.expectEqualStrings("value", try backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
+                try std.testing.expectEqualStrings("next", try backend.getMergedWithMutable(&backend.mutable, .{}, "after-pressure"));
+            }
+            var read_only = try Backend.open(alloc, root, .{ .resource_manager = &manager, .backend = .{ .read_only = true } });
+            defer read_only.close();
+            try std.testing.expectError(error.ReadOnly, read_only.applyCompletionPointBatchWithWal(.{}, &operations, limits));
+            try std.testing.expectEqualStrings("next", try read_only.getMergedWithMutable(&read_only.mutable, .{}, "after-pressure"));
+        }
+
+        test "workload admission lsm native prepaid point commit keeps backend alive through sealed close" {
+            const Fixture = struct {
+                var start = std.atomic.Value(bool).init(false);
+                var done = std.atomic.Value(bool).init(false);
+                var waited: bool = false;
+                fn close(backend: *Backend) void {
+                    while (!start.load(.acquire)) platform.time.yieldBriefly();
+                    backend.close();
+                    done.store(true, .release);
+                }
+                fn seal(backend: *Backend, _: *storage_io.NativeWalCompletionIo) ?storage_io.Storage {
+                    start.store(true, .release);
+                    while (!backend.closing.load(.acquire)) platform.time.yieldBriefly();
+                    waited = !done.load(.acquire);
+                    return null;
+                }
+            };
+            const alloc = std.testing.allocator;
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+            defer manager.deinit(alloc);
+            var path_buffer: [256]u8 = undefined;
+            const root_z = repository_mod.tmpPath(&path_buffer, "native-prepaid-close");
+            const root = std.mem.span(root_z);
+            defer repository_mod.cleanupTmp(root_z);
+            var backend = try Backend.open(alloc, root, .{ .resource_manager = &manager, .flush_threshold = 1000 });
+            Fixture.start.store(false, .release);
+            Fixture.done.store(false, .release);
+            Fixture.waited = false;
+            const closer = try std.Thread.spawn(.{}, Fixture.close, .{&backend});
+            Backend.test_completion_wal_sealed_hook = Fixture.seal;
+            defer Backend.test_completion_wal_sealed_hook = null;
+            const outcome = backend.applyCompletionPointBatchWithWal(.{}, &.{.{ .key = "before-close", .value = "committed" }}, .{ .max_operations = 1, .max_encoded_bytes = 256, .physical_capacity = 256 * 1024 });
+            // Also release the close thread if a preparation regression fails
+            // before the hook, so the test reports failure instead of hanging.
+            Fixture.start.store(true, .release);
+            closer.join();
+            try outcome;
+            try std.testing.expect(Fixture.waited and Fixture.done.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+            var reopened = try Backend.open(alloc, root, .{ .backend = .{ .read_only = true } });
+            defer reopened.close();
+            try std.testing.expectEqualStrings("committed", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "before-close"));
         }
 
         test "workload admission lsm prepaid sealed publication preserves shared old charges and reader ownership" {

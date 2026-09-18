@@ -92,3 +92,57 @@ This is not durable transaction completion. No WAL or manifest admission is
 bypassed. Durable pre-prepare physical-plan certificates, restart reservations,
 replay/backlog capacity, and protected WAL/manifest/flush resources remain
 requirements before public transaction policy can claim mandatory completion.
+
+## One-shot native WAL point commits
+
+`Backend.applyCompletionPointBatchWithWal(namespace, operations, limits)` now
+provides an internal native persistent path. It accepts bounded point puts and
+tombstones on a writable, backend-owned native store with WAL enabled and a
+ResourceManager. Custom providers, memory-only stores, read-only handles and
+active bulk sessions fail closed. No public configuration invokes it.
+
+Before sealing, it applies ordinary aggregate-memory, manifest/backlog and WAL
+retention admission, including any pressure-driven flush. It then owns the
+complete copied input, COW successor, encoded WAL record, prepared native paths,
+two native FD permits, WAL serialization, and a backend lifecycle pin. COW is
+built after admission that can release the backend mutex. Observer metadata is
+pinned before the irreversible boundary; these pins grant no byte credit.
+WAL growth is separately admitted into a temporary observer and atomically
+transferred into the backend retention observer after the attempt. The same
+bytes are never released and reacquired or counted twice. This follows the
+existing ResourceManager treatment of WAL retention; it does not reserve
+filesystem free space or guarantee successful device I/O.
+
+The seal forbids further allocation in the physical owner. Native append and
+publication keep the backend and WAL locks. Publication is a prepared root
+swap with no subsequent stale-state validation. A failed or uncertain storage
+attempt fences the backend, preserves manifest debt and retains conservative
+WAL-growth accounting until recovery or an authoritative retention snapshot.
+The original error is returned, with no implicit resend. Fully written but
+unpublished records remain recoverable through ordinary backend reopen.
+
+The operation marks maintenance deadlines and debt without starting new
+allocating maintenance. Its caller must continue the normal maintenance loop;
+this API does not finish SST construction or manifest publication. Native
+working buffers and unused credit retire on return, while shared tree nodes
+remain charged to their heap-stable owner through the final reader. Ticket
+reclamation runs in bounded slices outside the writer lock, with a backend pin
+held through cleanup. Close waits for that ownership.
+
+Native tests cover allocation/FD/admission exhaustion after sealing, lower
+limits, pinned readers, WAL rotation, pressure checkpoints before COW, manifest
+backlog and FD rejection, preparation allocation failures, partial and fully
+synced unknown outcomes, failure between append and publication, writable
+recovery, and close overlapping the sealed operation. These are local resource
+ownership and storage correctness tests, not throughput qualification.
+
+This remains a single-call internal mechanism. It supplies no durable
+pre-prepare transaction certificate, retained cross-request ticket, restart
+reservation reconstruction, or protected SST/manifest completion guarantee.
+Those boundaries must be implemented before enabling a public transaction
+policy that promises mandatory completion.
+
+The native stage's focused suite passed 21 tests in each of Debug and
+ReleaseSafe, with zero failures, skips or leaks. From `zig/`, run
+`zig build lsm-backend-test -j1` (or add `-Doptimize=ReleaseSafe`), followed by
+`-- --test-filter 'workload admission lsm' --test-filter 'observer metadata pin' --test-filter 'lsm WAL uncertainty' --test-filter 'lsm backend write stats separate'`.

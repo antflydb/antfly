@@ -6109,7 +6109,7 @@ test "resource manager records index repair activation pause separately from cle
     try std.testing.expectEqual(@as(u64, 25 * std.time.ns_per_ms), stats.last_budget_ns);
 }
 
-test "observer metadata pin admits bookkeeping before allocation-free zero transitions" {
+test "workload admission observer metadata pin admits bookkeeping before allocation-free zero transitions" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator(), .memory_budget = .{ .hard_limit_bytes = 32 } });
     defer manager.deinit(std.testing.allocator);
@@ -6131,7 +6131,7 @@ test "observer metadata pin admits bookkeeping before allocation-free zero trans
     try std.testing.expectEqual(@as(usize, 0), manager.observer_identities.count());
 }
 
-test "observer metadata pin canonical generation rejects copied stale release and completion owner" {
+test "workload admission observer metadata pin canonical generation rejects copied stale release and completion owner" {
     var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
     defer manager.deinit(std.testing.allocator);
     var current: u64 = 0;
@@ -6154,7 +6154,7 @@ test "observer metadata pin canonical generation rejects copied stale release an
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 
-test "observer metadata pin preserves atomic transfer endpoints without post-seal allocation" {
+test "workload admission observer metadata pin preserves atomic transfer endpoints without post-seal allocation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator(), .memory_budget = .{ .hard_limit_bytes = 32 } });
     defer manager.deinit(std.testing.allocator);
@@ -6175,7 +6175,7 @@ test "observer metadata pin preserves atomic transfer endpoints without post-sea
     try std.testing.expectEqual(@as(usize, 2), manager.observer_identities.count());
 }
 
-test "observer metadata pin allocation failure rolls back bookkeeping and identity exhaustion fails closed" {
+test "workload admission observer metadata pin allocation failure rolls back bookkeeping and identity exhaustion fails closed" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator() });
     defer manager.deinit(std.testing.allocator);
