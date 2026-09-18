@@ -93,11 +93,21 @@ The implementation now consists of:
   Each catalog checkpoint owns an immutable descriptor containing its history
   root and a copy-on-write B+ tree mapping keys to their latest record pages.
   Point reads and misses use bounded tree searches, including after reopening
-  and at older pinned checkpoints. Empty keys and keys too large for a tree
-  separator retain exact history lookup; ordinary index paths use the tree.
+  and at older pinned checkpoints. Empty keys are indexed, and keys longer
+  than 512 bytes use references to their immutable record pages in both leaves
+  and separators. This bounds encoded key slots so mixed-size keys always
+  admit a split, including maximum-length catalog keys. Vacuum rebuilds those
+  references against the new generation; integrity checks prove that the
+  referenced records remain reachable in the checkpoint.
+  Directory listing and subtree deletion seek the catalog tree at a path
+  prefix instead of replaying mutation history. Listing pins a checkpoint and
+  holds the generation read lock, allowing ordinary commits to continue.
   External catalog values use a 64-way immutable extent tree with byte lengths
-  on each child. Appends copy only the rightmost path and partial tail leaf;
-  range reads seek directly to the requested extents. Vacuum builds packed
+  on each child. Appends retain one unfinished node per height, fill the partial
+  tail leaf, and seal suffix subtrees once. Existing full subtrees remain
+  shared, so large appends no longer rewrite the ancestor path per leaf and
+  temporary memory depends on tree height rather than suffix length.
+  Range reads seek directly to the requested extents. Vacuum builds packed
   catalog indexes and extent trees; integrity checks validate both structures.
   Positional page writes extend the file directly, without per-page stat or
   resize calls; data, checkpoint-slot, and active-slot sync barriers remain.

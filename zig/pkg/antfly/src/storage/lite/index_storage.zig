@@ -215,26 +215,37 @@ fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
 
 fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try validateIndexPath(self, path);
+    const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
+    try validateIndexPath(self, directory);
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
-
-    const index_records = try self.docs.file.snapshotIndexCatalogKeysAlloc(self.allocator);
-    defer native.NativeFile.freeSnapshotCatalogKeys(self.allocator, index_records);
 
     var mutations = std.ArrayListUnmanaged(native.CatalogMutation).empty;
     defer {
         for (mutations.items) |mutation| self.allocator.free(mutation.key);
         mutations.deinit(self.allocator);
     }
-
-    for (index_records) |record| {
-        if (!pathContains(path, record.key)) continue;
+    // A subtree includes the exact logical file, but never a neighboring name
+    // such as /a-other. Seek descendants using the slash boundary separately.
+    if (try self.docs.file.getIndexCatalogRecordSize(directory) != null) {
+        const key = try self.allocator.dupe(u8, directory);
+        errdefer self.allocator.free(key);
+        try mutations.append(self.allocator, .{ .key = key, .is_delete = true });
+    }
+    const prefix = if (std.mem.eql(u8, directory, "/"))
+        try self.allocator.dupe(u8, "/")
+    else
+        try std.fmt.allocPrint(self.allocator, "{s}/", .{directory});
+    defer self.allocator.free(prefix);
+    var cursor = try self.docs.file.indexCatalogCursor(self.docs.file.activeCheckpoint(), prefix);
+    defer cursor.deinit();
+    while (try cursor.next()) |record| {
+        defer self.docs.file.allocator.free(record.key);
+        if (std.mem.eql(u8, record.key, directory)) continue;
         const key = try self.allocator.dupe(u8, record.key);
         errdefer self.allocator.free(key);
         try mutations.append(self.allocator, .{ .key = key, .is_delete = true });
     }
-
     try self.docs.file.putIndexCatalogBatch(mutations.items);
 }
 
@@ -242,19 +253,24 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
-
-    // Enumerate current keys without reading file payloads. The snapshot
-    // resolves overwrites and tombstones under the same checkpoint lock.
-    const keys = try self.docs.file.snapshotIndexCatalogKeysAlloc(allocator);
-    defer native.NativeFile.freeSnapshotCatalogKeys(allocator, keys);
+    const io = self.docs.file.runtime();
+    self.docs.generation_lock.lockSharedUncancelable(io);
+    defer self.docs.generation_lock.unlockShared(io);
+    const checkpoint = pinCheckpoint(self.docs);
+    const prefix = if (std.mem.eql(u8, directory, "/"))
+        try allocator.dupe(u8, "/")
+    else
+        try std.fmt.allocPrint(allocator, "{s}/", .{directory});
+    defer allocator.free(prefix);
+    var cursor = try self.docs.file.indexCatalogCursor(checkpoint, prefix);
+    defer cursor.deinit();
     var names = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (names.items) |name| allocator.free(name);
         names.deinit(allocator);
     }
-    for (keys) |record| {
+    while (try cursor.next()) |record| {
+        defer self.docs.file.allocator.free(record.key);
         const parent = std.fs.path.dirname(record.key) orelse continue;
         if (!std.mem.eql(u8, parent, directory)) continue;
         const name = try allocator.dupe(u8, std.fs.path.basename(record.key));
@@ -810,4 +826,47 @@ test "lite native index storage serializes physical writes without taking docume
     try storage.writeFileAbsolute("/indexes/ft/b.tbl", "released");
 
     try std.testing.expectError(error.FileBusy, docs.beginWrite());
+}
+
+test "lite native directory operations seek bounded prefixes independent of catalog history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "catalog-directory-seek.aflite");
+    defer alloc.free(path);
+    var docs = try docstore.Store.create(alloc, path, true);
+    defer docs.close();
+    var indexes = Store.init(alloc, &docs);
+    const storage = indexes.storage();
+    for (0..1000) |i| {
+        var key: [32]u8 = undefined;
+        try storage.writeFileAbsolute(try std.fmt.bufPrint(&key, "/unrelated/{d:0>8}", .{i}), "x");
+        try storage.writeFileAbsolute("/unrelated/repeated", try std.fmt.bufPrint(&key, "{d}", .{i}));
+    }
+    try storage.writeFileAbsolute("/a", "exact");
+    try storage.writeFileAbsolute("/a/one", "child");
+    try storage.writeFileAbsolute("/a/sub/two", "nested");
+    try storage.writeFileAbsolute("/a/deleted", "old");
+    try storage.deleteFileAbsolute("/a/deleted");
+    try storage.writeFileAbsolute("/a-other/keep", "neighbor");
+    const before = docs.file.test_page_reads.load(.monotonic);
+    const names = try storage.listFileNamesAlloc(alloc, "/a/");
+    defer StorageIo.freeFileNames(alloc, names);
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("one", names[0]);
+    try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - before <= 12);
+    const before_missing = docs.file.test_page_reads.load(.monotonic);
+    const missing = try storage.listFileNamesAlloc(alloc, "/absent");
+    defer StorageIo.freeFileNames(alloc, missing);
+    try std.testing.expectEqual(@as(usize, 0), missing.len);
+    try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - before_missing <= 6);
+    const before_delete = docs.file.test_page_reads.load(.monotonic);
+    try storage.deleteTree("/a/");
+    try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - before_delete <= 40);
+    try std.testing.expectError(error.FileNotFound, storage.fileSize("/a"));
+    try std.testing.expectError(error.FileNotFound, storage.fileSize("/a/one"));
+    try std.testing.expectError(error.FileNotFound, storage.fileSize("/a/sub/two"));
+    try std.testing.expectEqual(@as(u64, 8), try storage.fileSize("/a-other/keep"));
+    try std.testing.expectEqual(@as(u64, 1), try storage.fileSize("/unrelated/00000000"));
+    try std.testing.expect((try docs.file.check()).valid);
 }
