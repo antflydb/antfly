@@ -25994,17 +25994,9 @@ fn initLayeredSecretStore(
     io: std.Io,
     raw_paths: []const []const u8,
 ) !antfly.common.secrets.FileStore {
-    var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (normalized_paths.items) |path| alloc.free(path);
-        normalized_paths.deinit(alloc);
-    }
-    for (raw_paths) |raw_path| {
-        const normalized_path = try normalizeResolvedPathAlloc(alloc, raw_path);
-        errdefer alloc.free(normalized_path);
-        try normalized_paths.append(alloc, normalized_path);
-    }
-    return try antfly.common.secrets.FileStore.initLayeredWithIo(alloc, io, normalized_paths.items);
+    // FileStore owns these paths and must follow their current symlink targets
+    // on reload, including Kubernetes projected-volume generation switches.
+    return try antfly.common.secrets.FileStore.initLayeredWithIo(alloc, io, raw_paths);
 }
 
 fn resolveLocalBaseDir(
@@ -31827,6 +31819,10 @@ fn consumerTests() type {
             defer cfg.deinit(std.testing.allocator);
             try std.testing.expectEqualStrings("antfly.json", cfg.config_path.?);
             try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
+        }
+
+        test "data runtime secret store follows projected symlink rotation" {
+            try @import("../common/secret_projection_test_support.zig").expectRuntimeRotation(initLayeredSecretStore);
         }
 
         test "data runtime cli accepts secret store path" {
