@@ -1044,6 +1044,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "coordinator prunes the final score domain before paging",
             "profiled composed dense query preserves exact route telemetry",
             "aggregation completeness requires exact total relation",
+            "aggregation full-result rerun includes newly published text documents at the same identity generation",
+            "aggregation full-result rerun preserves the graph reranked hit page",
             "aggregation context rejects non-current identity generation",
             "aggregation text analysis selects the named full text index",
             "collect significant terms field requests gathers unique field terms from hits",
