@@ -115,6 +115,7 @@ pub const generation_reranking_vopr = @import("vopr/generation_reranking.zig");
 pub const distributed_query_vopr = @import("vopr/distributed_query.zig");
 pub const parquet_cache_vopr = @import("vopr/parquet_cache.zig");
 pub const provisioning_startup_vopr = @import("vopr/provisioning_startup.zig");
+pub const restore_admission_vopr = @import("vopr/restore_admission.zig");
 pub const generation_lifecycle_vopr = @import("vopr/generation_lifecycle.zig");
 pub const backfill_marker_discovery_vopr = @import("vopr/backfill_marker_discovery.zig");
 pub const config_extension_lifecycle_vopr = @import("vopr/config_extension_lifecycle.zig");
@@ -402,6 +403,7 @@ test {
     _ = distributed_query_vopr;
     _ = parquet_cache_vopr;
     _ = provisioning_startup_vopr;
+    _ = restore_admission_vopr;
     _ = generation_lifecycle_vopr;
     _ = backfill_marker_discovery_vopr;
     _ = config_extension_lifecycle_vopr;

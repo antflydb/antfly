@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from ..models.query_builder_result_plan import QueryBuilderResultPlan
     from ..models.query_builder_result_query import QueryBuilderResultQuery
     from ..models.query_request import QueryRequest
-    from ..models.retrieval_query_request import RetrievalQueryRequest
+    from ..models.retrieval_navigation_config import RetrievalNavigationConfig
 
 
 T = TypeVar("T", bound="QueryBuilderResult")
@@ -38,13 +38,15 @@ class QueryBuilderResult:
         remaining_user_clarifications (int | Unset): Remaining clarification turns allowed for this interaction.
         questions (list[AgentQuestion] | Unset): Clarification questions exposed in the shared bounded-agent envelope.
         query_request (QueryRequest | Unset):
-        retrieval_query_request (RetrievalQueryRequest | Unset): A canonical query in the retrieval pipeline with an
-            optional tree search
-            configuration. Each query specifies its own table. Deprecated stateful
-            graph_searches compatibility is intentionally unavailable here.
-
-            When both search fields (semantic_search, full_text_search) and tree_search
-            are provided, the search results are used as start nodes for tree navigation.
+        retrieval_query_request (QueryRequest | Unset):
+        retrieval_navigation (RetrievalNavigationConfig | Unset): Retrieval-step navigation targeting one ordinary
+            query. Graph navigation
+            follows one path; tree navigation explores a retained branch frontier.
+            Agentic selection uses the enclosing model and budgets. Ranked selection
+            is supported for trees and uses the existing deterministic tree traversal.
+            Agentic selection requires agentic mode and a retrieval generator. Search
+            starts exploration; navigation selects only an offered, unvisited node.
+            All reads enforce mandatory predicates and authenticated row filters.
         specialist (str | Unset): Specialist or strategy used to build the query, such as `full_text`, `filter`, or
             `hybrid`. Example: full_text.
         plan (QueryBuilderResultPlan | Unset): Optional machine-readable coordination plan for observability.
@@ -65,7 +67,8 @@ class QueryBuilderResult:
     remaining_user_clarifications: int | Unset = UNSET
     questions: list[AgentQuestion] | Unset = UNSET
     query_request: QueryRequest | Unset = UNSET
-    retrieval_query_request: RetrievalQueryRequest | Unset = UNSET
+    retrieval_query_request: QueryRequest | Unset = UNSET
+    retrieval_navigation: RetrievalNavigationConfig | Unset = UNSET
     specialist: str | Unset = UNSET
     plan: QueryBuilderResultPlan | Unset = UNSET
     explanation: str | Unset = UNSET
@@ -112,6 +115,10 @@ class QueryBuilderResult:
         if not isinstance(self.retrieval_query_request, Unset):
             retrieval_query_request = self.retrieval_query_request.to_dict()
 
+        retrieval_navigation: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.retrieval_navigation, Unset):
+            retrieval_navigation = self.retrieval_navigation.to_dict()
+
         specialist = self.specialist
 
         plan: dict[str, Any] | Unset = UNSET
@@ -153,6 +160,8 @@ class QueryBuilderResult:
             field_dict["query_request"] = query_request
         if retrieval_query_request is not UNSET:
             field_dict["retrieval_query_request"] = retrieval_query_request
+        if retrieval_navigation is not UNSET:
+            field_dict["retrieval_navigation"] = retrieval_navigation
         if specialist is not UNSET:
             field_dict["specialist"] = specialist
         if plan is not UNSET:
@@ -173,7 +182,7 @@ class QueryBuilderResult:
         from ..models.query_builder_result_plan import QueryBuilderResultPlan
         from ..models.query_builder_result_query import QueryBuilderResultQuery
         from ..models.query_request import QueryRequest
-        from ..models.retrieval_query_request import RetrievalQueryRequest
+        from ..models.retrieval_navigation_config import RetrievalNavigationConfig
 
         d = dict(src_dict)
         query = QueryBuilderResultQuery.from_dict(d.pop("query"))
@@ -221,11 +230,18 @@ class QueryBuilderResult:
             query_request = QueryRequest.from_dict(_query_request)
 
         _retrieval_query_request = d.pop("retrieval_query_request", UNSET)
-        retrieval_query_request: RetrievalQueryRequest | Unset
+        retrieval_query_request: QueryRequest | Unset
         if isinstance(_retrieval_query_request, Unset):
             retrieval_query_request = UNSET
         else:
-            retrieval_query_request = RetrievalQueryRequest.from_dict(_retrieval_query_request)
+            retrieval_query_request = QueryRequest.from_dict(_retrieval_query_request)
+
+        _retrieval_navigation = d.pop("retrieval_navigation", UNSET)
+        retrieval_navigation: RetrievalNavigationConfig | Unset
+        if isinstance(_retrieval_navigation, Unset):
+            retrieval_navigation = UNSET
+        else:
+            retrieval_navigation = RetrievalNavigationConfig.from_dict(_retrieval_navigation)
 
         specialist = d.pop("specialist", UNSET)
 
@@ -254,6 +270,7 @@ class QueryBuilderResult:
             questions=questions,
             query_request=query_request,
             retrieval_query_request=retrieval_query_request,
+            retrieval_navigation=retrieval_navigation,
             specialist=specialist,
             plan=plan,
             explanation=explanation,

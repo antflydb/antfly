@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.chat_tools_config import ChatToolsConfig
+    from ..models.retrieval_navigation_config import RetrievalNavigationConfig
 
 
 T = TypeVar("T", bound="RetrievalStepConfig")
@@ -21,6 +22,14 @@ class RetrievalStepConfig:
     the top-level request tools policy when both are present.
 
         Attributes:
+            navigation (RetrievalNavigationConfig | Unset): Retrieval-step navigation targeting one ordinary query. Graph
+                navigation
+                follows one path; tree navigation explores a retained branch frontier.
+                Agentic selection uses the enclosing model and budgets. Ranked selection
+                is supported for trees and uses the existing deterministic tree traversal.
+                Agentic selection requires agentic mode and a retrieval generator. Search
+                starts exploration; navigation selects only an offered, unvisited node.
+                All reads enforce mandatory predicates and authenticated row filters.
             tools (ChatToolsConfig | Unset): Configuration for retrieval agent tools.
 
                 If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools
@@ -31,10 +40,15 @@ class RetrievalStepConfig:
                 a prompt-based fallback is used with structured output parsing.
     """
 
+    navigation: RetrievalNavigationConfig | Unset = UNSET
     tools: ChatToolsConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        navigation: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.navigation, Unset):
+            navigation = self.navigation.to_dict()
+
         tools: dict[str, Any] | Unset = UNSET
         if not isinstance(self.tools, Unset):
             tools = self.tools.to_dict()
@@ -42,6 +56,8 @@ class RetrievalStepConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if navigation is not UNSET:
+            field_dict["navigation"] = navigation
         if tools is not UNSET:
             field_dict["tools"] = tools
 
@@ -50,8 +66,16 @@ class RetrievalStepConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.chat_tools_config import ChatToolsConfig
+        from ..models.retrieval_navigation_config import RetrievalNavigationConfig
 
         d = dict(src_dict)
+        _navigation = d.pop("navigation", UNSET)
+        navigation: RetrievalNavigationConfig | Unset
+        if isinstance(_navigation, Unset):
+            navigation = UNSET
+        else:
+            navigation = RetrievalNavigationConfig.from_dict(_navigation)
+
         _tools = d.pop("tools", UNSET)
         tools: ChatToolsConfig | Unset
         if isinstance(_tools, Unset):
@@ -60,6 +84,7 @@ class RetrievalStepConfig:
             tools = ChatToolsConfig.from_dict(_tools)
 
         retrieval_step_config = cls(
+            navigation=navigation,
             tools=tools,
         )
 

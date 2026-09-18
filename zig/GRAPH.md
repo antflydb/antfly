@@ -829,3 +829,9 @@ versions are rejected, not migrated or silently decoded.
 
 See [preparation and score-reader benchmarks](bench/graph/METRIC_PREPARATION.md)
 for reproducible phase-specific measurements and their limitations.
+
+## Retrieval-agent navigation
+
+Agentic graph walks and tree exploration are configured on the retrieval step.
+See [Retrieval-step navigation](../docs/design/retrieval-navigation.md) for the
+request contract, ranked/agentic behavior, budgets, and query API boundary.

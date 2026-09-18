@@ -37,18 +37,17 @@ pub fn add(ctx: Context, wasm_jinja: *std.Build.Module, wasm_platform: *std.Buil
 
     var finetune_ctx = finetune.fromWorkflow(ctx);
     finetune_ctx.publish_targets = false;
-    const finetune_step = @import("finetune/tests.zig").addTests(finetune_ctx, "inference-finetune-test");
+    const finetune_step = @import("finetune/tests.zig").addTests(finetune_ctx, "inference-finetune-test", true);
     const commands = @import("finetune/tools.zig").register(finetune_ctx);
     const workflows = @import("finetune/workflows.zig").register(finetune_ctx);
+    finetune_step.dependOn(finetune.addCommandChecks(finetune_ctx, &(@import("finetune/tools.zig").specs ++ @import("finetune/workflows.zig").specs)));
     for (commands) |command| {
-        finetune_step.dependOn(&command.executable.step);
         if (std.mem.eql(u8, command.executable.name, "train-gliner25"))
             ctx.step("train-gliner25", "Run a bounded GLiNER2.5 native training job").dependOn(&command.run.step);
         if (std.mem.eql(u8, command.executable.name, "materialize-gliner25-adapter"))
             ctx.step("materialize-gliner25-adapter", "Materialize a GLiNER2.5 adapter into an atomic FP32 bundle").dependOn(&command.run.step);
     }
     for (workflows) |command| {
-        finetune_step.dependOn(&command.executable.step);
         if (std.mem.eql(u8, command.executable.name, "gliner2-entity-training-readiness"))
             ctx.step("gliner2-entity-training-readiness", "Run GLiNER2 entity training readiness").dependOn(&command.run.step);
     }

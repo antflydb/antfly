@@ -370,6 +370,7 @@ pub const WriteProfile = struct {
     posting_lazy_centroid_deferrals: u64 = 0,
     posting_lazy_payload_deferrals: u64 = 0,
     posting_lazy_ancestor_deferrals: u64 = 0,
+    range_nodes_examined: u64 = 0,
     range_put_calls: u64 = 0,
     range_delete_calls: u64 = 0,
     range_key_bytes: u64 = 0,

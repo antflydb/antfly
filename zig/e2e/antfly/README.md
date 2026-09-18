@@ -9,6 +9,11 @@ Use product-area names for test files. Do not use migration labels like `*_parit
 
 ## Current Coverage
 
+- `test_aggregations.py`
+  - exact terms and stats over 11,000 synthetic documents
+  - read-only control followed by three trials with ten readers and two concurrent writers inserting documents without the aggregated field
+  - every query, aggregate value, and write response is checked; HTTP and server-log failures are retained in test output
+  - success at the configured aggregation budget and rejection above it
 - `test_quickstart.py`
   - serverless quickstart flow
   - text search
