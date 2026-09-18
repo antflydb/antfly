@@ -687,18 +687,19 @@ fn vertexGenerateRequestJsonAlloc(alloc: Allocator, messages: []const inference.
     errdefer out.deinit(alloc);
 
     var wrote_system = false;
+    var system_part_count: usize = 0;
     try out.append(alloc, '{');
     for (messages) |message| {
         if (message.role != .system) continue;
         const content = message.content orelse continue;
-        if (wrote_system) continue;
-        try out.appendSlice(alloc, "\"systemInstruction\":{\"parts\":");
-        try appendVertexParts(alloc, &out, content);
-        try out.append(alloc, '}');
-        wrote_system = true;
+        if (!wrote_system) {
+            try out.appendSlice(alloc, "\"systemInstruction\":{\"parts\":[");
+            wrote_system = true;
+        }
+        try appendVertexContentParts(alloc, &out, content, &system_part_count);
     }
 
-    if (wrote_system) try out.append(alloc, ',');
+    if (wrote_system) try out.appendSlice(alloc, "]},");
     try out.appendSlice(alloc, "\"contents\":[");
     var count: usize = 0;
     var i: usize = 0;
@@ -772,17 +773,7 @@ fn appendVertexContent(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), messa
         try out.append(alloc, '[');
         var count: usize = 0;
         if (message.content) |content| {
-            switch (content) {
-                .text => |text| {
-                    try appendVertexPart(alloc, out, .{ .text = text });
-                    count += 1;
-                },
-                .parts => |parts| for (parts) |part| {
-                    if (count > 0) try out.append(alloc, ',');
-                    try appendVertexPart(alloc, out, part);
-                    count += 1;
-                },
-            }
+            try appendVertexContentParts(alloc, out, content, &count);
         }
         if (message.tool_calls) |calls| for (calls) |call| {
             if (count > 0) try out.append(alloc, ',');
@@ -926,20 +917,17 @@ fn appendVertexTools(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), options
     }
 }
 
-fn appendVertexParts(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), content: inference.ChatMessageContent) !void {
+fn appendVertexContentParts(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), content: inference.ChatMessageContent, count: *usize) !void {
     switch (content) {
         .text => |text| {
-            try out.appendSlice(alloc, "[{\"text\":");
-            try appendJsonString(alloc, out, text);
-            try out.appendSlice(alloc, "}]");
+            if (count.* > 0) try out.append(alloc, ',');
+            try appendVertexPart(alloc, out, .{ .text = text });
+            count.* += 1;
         },
-        .parts => |parts| {
-            try out.append(alloc, '[');
-            for (parts, 0..) |part, i| {
-                if (i > 0) try out.append(alloc, ',');
-                try appendVertexPart(alloc, out, part);
-            }
-            try out.append(alloc, ']');
+        .parts => |parts| for (parts) |part| {
+            if (count.* > 0) try out.append(alloc, ',');
+            try appendVertexPart(alloc, out, part);
+            count.* += 1;
         },
     }
 }
@@ -1314,6 +1302,42 @@ test "gemini provider sends api key and generates content" {
     if (run_err) |err| return err;
 
     try std.testing.expectEqualStrings("generated from gemini", result.?.content);
+}
+
+test "vertex request preserves all agent system instructions in order" {
+    const alloc = std.testing.allocator;
+    const instructions = [_][]const u8{
+        "You are a database retrieval agent.",
+        "Answer in Spanish.",
+        "Business glossary: ARR means annual recurring revenue.",
+        "Use the supplied generation context.",
+        "Navigate only to offered neighbors.",
+    };
+    const body = try vertexGenerateRequestJsonAlloc(alloc, &.{
+        .{ .role = .system },
+        .{ .role = .system, .content = .{ .parts = &.{} } },
+        .{ .role = .system, .content = .{ .text = instructions[0] } },
+        .{ .role = .system, .content = .{ .text = instructions[1] } },
+        .{ .role = .user, .content = .{ .text = "Find ARR" } },
+        .{ .role = .system, .content = .{ .parts = &.{
+            .{ .text = instructions[2] },
+            .{ .text = instructions[3] },
+        } } },
+        .{ .role = .system, .content = .{ .parts = &.{} } },
+        .{ .role = .system, .content = .{ .text = instructions[4] } },
+    }, .{});
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const parts = parsed.value.object.get("systemInstruction").?.object.get("parts").?.array.items;
+    try std.testing.expectEqual(instructions.len, parts.len);
+    for (instructions, parts) |expected, part| {
+        try std.testing.expectEqualStrings(expected, part.object.get("text").?.string);
+    }
+    const contents = parsed.value.object.get("contents").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), contents.len);
+    try std.testing.expectEqualStrings("user", contents[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("Find ARR", contents[0].object.get("parts").?.array.items[0].object.get("text").?.string);
 }
 
 test "vertex request serialization includes max output tokens" {
