@@ -1034,13 +1034,17 @@ pub const Context = struct {
         sock: *Socket,
         stream_id: u31,
         io: Io,
+        context: ?*const Context = null,
         closed: bool = false,
+        suppress_body: bool = false,
 
         /// Sends data as DATA frames without END_STREAM.
         /// Blocks if the flow-control window is exhausted, resuming
         /// when WINDOW_UPDATE frames are received from the peer.
         pub fn write(self: *H2StreamWriter, data: []const u8) !void {
             if (self.closed) return error.StreamClosed;
+            if (self.context) |ctx| try ctx.checkStreamActive();
+            if (self.suppress_body) return;
             self.h2.write_mutex.lockUncancelable(self.io);
             defer self.h2.write_mutex.unlock(self.io);
             try self.h2.writeDataBlocking(self.sock, self.stream_id, data, false);
@@ -1049,7 +1053,9 @@ pub const Context = struct {
         /// Sends END_STREAM and marks the writer done.
         pub fn close(self: *H2StreamWriter) !void {
             if (self.closed) return;
+            if (self.context) |ctx| try ctx.checkStreamActive();
             self.closed = true;
+            if (self.suppress_body) return;
             self.h2.write_mutex.lockUncancelable(self.io);
             defer self.h2.write_mutex.unlock(self.io);
             try self.h2.writeData(self.sock, self.stream_id, &.{}, true);
@@ -1060,7 +1066,9 @@ pub const Context = struct {
         /// Closes the writer — no further writes are allowed.
         pub fn sendTrailers(self: *H2StreamWriter, trailers: []const hpack.HeaderEntry) !void {
             if (self.closed) return error.StreamClosed;
+            if (self.context) |ctx| try ctx.checkStreamActive();
             self.closed = true;
+            if (self.suppress_body) return;
             self.h2.write_mutex.lockUncancelable(self.io);
             defer self.h2.write_mutex.unlock(self.io);
             try self.h2.sendHeaders(self.sock, self.stream_id, trailers, true);
@@ -1071,6 +1079,8 @@ pub const Context = struct {
     /// DATA frames. The handler must call `writer.close()` when done.
     /// Only available for HTTP/2 streams.
     pub fn streamH2(self: *Self, status_code: u16, extra_headers: []const hpack.HeaderEntry) !H2StreamWriter {
+        try self.checkStreamActive();
+        const alloc = self.response.bodyAllocator();
         const h2 = self.h2 orelse return error.NotH2;
         const sock = self.h2_sock orelse return error.NotH2;
 
@@ -1079,16 +1089,16 @@ pub const Context = struct {
             status_code,
             extra_headers,
             &status_buf,
-            self.allocator,
+            alloc,
         );
-        defer self.allocator.free(h2_headers);
+        defer alloc.free(h2_headers);
 
         h2.write_mutex.lockUncancelable(self.io);
         defer h2.write_mutex.unlock(self.io);
-        try h2.sendHeaders(sock, self.h2_stream_id, h2_headers, false);
+        try h2.sendHeaders(sock, self.h2_stream_id, h2_headers, self.request.method == .HEAD);
 
         self.h2_stream_sent = true;
-        return .{ .h2 = h2, .sock = sock, .stream_id = self.h2_stream_id, .io = self.io };
+        return .{ .h2 = h2, .sock = sock, .stream_id = self.h2_stream_id, .io = self.io, .context = self, .suppress_body = self.request.method == .HEAD };
     }
 
     /// Unified streaming response writer for both HTTP/1.1 and HTTP/2.
@@ -1101,12 +1111,16 @@ pub const Context = struct {
         h1_sock: ?*Socket,
         h2_writer: ?H2StreamWriter,
         delegate: ?StreamDelegate = null,
+        /// Borrowed until the synchronous handler finishes; never detached.
+        context: ?*const Context = null,
         closed: bool = false,
+        suppress_body: bool = false,
 
         /// Sends a chunk of data to the client.
         pub fn write(self: *StreamWriter, data: []const u8) !void {
             if (self.closed) return error.StreamClosed;
-            if (data.len == 0) return;
+            if (self.context) |ctx| try ctx.checkStreamActive();
+            if (data.len == 0 or self.suppress_body) return;
 
             if (self.delegate) |delegate| {
                 try delegate.write(delegate.ptr, data);
@@ -1142,6 +1156,7 @@ pub const Context = struct {
         /// Sends the terminating chunk / END_STREAM.
         pub fn close(self: *StreamWriter) !void {
             if (self.closed) return;
+            if (self.context) |ctx| try ctx.checkStreamActive();
             self.closed = true;
 
             if (self.delegate) |delegate| {
@@ -1149,6 +1164,7 @@ pub const Context = struct {
             } else if (self.h2_writer) |*w| {
                 try w.close();
             } else if (self.h1_sock) |sock| {
+                if (self.suppress_body) return;
                 // Terminating chunk: "0\r\n\r\n"
                 try sock.sendAll("0\r\n\r\n");
             }
@@ -1216,6 +1232,17 @@ pub const Context = struct {
         }
     };
 
+    fn checkStreamActive(self: *const Self) !void {
+        if (self.isCancellationRequested()) return error.Canceled;
+        // A deadline without clock authority belongs to the embedding's native
+        // clock contract; do not reinterpret it using another clock epoch.
+        if (self.application_deadline_io) |clock_io| {
+            if (self.application_deadline_ns) |deadline| {
+                if (Io.Clock.awake.now(clock_io).nanoseconds >= deadline) return error.Timeout;
+            }
+        }
+    }
+
     /// Sends response headers and returns a `StreamWriter` for incremental body data.
     /// Works for both HTTP/1.1 (chunked transfer encoding) and HTTP/2 (DATA frames).
     /// The handler must call `writer.close()` when done.
@@ -1236,17 +1263,19 @@ pub const Context = struct {
     /// type. This is the general body-streaming primitive; `streamResponse`
     /// remains the SSE convenience wrapper.
     pub fn streamResponseWithContentType(self: *Self, status_code: u16, content_type: []const u8) !StreamWriter {
+        try self.checkStreamActive();
+        const alloc = self.response.bodyAllocator();
         if (self.stream_delegate) |delegate| {
             _ = try self.response.header(HeaderName.CONTENT_TYPE, content_type);
             self.response.headers.removeAll(HeaderName.CONTENT_LENGTH);
             self.response.headers.removeAll(HeaderName.TRANSFER_ENCODING);
             try delegate.start(delegate.ptr, status_code, content_type, &self.response.headers);
-            return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate };
+            return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate, .context = self, .suppress_body = self.request.method == .HEAD };
         }
         // Middleware has already established response policy (e.g. CORS).
         // Copy it before committing headers, then let the transport own the
         // content type and framing. Never reuse a buffered Content-Length.
-        var headers = try self.response.headers.clone(self.allocator);
+        var headers = try self.response.headers.clone(alloc);
         defer headers.deinit();
         headers.removeAll(HeaderName.CONTENT_LENGTH);
         headers.removeAll(HeaderName.TRANSFER_ENCODING);
@@ -1254,21 +1283,21 @@ pub const Context = struct {
         if (!headers.contains(HeaderName.CACHE_CONTROL)) try headers.set(HeaderName.CACHE_CONTROL, "no-cache");
         if (self.h2 != null) {
             var extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
-            defer extra.deinit(self.allocator);
-            try appendH2ResponseHeaders(self.allocator, &extra, &headers);
+            defer extra.deinit(alloc);
+            try appendH2ResponseHeaders(alloc, &extra, &headers);
             const h2w = try self.streamH2(status_code, extra.items);
-            return .{ .h1_sock = null, .h2_writer = h2w };
+            return .{ .h1_sock = null, .h2_writer = h2w, .context = self, .suppress_body = self.request.method == .HEAD };
         }
 
         // HTTP/1.1 path — send headers with Transfer-Encoding: chunked
         const sock = self.h1_sock orelse return error.NoSocket;
 
         // Build and send headers-only response
-        var resp = Response.init(self.allocator, status_code);
+        var resp = Response.init(alloc, status_code);
         defer resp.deinit();
         resp.headers.deinit();
         resp.headers = headers;
-        headers = Headers.init(self.allocator);
+        headers = Headers.init(alloc);
         self.h1_keep_alive = self.h1_keep_alive and
             self.request.headers.isKeepAlive(self.request.version) and
             resp.headers.isKeepAlive(self.request.version);
@@ -1276,12 +1305,12 @@ pub const Context = struct {
         try resp.headers.set(HeaderName.TRANSFER_ENCODING, "chunked");
 
         // Serialize headers only (no body)
-        const header_bytes = try serializeToSlice(self.allocator, &resp);
-        defer self.allocator.free(header_bytes);
+        const header_bytes = try serializeToSlice(alloc, &resp);
+        defer alloc.free(header_bytes);
         try sock.sendAll(header_bytes);
 
         self.h1_stream_sent = true;
-        return .{ .h1_sock = sock, .h2_writer = null };
+        return .{ .h1_sock = sock, .h2_writer = null, .context = self, .suppress_body = self.request.method == .HEAD };
     }
 };
 
@@ -2114,7 +2143,7 @@ pub const Server = struct {
     fn executeH1Application(self: *Self, ctx: *Context, req: *Request) anyerror!H1ApplicationResult {
         for (self.pre_route_hooks.items) |hook| try hook(ctx);
 
-        var suppress_body = false;
+        var suppress_body = req.method == .HEAD;
         var params_buf: [16]RouteParam = undefined;
         var route_result = self.router.find(req.method, req.uri.path, &params_buf);
         if (route_result == null and req.method == .HEAD) {
@@ -3187,12 +3216,16 @@ pub const Server = struct {
                     cancelH2Stream(h2, sock, stream_id);
                     return;
                 };
-                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                if (!ctx.h2_stream_sent) {
+                    try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                } else {
+                    cancelH2Stream(h2, sock, stream_id);
+                }
                 return;
             };
         }
 
-        var suppress_body = false;
+        var suppress_body = req.method == .HEAD;
         var params_buf: [16]RouteParam = undefined;
         var route_result = self.router.find(req.method, req.uri.path, &params_buf);
 
@@ -3213,7 +3246,11 @@ pub const Server = struct {
                     cancelH2Stream(h2, sock, stream_id);
                     return;
                 };
-                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                if (!ctx.h2_stream_sent) {
+                    try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                } else {
+                    cancelH2Stream(h2, sock, stream_id);
+                }
                 return;
             };
         } else {
@@ -3227,7 +3264,11 @@ pub const Server = struct {
                         cancelH2Stream(h2, sock, stream_id);
                         return;
                     };
-                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                    if (!ctx.h2_stream_sent) {
+                        try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                    } else {
+                        cancelH2Stream(h2, sock, stream_id);
+                    }
                     return;
                 };
             } else if (self.global_handler) |global_handler| {
@@ -3236,7 +3277,11 @@ pub const Server = struct {
                         cancelH2Stream(h2, sock, stream_id);
                         return;
                     };
-                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                    if (!ctx.h2_stream_sent) {
+                        try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                    } else {
+                        cancelH2Stream(h2, sock, stream_id);
+                    }
                     return;
                 };
             } else {
@@ -3452,8 +3497,9 @@ pub const Server = struct {
         } else |_| {}
         var headers_only = resp.*;
         headers_only.body = null;
-        const bytes = try serializeToSlice(allocator, &headers_only);
-        defer allocator.free(bytes);
+        const output_alloc = resp.body_allocator orelse allocator;
+        const bytes = try serializeToSlice(output_alloc, &headers_only);
+        defer output_alloc.free(bytes);
         try socket.sendAll(bytes);
         if (resp.body) |body| try socket.sendAll(body);
     }
@@ -4791,6 +4837,7 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
             const rows = mem.eql(u8, ctx.request.uri.path, "/rows");
             var writer = if (rows) try ctx.streamResponseWithContentType(200, "application/x-ndjson") else try ctx.streamResponse(200);
             if (rows) try writer.write("{}\n") else try writer.writeEvent("done", "{}");
+            if (mem.eql(u8, ctx.request.uri.path, "/failed")) return error.Timeout;
             try writer.close();
             return ctx.response.build();
         }
@@ -4802,7 +4849,9 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
     defer server.deinit();
     try server.use(.{ .name = "policy", .handler = State.policy });
     try server.get("/stream", State.handler);
+    try server.head("/stream", State.handler);
     try server.get("/rows", State.handler);
+    try server.get("/failed", State.handler);
     try server.bind();
     var thread = try std.testing.io.concurrent(struct {
         fn run(s: *Server) void {
@@ -4834,6 +4883,10 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
         try std.testing.expectEqualStrings("{}\n", rows.body.?);
         try std.testing.expectEqualStrings("https://allowed.example", rows.headers.get("Access-Control-Allow-Origin").?);
         try std.testing.expectEqualStrings("stream-request", rows.headers.get("X-Request-ID").?);
+        var head_response = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .HEAD, "https://allowed.example", "/stream");
+        defer head_response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), head_response.status.code);
+        if (head_response.body) |body| try std.testing.expectEqual(@as(usize, 0), body.len);
         var preflight = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, "https://allowed.example", "/stream");
         defer preflight.deinit();
         try std.testing.expectEqual(@as(u16, 204), preflight.status.code);
@@ -4845,8 +4898,11 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
         var automatic = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .OPTIONS, null, "/stream");
         defer automatic.deinit();
         try std.testing.expectEqual(@as(u16, 204), automatic.status.code);
-        try std.testing.expectEqualStrings("GET, OPTIONS", automatic.headers.get("Allow").?);
+        try std.testing.expectEqualStrings("GET, HEAD, OPTIONS", automatic.headers.get("Allow").?);
     }
+    // Once a stream has committed headers, timeout must reset that stream;
+    // neither a second HTTP response nor an unterminated stream is valid.
+    try std.testing.expectError(error.StreamReset, State.request(alloc, io_impl.io(), server.boundAddress().?, true, .GET, null, "/failed"));
 }
 
 test "H1 streaming advertises and honors connection retirement" {
@@ -6554,4 +6610,71 @@ test "removeCookie rejects CR/LF in name" {
 
     const result = ctx.removeCookie("bad\nname", .{});
     try std.testing.expectError(error.HeaderContainsCrLf, result);
+}
+
+test "stream output header scratch respects body allocator before committing" {
+    const alloc = std.testing.allocator;
+    var request = try Request.init(alloc, .GET, "/stream");
+    defer request.deinit();
+    var context = Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    const large = [_]u8{'x'} ** 1024;
+    try context.setHeader("x-large", &large);
+    var storage: [64]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&storage);
+    const Ref = struct {
+        fn noop(_: *anyopaque) void {}
+    };
+    context.response.body_memory = .{
+        .allocator = bounded.allocator(),
+        .ptr = &bounded,
+        .retain = Ref.noop,
+        .release = Ref.noop,
+    };
+    try std.testing.expectError(error.OutOfMemory, context.streamResponseWithContentType(200, "application/x-ndjson"));
+    try std.testing.expect(!context.h1_stream_sent);
+    try std.testing.expect(!context.h2_stream_sent);
+}
+
+test "stream output cancellation and deadline stop producers before more bytes" {
+    const Capture = struct {
+        starts: usize = 0,
+        writes: usize = 0,
+        closes: usize = 0,
+        fn start(raw: ?*anyopaque, _: u16, _: []const u8, _: *const Headers) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.starts += 1;
+        }
+        fn write(raw: ?*anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.writes += 1;
+        }
+        fn close(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.closes += 1;
+        }
+    };
+    var request = try Request.init(std.testing.allocator, .GET, "/stream");
+    defer request.deinit();
+    var context = Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    var capture: Capture = .{};
+    var canceled = std.atomic.Value(bool).init(false);
+    context.cancellation = &canceled;
+    context.stream_delegate = .{ .ptr = &capture, .start = Capture.start, .write = Capture.write, .close = Capture.close };
+    var writer = try context.streamResponse(200);
+    try writer.write("first");
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, writer.write("later"));
+    try std.testing.expectError(error.Canceled, writer.close());
+    try std.testing.expectError(error.Canceled, context.streamResponse(200));
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    try std.testing.expectEqual(@as(usize, 1), capture.writes);
+    try std.testing.expectEqual(@as(usize, 0), capture.closes);
+    canceled.store(false, .release);
+    context.application_deadline_io = std.testing.io;
+    context.application_deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, writer.write("expired"));
+    try std.testing.expectError(error.Timeout, writer.close());
+    try std.testing.expectEqual(@as(usize, 1), capture.writes);
 }
