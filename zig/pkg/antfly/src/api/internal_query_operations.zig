@@ -84,10 +84,10 @@ pub const CatalogSource = struct {
 
 pub const QueryRouter = struct {
     ptr: *anyopaque,
-    route_query_to_read_schema: *const fn (ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) anyerror!void,
+    route_query_to_read_schema: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: *db_mod.types.SearchRequest) anyerror!void,
 
-    fn route(self: QueryRouter, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
-        return try self.route_query_to_read_schema(self.ptr, table_name, req);
+    fn route(self: QueryRouter, alloc: std.mem.Allocator, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
+        return try self.route_query_to_read_schema(self.ptr, alloc, table_name, req);
     }
 };
 
@@ -122,8 +122,8 @@ pub const Context = struct {
     }
 
     /// Route a planned request to the schema generation that owns the read.
-    pub fn routeQuery(self: Context, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
-        return self.query_router.route(table_name, req);
+    pub fn routeQuery(self: Context, alloc: std.mem.Allocator, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
+        return self.query_router.route(alloc, table_name, req);
     }
 };
 

@@ -2803,7 +2803,7 @@ pub const AntflyApiHandler = struct {
         const prepared = @import("prepared_query_routing.zig");
         const applied = prepared.apply(ctx.allocator, table_name, ctx.header(prepared.header_name), ctx.header(metadata_api.catalog_route_fence_header), request) catch |err| return try textResponse(ctx, 400, @errorName(err));
         if (applied) return null;
-        query_context.routeQuery(table_name, request) catch |err| {
+        query_context.routeQuery(ctx.allocator, table_name, request) catch |err| {
             const response = switch (err) {
                 error.TableNotFound => try textResponse(ctx, 404, @errorName(err)),
                 error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => try textResponse(ctx, 500, "invalid table metadata"),

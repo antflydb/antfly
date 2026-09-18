@@ -7456,9 +7456,9 @@ pub const ApiHttpServer = struct {
         _ = try self.txn_sessions.cleanupExpired(self.alloc, now_ns -| ttl_ns);
     }
 
-    fn routeInternalGroupQueryToReadSchema(ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
+    fn routeInternalGroupQueryToReadSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.maybeRouteQueryToReadSchema(table_name, req);
+        return try self.routeQueryToReadSchemaWithResolver(alloc, table_name, req, null);
     }
 
     fn queryTableDefinition(self: *ApiHttpServer, alloc: std.mem.Allocator, resolver: ?*CatalogQueryResolver, table_name: []const u8, context: api_operation.RequestContext) !?metadata_table_manager.TableRecord {
@@ -11660,9 +11660,9 @@ pub const ApiHttpServer = struct {
     ) !query_api.QueryResponse {
         _ = try system_catalog.Target.literal(logical_name);
         const source = self.table_reads orelse return error.TableNotFound;
-        var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
-        defer if (identity) |*owned| owned.deinit(self.alloc);
-        var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
+        var identity = try cloneCatalogIdentity(alloc, borrowed_identity);
+        defer if (identity) |*owned| owned.deinit(alloc);
+        var catalog_arena = std.heap.ArenaAllocator.init(alloc);
         defer catalog_arena.deinit();
         var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
         var binding = try self.bindCatalogQuery(alloc, context, logical_name, body, &identity, &resolver);
@@ -15530,7 +15530,7 @@ pub const ApiHttpServer = struct {
         for (result.tables) |table| if (table == null) return error.TableNotFound;
         const offset: usize = if (primary_foreign) 0 else 1;
         const physical = if (primary_foreign) try a.dupe(u8, logical) else result.tables[0].?.name;
-        if (!primary_foreign) if (identity.*) |*value| try projectCatalogIdentity(self.alloc, value, primary_key, physical);
+        if (!primary_foreign) if (identity.*) |*value| try projectCatalogIdentity(alloc, value, primary_key, physical);
         for (references.items, targets.items[offset..], result.tables[offset..]) |reference, rhs, table| {
             reference.right_label = try rhs.displayNameAlloc(a);
             reference.right_table = @constCast(table.?.name);
@@ -49783,8 +49783,67 @@ test "system catalog restore listing shares one projection and honors legacy ren
     try std.testing.expectEqual(@as(usize, 2), fake.snapshots);
 }
 
-test "system catalog binds primary and nested joins once without conflating literal names" {
-    const alloc = std.testing.allocator;
+test "workload admission internal query routing preserves the planned request allocator" {
+    const base_alloc = std.testing.allocator;
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(1, .{ .max_retained_bytes = 1024 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(base_alloc, &gate);
+    defer owner.release();
+    const alloc = owner.allocator();
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .schema_json = "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}",
+                    .indexes_json = "{\"full_text_index\":{\"type\":\"full_text\"}}",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = null }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var server = ApiHttpServer.init(base_alloc, .{}, FakeSource.iface(), null, null);
+    defer server.deinit();
+    const context = server.internalQueryContext();
+    var request = try context.planQuery(alloc, "docs", "{\"query\":{\"match_all\":{}}}");
+    defer request.deinit(alloc);
+    try context.routeQuery(alloc, "docs", &request.req);
+    try std.testing.expectEqualStrings("full_text_index", request.req.index_name.?);
+    try std.testing.expectEqualStrings("full_text_index", request.req.primary_text_index_name.?);
+}
+
+test "workload admission system catalog binds primary and nested joins once without conflating literal names" {
+    const base_alloc = std.testing.allocator;
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(1, .{ .max_retained_bytes = 1024 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(base_alloc, &gate);
+    defer owner.release();
+    const alloc = owner.allocator();
     const Fake = struct {
         calls: usize = 0,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
@@ -49810,9 +49869,18 @@ test "system catalog binds primary and nested joins once without conflating lite
         }
     };
     var fake = Fake{};
-    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog } }, null, null);
+    var server = ApiHttpServer.init(base_alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog } }, null, null);
     defer server.deinit();
-    var identity: ?AuthenticatedIdentity = null;
+    // Authentication snapshots are cloned into the request owner. Catalog
+    // projection must use that same owner when growing permissions and aliases.
+    var permission = try usermgr.Permission.initOwned(alloc, .table, "*", .read);
+    defer permission.deinit(alloc);
+    var permissions = [_]usermgr.Permission{permission};
+    var row_filter = try usermgr.RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"tenant\":\"a\"}}");
+    defer row_filter.deinit(alloc);
+    var row_filters = [_]usermgr.RowFilterEntry{row_filter};
+    var identity = try cloneCatalogIdentity(alloc, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = &row_filters });
+    defer if (identity) |*value| value.deinit(alloc);
     const body =
         \\{"full_text_search":{"match_all":{}},"join":{"right_table":"tenant.public.customers","on":{"left_field":"customer","right_field":"_id"},"nested_join":{"right_target":{"database":"tenant","table":"customers"},"on":{"left_field":"customer","right_field":"_id"}}}}
     ;
@@ -49825,6 +49893,9 @@ test "system catalog binds primary and nested joins once without conflating lite
     try std.testing.expectEqual(@as(?u64, 7), binding.revision);
     try std.testing.expectEqualStrings("table:primary", binding.physical);
     try std.testing.expectEqualStrings("docs", binding.label);
+    try std.testing.expectEqualStrings("table:primary", identity.?.catalog_aliases[0].physical);
+    try std.testing.expectEqualStrings("table:primary", identity.?.row_filter[1].table);
+    try std.testing.expect(permissionsAllow(identity.?.permissions, .table, "table:primary", .read));
     try std.testing.expectEqualStrings("table:literal", binding.join.?.join.right_table);
     try std.testing.expectEqualStrings("table:scoped", binding.join.?.join.nested_join.?.right_table);
     try std.testing.expectEqualStrings("tenant.public.customers", binding.join.?.join.right_label.?);
