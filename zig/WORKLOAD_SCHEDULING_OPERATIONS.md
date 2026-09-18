@@ -185,10 +185,10 @@ latency and completed throughput. A generator that falls behind invalidates
 offered-load evidence. Small harness smoke tests and passing unit tests do not
 qualify new defaults or satisfy the full release matrix.
 
-Current native Debug smoke exposed a control-task capacity escape and a query
-allocator mismatch. The capacity fix has a passing focused regression; the
-standalone allocator correction and rebuilt native smoke are still being
-validated. No full native smoke or optimized performance pass is claimed by
-this guide. Full operator coverage, fair bounded/general lanes, protected
-control/recovery progress, coordinator reconciliation, streaming retention,
-and Cloud policy integration remain release work.
+Tracked query/lookup allocation ownership, dense overload responses across
+runtime boundaries, and background task-capacity failures have focused
+regressions. Consult the [validation record](WORKLOAD_SCHEDULING_VALIDATION.md)
+for native results and retained failed experiments. No optimized performance
+pass is claimed by this guide. Full operator coverage, fair bounded/general
+lanes, protected control/recovery progress, coordinator reconciliation,
+streaming retention, and Cloud policy integration remain release work.

@@ -12,6 +12,14 @@ python3 scripts/workload_qualification.py template --runtime process --output /t
 python3 scripts/workload_qualification.py run /tmp/workload-plan.json --output /tmp/workload-receipts
 ```
 
+The command exits 1 for request correctness or process failures, including
+failures during warmup; it still retains summaries, raw samples, and checksums.
+Exit 2 means generator-invalid evidence without a detected correctness failure.
+Expected overload 429s remain separate from unexpected HTTP/transport failures.
+Exit 0 establishes only clean evidence for the exercised subset; it never marks
+the full release matrix qualified. Inspect `correctness_failures`,
+`generator_valid`, and `shutdown_clean` in `summary.json` together.
+
 For a harness smoke test with an existing binary whose build provenance is
 unknown, set both arms' `revision` and `optimization` to `"unknown"`. This is
 permitted only for `purpose: "smoke"`; artifact SHA-256 hashes are still retained.

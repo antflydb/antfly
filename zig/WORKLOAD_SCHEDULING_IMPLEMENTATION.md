@@ -306,6 +306,7 @@ evidence that a write was rolled back or that remote work quiesced.
 cd zig
 zig build antfly-common-config-test -j2
 zig build antfly-workload-admission-test -j2
+zig build runtime-callback-abi-test -j2
 zig build runtime-io-abi-test antfly-storage-owner-test -Dstorage-owner-test-filter='dense execution policy' -j2
 zig build antfly-data-runtime-test -j2 -- --test-filter 'data runtime status refresh retries bounded executor pressure without losing wakes'
 cd ../go/pkg/sdk
@@ -350,11 +351,13 @@ capacity. Point-journal regressions also verify legacy-format refusal and that
 only actual previous-executor completion can reconcile its retained uncertainty.
 These tests do not constitute distributed coordinator qualification.
 
-Native Debug smoke exposed both a fatal background-capacity escape and a query
-allocator ownership mismatch. The control-capacity regression is fixed and its
-focused gate passed. The standalone allocator investigation and native rerun
-remain in progress; no successful current native smoke or performance result is
-claimed here.
+Native Debug experiments exposed query allocator mismatches, a fatal
+background-capacity escape, and dense admission errors lost across the runtime
+callback boundary. Corrective stages include focused ownership, executor, and
+independently compiled callback regressions. The
+[validation record](WORKLOAD_SCHEDULING_VALIDATION.md) preserves the failed
+experiments and subsequent checks; none establishes optimized performance or
+release qualification.
 
 ## Remaining design phases
 
@@ -363,7 +366,7 @@ claimed here.
 | Ownership/progress prerequisite | Typed ledger, scheduler, allocator, and attempt state models are implemented and tested; complete operator inventory and process-wide progress proof remain open |
 | Phase 1 | Fixed foreground waiting, contextual allocation ownership, deadlines, overload diagnostics, and SDK contracts are integrated on the paths above; full ingress/planning/output coverage and protected floors remain open |
 | Phase 2 | Dense driver/helper ownership, exact working bytes, one pinned-executor I/O boundary, session recovery bounds, and opt-in durable join-row workers are integrated; full operator scheduling, fairness, distributed coordinator ownership, and all write recovery remain open |
-| Phase 3 | SDK pools/retries, engine diagnostics, and qualification tooling exist; native smoke completion, optimized release qualification, Cloud integration, sizing/defaults, and adaptive policy remain open |
+| Phase 3 | SDK pools/retries, engine diagnostics, and qualification tooling exist; native pressure qualification, optimized release qualification, Cloud integration, sizing/defaults, and adaptive policy remain open |
 
 - Audit the tested ownership foundations against real continuation, remote
   attempt, mandatory recovery, and demotion paths; extend deterministic coverage
