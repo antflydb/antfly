@@ -331,6 +331,48 @@ pub const HandlerStats = struct {
     }
 };
 
+pub fn dispatchPolicyFromKernel(handle: *anyopaque, functions: *const abi.FunctionTable) !abi.DispatchPolicy {
+    if (!abi.validFunctionTable(functions, abi.Capability.dispatch_admission)) return error.UnsupportedVersion;
+    var policy: abi.DispatchPolicy = .{};
+    var lane: u8 = 0;
+    try callError(functions.handler_dispatch_policy(&.{
+        .abi_version = abi.abi_version,
+        .handler_handle = handle,
+        .out_policy = &policy,
+        .out_lane = &lane,
+    }));
+    return policy;
+}
+
+pub fn classifyIngressFromKernel(handle: *anyopaque, functions: *const abi.FunctionTable, request: @import("workload_dispatch.zig").Request) @import("workload_dispatch.zig").Lane {
+    if (!abi.validFunctionTable(functions, abi.Capability.dispatch_admission)) return .general;
+    const wire: abi.DispatchRequest = .{
+        .method = .init(request.method),
+        .path = .init(request.path),
+        .content_length = .init(request.content_length),
+        .transfer_encoding = .init(request.transfer_encoding),
+        .content_encoding = .init(request.content_encoding),
+        .credential = .init(request.credential),
+        .body_received_bytes = request.body_received_bytes,
+        .body_complete = @intFromBool(request.body_complete),
+    };
+    var policy: abi.DispatchPolicy = .{};
+    var lane: u8 = 0;
+    const status = functions.handler_dispatch_policy(&.{
+        .abi_version = abi.abi_version,
+        .handler_handle = handle,
+        .request = &wire,
+        .out_policy = &policy,
+        .out_lane = &lane,
+    });
+    if (!status.isOk()) return .general;
+    return switch (lane) {
+        1 => .control,
+        2 => .recovery,
+        else => .general,
+    };
+}
+
 const OpaqueHttpxHandler = struct {
     const RouteSelection = enum {
         all,
@@ -427,10 +469,32 @@ const OpaqueHttpxHandler = struct {
         return response;
     }
 
+    fn classifyTransportIngress(raw: ?*anyopaque, view: httpx.RequestDispatchView) httpx.RequestTaskLane {
+        const self: *OpaqueHttpxHandler = @ptrCast(@alignCast(raw.?));
+        return switch (classifyIngressFromKernel(self.handle, self.functions, @import("workload_dispatch.zig").Request.fromTransport(view))) {
+            .general => .general,
+            .control => .control,
+            .recovery => .recovery,
+        };
+    }
+
+    fn configureTransportIngress(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
+        const policy = try dispatchPolicyFromKernel(self.handle, self.functions);
+        if (policy.max_requests == 0) return;
+        if (server.config.max_request_tasks < policy.max_requests) return error.InvalidConfig;
+        try server.configureRequestDispatch(.{
+            .control_tasks = policy.control_requests,
+            .recovery_tasks = policy.recovery_requests,
+            .classifier = .{ .ctx = self, .classify = classifyTransportIngress },
+            .h1_rejection_response = @import("workload_dispatch.zig").busy_response,
+        });
+    }
+
     fn registerRoutesWithOptions(self: *OpaqueHttpxHandler, server: *httpx.Server, selection: RouteSelection) !void {
         if (!abi.validFunctionTable(self.functions, abi.Capability.route_manifest)) return error.UnsupportedVersion;
         if (self.runtime_routes.items.len != 0) return error.RoutesAlreadyRegistered;
         const alloc = self.alloc orelse return error.ApiKernelNotInitialized;
+        try self.configureTransportIngress(server);
         var entries_ptr: ?[*]const abi.RouteManifestEntry = null;
         var entries_len: usize = 0;
         try callError(self.functions.handler_route_manifest(&.{
@@ -458,6 +522,7 @@ const OpaqueHttpxHandler = struct {
                 .boundary_allocator = self.boundary_allocator,
                 .functions = self.functions,
                 .kernel_route_handle = entry.route_handle,
+                .method = entry.method,
                 .request_body = entry.request_body,
                 .streaming_response = entry.streaming_response != 0,
             };
@@ -498,6 +563,7 @@ const RuntimeRoute = struct {
     boundary_allocator: ?*BoundaryAllocator = null,
     functions: *const abi.FunctionTable,
     kernel_route_handle: *anyopaque,
+    method: abi.HttpMethod = .get,
     request_body: abi.RequestBodyMode,
     streaming_response: bool,
 };
@@ -521,6 +587,9 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     const request_view: abi.HttpRequestView = .{
         .method = switch (context.request.method) {
             .GET => .get,
+            // httpx selects the GET route for HEAD and suppresses its body on
+            // the original host context. Preserve that fallback across the ABI.
+            .HEAD => if (route.method == .get) .get else return error.MethodNotAllowed,
             .POST => .post,
             .PUT => .put,
             .DELETE => .delete,
@@ -810,6 +879,45 @@ test "linked transport projects the universal request cancellation callback" {
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
     try std.testing.expectEqualStrings("ok", response.body.?);
     try std.testing.expect(FakeKernel.saw_cancellation);
+}
+
+test "linked API dispatch preserves HEAD fallback to a GET kernel route" {
+    const FakeKernel = struct {
+        var calls: usize = 0;
+        fn handle(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
+            if (context.request.method != .get) return abi.statusFromError(error.TestUnexpectedResult);
+            calls += 1;
+            context.out_response_handle.* = @ptrFromInt(1);
+            context.out_response.* = .{ .status = 200, .body = abi.Bytes.init("healthy") };
+            return .ok;
+        }
+        fn destroy(_: *anyopaque) callconv(.c) void {}
+    };
+    var functions: abi.FunctionTable = undefined;
+    functions.handler_handle_http = FakeKernel.handle;
+    functions.handler_destroy_http_response = FakeKernel.destroy;
+    var route = RuntimeRoute{
+        .functions = &functions,
+        .kernel_route_handle = @ptrFromInt(1),
+        .method = .get,
+        .request_body = .none,
+        .streaming_response = false,
+    };
+    var request = try httpx.Request.init(std.testing.allocator, .HEAD, "/healthz");
+    defer request.deinit();
+    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    context.route_data = &route;
+    FakeKernel.calls = 0;
+    var response = try runtimeApiHttpHandler(&context);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqualStrings("healthy", response.body.?);
+    try std.testing.expectEqual(httpx.Method.HEAD, request.method);
+    try std.testing.expectEqual(@as(usize, 1), FakeKernel.calls);
+    route.method = .post;
+    try std.testing.expectError(error.MethodNotAllowed, runtimeApiHttpHandler(&context));
+    try std.testing.expectEqual(@as(usize, 1), FakeKernel.calls);
 }
 
 test "linked transport admits a streaming body before the kernel pulls it" {

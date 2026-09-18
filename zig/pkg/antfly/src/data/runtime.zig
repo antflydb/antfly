@@ -921,6 +921,7 @@ const DataPublicHttpRuntime = struct {
     const RuntimeStats = struct {
         max_connection_threads: u32,
         active_connection_threads: usize,
+        active_requests: usize,
         peak_connection_threads: usize,
         query: antfly.common.request_admission.RequestAdmission.Stats,
         write: antfly.common.request_admission.RequestAdmission.Stats,
@@ -928,6 +929,8 @@ const DataPublicHttpRuntime = struct {
         accept_errors_total: u64,
         connection_dispatch_rejections_total: u64,
         request_dispatch_rejections_total: u64,
+        request_permit_rejections_total: u64,
+        request_executor_rejections_total: u64,
         h2_stream_dispatch_rejections_total: u64,
         request_cancellations_total: u64,
         listener_capacity: usize,
@@ -1033,6 +1036,7 @@ const DataPublicHttpRuntime = struct {
             // handoff threads.
             .max_connection_threads = transport.max_connections,
             .active_connection_threads = transport.active_connections,
+            .active_requests = transport.active_requests,
             .peak_connection_threads = transport.peak_active_connections,
             .query = application.query,
             .write = application.write,
@@ -1040,6 +1044,8 @@ const DataPublicHttpRuntime = struct {
             .accept_errors_total = transport.accept_errors_total,
             .connection_dispatch_rejections_total = transport.connection_dispatch_rejections_total,
             .request_dispatch_rejections_total = transport.request_dispatch_rejections_total,
+            .request_permit_rejections_total = transport.request_permit_rejections_total,
+            .request_executor_rejections_total = transport.request_executor_rejections_total,
             .h2_stream_dispatch_rejections_total = transport.h2_stream_dispatch_rejections_total,
             .request_cancellations_total = transport.request_cancellations_total,
             .listener_capacity = http_runtime.listener_capacity,
@@ -2080,6 +2086,7 @@ pub const HealthSource = struct {
         if (listener_stats) |http| {
             try health_metrics.appendPromMetric(writer, "antfly_http_connection_thread_limit", "gauge", "Maximum public HTTP connection handoff threads", http.max_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_connection_threads", "gauge", "Currently active public HTTP connection handoff threads", http.active_connection_threads);
+            try health_metrics.appendPromMetric(writer, "antfly_http_active_requests", "gauge", "Currently active public HTTP requests", http.active_requests);
             try health_metrics.appendPromMetric(writer, "antfly_http_peak_connection_threads", "gauge", "Peak public HTTP connection handoff threads since process start", http.peak_connection_threads);
             try http.appendAdmissionMetrics(writer);
             if (inference_admission_stats) |inference| {
@@ -2088,6 +2095,8 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_connection_dispatch_rejections_total", "counter", "Accepted public HTTP connections closed because concurrent execution was unavailable", http.connection_dispatch_rejections_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_request_dispatch_rejections_total", "counter", "HTTP requests rejected before application execution because listener or runtime request capacity was unavailable", http.request_dispatch_rejections_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_request_permit_rejections_total", "counter", "HTTP requests rejected because their listener request-task partition was full", http.request_permit_rejections_total);
+            try health_metrics.appendPromMetric(writer, "antfly_http_request_executor_rejections_total", "counter", "HTTP requests rejected after acquiring a request permit because executor dispatch failed", http.request_executor_rejections_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_h2_stream_dispatch_rejections_total", "counter", "HTTP/2 streams reset before application execution because bounded handler execution was unavailable", http.h2_stream_dispatch_rejections_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_request_cancellations_total", "counter", "Public HTTP requests terminated by application cancellation", http.request_cancellations_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_listener_capacity", "gauge", "Maximum concurrent long-lived HTTP listeners", http.listener_capacity);

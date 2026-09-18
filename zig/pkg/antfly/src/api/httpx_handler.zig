@@ -709,25 +709,69 @@ pub const AntflyApiHandler = struct {
         return if (err == error.OutOfMemory and ownerMemoryExhausted(owner)) error.AdmissionBytesExhausted else err;
     }
 
-    /// Only fixed-shape, authenticated completion/control RPCs may consume the
-    /// recovery partition. Pre-authentication uses bounded stack scratch, so a
-    /// full general envelope cannot prevent verifying the caller's credential.
-    fn usesRecoveryIngress(self: *AntflyApiHandler, ctx: *httpx.Context) bool {
-        if (self.api_server.ingress_admission.config.recovery_requests == 0 or ctx.request.method != .POST) return false;
-        const path = ctx.request.uri.path;
-        if (!std.mem.eql(u8, path, routes.workload_attempt_control) and
-            routes.matchGroupTxnResolve(path) == null and routes.matchGroupTxnStatus(path) == null and
-            routes.matchGroupTxnAcknowledge(path) == null) return false;
-        if (ctx.header("transfer-encoding") != null or ctx.header("content-encoding") != null or
-            ctx.request.bodyLen() > 8192 or (ctx.request.headers.getContentLength() orelse 0) > 8192 or
-            (ctx.hasStreamingRequestBody() and ctx.request.headers.getContentLength() == null)) return false;
-        const token = ctx.header(internal_service_auth.header_name) orelse return false;
-        if (token.len > 4096) return false;
+    /// No body reads or heap allocations are allowed before transport dispatch.
+    /// Both adapters use these exact framing and credential checks; URL names
+    /// alone never grant the protected recovery partition.
+    pub fn classifyIngressRequest(self: *AntflyApiHandler, request: @import("workload_dispatch.zig").Request) @import("workload_dispatch.zig").Lane {
+        const config = self.api_server.ingress_admission.config;
+        if (config.max_requests == 0) return .general;
+        const content_length = if (request.content_length) |value|
+            std.fmt.parseInt(u64, value, 10) catch return .general
+        else
+            0;
+        const control = (std.mem.eql(u8, request.method, "GET") or std.mem.eql(u8, request.method, "HEAD")) and
+            (std.mem.eql(u8, request.path, routes.healthz) or std.mem.eql(u8, request.path, routes.readyz)) and
+            request.body_received_bytes == 0 and content_length == 0 and
+            request.transfer_encoding == null and request.body_complete;
+        if (control) return .control;
+        if (config.recovery_requests == 0 or !std.mem.eql(u8, request.method, "POST")) return .general;
+        if (!std.mem.eql(u8, request.path, routes.workload_attempt_control) and
+            routes.matchGroupTxnResolve(request.path) == null and routes.matchGroupTxnStatus(request.path) == null and
+            routes.matchGroupTxnAcknowledge(request.path) == null) return .general;
+        if (request.transfer_encoding != null or request.content_encoding != null or
+            request.body_received_bytes > 8192 or content_length > 8192 or
+            (!request.body_complete and request.content_length == null)) return .general;
+        const token = request.credential orelse return .general;
+        if (token.len > 4096) return .general;
         var scratch: [32 * 1024]u8 = undefined;
         var arena = std.heap.FixedBufferAllocator.init(&scratch);
-        var identity = self.api_server.authenticateInternalServiceRequestUsingAllocator(arena.allocator(), token) catch return false;
+        var identity = self.api_server.authenticateInternalServiceRequestUsingAllocator(arena.allocator(), token) catch return .general;
         defer identity.deinit(arena.allocator());
-        return identity.is_internal_service;
+        return if (identity.is_internal_service) .recovery else .general;
+    }
+
+    fn ingressLane(self: *AntflyApiHandler, ctx: *httpx.Context) @import("workload_dispatch.zig").Lane {
+        return self.classifyIngressRequest(.{
+            .method = @tagName(ctx.request.method),
+            .path = ctx.request.uri.path,
+            .content_length = ctx.header("content-length"),
+            .transfer_encoding = ctx.header("transfer-encoding"),
+            .content_encoding = ctx.header("content-encoding"),
+            .credential = ctx.header(internal_service_auth.header_name),
+            .body_received_bytes = ctx.request.bodyLen(),
+            .body_complete = !ctx.hasStreamingRequestBody(),
+        });
+    }
+
+    fn classifyTransportIngress(raw: ?*anyopaque, view: httpx.RequestDispatchView) httpx.RequestTaskLane {
+        const self: *AntflyApiHandler = @ptrCast(@alignCast(raw.?));
+        return switch (self.classifyIngressRequest(@import("workload_dispatch.zig").Request.fromTransport(view))) {
+            .general => .general,
+            .control => .control,
+            .recovery => .recovery,
+        };
+    }
+
+    fn configureTransportIngress(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        const config = self.api_server.ingress_admission.config;
+        if (config.max_requests == 0) return;
+        if (server.config.max_request_tasks < config.max_requests) return error.InvalidConfig;
+        try server.configureRequestDispatch(.{
+            .control_tasks = config.control_requests,
+            .recovery_tasks = config.recovery_requests,
+            .classifier = .{ .ctx = self, .classify = classifyTransportIngress },
+            .h1_rejection_response = @import("workload_dispatch.zig").busy_response,
+        });
     }
 
     fn installIngressOwner(self: *AntflyApiHandler, ctx: *httpx.Context) !?*IngressState {
@@ -740,11 +784,11 @@ pub const AntflyApiHandler = struct {
         if (ctx.decoded_query_values.capacity != 0 or ctx.response.body_owned or
             ctx.response.body_memory != null or ctx.request_memory != null)
             return error.IngressAllocatorAlreadyInUse;
-        const control = (ctx.request.method == .GET or ctx.request.method == .HEAD) and
-            (std.mem.eql(u8, ctx.request.uri.path, routes.healthz) or std.mem.eql(u8, ctx.request.uri.path, routes.readyz)) and
-            ctx.request.bodyLen() == 0 and (ctx.request.headers.getContentLength() orelse 0) == 0 and
-            ctx.header("transfer-encoding") == null and !ctx.hasStreamingRequestBody();
-        const gate = if (control) &runtime.control else if (self.usesRecoveryIngress(ctx)) &runtime.recovery else &runtime.general;
+        const gate = switch (self.ingressLane(ctx)) {
+            .general => &runtime.general,
+            .control => &runtime.control,
+            .recovery => &runtime.recovery,
+        };
         const account = try gate.memoryAccount(self.api_server.alloc);
         defer account.release();
         var lease = try account.acquireOutstanding();
@@ -799,6 +843,7 @@ pub const AntflyApiHandler = struct {
     }
 
     fn installMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        try self.configureTransportIngress(server);
         try server.useFirst(httpx.Middleware.bind("antfly-workload-ingress", self, enforceIngress));
         try server.use(httpx.Middleware.bind("antfly-request-stats", self, recordRequest));
         try server.use(httpx.Middleware.bind("antfly-internal-service-auth", self, enforceInternalServiceAuth));

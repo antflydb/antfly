@@ -494,6 +494,32 @@ pub fn handlerAuthorizeInternalService(context: *const abi.InternalServiceAuthCo
     return .ok;
 }
 
+pub fn handlerDispatchPolicy(context: *const abi.DispatchPolicyContext) callconv(.c) abi.Status {
+    if (validateContext(abi.DispatchPolicyContext, context.abi_version, context.struct_size)) |failure| return failure;
+    const state: *HandlerState = @ptrCast(@alignCast(context.handler_handle));
+    const config = state.handler.api_server.ingress_admission.config;
+    context.out_policy.* = .{
+        .max_requests = config.max_requests,
+        .control_requests = if (config.max_requests != 0) config.control_requests else 0,
+        .recovery_requests = if (config.max_requests != 0) config.recovery_requests else 0,
+    };
+    context.out_lane.* = 0;
+    if (context.request) |request| {
+        if (request.body_complete > 1) return .ok;
+        context.out_lane.* = @intFromEnum(state.handler.classifyIngressRequest(.{
+            .method = request.method.slice(),
+            .path = request.path.slice(),
+            .content_length = request.content_length.slice(),
+            .transfer_encoding = request.transfer_encoding.slice(),
+            .content_encoding = request.content_encoding.slice(),
+            .credential = request.credential.slice(),
+            .body_received_bytes = request.body_received_bytes,
+            .body_complete = request.body_complete != 0,
+        }));
+    }
+    return .ok;
+}
+
 pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
     if (validateContext(abi.HttpHandleContext, context.abi_version, context.struct_size)) |failure| return failure;
     var executor = context.executor.receive() catch |err| return fail(err);
@@ -570,7 +596,8 @@ const function_table: abi.FunctionTable = .{
         abi.Capability.route_manifest |
         abi.Capability.inference_admission_stats |
         abi.Capability.internal_service_ingress |
-        abi.Capability.workload_coordinator,
+        abi.Capability.workload_coordinator |
+        abi.Capability.dispatch_admission,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
@@ -598,6 +625,7 @@ const function_table: abi.FunctionTable = .{
     .inference_admission_stats = &inferenceAdmissionStats,
     .handler_authorize_internal_service = &handlerAuthorizeInternalService,
     .coordinator_port = &coordinatorPort,
+    .handler_dispatch_policy = &handlerDispatchPolicy,
 };
 
 pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {
@@ -1433,4 +1461,84 @@ test "workload admission compiled coordinator port preserves durable uncertainty
     try std.testing.expectError(error.AdmissionFull, exported.port.execute(alloc, 8, "http://worker", request, deadline));
     try std.testing.expectEqual(@as(u32, 1), (try owner.store.usage()).attempts);
     try std.testing.expectEqual(@as(u32, 0), owner.active.load(.acquire));
+}
+
+test "workload admission dispatch ABI authenticates protected lanes without heap allocation" {
+    const alloc = std.testing.allocator;
+    const bridge = @import("kernel_bridge.zig");
+    const dispatch = @import("workload_dispatch.zig");
+    const service_auth = @import("internal_service_auth.zig");
+    var source: KernelIngressTestStatus = .{};
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    const secret = "d" ** 32;
+    var server = try server_mod.ApiHttpServer.initWithConfig(failing.allocator(), .{
+        .internal_service_secret = secret,
+        .internal_service_verification_secret = "e" ** 32,
+        .internal_service_issuer = "cluster",
+        .ingress_admission = .{ .max_requests = 3, .max_retained_bytes = 256 * 1024, .control_requests = 1, .control_retained_bytes = 64 * 1024, .recovery_requests = 1, .recovery_retained_bytes = 64 * 1024 },
+    }, source.source(), null, null);
+    defer server.deinit();
+    var state: HandlerState = .{
+        .alloc = failing.allocator(),
+        .handler = .{ .api_server = &server },
+        .route_validator = httpx.Router.init(alloc),
+    };
+    defer state.route_validator.deinit();
+    const token = try service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "cluster", .node_id = 7 }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    const previous_token = try service_auth.tokenAlloc(alloc, .{ .secret = "e" ** 32, .issuer = "cluster", .node_id = 7 }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(previous_token);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    const policy = try bridge.dispatchPolicyFromKernel(&state, getFunctionTable());
+    try std.testing.expectEqualDeep(abi.DispatchPolicy{ .max_requests = 3, .control_requests = 1, .recovery_requests = 1 }, policy);
+    const Case = struct { request: dispatch.Request, lane: dispatch.Lane };
+    const control_path = @import("http_routes.zig").Routes.workload_attempt_control;
+    const cases = [_]Case{
+        .{ .request = .{ .method = "GET", .path = "/healthz", .body_complete = true }, .lane = .control },
+        .{ .request = .{ .method = "HEAD", .path = "/readyz", .body_complete = true }, .lane = .control },
+        .{ .request = .{ .method = "GET", .path = "/healthz", .body_complete = false }, .lane = .general },
+        .{ .request = .{ .method = "GET", .path = "/healthz", .body_complete = true, .content_length = "1" }, .lane = .general },
+        .{ .request = .{ .method = "GET", .path = "/healthz", .body_complete = true, .content_length = "invalid" }, .lane = .general },
+        .{ .request = .{ .method = "GET", .path = "/healthz", .body_complete = true, .transfer_encoding = "chunked" }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true, .credential = "forged" }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables/txn-resolve", .body_complete = true }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables/txn-status", .body_complete = true }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables/txn-acknowledge", .body_complete = true }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables//txn-status", .body_complete = true, .credential = token }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true, .credential = token }, .lane = .recovery },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true, .credential = previous_token }, .lane = .recovery },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables/docs/txn-resolve", .body_complete = true, .credential = token }, .lane = .recovery },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables/docs/txn-status", .body_complete = true, .credential = token }, .lane = .recovery },
+        .{ .request = .{ .method = "POST", .path = "/internal/v1/groups/7/tables/docs/txn-acknowledge", .body_complete = true, .credential = token }, .lane = .recovery },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true, .credential = "x" ** 4097 }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .content_length = "8192", .credential = token }, .lane = .recovery },
+        .{ .request = .{ .method = "POST", .path = control_path, .credential = token }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .content_length = "8193", .credential = token }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true, .body_received_bytes = 8193, .credential = token }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = control_path, .body_complete = true, .content_encoding = "gzip", .credential = token }, .lane = .general },
+        .{ .request = .{ .method = "POST", .path = "/db/v1/tables/docs/batch", .body_complete = true, .credential = token }, .lane = .general },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.lane, state.handler.classifyIngressRequest(case.request));
+        try std.testing.expectEqual(case.lane, bridge.classifyIngressFromKernel(&state, getFunctionTable(), case.request));
+    }
+    var incompatible = getFunctionTable().*;
+    incompatible.capabilities &= ~abi.Capability.dispatch_admission;
+    try std.testing.expectError(error.UnsupportedVersion, bridge.dispatchPolicyFromKernel(&state, &incompatible));
+    try std.testing.expectEqual(dispatch.Lane.general, bridge.classifyIngressFromKernel(&state, &incompatible, cases[0].request));
+    incompatible = getFunctionTable().*;
+    incompatible.struct_size = abi.requiredFunctionTableSize(abi.Capability.dispatch_admission).? - 1;
+    try std.testing.expectError(error.UnsupportedVersion, bridge.dispatchPolicyFromKernel(&state, &incompatible));
+    try std.testing.expectEqual(dispatch.Lane.general, bridge.classifyIngressFromKernel(&state, &incompatible, cases[0].request));
+    const InvalidLane = struct {
+        fn classify(context: *const abi.DispatchPolicyContext) callconv(.c) abi.Status {
+            context.out_lane.* = 255;
+            return .ok;
+        }
+    };
+    incompatible = getFunctionTable().*;
+    incompatible.handler_dispatch_policy = InvalidLane.classify;
+    try std.testing.expectEqual(dispatch.Lane.general, bridge.classifyIngressFromKernel(&state, &incompatible, cases[0].request));
 }

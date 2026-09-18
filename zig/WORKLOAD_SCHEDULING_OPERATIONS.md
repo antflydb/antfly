@@ -30,6 +30,29 @@ concurrency and record it. Alternatively, deliberately test a smaller execution
 capacity with bounded waiting and report rejection and queue time separately.
 Neither choice increases the independent HTTP connection/request-task limits.
 
+With `admission.ingress.max_requests` enabled, the data/API listener provisions
+at least that many request tasks and 32 additional connection slots for parsing
+and rejection. Disabled ingress preserves its legacy 32-task/64-connection
+limits. This does not multiply upload buffering: body slots stay bounded at 32.
+Standalone also sizes request tasks to cover configured ingress, while retaining
+its descriptor-based connection limit and existing upload-buffer ceiling.
+
+Control and authenticated recovery request-task reservations are inside the
+listener's total capacity, matching the configured ingress partitions. Empty
+GET/HEAD health/readiness probes can use control slots; only bounded, signed
+internal completion/control requests can use recovery slots. HTTP/1 rejection
+before execution returns structured 429 with `execution_started=false` and
+`Retry-After: 1`; HTTP/2 dispatch rejection uses `REFUSED_STREAM`. Authentication
+and framing are checked before selecting recovery capacity and checked again
+at application ingress. These reservations protect request tasks, not incoming
+connection slots, header parsing, or the entire process. The separate health
+listener retains its independent listener/runtime reservation.
+
+`antfly_http_request_permit_rejections_total` distinguishes exhausted listener
+request partitions from `antfly_http_request_executor_rejections_total`, which
+records failures to dispatch a task after acquiring its permit. Their sum is
+`antfly_http_request_dispatch_rejections_total`.
+
 Waiting is configured under the class's `waiting` object:
 
 | Field | Meaning |

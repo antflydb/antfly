@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 29;
+pub const abi_version: u32 = 30;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -142,6 +142,35 @@ pub const InternalServiceAuthContext = extern struct {
     out_legacy_accepted: *u8,
 };
 
+/// Allocation-free dispatch classification across the compiled API boundary.
+/// Only these borrowed framing fields and a bounded credential cross it.
+pub const DispatchRequest = extern struct {
+    method: Bytes,
+    path: Bytes,
+    content_length: OptionalBytes,
+    transfer_encoding: OptionalBytes,
+    content_encoding: OptionalBytes,
+    credential: OptionalBytes,
+    body_received_bytes: u64,
+    body_complete: u8,
+};
+
+pub const DispatchPolicy = extern struct {
+    max_requests: u32 = 0,
+    control_requests: u32 = 0,
+    recovery_requests: u32 = 0,
+};
+
+pub const DispatchPolicyContext = extern struct {
+    abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
+    handler_handle: *anyopaque,
+    request: ?*const DispatchRequest = null,
+    out_policy: *DispatchPolicy,
+    /// Stable scalar: 0=general, 1=control, 2=authenticated recovery.
+    out_lane: *u8,
+};
+
 pub const RouteManifestEntry = extern struct {
     route_handle: *anyopaque,
     method: HttpMethod,
@@ -169,6 +198,7 @@ pub const Capability = struct {
     pub const inference_admission_stats: u64 = 1 << 4;
     pub const internal_service_ingress: u64 = 1 << 5;
     pub const workload_coordinator: u64 = 1 << 6;
+    pub const dispatch_admission: u64 = 1 << 7;
 };
 
 /// The sole discovery point for the API-kernel ABI. Keeping the table itself
@@ -206,6 +236,7 @@ pub const FunctionTable = extern struct {
     handler_authorize_internal_service: *const fn (*const InternalServiceAuthContext) callconv(.c) Status,
     close_foreground_admission: *const fn (*const CallContext) callconv(.c) Status,
     coordinator_port: *const fn (*const CallContext) callconv(.c) Status,
+    handler_dispatch_policy: *const fn (*const DispatchPolicyContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -228,7 +259,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         Capability.route_manifest |
         Capability.inference_admission_stats |
         Capability.internal_service_ingress |
-        Capability.workload_coordinator;
+        Capability.workload_coordinator |
+        Capability.dispatch_admission;
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     if (required_capabilities & Capability.core != 0)
@@ -241,11 +273,15 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         required = @max(required, functionTableFieldEnd("handler_authorize_internal_service"));
     if (required_capabilities & Capability.workload_coordinator != 0)
         required = @max(required, functionTableFieldEnd("coordinator_port"));
+    if (required_capabilities & Capability.dispatch_admission != 0)
+        required = @max(required, functionTableFieldEnd("handler_dispatch_policy"));
     return required;
 }
 
 test "API kernel control contexts retain C layout" {
     const std = @import("std");
+    try std.testing.expectEqual(.@"extern", @typeInfo(DispatchPolicyContext).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(DispatchRequest).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(CreateContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(CallContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(HandlerCreateContext).@"struct".layout);

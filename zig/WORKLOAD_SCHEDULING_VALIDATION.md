@@ -633,3 +633,57 @@ scheduling disabled. It demonstrates control progress during query saturation,
 not protected task or connection capacity under transport saturation. It is
 not throughput, Cloud resource-envelope, or release qualification. The earlier
 failed C40 receipt remains unchanged.
+
+
+### Uncertain WAL writes and writable tail repair
+
+Commit `b7a751239a` integrates the independently reproduced WAL correctness fix
+(`b5097c169f` in the isolated worktree). Before the fix, a partial append followed
+by writable reopen could acknowledge a later write, then fail the next reopen
+with `CorruptLsmWal`. The initial native regression exited one:
+`/tmp/workload-wal-uncertainty-baseline.log`.
+
+Backend appends now use the single-use prepared outcome, fence further mutation
+on any uncertain storage failure, preserve unpublished manifest debt, and never
+retry an append after `FileNotFound`. Pure preparation failures remain unfenced.
+Writable startup checkpoints all successfully replayed state and resets an
+ignored torn tail before admitting foreground writes; failed repair rejects
+startup. Read-only startup leaves the tail untouched.
+
+The exact isolated source passed 19/19 tests in both Debug and ReleaseSafe with
+no leaks (`/tmp/workload-wal-uncertainty-final-debug.log`,
+`/tmp/workload-wal-uncertainty-final-release-safe.log`). Cases include partial and
+fully synced unknown writes, same-process fencing, debt conservation, failed
+repair/retry, a torn first record, existing SSTs, tombstones, multiple segments,
+and preserved replay/outbox keys. The scheduling integration then passed the
+combined WAL/uncertainty gate: 26/26, no failures/leaks, actual exit zero
+(`/tmp/workload-wal-uncertainty-integrated.log`). This fixes ordinary backend
+recovery; it does not provide persistent transaction completion reservations.
+
+### Protected request-task dispatch integration
+
+The HTTP transport stage `dce5aa1173` adds nonborrowable general, control and
+recovery request-task permits. The protocol follow-up `de60e6f161` rejects
+ambiguous HTTP/2 request headers before classification and excess declared-body
+DATA before buffering. The combined transport gate passed 122/122 with actual
+exit zero (`/tmp/workload-http-dispatch-framing-integrated.log`). This includes
+real H1, H2 and h2c request dispatch and permit cleanup; it does not reserve
+incoming connections or header parsing capacity.
+
+The first API integration gate passed 141 metadata/storage tests and 223 runtime
+tests with one optional skip, no failures or leaks, actual exit zero
+(`/tmp/workload-transport-partition-api-integration.log`). It covers API ABI 30,
+bounded stack authentication, fail-closed incompatible tables/lane values, the
+observer metadata pins and sealed native point-batch helper. This gate preceded
+the close-entry and malformed-route follow-ups; their final checks are recorded
+separately. Native transport saturation qualification must use a newly frozen
+binary containing the dispatch integration; the earlier C40/C80 binary does
+not establish protected request-task capacity.
+
+Review follow-ups fixed overlapping group route prefix/suffix bounds
+(`584eea6e53`, route gate 2/2, `/tmp/workload-dispatch-route-bounds.log`) and
+native completion entry racing a draining close (`5511c11024`, native gate 6/6,
+`/tmp/workload-native-prepaid-close-entry-final.log`). Both exited zero without
+leaks. The API bridge now preserves HEAD fallback for a selected GET route,
+leaving the host method unchanged for transport body suppression; its new
+regression and malformed-path classifier cases are part of the final API gate.

@@ -221,8 +221,8 @@ The REST/httpx, alternate-listener API-kernel paths, MCP, query builder, A2A,
 extension-host query/write calls, and serverless query/write handlers share this
 owner at their existing admission boundaries. Legacy nonwaiting callers cannot
 jump ahead of queued work. Metadata/data teardown can close admission across the
-compiled API boundary. The current API ABI is 27, storage-owner ABI is 65, and
-native runtime ABI is 9; these include admission diagnostics, dense I/O context,
+compiled API boundary. The current API ABI is 30, storage-owner ABI is 68, and
+native runtime ABI is 11; these include admission diagnostics, dense I/O context,
 executor capabilities, and worker configuration. Incompatible layouts are
 rejected. No inference-provider admission or transaction durability contract
 is replaced by this queue.
@@ -548,6 +548,37 @@ independently compiled callback regressions. The
 [validation record](WORKLOAD_SCHEDULING_VALIDATION.md) preserves the failed
 experiments and subsequent checks; none establishes optimized performance or
 release qualification.
+
+## Additional control and write recovery stages
+
+The data/API transport now carries opt-in ingress capacity through its request
+and connection limits, without multiplying upload buffering. Native C40/C80
+correctness passed on frozen `3eea19e027`: all successful reads returned the exact
+sentinel, excess work received structured 429, API probes progressed, and tracked
+query ownership drained after healing. See the validation record for the frozen
+binary and receipt boundaries; this is not throughput qualification.
+
+HTTP request tasks now support nonborrowable control/recovery partitions inside
+the listener total. The API uses one bounded framing/authentication classifier
+for direct and compiled dispatch (API ABI 30). Recovery privilege requires a
+signed internal-service credential; ordinary URL matching is insufficient.
+H1 transport rejection has an allocation-free structured 429 response, while
+H2 retains REFUSED_STREAM semantics. Task reservations do not reserve connection
+slots or establish a process-wide execution/progress guarantee.
+
+Ordinary LSM append failures now distinguish pre-I/O preparation from uncertain
+storage effects. Uncertainty fences mutation and preserves manifest debt.
+Writable reopen checkpoints valid recovered state and repairs a torn WAL before
+new writes; read-only open leaves it unchanged. This fixes a reproduced case
+where a post-reopen acknowledged write made the next reopen fail.
+
+The [internal LSM completion stages](WORKLOAD_LSM_COMPLETION.md) now include a
+native one-shot point-batch helper that seals memory, WAL encoding, descriptor
+ownership and accounting before append/publication. It remains internal and
+performs ordinary admission before sealing. It is not a prepare-now/commit-later
+transaction guarantee: exact physical plans, durable certificates, pre-admitted
+SST/manifest completion, restart restoration and production transaction wiring
+remain required.
 
 ## Remaining design phases
 

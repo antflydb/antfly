@@ -685,6 +685,8 @@ const StandaloneHealthSource = struct {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_accept_errors_total", "counter", "Public HTTP listener accept failures", http.accept_errors_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_connection_dispatch_rejections_total", "counter", "Accepted public HTTP connections closed because concurrent execution was unavailable", http.connection_dispatch_rejections_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_dispatch_rejections_total", "counter", "HTTP requests rejected before application execution because listener or runtime request capacity was unavailable", http.request_dispatch_rejections_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_permit_rejections_total", "counter", "HTTP requests rejected because their listener request-task partition was full", http.request_permit_rejections_total);
+            try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_executor_rejections_total", "counter", "HTTP requests rejected after acquiring a request permit because executor dispatch failed", http.request_executor_rejections_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_h2_stream_dispatch_rejections_total", "counter", "HTTP/2 streams reset before application execution because bounded handler execution was unavailable", http.h2_stream_dispatch_rejections_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_request_cancellations_total", "counter", "Public HTTP requests terminated by application cancellation", http.request_cancellations_total);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_body_buffer_capacity_bytes", "gauge", "Aggregate HTTP request-body buffer capacity", http.body_buffer_capacity_bytes);
@@ -3846,7 +3848,7 @@ pub fn runFromIterator(
     var unified_api_ready = std.atomic.Value(bool).init(false);
 
     var unified_lifecycle = UnifiedServerLifecycle.init(control_io);
-    const public_http_config = publicHttpServerConfig(bind_host, bind_port);
+    const public_http_config = publicHttpServerConfig(bind_host, bind_port, api_server.cfg.ingress_admission.max_requests);
     var http_observer_lease = try node_backend_runtime.ptr().acquireWorkers(.{});
     defer http_observer_lease.release();
     var http_runtime = httpx.HttpRuntime.init(alloc, .{
@@ -4337,7 +4339,7 @@ fn configuredPublicHttpConnectionLimit() u32 {
     return publicHttpConnectionLimitForFdSoftLimit(@intCast(limit.cur));
 }
 
-fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerConfig {
+fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16, ingress_requests: u32) httpx.ServerConfig {
     return (httpx.ServerConfig{
         .host = bind_host,
         .port = bind_port,
@@ -4356,6 +4358,7 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         // clients, and diagnostics. This prevents the historical 1,000-socket
         // cliff under the common 1,024 descriptor soft limit.
         .max_connections = configuredPublicHttpConnectionLimit(),
+        .max_request_tasks = @max(configuredPublicHttpConnectionLimit(), ingress_requests),
         .accept_error_backoff_initial_ms = 5,
         .accept_error_backoff_max_ms = 1_000,
         .max_requests_per_connection = public_api_max_requests_per_connection,
@@ -9245,7 +9248,7 @@ test "standalone runtime defaults public listener to antfarm port" {
 }
 
 test "standalone public HTTP server is restart-safe and uses public API request body limit" {
-    const cfg = publicHttpServerConfig("127.0.0.1", 8080);
+    const cfg = publicHttpServerConfig("127.0.0.1", 8080, 0);
     try std.testing.expect(cfg.reuse_address);
     try std.testing.expect(!cfg.reuse_port);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
@@ -9260,6 +9263,11 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     try std.testing.expectEqual(@as(u32, 128), publicHttpConnectionLimitForFdSoftLimit(512));
     try std.testing.expectEqual(@as(u32, 32), publicHttpConnectionLimitForFdSoftLimit(128));
     try std.testing.expectEqual(@as(u32, 1), publicHttpConnectionLimitForFdSoftLimit(3));
+    const scheduled = publicHttpServerConfig("127.0.0.1", 8080, 1024);
+    try std.testing.expectEqual(@as(u32, 1024), scheduled.max_request_tasks);
+    try std.testing.expectEqual(cfg.max_connections, scheduled.max_connections);
+    try std.testing.expectEqual(cfg.max_h1_inflight_bodies, scheduled.max_h1_inflight_bodies);
+    try std.testing.expectEqual(cfg.request_body_buffer_budget_bytes, scheduled.request_body_buffer_budget_bytes);
 }
 
 test "standalone rejects configured server TLS instead of serving plaintext" {
