@@ -56,7 +56,7 @@ The implementation now consists of:
   `runUntilIdle`.
 - `storage/db/db.zig` already supports open modes such as writer,
   query-readonly, and status-only.
-- `storage/lite/native.zig` owns the native revision-2 header, alternating checkpoint roots,
+- `storage/lite/native.zig` owns the native revision-3 header, alternating checkpoint roots,
   page allocation, free map, crash recovery, integrity checks, stable snapshots,
   and atomic vacuum replacement. Document commits publish a namespace-head
   directory and per-namespace page links in the same checkpoint, so a cold
@@ -90,6 +90,19 @@ The implementation now consists of:
   blocks vacuum before it can reclaim those roots.
 - `storage/lite/index_storage.zig` stores Antfly index logical files in the
   native index catalog inside the same `.aflite` file.
+  Each catalog checkpoint owns an immutable descriptor containing its history
+  root and a copy-on-write B+ tree mapping keys to their latest record pages.
+  Point reads and misses use bounded tree searches, including after reopening
+  and at older pinned checkpoints. Empty keys and keys too large for a tree
+  separator retain exact history lookup; ordinary index paths use the tree.
+  External catalog values use a 64-way immutable extent tree with byte lengths
+  on each child. Appends copy only the rightmost path and partial tail leaf;
+  range reads seek directly to the requested extents. Vacuum builds packed
+  catalog indexes and extent trees; integrity checks validate both structures.
+  Positional page writes extend the file directly, without per-page stat or
+  resize calls; data, checkpoint-slot, and active-slot sync barriers remain.
+  Revision 2 and other unsupported headers are rejected without mutation;
+  there is no automatic upgrade or compatibility reader.
 - `storage/lite/backend.zig` caches one runtime per logical table/group and
   injects those runtimes through the standalone backend-runtime DB-open hook.
 - Standalone metadata is stored in a reserved system namespace in the same
@@ -150,7 +163,7 @@ into another.
 file format, the selected engine, the primary, replay, and index layouts, the
 native format revision, page size, and active checkpoint sequence. That makes the
 public native `.aflite` path observable and keeps internal bridge profiles from
-being mistaken for the format revision 2 contract.
+being mistaken for the format revision 3 contract.
 
 For native `.aflite`, the public status contract should report
 `primary_layout: native_document_pages`,
@@ -411,11 +424,11 @@ same way. Neither should be the public Lite v1 contract.
 
 ### Compatibility Policy
 
-Because this is new, unreleased code, native revision 2 does not carry a legacy fallback,
+Because this is new, unreleased code, native revision 3 does not carry a legacy fallback,
 pre-release importer, v0 directory reader, silent LSM-container upgrade path, or
 prototype-to-v1 auto-migrator. Prototype files can be recreated from tests or
 explicit exports while the format is still pre-release. `.aflite` readers should
-accept the documented revision-2 format and reject unknown versions loudly. Recovery
+accept the documented revision-3 format and reject unknown versions loudly. Recovery
 from an older complete checkpoint root inside the same file is crash
 recovery, not legacy compatibility; a file with no complete checkpoint should
 fail with an explicit integrity error. Compatibility branches should only be
