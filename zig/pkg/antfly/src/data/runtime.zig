@@ -2258,6 +2258,12 @@ pub const HealthSource = struct {
                     .max_suspended_io = metrics.dense_max_suspended_io,
                     .suspended_io = metrics.dense_suspended_io,
                     .working_bytes = metrics.dense_working_bytes,
+                    .all_reads = metrics.dense_all_reads != 0,
+                    .bounded_runnable = metrics.read_bounded_runnable,
+                    .bounded_outstanding = metrics.read_bounded_outstanding,
+                    .transition_outstanding = metrics.read_transition_outstanding,
+                    .transition_bytes = metrics.read_transition_bytes,
+
                     .runnable = metrics.dense_runnable,
                     .outstanding = metrics.dense_outstanding,
                     .queued = metrics.dense_queued,
@@ -2971,18 +2977,29 @@ fn asyncMutexMetricValue(stats: antfly.db.types.DBMutexStats, field: AsyncMutexM
 }
 
 fn writeDenseExecutionMetrics(writer: *std.Io.Writer, stats: resource_manager_mod.DenseExecution.Stats) !void {
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_enabled", "gauge", "Whether fixed dense caller and helper scheduling is enabled", @intFromBool(stats.max_runnable_tasks != 0));
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_runnable_limit", "gauge", "Configured and effective dense runnable task limit", stats.max_runnable_tasks);
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_outstanding_limit", "gauge", "Configured and effective dense outstanding task limit", stats.max_outstanding_tasks);
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_queue_limit", "gauge", "Configured and effective dense queued task limit", stats.max_queued_tasks);
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_max_wait_ms", "gauge", "Maximum dense execution queue waiting time in milliseconds", stats.max_wait_ms);
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_runnable", "gauge", "Dense drivers and helpers owning runnable leases", stats.runnable);
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_outstanding", "gauge", "Dense drivers and helpers owning request leases", stats.outstanding);
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_queued", "gauge", "Fresh dense drivers waiting for runnable leases; resumptions retain existing ownership", stats.queued);
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_working_bytes_limit", "gauge", "Hard byte ceiling for participating dense workspaces", stats.max_working_bytes);
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_working_bytes", "gauge", "Actual allocated bytes in participating dense workspaces", stats.working_bytes);
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_suspended_io_limit", "gauge", "Maximum native reads that release runnable capacity", stats.max_suspended_io);
-    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_suspended_io", "gauge", "Native reads currently holding suspended I/O ownership", stats.suspended_io);
+    if (stats.all_reads)
+        return writeExecutionMetricsForScope("antfly_read_execution_", writer, stats);
+    return writeExecutionMetricsForScope("antfly_dense_execution_", writer, stats);
+}
+
+fn writeExecutionMetricsForScope(comptime prefix: []const u8, writer: *std.Io.Writer, stats: resource_manager_mod.DenseExecution.Stats) !void {
+    try health_metrics.appendPromMetric(writer, prefix ++ "bounded_runnable", "gauge", "Protected verified probes owning runnable leases", stats.bounded_runnable);
+    try health_metrics.appendPromMetric(writer, prefix ++ "bounded_outstanding", "gauge", "Protected probes owning request leases", stats.bounded_outstanding);
+    try health_metrics.appendPromMetric(writer, prefix ++ "transition_outstanding", "gauge", "Demoted reads awaiting general capacity", stats.transition_outstanding);
+    try health_metrics.appendPromMetric(writer, prefix ++ "transition_bytes", "gauge", "Live bytes owned by demoted waiting reads", stats.transition_bytes);
+
+    try health_metrics.appendPromMetric(writer, prefix ++ "enabled", "gauge", "Whether fixed read caller and helper scheduling is enabled", @intFromBool(stats.max_runnable_tasks != 0));
+    try health_metrics.appendPromMetric(writer, prefix ++ "runnable_limit", "gauge", "Configured and effective read runnable task limit", stats.max_runnable_tasks);
+    try health_metrics.appendPromMetric(writer, prefix ++ "outstanding_limit", "gauge", "Configured and effective read outstanding task limit", stats.max_outstanding_tasks);
+    try health_metrics.appendPromMetric(writer, prefix ++ "queue_limit", "gauge", "Configured and effective read queued task limit", stats.max_queued_tasks);
+    try health_metrics.appendPromMetric(writer, prefix ++ "max_wait_ms", "gauge", "Maximum read execution queue waiting time in milliseconds", stats.max_wait_ms);
+    try health_metrics.appendPromMetric(writer, prefix ++ "runnable", "gauge", "Read drivers and helpers owning runnable leases", stats.runnable);
+    try health_metrics.appendPromMetric(writer, prefix ++ "outstanding", "gauge", "Read drivers and helpers owning request leases", stats.outstanding);
+    try health_metrics.appendPromMetric(writer, prefix ++ "queued", "gauge", "Fresh read drivers waiting for runnable leases; resumptions retain existing ownership", stats.queued);
+    try health_metrics.appendPromMetric(writer, prefix ++ "working_bytes_limit", "gauge", "Hard byte ceiling for participating read workspaces", stats.max_working_bytes);
+    try health_metrics.appendPromMetric(writer, prefix ++ "working_bytes", "gauge", "Actual allocated bytes in participating read workspaces", stats.working_bytes);
+    try health_metrics.appendPromMetric(writer, prefix ++ "suspended_io_limit", "gauge", "Maximum native reads that release runnable capacity", stats.max_suspended_io);
+    try health_metrics.appendPromMetric(writer, prefix ++ "suspended_io", "gauge", "Native reads currently holding suspended I/O ownership", stats.suspended_io);
 }
 
 fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.ResourceManager) !void {
@@ -5669,8 +5686,10 @@ pub const DataServer = struct {
 
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
-        if (comptime !linked_storage)
+        if (comptime !linked_storage) {
             try self.provisioned_storage.resource_manager.configureDenseExecution(self.api_server_cfg.dense_execution);
+            try self.provisioned_storage.resource_manager.configureReadExecution(self.api_server_cfg.read_execution);
+        }
         var api_server_cfg = self.api_server_cfg;
         api_server_cfg.remote_attempt_node_id = if (self.store_registration) |registration| registration.node_id else 0;
         if (self.data_request_lifecycle_hook != null) {
@@ -19739,6 +19758,7 @@ pub const DataServer = struct {
             if (cfg.storage_kernel_context_handle == null) {
                 var context = kernel_owner_client.Context{};
                 const dense = cfg.api_server_cfg.dense_execution;
+                const reads = cfg.api_server_cfg.read_execution;
                 const context_request: @import("kernel_owner_abi").ContextRequest = .{
                     .dense_max_runnable_tasks = dense.max_runnable_tasks,
                     .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
@@ -19746,6 +19766,19 @@ pub const DataServer = struct {
                     .dense_max_wait_ms = dense.max_wait_ms,
                     .dense_max_working_bytes = dense.max_working_bytes,
                     .dense_max_suspended_io = dense.max_suspended_io,
+                    .read_max_runnable_tasks = reads.max_runnable_tasks,
+                    .read_max_outstanding_tasks = reads.max_outstanding_tasks,
+                    .read_max_queued_tasks = reads.max_queued_tasks,
+                    .read_max_wait_ms = reads.max_wait_ms,
+                    .read_max_working_bytes = reads.max_working_bytes,
+                    .read_max_suspended_io = reads.max_suspended_io,
+                    .read_max_scan_state_bytes = reads.max_scan_state_bytes,
+                    .read_max_scan_snapshot_ms = reads.max_scan_snapshot_ms,
+                    .read_protected_runnable_tasks = reads.protected.max_runnable_tasks,
+                    .read_protected_outstanding_tasks = reads.protected.max_outstanding_tasks,
+                    .read_protected_working_bytes = reads.protected.max_working_bytes,
+                    .read_transition_tasks = reads.protected.max_transition_tasks,
+                    .read_transition_bytes = reads.protected.max_transition_bytes,
                 };
                 if (backend_runtime.?.usesBorrowedIo()) {
                     const services = @import("../storage/kernel_runtime_services.zig");
@@ -25780,6 +25813,7 @@ pub fn runFromIterator(
             .session_max_retained_bytes = if (loaded_config) |*cfg| cfg.admission.session_max_retained_bytes else 64 * 1024 * 1024,
             .ingress_admission = if (loaded_config) |*cfg| cfg.admission.ingress else .{},
             .dense_execution = if (loaded_config) |*cfg| cfg.admission.dense_execution else .{},
+            .read_execution = if (loaded_config) |*cfg| cfg.admission.read_execution else .{},
             .remote_attempt_worker = if (loaded_config) |*cfg| cfg.admission.remote_attempt_worker else .{},
             .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},

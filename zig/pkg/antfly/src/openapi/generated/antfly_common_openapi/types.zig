@@ -19,6 +19,7 @@ pub const AdmissionConfig = struct {
     session_max_retained_bytes: ?i64 = null,
     remote_attempt_worker: ?RemoteAttemptWorkerConfig = null,
     dense_execution: ?DenseExecutionConfig = null,
+    read_execution: ?ReadExecutionConfig = null,
     query: ?QueryAdmissionConfig = null,
     write: ?WriteAdmissionConfig = null,
     inference: ?InferenceAdmissionConfig = null,
@@ -29,6 +30,7 @@ pub const AdmissionConfig = struct {
         .{ "session_max_retained_bytes", "session_max_retained_bytes", true },
         .{ "remote_attempt_worker", "remote_attempt_worker", true },
         .{ "dense_execution", "dense_execution", true },
+        .{ "read_execution", "read_execution", true },
         .{ "query", "query", true },
         .{ "write", "write", true },
         .{ "inference", "inference", true },
@@ -58,6 +60,10 @@ pub const AdmissionConfig = struct {
         }
         if (self.dense_execution) |value| {
             try jw.objectField("dense_execution");
+            try jw.write(value);
+        }
+        if (self.read_execution) |value| {
+            try jw.objectField("read_execution");
             try jw.write(value);
         }
         if (self.query) |value| {
@@ -2058,6 +2064,57 @@ pub const ObjectStorageLocation = struct {
     }
 };
 
+/// Opt-in hard partition within read_execution totals for verified local existence probes. Each possible probe prepays 64 KiB scratch and a transition ticket before execution. General reads cannot consume these floors. Both protected and transition bytes/counts are inside totals. Supported on provisioned local LMDB reads only; serverless rejects this partition. All zero values disable it.
+pub const ProtectedReadExecutionConfig = struct {
+    max_runnable_tasks: ?i64 = null,
+    max_outstanding_tasks: ?i64 = null,
+    max_working_bytes: ?i64 = null,
+    max_transition_tasks: ?i64 = null,
+    max_transition_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_runnable_tasks", "max_runnable_tasks", true },
+        .{ "max_outstanding_tasks", "max_outstanding_tasks", true },
+        .{ "max_working_bytes", "max_working_bytes", true },
+        .{ "max_transition_tasks", "max_transition_tasks", true },
+        .{ "max_transition_bytes", "max_transition_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_runnable_tasks) |value| {
+            try jw.objectField("max_runnable_tasks");
+            try jw.write(value);
+        }
+        if (self.max_outstanding_tasks) |value| {
+            try jw.objectField("max_outstanding_tasks");
+            try jw.write(value);
+        }
+        if (self.max_working_bytes) |value| {
+            try jw.objectField("max_working_bytes");
+            try jw.write(value);
+        }
+        if (self.max_transition_tasks) |value| {
+            try jw.objectField("max_transition_tasks");
+            try jw.write(value);
+        }
+        if (self.max_transition_bytes) |value| {
+            try jw.objectField("max_transition_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const QueryAdmissionConfig = struct {
     waiting: ?AdmissionWaitingConfig = null,
     /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Bounded waiting is opt-in through waiting. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
@@ -2085,6 +2142,89 @@ pub const QueryAdmissionConfig = struct {
         }
         if (self.max_concurrent_requests) |value| {
             try jw.objectField("max_concurrent_requests");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opt-in shared storage read scheduling for text, vector, graph, aggregation, document lookups, and scans. Dense helpers use the same ledger. Cannot be enabled together with dense_execution. Unknown or nonyielding operators retain a general-lane execution lease through completion. Defaults preserve existing scheduling.
+pub const ReadExecutionConfig = struct {
+    protected: ?ProtectedReadExecutionConfig = null,
+    /// Per-scan saved-state reservation for audited output suspension; zero keeps coarse ownership. Does not measure MVCC pages pinned by snapshots.
+    max_scan_state_bytes: ?i64 = null,
+    /// Absolute lifetime ceiling for suspended scan snapshots, within the original request deadline.
+    max_scan_snapshot_ms: ?i64 = null,
+    /// Maximum combined read callers and helpers; zero disables this scheduler.
+    max_runnable_tasks: ?i64 = null,
+    /// Hard aggregate ceiling for read memory participating in scheduler accounting. Covers scoped exact-search and opted-in native read arenas; pooled HBC scratch and result ownership keep their existing memory policy. Zero preserves the legacy memory path. Requires a nonzero task limit.
+    max_working_bytes: ?i64 = null,
+    /// Maximum native exact positional reads that can release runnable capacity during synchronous I/O. Enables scoped native read arenas; requires working memory and waiting budgets. Zero keeps coarse driver ownership. Requires a runtime that keeps callers on their original thread during I/O; other runtimes remain coarse. The operating-system read is not preemptible.
+    max_suspended_io: ?i64 = null,
+    /// Hard bound on active and queued read tasks; must cover runnable capacity.
+    max_outstanding_tasks: ?i64 = null,
+    /// Waiting read callers; helpers never queue. Must not exceed outstanding capacity.
+    max_queued_tasks: ?i64 = null,
+    /// Queue wait ceiling within the request deadline; zero requires a zero queue limit.
+    max_wait_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "protected", "protected", true },
+        .{ "max_scan_state_bytes", "max_scan_state_bytes", true },
+        .{ "max_scan_snapshot_ms", "max_scan_snapshot_ms", true },
+        .{ "max_runnable_tasks", "max_runnable_tasks", true },
+        .{ "max_working_bytes", "max_working_bytes", true },
+        .{ "max_suspended_io", "max_suspended_io", true },
+        .{ "max_outstanding_tasks", "max_outstanding_tasks", true },
+        .{ "max_queued_tasks", "max_queued_tasks", true },
+        .{ "max_wait_ms", "max_wait_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.protected) |value| {
+            try jw.objectField("protected");
+            try jw.write(value);
+        }
+        if (self.max_scan_state_bytes) |value| {
+            try jw.objectField("max_scan_state_bytes");
+            try jw.write(value);
+        }
+        if (self.max_scan_snapshot_ms) |value| {
+            try jw.objectField("max_scan_snapshot_ms");
+            try jw.write(value);
+        }
+        if (self.max_runnable_tasks) |value| {
+            try jw.objectField("max_runnable_tasks");
+            try jw.write(value);
+        }
+        if (self.max_working_bytes) |value| {
+            try jw.objectField("max_working_bytes");
+            try jw.write(value);
+        }
+        if (self.max_suspended_io) |value| {
+            try jw.objectField("max_suspended_io");
+            try jw.write(value);
+        }
+        if (self.max_outstanding_tasks) |value| {
+            try jw.objectField("max_outstanding_tasks");
+            try jw.write(value);
+        }
+        if (self.max_queued_tasks) |value| {
+            try jw.objectField("max_queued_tasks");
+            try jw.write(value);
+        }
+        if (self.max_wait_ms) |value| {
+            try jw.objectField("max_wait_ms");
             try jw.write(value);
         }
         try jw.endObject();

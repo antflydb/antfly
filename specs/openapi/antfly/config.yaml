@@ -807,6 +807,8 @@ components:
           $ref: "#/components/schemas/RemoteAttemptWorkerConfig"
         dense_execution:
           $ref: "#/components/schemas/DenseExecutionConfig"
+        read_execution:
+          $ref: "#/components/schemas/ReadExecutionConfig"
         query:
           $ref: "#/components/schemas/QueryAdmissionConfig"
         write:
@@ -935,6 +937,114 @@ components:
           maximum: 60000
           default: 0
           description: Queue wait ceiling within the request deadline; zero requires a zero queue limit.
+
+    ReadExecutionConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Opt-in shared storage read scheduling for text, vector, graph,
+        aggregation, document lookups, and scans. Dense helpers use the same
+        ledger. Cannot be enabled together with dense_execution. Unknown or
+        nonyielding operators retain a general-lane execution lease through
+        completion. Defaults preserve existing scheduling.
+      properties:
+        protected:
+          $ref: "#/components/schemas/ProtectedReadExecutionConfig"
+        max_scan_state_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+          description: Per-scan saved-state reservation for audited output suspension; zero keeps coarse ownership. Does not measure MVCC pages pinned by snapshots.
+        max_scan_snapshot_ms:
+          type: integer
+          minimum: 1
+          maximum: 60000
+          default: 30000
+          description: Absolute lifetime ceiling for suspended scan snapshots, within the original request deadline.
+        max_runnable_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Maximum combined read callers and helpers; zero disables this scheduler.
+        max_working_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+          description: >-
+            Hard aggregate ceiling for read memory participating in scheduler
+            accounting. Covers scoped exact-search and opted-in native read arenas; pooled
+            HBC scratch and result ownership keep their existing memory policy.
+            Zero preserves the legacy memory path. Requires a nonzero task limit.
+        max_suspended_io:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: >-
+            Maximum native exact positional reads that can release runnable
+            capacity during synchronous I/O. Enables scoped native read arenas;
+            requires working memory and waiting budgets. Zero keeps coarse
+            driver ownership. Requires a runtime that keeps callers on their
+            original thread during I/O; other runtimes remain coarse. The
+            operating-system read is not preemptible.
+        max_outstanding_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Hard bound on active and queued read tasks; must cover runnable capacity.
+        max_queued_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Waiting read callers; helpers never queue. Must not exceed outstanding capacity.
+        max_wait_ms:
+          type: integer
+          minimum: 0
+          maximum: 60000
+          default: 0
+          description: Queue wait ceiling within the request deadline; zero requires a zero queue limit.
+
+    ProtectedReadExecutionConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Opt-in hard partition within read_execution totals for verified local
+        existence probes. Each possible probe prepays 64 KiB scratch and a
+        transition ticket before execution. General reads cannot consume these
+        floors. Both protected and transition bytes/counts are inside totals.
+        Supported on provisioned local LMDB reads only; serverless rejects this
+        partition. All zero values disable it.
+      properties:
+        max_runnable_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+        max_outstanding_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+        max_working_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+        max_transition_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+        max_transition_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
 
     GraphExecutionConfig:
       type: object

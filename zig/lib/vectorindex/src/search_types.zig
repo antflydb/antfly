@@ -96,6 +96,9 @@ pub const SearchRequest = struct {
     /// Borrowed request-lifecycle signal. Search loops poll this at bounded
     /// intervals so a disconnected caller does not retain query capacity.
     cancellation: ?CancellationToken = null,
+    /// Process-local storage driver borrowed only during this synchronous call.
+    /// The generic vector package never dereferences or retains it.
+    read_execution: ?*anyopaque = null,
 };
 
 pub fn normalizedSearchEffort(req: SearchRequest) ?f32 {

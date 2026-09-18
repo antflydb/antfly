@@ -97,6 +97,7 @@ pub const Config = struct {
         session_max_retained_bytes: usize = 64 * 1024 * 1024,
         remote_attempt_worker: @import("workload_worker_config.zig").Config = .{},
         dense_execution: @import("../storage/dense_execution.zig").Config = .{},
+        read_execution: @import("../storage/dense_execution.zig").Config = .{},
         query: RequestAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
         write: RequestAdmissionConfig = .{ .max_concurrent_requests = default_write_max_concurrent_requests },
         inference: RequestAdmissionConfig = .{ .max_concurrent_requests = default_inference_max_concurrent_requests },
@@ -722,7 +723,7 @@ pub const Config = struct {
         };
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("admission")) |admission_value| {
-            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "dense_execution", "remote_attempt_worker", "session_max_retained_bytes", "ingress" });
+            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "dense_execution", "read_execution", "remote_attempt_worker", "session_max_retained_bytes", "ingress" });
             const admission_object = switch (admission_value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
@@ -832,6 +833,10 @@ pub const Config = struct {
         else
             Config.InferenceConfig.KernelJitConfig{};
         errdefer kernel_jit.deinit(alloc);
+        const dense_execution = try executionFromOpenApi(if (validated.value.admission) |admission| admission.dense_execution else null);
+        const read_execution = try executionFromOpenApi(if (validated.value.admission) |admission| admission.read_execution else null);
+        if (dense_execution.max_runnable_tasks != 0 and read_execution.max_runnable_tasks != 0)
+            return error.InvalidConfig;
         return .{
             .registry = registry,
             .transcribers = transcribers,
@@ -854,7 +859,8 @@ pub const Config = struct {
                 .ingress = try ingressFromOpenApi(if (validated.value.admission) |admission| admission.ingress else null),
                 .session_max_retained_bytes = try boundedPositiveInt(usize, if (validated.value.admission) |admission| admission.session_max_retained_bytes else null, 4096, 1099511627776, 64 * 1024 * 1024),
                 .remote_attempt_worker = try remoteAttemptWorkerFromOpenApi(if (validated.value.admission) |admission| admission.remote_attempt_worker else null),
-                .dense_execution = try denseExecutionFromOpenApi(if (validated.value.admission) |admission| admission.dense_execution else null),
+                .dense_execution = dense_execution,
+                .read_execution = read_execution,
                 .query = .{
                     .max_concurrent_requests = if (validated.value.admission) |admission|
                         if (admission.query) |query|
@@ -1691,7 +1697,7 @@ fn parseRemoteContentS3Credential(alloc: std.mem.Allocator, value: std.json.Valu
     };
 }
 
-fn denseExecutionFromOpenApi(input: ?common_openapi.DenseExecutionConfig) !@import("../storage/dense_execution.zig").Config {
+fn executionFromOpenApi(input: anytype) !@import("../storage/dense_execution.zig").Config {
     const value = input orelse return .{};
     const config: @import("../storage/dense_execution.zig").Config = .{
         .max_runnable_tasks = std.math.cast(u32, value.max_runnable_tasks orelse 0) orelse return error.InvalidConfig,
@@ -1700,9 +1706,23 @@ fn denseExecutionFromOpenApi(input: ?common_openapi.DenseExecutionConfig) !@impo
         .max_wait_ms = std.math.cast(u32, value.max_wait_ms orelse 0) orelse return error.InvalidConfig,
         .max_working_bytes = std.math.cast(u64, value.max_working_bytes orelse 0) orelse return error.InvalidConfig,
         .max_suspended_io = std.math.cast(u32, value.max_suspended_io orelse 0) orelse return error.InvalidConfig,
+        .max_scan_state_bytes = if (@hasField(@TypeOf(value), "max_scan_state_bytes")) std.math.cast(u64, value.max_scan_state_bytes orelse 0) orelse return error.InvalidConfig else 0,
+        .max_scan_snapshot_ms = if (@hasField(@TypeOf(value), "max_scan_snapshot_ms")) std.math.cast(u32, value.max_scan_snapshot_ms orelse 30_000) orelse return error.InvalidConfig else 30_000,
+        .protected = if (@hasField(@TypeOf(value), "protected")) try protectedReadExecutionFromOpenApi(value.protected) else .{},
     };
     try config.validate();
     return config;
+}
+
+fn protectedReadExecutionFromOpenApi(input: ?common_openapi.ProtectedReadExecutionConfig) !@import("../storage/dense_execution.zig").ProtectedConfig {
+    const value = input orelse return .{};
+    return .{
+        .max_runnable_tasks = std.math.cast(u32, value.max_runnable_tasks orelse 0) orelse return error.InvalidConfig,
+        .max_outstanding_tasks = std.math.cast(u32, value.max_outstanding_tasks orelse 0) orelse return error.InvalidConfig,
+        .max_working_bytes = std.math.cast(u64, value.max_working_bytes orelse 0) orelse return error.InvalidConfig,
+        .max_transition_tasks = std.math.cast(u32, value.max_transition_tasks orelse 0) orelse return error.InvalidConfig,
+        .max_transition_bytes = std.math.cast(u64, value.max_transition_bytes orelse 0) orelse return error.InvalidConfig,
+    };
 }
 
 fn remoteAttemptWorkerFromOpenApi(input: ?common_openapi.RemoteAttemptWorkerConfig) !@import("workload_worker_config.zig").Config {
@@ -3795,4 +3815,46 @@ test "workload admission ingress config validates combined hard partitions" {
     try std.testing.expectEqual(@as(u32, 16), cfg.admission.ingress.max_requests);
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, "{\"admission\":{\"ingress\":{\"max_requests\":2,\"max_retained_bytes\":1048576}}}"));
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, "{\"admission\":{\"ingress\":{\"max_requests\":16}}}"));
+}
+
+test "workload admission shared read execution is opt in and exclusive with dense scheduling" {
+    const alloc = std.testing.allocator;
+    var defaults = try Config.parseFromSlice(alloc, "{}");
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(u32, 0), defaults.admission.read_execution.max_runnable_tasks);
+    var cfg = try Config.parseFromSlice(alloc,
+        \\{"admission":{"read_execution":{"max_runnable_tasks":2,"max_outstanding_tasks":8,"max_queued_tasks":4,"max_wait_ms":25,"max_working_bytes":65536,"max_suspended_io":1}}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 2), cfg.admission.read_execution.max_runnable_tasks);
+    try std.testing.expectEqual(@as(u64, 65536), cfg.admission.read_execution.max_working_bytes);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{"admission":{"read_execution":{"max_runnable_tasks":2,"max_outstanding_tasks":1}}}
+    ));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{"admission":{"read_execution":{"max_runnable_tasks":1,"max_outstanding_tasks":1},"dense_execution":{"max_runnable_tasks":1,"max_outstanding_tasks":1}}}
+    ));
+}
+
+test "workload admission protected reads and scan limits are inside the shared envelope" {
+    const alloc = std.testing.allocator;
+    var cfg = try Config.parseFromSlice(alloc,
+        \\{"admission":{"read_execution":{"max_runnable_tasks":2,"max_outstanding_tasks":8,"max_queued_tasks":4,"max_wait_ms":25,"max_working_bytes":524288,"max_scan_state_bytes":131072,"max_scan_snapshot_ms":1000,"protected":{"max_runnable_tasks":1,"max_outstanding_tasks":1,"max_working_bytes":65536,"max_transition_tasks":1,"max_transition_bytes":65536}}}}
+    );
+    defer cfg.deinit();
+    try std.testing.expect(cfg.admission.read_execution.protected.enabled());
+    try std.testing.expectEqual(@as(u64, 131072), cfg.admission.read_execution.max_scan_state_bytes);
+    try std.testing.expectEqual(@as(u32, 1000), cfg.admission.read_execution.max_scan_snapshot_ms);
+    var partitioned = cfg.admission.read_execution;
+    partitioned.max_working_bytes = 256 * 1024;
+    partitioned.max_scan_state_bytes = 128 * 1024;
+    try partitioned.validate();
+    partitioned.max_scan_state_bytes += 1;
+    try std.testing.expectError(error.InvalidConfig, partitioned.validate());
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{"admission":{"read_execution":{"max_runnable_tasks":2,"max_outstanding_tasks":8,"max_queued_tasks":4,"max_wait_ms":25,"max_working_bytes":131072,"protected":{"max_runnable_tasks":1,"max_outstanding_tasks":1,"max_working_bytes":65536,"max_transition_tasks":1,"max_transition_bytes":65536}}}}
+    ));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{"admission":{"read_execution":{"max_runnable_tasks":1,"max_outstanding_tasks":2,"max_queued_tasks":1,"max_wait_ms":25,"max_working_bytes":65536,"max_scan_state_bytes":65537}}}
+    ));
 }

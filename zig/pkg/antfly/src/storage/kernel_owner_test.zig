@@ -2152,3 +2152,33 @@ test "opaque WAL rejects custom simulation hooks even without a context pointer"
     try std.testing.expectError(error.UnsupportedKernelWalOptions, wal_client.WAL.open("/unused", wal_client.WalOptions{ .clock = .{ .now_ns_fn = Hooks.now, .sleep_ns_fn = Hooks.sleep } }));
     try std.testing.expectError(error.UnsupportedKernelWalOptions, wal_client.WAL.open("/unused", TestWalOptions{ .commit_scheduler = .{ .wait_ns_fn = Hooks.wait } }));
 }
+
+test "opaque storage context activates shared read policy and rejects competing dense policy" {
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(abi.Status.invalid_config, abi.antfly_storage_context_create(&.{
+        .dense_max_runnable_tasks = 1,
+        .dense_max_outstanding_tasks = 2,
+        .read_max_runnable_tasks = 1,
+        .read_max_outstanding_tasks = 2,
+    }, &context));
+    try std.testing.expect(context == null);
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{
+        .read_max_runnable_tasks = 2,
+        .read_max_outstanding_tasks = 8,
+        .read_max_queued_tasks = 4,
+        .read_max_wait_ms = 25,
+        .read_max_working_bytes = 524288,
+        .read_protected_runnable_tasks = 1,
+        .read_protected_outstanding_tasks = 1,
+        .read_protected_working_bytes = 65536,
+        .read_transition_tasks = 1,
+        .read_transition_bytes = 65536,
+    }, &context));
+    defer _ = abi.antfly_storage_context_destroy(context);
+    var metrics: abi.ContextMetricsResult = undefined;
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
+    try std.testing.expectEqual(@as(u8, 1), metrics.dense_all_reads);
+    try std.testing.expectEqual(@as(u32, 2), metrics.dense_max_runnable_tasks);
+    try std.testing.expectEqual(@as(u64, 0), metrics.read_bounded_outstanding);
+    try std.testing.expectEqual(@as(u64, 0), metrics.read_transition_outstanding);
+}

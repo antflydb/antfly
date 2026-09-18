@@ -1,15 +1,30 @@
 // Copyright 2026 Antfly, Inc.
 // Licensed under the Elastic License 2.0 (ELv2); see https://www.antfly.io/licensing/ELv2-license.
 
-//! First operator binding for the common scheduler. Dense drivers retain a
-//! coarse runnable lease through scan/rerank and helper join. Opt-in native
-//! exact positional reads can suspend only with scoped read arenas and local
-//! I/O ownership. Other pooled HBC scratch keeps its existing owner. This
-//! binding does not provide general cooperative lane isolation.
+//! Shared read execution binding for the common scheduler. General operators
+//! retain coarse runnable ownership; audited dense I/O and streamed scans may
+//! suspend with prepaid retained state. Narrow LMDB existence probes use a
+//! protected lane and reserve demotion capacity before executing. Other pooled
+//! HBC scratch keeps its existing owner; arbitrary operators are not preempted.
 const std = @import("std");
 const resources = @import("../common/workload_resources.zig");
 const scheduling = @import("../common/workload_scheduler.zig");
 const admission = @import("../common/workload_admission.zig");
+
+/// Fixed, server-audited existence probe scratch and demotion envelope.
+pub const bounded_probe_bytes: u64 = 64 * 1024;
+
+pub const ProtectedConfig = struct {
+    max_runnable_tasks: u32 = 0,
+    max_outstanding_tasks: u32 = 0,
+    max_working_bytes: u64 = 0,
+    max_transition_tasks: u32 = 0,
+    max_transition_bytes: u64 = 0,
+
+    pub fn enabled(self: ProtectedConfig) bool {
+        return self.max_runnable_tasks != 0;
+    }
+};
 
 pub const Config = struct {
     max_runnable_tasks: u32 = 0,
@@ -18,10 +33,28 @@ pub const Config = struct {
     max_wait_ms: u32 = 0,
     max_working_bytes: u64 = 0,
     max_suspended_io: u32 = 0,
+    max_scan_state_bytes: u64 = 0,
+    max_scan_snapshot_ms: u32 = 30_000,
+    protected: ProtectedConfig = .{},
 
     pub fn validate(self: Config) !void {
+        if (self.max_scan_snapshot_ms == 0 or self.max_scan_snapshot_ms > 60_000) return error.InvalidConfig;
+        if (self.max_scan_state_bytes != 0 and (self.max_scan_state_bytes < 4096 or self.max_scan_state_bytes > self.max_working_bytes or self.max_wait_ms == 0)) return error.InvalidConfig;
+        const p = self.protected;
+        if (!p.enabled()) {
+            if (!std.meta.eql(p, ProtectedConfig{})) return error.InvalidConfig;
+        } else {
+            if (p.max_outstanding_tasks < p.max_runnable_tasks or p.max_transition_tasks < p.max_outstanding_tasks or
+                p.max_runnable_tasks >= self.max_runnable_tasks or
+                @as(u64, p.max_outstanding_tasks) + p.max_transition_tasks >= self.max_outstanding_tasks or
+                p.max_working_bytes < @as(u64, p.max_outstanding_tasks) * bounded_probe_bytes or
+                p.max_transition_bytes < @as(u64, p.max_transition_tasks) * bounded_probe_bytes or
+                @as(u128, p.max_working_bytes) + p.max_transition_bytes + bounded_probe_bytes > self.max_working_bytes or
+                p.max_outstanding_tasks >= self.max_queued_tasks or self.max_wait_ms == 0) return error.InvalidConfig;
+            if (self.max_scan_state_bytes > self.max_working_bytes - p.max_working_bytes - p.max_transition_bytes) return error.InvalidConfig;
+        }
         if (self.max_runnable_tasks == 0) {
-            if (self.max_outstanding_tasks != 0 or self.max_queued_tasks != 0 or self.max_wait_ms != 0 or self.max_working_bytes != 0 or self.max_suspended_io != 0) return error.InvalidConfig;
+            if (self.max_outstanding_tasks != 0 or self.max_queued_tasks != 0 or self.max_wait_ms != 0 or self.max_working_bytes != 0 or self.max_suspended_io != 0 or self.max_scan_state_bytes != 0 or p.enabled()) return error.InvalidConfig;
             return;
         }
         if (self.max_outstanding_tasks < self.max_runnable_tasks or self.max_outstanding_tasks > 65_536 or
@@ -33,6 +66,11 @@ pub const Config = struct {
 };
 
 pub const Stats = struct {
+    bounded_runnable: u64 = 0,
+    bounded_outstanding: u64 = 0,
+    transition_outstanding: u64 = 0,
+    transition_bytes: u64 = 0,
+    all_reads: bool = false,
     max_runnable_tasks: u32 = 0,
     max_outstanding_tasks: u32 = 0,
     max_queued_tasks: u32 = 0,
@@ -46,9 +84,12 @@ pub const Stats = struct {
     queued: u64 = 0,
 };
 
+pub const Scope = enum { dense_only, all_reads };
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     config: Config,
+    scope: Scope = .dense_only,
     ledger: resources.Ledger,
     scheduler: scheduling.Scheduler,
 
@@ -58,14 +99,60 @@ pub const Runtime = struct {
         request: ?resources.RequestLease = null,
         job: ?scheduling.Scheduler.Job = null,
         continuation: ?resources.RetainedStateLease = null,
+        transition_ticket: ?resources.TransitionTicket = null,
+        cpu_started_ns: ?u64 = null,
+        /// Maximum live continuation workspace, reserved before taking a
+        /// snapshot. Its physical allocator borrows this credit explicitly.
+        prepaid_state: ?resources.RetainedStateLease = null,
+        prepaid_bytes: u64 = 0,
+
+        /// Call on the executing worker after transferring an optional helper
+        /// permit. Acquisition can happen on another thread; it is not CPU work.
+        pub fn startWork(self: *Lease, io: std.Io) void {
+            self.cpu_started_ns = if (@import("../runtime_io_abi.zig").callerThreadPinned(io))
+                @import("antfly_platform").time.threadCpuNs()
+            else
+                null;
+        }
+
+        fn startQuantum(self: *Lease) void {
+            self.cpu_started_ns = if (self.options) |options|
+                if (@import("../runtime_io_abi.zig").callerThreadPinned(options.io)) @import("antfly_platform").time.threadCpuNs() else null
+            else
+                null;
+        }
+
+        /// One accounting unit is 100 microseconds of caller-thread CPU.
+        /// Unknown or migrating providers retain the conservative unit estimate.
+        fn finishQuantum(self: *Lease) u64 {
+            const started = self.cpu_started_ns orelse return 1;
+            self.cpu_started_ns = null;
+            const finished = @import("antfly_platform").time.threadCpuNs() orelse return 1;
+            return @max(1, (finished -| started) / (100 * std.time.ns_per_us));
+        }
 
         pub fn release(self: *Lease) void {
-            if (self.job) |*job| job.release(1);
+            if (self.job) |*job| job.release(self.finishQuantum());
             self.job = null;
             if (self.continuation) |*state| state.release() catch unreachable;
             self.continuation = null;
+            if (self.prepaid_state) |*state| state.release() catch unreachable;
+            self.prepaid_state = null;
+            if (self.transition_ticket) |*ticket| ticket.release() catch unreachable;
+            self.transition_ticket = null;
             if (self.request) |*request| request.release() catch unreachable;
             self.request = null;
+        }
+
+        /// Call after the bounded probe has closed its snapshot and discarded
+        /// all borrowed row bytes. The prepaid request envelope remains owned.
+        pub fn demote(self: *Lease) !void {
+            var parked = try self.job.?.demoteAtYield(&self.transition_ticket.?, 0, self.finishQuantum());
+            self.job = null;
+            self.transition_ticket = null;
+            defer parked.release() catch unreachable;
+            self.job = parked.acquireResume(.{ .runnable = 1 }, 1, 0) catch |err| return mapError(err);
+            self.startQuantum();
         }
 
         /// Called only by serial physical reads with all destination storage
@@ -79,9 +166,31 @@ pub const Runtime = struct {
                 else => return mapError(err),
             };
             errdefer io_lease.release() catch unreachable;
-            self.continuation = try self.job.?.yieldState(0, 1);
+            self.continuation = try self.job.?.yieldState(0, self.finishQuantum());
             self.job = null;
             return io_lease;
+        }
+
+        /// Only an audited synchronous output boundary may call this: no
+        /// cursor mutex or helper is live, and all saved state uses prepaid
+        /// credits. Outstanding requests bound parked outputs independently
+        /// of the storage I/O-credit pool.
+        pub fn suspendOutput(self: *Lease) !bool {
+            const runtime = self.runtime orelse return false;
+            const options = self.options orelse return false;
+            if (runtime.scope != .all_reads or runtime.config.max_wait_ms == 0 or self.prepaid_state == null or
+                !@import("../runtime_io_abi.zig").callerThreadPinned(options.io)) return false;
+            try options.check();
+            self.continuation = self.job.?.yieldState(0, self.finishQuantum()) catch |err| return mapError(err);
+            self.job = null;
+            return true;
+        }
+
+        pub fn resumeOutput(self: *Lease) !void {
+            const runtime = self.runtime orelse return error.InvalidLease;
+            self.job = runtime.scheduler.acquireResume(&self.request.?, .general_read, &self.continuation.?, .{ .runnable = 1 }, 1, 0, self.options.?) catch |err| return mapError(err);
+            self.continuation = null;
+            self.startQuantum();
         }
 
         pub fn resumeIo(self: *Lease, io_lease: *resources.LocalIoLease) !void {
@@ -89,6 +198,7 @@ pub const Runtime = struct {
             const runtime = self.runtime.?;
             self.job = runtime.scheduler.acquireResume(&self.request.?, .general_read, &self.continuation.?, .{ .runnable = 1 }, 1, 0, self.options.?) catch |err| return mapError(err);
             self.continuation = null;
+            self.startQuantum();
         }
     };
 
@@ -107,10 +217,19 @@ pub const Runtime = struct {
             .retained_bytes = config.max_working_bytes,
             .io = config.max_suspended_io,
         };
+        var lanes: [resources.lane_count]resources.LanePolicy = @splat(.{ .ceiling = total });
+        if (config.protected.enabled()) {
+            const p = config.protected;
+            const bounded: resources.Bundle = .{ .handles = @as(u64, p.max_outstanding_tasks) * 4, .requests = p.max_outstanding_tasks, .queued = p.max_outstanding_tasks, .runnable = p.max_runnable_tasks, .retained_bytes = p.max_working_bytes };
+            const transition: resources.Bundle = .{ .handles = @as(u64, p.max_transition_tasks) * 2, .requests = p.max_transition_tasks, .retained_bytes = p.max_transition_bytes };
+            lanes[@intFromEnum(resources.Lane.bounded_read)] = .{ .floor = bounded, .ceiling = bounded };
+            lanes[@intFromEnum(resources.Lane.transition)] = .{ .floor = transition, .ceiling = transition };
+            lanes[@intFromEnum(resources.Lane.general_read)].ceiling = total.sub(bounded).sub(transition);
+        }
         self.* = .{
             .allocator = allocator,
             .config = config,
-            .ledger = try resources.Ledger.init(allocator, .{ .total = total, .lanes = @splat(.{ .ceiling = total }) }),
+            .ledger = try resources.Ledger.init(allocator, .{ .total = total, .lanes = lanes }),
             .scheduler = undefined,
         };
         errdefer self.ledger.deinit();
@@ -127,6 +246,11 @@ pub const Runtime = struct {
     pub fn stats(self: *Runtime) Stats {
         const snapshot = self.ledger.snapshot();
         return .{
+            .all_reads = self.scope == .all_reads,
+            .bounded_runnable = snapshot.lanes[@intFromEnum(resources.Lane.bounded_read)].runnable,
+            .bounded_outstanding = snapshot.lanes[@intFromEnum(resources.Lane.bounded_read)].requests,
+            .transition_outstanding = snapshot.lanes[@intFromEnum(resources.Lane.transition)].requests,
+            .transition_bytes = snapshot.lanes[@intFromEnum(resources.Lane.transition)].retained_bytes,
             .max_runnable_tasks = self.config.max_runnable_tasks,
             .max_outstanding_tasks = self.config.max_outstanding_tasks,
             .max_queued_tasks = self.config.max_queued_tasks,
@@ -149,11 +273,38 @@ pub const Runtime = struct {
     }
 
     pub fn acquire(self: *Runtime, options: admission.Options) !Lease {
+        return self.acquireWithState(options, 0);
+    }
+
+    pub fn acquireWithState(self: *Runtime, options: admission.Options, maximum_retained_bytes: u64) !Lease {
         try options.check();
         var request = self.ledger.admit(.general_read, 0) catch |err| return mapError(err);
         errdefer request.release() catch unreachable;
+        var state: ?resources.RetainedStateLease = if (maximum_retained_bytes != 0)
+            self.ledger.acquire(.retained_state, &request, .{ .retained_bytes = maximum_retained_bytes }) catch |err| return mapError(err)
+        else
+            null;
+        errdefer if (state) |*owned| owned.release() catch unreachable;
         const job = self.scheduler.acquire(&request, .general_read, .{ .runnable = 1 }, 1, 0, options) catch |err| return mapError(err);
-        return .{ .runtime = self, .options = options, .request = request, .job = job };
+        var lease = Lease{ .runtime = self, .options = options, .request = request, .job = job, .prepaid_state = state, .prepaid_bytes = maximum_retained_bytes };
+        lease.startQuantum();
+        return lease;
+    }
+
+    /// Internal primitive for the audited DB existence-probe implementation.
+    /// Request shape alone is insufficient: the caller validates storage/schema
+    /// eligibility and demotes before doing any work outside that certificate.
+    pub fn acquireBoundedProbe(self: *Runtime, options: admission.Options) !Lease {
+        if (self.scope != .all_reads or !self.config.protected.enabled()) return error.InvalidConfig;
+        try options.check();
+        var request = self.ledger.admit(.bounded_read, bounded_probe_bytes) catch |err| return mapError(err);
+        errdefer request.release() catch unreachable;
+        var ticket = self.ledger.reserveTransition(&request, .{ .handles = 2, .requests = 1, .retained_bytes = bounded_probe_bytes }) catch |err| return mapError(err);
+        errdefer ticket.release() catch unreachable;
+        const job = self.scheduler.acquire(&request, .bounded_read, .{ .runnable = 1 }, 1, 0, options) catch |err| return mapError(err);
+        var lease: Lease = .{ .runtime = self, .options = options, .request = request, .job = job, .transition_ticket = ticket };
+        lease.startQuantum();
+        return lease;
     }
 
     pub fn tryAcquire(self: *Runtime) ?Lease {
@@ -163,7 +314,7 @@ pub const Runtime = struct {
             request.release() catch unreachable;
             return null;
         }
-        return .{ .request = request, .job = job };
+        return .{ .runtime = self, .request = request, .job = job };
     }
 
     fn mapError(err: anyerror) anyerror {

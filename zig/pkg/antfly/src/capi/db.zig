@@ -2288,6 +2288,7 @@ pub fn storageOwnerContextCreateWithRuntime(
 /// an ABI function returns a scalar failure status.
 fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*StorageOwnerContext {
     const request = services.context;
+    if (request.dense_max_runnable_tasks != 0 and request.read_max_runnable_tasks != 0) return error.InvalidConfig;
     const bridge = if (services.allocator) |value| blk: {
         if (!value.valid()) return error.InvalidArgument;
         break :blk value.*;
@@ -2320,6 +2321,23 @@ fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*Storag
         .max_wait_ms = request.dense_max_wait_ms,
         .max_working_bytes = request.dense_max_working_bytes,
         .max_suspended_io = request.dense_max_suspended_io,
+    });
+    try context.resources.resource_manager.configureReadExecution(.{
+        .max_runnable_tasks = request.read_max_runnable_tasks,
+        .max_outstanding_tasks = request.read_max_outstanding_tasks,
+        .max_queued_tasks = request.read_max_queued_tasks,
+        .max_wait_ms = request.read_max_wait_ms,
+        .max_working_bytes = request.read_max_working_bytes,
+        .max_suspended_io = request.read_max_suspended_io,
+        .max_scan_state_bytes = request.read_max_scan_state_bytes,
+        .max_scan_snapshot_ms = request.read_max_scan_snapshot_ms,
+        .protected = .{
+            .max_runnable_tasks = request.read_protected_runnable_tasks,
+            .max_outstanding_tasks = request.read_protected_outstanding_tasks,
+            .max_working_bytes = request.read_protected_working_bytes,
+            .max_transition_tasks = request.read_transition_tasks,
+            .max_transition_bytes = request.read_transition_bytes,
+        },
     });
     var runtime_config = db_mod.background_runtime.Config{};
     if (context.io_receiver) |*io| runtime_config = .{
@@ -2434,6 +2452,12 @@ pub fn storageOwnerContextMetrics(
         .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
         .dense_max_queued_tasks = dense.max_queued_tasks,
         .dense_max_wait_ms = dense.max_wait_ms,
+        .dense_all_reads = @intFromBool(dense.all_reads),
+        .read_bounded_runnable = dense.bounded_runnable,
+        .read_bounded_outstanding = dense.bounded_outstanding,
+        .read_transition_outstanding = dense.transition_outstanding,
+        .read_transition_bytes = dense.transition_bytes,
+
         .dense_runnable = dense.runnable,
         .dense_outstanding = dense.outstanding,
         .dense_queued = dense.queued,

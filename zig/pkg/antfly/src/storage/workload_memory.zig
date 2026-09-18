@@ -15,6 +15,8 @@ pub const WorkingMemory = struct {
     state: resources.RetainedStateLease,
     reservation: resource_manager.Reservation,
     minimum: u64,
+    maximum: ?u64 = null,
+    owns_state: bool = true,
     live_bytes: u64 = 0,
     last_failure: ?anyerror = null,
 
@@ -24,8 +26,28 @@ pub const WorkingMemory = struct {
         const owner = manager orelse return null;
         const runtime = owner.dense_execution orelse return null;
         if (runtime.config.max_working_bytes == 0) return null;
-        const request = if (driver.scheduled.request) |*value| value else return error.InvalidLease;
+        const scheduled = driver.scheduledLease() orelse return error.InvalidLease;
+        const request = if (scheduled.request) |*value| value else return error.InvalidLease;
         return try init(owner, .dense_search_working_set, &runtime.ledger, request, backing, 0);
+    }
+
+    /// Scan/output continuations reserve their maximum before acquiring a
+    /// snapshot. This allocator checks the same prepaid bytes against the
+    /// ResourceManager and never allocates beyond that completion bundle.
+    pub fn forReadDriverPrepaid(manager: *resource_manager.ResourceManager, driver: *resource_manager.DenseExecution.Runtime.Lease, backing: std.mem.Allocator) !WorkingMemory {
+        const state = driver.prepaid_state orelse return error.InvalidLease;
+        if (driver.runtime != manager.dense_execution) return error.InvalidLease;
+        return .{
+            .backing = backing,
+            .state = state,
+            .reservation = manager.reserveWithoutReclaim(.relational_preparation_working_set, driver.prepaid_bytes) catch |err| switch (err) {
+                error.ResourceBudgetExceeded => return error.AdmissionBytesExhausted,
+                else => return err,
+            },
+            .minimum = driver.prepaid_bytes,
+            .maximum = driver.prepaid_bytes,
+            .owns_state = false,
+        };
     }
 
     pub fn allocationFailure(self: *const WorkingMemory, err: anyerror) anyerror {
@@ -49,7 +71,7 @@ pub const WorkingMemory = struct {
     pub fn deinit(self: *WorkingMemory) void {
         std.debug.assert(self.live_bytes == 0);
         self.reservation.release();
-        self.state.release() catch unreachable;
+        if (self.owns_state) self.state.release() catch unreachable;
         self.* = undefined;
     }
 
@@ -63,6 +85,7 @@ pub const WorkingMemory = struct {
 
     fn grow(self: *WorkingMemory, bytes: usize) !void {
         const next = std.math.add(u64, self.live_bytes, bytes) catch return error.ResourceRequestTooLarge;
+        if (self.maximum) |maximum| if (next > maximum) return error.ResourceRequestTooLarge;
         const additional = next -| self.reservation.bytes;
         if (additional > 0) {
             try self.state.grow(.{ .retained_bytes = additional });
@@ -189,4 +212,52 @@ test "workload admission working memory rollback and completion credits survive 
     memory.allocator().free(buffer);
     job.release(1);
     try std.testing.expectEqual(@as(u64, 80), manager.snapshot().memory.used_bytes);
+}
+
+test "workload admission prepaid scan reservation denial preserves caller ownership" {
+    const alloc = std.testing.allocator;
+    var manager = resource_manager.ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 80 } });
+    defer manager.deinit(alloc);
+    try manager.configureReadExecution(.{ .max_runnable_tasks = 1, .max_outstanding_tasks = 2, .max_working_bytes = 100 });
+    var driver = (try manager.acquireReadDriverWithState(std.testing.io, .{ .io = std.testing.io }, 90)).?;
+    defer driver.release();
+    try std.testing.expectError(error.AdmissionBytesExhausted, WorkingMemory.forReadDriverPrepaid(&manager, &driver, alloc));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 90), manager.denseExecutionStats().working_bytes);
+    driver.release();
+    try std.testing.expectEqual(@as(u64, 0), manager.denseExecutionStats().working_bytes);
+}
+
+test "workload admission prepaid scan buffers retain completion credit across output wait and cancellation" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var manager = resource_manager.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    try manager.configureReadExecution(.{ .max_runnable_tasks = 1, .max_outstanding_tasks = 2, .max_queued_tasks = 1, .max_wait_ms = 1000, .max_working_bytes = 100 });
+    var cancelled = std.atomic.Value(bool).init(false);
+    var driver = (try manager.acquireReadDriverWithState(io, .{ .io = io, .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&cancelled) }, 100)).?;
+    defer driver.release();
+    var memory = try WorkingMemory.forReadDriverPrepaid(&manager, &driver, alloc);
+    defer memory.deinit();
+    const buffer = try memory.allocator().alloc(u8, 60);
+    defer memory.allocator().free(buffer);
+    try std.testing.expectError(error.OutOfMemory, memory.allocator().alloc(u8, 41));
+    try std.testing.expectEqual(error.AdmissionRequestTooLarge, memory.allocationFailure(error.OutOfMemory));
+    try std.testing.expect(try driver.suspendOutput());
+    try std.testing.expectEqual(@as(u64, 0), manager.denseExecutionStats().runnable);
+    try std.testing.expectEqual(@as(u64, 1), manager.denseExecutionStats().outstanding);
+    try std.testing.expectEqual(@as(u64, 100), manager.denseExecutionStats().working_bytes);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.relational_preparation_working_set).used_bytes);
+    var next = (try manager.acquireReadDriver(io, .{ .io = io })).?;
+    next.release();
+    try driver.resumeOutput();
+    try std.testing.expect(try driver.suspendOutput());
+    cancelled.store(true, .release);
+    try std.testing.expectError(error.Canceled, driver.resumeOutput());
+    // Failed resume retains the request and state until the actual buffers and
+    // caller's snapshot have unwound; it never fabricates a runnable release.
+    try std.testing.expect(driver.job == null and driver.continuation != null);
+    try std.testing.expectEqual(@as(u64, 100), manager.denseExecutionStats().working_bytes);
 }

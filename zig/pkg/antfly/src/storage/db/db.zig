@@ -8391,6 +8391,8 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: ?[]const u8,
     ) ![]schema_mod.FieldCapability {
+        var driver = try self.acquireGeneralReadDriver(null, .{ .io = self.backend_runtime.io() orelse std.Options.debug_io });
+        defer if (driver) |*owned| owned.release();
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         return try self.core.index_manager.observedDynamicFieldCapabilitiesAlloc(alloc, index_name);
@@ -8401,6 +8403,12 @@ pub const DB = struct {
         alloc: Allocator,
         index_name: ?[]const u8,
     ) ?[]schema_mod.FieldCapability {
+        var driver: ?resource_manager_mod.DenseExecution.Runtime.Lease = null;
+        if (self.readResourceManager()) |manager| if (manager.dense_execution) |runtime| if (runtime.scope == .all_reads) {
+            driver = runtime.tryAcquire() orelse return null;
+            driver.?.startWork(self.backend_runtime.io() orelse std.Options.debug_io);
+        };
+        defer if (driver) |*owned| owned.release();
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
         return self.core.index_manager.observedDynamicFieldCapabilitiesAlloc(alloc, index_name) catch null;
@@ -8411,6 +8419,13 @@ pub const DB = struct {
         alloc: Allocator,
         observation: index_manager_mod.IndexManager.DynamicFieldObservationQuery,
     ) ![]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
+        var driver = try self.acquireGeneralReadDriver(null, .{
+            .io = self.backend_runtime.io() orelse std.Options.debug_io,
+            .deadline_ns = observation.execution_deadline_ns,
+            .native_now_ns = platform_time.monotonicNs,
+            .cancellation = observation.cancellation orelse .none,
+        });
+        defer if (driver) |*owned| owned.release();
         try observation.checkActive();
         if (observation.execution_deadline_ns != null or observation.cancellation != null) {
             if (!self.core.tryLockApplyShared()) return error.StorageReadTemporarilyUnavailable;
@@ -8427,6 +8442,12 @@ pub const DB = struct {
         alloc: Allocator,
         observation: index_manager_mod.IndexManager.DynamicFieldObservationQuery,
     ) ?[]index_manager_mod.IndexManager.ObservedDynamicFieldCapabilitySet {
+        var driver: ?resource_manager_mod.DenseExecution.Runtime.Lease = null;
+        if (self.readResourceManager()) |manager| if (manager.dense_execution) |runtime| if (runtime.scope == .all_reads) {
+            driver = runtime.tryAcquire() orelse return null;
+            driver.?.startWork(self.backend_runtime.io() orelse std.Options.debug_io);
+        };
+        defer if (driver) |*owned| owned.release();
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
         return self.core.index_manager.observedDynamicFieldCapabilitySetsAlloc(alloc, observation) catch null;
@@ -21461,7 +21482,98 @@ pub const DB = struct {
         return try self.lookup(alloc, key, opts);
     }
 
+    pub fn readResourceManager(self: *DB) ?*resource_manager_mod.ResourceManager {
+        return self.async_context.resource_manager;
+    }
+
+    fn acquireGeneralReadDriver(self: *DB, borrowed: ?*resource_manager_mod.DenseExecution.Runtime.Lease, options: @import("../../common/workload_admission.zig").Options) !?resource_manager_mod.DenseExecution.Runtime.Lease {
+        const manager = self.readResourceManager() orelse {
+            if (borrowed != null) return error.InvalidLease;
+            return null;
+        };
+        if (borrowed) |driver| {
+            _ = try manager.borrowReadDriver(driver);
+            if (driver.options) |original| try original.check();
+            try options.check();
+            return null;
+        }
+        return manager.acquireReadDriver(options.io, options);
+    }
+
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+        try checkLookupOptionsActive(opts);
+        var clock = if (opts.execution_io) |borrow| try borrow.receive() else null;
+        const io = self.backend_runtime.io() orelse std.Options.debug_io;
+        const options: @import("../../common/workload_admission.zig").Options = .{
+            .io = io,
+            .deadline_ns = opts.execution_deadline_ns,
+            .clock_io = if (clock) |*receiver| receiver.io() else null,
+            .native_now_ns = if (clock == null) platform_time.monotonicNs else null,
+            .cancellation = opts.cancellation orelse .none,
+        };
+        const runtime = if (self.readResourceManager()) |manager| manager.dense_execution else null;
+        const bounded = opts.read_execution == null and runtime != null and runtime.?.scope == .all_reads and runtime.?.config.protected.enabled() and
+            opts.fields.len == 0 and !opts.include_all_fields and key.len <= 512 and
+            !internal_keys.isInternalUserKey(key) and !std.mem.startsWith(u8, key, "\x00\x00__metadata__:") and !isSplitMetadataKey(key) and self.core.store.kind == .lmdb;
+        var driver: ?resource_manager_mod.DenseExecution.Runtime.Lease = if (bounded)
+            try runtime.?.acquireBoundedProbe(options)
+        else
+            try self.acquireGeneralReadDriver(opts.read_execution, options);
+        defer if (driver) |*owned| owned.release();
+        if (bounded) {
+            const result = probe: {
+                var scratch_reservation = self.readResourceManager().?.reserveWithoutReclaim(.relational_preparation_working_set, resource_manager_mod.DenseExecution.bounded_probe_bytes) catch |err| switch (err) {
+                    error.ResourceBudgetExceeded => return error.AdmissionBytesExhausted,
+                    else => return err,
+                };
+                defer scratch_reservation.release();
+                break :probe try self.tryBoundedExistenceProbe(alloc, key, opts);
+            };
+            switch (result) {
+                .completed => |value| return value,
+                .general => try driver.?.demote(),
+            }
+        }
+        var admitted = opts;
+        if (driver) |*owned| admitted.read_execution = owned;
+        return self.lookupWithReadDriver(alloc, key, admitted);
+    }
+
+    const BoundedExistenceResult = union(enum) { general, completed: ?types.LookupResult };
+
+    /// One local primary-key probe and at most 4 KiB of JSON validation, with
+    /// fixed 64 KiB scratch. No row, transaction, schema view, or allocation
+    /// survives a fallback: general execution restarts under the original
+    /// request/deadline after an atomic, prepaid lane transfer.
+    fn tryBoundedExistenceProbe(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !BoundedExistenceResult {
+        var scratch: [resource_manager_mod.DenseExecution.bounded_probe_bytes]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        const probe_alloc = fixed.allocator();
+        var schema_view = self.core.acquireSchemaView();
+        defer if (schema_view) |*view| view.release();
+        if (schema_view) |view| if (view.storageMode() == .relational or view.tableSchema().ttl_duration_ns != 0) return .general;
+        try checkLookupOptionsActive(opts);
+        const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, probe_alloc, key, schema_view);
+        var probe = try self.core.store.beginProbeTxn();
+        defer probe.abort();
+        const raw = probe.getLeased(store_key) catch |err| switch (err) {
+            error.NotFound => {
+                try checkLookupOptionsActive(opts);
+                return .{ .completed = null };
+            },
+            else => return err,
+        };
+        if (raw.len > 4096) return .general;
+        const parsed = std.json.parseFromSlice(std.json.Value, probe_alloc, raw, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return .general,
+            else => return err,
+        };
+        defer parsed.deinit();
+        try checkLookupOptionsActive(opts);
+        return .{ .completed = .{ .json = try alloc.dupe(u8, "{}") } };
+    }
+
+    fn lookupWithReadDriver(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         try checkLookupOptionsActive(opts);
         // Pin the schema once and keep the physical row intact through TTL and
         // projection. Relational rows carry their timestamp in the authenticated
@@ -25741,14 +25853,18 @@ pub const DB = struct {
         graph_queries: []const types.NamedGraphQuery,
         input_sets: []const types.NamedGraphInputSet,
     ) ![]types.GraphSearchResult {
+        var driver = try self.acquireSearchReadDriver(req, .{});
+        defer if (driver) |*owned| owned.release();
+        var admitted = req;
+        if (driver) |*owned| admitted.read_execution = owned;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        if (req.identity_read_generation == null) {
+        if (admitted.identity_read_generation == null) {
             for (input_sets) |input_set| {
                 if (input_set.hit_ids.len > 0) return error.UnsupportedQueryRequest;
             }
         }
-        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(admitted);
 
         var named_sets = try alloc.alloc(NamedResultSet, input_sets.len);
         defer alloc.free(named_sets);
@@ -35199,6 +35315,26 @@ pub const DB = struct {
         opts: types.ScanOptions,
         visitor: types.ScanVisitor,
     ) !void {
+        var driver = try self.acquireGeneralReadDriver(opts.read_execution, .{
+            .io = self.backend_runtime.io() orelse std.Options.debug_io,
+            .deadline_ns = opts.execution_deadline_ns,
+            .native_now_ns = platform_time.monotonicNs,
+            .cancellation = opts.cancellation orelse .none,
+        });
+        defer if (driver) |*owned| owned.release();
+        var admitted = opts;
+        if (driver) |*owned| admitted.read_execution = owned;
+        return self.scanVisitWithReadDriver(alloc, from_key, to_key, admitted, visitor);
+    }
+
+    fn scanVisitWithReadDriver(
+        self: *DB,
+        alloc: Allocator,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: types.ScanOptions,
+        visitor: types.ScanVisitor,
+    ) !void {
         const projection_plan = db_query_projection.buildLookupFieldSelectionPlan(.{
             .fields = opts.fields,
             .include_all_fields = opts.include_all_fields,
@@ -35236,10 +35372,10 @@ pub const DB = struct {
             if (byte_range.end.len == 0 or std.mem.order(u8, to_key, byte_range.end) == .lt) break :blk to_key;
             break :blk byte_range.end;
         };
-        const lower = try self.core.documentRangeLowerAlloc(lower_raw);
-        defer self.core.alloc.free(lower);
-        const upper = if (upper_raw.len > 0) try self.core.documentRangeUpperAlloc(upper_raw) else null;
-        defer if (upper) |buf| self.core.alloc.free(buf);
+        const lower = try documentRangeLowerAlloc(alloc, lower_raw);
+        defer alloc.free(lower);
+        const upper = if (upper_raw.len > 0) try documentRangeUpperAlloc(alloc, upper_raw) else null;
+        defer if (upper) |buf| alloc.free(buf);
 
         var prepared_filter = if (opts.filter_query_json.len > 0)
             try db_query_graph.PreparedPatternFilter.init(alloc, opts.filter_query_json)
@@ -35568,8 +35704,8 @@ pub const DB = struct {
         };
         defer state.deinit();
         try state.checkActive();
-        const resume_lower = if (columnar_progress.delivered != 0) try self.core.documentRangeLowerAlloc(columnar_progress.last_key.items) else null;
-        defer if (resume_lower) |key| self.core.alloc.free(key);
+        const resume_lower = if (columnar_progress.delivered != 0) try documentRangeLowerAlloc(alloc, columnar_progress.last_key.items) else null;
+        defer if (resume_lower) |key| alloc.free(key);
         if (schema_view) |view| if (view.storageMode() == .relational) {
             const Check = struct {
                 fn owner(ptr: ?*anyopaque, _: []const u8) !docstore_mod.DocStore.ScanAction {
@@ -35600,7 +35736,27 @@ pub const DB = struct {
     /// The public response currently has one dense profile slot; compositions
     /// with multiple dense lanes intentionally leave it unset rather than
     /// publishing an ambiguous aggregate.
+    fn acquireSearchReadDriver(self: *DB, req: types.SearchRequest, exec_ctx: types.ExecutionContext) !?resource_manager_mod.DenseExecution.Runtime.Lease {
+        if (req.read_execution != null and exec_ctx.read_execution != null and req.read_execution != exec_ctx.read_execution) return error.InvalidLease;
+        return self.acquireGeneralReadDriver(req.read_execution orelse exec_ctx.read_execution, .{
+            .io = exec_ctx.io orelse self.backend_runtime.io() orelse std.Options.debug_io,
+            .deadline_ns = req.execution_deadline_ns,
+            .native_now_ns = platform_time.monotonicNs,
+            .cancellation = req.cancellation orelse .none,
+        });
+    }
+
     pub fn searchWithDenseProfile(self: *DB, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+        var driver = try self.acquireSearchReadDriver(req, .{});
+        defer if (driver) |*owned| owned.release();
+        var admitted = req;
+        if (driver) |*owned| admitted.read_execution = owned;
+        var result = try self.searchWithDenseProfileAdmitted(alloc, admitted);
+        result.request.read_execution = req.read_execution;
+        return result;
+    }
+
+    fn searchWithDenseProfileAdmitted(self: *DB, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
         try self.enforcePortableRuntimeGate();
         if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
         defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
@@ -35652,12 +35808,31 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !SearchWithCapturedRequestResult {
+        var driver = try self.acquireSearchReadDriver(req, exec_ctx);
+        defer if (driver) |*owned| owned.release();
+        var admitted = req;
+        admitted.read_execution = if (driver) |*owned| owned else req.read_execution orelse exec_ctx.read_execution;
+        var execution = exec_ctx;
+        execution.read_execution = admitted.read_execution;
+        if (admitted.read_execution != null) execution.max_parallelism = 1;
+        var result = try self.searchWithCapturedRequestAndExecutionContextAdmitted(alloc, admitted, execution);
+        // The captured request may outlive this synchronous driver stack.
+        result.request.read_execution = req.read_execution;
+        return result;
+    }
+
+    fn searchWithCapturedRequestAndExecutionContextAdmitted(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        exec_ctx: types.ExecutionContext,
+    ) !SearchWithCapturedRequestResult {
         if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
         defer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
         // Keep degraded requests out of catalog/apply lock queues. Revalidate
         // after admission below to close publication's check-to-use race.
         try self.enforcePortableRuntimeGate();
-        if (std.meta.eql(exec_ctx, types.ExecutionContext{})) {
+        if (exec_ctx.io == null and (exec_ctx.max_parallelism == null or (exec_ctx.read_execution != null and exec_ctx.max_parallelism == 1))) {
             const snapshot_input = directSingleVectorRequest(req) orelse req;
             const dense = snapshot_input.dense orelse if (snapshot_input.query == .dense_knn) snapshot_input.query.dense_knn else null;
             if (dense) |query| if (try self.trySnapshotDenseSearch(alloc, snapshot_input, query, false)) |captured| {
@@ -36634,6 +36809,8 @@ pub const DB = struct {
     }
 
     pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        var driver = try self.acquireSearchReadDriver(req, .{});
+        defer if (driver) |*owned| owned.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectSearchRequestTextStats(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{
@@ -36672,9 +36849,13 @@ pub const DB = struct {
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
+        var driver = try self.acquireSearchReadDriver(req, exec_ctx);
+        defer if (driver) |*owned| owned.release();
+        var admitted = req;
+        admitted.read_execution = if (driver) |*owned| owned else req.read_execution orelse exec_ctx.read_execution;
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        return try self.collectPlanningStatsLocked(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), max_work, exec_ctx);
+        return try self.collectPlanningStatsLocked(alloc, try self.searchRequestAtCurrentIdentityGeneration(admitted), max_work, exec_ctx);
     }
 
     fn collectPlanningStatsLocked(
@@ -36720,6 +36901,8 @@ pub const DB = struct {
     }
 
     pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        var driver = try self.acquireGeneralReadDriver(null, .{ .io = self.backend_runtime.io() orelse std.Options.debug_io });
+        defer if (driver) |*owned| owned.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
@@ -36734,6 +36917,8 @@ pub const DB = struct {
         alloc: Allocator,
         requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
     ) ![]const aggregations_mod.DistributedBackgroundTextStats {
+        var driver = try self.acquireGeneralReadDriver(null, .{ .io = self.backend_runtime.io() orelse std.Options.debug_io });
+        defer if (driver) |*owned| owned.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
@@ -37344,6 +37529,21 @@ pub const DB = struct {
     /// Profiled counterpart to `searchWithCapturedRequest`; the request token
     /// and dense result are created under one DB search lease.
     pub fn searchDenseProfiledWithCapturedRequest(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        dense: types.DenseKnnQuery,
+    ) !ProfiledDenseSearchWithCapturedRequestResult {
+        var driver = try self.acquireSearchReadDriver(req, .{});
+        defer if (driver) |*owned| owned.release();
+        var admitted = req;
+        if (driver) |*owned| admitted.read_execution = owned;
+        var result = try self.searchDenseProfiledWithCapturedRequestAdmitted(alloc, admitted, dense);
+        result.request.read_execution = req.read_execution;
+        return result;
+    }
+
+    fn searchDenseProfiledWithCapturedRequestAdmitted(
         self: *DB,
         alloc: Allocator,
         req: types.SearchRequest,
@@ -38678,10 +38878,14 @@ pub const DB = struct {
         req: types.SearchRequest,
         keys: []const []const u8,
     ) ![]types.SearchHit {
+        var driver = try self.acquireSearchReadDriver(req, .{});
+        defer if (driver) |*owned| owned.release();
+        var admitted_req = req;
+        if (driver) |*owned| admitted_req.read_execution = owned;
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
 
-        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
+        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(admitted_req);
         var admission = try self.filterGraphKeysWithOrdinalsAlloc(
             alloc,
             snapshot_req,
@@ -38724,6 +38928,20 @@ pub const DB = struct {
         expected: index_manager_mod.IndexManager.CoverageIdentity,
         identity_read_generation: ?u64,
     ) ![]bool {
+        return self.graphHasIncomingEdgesForInternalReadWithContext(alloc, index_name, keys, expected, identity_read_generation, .{});
+    }
+
+    pub fn graphHasIncomingEdgesForInternalReadWithContext(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        keys: []const []const u8,
+        expected: index_manager_mod.IndexManager.CoverageIdentity,
+        identity_read_generation: ?u64,
+        req: types.SearchRequest,
+    ) ![]bool {
+        var driver = try self.acquireSearchReadDriver(req, .{});
+        defer if (driver) |*owned| owned.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         // Validate under the same apply lease as the reverse snapshot. A
@@ -130993,4 +131211,85 @@ test "source vector migration converts legacy ANN generations in both modes" {
         defer result.deinit();
         try std.testing.expectEqualStrings("a", result.hits[0].id);
     }
+}
+
+test "workload admission broad DB reads share capacity and return no stack driver" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-read-admission");
+    defer path_tmp.cleanup();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .resource_manager = &manager });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }}, .sync_level = .full_index });
+    try manager.configureReadExecution(.{ .max_runnable_tasks = 1, .max_outstanding_tasks = 2 });
+    var blocker = (try manager.acquireReadDriver(std.testing.io, .{ .io = std.testing.io })).?;
+    var blocker_live = true;
+    defer if (blocker_live) blocker.release();
+    try std.testing.expectError(error.AdmissionFull, db.lookup(alloc, "doc:a", .{}));
+    try std.testing.expectError(error.AdmissionFull, db.searchWithCapturedRequest(alloc, .{}));
+    try std.testing.expectError(error.AdmissionFull, db.searchWithDenseProfile(alloc, .{}));
+    try std.testing.expectError(error.AdmissionFull, db.searchDenseProfiledWithCapturedRequest(alloc, .{}, .{ .vector = &.{ 0, 0 }, .k = 1 }));
+    // A synchronous nested lookup borrows the caller's sole slot.
+    var borrowed_lookup = (try db.lookup(alloc, "doc:a", .{ .read_execution = &blocker })).?;
+    borrowed_lookup.deinit(alloc);
+    var planning = try db.collectPlanningStatsWithExecutionContext(alloc, .{}, 100, .{ .read_execution = &blocker });
+    planning.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), manager.denseExecutionStats().runnable);
+    // A derived operation cannot refresh the original driver's deadline.
+    blocker.options.?.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, db.lookup(alloc, "doc:a", .{ .read_execution = &blocker }));
+    blocker.options.?.deadline_ns = null;
+    blocker.release();
+    blocker_live = false;
+    var looked_up = (try db.lookup(alloc, "doc:a", .{})).?;
+    looked_up.deinit(alloc);
+    var captured = try db.searchWithCapturedRequest(alloc, .{});
+    defer captured.result.deinit();
+    try std.testing.expect(captured.request.read_execution == null);
+    try std.testing.expect(manager.denseExecutionStats().all_reads);
+    try std.testing.expectEqual(@as(u64, 0), manager.denseExecutionStats().outstanding);
+    try std.testing.expectEqual(@as(u64, 0), manager.denseExecutionStats().runnable);
+}
+
+test "workload admission protected existence probes progress and demote wide rows without retaining snapshots" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-protected-existence");
+    defer path_tmp.cleanup();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .resource_manager = &manager, .primary_backend = .lmdb });
+    defer db.close();
+    try std.testing.expectEqual(.lmdb, db.core.store.kind);
+    const wide = "{\"body\":\"" ++ ("x" ** 5000) ++ "\"}";
+    try db.batch(.{ .writes = &.{ .{ .key = "small", .value = "{\"title\":\"small\"}" }, .{ .key = "wide", .value = wide } } });
+    try manager.configureReadExecution(.{
+        .max_runnable_tasks = 2,
+        .max_outstanding_tasks = 8,
+        .max_queued_tasks = 4,
+        .max_wait_ms = 2,
+        .max_working_bytes = 512 * 1024,
+        .protected = .{ .max_runnable_tasks = 1, .max_outstanding_tasks = 1, .max_working_bytes = 64 * 1024, .max_transition_tasks = 1, .max_transition_bytes = 64 * 1024 },
+    });
+    const runtime = manager.dense_execution.?;
+    var blocker = try runtime.acquire(.{ .io = std.testing.io });
+    defer blocker.release();
+    const projection: types.LookupOptions = .{ .include_all_fields = false };
+    var small = (try db.lookup(alloc, "small", projection)).?;
+    small.deinit(alloc);
+    try std.testing.expect((try db.lookup(alloc, "missing", projection)) == null);
+    // Wide rows cannot do unbounded decoding under protected capacity. Their
+    // parked request unwinds on the original admission wait ceiling.
+    try std.testing.expectError(error.AdmissionWaitTimeout, db.lookup(alloc, "wide", projection));
+    try std.testing.expectError(error.AdmissionWaitTimeout, db.lookup(alloc, "small", .{ .fields = &.{"_id"}, .include_all_fields = false }));
+    const after = runtime.ledger.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), after.total.requests);
+    try std.testing.expectEqual(@as(u64, 0), after.total.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), after.transition_reserved.requests);
+    try std.testing.expectEqual(@as(u64, 0), after.lanes[@intFromEnum(@import("../../common/workload_resources.zig").Lane.bounded_read)].requests);
+    blocker.release();
+    var demoted = (try db.lookup(alloc, "wide", projection)).?;
+    defer demoted.deinit(alloc);
+    try std.testing.expectEqualStrings("{}", demoted.json);
+    try std.testing.expectEqual(@as(u64, 0), runtime.ledger.snapshot().total.handles);
 }

@@ -4036,6 +4036,7 @@ fn runPositionalReadBatchProfiled(
     const Work = struct {
         context: @TypeOf(context),
         requests: []Request,
+        io: std.Io,
         next: std.atomic.Value(usize) = .init(0),
         profiled: bool,
         worker_wall_ns: std.atomic.Value(u64) = .init(0),
@@ -4043,6 +4044,7 @@ fn runPositionalReadBatchProfiled(
 
         fn worker(work: *@This(), submitted: u64, owned_lease: resource_manager_mod.ResourceManager.DenseReadTaskLease) std.Io.Cancelable!void {
             var lease = owned_lease;
+            if (lease.driver.scheduledLease()) |scheduled| scheduled.startWork(work.io);
             defer lease.release();
             const start = if (work.profiled) time.monotonicNs() else 0;
             if (work.profiled) _ = work.worker_start_delay_ns.fetchAdd(start - submitted, .monotonic);
@@ -4060,7 +4062,7 @@ fn runPositionalReadBatchProfiled(
             }
         }
     };
-    var work: Work = .{ .context = context, .requests = requests[completed..], .profiled = stats != null };
+    var work: Work = .{ .context = context, .requests = requests[completed..], .io = io, .profiled = stats != null };
     var group = std.Io.Group.init;
     // Drain all tasks even if the caller is cancelled while doing its share:
     // request buffers and the stack-owned queue must never escape this call.

@@ -13622,8 +13622,8 @@ pub const HBCIndex = struct {
                     .release = ExperimentalPostingReadGeneration.releaseOpaque,
                 };
                 txn.cache_fill_epoch = admission.cache_fill_epoch;
-                txn.execution_context = if (admission.driver.scheduled.runtime) |runtime|
-                    if (runtime.config.max_suspended_io != 0) &admission.driver.scheduled else null
+                txn.execution_context = if (admission.driver.scheduledLease()) |driver|
+                    if (driver.runtime.?.config.max_suspended_io != 0) driver else null
                 else
                     null;
                 return txn;
@@ -13631,8 +13631,8 @@ pub const HBCIndex = struct {
             generation.release();
         }
         var txn = try self.beginRuntimeSearchTxnForCoverage(complete_snapshot);
-        txn.execution_context = if (admission.driver.scheduled.runtime) |runtime|
-            if (runtime.config.max_suspended_io != 0) &admission.driver.scheduled else null
+        txn.execution_context = if (admission.driver.scheduledLease()) |driver|
+            if (driver.runtime.?.config.max_suspended_io != 0) driver else null
         else
             null;
         return txn;
@@ -18381,6 +18381,7 @@ pub const HBCIndex = struct {
     /// legacy exact routing's admission behavior when the scheduler is off.
     pub fn acquireDenseExecutionDriver(self: *HBCIndex, req: SearchRequest) !resource_manager_mod.ResourceManager.DenseDriverLease {
         const manager = self.resource_manager orelse return .{};
+        if (req.read_execution) |raw| return manager.borrowReadDriver(@ptrCast(@alignCast(raw)));
         if (manager.dense_execution == null) return .{};
         return manager.acquireDenseDriver(self.runtimeIo(), if (req.cancellation) |token|
             .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn }
@@ -18400,10 +18401,13 @@ pub const HBCIndex = struct {
         var driver: resource_manager_mod.ResourceManager.DenseDriverLease = .{};
         errdefer driver.release();
         if (self.resource_manager) |manager| if (active_count != 0) {
-            driver = try manager.acquireDenseDriver(self.runtimeIo(), if (req.cancellation) |token|
-                .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn }
+            driver = if (req.read_execution) |raw|
+                try manager.borrowReadDriver(@ptrCast(@alignCast(raw)))
             else
-                null);
+                try manager.acquireDenseDriver(self.runtimeIo(), if (req.cancellation) |token|
+                    .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn }
+                else
+                    null);
         };
         var lease = try self.acquireSearchAdmissionWork(active_count, node_count, req);
         lease.driver = driver;
@@ -23391,7 +23395,7 @@ test "workload admission HBC search binds its driver to the transaction and reti
     defer tp.cleanup();
     var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
     defer manager.deinit(alloc);
-    try manager.configureDenseExecution(.{ .max_runnable_tasks = 1, .max_outstanding_tasks = 2, .max_queued_tasks = 1, .max_wait_ms = 5000, .max_working_bytes = 65536, .max_suspended_io = 1 });
+    try manager.configureReadExecution(.{ .max_runnable_tasks = 1, .max_outstanding_tasks = 2, .max_queued_tasks = 1, .max_wait_ms = 5000, .max_working_bytes = 65536, .max_suspended_io = 1 });
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2, .leaf_size = 64, .branching_factor = 2, .use_quantization = false });
     defer idx.close();
     try idx.insert(1, &.{ 0, 0 });
@@ -23403,6 +23407,19 @@ test "workload admission HBC search binds its driver to the transaction and reti
         var txn = try idx.beginRuntimeSearchTxnForCoverageWithAdmission(&admission, false);
         defer txn.abort();
         try std.testing.expect(HBCIndex.denseExecutionDriverFromTxn(&txn) == &admission.driver.scheduled);
+    }
+    {
+        var outer = (try manager.acquireReadDriver(std.testing.io, .{ .io = std.testing.io })).?;
+        defer outer.release();
+        var admission = try idx.acquireSearchAdmission(2, idx.metadata.node_count, .{ .query = &.{ 0, 0 }, .k = 2, .read_execution = &outer });
+        var txn = try idx.beginRuntimeSearchTxnForCoverageWithAdmission(&admission, false);
+        try std.testing.expect(HBCIndex.denseExecutionDriverFromTxn(&txn) == &outer);
+        txn.abort();
+        idx.releaseSearchAdmission(&admission);
+        // The nested HBC admission never reacquires the sole runnable slot or
+        // releases its caller's lease when its own buffers retire.
+        try std.testing.expectEqual(@as(u64, 1), manager.denseExecutionStats().runnable);
+        try std.testing.expectEqual(@as(u64, 1), manager.denseExecutionStats().outstanding);
     }
     const Observer = struct {
         manager: *resource_manager_mod.ResourceManager,

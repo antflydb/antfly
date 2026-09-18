@@ -1160,6 +1160,7 @@ pub const ApiHttpServerConfig = struct {
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
     query_admission_waiting: @import("../common/workload_admission.zig").Config = .{},
     dense_execution: @import("../storage/dense_execution.zig").Config = .{},
+    read_execution: @import("../storage/dense_execution.zig").Config = .{},
     /// Node-local foreground data-mutation admission capacity. Zero is unlimited.
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     write_admission_waiting: @import("../common/workload_admission.zig").Config = .{},

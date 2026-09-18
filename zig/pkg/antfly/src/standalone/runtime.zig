@@ -3017,6 +3017,7 @@ pub fn runFromIterator(
     defer if (control_only_storage_sources) storage_kernel_context.deinit();
     if (comptime control_only_storage_sources) {
         const dense = if (loaded_config) |*cfg| cfg.admission.dense_execution else (antfly.common.config.Config.AdmissionConfig{}).dense_execution;
+        const reads = if (loaded_config) |*cfg| cfg.admission.read_execution else (antfly.common.config.Config.AdmissionConfig{}).read_execution;
         try storage_kernel_context.ensureWith(.{
             .storage_kind = if (lite_path != null) .lite else .directory,
             .no_sync = @intFromBool(!lite_fsync),
@@ -3028,6 +3029,19 @@ pub fn runFromIterator(
             .dense_max_wait_ms = dense.max_wait_ms,
             .dense_max_working_bytes = dense.max_working_bytes,
             .dense_max_suspended_io = dense.max_suspended_io,
+            .read_max_runnable_tasks = reads.max_runnable_tasks,
+            .read_max_outstanding_tasks = reads.max_outstanding_tasks,
+            .read_max_queued_tasks = reads.max_queued_tasks,
+            .read_max_wait_ms = reads.max_wait_ms,
+            .read_max_working_bytes = reads.max_working_bytes,
+            .read_max_suspended_io = reads.max_suspended_io,
+            .read_max_scan_state_bytes = reads.max_scan_state_bytes,
+            .read_max_scan_snapshot_ms = reads.max_scan_snapshot_ms,
+            .read_protected_runnable_tasks = reads.protected.max_runnable_tasks,
+            .read_protected_outstanding_tasks = reads.protected.max_outstanding_tasks,
+            .read_protected_working_bytes = reads.protected.max_working_bytes,
+            .read_transition_tasks = reads.protected.max_transition_tasks,
+            .read_transition_bytes = reads.protected.max_transition_bytes,
         });
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
@@ -3601,6 +3615,7 @@ pub fn runFromIterator(
             .session_max_retained_bytes = if (loaded_config) |*cfg| cfg.admission.session_max_retained_bytes else 64 * 1024 * 1024,
             .ingress_admission = if (loaded_config) |*cfg| cfg.admission.ingress else .{},
             .dense_execution = if (loaded_config) |*cfg| cfg.admission.dense_execution else .{},
+            .read_execution = if (loaded_config) |*cfg| cfg.admission.read_execution else .{},
             .remote_attempt_worker = if (loaded_config) |*cfg| cfg.admission.remote_attempt_worker else .{},
             .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},

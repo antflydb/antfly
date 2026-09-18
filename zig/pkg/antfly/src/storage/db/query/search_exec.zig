@@ -13083,6 +13083,7 @@ fn searchDenseInternal(
             .filter_ids = effective_filter_ids,
             .exclude_ids = effective_exclude_ids,
             .cancellation = lifetime.token(),
+            .read_execution = req.read_execution,
         };
 
         const hbc_search_start = platform_time.monotonicNs();

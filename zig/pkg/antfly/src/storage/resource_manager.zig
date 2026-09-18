@@ -1010,6 +1010,13 @@ pub const ResourceManager = struct {
     pub const DenseDriverLease = struct {
         legacy: DenseWorkAdmission.Queue.Lease = .{},
         scheduled: DenseExecution.Runtime.Lease = .{},
+        /// Borrowed from the synchronous outer DB read; never retired here.
+        borrowed: ?*DenseExecution.Runtime.Lease = null,
+
+        pub fn scheduledLease(self: *const @This()) ?*DenseExecution.Runtime.Lease {
+            if (self.borrowed) |lease| return lease;
+            return if (self.scheduled.runtime != null) @constCast(&self.scheduled) else null;
+        }
 
         pub fn release(self: *@This()) void {
             self.scheduled.release();
@@ -1021,12 +1028,47 @@ pub const ResourceManager = struct {
     /// setup is harmless; changing policy on a live manager is not supported.
     pub fn configureDenseExecution(self: *ResourceManager, config: DenseExecution.Config) !void {
         try config.validate();
+        if (config.protected.enabled() or config.max_scan_state_bytes != 0) return error.InvalidConfig;
+        if (config.max_runnable_tasks == 0) return;
         if (self.dense_execution) |runtime| {
-            if (!std.meta.eql(runtime.config, config)) return error.AdmissionBusy;
+            if (runtime.scope != .dense_only or !std.meta.eql(runtime.config, config)) return error.AdmissionBusy;
             return;
         }
         if (config.max_runnable_tasks != 0)
             self.dense_execution = try DenseExecution.Runtime.create(self.identity_allocator, config);
+    }
+
+    pub fn configureReadExecution(self: *ResourceManager, config: DenseExecution.Config) !void {
+        try config.validate();
+        if (config.max_runnable_tasks == 0) return;
+        if (self.dense_execution) |runtime| {
+            if (runtime.scope != .all_reads or !std.meta.eql(runtime.config, config)) return error.AdmissionBusy;
+            return;
+        }
+        const runtime = try DenseExecution.Runtime.create(self.identity_allocator, config);
+        runtime.scope = .all_reads;
+        self.dense_execution = runtime;
+    }
+
+    pub fn acquireReadDriver(self: *ResourceManager, io: std.Io, options: @import("../common/workload_admission.zig").Options) !?DenseExecution.Runtime.Lease {
+        const runtime = self.dense_execution orelse return null;
+        if (runtime.scope != .all_reads) return null;
+        var effective = options;
+        effective.io = io;
+        return try runtime.acquire(effective);
+    }
+
+    pub fn acquireReadDriverWithState(self: *ResourceManager, io: std.Io, options: @import("../common/workload_admission.zig").Options, maximum_retained_bytes: u64) !?DenseExecution.Runtime.Lease {
+        const runtime = self.dense_execution orelse return null;
+        if (runtime.scope != .all_reads) return null;
+        var effective = options;
+        effective.io = io;
+        return try runtime.acquireWithState(effective, maximum_retained_bytes);
+    }
+
+    pub fn borrowReadDriver(self: *ResourceManager, lease: *DenseExecution.Runtime.Lease) !DenseDriverLease {
+        if (lease.runtime != self.dense_execution or lease.request == null or lease.job == null) return error.InvalidLease;
+        return .{ .borrowed = lease };
     }
 
     pub fn acquireDenseDriver(self: *ResourceManager, io: std.Io, cancellation: ?DenseWorkAdmission.Cancellation) !DenseDriverLease {
