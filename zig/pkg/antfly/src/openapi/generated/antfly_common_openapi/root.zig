@@ -40,6 +40,7 @@ pub const ObjectStorageConfig = types.ObjectStorageConfig;
 pub const ObjectStorageLanes = types.ObjectStorageLanes;
 pub const ObjectStorageLocation = types.ObjectStorageLocation;
 pub const QueryAdmissionConfig = types.QueryAdmissionConfig;
+pub const RemoteAttemptWorkerConfig = types.RemoteAttemptWorkerConfig;
 pub const S3ExternalIoConfig = types.S3ExternalIoConfig;
 pub const StorageConfig = types.StorageConfig;
 pub const StorageEngine = types.StorageEngine;

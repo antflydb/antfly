@@ -794,6 +794,8 @@ components:
       additionalProperties: false
       description: Node-local foreground database request admission settings.
       properties:
+        remote_attempt_worker:
+          $ref: "#/components/schemas/RemoteAttemptWorkerConfig"
         dense_execution:
           $ref: "#/components/schemas/DenseExecutionConfig"
         query:
@@ -802,6 +804,38 @@ components:
           $ref: "#/components/schemas/WriteAdmissionConfig"
         inference:
           $ref: "#/components/schemas/InferenceAdmissionConfig"
+
+    RemoteAttemptWorkerConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Opt-in durable join-row worker deduplication and generation fencing.
+        Requires the node's durable API session backend and internal service
+        authentication. Journal bytes include active and uncertain attempts,
+        terminal tombstones and coordinator fences. Coordinator dispatch is
+        not enabled by this setting. Unknown prior incarnations remain charged.
+      properties:
+        max_attempts:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 4096
+          default: 0
+          description: Zero disables worker execution under the attempt protocol.
+        max_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 67108864
+          default: 0
+          description: Journal reservation ceiling; enabled workers require at least 4096 bytes.
+        max_run_ms:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 60000
+          default: 30000
+          description: Local execution budget ceiling; expiry never certifies quiescence.
 
     DenseExecutionConfig:
       type: object

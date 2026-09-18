@@ -3614,6 +3614,7 @@ pub fn runFromIterator(
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .query_admission_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
             .dense_execution = if (loaded_config) |*cfg| cfg.admission.dense_execution else .{},
+            .remote_attempt_worker = if (loaded_config) |*cfg| cfg.admission.remote_attempt_worker else .{},
             .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,

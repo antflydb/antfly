@@ -49,6 +49,8 @@ const ServiceAuthentication = struct {
     identity_allocator: std.mem.Allocator,
     identity: AuthenticatedIdentity,
     attempt: ?attempt_protocol.Request = null,
+    received_ns: u64 = 0,
+    worker_cancellation: operation_contract.CancellationToken = .none,
 
     fn destroy(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -816,6 +818,7 @@ pub const AntflyApiHandler = struct {
 
     fn internalServiceAuthRejection(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
         if (!requiresInternalServicePrincipal(ctx.request.uri.path)) return null;
+        const received_ns = platform_time.monotonicNs();
         const secret = self.api_server.cfg.internal_service_secret orelse
             return @as(?httpx.Response, try jsonErrorResponse(ctx, 503, "internal service authentication is not configured"));
         if (secret.len == 0)
@@ -838,7 +841,7 @@ pub const AntflyApiHandler = struct {
         if (!identity.is_internal_service)
             return @as(?httpx.Response, try jsonErrorResponse(ctx, 403, "internal service credential required"));
         const authenticated = try ctx.allocator.create(ServiceAuthentication);
-        authenticated.* = .{ .allocator = ctx.allocator, .identity_allocator = self.api_server.alloc, .identity = identity };
+        authenticated.* = .{ .allocator = ctx.allocator, .identity_allocator = self.api_server.alloc, .identity = identity, .received_ns = received_ns };
         ctx.setData(service_authentication_key, authenticated, ServiceAuthentication.destroy) catch |err| {
             ctx.allocator.destroy(authenticated);
             return err;
@@ -856,11 +859,17 @@ pub const AntflyApiHandler = struct {
                 .issuer = self.api_server.cfg.internal_service_issuer orelse "",
             }, frame, identity.username, @tagName(ctx.request.method), target, body) catch
                 return @as(?httpx.Response, try unauthorizedResponse(ctx));
-            // Authentication alone cannot admit execution. Until the durable
-            // dedup/fence owner is installed, even a verified attempt is refused.
-            // Do not sign a terminal reply without a durable rejection tombstone:
-            // a delayed replay after upgrade must not resurrect retired work.
-            return @as(?httpx.Response, try jsonErrorResponse(ctx, 503, "remote attempt worker protocol unavailable"));
+            // Preserve elapsed authentication/body-read time and an earlier
+            // application deadline across repeated host/kernel authentication.
+            const deadline = received_ns +| authenticated.attempt.?.remaining_ns;
+            ctx.application_deadline_ns = @min(requestCancellation(ctx).query_deadline_ns orelse deadline, deadline);
+            ctx.application_deadline_io = null;
+            // Only the synchronous join-row worker has a durable attempt owner.
+            // Other routes and unconfigured workers must not downgrade to legacy
+            // execution, or sign a rejection without a durable tombstone/fence.
+            if (self.api_server.remote_attempt_worker == null or ctx.request.method != .POST or
+                routes.matchGroupJoinRows(ctx.request.uri.path) == null)
+                return @as(?httpx.Response, try jsonErrorResponse(ctx, 503, "remote attempt worker protocol unavailable"));
         }
         return null;
     }
@@ -1605,12 +1614,15 @@ pub const AntflyApiHandler = struct {
             ) catch {};
         }
         return .{
-            .cancellation = if (ctx.cancellation != null or ctx.cancellation_probe != null) .{
+            .cancellation = if (ctx.cancellation != null or ctx.cancellation_probe != null or service != null) .{
                 .ptr = ctx,
                 .is_cancelled_fn = struct {
                     fn call(raw: *const anyopaque) bool {
                         const context: *const httpx.Context = @ptrCast(@alignCast(raw));
-                        return context.isCancellationRequested();
+                        return context.isCancellationRequested() or if (ServiceAuthentication.fromContext(context)) |authenticated|
+                            authenticated.worker_cancellation.isCancelled()
+                        else
+                            false;
                     }
                 }.call,
             } else .none,
@@ -2249,6 +2261,66 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalJoinRows(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const authentication = ServiceAuthentication.fromContext(ctx);
+        const request = if (authentication) |authenticated| authenticated.attempt else null;
+        if (request) |attempt| {
+            const worker = self.api_server.remote_attempt_worker orelse return jsonErrorResponse(ctx, 503, "remote attempt worker unavailable");
+            const keys: attempt_protocol.Keys = .{
+                .primary = self.api_server.cfg.internal_service_secret.?,
+                .verification = self.api_server.cfg.internal_service_verification_secret,
+                .issuer = self.api_server.cfg.internal_service_issuer.?,
+            };
+            const body = (try ctx.body()) orelse "";
+            const Control = struct { workload_attempt_control: ?[]const u8 = null };
+            var control = std.json.parseFromSlice(Control, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch
+                return jsonErrorResponse(ctx, 400, "invalid remote attempt control");
+            defer control.deinit();
+            if (control.value.workload_attempt_control) |action| {
+                if (!std.mem.eql(u8, action, "close_generation") or attempt.attempt.destination != worker.node_id)
+                    return jsonErrorResponse(ctx, 400, "invalid remote attempt control");
+                const evidence = (worker.closeGeneration(attempt.attempt.coordinator, attempt.attempt.generation, attempt.attempt.worker_incarnation) catch
+                    return jsonErrorResponse(ctx, 503, "remote attempt fence unavailable")) orelse
+                    return jsonErrorResponse(ctx, 409, "remote attempt generation is not quiescent");
+                const signed = try attempt_protocol.signFenceAfterQuiescence(ctx.allocator, keys, evidence);
+                defer ctx.allocator.free(signed);
+                try ctx.setHeader(attempt_protocol.evidence_header, signed);
+                return jsonResponse(ctx, 200, "{}");
+            }
+            const admitted = worker.begin(attempt) catch
+                return jsonErrorResponse(ctx, 503, "remote attempt admission unavailable");
+            if (admitted == .active) return jsonErrorResponse(ctx, 409, "remote attempt is still active");
+            var response: httpx.Response = undefined;
+            if (admitted == .terminal) {
+                response = try jsonErrorResponse(ctx, 409, "remote attempt already completed; result unavailable");
+            } else {
+                var lease = admitted.started;
+                authentication.?.worker_cancellation = lease.cancellation();
+                defer authentication.?.worker_cancellation = .none;
+                const deadline = authentication.?.received_ns +| @min(attempt.remaining_ns, @as(u64, worker.config.max_run_ms) * std.time.ns_per_ms);
+                const existing_deadline = requestCancellation(ctx).query_deadline_ns;
+                ctx.application_deadline_ns = @min(existing_deadline orelse deadline, deadline);
+                ctx.application_deadline_io = null;
+                response = self.internalJoinRowsLegacy(ctx) catch |err| {
+                    authentication.?.worker_cancellation = .none;
+                    try lease.finish();
+                    return err;
+                };
+                authentication.?.worker_cancellation = .none;
+                lease.finish() catch |err| {
+                    response.deinit();
+                    return err;
+                };
+            }
+            errdefer response.deinit();
+            const signed = try attempt_protocol.signTerminalAfterQuiescence(ctx.allocator, keys, attempt.attempt, response.status.code, response.body orelse "");
+            defer ctx.allocator.free(signed);
+            try response.headers.set(attempt_protocol.evidence_header, signed);
+            return response;
+        }
+        return self.internalJoinRowsLegacy(ctx);
+    }
+
+    fn internalJoinRowsLegacy(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid join rows request");
@@ -7743,6 +7815,97 @@ test "workload admission authenticated service identity reaches internal context
         }
     }
     try std.testing.expectEqual(@as(usize, 1), observer.calls);
+}
+
+test "workload admission durable join rows deduplicate and sign only after actual unwind" {
+    const alloc = std.testing.allocator;
+    const worker_module = @import("workload_attempt_worker.zig");
+    const Fake = struct {
+        worker: ?*worker_module.Store = null,
+        calls: usize = 0,
+        close_during_query: bool = false,
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query, .query_group_local = groupQuery } };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+        fn groupQuery(raw: *anyopaque, a: std.mem.Allocator, _: u64, _: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(req.execution_deadline_ns != null);
+            try std.testing.expectEqual(@as(usize, 1), (try self.worker.?.usage()).attempts);
+            if (self.close_during_query) try std.testing.expect((try self.worker.?.closeGeneration(7, 3, self.worker.?.incarnation)) == null);
+            return .{ .json = try a.dupe(u8, "{\"responses\":[{\"hits\":{\"hits\":[],\"total\":{\"value\":0,\"relation\":\"exact\"}}}]}") };
+        }
+    };
+    var status: AuthStatusSource = .{};
+    try std.testing.expectError(error.RemoteAttemptDurabilityRequired, ApiHttpServer.initWithConfig(alloc, .{ .remote_attempt_worker = .{ .max_attempts = 4, .max_bytes = 8192 } }, status.iface(), null, null));
+    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var storage = try backend.runtimeStore(alloc, .{ .name = "system/runtime-attempts" });
+    defer storage.deinit();
+    var durable = transactions_api.DurableSessionStore.initRuntime(alloc, &storage);
+    var fake: Fake = .{};
+    const secret = "a" ** 32;
+    var server = try ApiHttpServer.initWithConfig(alloc, .{
+        .session_store = &durable,
+        .remote_attempt_worker = .{ .max_attempts = 4, .max_bytes = 8192 },
+        .remote_attempt_node_id = 8,
+        .internal_service_secret = secret,
+        .internal_service_issuer = "cluster",
+    }, status.iface(), fake.source(), null);
+    defer server.deinit();
+    fake.worker = server.remote_attempt_worker;
+    var handler: AntflyApiHandler = .{ .api_server = &server };
+    const target = "/internal/v1/groups/8/tables/docs/join-rows";
+    const query_body = "{\"join\":{\"right_table\":\"docs\",\"on\":{\"left_field\":\"customer_id\",\"right_field\":\"_id\"}}}";
+    const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "cluster", .node_id = 7 }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    inline for (.{ "query", "duplicate", "fence", "cancel", "fence_cancelled" }) |mode| {
+        const fencing = comptime std.mem.startsWith(u8, mode, "fence");
+        const generation: u64 = if (comptime std.mem.eql(u8, mode, "cancel") or std.mem.eql(u8, mode, "fence_cancelled")) 3 else 2;
+        fake.close_during_query = comptime std.mem.eql(u8, mode, "cancel");
+        const body = if (fencing) "{\"workload_attempt_control\":\"close_generation\"}" else query_body;
+        const attempt: attempt_protocol.Request = .{
+            .version = 1,
+            .attempt = .{ .coordinator = 7, .generation = generation, .sequence = 1, .operation = 1, .destination = 8, .worker_incarnation = fake.worker.?.incarnation },
+            .remaining_ns = 5 * std.time.ns_per_s,
+            .request_digest = attempt_protocol.requestDigest("POST", target, body),
+        };
+        const signed = try attempt_protocol.signRequest(alloc, .{ .primary = secret, .issuer = "cluster" }, attempt);
+        defer alloc.free(signed);
+        var request = try httpx.Request.init(alloc, .POST, target);
+        defer request.deinit();
+        request.body = body;
+        try request.headers.set(internal_service_auth.header_name, token);
+        try request.headers.set(attempt_protocol.request_header, signed);
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        context.params = &.{ .{ .name = "group_id", .value = "8" }, .{ .name = "table_name", .value = "docs" } };
+        try std.testing.expect((try handler.internalServiceAuthRejection(&context)) == null);
+        const original_deadline = context.application_deadline_ns.?;
+        var response = try handler.dispatchLinkedRoute(&context, httpx.Handler.bind(&handler, AntflyApiHandler.internalJoinRows));
+        defer response.deinit();
+        const expected: u16 = if (comptime std.mem.eql(u8, mode, "duplicate")) 409 else if (comptime std.mem.eql(u8, mode, "cancel")) 408 else 200;
+        try std.testing.expect(context.application_deadline_ns.? <= original_deadline);
+        if (response.status.code != expected) std.debug.print("worker mode={s} body={s} calls={d}\n", .{ mode, response.body orelse "", fake.calls });
+        try std.testing.expectEqual(expected, response.status.code);
+        const evidence = response.headers.get(attempt_protocol.evidence_header).?;
+        if (fencing) {
+            _ = try attempt_protocol.verifyFence(alloc, .{ .primary = secret, .issuer = "cluster" }, evidence, attempt.attempt);
+        } else {
+            _ = try attempt_protocol.verifyTerminal(alloc, .{ .primary = secret, .issuer = "cluster" }, evidence, attempt.attempt, response.status.code, response.body orelse "");
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), (try fake.worker.?.usage()).attempts);
 }
 
 test "compressed requests authenticate before decompression and reuse the identity" {

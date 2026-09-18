@@ -93,6 +93,7 @@ pub const Config = struct {
     };
 
     pub const AdmissionConfig = struct {
+        remote_attempt_worker: @import("workload_worker_config.zig").Config = .{},
         dense_execution: @import("../storage/dense_execution.zig").Config = .{},
         query: RequestAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
         write: RequestAdmissionConfig = .{ .max_concurrent_requests = default_write_max_concurrent_requests },
@@ -709,7 +710,7 @@ pub const Config = struct {
         };
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("admission")) |admission_value| {
-            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "dense_execution" });
+            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "dense_execution", "remote_attempt_worker" });
             const admission_object = switch (admission_value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
@@ -837,6 +838,7 @@ pub const Config = struct {
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
             .admission = .{
+                .remote_attempt_worker = try remoteAttemptWorkerFromOpenApi(if (validated.value.admission) |admission| admission.remote_attempt_worker else null),
                 .dense_execution = try denseExecutionFromOpenApi(if (validated.value.admission) |admission| admission.dense_execution else null),
                 .query = .{
                     .max_concurrent_requests = if (validated.value.admission) |admission|
@@ -1686,6 +1688,31 @@ fn denseExecutionFromOpenApi(input: ?common_openapi.DenseExecutionConfig) !@impo
     };
     try config.validate();
     return config;
+}
+
+fn remoteAttemptWorkerFromOpenApi(input: ?common_openapi.RemoteAttemptWorkerConfig) !@import("workload_worker_config.zig").Config {
+    const value = input orelse return .{};
+    const config: @import("workload_worker_config.zig").Config = .{
+        .max_attempts = std.math.cast(u32, value.max_attempts orelse 0) orelse return error.InvalidConfig,
+        .max_bytes = std.math.cast(u64, value.max_bytes orelse 0) orelse return error.InvalidConfig,
+        .max_run_ms = std.math.cast(u32, value.max_run_ms orelse 30_000) orelse return error.InvalidConfig,
+    };
+    try config.validate();
+    return config;
+}
+
+test "common config durable remote attempt workers are opt in and bounded" {
+    const alloc = std.testing.allocator;
+    var cfg = try Config.parseFromSlice(alloc, "{\"admission\":{\"remote_attempt_worker\":{\"max_attempts\":4,\"max_bytes\":8192}}}");
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 4), cfg.admission.remote_attempt_worker.max_attempts);
+    try std.testing.expectEqual(@as(u32, 30_000), cfg.admission.remote_attempt_worker.max_run_ms);
+    inline for (.{
+        "{\"admission\":{\"remote_attempt_worker\":{\"max_attempts\":1}}}",
+        "{\"admission\":{\"remote_attempt_worker\":{\"max_bytes\":8192}}}",
+        "{\"admission\":{\"remote_attempt_worker\":{\"max_attempts\":4097,\"max_bytes\":8192}}}",
+        "{\"admission\":{\"remote_attempt_worker\":{\"max_run_ms\":60001}}}",
+    }) |json| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, json));
 }
 
 fn admissionWaitingFromOpenApi(input: ?common_openapi.AdmissionWaitingConfig) !@import("workload_admission.zig").Config {

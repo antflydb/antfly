@@ -193,6 +193,8 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         state.runtime_io.init(borrows) catch |err| return fail(err);
         imported_cfg.imported_runtime_io = state.runtime_io.views();
     }
+    if (imported_cfg.remote_attempt_worker.max_attempts != 0 and context.flags & CreateContext.fallible_init == 0)
+        return fail(error.RemoteAttemptDurabilityRequired);
     state.server = if (context.flags & CreateContext.fallible_init != 0)
         server_mod.ApiHttpServer.initWithConfig(owner_alloc, imported_cfg, source.*, reads.*, writes.*) catch |err| {
             std.log.err("API kernel create failed initializing server: error.{s}", .{@errorName(err)});

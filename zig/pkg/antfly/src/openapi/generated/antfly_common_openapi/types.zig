@@ -14,6 +14,7 @@ const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
 /// Node-local foreground database request admission settings.
 pub const AdmissionConfig = struct {
+    remote_attempt_worker: ?RemoteAttemptWorkerConfig = null,
     dense_execution: ?DenseExecutionConfig = null,
     query: ?QueryAdmissionConfig = null,
     write: ?WriteAdmissionConfig = null,
@@ -21,6 +22,7 @@ pub const AdmissionConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_attempt_worker", "remote_attempt_worker", true },
         .{ "dense_execution", "dense_execution", true },
         .{ "query", "query", true },
         .{ "write", "write", true },
@@ -37,6 +39,10 @@ pub const AdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_attempt_worker) |value| {
+            try jw.objectField("remote_attempt_worker");
+            try jw.write(value);
+        }
         if (self.dense_execution) |value| {
             try jw.objectField("dense_execution");
             try jw.write(value);
@@ -2021,6 +2027,48 @@ pub const QueryAdmissionConfig = struct {
         }
         if (self.max_concurrent_requests) |value| {
             try jw.objectField("max_concurrent_requests");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opt-in durable join-row worker deduplication and generation fencing. Requires the node's durable API session backend and internal service authentication. Journal bytes include active and uncertain attempts, terminal tombstones and coordinator fences. Coordinator dispatch is not enabled by this setting. Unknown prior incarnations remain charged.
+pub const RemoteAttemptWorkerConfig = struct {
+    /// Zero disables worker execution under the attempt protocol.
+    max_attempts: ?i64 = null,
+    /// Journal reservation ceiling; enabled workers require at least 4096 bytes.
+    max_bytes: ?i64 = null,
+    /// Local execution budget ceiling; expiry never certifies quiescence.
+    max_run_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_attempts", "max_attempts", true },
+        .{ "max_bytes", "max_bytes", true },
+        .{ "max_run_ms", "max_run_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_attempts) |value| {
+            try jw.objectField("max_attempts");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        if (self.max_run_ms) |value| {
+            try jw.objectField("max_run_ms");
             try jw.write(value);
         }
         try jw.endObject();

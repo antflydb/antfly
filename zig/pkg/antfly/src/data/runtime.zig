@@ -5690,6 +5690,7 @@ pub const DataServer = struct {
         if (comptime !linked_storage)
             try self.provisioned_storage.resource_manager.configureDenseExecution(self.api_server_cfg.dense_execution);
         var api_server_cfg = self.api_server_cfg;
+        api_server_cfg.remote_attempt_node_id = if (self.store_registration) |registration| registration.node_id else 0;
         if (self.data_request_lifecycle_hook != null) {
             if (api_server_cfg.query_result_lifecycle_hook != null)
                 return error.AmbiguousQueryResultLifecycleOwner;
@@ -25795,6 +25796,7 @@ pub fn runFromIterator(
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .query_admission_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
             .dense_execution = if (loaded_config) |*cfg| cfg.admission.dense_execution else .{},
+            .remote_attempt_worker = if (loaded_config) |*cfg| cfg.admission.remote_attempt_worker else .{},
             .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,

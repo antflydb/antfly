@@ -454,6 +454,8 @@ pub const OwnedStack = struct {
     handler: api_mod.HttpHandler,
 
     pub fn init(self: *OwnedStack, alloc: Allocator, cfg: BootstrapConfig, io: std.Io) !void {
+        if (cfg.node_config) |node_config| if (node_config.admission.remote_attempt_worker.max_attempts != 0)
+            return error.RemoteAttemptDurabilityRequired;
         try validateConfig(alloc, cfg);
         self.alloc = alloc;
         self.embedding_provider_runtime = managed_embedder.ProviderRuntime.init(alloc, io);

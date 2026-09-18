@@ -1232,6 +1232,9 @@ pub const ApiHttpServerConfig = struct {
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
     session_store_scope: transactions_api.SessionStoreScope = .node_local,
+    remote_attempt_worker: @import("../common/workload_worker_config.zig").Config = .{},
+    /// Stable identity supplied by the owning node runtime, never by a caller.
+    remote_attempt_node_id: u64 = 0,
     ha_admin_executor: ?ha_http_operation.Executor = null,
     /// Dedicated HA administration credential. This is intentionally separate
     /// from native user authentication and other internal admin surfaces.
@@ -3097,6 +3100,7 @@ pub const ApiHttpServer = struct {
     request_count: std.atomic.Value(u64) = .init(0),
     first_request_started_at_ns: std.atomic.Value(u64) = .init(0),
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
+    remote_attempt_worker: ?*@import("workload_attempt_worker.zig").Store = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     repair_job_store: repair_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
@@ -3680,6 +3684,7 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) !ApiHttpServer {
+        try cfg.remote_attempt_worker.validate();
         var effective_cfg = cfg;
         const request_alloc = if (builtin.is_test)
             alloc
@@ -3783,6 +3788,23 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.restore_job_store.attach(opened);
         }
+        if (cfg.remote_attempt_worker.max_attempts != 0) {
+            const durable = server.cfg.session_store orelse return error.RemoteAttemptDurabilityRequired;
+            if (cfg.remote_attempt_node_id == 0) return error.RemoteAttemptNodeIdentityRequired;
+            try internal_service_auth.validateRuntimeConfig(cfg.internal_service_secret, cfg.internal_service_verification_secret, cfg.internal_service_issuer);
+            const worker = try alloc.create(@import("workload_attempt_worker.zig").Store);
+            errdefer alloc.destroy(worker);
+            var incarnation: u64 = 0;
+            if (server.sharedApiIo()) |io| {
+                while (incarnation == 0) try io.randomSecure(std.mem.asBytes(&incarnation));
+            } else {
+                var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                defer threaded.deinit();
+                while (incarnation == 0) try threaded.io().randomSecure(std.mem.asBytes(&incarnation));
+            }
+            worker.* = try @import("workload_attempt_worker.zig").Store.init(alloc, durable, cfg.remote_attempt_node_id, incarnation, cfg.remote_attempt_worker);
+            server.remote_attempt_worker = worker;
+        }
         return server;
     }
 
@@ -3832,6 +3854,10 @@ pub const ApiHttpServer = struct {
         self.mcp_sessions.deinit(self.owner_alloc);
         self.a2a_tasks.deinit(self.owner_alloc);
         self.txn_sessions.deinit(self.alloc);
+        if (self.remote_attempt_worker) |worker| {
+            worker.deinit();
+            self.owner_alloc.destroy(worker);
+        }
         if (self.opened_session_store) |opened| {
             opened.deinit();
             self.owner_alloc.destroy(opened);
