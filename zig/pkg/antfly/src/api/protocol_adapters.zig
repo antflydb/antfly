@@ -341,6 +341,29 @@ pub fn executeExtensionMcpRequest(server_ptr: anytype, request: McpRequest, auth
 }
 
 fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype, extension_name_filter: ?[]const u8) !contextual_operations.OwnedResponse {
+    try request.context.ensureActive();
+    const memory = server_ptr.mcpAllocationOwner() catch |err| switch (err) {
+        error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge => return server_ptr.mcpMemoryExhaustedResponse(false),
+        else => return err,
+    };
+    defer memory.release();
+    server_ptr.ensureMcpSessionMemory() catch |err| switch (err) {
+        error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge => return server_ptr.mcpMemoryExhaustedResponse(false),
+        else => return err,
+    };
+    var execution_started = false;
+    var response = executeMcpRequestFilteredAllocated(server_ptr, request, authenticated_identity, extension_name_filter, memory.allocator(), &execution_started) catch |err| {
+        if (err == error.OutOfMemory and (memory.budget_exhausted.load(.acquire) or server_ptr.mcp_session_memory.?.budget_exhausted.load(.acquire))) {
+            return server_ptr.mcpMemoryExhaustedResponse(execution_started);
+        }
+        return err;
+    };
+    memory.retain();
+    response.memory_owner = memory;
+    return response;
+}
+
+fn executeMcpRequestFilteredAllocated(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype, extension_name_filter: ?[]const u8, protocol_alloc: std.mem.Allocator, execution_started: *bool) !contextual_operations.OwnedResponse {
     const Server = @TypeOf(server_ptr);
     const ToolContext = struct {
         server: Server,
@@ -379,14 +402,20 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn createTable(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return mcpError(alloc, "invalid table target");
+            };
             defer alloc.free(table_name);
             var body = std.json.ObjectMap.empty;
             const default_shards: i64 = if (ctx.server.cfg.deployment_mode.isStandalone()) 1 else 3;
             try body.put(alloc, "num_shards", .{ .integer = jsonIntArg(args, "numShards") orelse default_shards });
             if (jsonStringArg(args, "fields")) |fields_json| {
                 if (fields_json.len != 0) {
-                    const fields = std.json.parseFromSliceLeaky(std.json.Value, alloc, fields_json, .{}) catch return mcpError(alloc, "invalid fields JSON");
+                    const fields = std.json.parseFromSliceLeaky(std.json.Value, alloc, fields_json, .{}) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        return mcpError(alloc, "invalid fields JSON");
+                    };
                     try body.put(alloc, "schema", fields);
                 }
             }
@@ -398,7 +427,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn createIndex(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return mcpError(alloc, "invalid table target");
+            };
             defer alloc.free(table_name);
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
             var body = std.json.ObjectMap.empty;
@@ -408,10 +440,16 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             if (jsonStringArg(args, "field")) |field| if (field.len != 0) try body.put(alloc, "field", .{ .string = field });
             if (jsonStringArg(args, "template")) |template| if (template.len != 0) try body.put(alloc, "template", .{ .string = template });
             if (jsonStringArg(args, "embedder")) |embedder_json| {
-                if (embedder_json.len != 0) try body.put(alloc, "embedder", std.json.parseFromSliceLeaky(std.json.Value, alloc, embedder_json, .{}) catch return mcpError(alloc, "invalid embedder JSON"));
+                if (embedder_json.len != 0) try body.put(alloc, "embedder", std.json.parseFromSliceLeaky(std.json.Value, alloc, embedder_json, .{}) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    return mcpError(alloc, "invalid embedder JSON");
+                });
             }
             if (jsonStringArg(args, "summarizer")) |summarizer_json| {
-                if (summarizer_json.len != 0) try body.put(alloc, "summarizer", std.json.parseFromSliceLeaky(std.json.Value, alloc, summarizer_json, .{}) catch return mcpError(alloc, "invalid summarizer JSON"));
+                if (summarizer_json.len != 0) try body.put(alloc, "summarizer", std.json.parseFromSliceLeaky(std.json.Value, alloc, summarizer_json, .{}) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    return mcpError(alloc, "invalid summarizer JSON");
+                });
             }
             return try ctx.executeOperation(alloc, .{ .create_index = .{
                 .table_name = table_name,
@@ -421,7 +459,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return mcpError(alloc, "invalid table target");
+            };
             defer alloc.free(table_name);
             const result = try ctx.executeOperation(alloc, .{ .list_indexes = .{ .table_name = table_name } });
             if (result.structured) |structured| {
@@ -435,7 +476,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn getDocument(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return mcpError(alloc, "invalid table target");
+            };
             defer alloc.free(table_name);
             const key = jsonStringArg(args, "key") orelse return mcpError(alloc, "missing key");
             var fields_csv = std.ArrayListUnmanaged(u8).empty;
@@ -458,7 +502,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn sampleDocuments(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return mcpError(alloc, "invalid table target");
+            };
             defer alloc.free(table_name);
             const limit = jsonIntArg(args, "limit") orelse 5;
             if (limit <= 0) return mcpError(alloc, "limit must be greater than 0");
@@ -476,7 +523,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn indexRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, body: []const u8) !mcp.CallToolResult {
-            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return mcpError(alloc, "invalid table target");
+            };
             defer alloc.free(table_name);
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
             _ = body;
@@ -485,7 +535,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn query(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return mcpError(alloc, "invalid table target");
+            };
             defer alloc.free(table_name);
             if (jsonValueArg(args, "queryRequest")) |query_request| {
                 if (query_request != .object) return mcpError(alloc, "queryRequest must be an object");
@@ -507,7 +560,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             }
 
             var body = std.json.ObjectMap.empty;
-            putFullTextSearchArg(alloc, &body, args) catch return mcpError(alloc, "invalid fullTextSearch");
+            putFullTextSearchArg(alloc, &body, args) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return mcpError(alloc, "invalid fullTextSearch");
+            };
             if (jsonStringArg(args, "fullTextIndex")) |index_name| {
                 if (index_name.len == 0) return mcpError(alloc, "fullTextIndex must not be empty");
                 if (!body.contains("full_text_search")) return mcpError(alloc, "fullTextIndex requires fullTextSearch");
@@ -536,7 +592,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn backupRestore(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, operation: []const u8) !mcp.CallToolResult {
-            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return mcpError(alloc, "invalid table target");
+            };
             defer alloc.free(table_name);
             const backup_id = jsonStringArg(args, "backupId") orelse return mcpError(alloc, "missing backupId");
             const location = jsonStringArg(args, "location") orelse return mcpError(alloc, "missing location");
@@ -556,7 +615,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn batch(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
+            const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return mcpError(alloc, "invalid table target");
+            };
             defer alloc.free(table_name);
             var body = std.json.ObjectMap.empty;
             const inserts = jsonValueArg(args, "inserts");
@@ -575,7 +637,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         const TableOperationKind = enum { drop_table, describe_table };
 
         fn tableOperation(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, table_arg: []const u8, kind: TableOperationKind) !mcp.CallToolResult {
-            const table_name = mcpTableNameAlloc(alloc, args, table_arg) catch return mcpError(alloc, "invalid table target");
+            const table_name = mcpTableNameAlloc(alloc, args, table_arg) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return mcpError(alloc, "invalid table target");
+            };
             defer alloc.free(table_name);
             return switch (kind) {
                 .drop_table => try ctx.executeOperation(alloc, .{ .drop_table = .{ .table_name = table_name } }),
@@ -627,13 +692,13 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
 
     var extension_tools = std.ArrayListUnmanaged(ExtensionMcpTool).empty;
     defer {
-        for (extension_tools.items) |tool| tool.deinit(server_ptr.alloc);
-        extension_tools.deinit(server_ptr.alloc);
+        for (extension_tools.items) |tool| tool.deinit(protocol_alloc);
+        extension_tools.deinit(protocol_alloc);
     }
     if (snapshot_opt) |*snapshot| {
         if (extension_name_filter) |extension_name| {
             if (!extensionRuntimeMemberVisible(snapshot.installed_extensions, extension_name)) {
-                return try contextual_operations.textAlloc(server_ptr.alloc, 404, "extension not found");
+                return try contextual_operations.textAlloc(protocol_alloc, 404, "extension not found");
             }
         }
         for (snapshot.extension_members) |*member| {
@@ -642,15 +707,19 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
                 if (!std.mem.eql(u8, member.extension_name, extension_name)) continue;
             }
             if (!extensionRuntimeMemberVisible(snapshot.installed_extensions, member.extension_name)) continue;
-            try extension_tools.append(server_ptr.alloc, try extensionMcpToolFromMemberAlloc(server_ptr.alloc, member, snapshot));
+            const tool = try extensionMcpToolFromMemberAlloc(protocol_alloc, member, snapshot);
+            extension_tools.append(protocol_alloc, tool) catch |err| {
+                tool.deinit(protocol_alloc);
+                return err;
+            };
         }
     } else if (extension_name_filter != null) {
-        return try contextual_operations.textAlloc(server_ptr.alloc, 404, "extension not found");
+        return try contextual_operations.textAlloc(protocol_alloc, 404, "extension not found");
     }
-    const extension_contexts = try server_ptr.alloc.alloc(ExtensionToolContext, extension_tools.items.len);
-    defer if (extension_contexts.len > 0) server_ptr.alloc.free(extension_contexts);
+    const extension_contexts = try protocol_alloc.alloc(ExtensionToolContext, extension_tools.items.len);
+    defer if (extension_contexts.len > 0) protocol_alloc.free(extension_contexts);
     for (extension_contexts, 0..) |*ctx, i| {
-        const installed = findInstalledExtensionForRuntimeTool(snapshot_opt.?.installed_extensions, extension_tools.items[i].member.extension_name) orelse return try contextual_operations.textAlloc(server_ptr.alloc, 404, "extension not found");
+        const installed = findInstalledExtensionForRuntimeTool(snapshot_opt.?.installed_extensions, extension_tools.items[i].member.extension_name) orelse return try contextual_operations.textAlloc(protocol_alloc, 404, "extension not found");
         ctx.* = .{
             .server = server_ptr,
             .authenticated_identity = authenticated_identity,
@@ -663,10 +732,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
     var input_schemas: [mcp_tool_specs.len][]u8 = undefined;
     var input_schema_count: usize = 0;
     defer {
-        for (input_schemas[0..input_schema_count]) |schema| server_ptr.alloc.free(schema);
+        for (input_schemas[0..input_schema_count]) |schema| protocol_alloc.free(schema);
     }
     for (mcp_tool_specs, 0..) |spec, i| {
-        input_schemas[i] = try buildMcpInputSchema(server_ptr.alloc, spec);
+        input_schemas[i] = try buildMcpInputSchema(protocol_alloc, spec);
         input_schema_count += 1;
     }
 
@@ -676,11 +745,11 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         .max_tool_result_bytes = server_ptr.cfg.mcp_max_tool_result_bytes,
         .tool_result_too_large_text = mcp_tool_result_too_large_text,
     };
-    defer protocol_server.deinit(server_ptr.alloc);
+    defer protocol_server.deinit(protocol_alloc);
     if (extension_name_filter == null) {
         for (&contexts, mcp_tool_specs, 0..) |*ctx, spec, i| {
             if (!mcpToolVisibleForIdentity(spec, authenticated_identity)) continue;
-            try protocol_server.addTool(server_ptr.alloc, .{
+            try protocol_server.addTool(protocol_alloc, .{
                 .name = spec.name,
                 .description = spec.description,
                 .input_schema_json = input_schemas[i],
@@ -690,7 +759,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
     }
     for (extension_tools.items, extension_contexts) |tool, *ctx| {
         if (!extensionMcpToolVisibleForIdentity(ctx.installed, &tool, authenticated_identity)) continue;
-        try protocol_server.addTool(server_ptr.alloc, .{
+        try protocol_server.addTool(protocol_alloc, .{
             .name = tool.member.object_name,
             .description = tool.description,
             .input_schema_json = tool.input_schema_json,
@@ -698,30 +767,36 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         });
     }
 
+    try request.context.ensureActive();
+    execution_started.* = true;
     var transport = switch (request.method) {
         .get => protocol_server.handleStreamableHttpGetWithSession(
-            server_ptr.alloc,
+            protocol_alloc,
             request.endpoint_path,
             request.session_id,
             request.last_event_id,
         ) catch |err| switch (err) {
-            error.InvalidLastEventId => return try contextual_operations.textAlloc(server_ptr.alloc, 400, "invalid Last-Event-ID"),
-            error.McpEventIdExhausted => return try contextual_operations.textAlloc(server_ptr.alloc, 409, "MCP event sequence exhausted"),
+            error.InvalidLastEventId => return try contextual_operations.textAlloc(protocol_alloc, 400, "invalid Last-Event-ID"),
+            error.McpEventIdExhausted => return try contextual_operations.textAlloc(protocol_alloc, 409, "MCP event sequence exhausted"),
             else => return err,
         },
         .post => protocol_server.handleStreamableHttpPostWithSession(
-            server_ptr.alloc,
+            protocol_alloc,
             request.body,
             request.session_id,
         ) catch |err| switch (err) {
-            error.McpSessionCapacityExceeded => return try contextual_operations.textAlloc(server_ptr.alloc, 429, "MCP session capacity exceeded"),
+            error.McpSessionCapacityExceeded => return try contextual_operations.textAlloc(protocol_alloc, 429, "MCP session capacity exceeded"),
             else => return err,
         },
-        .delete => try protocol_server.handleStreamableHttpDelete(server_ptr.alloc, request.session_id),
-        else => return try contextual_operations.textAlloc(server_ptr.alloc, 405, "method not allowed"),
+        .delete => try protocol_server.handleStreamableHttpDelete(protocol_alloc, request.session_id),
+        else => return try contextual_operations.textAlloc(protocol_alloc, 405, "method not allowed"),
     };
-    defer transport.deinit(server_ptr.alloc);
-    return try contextualResponseFromMcpResult(server_ptr.alloc, transport);
+    defer transport.deinit(protocol_alloc);
+    errdefer if (transport.created_session_id) |id| {
+        _ = server_ptr.mcp_sessions.iface().close(id);
+    };
+    try request.context.ensureActive();
+    return try contextualResponseFromMcpResult(protocol_alloc, &transport);
 }
 
 fn mcpToolVisibleForIdentity(spec: McpToolSpec, authenticated_identity: anytype) bool {
@@ -850,7 +925,10 @@ fn identityHasPermission(
 }
 
 fn extensionMcpToolFromMemberAlloc(alloc: std.mem.Allocator, member: *const extension_domain.ExtensionMember, snapshot: anytype) !ExtensionMcpTool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, member.owner_metadata_json, .{}) catch null;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, member.owner_metadata_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
     defer if (parsed) |*value| value.deinit();
 
     var description: ?[]u8 = null;
@@ -1312,7 +1390,10 @@ fn extensionRuntimeMemberVisible(installed_extensions: []const extension_domain.
 }
 
 fn cloneValidMcpInputSchemaJson(alloc: std.mem.Allocator, schema_json: []const u8) !?[]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
     return try alloc.dupe(u8, schema_json);
@@ -1584,7 +1665,7 @@ fn buildA2aDispatcher(
     return dispatcher;
 }
 
-fn contextualResponseFromMcpResult(alloc: std.mem.Allocator, result: mcp.HttpResult) !contextual_operations.OwnedResponse {
+fn contextualResponseFromMcpResult(alloc: std.mem.Allocator, result: *mcp.HttpResult) !contextual_operations.OwnedResponse {
     var headers = try alloc.alloc(contextual_operations.Header, result.headers.len);
     var initialized: usize = 0;
     errdefer {
@@ -1603,7 +1684,8 @@ fn contextualResponseFromMcpResult(alloc: std.mem.Allocator, result: mcp.HttpRes
         };
         initialized += 1;
     }
-    const body = try alloc.dupe(u8, result.body);
+    const body = result.body;
+    result.body = &.{};
     return .{
         .status = result.status,
         .content_type = result.content_type,
@@ -1756,7 +1838,10 @@ fn mcpResultFromOwnedResponse(alloc: std.mem.Allocator, resp: contextual_operati
     }
     var structured: ?std.json.Value = null;
     if (std.mem.indexOf(u8, resp.content_type, "json") != null and resp.body.len != 0) {
-        structured = std.json.parseFromSliceLeaky(std.json.Value, alloc, resp.body, .{}) catch null;
+        structured = std.json.parseFromSliceLeaky(std.json.Value, alloc, resp.body, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
     }
     return .{
         .text = try alloc.dupe(u8, if (resp.body.len == 0) "ok" else resp.body),
