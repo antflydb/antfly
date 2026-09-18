@@ -38,11 +38,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var skip_filters: std.ArrayList([]const u8) = .empty;
     defer skip_filters.deinit(allocator);
 
+    var reverse_order = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--listen=-")) {
             continue;
+        } else if (std.mem.eql(u8, arg, "--reverse-test-order")) {
+            reverse_order = true;
         } else if (std.mem.startsWith(u8, arg, "--seed=")) {
             std.testing.random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
                 @panic("unable to parse --seed command line argument");
@@ -87,7 +90,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var fail_count: usize = 0;
     var leak_count: usize = 0;
 
-    for (test_fn_list) |test_fn| {
+    for (0..test_fn_list.len) |position| {
+        const index = if (reverse_order) test_fn_list.len - 1 - position else position;
+        const test_fn = test_fn_list[index];
         if (!matchesSelected(test_fn.name, filters.items, skip_filters.items)) continue;
         matched_count += 1;
         if (matched_count <= runtime_offset) continue;

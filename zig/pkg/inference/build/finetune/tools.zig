@@ -176,6 +176,9 @@ pub const specs = [_]common.CommandSpec{
     },
     .{
         .name = "eval-fused-chunker",
+        // Training and evaluation both import native_compute by relative path.
+        // They cannot give that source file two distinct module owners.
+        .shared_check = false,
         .root_source_file = "src/finetune_eval_fused_chunker.zig",
         .description = "Evaluate a fused chunker-embedder boundary head checkpoint",
         .imports = &.{ .build_options, .ml, .antfly_platform, .inference_linalg },
