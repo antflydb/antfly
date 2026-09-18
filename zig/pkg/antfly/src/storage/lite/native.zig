@@ -330,19 +330,264 @@ pub const CatalogCursor = struct {
     }
 };
 
-const DocumentIndexSplit = struct {
-    separator: []u8,
-    key_page: u64,
-    right_page_id: u64,
-};
+/// Transaction-local copy-on-write B+ tree editor. Each visited page is decoded
+/// once, external keys stay references until compared, and only the final dirty
+/// nodes reachable from the new root are written. Deletion merges or redistributes
+/// neighboring nodes; old checkpoints retain their original pages and separators.
+const IndexEditor = struct {
+    const Key = struct {
+        bytes: []const u8,
+        page: u64 = 0,
 
-const DocumentIndexInsertResult = struct {
-    page_id: u64,
-    split: ?DocumentIndexSplit = null,
+        fn slotSize(self: Key) usize {
+            return 10 + (if (self.page != 0) @as(usize, 8) else self.bytes.len);
+        }
+    };
+    const Link = struct { page: u64 = 0, node: ?*Node = null };
+    const Node = struct {
+        kind: DocumentIndexNodeKind,
+        page: u64 = 0,
+        dirty: bool = true,
+        keys: std.ArrayListUnmanaged(Key) = .empty,
+        links: std.ArrayListUnmanaged(Link) = .empty,
 
-    fn deinit(self: *DocumentIndexInsertResult, allocator: Allocator) void {
-        if (self.split) |split| allocator.free(split.separator);
-        self.* = undefined;
+        fn size(self: *const Node) usize {
+            var result: usize = document_index_header_size + @as(usize, if (self.kind == .internal) 8 else 0);
+            for (self.keys.items) |key| result += key.slotSize();
+            return result;
+        }
+    };
+    const Split = struct { separator: Key, right: Link };
+    const Erased = struct { removed: bool, split: ?Split = null };
+
+    file: *NativeFile,
+    checkpoint: CheckpointSlot,
+    arena: std.heap.ArenaAllocator,
+    root: Link,
+
+    fn init(file: *NativeFile, checkpoint: CheckpointSlot, root: u64) IndexEditor {
+        return .{ .file = file, .checkpoint = checkpoint, .arena = .init(file.allocator), .root = .{ .page = root } };
+    }
+
+    fn deinit(self: *IndexEditor) void {
+        self.arena.deinit();
+    }
+
+    fn newNode(self: *IndexEditor, kind: DocumentIndexNodeKind) !*Node {
+        const node = try self.arena.allocator().create(Node);
+        node.* = .{ .kind = kind };
+        return node;
+    }
+
+    fn load(self: *IndexEditor, link: *Link) !*Node {
+        if (link.node) |node| return node;
+        const payload = try self.file.readPagePayloadByKindAllocForCheckpoint(self.file.allocator, link.page, .document_index, self.checkpoint);
+        defer self.file.allocator.free(payload);
+        const alloc = self.arena.allocator();
+        // Decoded buffers belong to the editor arena; transfer key slices
+        // directly instead of allocating another copy of every inline key.
+        const decoded = try decodeDocumentIndexNode(alloc, payload);
+        const node = try self.newNode(decoded.kind);
+        node.page = link.page;
+        node.dirty = false;
+        try node.keys.ensureTotalCapacity(alloc, decoded.keys.len);
+        try node.links.ensureTotalCapacity(alloc, decoded.pointers.len);
+        for (decoded.keys, decoded.key_pages.?) |key, page| {
+            node.keys.appendAssumeCapacity(.{ .bytes = key, .page = page });
+        }
+        for (decoded.pointers) |page| node.links.appendAssumeCapacity(.{ .page = page });
+        link.node = node;
+        return node;
+    }
+
+    fn resolve(self: *IndexEditor, key: *Key) ![]const u8 {
+        if (key.page == 0 or key.bytes.len != 0) return key.bytes;
+        const raw = try self.file.readPageAllocForCheckpoint(self.file.allocator, key.page, self.checkpoint);
+        defer self.file.allocator.free(raw);
+        const bytes = switch (raw[4]) {
+            @intFromEnum(PageKind.catalog) => (try decodeCatalogEntry(try decodePagePayload(raw, .catalog))).key,
+            @intFromEnum(PageKind.document) => (try decodeDocumentEntry(try decodePagePayload(raw, .document))).key,
+            else => return error.InvalidDocumentIndex,
+        };
+        if (bytes.len <= index_inline_key_limit) return error.InvalidDocumentIndex;
+        key.bytes = try self.arena.allocator().dupe(u8, bytes);
+        return key.bytes;
+    }
+
+    fn bound(self: *IndexEditor, node: *Node, key: []const u8, upper: bool) !usize {
+        var low: usize = 0;
+        var high = node.keys.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const order = std.mem.order(u8, try self.resolve(&node.keys.items[mid]), key);
+            if (order == .lt or (upper and order == .eq)) low = mid + 1 else high = mid;
+        }
+        return low;
+    }
+
+    fn put(self: *IndexEditor, key: []const u8, page: u64) !void {
+        if (self.root.page == 0 and self.root.node == null) self.root.node = try self.newNode(.leaf);
+        if (try self.insert(try self.load(&self.root), key, page, 0)) |split| {
+            const root = try self.newNode(.internal);
+            try root.keys.append(self.arena.allocator(), split.separator);
+            try root.links.appendSlice(self.arena.allocator(), &.{ self.root, split.right });
+            self.root = .{ .node = root };
+        }
+    }
+
+    fn insert(self: *IndexEditor, node: *Node, key: []const u8, page: u64, depth: usize) anyerror!?Split {
+        if (depth > 64) return error.InvalidDocumentIndex;
+        const alloc = self.arena.allocator();
+        const index = try self.bound(node, key, node.kind == .internal);
+        if (node.kind == .leaf) {
+            const replacement = index < node.keys.items.len and std.mem.eql(u8, try self.resolve(&node.keys.items[index]), key);
+            const owned = Key{ .bytes = try alloc.dupe(u8, key), .page = if (key.len > index_inline_key_limit) page else 0 };
+            if (replacement) {
+                node.keys.items[index] = owned;
+                node.links.items[index] = .{ .page = page };
+            } else {
+                try node.keys.insert(alloc, index, owned);
+                try node.links.insert(alloc, index, .{ .page = page });
+            }
+        } else {
+            const child = try self.load(&node.links.items[index]);
+            if (try self.insert(child, key, page, depth + 1)) |split| {
+                try node.keys.insert(alloc, index, split.separator);
+                try node.links.insert(alloc, index + 1, split.right);
+            }
+        }
+        node.dirty = true;
+        if (node.size() <= self.file.maxPagePayloadBytes()) return null;
+        return try self.splitNode(node);
+    }
+
+    /// Choose a byte-balanced split in linear time without fetching key bytes.
+    fn splitNode(self: *IndexEditor, node: *Node) !Split {
+        const capacity = self.file.maxPagePayloadBytes();
+        const header: usize = document_index_header_size + @as(usize, if (node.kind == .internal) 8 else 0);
+        const total = node.size() - header;
+        var prefix: usize = 0;
+        var best: ?usize = null;
+        var imbalance: usize = std.math.maxInt(usize);
+        for (node.keys.items, 0..) |key, i| {
+            const left = header + prefix;
+            const right = header + total - prefix - (if (node.kind == .internal) key.slotSize() else 0);
+            if ((node.kind == .internal or i > 0) and left <= capacity and right <= capacity) {
+                const delta = if (left > right) left - right else right - left;
+                if (delta < imbalance) {
+                    best = i;
+                    imbalance = delta;
+                }
+            }
+            prefix += key.slotSize();
+        }
+        const at = best orelse return error.DocumentIndexNodeTooLarge;
+        const right = try self.newNode(node.kind);
+        const separator = node.keys.items[at];
+        const key_start = at + @as(usize, if (node.kind == .internal) 1 else 0);
+        const link_start = key_start;
+        try right.keys.appendSlice(self.arena.allocator(), node.keys.items[key_start..]);
+        try right.links.appendSlice(self.arena.allocator(), node.links.items[link_start..]);
+        node.keys.items.len = at;
+        node.links.items.len = at + @as(usize, if (node.kind == .internal) 1 else 0);
+        node.dirty = true;
+        return .{ .separator = separator, .right = .{ .node = right } };
+    }
+
+    fn remove(self: *IndexEditor, key: []const u8) !void {
+        if (self.root.page == 0 and self.root.node == null) return;
+        const root = try self.load(&self.root);
+        const result = try self.erase(root, key, 0);
+        if (!result.removed) return;
+        if (result.split) |split| {
+            const parent = try self.newNode(.internal);
+            try parent.keys.append(self.arena.allocator(), split.separator);
+            try parent.links.appendSlice(self.arena.allocator(), &.{ self.root, split.right });
+            self.root = .{ .node = parent };
+        }
+        if (root.links.items.len == 0) {
+            self.root = .{};
+            return;
+        }
+        var depth: usize = 0;
+        while (true) : (depth += 1) {
+            if (depth > 64) return error.InvalidDocumentIndex;
+            const current = try self.load(&self.root);
+            if (current.kind != .internal or current.links.items.len != 1) break;
+            self.root = current.links.items[0];
+        }
+    }
+
+    fn erase(self: *IndexEditor, node: *Node, key: []const u8, depth: usize) anyerror!Erased {
+        if (depth > 64) return error.InvalidDocumentIndex;
+        const index = try self.bound(node, key, node.kind == .internal);
+        if (node.kind == .leaf) {
+            if (index == node.keys.items.len or !std.mem.eql(u8, try self.resolve(&node.keys.items[index]), key)) return .{ .removed = false };
+            _ = node.keys.orderedRemove(index);
+            _ = node.links.orderedRemove(index);
+        } else {
+            const child = try self.load(&node.links.items[index]);
+            const result = try self.erase(child, key, depth + 1);
+            if (!result.removed) return result;
+            if (result.split) |split| {
+                try node.keys.insert(self.arena.allocator(), index, split.separator);
+                try node.links.insert(self.arena.allocator(), index + 1, split.right);
+            } else if (child.links.items.len == 0) {
+                _ = node.links.orderedRemove(index);
+                if (node.keys.items.len != 0) _ = node.keys.orderedRemove(if (index == 0) 0 else index - 1);
+            } else if (node.links.items.len > 1 and child.size() < self.file.maxPagePayloadBytes() / 2) {
+                try self.rebalance(node, if (index == 0) 0 else index - 1);
+            }
+        }
+        node.dirty = true;
+        // Replacing a separator during redistribution can grow a parent even
+        // during deletion: variable-width inline keys need the same split
+        // propagation as insertion.
+        return .{ .removed = true, .split = if (node.size() > self.file.maxPagePayloadBytes()) try self.splitNode(node) else null };
+    }
+
+    fn rebalance(self: *IndexEditor, parent: *Node, left_index: usize) !void {
+        const left = try self.load(&parent.links.items[left_index]);
+        const right = try self.load(&parent.links.items[left_index + 1]);
+        if (left.kind != right.kind) return error.InvalidDocumentIndex;
+        const alloc = self.arena.allocator();
+        if (left.kind == .internal) try left.keys.append(alloc, parent.keys.items[left_index]);
+        try left.keys.appendSlice(alloc, right.keys.items);
+        try left.links.appendSlice(alloc, right.links.items);
+        left.dirty = true;
+        if (left.size() <= self.file.maxPagePayloadBytes()) {
+            _ = parent.keys.orderedRemove(left_index);
+            _ = parent.links.orderedRemove(left_index + 1);
+        } else {
+            const halves = try self.splitNode(left);
+            parent.keys.items[left_index] = halves.separator;
+            parent.links.items[left_index + 1] = halves.right;
+        }
+    }
+
+    fn finish(self: *IndexEditor, pages: *PageAllocator) !u64 {
+        if (self.root.page == 0 and self.root.node == null) return 0;
+        return try self.flush(&self.root, pages, 0);
+    }
+
+    fn flush(self: *IndexEditor, link: *Link, pages: *PageAllocator, depth: usize) anyerror!u64 {
+        if (depth > 64) return error.InvalidDocumentIndex;
+        const node = link.node orelse return link.page;
+        if (!node.dirty) return node.page;
+        const alloc = self.arena.allocator();
+        const pointers = try alloc.alloc(u64, node.links.items.len);
+        for (node.links.items, 0..) |*child, i| pointers[i] = if (node.kind == .leaf) child.page else try self.flush(child, pages, depth + 1);
+        const keys = try alloc.alloc([]u8, node.keys.items.len);
+        const key_pages = try alloc.alloc(u64, node.keys.items.len);
+        for (node.keys.items, 0..) |key, i| {
+            keys[i] = @constCast(key.bytes);
+            key_pages[i] = key.page;
+        }
+        const page = try self.file.writeDocumentIndexNode(pages, .{ .kind = node.kind, .keys = keys, .pointers = pointers, .key_pages = key_pages });
+        node.page = page;
+        node.dirty = false;
+        link.page = page;
+        return page;
     }
 };
 
@@ -1370,7 +1615,8 @@ pub const NativeFile = struct {
         var next_root_page = roots.history;
         var page_allocator = try self.pageAllocatorFromFreeMap(previous);
         defer page_allocator.deinit();
-        var key_index = roots.index;
+        var editor = IndexEditor.init(self, previous, roots.index);
+        defer editor.deinit();
 
         for (mutations) |mutation| {
             var external_value_root_page: u64 = 0;
@@ -1390,9 +1636,10 @@ pub const NativeFile = struct {
             });
             try self.writePage(page_id, .catalog, payload.items);
             next_root_page = page_id;
-            key_index = try self.upsertCatalogIndex(&page_allocator, key_index, mutation.key, page_id);
+            if (mutation.is_delete) try editor.remove(mutation.key) else try editor.put(mutation.key, page_id);
         }
 
+        const key_index = try editor.finish(&page_allocator);
         var next = previous;
         next.commit_sequence += 1;
         setCatalogRootPage(&next, root, try self.writeCatalogRoot(&page_allocator, next_root_page, key_index));
@@ -1491,7 +1738,8 @@ pub const NativeFile = struct {
         var next_root_page = roots.history;
         var page_allocator = try self.pageAllocatorFromFreeMap(previous);
         defer page_allocator.deinit();
-        var key_index = roots.index;
+        var editor = IndexEditor.init(self, previous, roots.index);
+        defer editor.deinit();
 
         var external_value_root_page: u64 = 0;
         if (entry.external_value_root_page != 0) {
@@ -1511,7 +1759,7 @@ pub const NativeFile = struct {
             });
             try self.writePage(new_page_id, .catalog, payload.items);
             next_root_page = new_page_id;
-            key_index = try self.upsertCatalogIndex(&page_allocator, key_index, new_key, new_page_id);
+            try editor.put(new_key, new_page_id);
         }
 
         {
@@ -1525,9 +1773,10 @@ pub const NativeFile = struct {
             });
             try self.writePage(tombstone_page_id, .catalog, payload.items);
             next_root_page = tombstone_page_id;
-            key_index = try self.upsertCatalogIndex(&page_allocator, key_index, old_key, tombstone_page_id);
+            try editor.remove(old_key);
         }
 
+        const key_index = try editor.finish(&page_allocator);
         var next = previous;
         next.commit_sequence += 1;
         setCatalogRootPage(&next, root, try self.writeCatalogRoot(&page_allocator, next_root_page, key_index));
@@ -2148,6 +2397,8 @@ pub const NativeFile = struct {
         if (bulk_build_initial_index) try initial_index_entries.ensureTotalCapacity(self.allocator, mutations.len);
         var page_allocator = try self.pageAllocatorFromFreeMap(previous);
         defer page_allocator.deinit();
+        var editor = IndexEditor.init(self, previous, next_index_root_page);
+        defer editor.deinit();
         var changed_heads = NamespaceDirectory.empty;
         defer changed_heads.deinit(self.allocator);
         try changed_heads.ensureTotalCapacity(
@@ -2184,15 +2435,7 @@ pub const NativeFile = struct {
                     .ordinal = ordinal,
                 });
             } else {
-                var working_checkpoint = previous;
-                working_checkpoint.page_count = page_allocator.next_page_id;
-                next_index_root_page = try self.upsertDocumentIndex(
-                    &page_allocator,
-                    next_index_root_page,
-                    mutation.key,
-                    page_id,
-                    working_checkpoint,
-                );
+                try editor.put(mutation.key, page_id);
             }
             if (changed_heads.getPtr(namespace)) |head| {
                 head.* = page_id;
@@ -2223,6 +2466,8 @@ pub const NativeFile = struct {
                 index = end;
             }
             next_index_root_page = try builder.finish();
+        } else {
+            next_index_root_page = try editor.finish(&page_allocator);
         }
 
         const write_snapshot = previous.namespace_directory_root_page == 0 or
@@ -2351,172 +2596,6 @@ pub const NativeFile = struct {
         return page_id;
     }
 
-    fn cloneLeafWithUpsert(self: *NativeFile, node: DocumentIndexNode, key: []const u8, document_page_id: u64) !DocumentIndexNode {
-        const index = lowerBoundIndexKeys(node.keys, key);
-        const replace = index < node.keys.len and std.mem.eql(u8, node.keys[index], key);
-        const count = node.keys.len + @intFromBool(!replace);
-        const keys = try self.allocator.alloc([]u8, count);
-        var initialized: usize = 0;
-        errdefer {
-            for (keys[0..initialized]) |owned| self.allocator.free(owned);
-            self.allocator.free(keys);
-        }
-        const pointers = try self.allocator.alloc(u64, count);
-        errdefer self.allocator.free(pointers);
-        const key_pages = try self.allocator.alloc(u64, keys.len);
-        errdefer self.allocator.free(key_pages);
-        var source: usize = 0;
-        for (0..count) |out_index| {
-            if (out_index == index) {
-                keys[out_index] = try self.allocator.dupe(u8, key);
-                pointers[out_index] = document_page_id;
-                key_pages[out_index] = if (key.len > index_inline_key_limit) document_page_id else 0;
-                initialized += 1;
-                if (replace) source += 1;
-            } else {
-                keys[out_index] = try self.allocator.dupe(u8, node.keys[source]);
-                pointers[out_index] = node.pointers[source];
-                key_pages[out_index] = node.key_pages.?[source];
-                initialized += 1;
-                source += 1;
-            }
-        }
-        return .{ .kind = .leaf, .keys = keys, .pointers = pointers, .key_pages = key_pages };
-    }
-
-    fn cloneInternalWithChildResult(
-        self: *NativeFile,
-        node: DocumentIndexNode,
-        child_index: usize,
-        child_result: DocumentIndexInsertResult,
-    ) !DocumentIndexNode {
-        const extra: usize = if (child_result.split != null) 1 else 0;
-        const keys = try self.allocator.alloc([]u8, node.keys.len + extra);
-        var initialized: usize = 0;
-        errdefer {
-            for (keys[0..initialized]) |owned| self.allocator.free(owned);
-            self.allocator.free(keys);
-        }
-        const pointers = try self.allocator.alloc(u64, node.pointers.len + extra);
-        errdefer self.allocator.free(pointers);
-
-        for (node.pointers, 0..) |pointer, i| pointers[i + @intFromBool(extra == 1 and i > child_index)] = pointer;
-        pointers[child_index] = child_result.page_id;
-        if (child_result.split) |split| pointers[child_index + 1] = split.right_page_id;
-
-        const key_pages = try self.allocator.alloc(u64, keys.len);
-        errdefer self.allocator.free(key_pages);
-        var source: usize = 0;
-        for (keys, 0..) |*out_key, i| {
-            if (extra == 1 and i == child_index) {
-                out_key.* = try self.allocator.dupe(u8, child_result.split.?.separator);
-                key_pages[i] = child_result.split.?.key_page;
-            } else {
-                out_key.* = try self.allocator.dupe(u8, node.keys[source]);
-                key_pages[i] = node.key_pages.?[source];
-                source += 1;
-            }
-            initialized += 1;
-        }
-        return .{ .kind = .internal, .keys = keys, .pointers = pointers, .key_pages = key_pages };
-    }
-
-    fn documentIndexNodeFits(self: *NativeFile, node: DocumentIndexNode) bool {
-        const size = encodedDocumentIndexNodeSize(node) catch return false;
-        return size <= self.maxPagePayloadBytes();
-    }
-
-    fn insertDocumentIndexNode(
-        self: *NativeFile,
-        page_allocator: *PageAllocator,
-        page_id: u64,
-        key: []const u8,
-        document_page_id: u64,
-        checkpoint: CheckpointSlot,
-    ) !DocumentIndexInsertResult {
-        var node = try self.readDocumentIndexNode(page_id, checkpoint);
-        defer node.deinit(self.allocator);
-        if (node.kind == .leaf) {
-            var updated = try self.cloneLeafWithUpsert(node, key, document_page_id);
-            defer updated.deinit(self.allocator);
-            if (self.documentIndexNodeFits(updated)) return .{ .page_id = try self.writeDocumentIndexNode(page_allocator, updated) };
-
-            var best_split: ?usize = null;
-            var best_imbalance: usize = std.math.maxInt(usize);
-            var split_index: usize = 1;
-            while (split_index < updated.keys.len) : (split_index += 1) {
-                const left = DocumentIndexNode{ .kind = .leaf, .keys = updated.keys[0..split_index], .key_pages = updated.key_pages.?[0..split_index], .pointers = updated.pointers[0..split_index] };
-                const right = DocumentIndexNode{ .kind = .leaf, .keys = updated.keys[split_index..], .key_pages = updated.key_pages.?[split_index..], .pointers = updated.pointers[split_index..] };
-                if (!self.documentIndexNodeFits(left) or !self.documentIndexNodeFits(right)) continue;
-                const left_size = try encodedDocumentIndexNodeSize(left);
-                const right_size = try encodedDocumentIndexNodeSize(right);
-                const imbalance = if (left_size > right_size) left_size - right_size else right_size - left_size;
-                if (imbalance < best_imbalance) {
-                    best_imbalance = imbalance;
-                    best_split = split_index;
-                }
-            }
-            const balanced_split = best_split orelse return error.DocumentIndexNodeTooLarge;
-            const left = DocumentIndexNode{ .kind = .leaf, .keys = updated.keys[0..balanced_split], .key_pages = updated.key_pages.?[0..balanced_split], .pointers = updated.pointers[0..balanced_split] };
-            const right = DocumentIndexNode{ .kind = .leaf, .keys = updated.keys[balanced_split..], .key_pages = updated.key_pages.?[balanced_split..], .pointers = updated.pointers[balanced_split..] };
-            const left_page = try self.writeDocumentIndexNode(page_allocator, left);
-            const right_page = try self.writeDocumentIndexNode(page_allocator, right);
-            return .{
-                .page_id = left_page,
-                .split = .{
-                    .separator = try self.allocator.dupe(u8, right.keys[0]),
-                    .key_page = right.key_pages.?[0],
-                    .right_page_id = right_page,
-                },
-            };
-        }
-
-        const child_index = upperBoundIndexKeys(node.keys, key);
-        var child_result = try self.insertDocumentIndexNode(page_allocator, node.pointers[child_index], key, document_page_id, checkpoint);
-        defer child_result.deinit(self.allocator);
-        var updated = try self.cloneInternalWithChildResult(node, child_index, child_result);
-        defer updated.deinit(self.allocator);
-        if (self.documentIndexNodeFits(updated)) return .{ .page_id = try self.writeDocumentIndexNode(page_allocator, updated) };
-
-        var best_promote: ?usize = null;
-        var best_imbalance: usize = std.math.maxInt(usize);
-        for (0..updated.keys.len) |promote_index| {
-            const left = DocumentIndexNode{
-                .kind = .internal,
-                .keys = updated.keys[0..promote_index],
-                .key_pages = updated.key_pages.?[0..promote_index],
-                .pointers = updated.pointers[0 .. promote_index + 1],
-            };
-            const right = DocumentIndexNode{
-                .kind = .internal,
-                .keys = updated.keys[promote_index + 1 ..],
-                .key_pages = updated.key_pages.?[promote_index + 1 ..],
-                .pointers = updated.pointers[promote_index + 1 ..],
-            };
-            if (!self.documentIndexNodeFits(left) or !self.documentIndexNodeFits(right)) continue;
-            const left_size = try encodedDocumentIndexNodeSize(left);
-            const right_size = try encodedDocumentIndexNodeSize(right);
-            const imbalance = if (left_size > right_size) left_size - right_size else right_size - left_size;
-            if (imbalance < best_imbalance) {
-                best_imbalance = imbalance;
-                best_promote = promote_index;
-            }
-        }
-        const promote_index = best_promote orelse return error.DocumentIndexNodeTooLarge;
-        const left = DocumentIndexNode{ .kind = .internal, .keys = updated.keys[0..promote_index], .key_pages = updated.key_pages.?[0..promote_index], .pointers = updated.pointers[0 .. promote_index + 1] };
-        const right = DocumentIndexNode{ .kind = .internal, .keys = updated.keys[promote_index + 1 ..], .key_pages = updated.key_pages.?[promote_index + 1 ..], .pointers = updated.pointers[promote_index + 1 ..] };
-        const left_page = try self.writeDocumentIndexNode(page_allocator, left);
-        const right_page = try self.writeDocumentIndexNode(page_allocator, right);
-        return .{
-            .page_id = left_page,
-            .split = .{
-                .separator = try self.allocator.dupe(u8, updated.keys[promote_index]),
-                .key_page = updated.key_pages.?[promote_index],
-                .right_page_id = right_page,
-            },
-        };
-    }
-
     fn upsertDocumentIndex(
         self: *NativeFile,
         page_allocator: *PageAllocator,
@@ -2525,19 +2604,10 @@ pub const NativeFile = struct {
         document_page_id: u64,
         checkpoint: CheckpointSlot,
     ) !u64 {
-        if (root_page_id == 0) {
-            const keys = [_][]u8{@constCast(key)};
-            const pointers = [_]u64{document_page_id};
-            const key_pages = [_]u64{if (key.len > index_inline_key_limit) document_page_id else 0};
-            return try self.writeDocumentIndexNode(page_allocator, .{ .kind = .leaf, .keys = @constCast(&keys), .pointers = @constCast(&pointers), .key_pages = @constCast(&key_pages) });
-        }
-        var result = try self.insertDocumentIndexNode(page_allocator, root_page_id, key, document_page_id, checkpoint);
-        defer result.deinit(self.allocator);
-        const split = result.split orelse return result.page_id;
-        const keys = [_][]u8{split.separator};
-        const pointers = [_]u64{ result.page_id, split.right_page_id };
-        const key_pages = [_]u64{split.key_page};
-        return try self.writeDocumentIndexNode(page_allocator, .{ .kind = .internal, .keys = @constCast(&keys), .pointers = @constCast(&pointers), .key_pages = @constCast(&key_pages) });
+        var editor = IndexEditor.init(self, checkpoint, root_page_id);
+        defer editor.deinit();
+        try editor.put(key, document_page_id);
+        return try editor.finish(page_allocator);
     }
 
     fn lookupDocumentIndexPage(self: *NativeFile, checkpoint: CheckpointSlot, key: []const u8) !?u64 {
@@ -4283,7 +4353,7 @@ const DocumentIndexBulkBuilder = struct {
             self.owner.allocator.free(owned);
             return err;
         };
-        const node = DocumentIndexNode{ .kind = .leaf, .keys = self.leaf_keys.items, .pointers = self.leaf_pointers.items, .key_pages = self.leaf_pointers.items };
+        const node = DocumentIndexNode{ .kind = .leaf, .keys = self.leaf_keys.items, .pointers = self.leaf_pointers.items };
         if (self.nodeFits(node)) return;
         if (self.leaf_keys.items.len == 1) return error.DocumentIndexNodeTooLarge;
 
@@ -4308,7 +4378,10 @@ const DocumentIndexBulkBuilder = struct {
         if (self.leaf_keys.items.len == 0) return;
         const first_key = try self.owner.allocator.dupe(u8, self.leaf_keys.items[0]);
         errdefer self.owner.allocator.free(first_key);
-        const page_id = try self.appendNode(.{ .kind = .leaf, .keys = self.leaf_keys.items, .pointers = self.leaf_pointers.items, .key_pages = self.leaf_pointers.items });
+        const key_pages = try self.owner.allocator.alloc(u64, self.leaf_keys.items.len);
+        defer self.owner.allocator.free(key_pages);
+        for (self.leaf_keys.items, self.leaf_pointers.items, key_pages) |key, page, *key_page| key_page.* = if (key.len > index_inline_key_limit) page else 0;
+        const page_id = try self.appendNode(.{ .kind = .leaf, .keys = self.leaf_keys.items, .pointers = self.leaf_pointers.items, .key_pages = key_pages });
         try self.children.append(self.owner.allocator, .{ .first_key = first_key, .key_page = self.leaf_pointers.items[0], .page_id = page_id });
         for (self.leaf_keys.items) |key| self.owner.allocator.free(key);
         self.leaf_keys.clearRetainingCapacity();
@@ -4365,7 +4438,7 @@ const DocumentIndexBulkBuilder = struct {
             pointers[i] = child.page_id;
             if (i > 0) {
                 keys[i - 1] = child.first_key;
-                key_pages[i - 1] = child.key_page;
+                key_pages[i - 1] = if (child.first_key.len > index_inline_key_limit) child.key_page else 0;
             }
         }
         return try self.appendNode(.{ .kind = .internal, .keys = keys, .pointers = pointers, .key_pages = key_pages });
@@ -5080,9 +5153,9 @@ fn encodedDocumentIndexNodeSize(node: DocumentIndexNode) !usize {
         return error.InvalidDocumentIndex;
     const internal_header_size: usize = if (node.kind == .internal) @sizeOf(u64) else 0;
     var size: usize = document_index_header_size + internal_header_size;
-    for (node.keys) |key| {
+    for (node.keys, 0..) |key, i| {
         if (key.len > std.math.maxInt(u16)) return error.RecordTooLarge;
-        size = try std.math.add(usize, size, @sizeOf(u16) + @sizeOf(u64) + (if (key.len > index_inline_key_limit) @as(usize, 8) else key.len));
+        size = try std.math.add(usize, size, @sizeOf(u16) + @sizeOf(u64) + (if (key.len > index_inline_key_limit or (node.key_pages != null and node.key_pages.?[i] != 0)) @as(usize, 8) else key.len));
     }
     return size;
 }
@@ -5127,7 +5200,7 @@ fn encodeDocumentIndexNode(allocator: Allocator, node: DocumentIndexNode) ![]u8 
         pos += 8;
     }
     for (node.keys, 0..) |key, i| {
-        const external = key.len > index_inline_key_limit;
+        const external = key.len > index_inline_key_limit or (node.key_pages != null and node.key_pages.?[i] != 0);
         std.mem.writeInt(u16, out[pos..][0..2], if (external) index_external_key_marker else @intCast(key.len), .little);
         pos += 2;
         const pointer_index = if (node.kind == .leaf) i else i + 1;
@@ -7997,4 +8070,269 @@ test "lite native document overflow keys survive bulk build overwrite and vacuum
     try std.testing.expectEqualStrings("new", current);
     try std.testing.expect((try file.getDocumentAlloc(alloc, mutations[226].key)) == null);
     try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native catalog deletion keeps directory scans independent of retired generations" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "live-catalog-deletion.aflite");
+    defer alloc.free(path);
+    var file = try NativeFile.createWithOptions(alloc, path, .{ .no_sync = true });
+    defer file.close();
+    for (0..1000) |i| {
+        var key: [64]u8 = undefined;
+        try file.putIndexCatalogRecord(try std.fmt.bufPrint(&key, "/generation/block-{d:0>8}", .{i}), "x");
+    }
+    const pinned = file.activeCheckpoint();
+    try file.putIndexCatalogRecord("/generation/CURRENT", "live");
+    for (0..1000) |i| {
+        var key: [64]u8 = undefined;
+        try file.deleteIndexCatalogRecord(try std.fmt.bufPrint(&key, "/generation/block-{d:0>8}", .{i}));
+    }
+    const before = file.test_page_reads.load(.monotonic);
+    var cursor = try file.indexCatalogCursor(file.activeCheckpoint(), "/generation/");
+    defer cursor.deinit();
+    const only = (try cursor.next()).?;
+    defer alloc.free(only.key);
+    try std.testing.expectEqualStrings("/generation/CURRENT", only.key);
+    try std.testing.expect((try cursor.next()) == null);
+    try std.testing.expect(file.test_page_reads.load(.monotonic) - before <= 4);
+    var old = try file.indexCatalogCursor(pinned, "/generation/");
+    defer old.deinit();
+    var count: usize = 0;
+    while (try old.next()) |record| {
+        alloc.free(record.key);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1000), count);
+    try std.testing.expect((try file.check()).valid);
+    try file.deleteIndexCatalogRecord("/generation/CURRENT");
+    const roots = try file.readCatalogRoots(file.activeCheckpoint().index_catalog_root_page, file.activeCheckpoint());
+    try std.testing.expectEqual(@as(u64, 0), roots.index);
+    try file.putIndexCatalogRecord("/generation/new", "new");
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native catalog batches write only final reachable index nodes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "catalog-batch-editor.aflite");
+    defer alloc.free(path);
+    var file = try NativeFile.createWithOptions(alloc, path, .{ .no_sync = true });
+    defer file.close();
+    const keys = try alloc.alloc([16]u8, 1024);
+    defer alloc.free(keys);
+    const mutations = try alloc.alloc(CatalogMutation, keys.len);
+    defer alloc.free(mutations);
+    for (mutations, 0..) |*mutation, i| mutation.* = .{ .key = try std.fmt.bufPrint(&keys[i], "key-{d:0>8}", .{i}), .value = "old" };
+    for (0..2) |pass| {
+        const before = file.activeCheckpoint().page_count;
+        try file.putIndexCatalogBatch(mutations);
+        const checkpoint = file.activeCheckpoint();
+        const roots = try file.readCatalogRoots(checkpoint.index_catalog_root_page, checkpoint);
+        var indexed = checkpoint;
+        indexed.document_index_root_page = roots.index;
+        var reachable = NativeFile.ReachablePageSet{};
+        defer reachable.deinit(alloc);
+        const nodes = try file.collectDocumentIndexPages(indexed, &reachable, false, false, null);
+        // Every record plus the final index, descriptor and free map. No
+        // unpublished intermediate roots/paths may consume persistent pages.
+        try std.testing.expectEqual(@as(u64, mutations.len) + nodes + 2, checkpoint.page_count - before);
+        try std.testing.expect(checkpoint.page_count - before <= 1050);
+        try std.testing.expect((try file.check()).valid);
+        if (pass == 0) for (mutations) |*mutation| {
+            mutation.value = "new";
+        };
+    }
+    // Repeated keys preserve input-order semantics without emitting transient
+    // tree versions, including removal followed by recreation in one commit.
+    const pinned = file.activeCheckpoint();
+    try file.putIndexCatalogBatch(&.{
+        .{ .key = mutations[0].key, .is_delete = true },
+        .{ .key = mutations[0].key, .value = "recreated" },
+        .{ .key = mutations[1].key, .value = "temporary" },
+        .{ .key = mutations[1].key, .is_delete = true },
+    });
+    const old = (try file.getIndexCatalogRecordAtCheckpointAlloc(alloc, mutations[0].key, pinned)).?;
+    defer alloc.free(old);
+    try std.testing.expectEqualStrings("new", old);
+    const recreated = (try file.getIndexCatalogRecordAlloc(alloc, mutations[0].key)).?;
+    defer alloc.free(recreated);
+    try std.testing.expectEqualStrings("recreated", recreated);
+    try std.testing.expect((try file.getIndexCatalogRecordAlloc(alloc, mutations[1].key)) == null);
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native long key updates resolve only comparison keys" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "lazy-key-editor.aflite");
+    defer alloc.free(path);
+    var file = try NativeFile.createWithOptions(alloc, path, .{ .no_sync = true });
+    defer file.close();
+    for (0..400) |i| {
+        var key: [1000]u8 = @splat('k');
+        _ = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        try file.putIndexCatalogRecord(&key, "old");
+    }
+    var key: [1000]u8 = @splat('k');
+    _ = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{@as(usize, 200)});
+    const before = file.test_page_reads.load(.monotonic);
+    try file.putIndexCatalogRecord(&key, "replacement");
+    try std.testing.expect(file.test_page_reads.load(.monotonic) - before <= 32);
+    const before_delete = file.test_page_reads.load(.monotonic);
+    try file.deleteIndexCatalogRecord(&key);
+    try std.testing.expect(file.test_page_reads.load(.monotonic) - before_delete <= 32);
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native catalog editor rebalances mixed key widths across deletion and reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "mixed-key-editor.aflite");
+    defer alloc.free(path);
+    const count = 1536;
+    const keys = try alloc.alloc([]u8, count);
+    defer alloc.free(keys);
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(key);
+    const widths = [_]usize{ 8, 16, 511, 512, 513, 1000, 4000 };
+    for (keys, 0..) |*key, i| {
+        key.* = try alloc.alloc(u8, if (i == 0) 0 else widths[i % widths.len]);
+        initialized += 1;
+        @memset(key.*, 'k');
+        if (i != 0) _ = try std.fmt.bufPrint(key.*[0..8], "{d:0>8}", .{i});
+    }
+    {
+        var file = try NativeFile.createWithOptions(alloc, path, .{ .no_sync = true });
+        defer file.close();
+        const mutations = try alloc.alloc(CatalogMutation, count);
+        defer alloc.free(mutations);
+        for (mutations, 0..) |*mutation, i| mutation.* = .{ .key = keys[(i * 1009) % count], .value = "old" };
+        try file.putIndexCatalogBatch(mutations);
+        const pinned = file.activeCheckpoint();
+        try std.testing.expect((try file.check()).valid);
+        // Coprime permutations exercise both sides of internal nodes, merging,
+        // redistribution, and separator replacement with different slot sizes.
+        for (0..4) |phase| {
+            for (mutations[0 .. count / 4], 0..) |*mutation, j| mutation.* = .{ .key = keys[((phase * (count / 4) + j) * 1013) % count], .is_delete = true };
+            try file.putIndexCatalogBatch(mutations[0 .. count / 4]);
+            var cursor = try file.indexCatalogCursor(file.activeCheckpoint(), "");
+            defer cursor.deinit();
+            var actual: usize = 0;
+            while (try cursor.next()) |record| {
+                alloc.free(record.key);
+                actual += 1;
+            }
+            try std.testing.expectEqual(count - (phase + 1) * (count / 4), actual);
+            try std.testing.expect((try file.check()).valid);
+        }
+        var old = try file.indexCatalogCursor(pinned, "");
+        defer old.deinit();
+        var old_count: usize = 0;
+        while (try old.next()) |record| {
+            alloc.free(record.key);
+            old_count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, count), old_count);
+        // Rebuild from an empty live tree while preserving deletion history.
+        for (mutations, keys) |*mutation, key| mutation.* = .{ .key = key, .value = "new" };
+        try file.putIndexCatalogBatch(mutations);
+        try file.renameIndexCatalogRecord(keys[17], "/renamed");
+        try std.testing.expect((try file.check()).valid);
+        _ = try file.vacuum();
+    }
+    var reopened = try NativeFile.open(alloc, path, false);
+    defer reopened.close();
+    try std.testing.expect((try reopened.getIndexCatalogRecordAlloc(alloc, keys[17])) == null);
+    const value = (try reopened.getIndexCatalogRecordAlloc(alloc, "/renamed")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("new", value);
+    try std.testing.expect((try reopened.check()).valid);
+}
+
+test "lite native existing document batches write each changed tree node once" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "document-batch-editor.aflite");
+    defer alloc.free(path);
+    var file = try NativeFile.createWithOptions(alloc, path, .{ .no_sync = true });
+    defer file.close();
+    const keys = try alloc.alloc([16]u8, 1024);
+    defer alloc.free(keys);
+    const mutations = try alloc.alloc(DocumentMutation, keys.len);
+    defer alloc.free(mutations);
+    for (mutations, 0..) |*mutation, i| mutation.* = .{ .key = try std.fmt.bufPrint(&keys[i], "doc-{d:0>8}", .{i}), .value = "old" };
+    try file.putDocumentBatch(mutations);
+    const pinned = file.activeCheckpoint();
+    for (mutations) |*mutation| mutation.value = "new";
+    const before = file.activeCheckpoint().page_count;
+    try file.putDocumentBatch(mutations);
+    const checkpoint = file.activeCheckpoint();
+    var reachable = NativeFile.ReachablePageSet{};
+    defer reachable.deinit(alloc);
+    const nodes = try file.collectDocumentIndexPages(checkpoint, &reachable, false, false, null);
+    try std.testing.expectEqual(@as(u64, mutations.len) + nodes + 2, checkpoint.page_count - before);
+    try std.testing.expect(checkpoint.page_count - before <= 1050);
+    const old = (try file.getDocumentAtCheckpointAlloc(alloc, pinned, mutations[0].key)).?;
+    defer alloc.free(old);
+    try std.testing.expectEqualStrings("old", old);
+    const current = (try file.getDocumentAlloc(alloc, mutations[0].key)).?;
+    defer alloc.free(current);
+    try std.testing.expectEqualStrings("new", current);
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native catalog editor mixed batches match a reference map" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "model-catalog-editor.aflite");
+    defer alloc.free(path);
+    var file = try NativeFile.createWithOptions(alloc, path, .{ .no_sync = true });
+    defer file.close();
+    const count = 192;
+    var expected: [count]?u64 = @splat(null);
+    const keys = try alloc.alloc([]u8, count);
+    defer alloc.free(keys);
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(key);
+    const widths = [_]usize{ 8, 511, 512, 513, 1000 };
+    for (keys, 0..) |*key, i| {
+        key.* = try alloc.alloc(u8, if (i == 0) 0 else widths[i % widths.len]);
+        initialized += 1;
+        @memset(key.*, 'm');
+        if (i != 0) _ = try std.fmt.bufPrint(key.*[0..8], "{d:0>8}", .{i});
+    }
+    var rng = std.Random.DefaultPrng.init(803);
+    const random = rng.random();
+    for (0..120) |round| {
+        var values: [24][8]u8 = undefined;
+        var mutations: [24]CatalogMutation = undefined;
+        for (&mutations, 0..) |*mutation, i| {
+            const selected = random.uintLessThan(usize, count);
+            const deleted = random.uintLessThan(u8, 3) == 0;
+            const version: u64 = round * mutations.len + i;
+            std.mem.writeInt(u64, &values[i], version, .little);
+            mutation.* = .{ .key = keys[selected], .value = &values[i], .is_delete = deleted };
+            expected[selected] = if (deleted) null else version;
+        }
+        try file.putIndexCatalogBatch(&mutations);
+        if (round % 12 == 0 or round == 119) {
+            for (keys, expected) |key, want| {
+                const actual = try file.getIndexCatalogRecordAlloc(alloc, key);
+                defer if (actual) |value| alloc.free(value);
+                if (want) |version| {
+                    try std.testing.expect(actual != null);
+                    try std.testing.expectEqual(version, std.mem.readInt(u64, actual.?[0..8], .little));
+                } else try std.testing.expect(actual == null);
+            }
+            try std.testing.expect((try file.check()).valid);
+        }
+    }
 }

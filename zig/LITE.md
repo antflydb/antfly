@@ -98,10 +98,17 @@ The implementation now consists of:
   and separators. This bounds encoded key slots so mixed-size keys always
   admit a split, including maximum-length catalog keys. Vacuum rebuilds those
   references against the new generation; integrity checks prove that the
-  referenced records remain reachable in the checkpoint.
-  Directory listing and subtree deletion seek the catalog tree at a path
-  prefix instead of replaying mutation history. Listing pins a checkpoint and
-  holds the generation read lock, allowing ordinary commits to continue.
+  referenced records remain reachable in the checkpoint. Updates retain encoded
+  key references and resolve only comparison keys, including during splits.
+  A transaction-local tree editor decodes each visited node once and writes
+  each surviving changed node once at commit, avoiding intermediate tree
+  versions during catalog and document batches.
+  Deleting a catalog key removes it from the current tree using copy-on-write
+  merging and redistribution. Historical records and older checkpoint roots
+  remain intact, but retired filenames no longer accumulate directory-scan
+  work. Directory listing and subtree deletion seek the live catalog tree at a
+  path prefix instead of replaying mutation history. Listing pins a checkpoint
+  and holds the generation read lock, allowing ordinary commits to continue.
   External catalog values use a 64-way immutable extent tree with byte lengths
   on each child. Appends retain one unfinished node per height, fill the partial
   tail leaf, and seal suffix subtrees once. Existing full subtrees remain
