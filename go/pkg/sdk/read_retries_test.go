@@ -107,6 +107,38 @@ func TestReadRetriesCancellationDuringBackoff(t *testing.T) {
 	}
 }
 
+func TestReadRetriesKeepOriginalBodyTimeout(t *testing.T) {
+	calls := 0
+	transport, _ := NewReadRetryTransport(admissionRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		deadline, ok := req.Context().Deadline()
+		if !ok || time.Until(deadline) > 80*time.Millisecond {
+			t.Fatal("body timeout missing from original deadline")
+		}
+		body, _ := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if string(body) != `{"timeout_ms":80}` {
+			t.Fatalf("body changed: %s", body)
+		}
+		return retryResponse(429, rejectedQuery), nil
+	}), ReadRetryPolicy{MaxAttempts: 3, MaxElapsed: time.Second, InitialBackoff: 100 * time.Millisecond, MaxBackoff: 100 * time.Millisecond})
+	req, _ := http.NewRequest(http.MethodPost, "http://test/db/v1/query", strings.NewReader(`{"timeout_ms":80}`))
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if calls != 1 {
+		t.Fatalf("body timeout restarted across backoff: %d attempts", calls)
+	}
+	req, _ = http.NewRequest(http.MethodPost, "http://test/db/v1/query", strings.NewReader("{\"timeout_ms\":100}\n{\"timeout_ms\":20}\n"))
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	budget, valid := queryRetryBudget(req, time.Second)
+	if !valid || budget != 20*time.Millisecond {
+		t.Fatalf("NDJSON budget=%v valid=%v", budget, valid)
+	}
+}
+
 func TestReadRetriesPreserveOversizedAndUnknownLengthErrors(t *testing.T) {
 	for _, length := range []int64{-1, 5} {
 		calls := 0

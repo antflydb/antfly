@@ -24,6 +24,8 @@ class ReadRetryPolicy:
 
     The original caller deadline (antfly_deadline request extension, monotonic
     seconds) wins over max_elapsed. Async task cancellation interrupts backoff.
+    Query timeout_ms also bounds the original operation; subsequent dispatches
+    forward only the remaining body budget without reencoding other fields.
     Synchronous httpx I/O timeouts are capped by the remaining budget; as with
     httpx itself they bound individual I/O waits, not total stream consumption.
     """
@@ -51,6 +53,70 @@ def _eligible(request: httpx.Request) -> bool:
     except httpx.RequestNotRead:
         return False
     return True
+
+
+@dataclass
+class _QueryBody:
+    budget: float
+    text: str
+    timeout_spans: list[tuple[int, int]]
+
+
+def _query_body(request: httpx.Request, maximum: float) -> _QueryBody | None:
+    if len(request.content) > 1 << 20:
+        return None
+    try:
+        text = request.content.decode("utf-8")
+        ndjson = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() == "application/x-ndjson"
+        lines = text.splitlines(keepends=True) if ndjson else [text]
+
+        def invalid_constant(value: str) -> None:
+            raise ValueError(f"non-JSON constant: {value}")
+
+        decoder = json.JSONDecoder(parse_constant=invalid_constant)
+        spans = []
+        offset = 0
+        seen = False
+        for line in lines:
+            if not line.strip():
+                offset += len(line)
+                continue
+            value = decoder.decode(line)
+            if not isinstance(value, dict):
+                return None
+            seen = True
+            timeout = value.get("timeout_ms")
+            if timeout is not None:
+                if type(timeout) is not int or not 0 <= timeout <= (1 << 64) - 1:
+                    return None
+                maximum = min(maximum, timeout / 1000)
+            # Replace only top-level timeout tokens. Every other byte, including
+            # large integers, decimal spelling and unknown fields, is preserved.
+            position = len(line) - len(line.lstrip()) + 1
+            keys = set()
+            while True:
+                position += len(line[position:]) - len(line[position:].lstrip())
+                if line[position] == "}":
+                    break
+                key, position = decoder.raw_decode(line, position)
+                if key in keys:
+                    return None
+                keys.add(key)
+                position += len(line[position:]) - len(line[position:].lstrip())
+                position += 1
+                position += len(line[position:]) - len(line[position:].lstrip())
+                start = position
+                _, position = decoder.raw_decode(line, position)
+                if key == "timeout_ms" and timeout is not None:
+                    spans.append((offset + start, offset + position))
+                position += len(line[position:]) - len(line[position:].lstrip())
+                if line[position] == "}":
+                    break
+                position += 1
+            offset += len(line)
+        return _QueryBody(maximum, text, spans) if seen else None
+    except (ValueError, UnicodeError, IndexError, TypeError):
+        return None
 
 
 def _bounded(response: httpx.Response) -> bool:
@@ -89,7 +155,7 @@ def _delay(
     return delay if time.monotonic() + delay < deadline else None
 
 
-def _request(request: httpx.Request, deadline: float) -> httpx.Request:
+def _request(request: httpx.Request, deadline: float, body: _QueryBody) -> httpx.Request:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise httpx.TimeoutException("Antfly read retry deadline expired", request=request)
@@ -101,8 +167,13 @@ def _request(request: httpx.Request, deadline: float) -> httpx.Request:
             "timeout", {"connect": None, "read": None, "write": None, "pool": None}
         ).items()
     }
+    text = body.text
+    for start, end in reversed(body.timeout_spans):
+        text = text[:start] + str(max(0, math.floor(remaining * 1000))) + text[end:]
+    headers = httpx.Headers(request.headers)
+    headers.pop("Content-Length", None)
     return httpx.Request(
-        request.method, request.url, headers=request.headers, content=request.content, extensions=extensions
+        request.method, request.url, headers=headers, content=text.encode("utf-8"), extensions=extensions
     )
 
 
@@ -141,9 +212,13 @@ class ReadRetryHTTPClient(AdmissionHTTPClient):
         if not _eligible(request):
             return super().send(request, stream=stream, **kwargs)
         policy = self.read_retry_policy
-        deadline = min(time.monotonic() + policy.max_elapsed, request.extensions.get("antfly_deadline", math.inf))
+        started = time.monotonic()
+        query_body = _query_body(request, policy.max_elapsed)
+        if query_body is None:
+            return super().send(request, stream=stream, **kwargs)
+        deadline = min(started + query_body.budget, request.extensions.get("antfly_deadline", math.inf))
         for attempt in range(policy.max_attempts):
-            response = super().send(_request(request, deadline), stream=True, **kwargs)
+            response = super().send(_request(request, deadline, query_body), stream=True, **kwargs)
             try:
                 delay = None
                 if attempt + 1 < policy.max_attempts and _bounded(response):
@@ -185,10 +260,14 @@ class ReadRetryAsyncHTTPClient(AdmissionAsyncHTTPClient):
         if not _eligible(request):
             return await super().send(request, stream=stream, **kwargs)
         policy = self.read_retry_policy
-        deadline = min(time.monotonic() + policy.max_elapsed, request.extensions.get("antfly_deadline", math.inf))
+        started = time.monotonic()
+        query_body = _query_body(request, policy.max_elapsed)
+        if query_body is None:
+            return await super().send(request, stream=stream, **kwargs)
+        deadline = min(started + query_body.budget, request.extensions.get("antfly_deadline", math.inf))
         async with asyncio.timeout(max(0, deadline - time.monotonic())):
             for attempt in range(policy.max_attempts):
-                response = await super().send(_request(request, deadline), stream=True, **kwargs)
+                response = await super().send(_request(request, deadline, query_body), stream=True, **kwargs)
                 try:
                     delay = None
                     if attempt + 1 < policy.max_attempts and _bounded(response):

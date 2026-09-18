@@ -1,4 +1,5 @@
-/** Opt-in query retries. A single budget includes admission and backoff. */
+/** Opt-in query retries. Admission and backoff share the original signal and
+ * query-body timeout_ms budget (the shortest submitted NDJSON line wins). */
 export interface ReadRetryPolicy {
   maxAttempts: number;
   maxElapsedMs: number;
@@ -8,6 +9,28 @@ export interface ReadRetryPolicy {
 
 const queryPath =
   /^\/db\/v1\/(query|tables\/[^/]+\/query|databases\/[^/]+\/namespaces\/[^/]+\/tables\/[^/]+\/query)$/;
+
+function bodyBudget(
+  body: Uint8Array,
+  contentType: string | null,
+  maximum: number
+): number | undefined {
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+  const lines =
+    contentType?.split(";", 1)[0]?.trim().toLowerCase() === "application/x-ndjson"
+      ? text.split("\n").filter((line) => line.trim())
+      : [text];
+  if (!lines.length) return undefined;
+  for (const line of lines) {
+    const object = JSON.parse(line);
+    if (!object || typeof object !== "object" || Array.isArray(object)) return undefined;
+    const timeout = object.timeout_ms;
+    if (timeout === undefined || timeout === null) continue;
+    if (!Number.isSafeInteger(timeout) || timeout < 0) return undefined;
+    maximum = Math.min(maximum, timeout);
+  }
+  return maximum;
+}
 
 function validate(policy: ReadRetryPolicy): void {
   const { maxAttempts, maxElapsedMs, initialBackoffMs, maxBackoffMs } = policy;
@@ -59,8 +82,9 @@ export function readRetryFetch(
       init?.body instanceof ReadableStream
     )
       return base(input, init);
-    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.maxElapsedMs)]);
-    const deadline = performance.now() + config.maxElapsedMs;
+    let signal = AbortSignal.any([request.signal, AbortSignal.timeout(config.maxElapsedMs)]);
+    const started = performance.now();
+    let deadline = started + config.maxElapsedMs;
     // A Request can hide an arbitrary stream. Only inspect a bounded prefix of
     // a clone and preserve the untouched original when it cannot be replayed.
     const copy = request.clone();
@@ -102,6 +126,17 @@ export function readRetryFetch(
       body.set(chunk, offset);
       offset += chunk.byteLength;
     }
+    let budget: number | undefined;
+    try {
+      budget = bodyBudget(body, request.headers.get("Content-Type"), config.maxElapsedMs);
+    } catch {
+      /* Unknown body contracts bypass retries. */
+    }
+    if (budget === undefined) return base(new Request(request, { body, signal: request.signal }));
+    deadline = started + budget;
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw new DOMException("Antfly query deadline expired", "TimeoutError");
+    signal = AbortSignal.any([signal, AbortSignal.timeout(Math.ceil(remaining))]);
     for (let attempt = 1; ; attempt++) {
       signal.throwIfAborted();
       const response = await base(new Request(request, { body, signal }));

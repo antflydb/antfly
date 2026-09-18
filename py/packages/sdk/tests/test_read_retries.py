@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 
 import httpx
@@ -41,6 +42,55 @@ def test_retries_replay_and_release_admission():
     assert response.text == "result"
     assert calls == [b"{}", b"{}"]
     assert pool.stats == {"active": 0, "queued": 0}
+
+
+def test_retry_forwards_remaining_body_timeout_without_reencoding_other_values():
+    requests = []
+    original = b'{ "large": 12345678901234567890123456789, "decimal": 1.0000000000000000001, "timeout_ms": 150 }'
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(429, json=REJECTION) if len(requests) == 1 else httpx.Response(200, json={"ok": True})
+
+    with ReadRetryHTTPClient(ReadRetryPolicy(3, 1, 0.1, 0.1), transport=httpx.MockTransport(handle)) as client:
+        assert client.post(URL, content=original).status_code == 200
+    assert len(requests) == 2
+    assert 0 < json.loads(requests[1].content)["timeout_ms"] < 60
+    assert b'"large": 12345678901234567890123456789, "decimal": 1.0000000000000000001' in requests[1].content
+    assert int(requests[1].headers["Content-Length"]) == len(requests[1].content)
+    assert requests[0].extensions["antfly_deadline"] == requests[1].extensions["antfly_deadline"]
+
+
+@pytest.mark.parametrize("body", [b'{ "timeout_ms": "50" }', b'{"timeout_ms":10,"timeout_ms":50}', b"not-json"])
+def test_unknown_body_contract_is_forwarded_once_unchanged(body):
+    seen = []
+
+    def handle(request):
+        seen.append(request.content)
+        return httpx.Response(429, json=REJECTION)
+
+    with ReadRetryHTTPClient(POLICY, transport=httpx.MockTransport(handle)) as client:
+        assert client.post(URL, content=body).status_code == 429
+    assert seen == [body]
+
+
+@pytest.mark.asyncio
+async def test_async_ndjson_uses_shortest_original_body_timeout():
+    requests = []
+
+    async def handle(request):
+        requests.append(request)
+        return httpx.Response(429, json=REJECTION)
+
+    async with ReadRetryAsyncHTTPClient(
+        ReadRetryPolicy(3, 1, 0.1, 0.1), transport=httpx.MockTransport(handle)
+    ) as client:
+        response = await client.post(
+            URL, content=b'{"timeout_ms":800}\n{"timeout_ms":80}\n', headers={"Content-Type": "application/x-ndjson"}
+        )
+    assert response.status_code == 429
+    assert len(requests) == 1
+    assert all(json.loads(line)["timeout_ms"] <= 80 for line in requests[0].content.splitlines())
 
 
 @pytest.mark.parametrize(

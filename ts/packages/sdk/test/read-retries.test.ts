@@ -16,6 +16,24 @@ const response = (status: number, body: string, after?: string) =>
 const url = "http://test/db/v1/tables/docs/query";
 
 describe("query read retries", () => {
+  it("includes the shortest body timeout in the original backoff budget", async () => {
+    const base = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      expect(await (input as Request).text()).toBe('{"timeout_ms":800}\n{"timeout_ms":80}\n');
+      return response(429, rejected);
+    });
+    const result = await readRetryFetch(base, {
+      ...policy,
+      initialBackoffMs: 100,
+      maxBackoffMs: 100,
+    })(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-ndjson" },
+      body: '{"timeout_ms":800}\n{"timeout_ms":80}\n',
+    });
+    expect(result.status).toBe(429);
+    expect(base).toHaveBeenCalledTimes(1);
+    await result.body?.cancel();
+  });
   it("preserves oversized or chunked error bodies without retrying", async () => {
     for (const length of [undefined, "5"]) {
       const body = `${rejected}${" ".repeat(16_384)}`;

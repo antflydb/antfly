@@ -12,12 +12,14 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
 // ReadRetryPolicy is opt-in. MaxAttempts includes the original attempt. One
 // MaxElapsed budget covers admission, attempts and backoff; an earlier caller
-// deadline wins. Only query routes rejected explicitly before execution qualify.
+// deadline or query-body timeout_ms wins (the shortest line for NDJSON).
+// Only query routes rejected explicitly before execution qualify.
 // Queries may observe newer data when eventually admitted.
 type ReadRetryPolicy struct {
 	MaxAttempts    int
@@ -45,11 +47,61 @@ func NewReadRetryTransport(base http.RoundTripper, policy ReadRetryPolicy) (http
 
 var retryQueryPath = regexp.MustCompile(`^/db/v1/(query|tables/[^/]+/query|databases/[^/]+/namespaces/[^/]+/tables/[^/]+/query)$`)
 
+// Inspect a bounded replay copy without changing caller bytes. Invalid or large
+// bodies bypass retries rather than guessing their timeout/serialization contract.
+func queryRetryBudget(req *http.Request, maximum time.Duration) (time.Duration, bool) {
+	if req.Body == nil || req.GetBody == nil {
+		return maximum, false
+	}
+	copy, err := req.GetBody()
+	if err != nil {
+		return maximum, false
+	}
+	defer copy.Close()
+	body, err := io.ReadAll(io.LimitReader(copy, (1<<20)+1))
+	if err != nil || len(body) > 1<<20 {
+		return maximum, false
+	}
+	lines := [][]byte{body}
+	if strings.EqualFold(strings.TrimSpace(strings.Split(req.Header.Get("Content-Type"), ";")[0]), "application/x-ndjson") {
+		lines = bytes.Split(body, []byte{'\n'})
+	}
+	seen := false
+	for _, line := range lines {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var object map[string]json.RawMessage
+		if json.Unmarshal(line, &object) != nil || object == nil {
+			return maximum, false
+		}
+		seen = true
+		value, found := object["timeout_ms"]
+		if !found || string(value) == "null" {
+			continue
+		}
+		var milliseconds uint64
+		if string(value) != "-0" && json.Unmarshal(value, &milliseconds) != nil {
+			return maximum, false
+		}
+		// Comparing before conversion avoids Duration overflow for valid u64 values.
+		if milliseconds <= uint64(maximum/time.Millisecond) {
+			maximum = min(maximum, time.Duration(milliseconds)*time.Millisecond)
+		}
+	}
+	return maximum, seen
+}
+
 func (t *readRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Method != http.MethodPost || !retryQueryPath.MatchString(req.URL.EscapedPath()) || (req.Body != nil && req.GetBody == nil) {
 		return t.base.RoundTrip(req)
 	}
-	ctx, cancel := context.WithTimeout(req.Context(), t.policy.MaxElapsed)
+	started := time.Now()
+	budget, recognized := queryRetryBudget(req, t.policy.MaxElapsed)
+	if !recognized {
+		return t.base.RoundTrip(req)
+	}
+	ctx, cancel := context.WithDeadline(req.Context(), started.Add(budget))
 	current := req.Clone(ctx)
 	for attempt := 1; ; attempt++ {
 		if err := ctx.Err(); err != nil {

@@ -10,6 +10,7 @@ pub struct ReadRetryPolicy {
     /// Includes the original attempt; must be in 2..=5.
     pub max_attempts: u8,
     /// One budget for admission, attempts and backoff (at most 60 seconds).
+    /// A shorter query-body timeout_ms or caller deadline wins for all attempts.
     pub max_elapsed: Duration,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
@@ -83,6 +84,45 @@ fn query_request(request: &Request) -> bool {
     }
 }
 
+fn query_budget(request: &Request, maximum: Duration) -> Option<Duration> {
+    let body = request.body()?.as_bytes()?;
+    if body.len() > 1 << 20 {
+        return None;
+    }
+    let ndjson = request
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/x-ndjson")
+        });
+    let lines: Vec<&[u8]> = if ndjson {
+        body.split(|byte| *byte == b'\n')
+            .filter(|line| line.iter().any(|byte| !byte.is_ascii_whitespace()))
+            .collect()
+    } else {
+        vec![body]
+    };
+    if lines.is_empty() {
+        return None;
+    }
+    let mut budget = maximum;
+    for line in lines {
+        let value: serde_json::Value = serde_json::from_slice(line).ok()?;
+        let object = value.as_object()?;
+        if let Some(timeout) = object.get("timeout_ms").filter(|value| !value.is_null()) {
+            let milliseconds = timeout.as_u64()?;
+            budget = budget.min(Duration::from_millis(milliseconds));
+        }
+    }
+    Some(budget)
+}
+
 fn retry_delay(
     policy: ReadRetryPolicy,
     attempt: u8,
@@ -143,10 +183,13 @@ impl QueryRetryClient {
         if !query_request(&request) {
             return Err(QueryRetryError::UnsupportedRequest);
         }
-        let end = deadline.map_or(Instant::now() + self.policy.max_elapsed, |value| {
-            value.min(Instant::now() + self.policy.max_elapsed)
-        });
-        timeout_at(end, self.execute_until(request, end))
+        let started = Instant::now();
+        let body_budget = query_budget(&request, self.policy.max_elapsed);
+        let end = deadline.map_or(
+            started + body_budget.unwrap_or(self.policy.max_elapsed),
+            |value| value.min(started + body_budget.unwrap_or(self.policy.max_elapsed)),
+        );
+        timeout_at(end, self.execute_until(request, end, body_budget.is_some()))
             .await
             .map_err(|_| QueryRetryError::Request(RunError::RequestDeadlineExceeded))?
     }
@@ -155,6 +198,7 @@ impl QueryRetryClient {
         &self,
         request: Request,
         end: Instant,
+        allow_retry: bool,
     ) -> Result<Admitted<Response>, QueryRetryError> {
         for attempt in 0..self.policy.max_attempts {
             let next = request
@@ -186,7 +230,7 @@ impl QueryRetryClient {
             }
             // Retire response/permit before backoff, including truncated errors.
             drop(response);
-            let delay = if !truncated && attempt + 1 < self.policy.max_attempts {
+            let delay = if allow_retry && !truncated && attempt + 1 < self.policy.max_attempts {
                 retry_delay(self.policy, attempt, status, &headers, &body)
             } else {
                 None
@@ -335,6 +379,29 @@ mod tests {
         headers.insert("retry-after", "2".parse().unwrap());
         assert_eq!(retry_delay(policy, 0, 429, &headers, body), None);
         let client = reqwest::Client::new();
+        let body_request = client
+            .post("http://localhost/db/v1/query")
+            .header("content-type", "application/x-ndjson")
+            .body("{\"timeout_ms\":800}\n{\"timeout_ms\":80}\n")
+            .build()
+            .unwrap();
+        let budget = query_budget(&body_request, policy.max_elapsed).unwrap();
+        assert_eq!(budget, Duration::from_millis(80));
+        let delay = retry_delay(
+            ReadRetryPolicy {
+                initial_backoff: Duration::from_millis(100),
+                ..policy
+            },
+            0,
+            429,
+            &HeaderMap::new(),
+            body,
+        )
+        .unwrap();
+        assert!(
+            delay > budget,
+            "backoff cannot restart the body's original deadline"
+        );
         assert!(query_request(
             &client
                 .post("http://localhost/db/v1/tables/docs/query")
