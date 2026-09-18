@@ -138,7 +138,9 @@ export function validateRelationalExpression(
       throw new TypeError(
         `${location}.args must contain ${min === max ? min : `${min}–${max}`} expressions`
       );
-    node.args.forEach((child, index) => visit(child, `${location}.args[${index}]`, depth + 1));
+    node.args.forEach((child, index) => {
+      visit(child, `${location}.args[${index}]`, depth + 1);
+    });
   };
   visit(input, path, 0);
 }

@@ -399,6 +399,8 @@ test "metadata transition driver online raw reservation excludes standalone nati
     const scope = testState().scope;
     const encoded = try (raw.Reservation{ .scope = scope }).encode();
     try std.testing.expectEqual(@as(usize, 2 + source.scope_encoded_size + 4), encoded.len);
+    // The shared accelerated CRC must retain the durable reservation wire format.
+    try std.testing.expectEqual(std.hash.Crc32.hash(encoded[0 .. encoded.len - 4]), std.mem.readInt(u32, encoded[encoded.len - 4 ..], .little));
     try std.testing.expectEqualDeep(scope, (try raw.Reservation.decode(&encoded)).scope);
     var old = encoded;
     old[0] = 1;

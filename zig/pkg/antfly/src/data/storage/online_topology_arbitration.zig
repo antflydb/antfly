@@ -15,6 +15,7 @@
 //! Shared raw/native Raft admission outcome. Reservation state is snapshotted;
 //! per-entry rejection receipts share durable entry-identity retention.
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const source = @import("../../storage/db/online_source_contract.zig");
 const topology = @import("../../storage/db/relational_integrity_topology_contract.zig");
 pub const Rejection = @import("../../storage/data_raft_projection_wire.zig").TopologyRejection;
@@ -34,12 +35,12 @@ pub const Reservation = struct {
         bytes[0] = 2;
         bytes[1] = @intFromBool(self.released);
         @memcpy(bytes[2..checksum_offset], &try self.scope.encode());
-        std.mem.writeInt(u32, bytes[checksum_offset..encoded_size], std.hash.Crc32.hash(bytes[0..checksum_offset]), .little);
+        std.mem.writeInt(u32, bytes[checksum_offset..encoded_size], Crc32.hash(bytes[0..checksum_offset]), .little);
         return bytes;
     }
     pub fn decode(bytes: []const u8) !Reservation {
         if (bytes.len != encoded_size or bytes[0] != 2 or bytes[1] > 1 or
-            std.mem.readInt(u32, bytes[checksum_offset..encoded_size], .little) != std.hash.Crc32.hash(bytes[0..checksum_offset])) return error.InvalidOnlineTopologyReservation;
+            std.mem.readInt(u32, bytes[checksum_offset..encoded_size], .little) != Crc32.hash(bytes[0..checksum_offset])) return error.InvalidOnlineTopologyReservation;
         const scope = source.Scope.decode(bytes[2..checksum_offset]) catch return error.InvalidOnlineTopologyReservation;
         if (scope.authority != .raft) return error.InvalidOnlineTopologyReservation;
         return .{ .scope = scope, .released = bytes[1] == 1 };

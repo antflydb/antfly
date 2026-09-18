@@ -1375,7 +1375,7 @@ export class AntflyClient {
           "marshalling constraint retirement",
           true
         );
-        if (!result || result.status !== "accepted")
+        if (result?.status !== "accepted")
           throw new Error("Constraint retirement returned no acceptance outcome");
         return result;
       },

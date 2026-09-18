@@ -1,3 +1,7 @@
+import {
+  isRelationalExpressionType,
+  validateRelationalExpression,
+} from "./relational-expression.js";
 import type {
   ArtifactIndexSource,
   CreateIndexRequest,
@@ -8,10 +12,6 @@ import type {
   IndexEmbedderConfig,
   RelationalIndexConfig,
 } from "./types.js";
-import {
-  isRelationalExpressionType,
-  validateRelationalExpression,
-} from "./relational-expression.js";
 
 const MAX_ARTIFACT_SOURCES = 64;
 

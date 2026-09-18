@@ -14,9 +14,9 @@ from antfly import (  # noqa: E402
     AntflyException,
     CreatedEmbeddingsIndex,
     CreatedRelationalIndex,
-    CreateRelationalIndexRequest,
     CreateEmbeddingsIndexRequest,
     CreateEmbeddingsIndexRequestType,
+    CreateRelationalIndexRequest,
     IndexMutationTemporarilyUnavailableError,
     StorageResourceExhaustedError,
     antfly_embedder,
@@ -416,6 +416,7 @@ class TestAntflyClient:
         result = client.indexes.create("orders", "recent", request)
         assert isinstance(result, CreatedRelationalIndex)
         assert [key.column for key in result.keys] == ["tenant", "created_at"]
+        assert not isinstance(result.keys[1].direction, Unset)
         assert result.keys[1].direction.value == "desc"
         mock_httpx.stream.assert_called_once_with("POST", "/db/v1/tables/orders/indexes/recent", json=request.to_dict())
 

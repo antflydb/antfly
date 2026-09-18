@@ -37,10 +37,13 @@ def test_storage_mode_is_typed_and_survives_round_trips(mode: TableStorageMode) 
     request = CreateTableRequest(schema=schema)
     encoded = request.to_dict()
     assert encoded["schema"]["storage_mode"] == mode.value
-    assert CreateTableRequest.from_dict(encoded).schema.storage_mode is mode
+    decoded = CreateTableRequest.from_dict(encoded)
+    assert isinstance(decoded.schema, TableSchema)
+    assert decoded.schema.storage_mode is mode
     status = TableStatus.from_dict(
         {"name": "rows", "schema": schema.to_dict(), "indexes": {}, "shards": {}, "storage_status": {}}
     )
+    assert isinstance(status.schema, TableSchema)
     assert status.schema.storage_mode is mode
     assert status.to_dict()["schema"]["storage_mode"] == mode.value
 
@@ -144,4 +147,5 @@ def test_generated_constraint_recovery_routes_and_acceptance() -> None:
     accepted = _parse_response(
         client=Client(base_url="http://example.invalid"), response=httpx.Response(202, json={"status": "accepted"})
     )
+    assert accepted is not None
     assert accepted.to_dict() == {"status": "accepted"}
