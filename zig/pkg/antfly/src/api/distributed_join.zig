@@ -218,6 +218,19 @@ pub const JoinContext = struct {
         return out;
     }
 
+    /// Decoding consumes the same worker budget as execution. Parsed requests
+    /// carry a native deadline captured before decoding; typed local callers
+    /// without that timestamp retain the relative-budget contract.
+    fn withReceivedExecutionBudget(self: JoinContext, request: anytype) !JoinContext {
+        const received_deadline = request.received_deadline_ns orelse
+            return self.withRemainingExecutionBudgetMs(request.remaining_timeout_ms);
+        var out = self.withNativeExecutionDeadline(received_deadline);
+        if (self.execution_deadline_ns) |local_deadline|
+            out.execution_deadline_ns = @min(local_deadline, out.execution_deadline_ns.?);
+        try out.ensureExecutionDeadline();
+        return out;
+    }
+
     /// Returns a ceiling-rounded relative budget so serialization cannot make
     /// a live sub-millisecond deadline expire early on the receiving node.
     pub fn remainingExecutionBudgetMs(self: JoinContext) !?u64 {
@@ -808,6 +821,8 @@ pub const LoadedRightJoinQuery = struct {
 };
 
 pub const JoinPartitionRequest = struct {
+    /// Process-local only; never serialized to another host.
+    received_deadline_ns: ?u64 = null,
     job_id: ?u64 = null,
     join: SupportedJoinRequest,
     left_hits: []const std.json.Value,
@@ -826,6 +841,8 @@ pub const JoinPartitionRequest = struct {
 };
 
 pub const JoinRowsRequest = struct {
+    /// Process-local only; never serialized to another host.
+    received_deadline_ns: ?u64 = null,
     job_id: ?u64 = null,
     join: SupportedJoinRequest,
     partition_index: usize = 0,
@@ -841,6 +858,8 @@ pub const JoinRowsRequest = struct {
 };
 
 pub const JoinUnmatchedRequest = struct {
+    /// Process-local only; never serialized to another host.
+    received_deadline_ns: ?u64 = null,
     join: SupportedJoinRequest,
     left_hit_count: usize = 0,
     left_fields: []const []const u8 = &.{},
@@ -857,6 +876,8 @@ pub const JoinUnmatchedRequest = struct {
 };
 
 pub const JoinFinalizeRequest = struct {
+    /// Process-local only; never serialized to another host.
+    received_deadline_ns: ?u64 = null,
     job_id: ?u64 = null,
     handoff_owner_group_id: ?u64 = null,
     join: SupportedJoinRequest,
@@ -875,6 +896,7 @@ pub const JoinFinalizeRequest = struct {
 };
 
 pub const EncodedJoinPartitionRequest = struct {
+    budget_version: ?u16 = null,
     job_id: ?u64 = null,
     join: BoundJoinClause,
     left_hits: []const std.json.Value,
@@ -886,6 +908,7 @@ pub const EncodedJoinPartitionRequest = struct {
 };
 
 pub const EncodedJoinRowsRequest = struct {
+    budget_version: ?u16 = null,
     job_id: ?u64 = null,
     join: BoundJoinClause,
     partition_index: ?u64 = null,
@@ -894,6 +917,7 @@ pub const EncodedJoinRowsRequest = struct {
 };
 
 pub const EncodedJoinUnmatchedRequest = struct {
+    budget_version: ?u16 = null,
     join: BoundJoinClause,
     left_hit_count: ?u64 = null,
     left_fields: ?[]const []const u8 = null,
@@ -903,6 +927,7 @@ pub const EncodedJoinUnmatchedRequest = struct {
 };
 
 pub const EncodedJoinFinalizeRequest = struct {
+    budget_version: ?u16 = null,
     job_id: ?u64 = null,
     handoff_owner_group_id: ?u64 = null,
     join: BoundJoinClause,
@@ -3250,7 +3275,7 @@ pub fn executeJoinFinalizeWorkerLocalTyped(
     table_name: []const u8,
     req: JoinFinalizeRequest,
 ) !JoinPartitionExecutionResult {
-    var binding = try JoinReadBinding.init(try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms), alloc, unbound_source);
+    var binding = try JoinReadBinding.init(try ctx.withReceivedExecutionBudget(req), alloc, unbound_source);
     defer binding.deinit();
     const worker_ctx = binding.ctx;
     const source = binding.source;
@@ -3320,7 +3345,7 @@ pub fn executeJoinRowsLocalTyped(
     table_name: []const u8,
     req: JoinRowsRequest,
 ) ![]std.json.Value {
-    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    const worker_ctx = try ctx.withReceivedExecutionBudget(req);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
     if (req.join.nested_join != null) return error.UnsupportedQueryRequest;
@@ -3383,7 +3408,7 @@ pub fn executeJoinUnmatchedLocalTyped(
     table_name: []const u8,
     req: JoinUnmatchedRequest,
 ) !EncodedJoinUnmatchedResponse {
-    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    const worker_ctx = try ctx.withReceivedExecutionBudget(req);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
     if (req.join.nested_join != null) return error.UnsupportedQueryRequest;
@@ -3505,7 +3530,7 @@ pub fn executeJoinPartitionWorkerLocalTyped(
     table_name: []const u8,
     req: JoinPartitionRequest,
 ) !JoinPartitionExecutionResult {
-    const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    const worker_ctx = try ctx.withReceivedExecutionBudget(req);
     job_store.setContext(worker_ctx);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
@@ -4864,7 +4889,22 @@ fn putTransportBudgetFields(
     remaining_timeout_ms: ?u64,
 ) !void {
     const remaining_ms = remaining_timeout_ms orelse return;
+    if (remaining_ms == 0) return error.Timeout;
+    try putOwnedJsonU64Field(alloc, object, "budget_version", 1);
     try putOwnedJsonU64Field(alloc, object, "remaining_timeout_ms", remaining_ms);
+}
+
+/// An absent version is the legacy millisecond protocol. Reject explicit
+/// unknown versions before constructing any executable worker request. A
+/// deadline is cancellation input, never evidence that remote work quiesced.
+fn receivedTransportDeadline(version: ?u16, remaining_ms: ?u64, received_ns: u64) !?u64 {
+    if (version) |value| if (value != 1) return error.UnsupportedQueryRequest;
+    const duration_ms = remaining_ms orelse {
+        if (version != null) return error.InvalidQueryRequest;
+        return null;
+    };
+    if (duration_ms == 0) return error.Timeout;
+    return received_ns +| duration_ms *| std.time.ns_per_ms;
 }
 
 fn encodeJoinJobStateRequest(
@@ -4881,11 +4921,14 @@ pub fn parseJoinPartitionRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !JoinPartitionRequest {
+    const received_ns = platform_time.monotonicNs();
     var parsed = try std.json.parseFromSlice(EncodedJoinPartitionRequest, alloc, body, .{
         .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
+    const received_deadline_ns = try receivedTransportDeadline(parsed.value.budget_version, parsed.value.remaining_timeout_ms, received_ns);
     return .{
+        .received_deadline_ns = received_deadline_ns,
         .job_id = parsed.value.job_id,
         .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .left_hits = parsed.value.left_hits,
@@ -4992,11 +5035,14 @@ pub fn parseJoinRowsRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !JoinRowsRequest {
+    const received_ns = platform_time.monotonicNs();
     var parsed = try std.json.parseFromSlice(EncodedJoinRowsRequest, alloc, body, .{
         .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
+    const received_deadline_ns = try receivedTransportDeadline(parsed.value.budget_version, parsed.value.remaining_timeout_ms, received_ns);
     return .{
+        .received_deadline_ns = received_deadline_ns,
         .job_id = parsed.value.job_id,
         .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .partition_index = if (parsed.value.partition_index) |value|
@@ -5019,11 +5065,14 @@ pub fn parseJoinUnmatchedRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !JoinUnmatchedRequest {
+    const received_ns = platform_time.monotonicNs();
     var parsed = try std.json.parseFromSlice(EncodedJoinUnmatchedRequest, alloc, body, .{
         .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
+    const received_deadline_ns = try receivedTransportDeadline(parsed.value.budget_version, parsed.value.remaining_timeout_ms, received_ns);
     return .{
+        .received_deadline_ns = received_deadline_ns,
         .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
         .left_hit_count = if (parsed.value.left_hit_count) |value|
             std.math.cast(usize, value) orelse return error.InvalidQueryRequest
@@ -5041,11 +5090,14 @@ pub fn parseJoinFinalizeRequest(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !JoinFinalizeRequest {
+    const received_ns = platform_time.monotonicNs();
     var parsed = try std.json.parseFromSlice(EncodedJoinFinalizeRequest, alloc, body, .{
         .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
+    const received_deadline_ns = try receivedTransportDeadline(parsed.value.budget_version, parsed.value.remaining_timeout_ms, received_ns);
     return .{
+        .received_deadline_ns = received_deadline_ns,
         .job_id = parsed.value.job_id,
         .handoff_owner_group_id = parsed.value.handoff_owner_group_id,
         .join = try supportedBoundJoinFromWire(alloc, parsed.value.join),
@@ -6356,7 +6408,7 @@ test "distributed join context forwards one absolute deadline to every query cal
     );
 }
 
-test "distributed join transports relative budgets and rejects exhausted handoffs" {
+test "workload admission distributed join transports relative budgets and rejects exhausted handoffs" {
     var state: u8 = 0;
     const ctx = JoinContext{
         .ptr = &state,
@@ -6387,15 +6439,81 @@ test "distributed join transports relative budgets and rejects exhausted handoff
         remaining_ms,
     );
     defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"budget_version\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "budget_started_at_unix_ms") == null);
     var parsed = try parseJoinPartitionRequest(alloc, body);
     defer parsed.deinit(alloc);
     try std.testing.expectEqual(@as(?u64, remaining_ms), parsed.remaining_timeout_ms);
+    try std.testing.expect(parsed.received_deadline_ns != null);
     const worker_ctx = try (JoinContext{
         .ptr = &state,
         .vtable = &.{ .acquire_planning = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
     }).withRemainingExecutionBudgetMs(parsed.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
+}
+
+test "workload admission join worker budget includes decoding and preserves earlier deadlines" {
+    var state: u8 = 0;
+    const now = platform_time.monotonicNs();
+    const ctx = JoinContext{
+        .ptr = &state,
+        .vtable = &.{ .acquire_planning = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
+        .execution_deadline_ns = now + std.time.ns_per_s,
+    };
+    // A queued or decoded request must not receive a fresh duration when it
+    // finally reaches the typed worker entry point.
+    try std.testing.expectError(error.Timeout, ctx.withReceivedExecutionBudget(.{
+        .received_deadline_ns = @as(?u64, 1),
+        .remaining_timeout_ms = @as(?u64, 60_000),
+    }));
+    const live = try ctx.withReceivedExecutionBudget(.{
+        .received_deadline_ns = @as(?u64, now + 2 * std.time.ns_per_s),
+        .remaining_timeout_ms = @as(?u64, 2_000),
+    });
+    try std.testing.expectEqual(ctx.execution_deadline_ns, live.execution_deadline_ns);
+    try std.testing.expectEqual(@as(?u64, 10 + std.time.ns_per_ms), try receivedTransportDeadline(1, 1, 10));
+    try std.testing.expectEqual(@as(?u64, 10 + std.time.ns_per_ms), try receivedTransportDeadline(null, 1, 10));
+    try std.testing.expectEqual(@as(?u64, null), try receivedTransportDeadline(null, null, 10));
+    try std.testing.expectError(error.Timeout, receivedTransportDeadline(1, 0, 10));
+    try std.testing.expectError(error.InvalidQueryRequest, receivedTransportDeadline(1, null, 10));
+    try std.testing.expectError(error.UnsupportedQueryRequest, receivedTransportDeadline(2, 1, 10));
+}
+
+test "workload admission every join worker parser rejects unsupported budget versions" {
+    const alloc = std.testing.allocator;
+    var join = try testSupportedJoinRequestAlloc(alloc);
+    defer join.deinit(alloc);
+    const bodies = [_][]u8{
+        try encodeJoinPartitionRequest(alloc, null, join, &.{}, false, 0, 1, &.{}, 100),
+        try encodeJoinRowsRequest(alloc, null, join, 0, 1, 100),
+        try encodeJoinUnmatchedRequest(alloc, join, 0, &.{}, false, &.{}, 100),
+        try encodeJoinFinalizeRequest(alloc, 1, null, join, &.{}, &.{}, false, 1, 100),
+    };
+    defer for (bodies) |body| alloc.free(body);
+    var state: u8 = 0;
+    const expired_context = JoinContext{
+        .ptr = &state,
+        .vtable = &.{ .acquire_planning = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
+    };
+    inline for (.{ parseJoinPartitionRequest, parseJoinRowsRequest, parseJoinUnmatchedRequest, parseJoinFinalizeRequest }, 0..) |parse, i| {
+        var valid = try parse(alloc, bodies[i]);
+        defer valid.deinit(alloc);
+        try std.testing.expect(valid.received_deadline_ns != null);
+        valid.received_deadline_ns = 1;
+        // Every real typed worker must reject expiry before using storage or
+        // job-store dependencies, even though the wire duration remains live.
+        try std.testing.expectError(error.Timeout, switch (i) {
+            0 => executeJoinPartitionWorkerLocalTyped(expired_context, undefined, alloc, undefined, 1, "customers", valid),
+            1 => executeJoinRowsLocalTyped(expired_context, alloc, undefined, 1, "customers", valid),
+            2 => executeJoinUnmatchedLocalTyped(expired_context, alloc, undefined, 1, "customers", valid),
+            3 => executeJoinFinalizeWorkerLocalTyped(expired_context, undefined, alloc, undefined, 1, "customers", valid),
+            else => unreachable,
+        });
+        const marker = "\"budget_version\":1";
+        const index = std.mem.indexOf(u8, bodies[i], marker) orelse return error.TestExpectedVersion;
+        bodies[i][index + marker.len - 1] = '2';
+        try std.testing.expectError(error.UnsupportedQueryRequest, parse(alloc, bodies[i]));
+    }
 }
 
 test "distributed join transport passes timeout out of band without parsing payload" {
