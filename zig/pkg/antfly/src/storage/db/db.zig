@@ -40343,6 +40343,7 @@ pub const DB = struct {
         errdefer observeSearchFailureMetric(metric_name, .search, platform_time.monotonicNs() -| start_ns);
         const result = try db_query_search.searchTextQuery(alloc, execution_req, text_query, .{
             .ctx = self,
+            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .text_index_entry = textIndexEntryCallback,
             .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
             .text_index_supports_unit_grouping = textIndexSupportsUnitGroupingCallback,

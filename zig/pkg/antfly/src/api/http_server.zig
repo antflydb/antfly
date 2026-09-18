@@ -14513,14 +14513,16 @@ pub const ApiHttpServer = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        var document = try std.json.parseFromSliceLeaky(std.json.Value, a, proposed, .{ .allocate = .alloc_always });
+        // Binding changes identities only. Preserve all schema number tokens,
+        // including defaults and bounds that are not typed CHECK literals.
+        var document = try std.json.parseFromSliceLeaky(std.json.Value, a, proposed, .{ .allocate = .alloc_always, .parse_numbers = false });
         if (document != .object) return error.InvalidSchemaUpdateRequest;
         const foreign = document.object.getPtr("foreign_keys") orelse return alloc.dupe(u8, proposed);
         if (foreign.* == .null) return alloc.dupe(u8, proposed);
         if (foreign.* != .array or foreign.array.items.len > 256) return error.InvalidSchemaUpdateRequest;
         var inherited: std.StringHashMap([]const u8) = .init(a);
         if (before.len != 0) {
-            const prior = try std.json.parseFromSliceLeaky(std.json.Value, a, before, .{});
+            const prior = try std.json.parseFromSliceLeaky(std.json.Value, a, before, .{ .parse_numbers = false });
             if (prior.object.get("foreign_keys")) |fks| if (fks == .array) for (fks.array.items) |fk| {
                 try inherited.put(fk.object.get("name").?.string, fk.object.get("parent_table").?.string);
             };

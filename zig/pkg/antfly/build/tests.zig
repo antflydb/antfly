@@ -1230,6 +1230,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "match_all sorted segment seek checks deadline while scanning",
         "match_all sorted segment seek zero limit returns profile without scanning",
         "match_all projected source load rejects expired deadline before batch load",
+        "projected source batches",
         "match_all rejects sorted pages with unresolved stored pattern filters",
         "match_all rejects cursor pages with unresolved stored pattern filters",
         "match_all rejects field sort without native doc values",

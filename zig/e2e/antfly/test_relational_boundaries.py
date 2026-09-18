@@ -5,6 +5,7 @@
 """Exact typed values and least-privilege integrity across public boundaries."""
 
 import json
+from decimal import Decimal
 
 import pytest
 
@@ -22,6 +23,36 @@ def _ready(api, table):
         ),
         timeout_s=30,
     )
+
+
+@pytest.mark.parametrize("with_fk", [False, True])
+@pytest.mark.parametrize(
+    "spelling",
+    ["9007199254740993.0", "9223372036854775807e0", "-9223372036854775808.0"],
+)
+def test_relational_fk_binding_preserves_exact_schema_defaults(
+    auth_api, with_fk, spelling
+):
+    api = auth_api
+    api.s.headers["Authorization"] = auth._basic_auth("admin", "admin")
+    api.post("/tables/parents", {"schema": _schema()})
+    _ready(api, "parents")
+    schema = _schema("parents") if with_fk else _schema()
+    schema["document_schemas"]["row"]["schema"]["properties"]["extra"] = {
+        "type": "integer",
+        "default": "EXACT_NUMBER",
+    }
+    body = json.dumps({"schema": schema}).replace('"EXACT_NUMBER"', spelling)
+    response = api.request_raw("POST", "/tables/children", data=body, timeout=30)
+    assert response.status_code in (200, 201), response.text
+    _ready(api, "children")
+    response = api.request_raw("GET", "/tables/children", timeout=30)
+    assert response.status_code == 200, response.text
+    stored = json.loads(response.text, parse_float=Decimal)
+    default = stored["schema"]["document_schemas"]["row"]["schema"]["properties"][
+        "extra"
+    ]["default"]
+    assert Decimal(str(default)) == Decimal(spelling), response.text
 
 
 @pytest.mark.parametrize("coordinated", [False, True])

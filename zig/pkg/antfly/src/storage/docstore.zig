@@ -380,7 +380,7 @@ pub const DocStore = struct {
     payload_store: ?artifact_payload.Store = null,
     payload_capture_inline: bool = false,
     payload_migration_allowance: ?u64 = null,
-    payload_policy_mutex: std.atomic.Mutex = .unlocked,
+    payload_policy_mutex: std.Io.Mutex = .init,
     payload_recovery_required: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     /// Process-local wake hint, published only after successful row/schema
@@ -1269,14 +1269,26 @@ pub const DocStore = struct {
     }
 
     fn lockPayloadPolicy(self: *DocStore) void {
-        while (!self.payload_policy_mutex.tryLock()) std.atomic.spinLoopHint();
+        // This synchronous ABI has no borrowed task Io. Use the non-spawning
+        // synchronization Io, as the backend's other synchronous gates do.
+        // Admission can wait for the backend lock: spinning here starves its
+        // holder under concurrent query hydration and CPU quotas.
+        self.payload_policy_mutex.lockUncancelable(payloadPolicyIo());
+    }
+
+    fn payloadPolicyIo() std.Io {
+        return if (builtin.os.tag == .freestanding) .failing else std.Io.Threaded.global_single_threaded.io();
+    }
+
+    fn unlockPayloadPolicy(self: *DocStore) void {
+        self.payload_policy_mutex.unlock(payloadPolicyIo());
     }
 
     /// DB apply admission excludes writers. Reader admission holds this mutex
     /// until its primary view and source lease have both been captured.
     pub fn configurePayloadPolicy(self: *DocStore, store: ?artifact_payload.Store, capture_inline: bool, migration_allowance: ?u64) void {
         self.lockPayloadPolicy();
-        defer self.payload_policy_mutex.unlock();
+        defer self.unlockPayloadPolicy();
         self.payload_store = store;
         self.payload_capture_inline = capture_inline;
         self.payload_migration_allowance = migration_allowance;
@@ -1324,7 +1336,7 @@ pub const DocStore = struct {
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
         if (self.kind == .runtime) self.lockPayloadPolicy();
-        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        defer if (self.kind == .runtime) self.unlockPayloadPolicy();
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
@@ -1381,7 +1393,7 @@ pub const DocStore = struct {
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         if (self.kind == .runtime) self.lockPayloadPolicy();
-        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        defer if (self.kind == .runtime) self.unlockPayloadPolicy();
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         var txn: Txn = switch (self.kind) {
@@ -1408,7 +1420,7 @@ pub const DocStore = struct {
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         if (self.kind == .runtime) self.lockPayloadPolicy();
-        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        defer if (self.kind == .runtime) self.unlockPayloadPolicy();
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         var txn: Txn = switch (self.kind) {
@@ -1431,7 +1443,7 @@ pub const DocStore = struct {
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         if (self.kind == .runtime) self.lockPayloadPolicy();
-        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        defer if (self.kind == .runtime) self.unlockPayloadPolicy();
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         var txn: Txn = switch (self.kind) {
@@ -1449,7 +1461,7 @@ pub const DocStore = struct {
     pub fn beginWriteTxn(self: *DocStore) !Txn {
         try self.ensurePortableImportOperational();
         if (self.kind == .runtime) self.lockPayloadPolicy();
-        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        defer if (self.kind == .runtime) self.unlockPayloadPolicy();
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
@@ -1480,7 +1492,7 @@ pub const DocStore = struct {
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
         try self.ensurePortableImportOperational();
         if (self.kind == .runtime) self.lockPayloadPolicy();
-        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        defer if (self.kind == .runtime) self.unlockPayloadPolicy();
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
