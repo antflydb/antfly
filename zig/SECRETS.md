@@ -417,8 +417,14 @@ not clear the fence. Failed key wrapping happens before publication and does
 not advance the revision.
 
 Vacuum and stable file snapshots preserve the private catalog and its encrypted
-records; ordinary document reads/exports do not include them. File backups still
-need separately provisioned key access. Whole-file rollback has the restore and
+records; ordinary document reads/exports do not include them. Portable import
+rejects generation replacement with `LiteImportTargetNotEmpty` if the live target
+contains any secret state, including a scope head retained after all entries are
+deleted. This check runs under the writer reservation and catalog lock at
+publication, so secrets committed during import preparation cannot be lost.
+Import into a fresh file instead; deleting secrets does not erase revision history
+or make an existing scope pristine. File backups still need separately
+provisioned key access. Whole-file rollback has the restore and
 freshness limitations described above; restoring a backup is not a monotonic
 secret revision update.
 

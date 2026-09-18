@@ -60,7 +60,12 @@ file-backed and node-local, even in a distributed deployment.
 This section is startup-only; file contents can still rotate live. Paths are
 literal (relative to the working directory). Source names must be unique and
 `environment` is reserved. Keep the native file separate from external files,
-including symlink aliases. Only `type: "file"` is supported today.
+including symlink aliases. Startup rejects canonical native/source path overlap,
+even when the destination does not exist yet. Writes recheck that separation so
+a source redirected after startup cannot be overwritten. Keep these configured
+paths and their parent directories under trusted administration; the check is
+not a filesystem lock against concurrent path replacement. Only `type: "file"`
+is supported today.
 
 When the section is absent, legacy path flags and deployment defaults continue
 to apply. Do not combine it with `--secret-store-path` or the serverless legacy

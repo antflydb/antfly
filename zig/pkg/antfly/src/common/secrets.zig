@@ -55,9 +55,50 @@ pub const Config = struct {
     }
 
     fn validateSourcePath(path: []const u8) !void {
-        if (path.len == 0 or std.mem.indexOf(u8, path, "${") != null) return error.InvalidConfig;
+        if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null or std.mem.indexOf(u8, path, "${") != null) return error.InvalidConfig;
     }
 };
+
+/// Resolve existing symlinks and parent directories before normalizing missing
+/// components. This also covers files/directories that will be created on PUT.
+fn canonicalSecretPath(alloc: std.mem.Allocator, io: std.Io, path: []const u8, depth: usize) anyerror![]u8 {
+    if (depth > 128) return error.InvalidConfig;
+    if (std.Io.Dir.cwd().realPathFileAlloc(io, path, alloc)) |resolved| {
+        defer alloc.free(resolved);
+        return alloc.dupe(u8, resolved);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    // realpath fails on dangling links; resolve their targets explicitly.
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link_len = std.Io.Dir.cwd().readLink(io, path, &link_buf) catch |err| switch (err) {
+        error.FileNotFound, error.NotLink => null,
+        else => return err,
+    };
+    if (link_len) |len| {
+        const target = link_buf[0..len];
+        const joined = if (std.fs.path.isAbsolute(target))
+            try alloc.dupe(u8, target)
+        else
+            try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path) orelse ".", target });
+        defer alloc.free(joined);
+        return canonicalSecretPath(alloc, io, joined, depth + 1);
+    }
+    const parent = std.fs.path.dirname(path) orelse ".";
+    if (std.mem.eql(u8, parent, path)) return error.InvalidConfig;
+    const resolved_parent = try canonicalSecretPath(alloc, io, parent, depth + 1);
+    defer alloc.free(resolved_parent);
+    return std.fs.path.resolve(alloc, &.{ resolved_parent, std.fs.path.basename(path) });
+}
+
+fn rejectSourceAlias(alloc: std.mem.Allocator, io: std.Io, native_path: []const u8, source_path: []const u8) !void {
+    const native_canonical = try canonicalSecretPath(alloc, io, native_path, 0);
+    defer alloc.free(native_canonical);
+    const source_canonical = try canonicalSecretPath(alloc, io, source_path, 0);
+    defer alloc.free(source_canonical);
+    if (std.mem.eql(u8, native_canonical, source_canonical)) return error.InvalidConfig;
+}
 
 pub fn parseConfig(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Parsed(Config) {
     var parsed = std.json.parseFromValue(Config, alloc, value, .{}) catch |err| switch (err) {
@@ -395,6 +436,9 @@ pub const FileStore = struct {
 
     pub fn initConfiguredWithIo(alloc: std.mem.Allocator, io: std.Io, cfg: Config) !FileStore {
         try cfg.validate();
+        if (cfg.native) |native| {
+            for (cfg.sources) |source| try rejectSourceAlias(alloc, io, native.path, source.path);
+        }
         const count = cfg.sources.len + @as(usize, if (cfg.native != null) 1 else 0);
         // A pathless resolver enforces environment:false even without file sources.
         var paths = try alloc.alloc([]const u8, count);
@@ -844,6 +888,11 @@ pub const FileStore = struct {
     }
 
     fn persistEntries(self: *FileStore, entries: *const std.StringArrayHashMapUnmanaged(StoredSecret)) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+        // Mounted source paths can change after startup. Fail before creating
+        // directories or replacing the destination if they now alias native.
+        if (self.source_name != null) {
+            for (self.fallbacks) |*fallback| try rejectSourceAlias(self.alloc, self.io, self.path, fallback.path);
+        }
         const alloc = self.alloc;
         var persisted = try alloc.alloc(PersistedSecret, entries.count());
         defer alloc.free(persisted);
@@ -1917,4 +1966,85 @@ test "file secret store source configuration rejects ambiguity and bootstraps be
     try std.testing.expectError(error.InvalidConfig, initFromConfigPathWithIo(alloc, std.Options.debug_io, path, &.{"legacy.json"}));
     try writeFileAtomically(path, "{}");
     try std.testing.expect((try initFromConfigPathWithIo(alloc, std.Options.debug_io, path, &.{})) == null);
+}
+
+test "file secret store rejects canonical native source aliases including missing destinations" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(dir);
+    const relative = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/external.json", .{tmp.sub_path});
+    defer alloc.free(relative);
+    const dotted = try std.fmt.allocPrint(alloc, "./{s}", .{relative});
+    defer alloc.free(dotted);
+    const absolute = try std.fs.path.join(alloc, &.{ dir, "external.json" });
+    defer alloc.free(absolute);
+    const parent_alias = try std.fs.path.join(alloc, &.{ dir, "child", "..", "external.json" });
+    defer alloc.free(parent_alias);
+    try tmp.dir.createDir(io, "child", .default_dir);
+    for ([_]bool{ false, true }) |exists| {
+        if (exists) try tmp.dir.writeFile(io, .{ .sub_path = "external.json", .data = "{\"secrets\":[{\"key\":\"test.token\",\"value\":\"external\"}]}" });
+        for ([_][]const u8{ dotted, absolute, parent_alias }) |alias| {
+            try std.testing.expectError(error.InvalidConfig, FileStore.initConfiguredWithIo(alloc, io, .{
+                .native = .{ .path = alias },
+                .sources = &.{.{ .name = "external", .type = .file, .path = relative }},
+            }));
+        }
+    }
+    var external = try FileStore.initWithIo(alloc, io, relative);
+    defer external.deinit();
+    const value = (try external.getOwned(alloc, "test.token")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("external", value);
+}
+
+test "file secret store rejects symlink aliases at startup and after source replacement" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "external.json" });
+    defer alloc.free(path);
+    const link = try std.fs.path.join(alloc, &.{ dir, "link.json" });
+    defer alloc.free(link);
+    const directory_link = try std.fs.path.join(alloc, &.{ dir, "directory-link", "missing", "external.json" });
+    defer alloc.free(directory_link);
+    const directory_target = try std.fs.path.join(alloc, &.{ dir, "missing", "external.json" });
+    defer alloc.free(directory_target);
+    try tmp.dir.symLink(io, ".", "directory-link", .{ .is_directory = true });
+    try std.testing.expectError(error.InvalidConfig, FileStore.initConfiguredWithIo(alloc, io, .{
+        .native = .{ .path = directory_target },
+        .sources = &.{.{ .name = "external", .type = .file, .path = directory_link }},
+    }));
+    try tmp.dir.symLink(io, "external.json", "link.json", .{});
+    for ([_]bool{ false, true }) |exists| {
+        if (exists) try tmp.dir.writeFile(io, .{ .sub_path = "external.json", .data = "{\"secrets\":[]}" });
+        try std.testing.expectError(error.InvalidConfig, FileStore.initConfiguredWithIo(alloc, io, .{
+            .native = .{ .path = path },
+            .sources = &.{.{ .name = "external", .type = .file, .path = link }},
+        }));
+    }
+    try tmp.dir.deleteFile(io, "link.json");
+    try tmp.dir.writeFile(io, .{ .sub_path = "link.json", .data = "{\"secrets\":[]}" });
+    var store = try FileStore.initConfiguredWithIo(alloc, io, .{
+        .native = .{ .path = path },
+        .sources = &.{.{ .name = "external", .type = .file, .path = link }},
+    });
+    defer store.deinit();
+    var added = try store.put(alloc, "test.token", "preserved");
+    defer added.deinit(alloc);
+    try tmp.dir.deleteFile(io, "link.json");
+    try tmp.dir.symLink(io, "external.json", "link.json", .{});
+    try std.testing.expectError(error.InvalidConfig, store.put(alloc, "test.token", "bad"));
+    try std.testing.expectError(error.InvalidConfig, store.delete("test.token"));
+    var external = try FileStore.initWithIo(alloc, io, path);
+    defer external.deinit();
+    const value = (try external.getOwned(alloc, "test.token")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("preserved", value);
 }

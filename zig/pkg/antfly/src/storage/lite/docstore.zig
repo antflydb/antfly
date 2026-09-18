@@ -159,6 +159,10 @@ pub const Store = struct {
         defer self.mutex.unlock();
         lockStore(prepared);
         defer prepared.mutex.unlock();
+        // Portable archives omit secrets. Check at publication while reserving
+        // the writer slot so a secret committed during preparation cannot be lost.
+        if (self.secret_store_uncertain or self.file.checkpoint_publication_uncertain) return error.OutcomeUnknown;
+        if (try self.file.hasSecretState()) return error.LiteImportTargetNotEmpty;
         return try self.file.replaceWithPreparedGeneration(&prepared.file);
     }
 

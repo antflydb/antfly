@@ -10,7 +10,7 @@ const sync = @import("antfly_platform").sync;
 const contract = @import("../../common/secret_contract.zig");
 const record = @import("../../common/secret_record.zig");
 const Allocator = std.mem.Allocator;
-const namespace = "\x00antfly.secrets.v1/";
+const namespace = native.secret_catalog_prefix;
 
 pub const Store = struct {
     allocator: Allocator,
@@ -546,4 +546,39 @@ test "lite secrets preserve index commits made during wrapping and reject stale 
     const index = (try docs.file.getIndexCatalogRecordAlloc(alloc, "index/progress")).?;
     defer alloc.free(index);
     try std.testing.expectEqualStrings("wrapped", index);
+}
+
+test "lite secrets portable import rejects live secrets and retained scope revisions" {
+    const alloc = std.testing.allocator;
+    const LiteDb = @import("connection.zig").Connection;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp);
+    defer alloc.free(path);
+    const target_path = try std.fmt.allocPrint(alloc, "{s}.target.aflite", .{path});
+    defer alloc.free(target_path);
+    var source = try LiteDb.create(alloc, path, true);
+    defer source.close();
+    try source.db.batch(.{ .writes = &.{.{ .key = "document", .value = "{}" }} });
+    var portable: std.ArrayList(u8) = .empty;
+    defer portable.deinit(alloc);
+    try @import("../portable_backup.zig").exportPortable(alloc, source.db.core.store, &portable);
+    var target = try LiteDb.create(alloc, target_path, true);
+    defer target.close();
+    var provider = TestProvider{};
+    var store = try target.backend.secretStore(alloc, "scope", provider.provider());
+    defer store.deinit();
+    _ = try store.nativeStore().?.writer.put("scope", "key", "credential", .absent);
+    try std.testing.expect(try target.db.isPortableImportTargetEmpty(alloc));
+    try std.testing.expectError(error.LiteImportTargetNotEmpty, @import("restore_staging.zig").importPortableIntoLiteDb(alloc, &target.db, &target.backend, portable.items));
+    var value = try store.source().resolve(alloc, "scope", "key", .{});
+    defer value.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), value.revision);
+    try std.testing.expect(value.value != null);
+    _ = try store.nativeStore().?.writer.removeOverride("scope", "key", .{ .exact = 1 });
+    // A head with no live entries is still durable state and must not reset.
+    try std.testing.expectError(error.LiteImportTargetNotEmpty, @import("restore_staging.zig").importPortableIntoLiteDb(alloc, &target.db, &target.backend, portable.items));
+    try std.testing.expectEqual(@as(u64, 2), (try store.source().refresh("scope")).revision);
+    try std.testing.expectEqual(@as(u64, 3), (try store.nativeStore().?.writer.put("scope", "key", "recreated", .absent)).revision);
+    try expectValue(&store, "key", "recreated", 3);
 }
