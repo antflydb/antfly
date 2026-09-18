@@ -106,6 +106,27 @@ python3 -m unittest tools.test_finetune_command_checks \
   tools.test_runtime_cache.RuntimeCacheTest.test_finetune_standalone_shared_targets
 ```
 
+## VOPR admission by memory rather than a single build job
+
+The VOPR workflow now invokes `tools/run_bounded_zig_build.py` for qualification,
+runner compilation, production compilation, and compiled-owner soak iterations.
+All four invocations remove `-j1`, retain ReleaseSafe and their existing cache
+paths, and cap the cgroup/host-aware scheduler budget at 22 GiB. The wrapper also
+uses the patched Zig 0.16 memory-accounting build runner.
+
+Focused and build-only workflow roots now receive the same conservative default
+compile/run reservations as aggregate tests; existing measured reservations are
+preserved. Linux's production-owner VOPR root reserves 16 GiB, based on a measured
+13.26 GB compiler peak; the runtime adapter reserves 10 GiB. Those two large
+compilations cannot overlap under this cap, but smaller independent work can.
+This changes build admission, not scenario budgets or simulated scheduling.
+
+Regression checks inspect the actual Linux ReleaseSafe build graph for missing
+or over-cap claims, inject an unbudgeted artifact to prove detection, execute the
+workflow command blocks with failing stubs to verify exit-status propagation,
+and retain coverage of wrapper memory detection/accounting. CI must establish
+the elapsed benefit; no VOPR speedup is claimed from these graph checks.
+
 ## Ownership and boundaries
 
 | Work | Before | After |

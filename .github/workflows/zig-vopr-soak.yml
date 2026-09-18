@@ -72,6 +72,7 @@ jobs:
       replays: ${{ fromJSON(inputs.diagnostic_replays || '1') }}
 
   # Cold qualification and runner compilation have independent job budgets.
+  # Bound concurrent work by cgroup memory (capped at 22 GiB), not one build job.
   # Dedicated cache variables keep setup actions from replacing these paths.
   qualify:
     if: inputs.diagnostic_run == ''
@@ -102,8 +103,8 @@ jobs:
       - name: Test production transport, runtime scheduling, and determinism boundaries
         working-directory: zig
         run: |
-          zig build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test vopr-determinism-audit \
-            -Doptimize=ReleaseSafe -j1 --summary all \
+          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test vopr-determinism-audit \
+            -Doptimize=ReleaseSafe --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
 
   build:
@@ -140,7 +141,7 @@ jobs:
         if: steps.runner_cache.outputs.cache-hit != 'true'
         working-directory: zig
         run: |
-          zig build vopr-build -Doptimize=ReleaseSafe -j1 --summary all \
+          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build vopr-build -Doptimize=ReleaseSafe --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
       - name: Restore executable
         if: steps.runner_cache.outputs.cache-hit == 'true'
@@ -320,7 +321,7 @@ jobs:
         id: production-build
         working-directory: zig
         run: |
-          zig build antfly antfly-storage-owner-source-test -Doptimize=ReleaseSafe -j1 --summary all \
+          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
             2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/build.log"
           sha256sum zig-out/bin/antfly > "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
           tar -C zig-out/bin -czf "$RUNNER_TEMP/production-e2e-soak/antfly.tar.gz" antfly
@@ -328,7 +329,7 @@ jobs:
         working-directory: zig
         run: |
           for iteration in $(seq 1 20); do
-            zig build antfly-storage-owner-source-test -Doptimize=ReleaseSafe -j1 --summary all \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
               > "$RUNNER_TEMP/production-e2e-soak/owner-$iteration.log" 2>&1
           done
       - name: Soak public overwrite restore with concurrent readers and status

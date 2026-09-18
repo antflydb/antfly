@@ -1173,6 +1173,27 @@ class RuntimeCacheTest(unittest.TestCase):
             "standalone gate must reach shared finetuning owner once", failure
         )
 
+    def test_vopr_workflow_memory_admission(self):
+        shutil.copyfile(
+            ZIG_ROOT / "tools/fixtures/vopr_memory.zig", self.root / "zig/build.zig"
+        )
+        self.build(
+            "cache-vopr-memory",
+            settings=("-Dtarget=x86_64-linux-gnu", "-Doptimize=ReleaseSafe"),
+        )
+        project = self.root / "zig/project_build.zig"
+        contents = project.read_text()
+        injection = 'b.top_level_steps.get("vopr-build").?.step.dependencies.items[0].dependencies.items[0].max_rss = 0;'
+        anchor = "    const hbc_trace_mod ="
+        self.assertIn(anchor, contents)
+        project.write_text(contents.replace(anchor, injection + "\n" + anchor))
+        failure = self.build(
+            "cache-vopr-memory",
+            settings=("-Dtarget=x86_64-linux-gnu", "-Doptimize=ReleaseSafe"),
+            succeeds=False,
+        )
+        self.assertIn("unbudgeted VOPR work", failure)
+
     def test_wasm_profile_cache_contracts(self):
         for source in ("zig/lib/httpx/src/httpx.zig", "zig/lib/json/src/mod.zig"):
             path = self.own(source)
