@@ -11581,11 +11581,7 @@ fn aggregationCanUseCurrentResult(req: db_mod.types.SearchRequest, result: db_mo
 fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !u32 {
     try checkQueryDeadline(req);
     const budget = aggregationFullResultBudget();
-    // An inexact first page is a lower bound, not a safe allocation size.
-    // Rerun up to the configured budget and require that execution to prove
-    // completeness before computing aggregations.
-    if (result.total_hits_relation != .exact) return budget;
-    if (result.total_hits > budget) {
+    if (result.total_hits_relation == .exact and result.total_hits > budget) {
         std.log.warn("query aggregation full-result rerun budget exceeded operation={s} total_hits={d} budget={d}", .{
             operation,
             result.total_hits,
@@ -11593,7 +11589,12 @@ fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.ty
         });
         return error.QueryCandidateBudgetExceeded;
     }
-    return result.total_hits;
+    // Even an exact first-page count only describes that execution's text
+    // snapshot. Derived indexing can publish more already committed documents
+    // before the rerun without advancing the primary identity generation.
+    // Collect up to the budget, then prove completeness against the rerun's
+    // own total instead of truncating to the earlier snapshot's count.
+    return budget;
 }
 
 fn requireCompleteAggregationFullResult(
@@ -11642,6 +11643,11 @@ fn aggregationFullResultRequestAtGeneration(
     full_req.order_by = &.{};
     full_req.search_after = &.{};
     full_req.search_before = &.{};
+    // Graph-metric reranking only orders and scores the returned hit page.
+    // Aggregations consume stored fields from every match, so the internal
+    // collection must not inherit its bounded candidate window. The original
+    // request and its already-reranked hits remain unchanged.
+    full_req.graph_metric_rerank = null;
     // Aggregations operate on the top-level result set. Canonical hierarchy
     // matches are a bounded evidence projection attached to those groups, not
     // additional aggregation rows. Disable nested expansion for the complete
@@ -19020,7 +19026,7 @@ fn consumerTests() type {
                 .identity_read_generation = 99,
             }, "test");
             try std.testing.expectEqual(@as(u32, 0), full_req.offset);
-            try std.testing.expectEqual(@as(u32, 1), full_req.limit);
+            try std.testing.expectEqual(aggregationFullResultBudget(), full_req.limit);
             try std.testing.expect(!full_req.count_only);
             try std.testing.expect(full_req.include_stored);
             try std.testing.expectEqual(@as(?u64, 99), full_req.identity_read_generation);
@@ -19040,12 +19046,55 @@ fn consumerTests() type {
                 .total_hits_relation = .exact,
                 .identity_read_generation = 101,
             }, "grouped-test");
-            try std.testing.expectEqual(@as(u32, 200), grouped_full_req.limit);
+            try std.testing.expectEqual(aggregationFullResultBudget(), grouped_full_req.limit);
             try std.testing.expectEqual(db_mod.types.ReturnMode.parent, grouped_full_req.return_mode);
             try std.testing.expect(!grouped_full_req.hierarchy_grouped_matches);
             try std.testing.expectEqual(@as(u32, 0), grouped_full_req.max_chunks_per_parent);
             try std.testing.expectEqual(@as(?u64, 101), grouped_full_req.identity_read_generation);
             try std.testing.expect(db_mod.types.canonicalHierarchyExecutionWithinBudget(grouped_full_req));
+
+            // Distributed aggregation collection must also bypass graph
+            // reranking's candidate cap before deriving each shard's window.
+            for ([_]?u32{ null, 1 }) |candidate_count| {
+                const ranked_req = db_mod.types.SearchRequest{
+                    .limit = 1,
+                    .graph_metric_rerank = .{
+                        .index_name = "graph_idx",
+                        .metric_name = "degree",
+                        .candidate_count = candidate_count,
+                    },
+                };
+                var generations = [_]db_mod.types.ShardIdentityReadGeneration{.{ .group_id = 7, .generation = 99 }};
+                const ranked_full_req = try distributedAggregationFullResultRequest(ranked_req, .{
+                    .alloc = std.testing.allocator,
+                    .hits = @constCast(hits[0..]),
+                    .total_hits = 2,
+                    .shard_identity_read_generations = &generations,
+                }, "graph-rerank-test");
+                const shard_req = distributedSearchShardRequest(ranked_full_req, &.{}, false);
+                try std.testing.expectEqual(aggregationFullResultBudget(), shard_req.limit);
+                try std.testing.expect(shard_req.graph_metric_rerank == null);
+                try std.testing.expectEqual(candidate_count, ranked_req.graph_metric_rerank.?.candidate_count);
+            }
+
+            // A wider rerun still must reject partial results and enforce the
+            // candidate budget when the newer snapshot grows beyond it.
+            try std.testing.expectError(error.UnsupportedQueryRequest, requireCompleteAggregationFullResult(full_req, .{
+                .alloc = std.testing.allocator,
+                .hits = @constCast(hits[0..]),
+                .total_hits = 2,
+            }, "test-incomplete"));
+            try std.testing.expectError(error.QueryCandidateBudgetExceeded, requireCompleteAggregationFullResult(full_req, .{
+                .alloc = std.testing.allocator,
+                .hits = @constCast(hits[0..]),
+                .total_hits = aggregationFullResultBudget() + 1,
+            }, "test-over-budget"));
+            try std.testing.expectError(error.QueryCandidateBudgetExceeded, requireCompleteAggregationFullResult(full_req, .{
+                .alloc = std.testing.allocator,
+                .hits = @constCast(hits[0..]),
+                .total_hits = 1,
+                .total_hits_relation = .gte,
+            }, "test-inexact"));
         }
 
         test "reranker candidate and output windows have distinct bounds" {
@@ -27083,6 +27132,131 @@ fn implementationTests() type {
             var parsed_background = try parseTextStatsRequest(alloc, "docs", background_body);
             defer parsed_background.deinit(alloc);
             try std.testing.expectError(error.IdentityReadGenerationChanged, collectBackgroundTextStatsFromDbForRequest(alloc, &db, parsed_background));
+        }
+
+        test "aggregation full-result rerun includes newly published text documents at the same identity generation" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-api-aggregation-text-publication");
+            defer path_tmp.cleanup();
+            var db = try db_mod.DB.open(alloc, path_tmp.path(), .{ .start_index_workers = false });
+            defer db.close();
+            try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+            try db.batch(.{
+                .writes = &.{.{ .key = "old", .value = "{\"age\":18}" }},
+                .sync_level = .write,
+            });
+            try db.runUntilIdle();
+            try db.batch(.{
+                .writes = &.{.{ .key = "new", .value = "{\"node_type\":\"NewDocument\"}" }},
+                .sync_level = .write,
+            });
+
+            const req = db_mod.types.SearchRequest{
+                .index_name = "text",
+                .full_text = .{ .match_all = {} },
+                .count_only = true,
+                .limit = 0,
+                .aggregations_json =
+                \\{"terms":{"type":"terms","field":"age"},"stats":{"type":"stats","field":"age"}}
+                ,
+            };
+            var first = try db.searchWithCapturedRequest(alloc, req);
+            defer first.result.deinit();
+            try std.testing.expectEqual(@as(u32, 1), first.result.total_hits);
+            first.result.identity_read_generation = first.request.identity_read_generation;
+
+            // Publishing already committed writes changes the text snapshot,
+            // without changing the primary document identity generation.
+            try db.runUntilIdle();
+            const full_req = try aggregationFullResultRequest(req, first.result, "test-text-publication");
+            var full = try db.searchWithCapturedRequest(alloc, full_req);
+            defer full.result.deinit();
+            try std.testing.expectEqual(first.request.identity_read_generation, full.request.identity_read_generation);
+            try std.testing.expectEqual(@as(u32, 2), full.result.total_hits);
+            try requireCompleteAggregationFullResult(full_req, full.result, "test-text-publication");
+            try std.testing.expectEqual(@as(usize, 2), full.result.hits.len);
+
+            var meta: query_api.QueryResponseMeta = .{};
+            defer meta.deinit(alloc);
+            try applyAggregationResults(alloc, full_req, full.result, .{}, &meta);
+            try std.testing.expectEqual(@as(usize, 2), meta.aggregation_results.len);
+            for (meta.aggregation_results) |aggregation| {
+                if (std.mem.eql(u8, aggregation.name, "terms")) {
+                    try std.testing.expectEqual(@as(usize, 1), aggregation.buckets.len);
+                    try std.testing.expectEqualStrings("\"18\"", aggregation.buckets[0].key_json);
+                    try std.testing.expectEqual(@as(i64, 1), aggregation.buckets[0].count);
+                } else {
+                    const Stats = struct { count: i64, sum: f64, min: f64, max: f64, avg: f64 };
+                    var stats = try std.json.parseFromSlice(Stats, alloc, aggregation.value_json.?, .{ .ignore_unknown_fields = true });
+                    defer stats.deinit();
+                    try std.testing.expectEqual(Stats{ .count = 1, .sum = 18, .min = 18, .max = 18, .avg = 18 }, stats.value);
+                }
+            }
+        }
+
+        test "aggregation full-result rerun preserves the graph reranked hit page" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-api-aggregation-graph-rerank");
+            defer path_tmp.cleanup();
+            var db = try db_mod.DB.open(alloc, path_tmp.path(), .{ .start_index_workers = false });
+            defer db.close();
+            try db.addIndex(.{
+                .name = "graph_idx",
+                .kind = .graph,
+                .config_json =
+                \\{"edge_types":[{"name":"cites"}],"metrics":{"degree":{"enabled":true,"kind":"degree","refresh":"manual","edge_filter":{"types":["cites"]}}}}
+                ,
+            });
+            try db.batch(.{
+                .writes = &.{
+                    .{ .key = "a", .value = "{\"age\":18,\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"b\",\"weight\":1}]}}}" },
+                    .{ .key = "b", .value = "{\"age\":20}" },
+                },
+                .sync_level = .write,
+            });
+            try db.runUntilIdle();
+            var metric = try db.refreshGraphMetric(alloc, "graph_idx", "degree");
+            defer metric.deinit(alloc);
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric.state);
+            var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+
+            // Both the default oversampling window and an explicit one-hit
+            // candidate window must leave aggregations over all matches.
+            for ([_]?u32{ null, 1 }) |candidate_count| {
+                const req = db_mod.types.SearchRequest{
+                    .limit = 1,
+                    .graph_metric_rerank = .{
+                        .index_name = "graph_idx",
+                        .metric_name = "degree",
+                        .candidate_count = candidate_count,
+                    },
+                    .aggregations_json =
+                    \\{"age":{"type":"stats","field":"age"}}
+                    ,
+                };
+                var first = try db.searchWithCapturedRequest(alloc, req);
+                defer first.result.deinit();
+                try std.testing.expectEqual(@as(u32, 2), first.result.total_hits);
+                try std.testing.expectEqual(@as(usize, 1), first.result.hits.len);
+                try std.testing.expect(first.result.hits[0].score_details != null);
+                const original_id = try alloc.dupe(u8, first.result.hits[0].id);
+                defer alloc.free(original_id);
+                const original_score = first.result.hits[0].score;
+
+                var meta: query_api.QueryResponseMeta = .{};
+                defer meta.deinit(alloc);
+                try applyBoundQueryAggregations(&source, alloc, first.request, &first.result, &meta, .read_index);
+                try std.testing.expectEqual(@as(usize, 1), meta.aggregation_results.len);
+                const Stats = struct { count: i64, sum: f64, min: f64, max: f64, avg: f64 };
+                var stats = try std.json.parseFromSlice(Stats, alloc, meta.aggregation_results[0].value_json.?, .{ .ignore_unknown_fields = true });
+                defer stats.deinit();
+                try std.testing.expectEqual(Stats{ .count = 2, .sum = 38, .min = 18, .max = 20, .avg = 19 }, stats.value);
+                try std.testing.expectEqual(@as(usize, 1), first.result.hits.len);
+                try std.testing.expectEqualStrings(original_id, first.result.hits[0].id);
+                try std.testing.expectEqual(original_score, first.result.hits[0].score);
+                try std.testing.expect(first.result.hits[0].score_details != null);
+                try std.testing.expectEqual(candidate_count, first.request.graph_metric_rerank.?.candidate_count);
+            }
         }
 
         test "aggregation context rejects non-current identity generation" {
