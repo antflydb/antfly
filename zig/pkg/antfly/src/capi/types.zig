@@ -306,6 +306,27 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.InvalidDocIdentityBatch,
         error.InvalidInternalUserKey,
         error.InvalidMetadataBatch,
+        // Index/enrichment config translation and validation errors (see
+        // `table_index_config.zig`, `inference/managed_embedder.zig`, and
+        // `storage/db/catalog/index_manager.zig`'s enrichment catalog graph
+        // validation) are caller mistakes -- a malformed or self-inconsistent
+        // index/enrichment definition, not a server fault. Lite's native
+        // `antfly_db_add_index_json`/`antfly_db_add_enrichment_json` run the
+        // same translation and catalog validation the server runs during
+        // table provisioning, and previously fell through to the generic
+        // `else => .internal` below, which is indistinguishable from an
+        // actual bug from the caller's side of the C ABI.
+        error.InvalidCreateTableRequest,
+        error.UnsupportedCreateTableRequest,
+        error.InvalidIndexConfig,
+        error.InvalidEnrichmentConfig,
+        error.ConflictingEnrichmentConfig,
+        error.MissingEmbeddingArtifactEnrichment,
+        error.MissingEmbeddingArtifactProducer,
+        error.InvalidEmbeddingArtifactProducer,
+        error.EmbeddingArtifactDimensionRequired,
+        error.ConflictingEmbeddingArtifactDimensions,
+        error.ModelNotFound,
         => .invalid_argument,
         error.FileNotFound => .not_found,
         error.WouldBlock,
@@ -317,6 +338,11 @@ pub fn mapError(err: anyerror) ErrorCode {
         => .busy,
         error.FileLocksUnsupported => .unsupported,
         error.DurabilityOutcomeUnknown => .outcome_unknown,
+        // A dimension probe against a live embedder hit an operational
+        // (network/transport) failure rather than a malformed request --
+        // matches `managed_embedder.isOperationalEmbeddingProbeError`'s
+        // retryable classification.
+        error.EmbeddingProbeUnavailable => .busy,
         else => .internal,
     };
 }

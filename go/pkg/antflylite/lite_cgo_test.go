@@ -1743,3 +1743,215 @@ func TestLiteNativeGraphEdgesFromExtractionArtifact(t *testing.T) {
 	}
 	t.Logf("graph queries: %s", graphQueries)
 }
+
+// TestLiteNativeArtifactSourcedDenseVectorChunkPipeline reproduces the
+// server's chunk-artifact pattern go/pkg/docsaf/cmd/docsaf/main.go's
+// createHierarchyIndexes and antfly.NewArtifactEmbeddingIndexConfig build --
+// a `chunk` enrichment producing an artifact (here "document_chunks_v1"),
+// consumed by an embeddings index via
+// `"sources":[{"artifact":"document_chunk_dense_v1"}]`, with the producing
+// `embedding` enrichment nested in that same index's own config and pointed
+// at the chunk artifact through `source_artifact_name` -- against a native
+// Lite handle through nothing but AddIndexJSON. Before
+// `registerLiteIndexEnrichments` (capi/db.zig), a native Lite handle
+// silently dropped every nested "enrichments" declaration (db.addIndex has
+// no such field), so this exact shape returned a generic ANTFLY_INTERNAL:
+// the "sources" artifact reference could never resolve because the
+// enrichment that produces it was never registered. It asserts: (1) both
+// AddIndexJSON calls succeed, (2) the chunk artifact is independently
+// queryable through its own full_text index with a hit whose
+// `hierarchy.parent_doc_key` resolves to the parent document, and (3) a
+// hybrid full-text + semantic query against the artifact-sourced dense
+// index returns a hit with the same hierarchy resolution, proving real
+// vectors were published for the generated chunk artifact (not just an
+// index that silently never received any data).
+func TestLiteNativeArtifactSourcedDenseVectorChunkPipeline(t *testing.T) {
+	const dims = 4
+	server, embedCalls := newFakeAntflyEmbedServer(t, dims)
+
+	path := filepath.Join(t.TempDir(), "artifact-sourced-dense.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:                     OpenModeWriter,
+		Profile:                  ProfileNative,
+		RemoteProviderConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("create native remote-provider Lite database: %v", err)
+	}
+	defer db.Close()
+
+	// Producer: a full_text index over the generated chunk artifact stream,
+	// with the `chunk` enrichment nested in its own config -- docsaf's
+	// "document_text" index.
+	chunkIndex, err := json.Marshal(map[string]any{
+		"name": "document_text_chunks",
+		"kind": "full_text",
+		"config_json": mustMarshalJSONString(t, map[string]any{
+			"chunk_name": "document_chunks_v1",
+			"enrichments": []map[string]any{{
+				"name":       "document_chunks_v1",
+				"kind":       "chunk",
+				"field":      "body",
+				"chunk_size": 256,
+			}},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("marshal chunk index envelope: %v", err)
+	}
+	if err := db.AddIndexJSON(chunkIndex); err != nil {
+		t.Fatalf("add chunk-producing full_text index: %v", err)
+	}
+
+	// Consumer: docsaf's exact two-stage NewArtifactEmbeddingIndexConfig
+	// shape -- "sources" naming a generated embedding artifact, whose
+	// producing "embedding" enrichment is nested in this index's own config
+	// and references the chunk artifact above.
+	vectorIndex, err := json.Marshal(map[string]any{
+		"name": "document_vectors",
+		"kind": "dense_vector",
+		"config_json": mustMarshalJSONString(t, map[string]any{
+			"type":      "embeddings",
+			"sources":   []map[string]any{{"artifact": "document_chunk_dense_v1"}},
+			"dimension": dims,
+			"embedder": map[string]any{
+				"provider": "antfly",
+				"model":    "fake-embedder",
+				"api_url":  server.URL,
+			},
+			"distance_metric": "cosine",
+			"enrichments": []map[string]any{{
+				"name": "document_chunk_dense_v1",
+				"kind": "embedding",
+				// The chunk producer stores chunked content under the same
+				// field name its `chunk` enrichment read from ("body" here,
+				// not a fixed "text" key), so the consuming `embedding`
+				// enrichment's `field` must match it.
+				"field":                "body",
+				"source_artifact_name": "document_chunks_v1",
+				"expected_dims":        dims,
+			}},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("marshal vector index envelope: %v", err)
+	}
+	if err := db.AddIndexJSON(vectorIndex); err != nil {
+		t.Fatalf("add artifact-sourced dense_vector index: %v", err)
+	}
+
+	enrichments, err := db.EnrichmentsJSON()
+	if err != nil {
+		t.Fatalf("enrichments json: %v", err)
+	}
+	if !bytes.Contains(enrichments, []byte("document_chunks_v1")) || !bytes.Contains(enrichments, []byte("document_chunk_dense_v1")) {
+		t.Fatalf("enrichments %q missing the chunk/embedding producers nested in the index configs", enrichments)
+	}
+
+	const bodyA = "alpha beta gamma antfly chunk pipeline testing text"
+	const bodyB = "a totally different unrelated sentence about databases"
+	if err := db.Batch([]WriteIntent{
+		{Key: "doc:a", Value: []byte(fmt.Sprintf(`{"title":"a","body":%q}`, bodyA))},
+		{Key: "doc:b", Value: []byte(fmt.Sprintf(`{"title":"b","body":%q}`, bodyB))},
+	}, 2); err != nil {
+		t.Fatalf("batch write documents: %v", err)
+	}
+
+	pending, err := db.RunUntilIdleStatus()
+	if err != nil {
+		t.Fatalf("run until idle: %v", err)
+	}
+	var enrichment enrichmentPendingWorkStatus
+	if err := json.Unmarshal(pending.Enrichment, &enrichment); err != nil {
+		t.Fatalf("decode enrichment pending work: %v; raw=%s", err, pending.Enrichment)
+	}
+	if enrichment.ErrorCount != 0 || enrichment.FatalErrorCount != 0 || enrichment.Stalled ||
+		enrichment.TargetSequence != enrichment.AppliedSequence {
+		t.Fatalf("chunk+embedding artifact pipeline did not drain cleanly: %#v", enrichment)
+	}
+	if atomic.LoadInt32(embedCalls) == 0 {
+		t.Fatalf("fake inference server received no /ai/v1/embed requests; the embedding artifact enrichment never ran")
+	}
+
+	// The chunk artifact is independently queryable through its own
+	// full_text index, and hierarchy projection resolves the chunk hit back
+	// to its parent document.
+	chunkQuery, err := json.Marshal(map[string]any{
+		"full_text_search": map[string]any{"match": map[string]any{"field": "body", "text": "gamma"}},
+		"full_text_index":  "document_text_chunks",
+		"hierarchy":        map[string]any{"return_level": "chunk"},
+		"limit":            5,
+	})
+	if err != nil {
+		t.Fatalf("marshal chunk-artifact query: %v", err)
+	}
+	chunkResult, err := db.SearchJSON(chunkQuery)
+	if err != nil {
+		t.Fatalf("chunk-artifact full_text query: %v result=%s", err, chunkResult)
+	}
+	assertHierarchyParentDocKey(t, chunkResult, "doc:a")
+
+	// A hybrid full-text + semantic query against the artifact-sourced dense
+	// index resolves to the same parent document, proving the generated
+	// chunk's vector was actually published (an index that silently
+	// received no vectors would return zero hits here, not a wrong one --
+	// the chunk full_text index above vets that document_chunks_v1 exists).
+	hybridQuery, err := json.Marshal(map[string]any{
+		"full_text_search": map[string]any{"match": map[string]any{"field": "body", "text": "gamma"}},
+		"full_text_index":  "document_text_chunks",
+		"semantic_search":  bodyA,
+		"indexes":          []string{"document_vectors"},
+		"merge_config":     map[string]any{"strategy": "rrf"},
+		"hierarchy":        map[string]any{"return_level": "chunk"},
+		"limit":            5,
+	})
+	if err != nil {
+		t.Fatalf("marshal hybrid query: %v", err)
+	}
+	hybridResult, err := db.SearchJSON(hybridQuery)
+	if err != nil {
+		t.Fatalf("hybrid full-text + semantic query: %v result=%s", err, hybridResult)
+	}
+	assertHierarchyParentDocKey(t, hybridResult, "doc:a")
+}
+
+// mustMarshalJSONString marshals v to JSON and returns it as a string, for
+// building the nested `config_json` string field AddIndexJSON expects.
+func mustMarshalJSONString(t *testing.T, v any) string {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal nested config_json: %v", err)
+	}
+	return string(data)
+}
+
+// assertHierarchyParentDocKey fails the test unless result contains at least
+// one hit whose "hierarchy" object's "parent_doc_key" equals wantParentKey.
+func assertHierarchyParentDocKey(t *testing.T, result []byte, wantParentKey string) {
+	t.Helper()
+	type hit struct {
+		ID        string `json:"_id"`
+		Hierarchy struct {
+			ParentDocKey string `json:"parent_doc_key"`
+		} `json:"hierarchy"`
+	}
+	var parsed struct {
+		Responses []struct {
+			Hits struct {
+				Hits []hit `json:"hits"`
+			} `json:"hits"`
+		} `json:"responses"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("decode search result: %v; raw=%s", err, result)
+	}
+	for _, response := range parsed.Responses {
+		for _, h := range response.Hits.Hits {
+			if h.Hierarchy.ParentDocKey == wantParentKey {
+				return
+			}
+		}
+	}
+	t.Fatalf("no hit with hierarchy.parent_doc_key=%q in result: %s", wantParentKey, result)
+}

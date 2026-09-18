@@ -79,6 +79,7 @@ const scraping = antfly.scraping;
 const inference_provider = antfly.inference_provider;
 const managed_embedder = antfly.managed_embedder;
 const raft_catalog = antfly.raft_catalog;
+const indexes_api = antfly.public_api.indexes;
 const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
@@ -797,6 +798,150 @@ fn liteManagedEmbeddingIndexConfigJson(
         }
     }
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
+}
+
+/// Server table provisioning accepts the artifact-stream chunk pattern
+/// (`go/pkg/docsaf`'s `chunk` enrichment producing a `doc_chunks_v1` artifact,
+/// consumed by an embeddings index via `"sources":[{"artifact":...}]`) by
+/// nesting an `"enrichments"` array inside whichever index config
+/// authoritatively owns each producer, then harvesting every nested
+/// declaration across the whole table (`api/indexes.zig`'s
+/// `collectArtifactEnrichmentsFromTableIndexesJsonWithOptions`, dependency
+/// sorted via `sortArtifactEnrichmentsByDependency`) and registering each one
+/// with `db.upsertEnrichment` *before* admitting the physical indexes
+/// (`metadata_table_provisioner.reconcileDbIndexesWithOptions` calls
+/// `ensureEnrichments` ahead of `ensureIndexes`). A native Lite handle only
+/// ever admits one index at a time through `antfly_db_add_index_json`, so
+/// there is no single merged table definition to harvest from; this instead
+/// harvests the `"enrichments"` nested in *this* index's own raw config
+/// before it is translated/admitted, mirroring the same per-index shape
+/// docsaf and the dogfood example already send. Two caveats callers must
+/// respect that the server's atomic table-create request does not have: (1)
+/// a producer index (e.g. the `chunk` enrichment's owning `full_text` index)
+/// must be added before any index whose `sources`/`embedding_name` names an
+/// artifact that producer's enrichment declares, since enrichment admission
+/// validates upstream references immediately; (2) re-adding the same index
+/// name replays its enrichment declarations too, which is harmless because
+/// `db.upsertEnrichment` is idempotent for an unchanged config. Scoped to the
+/// native profile: a hosted Lite handle's owning process reconciles its own
+/// enrichments the same way the server does.
+fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8) !void {
+    var arena_impl = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, config_json, .{}) catch return;
+    if (parsed.value != .object or parsed.value.object.get("enrichments") == null) return;
+
+    const alloc = handle.alloc;
+    var collected: std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig) = .empty;
+    defer {
+        for (collected.items) |*cfg| cfg.deinit(alloc);
+        collected.deinit(alloc);
+    }
+    try indexes_api.collectArtifactEnrichmentsFromValueWithOptions(
+        alloc,
+        parsed.value,
+        .{ .antfly_provider = handle.liteAntflyProvider() },
+        &collected,
+    );
+    if (collected.items.len == 0) return;
+    indexes_api.sortArtifactEnrichmentsByDependency(collected.items);
+    for (collected.items) |cfg| _ = try handle.db.upsertEnrichment(cfg);
+}
+
+test "capi lite AddIndexJSON registers the server's nested artifact-sourced enrichment shape" {
+    // Reproduces the docsaf/dogfood chunk-artifact pattern -- a `chunk`
+    // enrichment producing `document_chunks_v1`, then an embeddings index
+    // consuming it via `"sources":[{"artifact":"document_chunk_dense_v1"}]`
+    // with the producing `embedding` enrichment nested in the index's own
+    // config -- driven entirely through `antfly_db_add_index_json`, the way
+    // `go/pkg/docsaf/cmd/docsaf/main.go`'s `createHierarchyIndexes` and
+    // `antfly.NewArtifactEmbeddingIndexConfig` build it. Before
+    // `registerLiteIndexEnrichments` this silently dropped both nested
+    // enrichment declarations (they are not valid `db.addIndex` fields), so
+    // the physical dense_vector index referenced a `document_chunk_dense_v1`
+    // artifact with no enrichment ever registered to produce it.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-nested-enrichments");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    // Producer index: a full_text index over the chunk artifact (docsaf's
+    // `document_text`), with the `chunk` enrichment nested in its config.
+    const chunk_index_json =
+        \\{"name":"document_text_chunks","kind":"full_text","config_json":"{\"chunk_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":64}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = chunk_index_json,
+        .len = chunk_index_json.len,
+    }));
+
+    var enrichments_after_chunk: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_enrichments_json(handle, &enrichments_after_chunk));
+    defer antfly_db_buffer_free(enrichments_after_chunk.ptr, enrichments_after_chunk.len);
+    try std.testing.expect(std.mem.indexOf(u8, enrichments_after_chunk.ptr.?[0..enrichments_after_chunk.len], "\"document_chunks_v1\"") != null);
+
+    // Consumer index: the exact two-stage `sources` form docsaf's
+    // `NewArtifactEmbeddingIndexConfig` builds, with the `embedding`
+    // enrichment nested in this index's own config and its
+    // `source_artifact_name` pointing at the chunk artifact above.
+    const vector_index_json =
+        \\{"name":"document_vectors","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}],\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"test-embed\",\"api_url\":\"http://127.0.0.1:1\"},\"distance_metric\":\"cosine\",\"enrichments\":[{\"name\":\"document_chunk_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"document_chunks_v1\",\"expected_dims\":3}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = vector_index_json,
+        .len = vector_index_json.len,
+    }));
+
+    var enrichments_after_vectors: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_enrichments_json(handle, &enrichments_after_vectors));
+    defer antfly_db_buffer_free(enrichments_after_vectors.ptr, enrichments_after_vectors.len);
+    try std.testing.expect(std.mem.indexOf(u8, enrichments_after_vectors.ptr.?[0..enrichments_after_vectors.len], "\"document_chunk_dense_v1\"") != null);
+
+    var indexes: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_indexes_json(handle, &indexes));
+    defer antfly_db_buffer_free(indexes.ptr, indexes.len);
+    const indexes_json = indexes.ptr.?[0..indexes.len];
+    try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"document_vectors\"") != null);
+    // The physical config carries the translated artifact source reference
+    // (config_json is itself JSON-encoded as a string, so its embedded quotes
+    // are backslash-escaped here rather than literal).
+    try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\\\"sources\\\":[{\\\"artifact\\\":\\\"document_chunk_dense_v1\\\"") != null);
+}
+
+test "capi lite AddIndexJSON surfaces an unresolvable source_artifact_name as invalid_argument, not internal" {
+    // Regression test for the ANTFLY_INTERNAL reported against every
+    // `sources`-based dense_vector config: the enrichment catalog's own
+    // upstream-reference validation (an `embedding` enrichment naming a
+    // `source_artifact_name` with no matching `chunk` enrichment) is a
+    // caller config mistake, not a server fault, and must map to
+    // ANTFLY_INVALID_ARGUMENT (see `capi/types.zig`'s `mapError`).
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-unresolved-artifact-source");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    const vector_index_json =
+        \\{"name":"document_vectors","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}],\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"test-embed\",\"api_url\":\"http://127.0.0.1:1\"},\"enrichments\":[{\"name\":\"document_chunk_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"missing_chunks_v1\",\"expected_dims\":3}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_add_index_json(handle, .{
+        .ptr = vector_index_json,
+        .len = vector_index_json.len,
+    }));
 }
 
 /// Server table provisioning never calls `db.addIndex` with a caller's raw
@@ -11849,6 +11994,14 @@ pub export fn antfly_db_add_index_json(
         .algebraic
     else
         return .invalid_argument;
+    // A native Lite handle also accepts the server's nested "enrichments"
+    // shape on this index's own config (see `registerLiteIndexEnrichments`),
+    // registering every declared producer before the index below is admitted
+    // so an artifact-sourced `sources`/`embedding_name` reference already
+    // resolves.
+    if (handle.lite_profile == .native) {
+        registerLiteIndexEnrichments(handle, parsed.value.config_json) catch |err| return capi.mapError(err);
+    }
     // Only a native Lite handle calls `db.addIndex` directly with a raw
     // public-shaped dense/sparse config; the server always translates first
     // (see `litePhysicalIndexConfigJson`). Every other handle keeps calling
