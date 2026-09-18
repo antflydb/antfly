@@ -38,6 +38,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_data_runtime_default_filters = [_][]const u8{
         "data ownership fallback requires a single store across all roles",
         "data runtime background worker capacity is reserved and closes with its owner",
+        "data runtime status refresh retries bounded executor pressure without losing wakes",
         "failed full index enrichment does not make resident reads unavailable",
         "enrichment runtime status reports worker lifecycle diagnostics",
         "enrichment index status encodes worker lifecycle diagnostics",

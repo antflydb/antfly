@@ -168,6 +168,7 @@ const remote_metadata_routing_probe_wait_ns: u64 = std.time.ns_per_ms;
 const provision_head_poll_startup_interval_ms: u64 = std.time.ms_per_s;
 const provision_head_poll_interval_ms: u64 = 5 * std.time.ms_per_s;
 const runtime_status_refresh_interval_ms: u64 = std.time.ms_per_s;
+const background_submit_retry_interval_ms: u64 = 100;
 const split_transition_batch_leader_wait_ns: u64 = 500 * std.time.ns_per_ms;
 const split_transition_source_leader_wait_ns: u64 = 5 * std.time.ns_per_s;
 const transition_action_lane_count: usize = 64;
@@ -2139,6 +2140,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_refresh_started_total", "counter", "Runtime-status refresh runs started", self.data_server.runtime_status_refresh_started.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_refresh_completed_total", "counter", "Runtime-status refresh runs completed", self.data_server.runtime_status_refresh_completed.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_refresh_failed_total", "counter", "Runtime-status refresh runs that exited early with an error", self.data_server.runtime_status_refresh_failed.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_refresh_submit_deferred_total", "counter", "Runtime-status refresh submissions deferred by executor capacity", self.data_server.runtime_status_refresh_submit_deferred.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_refresh_last_table_count", "gauge", "Tables present in the most recent runtime-status refresh snapshot", self.data_server.runtime_status_refresh_last_table_count.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_refresh_last_group_count", "gauge", "Local groups present in the most recent runtime-status refresh snapshot", self.data_server.runtime_status_refresh_last_group_count.load(.monotonic));
         try health_metrics.appendPromMetric(writer, "antfly_data_runtime_status_refresh_last_db_opens", "gauge", "DB opens performed by the most recent runtime-status refresh run", self.data_server.runtime_status_refresh_last_db_opens.load(.monotonic));
@@ -5015,12 +5017,15 @@ pub const DataServer = struct {
     local_group_status_cache: LocalGroupStatusCache = .{},
     local_group_status_refresh_mutex: std.atomic.Mutex = .unlocked,
     local_group_status_refresh_active: std.atomic.Value(bool) = .init(false),
+    local_group_status_submit_not_before_ms: std.atomic.Value(u64) = .init(0),
     runtime_status_refresh_mutex: std.atomic.Mutex = .unlocked,
     runtime_status_refresh_active: std.atomic.Value(bool) = .init(false),
     runtime_status_refresh_started: std.atomic.Value(u64) = .init(0),
     runtime_status_refresh_completed: std.atomic.Value(u64) = .init(0),
     runtime_status_generation: std.atomic.Value(u64) = .init(1),
     runtime_status_refresh_failed: std.atomic.Value(u64) = .init(0),
+    runtime_status_refresh_submit_deferred: std.atomic.Value(u64) = .init(0),
+    runtime_status_refresh_submit_not_before_ms: std.atomic.Value(u64) = .init(0),
     runtime_status_refresh_last_table_count: std.atomic.Value(u64) = .init(0),
     runtime_status_refresh_last_group_count: std.atomic.Value(u64) = .init(0),
     runtime_status_refresh_last_db_opens: std.atomic.Value(u64) = .init(0),
@@ -7647,6 +7652,7 @@ pub const DataServer = struct {
                             error.UnknownGroup,
                             error.LmdbUnexpected,
                             error.Corrupted,
+                            error.ConcurrencyUnavailable,
                             => {},
                             else => |retry_err| try self.recordProvisionedRootRefreshMetadataError(retry_err),
                         };
@@ -14468,7 +14474,7 @@ pub const DataServer = struct {
         }
         if (try self.cloneCachedLocalGroupStatusesMatching(alloc, generation, fingerprint, true)) |stale| {
             errdefer freeGroupStatusesOwned(alloc, stale);
-            try self.requestLocalGroupStatusRefreshWithSources(
+            self.requestLocalGroupStatusRefreshWithSources(
                 generation,
                 fingerprint,
                 replica_root_dir,
@@ -14484,7 +14490,10 @@ pub const DataServer = struct {
                 inferred_group_leadership,
                 group_leadership_source,
                 group_membership_source,
-            );
+            ) catch |err| switch (err) {
+                error.ConcurrencyUnavailable => {},
+                else => return err,
+            };
             return try mergeRaftOnlyLocalGroupStatusFallbacks(
                 alloc,
                 stale,
@@ -14493,7 +14502,7 @@ pub const DataServer = struct {
                 group_membership_source,
             );
         }
-        try self.requestLocalGroupStatusRefreshWithSources(
+        self.requestLocalGroupStatusRefreshWithSources(
             generation,
             fingerprint,
             replica_root_dir,
@@ -14509,7 +14518,10 @@ pub const DataServer = struct {
             inferred_group_leadership,
             group_leadership_source,
             group_membership_source,
-        );
+        ) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => {},
+            else => return err,
+        };
         return try collectRaftOnlyLocalGroupStatusFallbacks(
             alloc,
             group_ids,
@@ -18193,18 +18205,32 @@ pub const DataServer = struct {
     }
 
     fn maybeRequestRuntimeStatusRefresh(self: *DataServer) !void {
+        return self.maybeRequestRuntimeStatusRefreshWithSubmitter(self.backgroundMonotonicMs(), submitBackgroundJob);
+    }
+
+    fn maybeRequestRuntimeStatusRefreshWithSubmitter(self: *DataServer, now_ms: u64, submitter: BackgroundJobSubmitter) !void {
         const registration = self.store_registration orelse return;
         _ = registration;
         if (!self.runtime_status_dirty.load(.acquire)) return;
-
-        const now_ms = self.backgroundMonotonicMs();
+        if (now_ms < self.runtime_status_refresh_submit_not_before_ms.load(.acquire)) return;
         const last_at_ms = self.runtime_status_last_refresh_at_ms.load(.monotonic);
         if (!self.runtime_status_force_refresh.load(.acquire) and
             last_at_ms != 0 and now_ms -| last_at_ms < runtime_status_refresh_interval_ms)
         {
             return;
         }
-        try self.requestRuntimeStatusRefresh();
+        self.requestRuntimeStatusRefreshWithSubmitter(submitter) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => {
+                // No job owns this wake yet. Preserve dirty/force state and
+                // retry on a later control turn without consuming another
+                // executor or blocking control/Raft progress inline.
+                self.runtime_status_refresh_submit_not_before_ms.store(now_ms +| background_submit_retry_interval_ms, .release);
+                _ = self.runtime_status_refresh_submit_deferred.fetchAdd(1, .monotonic);
+                return;
+            },
+            else => return err,
+        };
+        self.runtime_status_refresh_submit_not_before_ms.store(0, .release);
     }
 
     fn maybeRequestProvisionedRootRefresh(self: *DataServer) !void {
@@ -18290,7 +18316,10 @@ pub const DataServer = struct {
         if (not_before_ms != 0 and now_ms < not_before_ms) return;
         const last_at_ms = self.provisioned_startup_catch_up_last_run_at_ms.load(.monotonic);
         if (last_at_ms != 0 and now_ms -| last_at_ms < (if (self.schema_repair_pending.load(.acquire)) @as(u64, 100) else provisioned_startup_catch_up_interval_ms)) return;
-        try self.requestProvisionedStartupCatchUp();
+        self.requestProvisionedStartupCatchUp() catch |err| switch (err) {
+            error.ConcurrencyUnavailable => self.provisioned_startup_catch_up_not_before_ms.store(now_ms +| background_submit_retry_interval_ms, .release),
+            else => return err,
+        };
     }
 
     const BackgroundJobSubmitter = *const fn (
@@ -18340,6 +18369,10 @@ pub const DataServer = struct {
     }
 
     fn requestRuntimeStatusRefresh(self: *DataServer) !void {
+        return self.requestRuntimeStatusRefreshWithSubmitter(submitBackgroundJob);
+    }
+
+    fn requestRuntimeStatusRefreshWithSubmitter(self: *DataServer, submitter: BackgroundJobSubmitter) !void {
         if (self.runtime_status_refresh_active.load(.acquire)) return;
 
         const runtime = try self.ensureBackendRuntime();
@@ -18352,7 +18385,7 @@ pub const DataServer = struct {
         self.runtime_status_refresh_active.store(true, .release);
         self.runtime_status_refresh_mutex.unlock();
         errdefer self.runtime_status_refresh_active.store(false, .release);
-        try runtime.durable_jobs.submit(.{
+        try submitter(runtime.durable_jobs, .{
             .owner_id = owner_id,
             .class = .maintenance,
             .ptr = self,
@@ -18456,7 +18489,10 @@ pub const DataServer = struct {
         const last_run_at_ms = self.provisioned_index_repair_last_run_at_ms.load(.monotonic);
         const immediate_wake = self.provisioned_index_repair_immediate_wake_count.load(.acquire) != 0;
         if (!indexRepairScanDue(immediate_wake, dirty, last_run_at_ms, now_ms, self.provisioned_index_repair_discovery_interval_ms)) return;
-        try self.requestProvisionedIndexRepair();
+        self.requestProvisionedIndexRepair() catch |err| switch (err) {
+            error.ConcurrencyUnavailable => self.recordProvisionedIndexRepairSchedulerFailure(now_ms),
+            else => return err,
+        };
     }
 
     fn requestProvisionedIndexRepair(self: *DataServer) !void {
@@ -19195,6 +19231,8 @@ pub const DataServer = struct {
         if (self.provisioned_startup_catch_up_active.load(.acquire)) return;
 
         if (self.local_group_status_refresh_active.load(.acquire)) return;
+        const now_ms = self.backgroundMonotonicMs();
+        if (now_ms < self.local_group_status_submit_not_before_ms.load(.acquire)) return;
 
         const refresh = try self.alloc.create(OwnedLocalGroupStatusRefresh);
         errdefer self.alloc.destroy(refresh);
@@ -19231,17 +19269,21 @@ pub const DataServer = struct {
         self.local_group_status_refresh_active.store(true, .release);
         self.local_group_status_refresh_mutex.unlock();
         errdefer self.local_group_status_refresh_active.store(false, .release);
-        errdefer {
-            refresh.deinit();
-            self.alloc.destroy(refresh);
-        }
-        try runtime.durable_jobs.submit(.{
+        // The allocation/init errdefers above own failure cleanup. Adding a
+        // second cleanup here would free the captured snapshot twice when a
+        // saturated executor rejects the job before accepting ownership.
+        runtime.durable_jobs.submit(.{
             .owner_id = owner_id,
             .class = .maintenance,
             .ptr = refresh,
             .run = runLocalGroupStatusRefreshJob,
             .deinit = deinitLocalGroupStatusRefreshJob,
-        });
+        }) catch |err| {
+            if (err == error.ConcurrencyUnavailable)
+                self.local_group_status_submit_not_before_ms.store(now_ms +| background_submit_retry_interval_ms, .release);
+            return err;
+        };
+        self.local_group_status_submit_not_before_ms.store(0, .release);
     }
 
     fn runOwnedLocalGroupStatusRefresh(self: *DataServer, refresh: *OwnedLocalGroupStatusRefresh) void {
@@ -33875,6 +33917,99 @@ fn consumerTests() type {
 
             try std.testing.expectEqual(@as(usize, 1), snapshot_source.cached_calls);
             try std.testing.expectEqual(@as(usize, 0), snapshot_source.admin_calls);
+        }
+
+        test "data runtime status refresh retries bounded executor pressure without losing wakes" {
+            if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            const Source = struct {
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return .{ .metadata_group_id = 1, .metrics = .{} };
+                }
+                fn snapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return .{ .status = try status(undefined), .tables = &.{}, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+                }
+                fn free(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn fatal(_: backend_runtime_mod.DurableJobLane, _: backend_runtime_mod.Job) !void {
+                    return error.UnsupportedPlatform;
+                }
+                fn block(io: std.Io, release: *std.Io.Event) void {
+                    release.waitUncancelable(io);
+                }
+            };
+            var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .lane_limits = .{ .durable_background = 8 } });
+            defer runtime.deinit();
+            var server: DataServer = .{
+                .alloc = alloc,
+                .backend_runtime = runtime.ptr(),
+                .store_registration = .{ .node_id = 9, .store_id = 19, .role = "data", .failure_domain = "test" },
+                .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+                .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-status-capacity", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
+                .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-status-capacity", antfly.public_api.table_catalog.emptyCatalogSource()),
+                .status_source = .{ .ptr = undefined, .vtable = &.{ .status = Source.status, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.free } },
+                .api_server_cfg = .{},
+                .query_async_limit = .nothing,
+                .listener_cfg = undefined,
+            };
+            defer server.deinit();
+            const io = runtime.ptr().io().?;
+            var release: std.Io.Event = .unset;
+            // The durable lane's reaper owns the eighth slot.
+            var tasks: [7]std.Io.Future(void) = undefined;
+            var started: usize = 0;
+            defer {
+                release.set(io);
+                for (tasks[0..started]) |*task| task.await(io);
+            }
+            for (&tasks) |*task| {
+                task.* = try io.concurrent(Source.block, .{ io, &release });
+                started += 1;
+            }
+            try std.testing.expectError(error.ConcurrencyUnavailable, io.concurrent(Source.block, .{ io, &release }));
+            server.runtime_status_force_refresh.store(true, .release);
+            server.runtime_status_last_refresh_at_ms.store(999, .release);
+            try server.maybeRequestRuntimeStatusRefreshWithSubmitter(1000, DataServer.submitBackgroundJob);
+            try std.testing.expect(server.runtime_status_dirty.load(.acquire));
+            try std.testing.expect(server.runtime_status_force_refresh.load(.acquire));
+            try std.testing.expect(!server.runtime_status_refresh_active.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 999), server.runtime_status_last_refresh_at_ms.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 1), server.runtime_status_refresh_submit_deferred.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 1100), server.runtime_status_refresh_submit_not_before_ms.load(.acquire));
+            // Even a forced wake must respect submission backoff.
+            try server.maybeRequestRuntimeStatusRefreshWithSubmitter(1099, Source.fatal);
+            try std.testing.expectError(error.UnsupportedPlatform, server.maybeRequestRuntimeStatusRefreshWithSubmitter(1100, Source.fatal));
+            try std.testing.expect(!server.runtime_status_refresh_active.load(.acquire));
+
+            // Adjacent maintenance producers use their own existing retry
+            // state, rather than killing the next control turn for the same
+            // exhausted executor after status refresh has been deferred.
+            server.provisioned_startup_catch_up_dirty.store(true, .release);
+            try server.maybeRequestProvisionedStartupCatchUp();
+            try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+            try std.testing.expect(!server.provisioned_startup_catch_up_active.load(.acquire));
+            try std.testing.expect(server.provisioned_startup_catch_up_not_before_ms.load(.acquire) != 0);
+            server.provisioned_index_repair_dirty.store(true, .release);
+            try server.maybeRequestProvisionedIndexRepair();
+            try std.testing.expect(server.provisioned_index_repair_dirty.load(.acquire));
+            try std.testing.expect(!server.provisioned_index_repair_active.load(.acquire));
+            try std.testing.expect(server.provisioned_index_repair_scheduler_not_before_ms.load(.acquire) != 0);
+
+            const fallback = try server.collectStoreStatusGroupStatusesWithSources(alloc, "/tmp/unused-status-capacity", &.{77}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, null, null, null);
+            defer freeGroupStatusesOwned(alloc, fallback);
+            try std.testing.expect(!server.local_group_status_refresh_active.load(.acquire));
+            try std.testing.expect(server.local_group_status_submit_not_before_ms.load(.acquire) != 0);
+
+            release.set(io);
+            for (tasks[0..started]) |*task| task.await(io);
+            started = 0;
+            try server.maybeRequestRuntimeStatusRefreshWithSubmitter(1100, DataServer.submitBackgroundJob);
+            server.drainDataServerBackgroundJobs();
+            try std.testing.expectEqual(@as(u64, 1), server.runtime_status_refresh_completed.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 0), server.runtime_status_refresh_failed.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 0), server.runtime_status_refresh_submit_not_before_ms.load(.acquire));
+            try std.testing.expect(!server.runtime_status_dirty.load(.acquire));
+            try std.testing.expect(!server.runtime_status_force_refresh.load(.acquire));
+            try std.testing.expect(!server.runtime_status_refresh_active.load(.acquire));
         }
 
         test "data runtime provisioned root refresh spawn failure preserves retry bookkeeping" {
