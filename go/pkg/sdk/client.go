@@ -46,6 +46,8 @@ type Config struct {
 	// Admission optionally bounds this client's outstanding operations and local
 	// waiting. Reuse the Client and close streaming responses to return capacity.
 	Admission *ClientAdmission
+	// ReadRetries optionally retries rejected query requests before execution.
+	ReadRetries *ReadRetryPolicy
 	// RequestEditors are applied to both Antfly and inference requests. Use
 	// WithBasicAuth, WithApiKey, or WithToken for authentication.
 	RequestEditors []oapi.RequestEditorFn
@@ -67,6 +69,18 @@ func NewClient(config Config) (*Client, error) {
 			client = *config.HTTPClient
 		}
 		transport, err := newAdmissionTransport(client.Transport, *config.Admission)
+		if err != nil {
+			return nil, err
+		}
+		client.Transport = transport
+		config.HTTPClient = &client
+	}
+	if config.ReadRetries != nil {
+		client := http.Client{}
+		if config.HTTPClient != nil {
+			client = *config.HTTPClient
+		}
+		transport, err := NewReadRetryTransport(client.Transport, *config.ReadRetries)
 		if err != nil {
 			return nil, err
 		}

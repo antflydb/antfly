@@ -35,6 +35,7 @@
 
 // Main client export
 export { AdmissionPool, type ClientAdmission, ClientBusyError } from "./admission.js";
+export { type ReadRetryPolicy, readRetryFetch } from "./read-retries.js";
 export {
   AntflyClient,
   DEFAULT_WRITE_MAX_REQUEST_BYTES,

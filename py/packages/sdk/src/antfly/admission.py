@@ -223,11 +223,13 @@ class _AsyncStream(httpx.AsyncByteStream):
 class AdmissionHTTPClient(httpx.Client):
     """httpx client preserving its connection/proxy pool and bounding operations."""
 
-    def __init__(self, pool: AdmissionPool, **kwargs: Any) -> None:
+    def __init__(self, pool: AdmissionPool | None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.admission_pool = pool
 
     def send(self, request: httpx.Request, *, stream: bool = False, **kwargs: Any) -> httpx.Response:
+        if self.admission_pool is None:
+            return super().send(request, stream=stream, **kwargs)
         lease = self.admission_pool.acquire(request.extensions.get("antfly_deadline"))
         try:
             response = super().send(request, stream=True, **kwargs)
@@ -250,11 +252,13 @@ class AdmissionHTTPClient(httpx.Client):
 class AdmissionAsyncHTTPClient(httpx.AsyncClient):
     """asyncio httpx client; task cancellation retires queued work before dispatch."""
 
-    def __init__(self, pool: AdmissionPool, **kwargs: Any) -> None:
+    def __init__(self, pool: AdmissionPool | None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.admission_pool = pool
 
     async def send(self, request: httpx.Request, *, stream: bool = False, **kwargs: Any) -> httpx.Response:
+        if self.admission_pool is None:
+            return await super().send(request, stream=stream, **kwargs)
         lease = await self.admission_pool.acquire_async(request.extensions.get("antfly_deadline"))
         try:
             response = await super().send(request, stream=True, **kwargs)

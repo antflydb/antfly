@@ -68,6 +68,7 @@ from .index_config import (
     graph_index_sources,
     validate_create_index_request_relationships,
 )
+from .read_retries import ReadRetryAsyncHTTPClient, ReadRetryHTTPClient, ReadRetryPolicy
 
 __version__ = "0.2.0"
 
@@ -75,6 +76,9 @@ __all__ = [
     "AdmissionAsyncHTTPClient",
     "AdmissionHTTPClient",
     "AdmissionPool",
+    "ReadRetryPolicy",
+    "ReadRetryHTTPClient",
+    "ReadRetryAsyncHTTPClient",
     "ClientAdmission",
     "ClientBusyError",
     "AntflyClient",

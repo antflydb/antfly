@@ -5,6 +5,7 @@
 
 import createClient, { type Client } from "openapi-fetch";
 import { admissionFetch } from "./admission.js";
+import { readRetryFetch } from "./read-retries.js";
 import { validateGraphQueryIdentifiers } from "./graph-identifiers.js";
 import { validateGraphQueryResponses } from "./graph-results.js";
 import { validateCreateIndexRequestRelationships } from "./index-config.js";
@@ -432,7 +433,7 @@ export class AntflyClient {
   private readonly fetch: typeof globalThis.fetch;
 
   constructor(config: AntflyConfig) {
-    this.fetch = admissionFetch(config.admission);
+    this.fetch = readRetryFetch(admissionFetch(config.admission), config.readRetries);
     this.config = {
       ...config,
       baseUrl: normalizeBaseUrl(config.baseUrl),
