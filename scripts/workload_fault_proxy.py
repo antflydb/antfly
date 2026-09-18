@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import collections
 import errno
+import json
+import uuid
 import select
 import socket
 import struct
@@ -30,19 +32,35 @@ class FaultProxy:
         buffer_bytes=65536,
         capture_response_bytes=0,
         redact_values=(),
+        max_evidence_events=20000,
+        max_evidence_bytes=16 * 1024 * 1024,
     ):
         if (
             type(capture_response_bytes) is not int
             or not 0 <= capture_response_bytes <= 16384
         ):
             raise ValueError("response capture must be0..16384bytes")
+        if (
+            type(max_evidence_events) is not int
+            or not 1 <= max_evidence_events <= 20000
+            or type(max_evidence_bytes) is not int
+            or not 1 <= max_evidence_bytes <= 16 * 1024 * 1024
+        ):
+            raise ValueError("invalid proxy evidence budget")
+        self.max_evidence_events, self.max_evidence_bytes = (
+            max_evidence_events,
+            max_evidence_bytes,
+        )
+        self.evidence_events = self.evidence_bytes = 0
+        self.evidence_limit_reported = False
+        self.observer = uuid.uuid4().hex
         self.capture_response_bytes = capture_response_bytes
         self.redact_values = tuple(value for value in redact_values if value)
         self.listener = listener
         self.listener.listen(128)
         self.listener.setblocking(False)
         self.target = ("127.0.0.1", target_port)
-        self.record, self.name = record, name
+        self.record_sink, self.name = record, name
         self.max_connections, self.buffer_bytes = max_connections, buffer_bytes
         self.lock = threading.Lock()
         self.applied = threading.Condition(self.lock)
@@ -54,6 +72,38 @@ class FaultProxy:
         self.thread = threading.Thread(target=self._run, name=f"fault-proxy-{name}")
         self.error = None
         self.thread.start()
+
+    def redact(self, value):
+        for secret in self.redact_values:
+            value = value.replace(secret, "[REDACTED]")
+        return value
+
+    def record(self, event):
+        # Bound all proxy-originated receipts, not just each connection's prefix.
+        # Exhaustion invalidates the run and stops the relay; proof is never
+        # silently sampled or discarded while reporting successful qualification.
+        size = len(json.dumps(event, separators=(",", ":")).encode())
+        with self.lock:
+            if self.evidence_limit_reported:
+                return
+            if (
+                self.evidence_events >= self.max_evidence_events
+                or size > self.max_evidence_bytes - self.evidence_bytes
+            ):
+                self.evidence_limit_reported = True
+                self.error = "proxy evidence budget exhausted"
+                self.stopping.set()
+                event = {
+                    "event": "proxy_evidence_limit",
+                    "proxy": self.name,
+                    "error": self.error,
+                    "recorded_events": self.evidence_events,
+                    "recorded_bytes": self.evidence_bytes,
+                }
+            else:
+                self.evidence_events += 1
+                self.evidence_bytes += size
+        self.record_sink(event)
 
     def set_policy(self, *, partition=False, delay_ms=0, drop_response=False):
         if not 0 <= delay_ms <= 10000:
@@ -68,8 +118,9 @@ class FaultProxy:
             generation = self.generation
             if (
                 not self.applied.wait_for(
-                    lambda: self.applied_generation >= generation
-                    or self.error is not None,
+                    lambda: (
+                        self.applied_generation >= generation or self.error is not None
+                    ),
                     timeout=2,
                 )
                 or self.error
@@ -126,10 +177,7 @@ class FaultProxy:
                         if colon and key.lower() in allowed:
                             headers.append([key, value.strip()])
 
-                def redact(value):
-                    for secret in self.redact_values:
-                        value = value.replace(secret, "[REDACTED]")
-                    return value
+                redact = self.redact
 
                 self.record(
                     {
@@ -144,6 +192,23 @@ class FaultProxy:
                         ),
                         "proxy": self.name,
                         "connection": pair["id"],
+                        "transport": {
+                            "observer": self.observer,
+                            "request_first_received_ns": pair[
+                                "request_first_received_ns"
+                            ],
+                            "request_first_forwarded_ns": pair[
+                                "request_first_forwarded_ns"
+                            ],
+                            "request_forwarded_bytes": pair["request_forwarded_bytes"],
+                            "response_last_forwarded_ns": pair[
+                                "response_last_forwarded_ns"
+                            ],
+                            "response_forwarded_bytes": pair[
+                                "response_forwarded_bytes"
+                            ],
+                            "response_dropped_bytes": pair["response_dropped_bytes"],
+                        },
                         "status_line": redact(lines[0]) if separator else None,
                         "headers": [[key, redact(value)] for key, value in headers],
                         "body_prefix": (
@@ -189,6 +254,7 @@ class FaultProxy:
                         client = pair["client"]
                         if pair["sizes"][client]:
                             count("dropped_response_bytes", pair["sizes"][client])
+                            pair["response_dropped_bytes"] += pair["sizes"][client]
                             pair["pending"][client].clear()
                             pair["sizes"][client] = 0
                 with self.applied:
@@ -282,6 +348,12 @@ class FaultProxy:
                                 "request_bytes": 0,
                                 "response_prefix": bytearray(),
                                 "response_bytes": 0,
+                                "request_first_received_ns": None,
+                                "request_first_forwarded_ns": None,
+                                "request_forwarded_bytes": 0,
+                                "response_last_forwarded_ns": None,
+                                "response_forwarded_bytes": 0,
+                                "response_dropped_bytes": 0,
                                 "eof": set(),
                                 "shutdown": set(),
                             }
@@ -324,6 +396,8 @@ class FaultProxy:
                         ),
                         len(chunk),
                     )
+                    if from_client and pair["request_first_received_ns"] is None:
+                        pair["request_first_received_ns"] = time.monotonic_ns()
                     if from_client and self.capture_response_bytes:
                         pair["request_bytes"] += len(chunk)
                         pair["request_prefix"].extend(
@@ -347,6 +421,7 @@ class FaultProxy:
                                 if len(parts) == 3 and parts[2].startswith("HTTP/")
                                 else "non-http"
                             )
+                            path = self.redact(path)
                             with self.lock:
                                 self.paths[
                                     (
@@ -373,6 +448,7 @@ class FaultProxy:
                         )
                     if not from_client and policy["drop_response"]:
                         count("dropped_response_bytes", len(chunk))
+                        pair["response_dropped_bytes"] += len(chunk)
                         continue
                     pair["pending"][destination].append(
                         [time.monotonic() + policy["delay_ms"] / 1000, chunk]
@@ -409,6 +485,13 @@ class FaultProxy:
                         ),
                         sent,
                     )
+                    if peer is pair["server"]:
+                        if pair["request_first_forwarded_ns"] is None:
+                            pair["request_first_forwarded_ns"] = time.monotonic_ns()
+                        pair["request_forwarded_bytes"] += sent
+                    else:
+                        pair["response_last_forwarded_ns"] = time.monotonic_ns()
+                        pair["response_forwarded_bytes"] += sent
                     pair["sizes"][peer] -= sent
                     if sent == len(chunk):
                         queue.popleft()

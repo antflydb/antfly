@@ -119,8 +119,8 @@ def verify_exchange(request, response, secret, issuer, coordinator, destination)
     return {"kind": "terminal", "attempt": attempt, "status": status, "proof": proof}
 
 
-def verify_generation_closure(prior, closure, following):
-    """A matching signed fence must cover prior attempt before a newer send."""
+def verify_generation_coverage(prior, closure, following):
+    """Verify signed generation coverage only; no delivery or ordering claim."""
     old, fence, new = prior["attempt"], closure["proof"], following["attempt"]
     if (
         closure["kind"] != "fence"
@@ -143,4 +143,98 @@ def verify_generation_closure(prior, closure, following):
         "closed_generation": old["generation"],
         "new_generation": new["generation"],
         "proof": fence,
+    }
+
+
+def verify_capture(capture, secret, issuer, coordinator, destination):
+    """Bind a verified exchange to its single proxy connection observation."""
+    if capture.get("event") != "proxy_response_capture":
+        raise ValueError("not a connection capture")
+    proof = verify_exchange(
+        capture["request_message"],
+        capture["response_message"],
+        secret,
+        issuer,
+        coordinator,
+        destination,
+    )
+    transport = capture.get("transport", {})
+    if (
+        not isinstance(transport.get("observer"), str)
+        or not transport["observer"]
+        or not isinstance(capture.get("proxy"), str)
+        or type(capture.get("connection")) is not int
+        or capture["connection"] <= 0
+    ):
+        raise ValueError("missing proxy observation identity")
+    for key in (
+        "request_forwarded_bytes",
+        "response_forwarded_bytes",
+        "response_dropped_bytes",
+    ):
+        if type(transport.get(key)) is not int or transport[key] < 0:
+            raise ValueError("invalid forwarding count")
+    for key in (
+        "request_first_received_ns",
+        "request_first_forwarded_ns",
+        "response_last_forwarded_ns",
+    ):
+        if transport.get(key) is not None and (
+            type(transport[key]) is not int or transport[key] <= 0
+        ):
+            raise ValueError("invalid forwarding time")
+    if (
+        transport["request_forwarded_bytes"]
+        != capture["request_message"]["received_bytes"]
+        or transport.get("request_first_received_ns") is None
+        or transport.get("request_first_forwarded_ns") is None
+        or transport["request_first_received_ns"]
+        > transport["request_first_forwarded_ns"]
+        or transport["response_forwarded_bytes"] + transport["response_dropped_bytes"]
+        > capture["response_message"]["received_bytes"]
+    ):
+        raise ValueError("inconsistent connection forwarding")
+    proof["observation"] = {
+        **transport,
+        "proxy": capture["proxy"],
+        "connection": capture["connection"],
+        "response_received_bytes": capture["response_message"]["received_bytes"],
+    }
+    return proof
+
+
+def verify_generation_closure(prior, closure, following):
+    """Require fence forwarding before the newer request reaches this relay.
+
+    This proves proxy-observed transport order, not application consumption of
+    the fence or retirement of the coordinator's durable record.
+    """
+    result = verify_generation_coverage(prior, closure, following)
+    old, fence, new = (
+        item.get("observation", {}) for item in (prior, closure, following)
+    )
+    if (
+        not old
+        or not fence
+        or not new
+        or any(
+            item.get("observer") != fence.get("observer")
+            or item.get("proxy") != fence.get("proxy")
+            for item in (old, new)
+        )
+        or len({item.get("connection") for item in (old, fence, new)}) != 3
+        or fence.get("response_dropped_bytes") != 0
+        or fence.get("response_forwarded_bytes") != fence.get("response_received_bytes")
+        or not fence.get("response_last_forwarded_ns")
+        or not old.get("request_first_forwarded_ns", 0)
+        < fence.get("request_first_forwarded_ns", 0)
+        or not fence["request_first_forwarded_ns"]
+        <= fence["response_last_forwarded_ns"]
+        < new.get("request_first_received_ns", 0)
+    ):
+        raise ValueError("no complete fence forwarding before newer request")
+    return {
+        **result,
+        "fence_forwarded_ns": fence["response_last_forwarded_ns"],
+        "new_request_received_ns": new["request_first_received_ns"],
     }

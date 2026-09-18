@@ -223,9 +223,11 @@ class SignedRunnerTests(unittest.TestCase):
                 "is_write": False,
             }
 
-        with tempfile.TemporaryDirectory() as tmp, patch.object(
-            cluster, "Cluster", FakeCluster
-        ), patch.object(cluster, "request", request):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(cluster, "Cluster", FakeCluster),
+            patch.object(cluster, "request", request),
+        ):
             complete = cluster.run(plan, Path(tmp) / "complete")
             self.assertTrue(complete["correctness_passed"])
             self.assertEqual(
@@ -314,6 +316,30 @@ class FaultProxyTests(unittest.TestCase):
         self.assertFalse(capture["truncated"])
         self.assertNotIn("credential-must-not-leak", json.dumps(capture))
 
+    def test_request_paths_are_redacted_in_all_receipts(self):
+        self.assertEqual(self.get("/fixture-secret?token=fixture-secret")[0], 200)
+        deadline = time.monotonic() + 1
+        while not any(
+            row["event"] == "proxy_response_capture" for row in self.receipts
+        ):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+        self.assertNotIn("fixture-secret", json.dumps(self.receipts))
+        self.assertNotIn("fixture-secret", json.dumps(self.proxy.snapshot()))
+        capture = next(
+            row for row in self.receipts if row["event"] == "proxy_response_capture"
+        )
+        transport = capture["transport"]
+        self.assertGreater(transport["request_first_forwarded_ns"], 0)
+        self.assertGreaterEqual(
+            transport["response_last_forwarded_ns"],
+            transport["request_first_forwarded_ns"],
+        )
+        self.assertEqual(transport["response_dropped_bytes"], 0)
+        self.assertEqual(
+            transport["response_forwarded_bytes"], capture["received_bytes"]
+        )
+
     def test_healthy_delayed_half_close_drains_bounded_queues(self):
         self.proxy.set_policy(delay_ms=20)
         started = time.monotonic()
@@ -354,6 +380,38 @@ class FaultProxyTests(unittest.TestCase):
         self.proxy.set_policy()
         self.assertEqual(self.get("/healed")[0], 200)
         self.assertFalse(self.proxy.snapshot()["policy"]["drop_response"])
+
+
+class ProxyEvidenceBudgetTests(unittest.TestCase):
+    def test_aggregate_event_and_byte_limits_fail_explicitly(self):
+        for options in ({"max_evidence_events": 2}, {"max_evidence_bytes": 32}):
+            with self.subTest(options=options):
+                listener = socket.socket()
+                listener.bind(("127.0.0.1", 0))
+                receipts = []
+                proxy = FaultProxy(listener, 1, receipts.append, "budget", **options)
+                try:
+                    for _ in range(100):
+                        proxy.record({"event": "fixture", "body": "x" * 40})
+                    self.assertEqual(
+                        sum(row["event"] == "proxy_evidence_limit" for row in receipts),
+                        1,
+                    )
+                    self.assertLessEqual(
+                        proxy.evidence_events, proxy.max_evidence_events
+                    )
+                    self.assertLessEqual(proxy.evidence_bytes, proxy.max_evidence_bytes)
+                    self.assertEqual(
+                        proxy.snapshot()["error"], "proxy evidence budget exhausted"
+                    )
+                    with self.assertRaisesRegex(
+                        RuntimeError, "evidence budget exhausted"
+                    ):
+                        proxy.close()
+                finally:
+                    proxy.stopping.set()
+                    proxy.thread.join(timeout=2)
+                    listener.close()
 
 
 if __name__ == "__main__":

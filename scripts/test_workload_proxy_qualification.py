@@ -59,6 +59,30 @@ class ProxyProofTests(unittest.TestCase):
             request, response, self.secret, self.issuer, 3, 2
         )
 
+    def observed(self, request, response, connection, first, last):
+        return evidence.verify_capture(
+            {
+                "event": "proxy_response_capture",
+                "proxy": "worker",
+                "connection": connection,
+                "request_message": request,
+                "response_message": response,
+                "transport": {
+                    "observer": "one-relay-lifetime",
+                    "request_first_received_ns": first,
+                    "request_first_forwarded_ns": first,
+                    "request_forwarded_bytes": request["received_bytes"],
+                    "response_last_forwarded_ns": last,
+                    "response_forwarded_bytes": response["received_bytes"],
+                    "response_dropped_bytes": 0,
+                },
+            },
+            self.secret,
+            self.issuer,
+            3,
+            2,
+        )
+
     def test_terminal_requires_exact_request_and_response(self):
         request, response = self.terminal_pair()
         self.assertEqual(self.verify(request, response)["attempt"], self.attempt)
@@ -120,7 +144,7 @@ class ProxyProofTests(unittest.TestCase):
         request["body_base64"] = base64.b64encode(body.replace(b"123", b"124")).decode()
         with self.assertRaises(ValueError):
             self.verify(request, response)
-        old = self.verify(*self.terminal_pair())
+        old = self.observed(*self.terminal_pair(), 1, 10, 20)
         body = b'{"workload_attempt_control":"close_generation"}'
         frame = protocol.sign_request(
             self.secret,
@@ -152,14 +176,46 @@ class ProxyProofTests(unittest.TestCase):
         response, _ = self.message(
             "HTTP/1.1 200 OK", b"{}", **{"X-Antfly-Workload-Evidence": frame}
         )
-        closure = self.verify(request, response)
-        following = self.verify(*self.terminal_pair({**self.attempt, "generation": 3}))
+        closure = self.observed(request, response, 2, 30, 40)
+        following = self.observed(
+            *self.terminal_pair({**self.attempt, "generation": 3}), 3, 50, 60
+        )
         self.assertEqual(
             evidence.verify_generation_closure(old, closure, following)[
                 "closed_generation"
             ],
             2,
         )
+        # Cryptographic coverage alone cannot establish observation order.
+        unobserved = {
+            key: value for key, value in closure.items() if key != "observation"
+        }
+        self.assertEqual(
+            evidence.verify_generation_coverage(old, unobserved, following)[
+                "closed_generation"
+            ],
+            2,
+        )
+        with self.assertRaises(ValueError):
+            evidence.verify_generation_closure(old, unobserved, following)
+        for changes in (
+            {"response_last_forwarded_ns": 55},  # newer request already sent
+            {"response_dropped_bytes": 1, "response_forwarded_bytes": 0},
+            {"response_forwarded_bytes": 0},  # observed but never delivered
+            {"observer": "different-relay-lifetime"},
+        ):
+            altered = {**closure, "observation": {**closure["observation"], **changes}}
+            with self.assertRaises(ValueError):
+                evidence.verify_generation_closure(old, altered, following)
+        buffered_early = {
+            **following,
+            "observation": {
+                **following["observation"],
+                "request_first_received_ns": 35,
+            },
+        }
+        with self.assertRaises(ValueError):
+            evidence.verify_generation_closure(old, closure, buffered_early)
         for changed in (
             {**following, "attempt": {**following["attempt"], "generation": 2}},
             {
