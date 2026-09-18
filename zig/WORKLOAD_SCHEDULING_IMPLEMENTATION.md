@@ -49,7 +49,7 @@ The REST/httpx, alternate-listener API-kernel paths, MCP, query builder, A2A,
 extension-host query/write calls, and serverless query/write handlers share this
 owner at their existing admission boundaries. Legacy nonwaiting callers cannot
 jump ahead of queued work. Metadata/data teardown can close admission across the
-compiled API boundary; API ABI version 20 includes that operation and expanded
+compiled API boundary; API ABI version 21 includes that operation and expanded
 statistics. No inference-provider admission or transaction durability contract
 is replaced by this queue.
 
@@ -59,6 +59,15 @@ and effective queue bounds, queue residence histograms, active/queued counts,
 retained bytes, expirations, cancellations, and draining are observable through
 the shared admission metrics. Explicit zero execution capacity retains its legacy
 unlimited meaning; explicit byte ceilings still apply to contextual leases.
+
+The shared metrics exporter includes a process-local policy generation, active
+plus queued operation count, and bounded rejection reasons. Execution capacity,
+queue count, queue bytes, total retained bytes, oversized requests, wait expiry,
+draining, and policy reductions remain distinguishable. Allocation-attempt
+denials have a separate counter: a failed allocator growth is not another
+rejected request. Providers that expose only legacy statistics report diagnostics
+as unavailable rather than implying zero pressure. These are engine contracts
+for Cloud observability; no Cloud dashboard or automatic scaling is implemented.
 
 The Go, TypeScript, Python, and Rust SDKs have optional shared client pools. They bound active operations and
 waiting, observe context cancellation before dispatch, and hold a slot through

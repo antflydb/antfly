@@ -49,6 +49,23 @@ pub const Failure = error{ AdmissionFull, AdmissionQueueFull, AdmissionBytesExha
 pub const wait_bucket_ms = [_]u64{ 1, 5, 10, 25, 50, 100, 250, 1000, 5000, 60000 };
 pub const wait_bucket_seconds = [_][]const u8{ "0.001", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "1", "5", "60", "+Inf" };
 
+/// Bounded diagnostic vocabulary. One request rejection increments exactly one
+/// reason; allocation denials are separate because an allocator can retry growth.
+pub const RejectionReason = enum {
+    execution_capacity,
+    queue_count,
+    queue_bytes,
+    retained_bytes,
+    request_bytes,
+    wait_timeout,
+    deadline,
+    draining,
+    policy_reduction,
+};
+pub const rejection_reason_count = @typeInfo(RejectionReason).@"enum".fields.len;
+pub const AllocationDenial = enum { retained_bytes, allocation_bytes, draining };
+pub const allocation_denial_count = @typeInfo(AllocationDenial).@"enum".fields.len;
+
 /// Stable allocation accounting can outlive the embedded admission controller.
 /// Its fixed metadata is controller overhead; retained_bytes tracks every
 /// allocation charged through it, including allocation-owner metadata.
@@ -117,6 +134,9 @@ pub const Controller = struct {
     head: ?*Waiter = null,
     tail: ?*Waiter = null,
     memory_account: ?*MemoryAccount = null,
+    policy_generation: u64 = 1,
+    rejection_reasons: [rejection_reason_count]u64 = @splat(0),
+    allocation_denials: [allocation_denial_count]u64 = @splat(0),
 
     const Waiter = struct {
         previous: ?*Waiter = null,
@@ -159,6 +179,10 @@ pub const Controller = struct {
         max_queued_bytes: usize = 0,
         max_retained_bytes: usize = 0,
         max_wait_ms: u32 = 0,
+        /// Zero denotes an older/partial statistics provider without diagnostics.
+        policy_generation: u64 = 0,
+        rejection_reasons: [rejection_reason_count]u64 = @splat(0),
+        allocation_denials: [allocation_denial_count]u64 = @splat(0),
     };
 
     pub fn init(capacity: usize) Controller {
@@ -198,10 +222,18 @@ pub const Controller = struct {
     pub fn reserveMemory(self: *Controller, bytes: usize) !void {
         self.lock();
         defer self.mutex.unlock();
-        if (self.closed) return error.AdmissionClosed;
-        if (self.config.max_retained_bytes != 0 and bytes > self.config.max_retained_bytes)
+        if (self.closed) {
+            self.allocation_denials[@intFromEnum(AllocationDenial.draining)] +|= 1;
+            return error.AdmissionClosed;
+        }
+        if (self.config.max_retained_bytes != 0 and bytes > self.config.max_retained_bytes) {
+            self.allocation_denials[@intFromEnum(AllocationDenial.allocation_bytes)] +|= 1;
             return error.AdmissionRequestTooLarge;
-        if (!self.fitsBytes(bytes)) return error.AdmissionBytesExhausted;
+        }
+        if (!self.fitsBytes(bytes)) {
+            self.allocation_denials[@intFromEnum(AllocationDenial.retained_bytes)] +|= 1;
+            return error.AdmissionBytesExhausted;
+        }
         self.retained_bytes += bytes;
     }
 
@@ -264,12 +296,17 @@ pub const Controller = struct {
         self.peak = @max(self.peak, self.active);
     }
 
+    fn recordRejection(self: *Controller, reason: RejectionReason) void {
+        self.rejected +|= 1;
+        self.rejection_reasons[@intFromEnum(reason)] +|= 1;
+    }
+
     /// Legacy nonwaiting callers share execution capacity and cannot bypass FIFO.
     pub fn tryAcquire(self: *Controller) bool {
         self.lock();
         defer self.mutex.unlock();
         if (self.closed or self.head != null or !self.hasSlot() or !self.fitsBytes(0)) {
-            self.rejected +|= 1;
+            self.recordRejection(if (self.closed) .draining else if (!self.fitsBytes(0)) .retained_bytes else .execution_capacity);
             return false;
         }
         self.activate();
@@ -293,7 +330,7 @@ pub const Controller = struct {
         waiter.wait_deadline_ns = started +| @as(u64, self.config.max_wait_ms) * std.time.ns_per_ms;
         const failure: ?Failure = if (self.closed) error.AdmissionClosed else if (self.config.max_retained_bytes != 0 and options.retained_bytes > self.config.max_retained_bytes) error.AdmissionRequestTooLarge else if (!self.fitsBytes(options.retained_bytes)) error.AdmissionBytesExhausted else null;
         if (failure) |err| {
-            self.rejected +|= 1;
+            self.recordRejection(if (err == error.AdmissionClosed) .draining else if (err == error.AdmissionRequestTooLarge) .request_bytes else .retained_bytes);
             self.mutex.unlock();
             return err;
         }
@@ -308,7 +345,7 @@ pub const Controller = struct {
         }
         const queue_failure: ?Failure = if (self.config.max_wait_ms == 0) error.AdmissionFull else if (self.queued >= self.config.max_queued_requests) error.AdmissionQueueFull else if (options.retained_bytes > self.config.max_queued_bytes -| self.queued_bytes) error.AdmissionBytesExhausted else null;
         if (queue_failure) |err| {
-            self.rejected +|= 1;
+            self.recordRejection(if (err == error.AdmissionFull) .execution_capacity else if (err == error.AdmissionQueueFull) .queue_count else .queue_bytes);
             self.mutex.unlock();
             return err;
         }
@@ -378,7 +415,14 @@ pub const Controller = struct {
         self.recordWait(waiter.options.now() -| waiter.started_ns);
         if (outcome) |err| {
             self.retained_bytes -= waiter.options.retained_bytes;
-            self.rejected +|= 1;
+            self.recordRejection(switch (err) {
+                error.AdmissionWaitTimeout => .wait_timeout,
+                error.DeadlineExceeded => .deadline,
+                error.AdmissionClosed => .draining,
+                // Reconfiguration is the only source of queue-full retirement.
+                error.AdmissionQueueFull => .policy_reduction,
+                else => unreachable,
+            });
             if (err == error.DeadlineExceeded or err == error.AdmissionWaitTimeout) self.expired +|= 1;
         } else self.activate();
         waiter.outcome = outcome;
@@ -453,6 +497,7 @@ pub const Controller = struct {
         defer self.mutex.unlock();
         self.capacity = capacity;
         self.config = config;
+        self.policy_generation +|= 1;
         // Oldest requests retain priority. Retire excess newest waiters and
         // stop granting while live bytes exceed a reduced process envelope.
         while (self.tail) |waiter| {
@@ -471,7 +516,29 @@ pub const Controller = struct {
         const owner = @constCast(self);
         owner.lock();
         defer owner.mutex.unlock();
-        return .{ .capacity = self.capacity, .in_flight = self.active, .peak_in_flight = self.peak, .rejected_total = self.rejected, .queued = self.queued, .queued_bytes = self.queued_bytes, .retained_bytes = self.retained_bytes, .waited_total = self.waited, .wait_ns_total = self.wait_ns, .wait_completed_total = self.wait_completed, .wait_buckets = self.wait_buckets, .expired_total = self.expired, .cancelled_total = self.cancelled, .draining = self.closed, .max_queued_requests = self.config.max_queued_requests, .max_queued_bytes = self.config.max_queued_bytes, .max_retained_bytes = self.config.max_retained_bytes, .max_wait_ms = self.config.max_wait_ms };
+        return .{
+            .capacity = self.capacity,
+            .in_flight = self.active,
+            .peak_in_flight = self.peak,
+            .rejected_total = self.rejected,
+            .queued = self.queued,
+            .queued_bytes = self.queued_bytes,
+            .retained_bytes = self.retained_bytes,
+            .waited_total = self.waited,
+            .wait_ns_total = self.wait_ns,
+            .wait_completed_total = self.wait_completed,
+            .wait_buckets = self.wait_buckets,
+            .expired_total = self.expired,
+            .cancelled_total = self.cancelled,
+            .draining = self.closed,
+            .max_queued_requests = self.config.max_queued_requests,
+            .max_queued_bytes = self.config.max_queued_bytes,
+            .max_retained_bytes = self.config.max_retained_bytes,
+            .max_wait_ms = self.config.max_wait_ms,
+            .policy_generation = self.policy_generation,
+            .rejection_reasons = self.rejection_reasons,
+            .allocation_denials = self.allocation_denials,
+        };
     }
 };
 
@@ -486,6 +553,39 @@ test "workload admission validates queue bounds and preserves zero capacity" {
     a.release();
     b.release();
     try std.testing.expectEqual(@as(usize, 0), controller.stats().retained_bytes);
+}
+
+test "workload admission diagnostics distinguish request rejection from allocation pressure" {
+    var gate = Controller.initConfigured(1, .{ .max_retained_bytes = 128 });
+    var lease = try gate.acquire(.{ .io = std.testing.io, .retained_bytes = 64 });
+    defer lease.release();
+    try std.testing.expectError(error.AdmissionFull, gate.acquire(.{ .io = std.testing.io, .retained_bytes = 1 }));
+    try std.testing.expectError(error.AdmissionRequestTooLarge, gate.acquire(.{ .io = std.testing.io, .retained_bytes = 129 }));
+    try std.testing.expectError(error.AdmissionBytesExhausted, gate.acquire(.{ .io = std.testing.io, .retained_bytes = 65 }));
+    try std.testing.expectError(error.AdmissionRequestTooLarge, gate.reserveMemory(129));
+    try std.testing.expectError(error.AdmissionBytesExhausted, gate.reserveMemory(65));
+    const generation = gate.stats().policy_generation;
+    try std.testing.expectError(error.InvalidConfig, gate.reconfigure(8, .{ .max_wait_ms = 1 }));
+    try std.testing.expectEqual(generation, gate.stats().policy_generation);
+    try std.testing.expectEqual(@as(usize, 1), gate.stats().capacity);
+    try gate.reconfigure(2, .{ .max_retained_bytes = 32 });
+    const reduced = gate.stats();
+    try std.testing.expectEqual(generation + 1, reduced.policy_generation);
+    try std.testing.expectEqual(@as(usize, 64), reduced.retained_bytes);
+    try std.testing.expect(!gate.tryAcquire());
+    gate.close();
+    try std.testing.expect(!gate.tryAcquire());
+    try std.testing.expectError(error.AdmissionClosed, gate.reserveMemory(1));
+    const stats = gate.stats();
+    try std.testing.expectEqual(@as(u64, 5), stats.rejected_total);
+    try std.testing.expectEqual(stats.rejected_total, @reduce(.Add, @as(@Vector(rejection_reason_count, u64), stats.rejection_reasons)));
+    try std.testing.expectEqual(@as(u64, 1), stats.rejection_reasons[@intFromEnum(RejectionReason.execution_capacity)]);
+    try std.testing.expectEqual(@as(u64, 1), stats.rejection_reasons[@intFromEnum(RejectionReason.request_bytes)]);
+    try std.testing.expectEqual(@as(u64, 2), stats.rejection_reasons[@intFromEnum(RejectionReason.retained_bytes)]);
+    try std.testing.expectEqual(@as(u64, 1), stats.rejection_reasons[@intFromEnum(RejectionReason.draining)]);
+    for (stats.allocation_denials) |count| try std.testing.expectEqual(@as(u64, 1), count);
+    lease.release();
+    try std.testing.expectEqual(@as(usize, 0), gate.stats().retained_bytes);
 }
 
 test "workload admission rejects expired cancelled and oversized work before starting" {
@@ -510,6 +610,7 @@ test "workload admission timeout retires queue bytes without releasing running w
     try std.testing.expectEqual(@as(usize, 0), stats.queued_bytes);
     try std.testing.expectEqual(@as(usize, 64), stats.retained_bytes);
     try std.testing.expectEqual(@as(usize, 1), stats.in_flight);
+    try std.testing.expectEqual(@as(u64, 1), stats.rejection_reasons[@intFromEnum(RejectionReason.wait_timeout)]);
 }
 
 test "workload admission cancellation racing grant returns every reservation once" {
@@ -607,6 +708,7 @@ test "workload admission FIFO pressure reduction and drain preserve ownership" {
             try controller.reconfigure(1, .{ .max_wait_ms = 5000, .max_queued_requests = 1, .max_queued_bytes = 64, .max_retained_bytes = 128 });
             try second.granted.wait(io);
             try std.testing.expectEqual(error.AdmissionQueueFull, second.err.?);
+            try std.testing.expectEqual(@as(u64, 1), controller.stats().rejection_reasons[@intFromEnum(RejectionReason.policy_reduction)]);
         }
         blocker.release();
         try first.granted.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });

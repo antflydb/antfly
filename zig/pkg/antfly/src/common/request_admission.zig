@@ -64,6 +64,21 @@ pub fn appendPrometheusMetrics(
     try prometheus.appendPromMetric(writer, names.peak_in_flight, "gauge", names.peak_help, stats.peak_in_flight);
     try prometheus.appendPromMetric(writer, names.rejected_total, "counter", names.rejected_help, stats.rejected_total);
     const prefix = "antfly_admission_" ++ @tagName(class);
+    try prometheus.appendPromMetric(writer, prefix ++ "_diagnostics_available", "gauge", "Whether the statistics provider exposes policy and limiting-resource diagnostics", @intFromBool(stats.policy_generation != 0));
+    if (stats.policy_generation != 0) {
+        try prometheus.appendPromMetric(writer, prefix ++ "_policy_generation", "gauge", "Process-local policy revision; resets on restart and advances on accepted reconfiguration", stats.policy_generation);
+        try prometheus.appendPromMetric(writer, prefix ++ "_outstanding_requests", "gauge", "Active plus queued foreground operations; excludes output retained after execution", stats.in_flight +| stats.queued);
+        const rejections = prefix ++ "_rejections_by_reason_total";
+        try writer.print("# HELP {s} Admission rejections by bounded limiting reason\n# TYPE {s} counter\n", .{ rejections, rejections });
+        inline for (@typeInfo(workload.RejectionReason).@"enum".fields, 0..) |field, i| {
+            try writer.print("{s}{{reason=\"{s}\"}} {d}\n", .{ rejections, field.name, stats.rejection_reasons[i] });
+        }
+        const denials = prefix ++ "_allocation_denials_total";
+        try writer.print("# HELP {s} Tracked allocation attempts denied by a budget; distinct from rejected requests\n# TYPE {s} counter\n", .{ denials, denials });
+        inline for (@typeInfo(workload.AllocationDenial).@"enum".fields, 0..) |field, i| {
+            try writer.print("{s}{{reason=\"{s}\"}} {d}\n", .{ denials, field.name, stats.allocation_denials[i] });
+        }
+    }
     try prometheus.appendPromMetric(writer, prefix ++ "_queue_capacity_requests", "gauge", "Configured maximum queued requests", stats.max_queued_requests);
     try prometheus.appendPromMetric(writer, prefix ++ "_queue_capacity_bytes", "gauge", "Configured maximum queued request bytes", stats.max_queued_bytes);
     try prometheus.appendPromMetric(writer, prefix ++ "_retained_capacity_bytes", "gauge", "Configured request and tracked allocation byte ceiling; zero is unlimited", stats.max_retained_bytes);
@@ -139,4 +154,26 @@ test "request admission metrics use the shared admission namespace" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_write_rejected_requests_total 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_capacity_requests 8\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_rejected_requests_total 4\n") != null);
+    // Partial inference/legacy providers must not advertise zero pressure as
+    // though they supplied complete diagnostics.
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_diagnostics_available 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_rejections_by_reason_total") == null);
+}
+
+test "request admission metrics expose actual fixed policy and bounded failure reasons" {
+    var gate = RequestAdmission.initConfigured(1, .{ .max_retained_bytes = 128 });
+    var lease = try gate.acquire(.{ .io = std.testing.io, .retained_bytes = 64 });
+    defer lease.release();
+    try std.testing.expect(!gate.tryAcquire());
+    try std.testing.expectError(error.AdmissionBytesExhausted, gate.reserveMemory(65));
+    try gate.reconfigure(2, .{ .max_retained_bytes = 128 });
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try appendPrometheusMetrics(&output.writer, .query, gate.stats());
+    const rendered = output.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_policy_generation 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_capacity_requests 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_outstanding_requests 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_rejections_by_reason_total{reason=\"execution_capacity\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_allocation_denials_total{reason=\"retained_bytes\"} 1\n") != null);
 }
