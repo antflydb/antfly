@@ -71,8 +71,3 @@ export const KernelsFile = z.object({
 });
 export type KernelsFile = z.infer<typeof KernelsFile>;
 
-export const EnvFlagsFile = z.object({
-  schemaVersion: z.number(),
-  flags: z.array(EnvFlagGate),
-});
-export type EnvFlagsFile = z.infer<typeof EnvFlagsFile>;

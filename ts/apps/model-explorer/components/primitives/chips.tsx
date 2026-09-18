@@ -74,22 +74,24 @@ export function EnvFlagChip({
     <TooltipProvider>
       <Tooltip>
         <TooltipTrigger asChild>
-          {/* A real destination (the flags index) — previously a no-op button. */}
-          <Link
-            href={`/systems/flags?q=${encodeURIComponent(name)}`}
-            aria-label={`${name}${defaultOn === undefined ? "" : ` (${defaultOn ? "default on" : "default off"})`} — view in the flags index`}
+          <span
             className={cn(
-              "inline-flex max-w-full items-center gap-1 rounded-sm border bg-muted/50 px-1.5 py-px font-mono text-[10px] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+              "inline-flex max-w-full items-center gap-1 rounded-sm border bg-muted/50 px-1.5 py-px font-mono text-[10px]",
               className,
             )}
           >
             {defaultOn !== undefined && (
               <span
+                aria-hidden="true"
                 className={cn("size-1.5 shrink-0 rounded-full", defaultOn ? "bg-emerald-500" : "bg-muted-foreground/40")}
               />
             )}
             <span className="truncate">{name}</span>
-          </Link>
+            {/* The dot carries the default state visually; say it too, so colour is not the only cue. */}
+            {defaultOn !== undefined && (
+              <span className="sr-only">{defaultOn ? " (default on)" : " (default off)"}</span>
+            )}
+          </span>
         </TooltipTrigger>
         <TooltipContent className="font-mono text-xs">
           {name}

@@ -69,7 +69,6 @@ const INDEX_TILES = [
   { label: "graph op kinds", value: "opKinds", href: "/runtime#graph" },
   { label: "Metal kernels", value: "kernels", href: "/systems/kernels" },
   { label: "compiled kernel routes", value: "routes", href: "/systems/kernels" },
-  { label: "env-flag references", value: "envFlags", href: "/systems/flags" },
 ] as const;
 
 export default function HomePage() {

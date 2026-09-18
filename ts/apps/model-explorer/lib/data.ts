@@ -2,14 +2,13 @@
 // env flags, kernels) — importing it from a client component would put
 // ~2 MB of JSON plus zod parsing into the browser bundle.
 import "server-only";
-import envFlagsJson from "@/data/generated/env-flags.json";
 import kernelsJson from "@/data/generated/kernels.json";
 import linksJson from "@/data/generated/links.json";
 import manifestJson from "@/data/generated/manifest.json";
 import opKindsJson from "@/data/generated/op-kinds.json";
 import snippetsJson from "@/data/generated/snippets.json";
 import { L } from "@/lib/links";
-import { EnvFlagsFile, KernelsFile, Manifest, type SourceLink } from "@/lib/schema";
+import { KernelsFile, Manifest, type SourceLink } from "@/lib/schema";
 
 // Single implementation lives in lib/links.ts (client-safe); re-exported here
 // so server code keeps one import site and the two can never drift.
@@ -17,7 +16,6 @@ export { L };
 
 export const manifest = Manifest.parse(manifestJson);
 export const kernels = KernelsFile.parse(kernelsJson);
-export const envFlags = EnvFlagsFile.parse(envFlagsJson);
 
 export const opKinds = (opKindsJson as { opKinds: Array<{ name: string; group: string; source: SourceLink }> })
   .opKinds;

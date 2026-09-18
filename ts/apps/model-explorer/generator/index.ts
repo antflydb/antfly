@@ -12,7 +12,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
-  EnvFlagsFile,
   type FrameScenario,
   KernelsFile,
   Manifest,
@@ -80,7 +79,6 @@ async function generate(): Promise<Map<string, string>> {
     "kernels.json",
     toJson(KernelsFile.parse({ schemaVersion: SCHEMA_VERSION, routes, inventory }))
   );
-  files.set("env-flags.json", toJson(EnvFlagsFile.parse({ schemaVersion: SCHEMA_VERSION, flags })));
   files.set("links.json", toJson({ schemaVersion: SCHEMA_VERSION, links: namedLinks }));
   for (const spec of models) {
     files.set(`models/${spec.id}.json`, toJson(spec));
@@ -125,7 +123,6 @@ async function generate(): Promise<Map<string, string>> {
         opKinds: opKinds.length,
         kernels: inventory.length,
         routes: routes.length,
-        envFlags: flags.length,
         snippets: Object.keys(snippets).length,
       },
     })

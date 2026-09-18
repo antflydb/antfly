@@ -35,7 +35,6 @@ const SYSTEMS = [
   { href: "/systems/kernels", name: "Kernel routing" },
   { href: "/systems/timeline", name: "Frame timeline" },
   { href: "/systems/kv", name: "KV cache" },
-  { href: "/systems/flags", name: "Env flags" },
 ];
 
 function ThemeToggle() {
