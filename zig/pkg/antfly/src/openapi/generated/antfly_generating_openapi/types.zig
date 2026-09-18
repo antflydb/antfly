@@ -685,6 +685,7 @@ pub const GeneratorProvider = enum {
     vertex,
     ollama,
     openai,
+    openrouter,
     antfly,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -693,6 +694,7 @@ pub const GeneratorProvider = enum {
             .vertex => "vertex",
             .ollama => "ollama",
             .openai => "openai",
+            .openrouter => "openrouter",
             .antfly => "antfly",
         };
         try jw.write(s);
@@ -708,6 +710,7 @@ pub const GeneratorProvider = enum {
             .{ "vertex", .vertex },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
+            .{ "openrouter", .openrouter },
             .{ "antfly", .antfly },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -1029,10 +1032,11 @@ pub const OpenAIReasoningEffort = enum {
 
 /// Configuration for the OpenRouter generative AI provider.
 pub const OpenRouterGeneratorConfig = struct {
-    /// Single model identifier. Either model or models must be provided.
-    model: ?[]const u8 = null,
-    /// Array of model identifiers for fallback routing. Either model or models must be provided.
-    models: ?[]const []const u8 = null,
+    provider: []const u8,
+    /// The OpenRouter model identifier to use.
+    model: []const u8,
+    /// The URL of the OpenRouter API endpoint.
+    url: ?[]const u8 = null,
     /// The OpenRouter API key.
     api_key: ?[]const u8 = null,
     /// Controls randomness in generation (0.0-2.0).
@@ -1048,8 +1052,9 @@ pub const OpenRouterGeneratorConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "model", "model", true },
-        .{ "models", "models", true },
+        .{ "provider", "provider", false },
+        .{ "model", "model", false },
+        .{ "url", "url", true },
         .{ "api_key", "api_key", true },
         .{ "temperature", "temperature", true },
         .{ "max_tokens", "max_tokens", true },
@@ -1068,12 +1073,12 @@ pub const OpenRouterGeneratorConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
-        if (self.models) |value| {
-            try jw.objectField("models");
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.url) |value| {
+            try jw.objectField("url");
             try jw.write(value);
         }
         if (self.api_key) |value| {

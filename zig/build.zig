@@ -3576,7 +3576,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{ "generating backend", "local generation budgets", "local generation bridge", "asset producer runtime", "provider quotas", "vertex provider" },
+        .filters = &.{ "generating backend", "local generation budgets", "local generation bridge", "asset producer runtime", "provider quotas", "vertex provider", "vertex request", "gemini provider", "agent tools", "agent conversation" },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");

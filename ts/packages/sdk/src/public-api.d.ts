@@ -9791,11 +9791,51 @@ export interface components {
              */
             presence_penalty?: number;
         };
+        /** @description Configuration for the OpenRouter generative AI provider. */
+        OpenRouterGeneratorConfig: {
+            /** @enum {string} */
+            provider: "openrouter";
+            /**
+             * @description The OpenRouter model identifier to use.
+             * @example openai/gpt-4.1
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the OpenRouter API endpoint.
+             * @default https://openrouter.ai/api/v1
+             */
+            url?: string;
+            /** @description The OpenRouter API key. */
+            api_key?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate in the response. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter (0.0-1.0).
+             */
+            top_p?: number;
+            /**
+             * Format: float
+             * @description Penalty for token frequency (-2.0 to 2.0).
+             */
+            frequency_penalty?: number;
+            /**
+             * Format: float
+             * @description Penalty for token presence (-2.0 to 2.0).
+             */
+            presence_penalty?: number;
+        };
         /**
          * @description Generator providers implemented by Antfly's generation runtime.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "antfly";
+        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "antfly";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -9805,7 +9845,7 @@ export interface components {
          *       "max_tokens": 2048
          *     }
          */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"]) & {
+        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"]) & {
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["GeneratorProvider"];
         };
