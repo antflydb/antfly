@@ -1,0 +1,215 @@
+{
+  "arms": {
+    "baseline": {
+      "config": {
+        "admission": {
+          "query": {
+            "max_concurrent_requests": 80,
+            "waiting": {
+              "max_queued_bytes": 67108864,
+              "max_queued_requests": 160,
+              "max_retained_bytes": 536870912,
+              "max_wait_ms": 1000
+            }
+          },
+          "write": {
+            "max_concurrent_requests": 80,
+            "waiting": {
+              "max_queued_bytes": 67108864,
+              "max_queued_requests": 160,
+              "max_retained_bytes": 536870912,
+              "max_wait_ms": 1000
+            }
+          }
+        }
+      },
+      "image": null,
+      "optimization": "ReleaseFast",
+      "revision": "64f1afbb373d5da0a932f08e456116da139e9e9a",
+      "telemetry": {
+        "ceilings": {
+          "antfly_admission_query_in_flight_requests": 80,
+          "antfly_admission_query_queued_bytes": 67108864,
+          "antfly_admission_query_queued_requests": 160,
+          "antfly_admission_query_retained_bytes": 536870912,
+          "antfly_admission_write_in_flight_requests": 80,
+          "antfly_admission_write_queued_bytes": 67108864,
+          "antfly_admission_write_queued_requests": 160,
+          "antfly_admission_write_retained_bytes": 536870912
+        },
+        "expected": {
+          "antfly_admission_query_queue_capacity_requests": 160,
+          "antfly_admission_query_retained_capacity_bytes": 536870912,
+          "antfly_admission_write_queue_capacity_requests": 160,
+          "antfly_admission_write_retained_capacity_bytes": 536870912
+        },
+        "interval_seconds": 0.25,
+        "queue_metrics": [
+          "antfly_admission_query_queued_requests",
+          "antfly_admission_write_queued_requests"
+        ],
+        "recovery_queue_bound": 0
+      }
+    },
+    "candidate": {
+      "config": {
+        "admission": {
+          "dense_execution": {
+            "max_runnable_tasks": 0
+          },
+          "ingress": {
+            "control_requests": 2,
+            "control_retained_bytes": 262144,
+            "max_requests": 512,
+            "max_retained_bytes": 536870912,
+            "recovery_requests": 4,
+            "recovery_retained_bytes": 4194304
+          },
+          "query": {
+            "max_concurrent_requests": 80,
+            "waiting": {
+              "max_queued_bytes": 67108864,
+              "max_queued_requests": 160,
+              "max_retained_bytes": 536870912,
+              "max_wait_ms": 1000
+            }
+          },
+          "read_execution": {
+            "max_outstanding_tasks": 160,
+            "max_queued_tasks": 160,
+            "max_runnable_tasks": 2,
+            "max_scan_snapshot_ms": 30000,
+            "max_scan_state_bytes": 0,
+            "max_suspended_io": 16,
+            "max_wait_ms": 1000,
+            "max_working_bytes": 67108864,
+            "protected": {
+              "max_outstanding_tasks": 0,
+              "max_runnable_tasks": 0,
+              "max_transition_bytes": 0,
+              "max_transition_tasks": 0,
+              "max_working_bytes": 0
+            }
+          },
+          "remote_attempt_coordinator": {
+            "max_attempts": 0,
+            "max_bytes": 0,
+            "max_destination_attempts": 0,
+            "max_destinations": 0
+          },
+          "remote_attempt_worker": {
+            "max_attempts": 0,
+            "max_bytes": 0
+          },
+          "session_max_retained_bytes": 67108864,
+          "transaction_completion_bytes": 16777216,
+          "write": {
+            "max_concurrent_requests": 80,
+            "waiting": {
+              "max_queued_bytes": 67108864,
+              "max_queued_requests": 160,
+              "max_retained_bytes": 536870912,
+              "max_wait_ms": 1000
+            }
+          }
+        },
+        "health_metrics_interval_ms": 250
+      },
+      "image": null,
+      "optimization": "ReleaseFast",
+      "revision": null,
+      "telemetry": {
+        "ceilings": {
+          "antfly_admission_query_in_flight_requests": 80,
+          "antfly_admission_query_queued_bytes": 67108864,
+          "antfly_admission_query_queued_requests": 160,
+          "antfly_admission_query_retained_bytes": 536870912,
+          "antfly_admission_write_in_flight_requests": 80,
+          "antfly_admission_write_queued_bytes": 67108864,
+          "antfly_admission_write_queued_requests": 160,
+          "antfly_admission_write_retained_bytes": 536870912,
+          "antfly_read_execution_outstanding": 160,
+          "antfly_read_execution_queued": 160,
+          "antfly_read_execution_runnable": 2,
+          "antfly_read_execution_suspended_io": 16,
+          "antfly_read_execution_working_bytes": 67108864,
+          "antfly_recovery_ingress_outstanding_requests": 4,
+          "antfly_recovery_ingress_retained_bytes": 4194304
+        },
+        "expected": {
+          "antfly_admission_query_queue_capacity_requests": 160,
+          "antfly_admission_query_retained_capacity_bytes": 536870912,
+          "antfly_admission_write_queue_capacity_requests": 160,
+          "antfly_admission_write_retained_capacity_bytes": 536870912,
+          "antfly_read_execution_enabled": 1,
+          "antfly_read_execution_outstanding_limit": 160,
+          "antfly_read_execution_queue_limit": 160,
+          "antfly_read_execution_runnable_limit": 2,
+          "antfly_read_execution_suspended_io_limit": 16,
+          "antfly_read_execution_working_bytes_limit": 67108864,
+          "antfly_recovery_ingress_capacity_bytes": 4194304,
+          "antfly_recovery_ingress_capacity_requests": 4,
+          "antfly_recovery_ingress_enabled": 1
+        },
+        "interval_seconds": 0.25,
+        "queue_metrics": [
+          "antfly_admission_query_queued_requests",
+          "antfly_admission_write_queued_requests",
+          "antfly_read_execution_queued"
+        ],
+        "recovery_queue_bound": 0
+      }
+    }
+  },
+  "comparison": "candidate_fixed_policy_vs_fixed_foreground_baseline",
+  "concurrency": [
+    1,
+    5,
+    10,
+    20,
+    30,
+    40,
+    60,
+    80
+  ],
+  "documents": 4096,
+  "generator_queue": 320,
+  "generator_workers": 160,
+  "note": "Preselected candidate fixed policy, distinct from identical-config overhead cells. Legacy baseline64f retains the same foreground80/queue160 limits; candidate also enables bounded ingress, reserved recovery, session/completion bytes and general read scheduling. Default native LSM: protected LMDB probes and snapshot suspension explicitly disabled. Both arms require pinned ReleaseFast artifacts and unchanged Cloud resource/timing gates. 250ms candidate health collection still requires observed <=1s source age; the older baseline may lack fresh ownership telemetry, which remains unavailable, never waived. These lookup/mixed cells do not exercise durable transaction decisions, remote attempts, sustained compaction, long-operator isolation, slow consumers or the retained vector datasets. Repeated identical writes are not sustained ingestion. Operator fixtures are separate deterministic data, not the quoted vector/graph benchmark datasets. No result is claimed.",
+  "open_factors": [
+    0.5,
+    0.8,
+    1.0,
+    1.25,
+    2.0
+  ],
+  "overload_seconds": 60,
+  "policy_version": 1,
+  "purpose": "qualification",
+  "recovery_seconds": 60,
+  "request_timeout": 30,
+  "runs": 3,
+  "runtime": "docker",
+  "schema": 1,
+  "seconds": 300,
+  "storage_description": "REPLACE_WITH_ACTUAL_HOST_DISK_AND_FILESYSTEM",
+  "tier": "standard",
+  "warmup_seconds": 60,
+  "workloads": [
+    {
+      "name": "lookup",
+      "query_percent_of_reads": 0,
+      "read_percent": 100
+    },
+    {
+      "name": "mixed90",
+      "query_percent_of_reads": 50,
+      "read_percent": 90
+    },
+    {
+      "name": "mixed50",
+      "query_percent_of_reads": 50,
+      "read_percent": 50
+    }
+  ]
+}

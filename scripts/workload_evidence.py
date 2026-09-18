@@ -42,7 +42,10 @@ def validate(spec):
         or not 0.1 <= interval <= 1
     ):
         raise ValueError("periodic sampling interval must be 0.1..1 seconds")
-    for metric, limit in spec.get("ceilings", {}).items():
+    for metric, limit in (
+        *spec.get("ceilings", {}).items(),
+        *spec.get("expected", {}).items(),
+    ):
         if (
             not isinstance(metric, str)
             or not isinstance(limit, (int, float))
@@ -50,7 +53,7 @@ def validate(spec):
             or limit < 0
         ):
             raise ValueError(
-                "explicit metric ceilings must be finite nonnegative values"
+                "explicit metric limits/expectations must be finite nonnegative values"
             )
     bound = spec.get("recovery_queue_bound")
     if bound is not None and (
@@ -236,6 +239,12 @@ def periodic_gates(observations, spec, seconds):
                 unavailable.append(f"missing required series {name}")
             elif value > limit:
                 failures.append(f"observed ceiling exceeded: {name}")
+        for name, expected in spec.get("expected", {}).items():
+            value = row.get("metrics", {}).get(name)
+            if value is None:
+                unavailable.append(f"missing required policy series {name}")
+            elif value != expected:
+                failures.append(f"configured policy mismatch: {name}")
     if not spec.get("ceilings"):
         unavailable.append("per-stage count/byte ceilings not declared")
     return {

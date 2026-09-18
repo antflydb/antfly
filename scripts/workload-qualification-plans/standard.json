@@ -68,7 +68,7 @@
   "documents": 4096,
   "generator_queue": 320,
   "generator_workers": 160,
-  "note": "Prepared fixed-policy single-node lookup/mixed workload subset. Null image/candidate revision fields are deliberately unresolved until builds from the final committed sources exist. Both arms use identical fixed admission; this isolates implementation overhead. This plan does not qualify lane isolation, dense/graph/aggregate work, remote ownership or write recovery. Record actual storage class and retain build receipts before running. Untouched legacy-default UX comparisons require a separate plan.",
+  "note": "Prepared identical-config overhead comparison for the single-node lookup/mixed workload subset. Null image/candidate revision fields are deliberately unresolved until builds from the final committed sources exist. Both arms use identical fixed admission; this isolates implementation overhead. This plan does not qualify lane isolation, dense/graph/aggregate work, remote ownership or write recovery. Record actual storage class and retain build receipts before running. Untouched legacy-default UX comparisons require a separate plan.",
   "open_factors": [
     0.5,
     0.8,

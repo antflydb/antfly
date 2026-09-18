@@ -165,7 +165,7 @@ def release_plan(
         },
     }
     plan["note"] = (
-        "Prepared fixed-policy single-node lookup/mixed workload subset. Null image/candidate revision fields are deliberately unresolved until builds from the final committed sources exist. Both arms use identical fixed admission; this isolates implementation overhead. This plan does not qualify lane isolation, dense/graph/aggregate work, remote ownership or write recovery. Record actual storage class and retain build receipts before running. Untouched legacy-default UX comparisons require a separate plan."
+        "Prepared identical-config overhead comparison for the single-node lookup/mixed workload subset. Null image/candidate revision fields are deliberately unresolved until builds from the final committed sources exist. Both arms use identical fixed admission; this isolates implementation overhead. This plan does not qualify lane isolation, dense/graph/aggregate work, remote ownership or write recovery. Record actual storage class and retain build receipts before running. Untouched legacy-default UX comparisons require a separate plan."
     )
     return plan
 
@@ -280,10 +280,18 @@ def validate(plan: dict[str, Any]) -> None:
                 raise ValueError(f"{field} must be an integer percentage")
     if "telemetry" in plan:
         evidence.validate(plan["telemetry"])
+    for arm in plan["arms"].values():
+        if "telemetry" in arm:
+            evidence.validate(arm["telemetry"])
     if "vector" in plan:
         vectors.validate(
             plan["vector"], qualification=plan["purpose"] == "qualification"
         )
+
+
+def arm_telemetry(plan, arm_name):
+    """Arm-specific exported series; absent freshness remains unavailable."""
+    return plan["arms"][arm_name].get("telemetry", plan.get("telemetry"))
 
 
 def free_port() -> int:
@@ -1382,8 +1390,10 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                             plan["request_timeout"],
                         )
 
+                    telemetry = arm_telemetry(plan, arm_name)
+
                     def observed_load(*args, **kwargs):
-                        if "telemetry" not in plan:
+                        if telemetry is None:
                             return run_load(*args, **kwargs)
                         raw_path = args[3]
                         with evidence.observe(
@@ -1391,7 +1401,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                             command,
                             runtime,
                             raw_path.with_suffix(".telemetry.jsonl"),
-                            plan["telemetry"],
+                            telemetry,
                         ) as observations:
                             measured = run_load(*args, **kwargs)
                         for observation in observations:
@@ -1409,7 +1419,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                                     - measured["monotonic_origin"]
                                 )
                         measured["periodic_telemetry"] = evidence.periodic_gates(
-                            observations, plan["telemetry"], kwargs["seconds"]
+                            observations, telemetry, kwargs["seconds"]
                         )
 
                         def samples():
@@ -1437,7 +1447,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                             measured["overload_recovery_gate"] = evidence.recovery_gate(
                                 samples(),
                                 observations,
-                                plan["telemetry"],
+                                telemetry,
                                 plan["overload_seconds"],
                                 kwargs["seconds"],
                                 max(prior) if prior else None,

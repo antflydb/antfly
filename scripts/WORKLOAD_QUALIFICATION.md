@@ -361,3 +361,77 @@ coordinator's ledger; that needs a public distributed query and its own retained
 metrics/retirement evidence. Protocol3 control behavior requires the rebuilt
 candidate; healthy advertised routing and transport faults can be checked on the
 older frozen binary independently.
+
+### Preselected candidate policy and overhead comparisons
+
+`scripts/workload-qualification-plans/` retains the identical-config overhead
+comparison: both arms have 80 foreground slots and 160 queued requests per class.
+It does not enable the shared read scheduler. The separate
+`scripts/workload-fixed-policy-plans/` contains preselected candidate policies
+against that same fixed baseline 64f. These are prepared inputs, not results;
+null image/revision fields deliberately prevent execution until artifacts are
+pinned. No production default is changed.
+
+| Candidate setting | Starter | Standard | Pro |
+| --- | ---: | ---: | ---: |
+| Enforced container CPU / memory |1 /4 GiB |2 /4 GiB |4 /8 GiB |
+| Read runnable / outstanding / queued |1 /160 /160 |2 /160 /160 |4 /160 /160 |
+| Participating read workspace |64 MiB |64 MiB |128 MiB |
+| Audited suspended native reads |8 |16 |32 |
+| Ingress total count / bytes |512 /512 MiB |512 /512 MiB |512 /1 GiB |
+| Reserved recovery count / bytes |4 /4 MiB |4 /4 MiB |4 /4 MiB |
+| Session bytes / transaction completion bytes |64 MiB /16 MiB |64 MiB /16 MiB |64 MiB /16 MiB |
+
+Ingress totals include the nonborrowable control floor (2 requests /256 KiB)
+and recovery floor. Foreground query/write limits remain identical between
+arms. Read queuing has a fixed 1000ms ceiling. The native default backend is LSM;
+these cells explicitly leave protected LMDB probes and scan snapshot suspension
+disabled. They cannot qualify those features. Single-node remote coordination
+is also disabled; separate correctness topology cells opt in.
+
+Generate the retained lookup/mixed plans, or materialize separate 4096-row
+checked graph/text/aggregation 90/10 and 50/50 mixes:
+
+```sh
+python 3 scripts/workload_fixed_policy.py --output /tmp/fixed-policy-plans
+python 3 scripts/workload_fixed_policy.py --operators --output /tmp/operator-policy-plans
+```
+
+The operator fixtures have exact semantic expectations, but are not declared
+long-running until measurements demonstrate that property. Repeated identical
+writes do not certify sustained ingestion or compaction. These cells do not
+replace retained 50 K×1536 /1 M×768 vector datasets, cold-storage, slow-consumer,
+protected-lane or durable-decision fault qualification. Both performance arms
+still require ReleaseFast, three fresh lifecycles,60s warmup,300s measurement,
+the full concurrency/rate schedule and the unchanged latency, throughput,
+90%-memory and 10s recovery gates.
+
+Telemetry can be declared per arm (`arms.baseline.telemetry` and
+`arms.candidate.telemetry`), overriding the common top-level specification.
+`expected` maps exact exported policy gauges to required values; a disabled or
+differently configured scheduler fails even when usage remains below all
+`ceilings`. Missing series remain unavailable. Candidate collection is 250ms,
+but every sample still needs observed source age at most 1s. Legacy baseline
+cache freshness may remain unavailable; selecting different series never
+waives freshness or qualifies that missing timing evidence. Recovery requires
+all declared queue series to return to the preselected zero bound. Sampled
+ceilings do not prove absence of excursions between samples.
+
+`local-correctness.json` is a separate three-process metadata/data/API template
+with tiny finite budgets,2 runnable /8 outstanding read tasks,8 worker records,
+4 coordinator attempts,2 MiB journals and reserved recovery ingress. Worker
+capacity includes coordinator-closure identities; retained terminal tombstones
+need not return to zero. The fixture table declares immutable recovery protocol 1
+with 4 obligations /4 MiB total /1 MiB per transaction; the maximum transaction
+plus 64 KiB fits each half of its 8 MiB completion reserve. The runner creates only
+disposable local credentials and persistent directories owned by the run.
+
+After pinning a fresh homogeneous binary, its hash and source revision, run it
+with `workload_cluster_qualification.py run ... --output ...`. It checks signed
+worker discovery, real advertised API proxy routing, partition/heal and API
+restart with previously committed data. It remains a correctness cell: no
+Cloud resource envelope is required, no performance result is inferred, and it
+does not establish coordinator reconciliation or interruption immediately after
+a durable decision. Those require distinct fault schedules and evidence. The
+prepared inputs have offline structural tests; native config parsing and live
+candidate execution remain pending until a matching build is supplied.
