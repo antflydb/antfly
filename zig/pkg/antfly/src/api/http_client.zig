@@ -296,6 +296,43 @@ pub const EmptyResponse = struct {
     pub fn deinit(_: *EmptyResponse, _: std.mem.Allocator) void {}
 };
 
+test "workload admission attempt client requires authenticated terminal evidence even on HTTP success" {
+    const alloc = std.testing.allocator;
+    const protocol = @import("workload_attempt_protocol.zig");
+    const Fake = struct {
+        mode: enum { valid, unsigned, replay, changed_body } = .valid,
+        fn execute(raw: *anyopaque, allocator: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            const authenticated = try protocol.verifyRequest(allocator, .{ .primary = "b" ** 32, .issuer = "cluster" }, request.header(protocol.request_header).?, "node:7", "POST", "/internal/v1/join", "{}");
+            var response: http_common.HttpResponse = .{ .status = 200, .body = try allocator.dupe(u8, if (self.mode == .changed_body) "changed" else "result") };
+            errdefer response.deinit(allocator);
+            if (self.mode != .unsigned) {
+                var id = authenticated.attempt;
+                if (self.mode == .replay) id.sequence += 1;
+                const evidence = try protocol.signTerminalAfterQuiescence(allocator, .{ .primary = "a" ** 32, .issuer = "cluster" }, id, 200, "result");
+                errdefer allocator.free(evidence);
+                const name = try allocator.dupe(u8, protocol.evidence_header);
+                errdefer allocator.free(name);
+                response.headers = try allocator.alloc(http_common.Header, 1);
+                response.headers[0] = .{ .name = name, .value = evidence };
+            }
+            return response;
+        }
+    };
+    var fake: Fake = .{};
+    var client = ApiHttpClient.init(alloc, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    _ = try client.withInternalServiceNodeAuth("b" ** 32, "cluster", 7);
+    const id: protocol.AttemptId = .{ .coordinator = 7, .generation = 2, .sequence = 3, .operation = 4, .destination = 8, .worker_incarnation = 9 };
+    const request: http_common.HttpRequest = .{ .method = .POST, .uri = "http://worker/internal/v1/join", .body = "{}" };
+    var response = try client.executeAttemptRequest(request, id, platform_time.monotonicNs() + std.time.ns_per_s, "a" ** 32);
+    response.deinit(alloc);
+    inline for (.{ .unsigned, .replay, .changed_body }) |mode| {
+        fake.mode = mode;
+        try std.testing.expectError(error.AttemptOutcomeUncertain, client.executeAttemptRequest(request, id, platform_time.monotonicNs() + std.time.ns_per_s, "a" ** 32));
+    }
+}
+
 pub const ApiHttpClient = struct {
     alloc: std.mem.Allocator,
     executor: http_common.RequestExecutor,
@@ -323,6 +360,48 @@ pub const ApiHttpClient = struct {
         else
             null;
         return self;
+    }
+
+    pub fn withInternalServiceNodeAuth(self: *ApiHttpClient, secret: []const u8, issuer: []const u8, node_id: u64) !*ApiHttpClient {
+        if (node_id == 0) return error.InvalidNodeIdentity;
+        self.internal_service = .{ .secret = secret, .issuer = issuer, .node_id = node_id };
+        return self;
+    }
+
+    /// Opt-in dispatch primitive. Its caller must persist/reserve this attempt
+    /// before calling. Neither HTTP status nor a transport error retires it:
+    /// only a response with identity-bound terminal evidence is returned.
+    pub fn executeAttemptRequest(self: *ApiHttpClient, request: http_common.HttpRequest, id: @import("workload_attempt_protocol.zig").AttemptId, deadline_ns: u64, verification_secret: ?[]const u8) !http_common.HttpResponse {
+        const protocol = @import("workload_attempt_protocol.zig");
+        const signing = self.internal_service orelse return error.AttemptAuthenticationUnavailable;
+        if (signing.node_id == null or signing.node_id.? != id.coordinator) return error.AttemptIdentityMismatch;
+        if (!internal_service_auth.requestTargetsInternalApi(request.uri)) return error.InvalidAttemptTarget;
+        const now = platform_time.monotonicNs();
+        if (now >= deadline_ns) return error.DeadlineExceeded;
+        const keys: protocol.Keys = .{ .primary = signing.secret, .verification = verification_secret, .issuer = signing.issuer };
+        const frame = try protocol.signRequest(self.alloc, keys, .{
+            .version = 1,
+            .attempt = id,
+            .remaining_ns = deadline_ns - now,
+            .request_digest = protocol.requestDigest(@tagName(request.method), try protocol.requestTarget(request.uri), request.body),
+        });
+        defer self.alloc.free(frame);
+        var headers: std.ArrayListUnmanaged(http_common.RequestHeader) = .empty;
+        defer headers.deinit(self.alloc);
+        for (request.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, protocol.request_header)) continue;
+            try headers.append(self.alloc, header);
+        }
+        try headers.append(self.alloc, .{ .name = protocol.request_header, .value = frame });
+        var signed_request = request;
+        signed_request.headers = headers.items;
+        const remaining_ms: u32 = @intCast(@min(std.math.maxInt(u32), (deadline_ns - now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms));
+        signed_request.timeout_ms = @min(request.timeout_ms orelse remaining_ms, remaining_ms);
+        var response = self.executeRequest(signed_request) catch return error.AttemptOutcomeUncertain;
+        errdefer response.deinit(self.alloc);
+        const evidence = response.header(protocol.evidence_header) orelse return error.AttemptOutcomeUncertain;
+        _ = protocol.verifyTerminal(self.alloc, keys, evidence, id, response.status, response.body) catch return error.AttemptOutcomeUncertain;
+        return response;
     }
 
     /// Execute one request, attaching node authority only when the resolved

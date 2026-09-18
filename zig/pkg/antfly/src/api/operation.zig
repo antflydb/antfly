@@ -112,6 +112,9 @@ pub const RequestContext = struct {
     /// the caller did not supply one; adapters may generate one in middleware.
     request_id: []const u8 = "",
     principal: ?Principal = null,
+    /// Authenticated wire identity only; execution still requires durable
+    /// worker deduplication/fencing admission. Never populate from raw headers.
+    authenticated_remote_attempt: ?@import("workload_attempt_protocol.zig").Request = null,
     admission: ?*AdmissionReservation = null,
     /// Borrowed for the duration of the operation. This is deliberately
     /// request-scoped: std.Io tasks may resume on a different worker thread.

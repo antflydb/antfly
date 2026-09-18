@@ -52,6 +52,8 @@ pub const Config = struct {
     secret: []const u8,
     issuer: []const u8,
     subject: []const u8 = default_subject,
+    /// Explicit stable node identity for attempt-aware internal callers.
+    node_id: ?u64 = null,
 };
 
 pub fn requestTargetsInternalApi(uri: []const u8) bool {
@@ -167,10 +169,15 @@ pub fn validateCredentialIsolation(
 }
 
 pub fn tokenAlloc(alloc: std.mem.Allocator, config: Config, now_seconds: i64) ![]u8 {
+    var subject_buffer: [25]u8 = undefined;
+    const subject = if (config.node_id) |id|
+        try @import("workload_attempt_protocol.zig").nodeSubject(&subject_buffer, id)
+    else
+        config.subject;
     const header_json = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
     const payload_json = try std.json.Stringify.valueAlloc(alloc, .{
         .iss = config.issuer,
-        .sub = config.subject,
+        .sub = subject,
         .aud = audience,
         .principal_kind = principal_kind,
         .admin = true,

@@ -41,6 +41,25 @@ const internal_join_operations = @import("internal_join_operations.zig");
 const internal_repair_operations = @import("internal_repair_operations.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const internal_service_auth = @import("internal_service_auth.zig");
+const attempt_protocol = @import("workload_attempt_protocol.zig");
+const service_authentication_key = "antfly.verified-internal-service";
+
+const ServiceAuthentication = struct {
+    allocator: std.mem.Allocator,
+    identity_allocator: std.mem.Allocator,
+    identity: AuthenticatedIdentity,
+    attempt: ?attempt_protocol.Request = null,
+
+    fn destroy(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.identity.deinit(self.identity_allocator);
+        self.allocator.destroy(self);
+    }
+
+    fn fromContext(ctx: *const httpx.Context) ?*ServiceAuthentication {
+        return @ptrCast(@alignCast(ctx.getData(service_authentication_key) orelse return null));
+    }
+};
 const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
 const http_client = @import("http_client.zig");
 const repair_jobs = @import("repair_jobs.zig");
@@ -802,7 +821,7 @@ pub const AntflyApiHandler = struct {
         if (secret.len == 0)
             return @as(?httpx.Response, try jsonErrorResponse(ctx, 503, "internal service authentication is not configured"));
         const token = ctx.header(internal_service_auth.header_name) orelse {
-            if (self.api_server.cfg.internal_service_accept_legacy_unauthenticated) {
+            if (self.api_server.cfg.internal_service_accept_legacy_unauthenticated and ctx.header(attempt_protocol.request_header) == null) {
                 // This compatibility path is opt-in, startup-validated, and
                 // intended only for the first half of a two-phase rolling
                 // upgrade. Mark accepted responses so operators can verify old
@@ -814,9 +833,35 @@ pub const AntflyApiHandler = struct {
         };
         var identity = self.api_server.authenticateInternalServiceRequest(token) catch
             return @as(?httpx.Response, try unauthorizedResponse(ctx));
-        defer identity.deinit(self.api_server.alloc);
+        var transferred = false;
+        defer if (!transferred) identity.deinit(self.api_server.alloc);
         if (!identity.is_internal_service)
             return @as(?httpx.Response, try jsonErrorResponse(ctx, 403, "internal service credential required"));
+        const authenticated = try ctx.allocator.create(ServiceAuthentication);
+        authenticated.* = .{ .allocator = ctx.allocator, .identity_allocator = self.api_server.alloc, .identity = identity };
+        ctx.setData(service_authentication_key, authenticated, ServiceAuthentication.destroy) catch |err| {
+            ctx.allocator.destroy(authenticated);
+            return err;
+        };
+        transferred = true;
+        if (ctx.header(attempt_protocol.request_header)) |frame| {
+            if (frame.len > attempt_protocol.max_frame_bytes)
+                return @as(?httpx.Response, try unauthorizedResponse(ctx));
+            const body = (try ctx.body()) orelse "";
+            const target = attempt_protocol.requestTarget(ctx.request.uri.raw) catch
+                return @as(?httpx.Response, try unauthorizedResponse(ctx));
+            authenticated.attempt = attempt_protocol.verifyRequest(ctx.allocator, .{
+                .primary = secret,
+                .verification = self.api_server.cfg.internal_service_verification_secret,
+                .issuer = self.api_server.cfg.internal_service_issuer orelse "",
+            }, frame, identity.username, @tagName(ctx.request.method), target, body) catch
+                return @as(?httpx.Response, try unauthorizedResponse(ctx));
+            // Authentication alone cannot admit execution. Until the durable
+            // dedup/fence owner is installed, even a verified attempt is refused.
+            // Do not sign a terminal reply without a durable rejection tombstone:
+            // a delayed replay after upgrade must not resurrect retired work.
+            return @as(?httpx.Response, try jsonErrorResponse(ctx, 503, "remote attempt worker protocol unavailable"));
+        }
         return null;
     }
 
@@ -1545,6 +1590,7 @@ pub const AntflyApiHandler = struct {
     }
 
     fn operationContext(ctx: *httpx.Context, identity: ?AuthenticatedIdentity) operation_contract.RequestContext {
+        const service = ServiceAuthentication.fromContext(ctx);
         const catalog_route_fence_json = ctx.header(metadata_api.catalog_route_fence_header) orelse "";
         if (catalog_route_fence_json.len != 0) {
             // The operation layer validates the encoded fence before storage
@@ -1572,9 +1618,13 @@ pub const AntflyApiHandler = struct {
             .deadline_io = if (ctx.application_deadline_io) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null,
             .request_id = ctx.header("x-request-id") orelse "",
             .principal = if (identity) |authenticated| .{
-                .kind = .user,
+                .kind = if (authenticated.is_internal_service) .service else .user,
                 .subject = authenticated.username,
+            } else if (service) |authenticated| .{
+                .kind = .service,
+                .subject = authenticated.identity.username,
             } else null,
+            .authenticated_remote_attempt = if (service) |authenticated| authenticated.attempt else null,
             .destination_authorization_principal = http_server_mod.storedDestinationPrincipal(identity),
             .catalog_route_fence_json = catalog_route_fence_json,
         };
@@ -7640,6 +7690,60 @@ const AuthStatusSource = struct {
         };
     }
 };
+
+test "workload admission authenticated service identity reaches internal context and opt in fails closed" {
+    const alloc = std.testing.allocator;
+    var status: AuthStatusSource = .{};
+    const old_secret = "a" ** 32;
+    var server = ApiHttpServer.init(alloc, .{
+        .internal_service_secret = "b" ** 32,
+        .internal_service_verification_secret = old_secret,
+        .internal_service_issuer = "cluster",
+        .internal_service_accept_legacy_unauthenticated = true,
+    }, status.iface(), null, null);
+    defer server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &server };
+    const Observer = struct {
+        calls: usize = 0,
+        fn execute(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            self.calls += 1;
+            const operation = AntflyApiHandler.operationContext(ctx, null);
+            try std.testing.expectEqual(operation_contract.Principal.Kind.service, operation.principal.?.kind);
+            try std.testing.expectEqualStrings("node:7", operation.principal.?.subject);
+            return httpx.Response.init(ctx.allocator, 200);
+        }
+    };
+    var observer: Observer = .{};
+    const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = old_secret, .issuer = "cluster", .node_id = 7 }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    const target = "/internal/v1/groups/8/tables/docs/join-rows";
+    inline for (.{ "omitted", "verified", "changed_body", "wrong_node", "unsigned" }) |mode| {
+        var request = try httpx.Request.init(alloc, .POST, target);
+        defer request.deinit();
+        request.body = if (comptime std.mem.eql(u8, mode, "changed_body")) "changed" else "{}";
+        if (comptime !std.mem.eql(u8, mode, "unsigned")) try request.headers.set(internal_service_auth.header_name, token);
+        const signed = try attempt_protocol.signRequest(alloc, .{ .primary = old_secret, .issuer = "cluster" }, .{
+            .version = 1,
+            .attempt = .{ .coordinator = if (comptime std.mem.eql(u8, mode, "wrong_node")) 8 else 7, .generation = 2, .sequence = 1, .operation = 1, .destination = 8, .worker_incarnation = 9 },
+            .remaining_ns = 100,
+            .request_digest = attempt_protocol.requestDigest("POST", target, "{}"),
+        });
+        defer alloc.free(signed);
+        if (comptime !std.mem.eql(u8, mode, "omitted")) try request.headers.set(attempt_protocol.request_header, signed);
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.dispatchLinkedRoute(&context, httpx.Handler.bind(&observer, Observer.execute));
+        defer response.deinit();
+        const expected: u16 = if (comptime std.mem.eql(u8, mode, "omitted")) 200 else if (comptime std.mem.eql(u8, mode, "verified")) 503 else 401;
+        try std.testing.expectEqual(expected, response.status.code);
+        if (comptime std.mem.eql(u8, mode, "verified")) {
+            const operation = AntflyApiHandler.operationContext(&context, null);
+            try std.testing.expectEqual(@as(u64, 7), operation.authenticated_remote_attempt.?.attempt.coordinator);
+            try std.testing.expect(response.headers.get(attempt_protocol.evidence_header) == null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), observer.calls);
+}
 
 test "compressed requests authenticate before decompression and reuse the identity" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
