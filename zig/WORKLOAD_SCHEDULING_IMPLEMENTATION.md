@@ -6,9 +6,8 @@ The design was committed first as `74820f0ec2`. Implementation is in progress.
 The current implementation provides fixed foreground admission with opt-in
 bounded waiting, shared read driver/helper scheduling, and bounded SDK read
 retries. Audited dense I/O and streamed scans can suspend with prepaid state;
-narrow LMDB existence probes have an opt-in protected partition. An opt-in
-join-row worker has durable attempt ownership. Coordinator attempt dispatch
-remains disabled. These stages do not complete the operator scheduling design
+narrow LMDB existence probes have an opt-in protected partition. Opt-in internal read workers and coordinator dispatch have durable attempt
+ownership; the new integration is undergoing local fault qualification. These stages do not complete the operator scheduling design
 or qualify new defaults.
 
 ## Review order
@@ -25,14 +24,16 @@ main contracts and representative commits, rather than an exhaustive history.
 | Execution and memory | Typed ownership, shared dense driver/helper capacity, actual working bytes, audited native read suspension | `44021169fe`, `1ec9843299`, `3cc6c9b647`, `849d822623`, `508311b930`, `9c687e2670` |
 | Request/output lifetime | Tracked allocation ownership through kernel, HTTP, and serverless handoffs; lookup admission | `1b527c5129`, `42b8c19983`, `fe9ede7c7c`, `afe3c72ae3`, `803b886294`, `85c22d2c8b`, `3d9b3aaa1b`, `8213869f68`, `9920f56295`, `18af5c041a`, `288746b7c5`, `95aba99ad4` |
 | Recovery and remote workers | Reserve durable obligations before prepare; authenticate attempts; persist opt-in worker deduplication and generation closure | `341f08a8b5`, `43ed43cabd`, `0d07db7932`, `b11a01530b`, `7fc30a22ef` |
+| API replay and storage recovery | Prepaid replay; two protected memory lanes; durable table recovery credits and guarded legacy completion | `de95b61f4f`, `bd0b9f5585`, `38bfa197af` |
+| Retained joins and distributed integration | Bounded persistent join state, allocation-failure cleanup, protocol-3 coordinator/worker ownership, protected control ingress, compiled runtime configuration | `48baab7337`, `63f2eb025f` |
+| Local fault and policy plans | Advertised transport faults, signed fixture evidence, separate actual candidate policies and scaled correctness topology | `c6122532ea`, `1018036e1d`, `121d96fbf3` |
 | Runtime pressure | Defer background submissions on finite executor pressure; preserve admission failures across the compiled callback ABI | `9511272560`, `2be51d61ad` |
 | Evidence and operations | Retained native/container harness, vector calibration, numerical Cloud gates, explicit failure outcomes and telemetry validation | `ebe085a24d`, `0f9a1a05f2`, `dff1a3d9f7`, `0c9395fc32`, `fc2d5878ec`, `f550aefaf0`, `811956a541`, `c6ad0692ec`, `488637eb6b` |
 
 The [validation record](WORKLOAD_SCHEDULING_VALIDATION.md) identifies exact tested
 source revisions and failures. The remaining-phase table below distinguishes
 implemented mechanisms from unfinished integration. In particular, fixed-policy
-waiting and dense scheduling remain opt-in, and coordinator dispatch remains
-disabled. Document lookups now joining the existing query gate is an intentional
+waiting and dense scheduling remain opt-in, and coordinator dispatch requires explicit configuration and compatible peers. Document lookups now joining the existing query gate is an intentional
 default behavior change that reviewers should assess explicitly.
 
 ## Follow-up implementation stages
@@ -136,10 +137,12 @@ preparing replay keeps the original durable obligation for another pass; it no
 longer removes the transaction. The allocator failure sweep also exposed and
 fixed a batch-parser key leak when value serialization fails.
 
-The integrated development checkpoint passed 190 tests, with one optional skip,
-zero failures/leaks, and six expected error logs. This validates the API replay
-slice; storage/index preparation, protected control progress under sustained
-load, and release performance qualification remain separate work.
+The API replay checkpoint passed 190 tests, with one optional skip, zero
+failures/leaks, and six expected error logs. The subsequent integrated recovery
+and coordination checkpoint passed 206 tests with one optional skip and the same
+zero-failure/leak result. Production transport fault tests, backend completion
+credits, sustained-load progress, and release performance qualification remain
+separate work.
 
 ## Implemented admission contract
 
@@ -190,7 +193,7 @@ The REST/httpx, alternate-listener API-kernel paths, MCP, query builder, A2A,
 extension-host query/write calls, and serverless query/write handlers share this
 owner at their existing admission boundaries. Legacy nonwaiting callers cannot
 jump ahead of queued work. Metadata/data teardown can close admission across the
-compiled API boundary. The current API ABI is 26, storage-owner ABI is 64, and
+compiled API boundary. The current API ABI is 27, storage-owner ABI is 65, and
 native runtime ABI is 9; these include admission diagnostics, dense I/O context,
 executor capabilities, and worker configuration. Incompatible layouts are
 rejected. No inference-provider admission or transaction durability contract
@@ -327,46 +330,47 @@ request owner. Opted-in native exact reads use a scoped read arena rather than
 borrowing pooled scratch. Their actual arena allocations are charged without
 also charging the same bytes as an estimated native-I/O workspace.
 
-`common/workload_attempts.zig` models bounded coordinator attempt ownership,
-pre-reserved reconciliation capacity, deadline-preserving retransmission, and
-destination isolation. A timeout does not release uncertain work. Authenticated
-terminal/quiescence evidence reconciles once; delayed evidence cannot reopen a
-fenced generation. Restart begins with dispatch disabled until each destination
-acknowledges the previous generation is fenced and quiescent. Production
-coordinator wiring, trusted membership/incarnation discovery, and complete
-shutdown/restart reconciliation remain necessary before enabling it. The module
-does not claim that an ordinary HTTP error proves remote retirement.
+`common/workload_attempts.zig` models bounded coordinator ownership. The opt-in
+production coordinator persists ownership before sending a request and retains
+uncertain sends across timeouts and restarts. Trusted membership maps each
+endpoint to its node identity. Signed discovery binds a nonce to the worker's
+durable namespace and monotonically increasing incarnation. The synchronous
+compiled coordinator port copies response buffers into the caller's allocator
+before returning; it does not expose Zig runtime objects across the ABI.
 
-The authentication prerequisite signs bounded, issuer/domain-separated attempt
-and terminal/fence frames. It verifies the active plus rotation key, binds the
-request content/route and canonical authenticated node identity, and projects
-verified identity into the internal operation context. An opt-in client accepts
-only matching signed terminal evidence; HTTP success without it remains
-`AttemptOutcomeUncertain`. Existing requests omit this protocol. Authentication
-alone does not establish quiescence.
+`admission.remote_attempt_worker` covers the audited internal lookup, query,
+preflight, scan, vector, graph, text-statistics, algebraic-partial, and join routes.
+It requires a durable API session backend, node identity, and internal service
+authentication. Protocol 3 binds attempt identity, namespace/incarnation,
+request content, route, and canonical authenticated node identity. Older signed
+protocols are refused; unsigned legacy traffic remains outside this opt-in path.
+Active duplicates do not execute. Terminal duplicates return evidence without
+replaying a saved result. The worker preserves the earlier caller deadline and
+local run ceiling. Cancellation requests termination; only handler unwind and a
+durable terminal record permit signed terminal evidence.
 
-`admission.remote_attempt_worker` installs a durable deduplication and
-generation-close owner for authenticated internal `join-rows` requests only.
-It requires the durable API session backend, a runtime-supplied node identity,
-and internal service authentication. Records bind attempt identity to request
-content. Active duplicates do not execute; terminal duplicates return evidence
-of completion without replaying a saved result. Workers preserve the earlier
-incoming deadline and local `max_run_ms` ceiling. Deadline expiry requests
-cancellation but never proves quiescence. Terminal evidence is signed only after
-the actual handler unwinds and its terminal state is durable.
+Generation closure is durable before cancellation. A fence is issued only after
+covered work has quiesced. Count and byte ceilings include attempts, tombstones,
+and closure records. A capacity rejection persists a rejection floor before
+signing proof that the rejected attempt cannot execute later. Safe acknowledgments
+advance only beneath the first still-owned attempt, preserving delayed sends.
+Coordinator journal version 2 and worker journal version 3 reject incompatible
+prior journals rather than silently discarding their obligations.
 
-Generation closure is persisted before cancellation is signaled, and fence
-evidence waits for local work to unwind and terminal state to persist. Count and
-byte ceilings include outstanding/uncertain attempts, terminal tombstones, and
-fences. Restart retains unknown prior-incarnation work and its reservations;
-capacity reduction cannot erase it. The v2 journal stores individual attempts,
-transactional count/byte accounting, and per-coordinator closure keys. Begin,
-finish, duplicate lookup, and usage use a fixed number of point operations;
-only startup reconstruction and generation fencing scan bounded records.
-Startup refuses a legacy v1 snapshot with `WorkerJournalMigrationRequired`;
-an offline migration must fence earlier writers and preserve their obligations.
-Performance qualification and coordinator reconciliation must precede rollout.
-The setting does not enable coordinator dispatch or automatic remote retirement.
+Native restart can retire prior local incarnations only after exclusive ownership
+of the same durable journal root is established and retained through teardown.
+A new namespace, copied root, or elapsed deadline is not proof of old-worker
+quiescence. Capacity-pressure reconciliation uses exact signed status and fence
+evidence; missing evidence remains charged. Destination records with no debt can
+be reclaimed at coordinator generation advance. Coordinator dispatch remains
+disabled by default and unsupported serverless configurations are rejected.
+
+Authenticated, bounded recovery control requests have a separate optional ingress
+count/byte reserve. This lane serves attempt discovery/status/fencing and
+transaction resolve/status/ack operations, survives foreground drain, and rejects
+oversized or ambiguously framed bodies before protected admission. Ordinary
+health probes keep their separate reserve. Join job maps, partial results, and
+cached responses retain a stable owner under the session byte ceiling.
 
 The existing distributed join RPCs now emit `budget_version=1` and validate an
 explicit version on workers. Workers capture their receive deadline before JSON
@@ -381,8 +385,29 @@ It reserves record capacity for each pending recovery obligation, including
 records predating the recovery index. A full budget rejects before participant
 preparation; an already pending transaction may complete under reduced limits.
 Restart derives ownership from durable records, and terminal acknowledgement
-retires the obligation. These bounds cover durable session records, not all
-decoded 2PC memory or stateless-write recovery.
+retires the obligation. API replay also prepays its bounded decoding workspace. Storage tables can opt
+into immutable `storage.transaction_recovery` count/byte/per-transaction limits
+at creation. Disabled tables preserve the previous catalog and JSON encoding.
+Activated tables durably account metadata and intent obligations in the same
+serialized transaction as their state changes. Compatible upgraded peers are
+required; this is not an existing-table or rolling-activation migration.
+
+`admission.transaction_completion_bytes` reserves two exclusive scratch lanes
+against the host preparation budget before foreground service: one for recovery
+metadata and one for applying rows. Separate lanes permit same-node resolution
+without reacquiring the metadata lane. Busy or undersized completion resources
+retain the durable obligation for retry; they cannot convert a committed Raft
+operation into an aborted write. Protected lanes apply to tables with the
+replicated recovery policy; legacy-table completion keeps its previous allocation
+path so enabling a small node reserve cannot newly strand old committed intents. Logical recovery credits and these decoder/batch
+reservations do not bound every index/backend allocation or process RSS. Complete
+stateless coordinator/RPC ownership and worst-case index preparation remain audit
+and qualification work. In particular, row completion still enters ordinary LSM
+write-buffer admission, and some backend/HA buffers retain their DB allocator.
+The current saturation proof covers preparation and metadata; it does not prove
+completion with exhausted LSM capacity. A follow-up must prepay backend credits
+or establish bounded drain progress without bypassing those limits. Corrupt or oversized historical metadata can require
+operator repair or a larger reserve; a failed decode does not erase the debt.
 
 Background status refresh now treats `ConcurrencyUnavailable` from the finite
 durable executor as a deferred submission rather than a fatal data-control
@@ -428,8 +453,8 @@ does not raise a transport's independent connection or request-task limit.
 | Dense rerank and helpers | Shared scheduler owns drivers/helpers; exact workspaces and opted-in native read arenas own actual bytes; serial immutable pread suspends only with proven executor affinity | Audit remaining boundaries; remove enclosing thread-affine scopes for portable suspension; add durable ownership for cached HBC scratch |
 | Vector, text, graph, aggregation | Shared coarse general execution plus existing cancellation/work budgets and storage memory reservations | Audit further resumable operator state before adding suspension boundaries |
 | Scan/stream output | Tracked response drain plus opt-in prepaid NDJSON scanner state, absolute snapshot lifetime, and admitted resume on proven runtimes | Extend verified suspension to other backends and operators; MVCC pages retain storage ownership |
-| Remote coordinator/worker tasks | Versioned remaining budgets; authenticated opt-in join-row worker persists deduplication, terminal state, and generation closure; coordinator is still disabled | Wire coordinator ownership, membership/incarnation discovery, destination uncertainty, restart reconciliation, and durable-storage qualification |
-| Transaction commits | Stable sessions reserve bounded durable recovery-record capacity before prepare; existing decisions, fencing, and `PendingSessionRecovery` remain authoritative | Extend coverage to stateless writes and decoded mandatory-completion resources |
+| Remote coordinator/worker tasks | Opt-in durable coordinator and protocol-3 worker; membership identity, signed discovery, uncertainty accounting, generation closure, and same-root restart proof | Qualify real transport loss/restarts and complete shutdown/fan-out audits |
+| Transaction commits | API replay workspace, durable table recovery credits, and separate protected metadata/row scratch lanes; existing decisions remain authoritative | Complete stateless coordinator/RPC and worst-case index/backend preparation ownership; qualify crash recovery |
 | Background/control/recovery | Existing dedicated runtime owners; status/maintenance submission pressure retries without terminating control | Prove process-wide protected count/byte/progress floors and sustained-load fairness across foreground and background work |
 
 Only the verified existence-probe path above enters protected read execution.
@@ -502,7 +527,7 @@ release qualification.
 | --- | --- |
 | Ownership/progress prerequisite | Typed ledger, scheduler, allocator, and attempt state models are implemented and tested; complete operator inventory and process-wide progress proof remain open |
 | Phase 1 | Fixed foreground waiting, contextual allocation ownership, deadlines, overload diagnostics, and SDK contracts are integrated on the paths above; frontend ingress/planning/output ownership and empty-probe floors are integrated; process-wide execution/cleanup floors remain open |
-| Phase 2 | Dense driver/helper ownership, exact working bytes, one pinned-executor I/O boundary, session recovery bounds, and opt-in durable join-row workers are integrated; shared coarse reads, protected existence probes, measured pinned work, demotion and scan suspension are integrated; further cooperative operators, distributed coordinator ownership, and all write recovery remain open |
+| Phase 2 | Dense driver/helper ownership, exact working bytes, one pinned-executor I/O boundary, session recovery bounds, and opt-in durable join-row workers are integrated; shared coarse reads, protected existence probes, measured pinned work, demotion and scan suspension are integrated; opt-in coordinator ownership and protected recovery mechanisms are implemented but awaiting full local fault qualification; further cooperative operators and complete write/index memory proof remain open |
 | Phase 3 | SDK pools/retries, engine diagnostics, and qualification tooling exist; native pressure qualification, optimized release qualification, Cloud integration, sizing/defaults, and adaptive policy remain open |
 
 - Audit the tested ownership foundations against real continuation, remote

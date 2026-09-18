@@ -229,3 +229,40 @@ release matrix row. General operators still have nonyielding coarse regions,
 and unaudited backends do not suspend. Distributed coordinator ownership,
 remaining write-recovery integration, process-wide progress guarantees, and
 optimized resource-constrained performance qualification remain later work.
+
+
+## Recovery and coordination integration checkpoint
+
+The final development checkpoint for source committed through `63f2eb025f` ran
+`zig build antfly-workload-admission-test -j2` with loopback networking enabled:
+**206 passed, one optional real-Wasmtime test skipped, zero failures and leaks;
+six expected error logs and zero unexpected logs; actual process exit 0**.
+The production/test files were hash-checked against the tested working tree
+before committing. Retained local evidence:
+
+- `/tmp/workload-recovery-coordination-checkpoint9.log`
+- `/tmp/workload-recovery-coordination-checkpoint9-source.json`
+- Recorded source digest: `30b3d32fefb94f4b83e93956ef265be27221ca8361e45cb65aa0e2905b2460cd`
+
+This checkpoint covers protected preparation/metadata lanes, reentrant recovery,
+bounded paging, legacy completion with a small reserve, visibility-wait lease
+release, API/join allocation-failure sweeps, durable coordinator uncertainty,
+worker namespace/restart fencing, protected authenticated control ingress, and
+compiled callback ownership. It includes metrics-cache age and table-policy
+identity checks. It does not qualify full LSM/backend completion memory or
+optimized performance. Production Debug build and native coordinator fault
+qualification are pending for these new sources.
+
+Development failures were retained in checkpoint logs 5 through 8: generated
+nullable projection and join-default compiler errors, a shadowed local, missing
+admission guards on alternate begin entry points, an existing cancellation error
+name mismatch in a new test, and allocation failure surfaced as `WriteFailed`.
+They were fixed before checkpoint 9. The join failure audit also repaired partial
+decoder cleanup and replaced temporary JSON ownership with direct serialization.
+
+The independent fault-proxy stage passed 47 tests with one optional skip; actual
+advertised routing, delay, partition, discarded response, and healing ran on the
+earlier frozen `3f9d2c481e` Debug binary. The fixed-policy plan stage passed 53
+tests with one optional skip. These are harness checks, not evidence that the
+new coordinator has passed native fault qualification or that a Cloud release
+performance row is qualified.
