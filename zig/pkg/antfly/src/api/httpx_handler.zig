@@ -6373,7 +6373,11 @@ pub const AntflyApiHandler = struct {
             const proposed = (if (mode == .merge_patch)
                 table_contract.mergeSchemaPatchRequest(alloc, current.schema_json, body_data)
             else
-                table_contract.parseSchemaUpdateRequest(alloc, body_data)) catch return jsonErrorResponse(ctx, 400, "invalid schema update request");
+                table_contract.parseSchemaUpdateRequest(alloc, body_data)) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                _ = ctx.status(400);
+                return ctx.text(table_contract.schemaUpdateRequestErrorMessage(err, body_data));
+            };
             defer alloc.free(proposed);
             const schema_route = try system_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path));
             defer if (schema_route) |value| value.deinit(alloc);
@@ -8136,7 +8140,8 @@ const LookupStatusSource = struct {
     fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 };
 
-const SchemaUpdateStatusSource = struct {
+/// Test metadata authority shared by direct and HTTP schema route regressions.
+pub const SchemaUpdateStatusSource = struct {
     projection_wait_calls: std.atomic.Value(u32) = .init(0),
     schema_json: ?[]const u8 = null,
     owns_schema_json: bool = false,
@@ -8144,7 +8149,7 @@ const SchemaUpdateStatusSource = struct {
     table_buf: [2]metadata_table_manager.TableRecord = undefined,
     range_buf: [1]metadata_table_manager.RangeRecord = undefined,
 
-    fn iface(self: *@This()) http_server_mod.StatusSource {
+    pub fn iface(self: *@This()) http_server_mod.StatusSource {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -8158,7 +8163,7 @@ const SchemaUpdateStatusSource = struct {
         };
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.owns_schema_json) alloc.free(self.schema_json.?);
     }
 

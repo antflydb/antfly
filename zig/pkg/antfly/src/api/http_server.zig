@@ -36273,22 +36273,8 @@ test "api http server updates local table schema through bound write source" {
 
     var table_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
-    const FakeSource = struct {
-        fn iface(_: *@This()) StatusSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .status = status,
-                },
-            };
-        }
-
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
-        }
-    };
-
-    var source = FakeSource{};
+    var source = @import("httpx_handler.zig").SchemaUpdateStatusSource{};
+    defer source.deinit(alloc);
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), null, table_source.source());
     defer server.deinit();
 
@@ -41620,11 +41606,17 @@ test "api http server serves table create and drop" {
             if (self.created) return error.TableAlreadyExists;
             try std.testing.expectEqual(@as(?u32, 1), req.num_shards);
             try std.testing.expectEqualStrings("docs table", req.description.?);
-            try std.testing.expect(req.schema_json == null);
+            try std.testing.expect(try tables_api.schemasSemanticallyEqual(inner_alloc, tables_api.default_schema_json, req.schema_json.?));
             try std.testing.expect(try indexes_api.equivalentIndexConfigJson(std.testing.allocator, tables_api.default_indexes_json, req.indexes_json.?));
             try std.testing.expectEqualStrings("[]", req.replication_sources_json.?);
+            const schema = try inner_alloc.dupe(u8, req.schema_json.?);
+            errdefer inner_alloc.free(schema);
+            const indexes = try inner_alloc.dupe(u8, req.indexes_json.?);
+            if (self.owns_schema_json) inner_alloc.free(self.table_record.schema_json);
+            self.table_record.schema_json = schema;
+            self.owns_schema_json = true;
             self.created = true;
-            self.replaceIndexesJson(inner_alloc, try inner_alloc.dupe(u8, req.indexes_json.?), true);
+            self.replaceIndexesJson(inner_alloc, indexes, true);
         }
 
         fn dropTable(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8) !void {

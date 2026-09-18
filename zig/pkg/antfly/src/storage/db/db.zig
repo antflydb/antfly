@@ -71345,7 +71345,14 @@ test "db implicit batch timestamps use the borrowed runtime clock" {
 test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
     const vopr = @import("vopr");
     const alloc = std.testing.allocator;
-    var runtime_io = try vopr.vopr_io.VoprIo.init(.{ .seed = 704, .file_allocator = alloc });
+    var runtime_io = try vopr.vopr_io.VoprIo.init(.{
+        .seed = 704,
+        .file_allocator = alloc,
+        // Full DB graph apply crosses the LSM and debug allocator on this
+        // fiber. Match the production-shaped DB/DataServer VOPR campaigns,
+        // rather than the generic scheduler's 1 MiB task stack.
+        .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+    });
     defer runtime_io.deinit();
     runtime_io.monotonic_ns = 200 * std.time.ns_per_day;
     var backend = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
