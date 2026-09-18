@@ -4062,6 +4062,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
             "standalone resolves the default secret store before full config parsing",
             "standalone runtime secret store follows projected symlink rotation",
+            "standalone runtime secret store writes preserve symlinks across target rotation",
             "standalone default secret store follows projected symlink rotation",
             "embedded provider lifetime rejects new calls and joins admitted calls",
             "standalone runtime resolves paths from common storage base dir",

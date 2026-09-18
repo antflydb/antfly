@@ -5524,6 +5524,10 @@ test "standalone runtime secret store follows projected symlink rotation" {
     try @import("../common/secret_projection_test_support.zig").expectRuntimeRotation(initLayeredSecretStore);
 }
 
+test "standalone runtime secret store writes preserve symlinks across target rotation" {
+    try @import("../common/secret_projection_test_support.zig").expectRuntimeWrites(initLayeredSecretStore);
+}
+
 fn initLayeredSecretStore(
     alloc: std.mem.Allocator,
     io: std.Io,

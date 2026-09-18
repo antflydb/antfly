@@ -115,3 +115,58 @@ pub fn expectRuntimeRotation(comptime init_store: anytype) !void {
     try std.testing.expect(!health.stale_snapshot);
     try std.testing.expectEqual(@as(u64, 0), health.reload_failures);
 }
+
+pub fn expectRuntimeWrites(comptime init_store: anytype) !void {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(cwd);
+
+    for ([_]bool{ false, true }) |relative| {
+        var primary = try Projection.init(io, "projected.primary");
+        defer primary.deinit();
+        var fallback = try Projection.init(io, "projected.fallback");
+        defer fallback.deinit();
+        const path = if (relative)
+            try std.fs.path.relative(alloc, cwd, null, cwd, primary.path)
+        else
+            try alloc.dupe(u8, primary.path);
+        defer alloc.free(path);
+        var store = try init_store(alloc, io, &.{ path, fallback.path });
+        defer store.deinit();
+
+        // Each generation must remain reachable through the logical symlink
+        // after both mutation operations. Reopening the target verifies disk
+        // contents independently of the writer's in-memory snapshot.
+        inline for (.{ "..2026_01", "..2026_02" }, 0..) |dir, index| {
+            if (index != 0) {
+                const generation = store.generation();
+                try primary.rotate();
+                try expectValue(&store, "projected.primary", "other");
+                try std.testing.expectEqual(generation + 1, store.generation());
+            }
+            const target_path = try std.fs.path.join(alloc, &.{ primary.root, dir, "secrets.json" });
+            defer alloc.free(target_path);
+            var target = try secrets.FileStore.initWithIo(alloc, io, target_path);
+            defer target.deinit();
+
+            var listed = try store.put(alloc, "projected.primary", "updated");
+            defer listed.deinit(alloc);
+            try expectValue(&target, "projected.primary", "updated");
+            try expectValue(&store, "projected.primary", "updated");
+            try std.testing.expectEqual(.sym_link, (try primary.tmp.dir.statFile(io, "secrets.json", .{ .follow_symlinks = false })).kind);
+
+            try std.testing.expect(try store.delete("projected.precedence"));
+            const deleted = try target.getOwned(alloc, "projected.precedence");
+            defer if (deleted) |value| alloc.free(value);
+            try std.testing.expectEqual(@as(?[]u8, null), deleted);
+            try expectValue(&store, "projected.precedence", "projected.fallback");
+            try expectValue(&store, "projected.fallback", "first");
+            try std.testing.expectEqual(.sym_link, (try primary.tmp.dir.statFile(io, "secrets.json", .{ .follow_symlinks = false })).kind);
+        }
+        try std.testing.expectEqualStrings(path, store.path);
+        try std.testing.expect(!store.healthSnapshot().last_reload_failed);
+    }
+}
