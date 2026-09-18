@@ -4,8 +4,9 @@ Design: [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md).
 
 The design was committed first as `74820f0ec2`. Implementation is in progress.
 The current implementation provides fixed foreground admission with opt-in
-bounded waiting, shared dense driver/helper scheduling, and bounded SDK read
-retries. Dense native reads have one audited suspension boundary, and an opt-in
+bounded waiting, shared read driver/helper scheduling, and bounded SDK read
+retries. Audited dense I/O and streamed scans can suspend with prepaid state;
+narrow LMDB existence probes have an opt-in protected partition. An opt-in
 join-row worker has durable attempt ownership. Coordinator attempt dispatch
 remains disabled. These stages do not complete the operator scheduling design
 or qualify new defaults.
@@ -60,10 +61,68 @@ The stage 1 follow-up adds:
 
 The combined stage 1 gate passed 137 tests with zero leaks; one optional real
 Wasmtime test was skipped there and passed in its separate engine gate. The
-validation record lists focused checks and production build evidence separately. Storage, inference, connection framing,
-Wasm runtime, and durable job memory retain their own owners; frontend allocation
+validation record lists focused checks and production build evidence separately.
+Storage, inference, connection framing, Wasm runtime, and durable job memory retain their own owners; frontend allocation
 accounting is not a process RSS cap. Existing public query/write concurrency
 limits remain coarse execution admission, while ingress counts include drain.
+
+## Stage 2: shared read execution
+
+Stage 2 extends the fixed scheduler under opt-in `admission.read_execution`.
+It is mutually exclusive with `dense_execution`; both remain disabled by default.
+The validation document records integration and production-build evidence
+separately from release qualification. Review stage 2 in these slices:
+
+| Commit | Change |
+| --- | --- |
+| `57100f3898` | Prepaid transition capacity and atomic demotion |
+| `3a026c60c5` | Absolute HTTP stream deadlines |
+| `0969910a0f` | Shared native reads, protected probes, configuration and diagnostics |
+| `31d8ed49c1` | Serverless query and joined-helper scheduling |
+| `27146c033f` | Prepaid scan state, admitted resume and compiled deadline transport |
+
+- Native DB lookup, scan, text/vector/composed search, aggregation, graph reads,
+  and query preflight acquire shared general execution before storage locks.
+  Nested dense work borrows that exact request owner; returned request metadata
+  cannot retain a pointer to its stack lease. Optional dense helpers acquire
+  independent nonwaiting permits or run inline.
+- Serverless query handlers use a shared read runtime. Graph column/range helpers
+  acquire before spawning, run inline if no permit fits, and retire only inside
+  the joined worker. Serverless rejects the provisioned-only protected-probe and
+  scan-suspension settings.
+- Caller-thread CPU is measured in 100 microsecond units only when the runtime
+  proves thread affinity. Helpers begin measurement on their executing thread.
+  Migrating or unknown runtimes retain a conservative service estimate.
+- An opt-in protected partition serves only a capped-key, empty-projection local
+  LMDB existence probe. It validates at most 4 KiB of JSON in fixed 64 KiB scratch,
+  checks JSON storage and disabled TTL, and prepays a transition ticket before
+  execution. Scratch also reserves the node memory budget. Wider or incompatible
+  rows close all probes/schema views before demoting to general execution and
+  restarting the read. Ordinary field projections and arbitrary `limit: 1`
+  queries do not qualify. These are storage execution floors; foreground ingress
+  and request admission retain their separate limits.
+- Demotion atomically transfers the request and quiescent children, carries
+  measured service debt, and preserves global byte charges. Prepaid transition
+  count/byte/metadata guarantees cannot be consumed by other work. A parked
+  demotion resumes only with a complete general grant; its 100 ms residence
+  ceiling cannot extend the original deadline. Live helpers/I/O forbid transfer.
+- LMDB NDJSON scan output can suspend at the synchronous sink boundary with explicit
+  prepaid scanner memory, snapshot lifetime, and a deadline-capable sink. It
+  resumes through the same scheduler and original deadline. Buffered collectors
+  and other snapshot backends (including LSM) or unproven runtimes remain coarse.
+  Snapshot/cursor cleanup precedes release
+  of saved-state credits. The reservation bounds owned scanner buffers and
+  logical pins, not physical MVCC pages retained by concurrent writes.
+- HTTP/1 and HTTP/2 writes honor min-only absolute output deadlines. HTTP/2
+  flow-control and writer-lock waiting cannot renew that deadline; stream-local
+  timeouts preserve other streams. A partial physical frame failure closes the
+  connection to prevent subsequent framing corruption. Compiled callbacks
+  subtract elapsed transit time instead of renewing the remaining budget.
+
+General text, graph, and aggregation operations still hold a coarse execution
+lease through their nonyielding regions. This stage does not assert arbitrary
+operator preemption, process-wide RSS limits, distributed fan-out ownership, or
+release performance qualification.
 
 ## Implemented admission contract
 
@@ -114,8 +173,8 @@ The REST/httpx, alternate-listener API-kernel paths, MCP, query builder, A2A,
 extension-host query/write calls, and serverless query/write handlers share this
 owner at their existing admission boundaries. Legacy nonwaiting callers cannot
 jump ahead of queued work. Metadata/data teardown can close admission across the
-compiled API boundary. The current API ABI is 25, storage-owner ABI is 63, and
-native runtime ABI is 8; these include admission diagnostics, dense I/O context,
+compiled API boundary. The current API ABI is 26, storage-owner ABI is 64, and
+native runtime ABI is 9; these include admission diagnostics, dense I/O context,
 executor capabilities, and worker configuration. Incompatible layouts are
 rejected. No inference-provider admission or transaction durability contract
 is replaced by this queue.
@@ -132,8 +191,9 @@ The final MCP protocol envelope and agent output retain their request/class
 owner through response drain. The serverless route inventory has no document
 lookup endpoint; its existing query routes use query admission. Substantive
 serverless metadata and publication work now enters query/write admission.
-Only empty health/readiness probes use the ingress control partition. This behavior change still requires
-release qualification; it is not evidence that all overload timeouts are fixed.
+Only empty health/readiness probes use the ingress control partition. This
+behavior change still requires release qualification; it is not evidence that
+all overload timeouts are fixed.
 
 Query and write classes have independent fixed count/byte budgets. This preserves
 their existing isolation and does not introduce borrowing between them. Configured
@@ -349,14 +409,14 @@ does not raise a transport's independent connection or request-task limit.
 | Public queries, document lookups, and writes | Admission lease held around the existing synchronous operation, including joins of its helpers; lookups share query capacity | Split runnable, retained state, and request lifetime at verified quiescent boundaries |
 | Query decoding/planning | Foreground body reservations plus tracked public single/NDJSON query and serverless query allocations; authentication/catalog/planning use ingress ownership before the class grant | Introduce separately protected execution for verified bounded planning |
 | Dense rerank and helpers | Shared scheduler owns drivers/helpers; exact workspaces and opted-in native read arenas own actual bytes; serial immutable pread suspends only with proven executor affinity | Audit remaining boundaries; remove enclosing thread-affine scopes for portable suspension; add durable ownership for cached HBC scratch |
-| Vector, text, graph, aggregation | Existing cancellation/work budgets and storage resource reservations; no scheduler continuation contract established | Inventory maximum nonyielding intervals, resumable state, and minimum completion resources; remain in the general lane until verified |
-| Scan/stream output | Tracked buffered bodies retain actual allocation charges through transport drain, including API-kernel and serverless handoffs; streaming snapshots remain storage/transport-owned | Complete streaming retained-state ownership and resume only through admission |
+| Vector, text, graph, aggregation | Shared coarse general execution plus existing cancellation/work budgets and storage memory reservations | Audit further resumable operator state before adding suspension boundaries |
+| Scan/stream output | Tracked response drain plus opt-in prepaid NDJSON scanner state, absolute snapshot lifetime, and admitted resume on proven runtimes | Extend verified suspension to other backends and operators; MVCC pages retain storage ownership |
 | Remote coordinator/worker tasks | Versioned remaining budgets; authenticated opt-in join-row worker persists deduplication, terminal state, and generation closure; coordinator is still disabled | Wire coordinator ownership, membership/incarnation discovery, destination uncertainty, restart reconciliation, and durable-storage qualification |
 | Transaction commits | Stable sessions reserve bounded durable recovery-record capacity before prepare; existing decisions, fencing, and `PendingSessionRecovery` remain authoritative | Extend coverage to stateless writes and decoded mandatory-completion resources |
 | Background/control/recovery | Existing dedicated runtime owners; status/maintenance submission pressure retries without terminating control | Prove process-wide protected count/byte/progress floors and sustained-load fairness across foreground and background work |
 
-No operator is admitted to a new protected bounded-plan execution lane by this
-change. None releases execution on an unverified suspend boundary. Existing
+Only the verified existence-probe path above enters protected read execution.
+No operator releases execution on an unverified suspend boundary. Existing
 committed-write recovery is preserved; client cancellation must not be used as
 evidence that a write was rolled back or that remote work quiesced.
 
@@ -425,7 +485,7 @@ release qualification.
 | --- | --- |
 | Ownership/progress prerequisite | Typed ledger, scheduler, allocator, and attempt state models are implemented and tested; complete operator inventory and process-wide progress proof remain open |
 | Phase 1 | Fixed foreground waiting, contextual allocation ownership, deadlines, overload diagnostics, and SDK contracts are integrated on the paths above; frontend ingress/planning/output ownership and empty-probe floors are integrated; process-wide execution/cleanup floors remain open |
-| Phase 2 | Dense driver/helper ownership, exact working bytes, one pinned-executor I/O boundary, session recovery bounds, and opt-in durable join-row workers are integrated; full operator scheduling, fairness, distributed coordinator ownership, and all write recovery remain open |
+| Phase 2 | Dense driver/helper ownership, exact working bytes, one pinned-executor I/O boundary, session recovery bounds, and opt-in durable join-row workers are integrated; shared coarse reads, protected existence probes, measured pinned work, demotion and scan suspension are integrated; further cooperative operators, distributed coordinator ownership, and all write recovery remain open |
 | Phase 3 | SDK pools/retries, engine diagnostics, and qualification tooling exist; native pressure qualification, optimized release qualification, Cloud integration, sizing/defaults, and adaptive policy remain open |
 
 - Audit the tested ownership foundations against real continuation, remote

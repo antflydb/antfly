@@ -74,7 +74,7 @@ runnable capacity before decoding or continuing, using the original deadline
 and cancellation. Pooled HBC scratch, result ownership, projection/residual
 helpers, and other unaudited paths keep their existing policies.
 
-This is not yet a process-wide scheduler or a protected interactive lane. Keep
+Dense-only scheduling does not supply protected interactive capacity. Keep
 fixed policies for qualification; automatic/adaptive sizing is unavailable.
 
 ## Reading the diagnostics
@@ -240,3 +240,58 @@ Wasm stores, and durable background jobs retain their own resource owners and
 limits. In particular, these settings do not qualify a process RSS ceiling or a
 protected CPU service guarantee. Execution scheduling and release qualification
 have separate gates.
+
+
+## Shared read execution
+
+`admission.read_execution` applies a shared fixed storage read limit. It is
+mutually exclusive with enabled `admission.dense_execution`. Both default to
+disabled; this example is an explicit policy, not a qualified sizing default:
+
+```yaml
+admission:
+  read_execution:
+    max_runnable_tasks: 2
+    max_outstanding_tasks: 8
+    max_queued_tasks: 4
+    max_wait_ms: 25
+    max_working_bytes: 8388608
+    max_scan_state_bytes: 1048576
+    max_scan_snapshot_ms: 30000
+    protected:
+      max_runnable_tasks: 1
+      max_outstanding_tasks: 1
+      max_working_bytes: 65536
+      max_transition_tasks: 1
+      max_transition_bytes: 65536
+```
+
+Protected and transition partitions are carved from these totals. Each possible
+protected probe needs a 64 KiB scratch reservation and a transition ticket.
+The default LSM backend stays in general execution; omit the protected
+partition unless serving eligible LMDB reads. Protected eligibility is verified
+by the engine: local LMDB, bounded key,
+empty projection, JSON storage, no TTL, and bounded validation. Wider records
+restart in the general lane after closing their first snapshot. General work
+cannot consume the protected execution floor, but upstream query/ingress limits
+still apply. A transition waits at most 100 ms and never beyond the original
+request deadline.
+
+`max_scan_state_bytes: 0` keeps scans coarse. A nonzero value prepays each
+participating scan's owned buffers, with 4096 bytes reserved for logical pin
+bookkeeping. It must fit `max_working_bytes`. The absolute snapshot ceiling
+also reaches socket and HTTP/2 flow-control waits; a trickling consumer cannot
+renew it. Physical MVCC pages pinned by snapshots remain a storage concern.
+Suspension requires LMDB, a proven pinned runtime, and a deadline-capable sink.
+LSM scans stay coarse until their mutable snapshot allocations have an audited
+retained-state certificate.
+
+Serverless supports shared general reads and separately admitted graph helpers.
+Omit `protected` and leave `max_scan_state_bytes` zero there; unsupported
+provisioned-only settings fail startup instead of being ignored.
+
+Native metrics use `antfly_read_execution_*` when shared reads are enabled;
+legacy dense-only mode retains `antfly_dense_execution_*`. Metrics include
+runnable/outstanding/queue state, participating working bytes, protected work,
+and parked transitions. Serverless metrics include a `read_execution` snapshot.
+These byte metrics cover participating workspaces, not the entire process.
