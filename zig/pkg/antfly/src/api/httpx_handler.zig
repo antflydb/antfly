@@ -6758,6 +6758,10 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(503);
                     return ctx.text("standby read unavailable");
                 },
+                error.DistributedQueryUnavailable => {
+                    var response = try public_table_http.queryTemporarilyUnavailableOwnedResponse(alloc, .distributed_query_unavailable);
+                    return respondOwnedApiResponseWithAllocator(ctx, &response, alloc);
+                },
                 error.PersistentDescriptorAdmissionExhausted,
                 error.ResourceBudgetExceeded,
                 error.StorageBusy,
@@ -6871,6 +6875,10 @@ pub const AntflyApiHandler = struct {
                 try ctx.setHeader("Retry-After", "1");
                 _ = ctx.status(503);
                 return ctx.text("group leader unavailable");
+            },
+            error.DistributedQueryUnavailable => {
+                var response = try public_table_http.queryTemporarilyUnavailableOwnedResponse(alloc, .distributed_query_unavailable);
+                return respondOwnedApiResponseWithAllocator(ctx, &response, alloc);
             },
             error.PersistentDescriptorAdmissionExhausted,
             error.ResourceBudgetExceeded,
@@ -11487,7 +11495,7 @@ test "httpx antfly reads preserve availability and terminal failures" {
 
     const alloc = std.testing.allocator;
     var status_source = LookupStatusSource{};
-    for ([_]anyerror{ error.TableNotFound, error.GenerationTransitionActive, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadIndexTimeout, error.DeadlineExceeded, error.CorruptInput }) |failure| {
+    for ([_]anyerror{ error.TableNotFound, error.GenerationTransitionActive, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.DistributedQueryUnavailable, error.ReadIndexTimeout, error.DeadlineExceeded, error.CorruptInput }) |failure| {
         var reads = MissingTableReads{ .failure = failure };
         const missing = failure == error.TableNotFound;
         const deadline = failure == error.DeadlineExceeded;
@@ -11519,7 +11527,7 @@ test "httpx antfly reads preserve availability and terminal failures" {
             try std.testing.expect(response.header("Retry-After") == null);
         } else {
             try std.testing.expectEqualStrings("1", response.header("Retry-After").?);
-            const reason = if (failure == error.ReadIndexTimeout) "group leader unavailable" else "storage_read_temporarily_unavailable";
+            const reason = if (failure == error.ReadIndexTimeout) "group leader unavailable" else if (failure == error.DistributedQueryUnavailable) "distributed_query_unavailable" else "storage_read_temporarily_unavailable";
             try std.testing.expect(std.mem.indexOf(u8, response.body.?, reason) != null);
         }
 
@@ -11538,7 +11546,7 @@ test "httpx antfly reads preserve availability and terminal failures" {
             try std.testing.expect(scan_response.header("Retry-After") == null);
         } else {
             try std.testing.expectEqualStrings("1", scan_response.header("Retry-After").?);
-            const reason = if (failure == error.ReadIndexTimeout) "group leader unavailable" else "storage_read_temporarily_unavailable";
+            const reason = if (failure == error.ReadIndexTimeout) "group leader unavailable" else if (failure == error.DistributedQueryUnavailable) "distributed_query_unavailable" else "storage_read_temporarily_unavailable";
             try std.testing.expect(std.mem.indexOf(u8, scan_response.body.?, reason) != null);
         }
 
