@@ -94,8 +94,22 @@ pub fn ensureBufferCapacity(
     const available = shared.capacity -| shared.stats().in_use;
     const geometric = if (buffer.capacity == 0) minimum else buffer.capacity +| @max(buffer.capacity / 2, 8);
     const target = @max(minimum, @min(geometric, buffer.capacity +| available));
+    return ensureBufferCapacityPrecise(shared, backing, buffer, target, reserved);
+}
+
+/// Exact growth target for callers that already cap their geometric policy.
+pub fn ensureBufferCapacityPrecise(
+    budget: ?*SharedBodyBudget,
+    backing: std.mem.Allocator,
+    buffer: *std.ArrayListUnmanaged(u8),
+    minimum: usize,
+    reserved: *usize,
+) !void {
+    if (minimum <= buffer.capacity) return;
+    const shared = budget orelse return buffer.ensureTotalCapacityPrecise(backing, minimum);
+    std.debug.assert(reserved.* == buffer.capacity);
     var tracker = CapacityAllocator{ .backing = backing, .budget = shared, .reserved = reserved };
-    buffer.ensureTotalCapacityPrecise(tracker.allocator(), target) catch |err| {
+    buffer.ensureTotalCapacityPrecise(tracker.allocator(), minimum) catch |err| {
         if (tracker.denied) return error.BodyCapacityExceeded;
         return err;
     };

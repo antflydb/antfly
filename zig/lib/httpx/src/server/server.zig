@@ -346,6 +346,8 @@ pub const Context = struct {
     io: Io,
     request: *Request,
     response: ResponseBuilder,
+    /// Application request allocator lifetime, independent of replaceable body owners.
+    request_memory: ?Response.BodyMemory = null,
     params: []const RouteParam = &.{},
     /// Borrowed opaque value associated with the matched route.
     route_data: ?*anyopaque = null,
@@ -367,6 +369,8 @@ pub const Context = struct {
     /// Set to true when a streaming response has been sent via `streamResponse()`.
     /// When true, the connection loop skips the normal response serialization.
     h1_stream_sent: bool = false,
+    /// Transport-neutral commitment marker, including delegated streams.
+    stream_committed: bool = false,
     /// Connection policy established before dispatch, then narrowed by the
     /// streaming response headers. Committed headers and socket retirement
     /// must agree so clients do not reuse a connection the server will close.
@@ -470,6 +474,7 @@ pub const Context = struct {
             data.deinit();
         }
         self.response.deinit();
+        if (self.request_memory) |owner| owner.release(owner.ptr);
     }
 
     /// Stores a pointer in the context data map with an optional destructor.
@@ -1139,6 +1144,7 @@ pub const Context = struct {
         try h2.sendHeaders(sock, self.h2_stream_id, h2_headers, self.request.method == .HEAD);
 
         self.h2_stream_sent = true;
+        self.stream_committed = true;
         return .{ .h2 = h2, .sock = sock, .stream_id = self.h2_stream_id, .io = self.io, .context = self, .suppress_body = self.request.method == .HEAD };
     }
 
@@ -1311,6 +1317,7 @@ pub const Context = struct {
             self.response.headers.removeAll(HeaderName.CONTENT_LENGTH);
             self.response.headers.removeAll(HeaderName.TRANSFER_ENCODING);
             try delegate.start(delegate.ptr, status_code, content_type, &self.response.headers);
+            self.stream_committed = true;
             return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate, .context = self, .suppress_body = self.request.method == .HEAD };
         }
         // Middleware has already established response policy (e.g. CORS).
@@ -1351,6 +1358,7 @@ pub const Context = struct {
         try sock.sendAll(header_bytes);
 
         self.h1_stream_sent = true;
+        self.stream_committed = true;
         return .{ .h1_sock = sock, .h2_writer = null, .context = self, .suppress_body = self.request.method == .HEAD };
     }
 };
@@ -1764,6 +1772,11 @@ pub const Server = struct {
     /// Adds middleware to the server.
     pub fn use(self: *Self, mw: Middleware) !void {
         try self.middleware.append(self.allocator, mw);
+    }
+
+    /// Installs an outer boundary before existing application middleware.
+    pub fn useFirst(self: *Self, mw: Middleware) !void {
+        try self.middleware.insert(self.allocator, 0, mw);
     }
 
     /// Adds a pre-route hook executed before route matching.
@@ -6706,6 +6719,7 @@ test "stream output cancellation and deadline stop producers before more bytes" 
     context.cancellation = &canceled;
     context.stream_delegate = .{ .ptr = &capture, .start = Capture.start, .write = Capture.write, .close = Capture.close };
     var writer = try context.streamResponse(200);
+    try std.testing.expect(context.stream_committed);
     try writer.write("first");
     canceled.store(true, .release);
     try std.testing.expectError(error.Canceled, writer.write("later"));
