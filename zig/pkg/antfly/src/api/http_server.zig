@@ -8267,18 +8267,28 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn loadQueryBuilderTableContext(self: *ApiHttpServer, table_name: []const u8) !query_builder_agent.QueryBuilderTableContext {
+        return self.loadQueryBuilderTableContextAlloc(self.alloc, table_name);
+    }
+
+    pub fn loadQueryBuilderTableContextAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8) !query_builder_agent.QueryBuilderTableContext {
         var snapshot = (try self.source.adminSnapshot()) orelse return error.TableNotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
         const schema_json = if (table.read_schema_json.len > 0) table.read_schema_json else table.schema_json;
-        const schema_fields = try self.loadQueryBuilderSchemaFieldsFromJson(schema_json);
-        errdefer freeOwnedStrings(self.alloc, schema_fields);
-        const observed_dynamic_capability_sets = try self.bestEffortObservedDynamicFieldCapabilitySets(table_name);
-        defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
-        const field_capabilities = try self.loadQueryBuilderFieldCapabilitiesFromJson(schema_json, observed_dynamic_capability_sets);
-        errdefer freeQueryBuilderFieldCapabilities(self.alloc, field_capabilities);
-        const index_context = try self.loadQueryBuilderIndexContextFromJson(table.indexes_json);
-        errdefer freeQueryBuilderIndexContext(self.alloc, index_context);
+        const schema_fields = try loadQueryBuilderSchemaFieldsFromJson(alloc, schema_json);
+        errdefer freeOwnedStrings(alloc, schema_fields);
+        const observed_dynamic_capability_sets: []table_reads.ObservedDynamicFieldCapabilitySet = if (self.table_reads) |source|
+            (source.observedDynamicFieldCapabilitySets(alloc, table_name, .{ .coverage_read_mode = .cached_only }) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable => null,
+                else => return err,
+            }) orelse &.{}
+        else
+            &.{};
+        defer table_reads.freeObservedDynamicFieldCapabilitySets(alloc, observed_dynamic_capability_sets);
+        const field_capabilities = try loadQueryBuilderFieldCapabilitiesFromJson(alloc, schema_json, observed_dynamic_capability_sets);
+        errdefer freeQueryBuilderFieldCapabilities(alloc, field_capabilities);
+        const index_context = try loadQueryBuilderIndexContextFromJson(alloc, table.indexes_json);
+        errdefer freeQueryBuilderIndexContext(alloc, index_context);
         return .{
             .schema_fields = schema_fields,
             .field_capabilities = field_capabilities,
@@ -8288,9 +8298,9 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn loadQueryBuilderSchemaFieldsFromJson(self: *ApiHttpServer, schema_json: []const u8) ![]const []const u8 {
-        if (schema_json.len == 0) return try self.alloc.alloc([]const u8, 0);
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+    fn loadQueryBuilderSchemaFieldsFromJson(alloc: std.mem.Allocator, schema_json: []const u8) ![]const []const u8 {
+        if (schema_json.len == 0) return try alloc.alloc([]const u8, 0);
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
 
@@ -8302,34 +8312,35 @@ pub const ApiHttpServer = struct {
 
         var fields = std.ArrayListUnmanaged([]const u8).empty;
         errdefer {
-            for (fields.items) |field| self.alloc.free(@constCast(field));
-            fields.deinit(self.alloc);
+            for (fields.items) |field| alloc.free(@constCast(field));
+            fields.deinit(alloc);
         }
 
         for (runtime_schema.full_text_documents) |document_schema| {
             for (document_schema.fields) |field| {
                 if (seen.contains(field.path)) continue;
                 try seen.put(arena, field.path, {});
-                try fields.append(self.alloc, try self.alloc.dupe(u8, field.path));
+                try fields.ensureUnusedCapacity(alloc, 1);
+                fields.appendAssumeCapacity(try alloc.dupe(u8, field.path));
             }
         }
 
-        return try fields.toOwnedSlice(self.alloc);
+        return try fields.toOwnedSlice(alloc);
     }
 
     fn loadQueryBuilderFieldCapabilitiesFromJson(
-        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
         schema_json: []const u8,
         observed_dynamic_capability_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
     ) ![]const query_builder_agent.QueryBuilderFieldCapability {
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
 
         var out = std.ArrayListUnmanaged(query_builder_agent.QueryBuilderFieldCapability).empty;
         errdefer {
-            freeQueryBuilderFieldCapabilitiesItems(self.alloc, out.items);
-            out.deinit(self.alloc);
+            freeQueryBuilderFieldCapabilitiesItems(alloc, out.items);
+            out.deinit(alloc);
         }
         if (schema_json.len > 0) {
             const parsed_schema = try tables_api.parseValidatedTableSchema(arena, schema_json);
@@ -8337,7 +8348,7 @@ pub const ApiHttpServer = struct {
             const capabilities = try storage_schema.fieldCapabilitiesAlloc(arena, runtime_schema);
             for (capabilities) |capability| {
                 const field = capability.field orelse continue;
-                try appendQueryBuilderFieldCapability(self.alloc, &out, .{
+                try appendQueryBuilderFieldCapability(alloc, &out, .{
                     .field = field,
                     .field_type = capability.field_type,
                     .query_modes = queryBuilderQueryModesForFieldCapability(capability),
@@ -8352,7 +8363,7 @@ pub const ApiHttpServer = struct {
         for (observed_dynamic_capability_sets) |set| {
             for (set.field_capabilities) |capability| {
                 const field = capability.field orelse continue;
-                try appendQueryBuilderFieldCapability(self.alloc, &out, .{
+                try appendQueryBuilderFieldCapability(alloc, &out, .{
                     .field = field,
                     .field_type = capability.field_type,
                     .query_modes = queryBuilderQueryModesForFieldCapability(capability),
@@ -8364,12 +8375,12 @@ pub const ApiHttpServer = struct {
                 });
             }
         }
-        return try out.toOwnedSlice(self.alloc);
+        return try out.toOwnedSlice(alloc);
     }
 
-    fn loadQueryBuilderIndexContextFromJson(self: *ApiHttpServer, indexes_json: []const u8) !QueryBuilderIndexContext {
+    fn loadQueryBuilderIndexContextFromJson(alloc: std.mem.Allocator, indexes_json: []const u8) !QueryBuilderIndexContext {
         const source = if (indexes_json.len == 0) "{}" else indexes_json;
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, source, .{});
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
         defer parsed.deinit();
         const object = switch (parsed.value) {
             .object => |object| object,
@@ -8377,16 +8388,16 @@ pub const ApiHttpServer = struct {
         };
 
         var full_text_metadata = std.ArrayListUnmanaged(query_builder_agent.QueryBuilderFullTextIndex).empty;
-        defer full_text_metadata.deinit(self.alloc);
+        defer full_text_metadata.deinit(alloc);
         var embedding_metadata = std.ArrayListUnmanaged(query_builder_agent.QueryBuilderEmbeddingIndex).empty;
-        defer embedding_metadata.deinit(self.alloc);
+        defer embedding_metadata.deinit(alloc);
         var graph_metadata = std.ArrayListUnmanaged(query_builder_agent.QueryBuilderGraphIndex).empty;
-        defer graph_metadata.deinit(self.alloc);
+        defer graph_metadata.deinit(alloc);
 
         errdefer {
-            freeQueryBuilderFullTextIndexMetadataItems(self.alloc, full_text_metadata.items);
-            freeQueryBuilderEmbeddingIndexMetadataItems(self.alloc, embedding_metadata.items);
-            freeQueryBuilderGraphIndexMetadataItems(self.alloc, graph_metadata.items);
+            freeQueryBuilderFullTextIndexMetadataItems(alloc, full_text_metadata.items);
+            freeQueryBuilderEmbeddingIndexMetadataItems(alloc, embedding_metadata.items);
+            freeQueryBuilderGraphIndexMetadataItems(alloc, graph_metadata.items);
         }
 
         var it = object.iterator();
@@ -8394,24 +8405,24 @@ pub const ApiHttpServer = struct {
             const index_type = queryBuilderIndexContextType(entry.key_ptr.*, entry.value_ptr.*) orelse continue;
             switch (index_type) {
                 .full_text => {
-                    try self.appendQueryBuilderFullTextIndexMetadata(&full_text_metadata, entry.key_ptr.*, entry.value_ptr.*);
+                    try appendQueryBuilderFullTextIndexMetadata(alloc, &full_text_metadata, entry.key_ptr.*, entry.value_ptr.*);
                 },
                 .embeddings => {
-                    const metadata = try self.queryBuilderEmbeddingIndexMetadata(entry.key_ptr.*, entry.value_ptr.*);
-                    errdefer freeQueryBuilderEmbeddingIndexMetadataItem(self.alloc, metadata);
-                    try embedding_metadata.append(self.alloc, metadata);
+                    const metadata = try queryBuilderEmbeddingIndexMetadata(alloc, entry.key_ptr.*, entry.value_ptr.*);
+                    errdefer freeQueryBuilderEmbeddingIndexMetadataItem(alloc, metadata);
+                    try embedding_metadata.append(alloc, metadata);
                 },
                 .graph => {
-                    try self.appendQueryBuilderGraphIndexMetadata(&graph_metadata, entry.key_ptr.*, entry.value_ptr.*);
+                    try appendQueryBuilderGraphIndexMetadata(alloc, &graph_metadata, entry.key_ptr.*, entry.value_ptr.*);
                 },
             }
         }
 
         var context = QueryBuilderIndexContext{};
-        errdefer freeQueryBuilderIndexContext(self.alloc, context);
-        context.full_text_index_metadata = if (full_text_metadata.items.len == 0) &.{} else try full_text_metadata.toOwnedSlice(self.alloc);
-        context.embedding_index_metadata = if (embedding_metadata.items.len == 0) &.{} else try embedding_metadata.toOwnedSlice(self.alloc);
-        context.graph_index_metadata = if (graph_metadata.items.len == 0) &.{} else try graph_metadata.toOwnedSlice(self.alloc);
+        errdefer freeQueryBuilderIndexContext(alloc, context);
+        context.full_text_index_metadata = if (full_text_metadata.items.len == 0) &.{} else try full_text_metadata.toOwnedSlice(alloc);
+        context.embedding_index_metadata = if (embedding_metadata.items.len == 0) &.{} else try embedding_metadata.toOwnedSlice(alloc);
+        context.graph_index_metadata = if (graph_metadata.items.len == 0) &.{} else try graph_metadata.toOwnedSlice(alloc);
         return context;
     }
 
@@ -8438,58 +8449,62 @@ pub const ApiHttpServer = struct {
     }
 
     fn appendQueryBuilderFullTextIndexMetadata(
-        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
         metadata: *std.ArrayListUnmanaged(query_builder_agent.QueryBuilderFullTextIndex),
         index_name: []const u8,
         value: std.json.Value,
     ) !void {
-        const name = try self.alloc.dupe(u8, index_name);
-        errdefer self.alloc.free(name);
-        const fields = try self.loadQueryBuilderFullTextIndexFields(value);
-        errdefer freeOwnedStrings(self.alloc, fields);
+        const name = try alloc.dupe(u8, index_name);
+        errdefer alloc.free(name);
+        const fields = try loadQueryBuilderFullTextIndexFields(alloc, value);
+        errdefer freeOwnedStrings(alloc, fields);
         const entry = query_builder_agent.QueryBuilderFullTextIndex{
             .name = name,
             .fields = fields,
         };
-        try metadata.append(self.alloc, entry);
+        try metadata.append(alloc, entry);
     }
 
-    fn loadQueryBuilderFullTextIndexFields(self: *ApiHttpServer, value: std.json.Value) ![]const []const u8 {
+    fn loadQueryBuilderFullTextIndexFields(alloc: std.mem.Allocator, value: std.json.Value) ![]const []const u8 {
         const object = switch (value) {
             .object => |object| object,
             else => return &.{},
         };
         var fields = std.ArrayListUnmanaged([]const u8).empty;
-        defer fields.deinit(self.alloc);
-        errdefer freeOwnedStringItems(self.alloc, fields.items);
+        defer fields.deinit(alloc);
+        errdefer freeOwnedStringItems(alloc, fields.items);
 
         if (object.get("field")) |field_value| {
-            if (field_value == .string) try fields.append(self.alloc, try self.alloc.dupe(u8, field_value.string));
+            if (field_value == .string) {
+                try fields.ensureUnusedCapacity(alloc, 1);
+                fields.appendAssumeCapacity(try alloc.dupe(u8, field_value.string));
+            }
         }
         if (object.get("fields")) |fields_value| {
             if (fields_value == .array) {
                 for (fields_value.array.items) |item| {
                     if (item != .string) continue;
-                    try fields.append(self.alloc, try self.alloc.dupe(u8, item.string));
+                    try fields.ensureUnusedCapacity(alloc, 1);
+                    fields.appendAssumeCapacity(try alloc.dupe(u8, item.string));
                 }
             }
         }
-        return if (fields.items.len == 0) &.{} else try fields.toOwnedSlice(self.alloc);
+        return if (fields.items.len == 0) &.{} else try fields.toOwnedSlice(alloc);
     }
 
     fn queryBuilderEmbeddingIndexMetadata(
-        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
         index_name: []const u8,
         value: std.json.Value,
     ) !query_builder_agent.QueryBuilderEmbeddingIndex {
         const object = switch (value) {
             .object => |object| object,
-            else => return .{ .name = try self.alloc.dupe(u8, index_name) },
+            else => return .{ .name = try alloc.dupe(u8, index_name) },
         };
-        const model = try self.queryBuilderEmbeddingIndexModel(object);
-        errdefer if (model) |value_model| self.alloc.free(@constCast(value_model));
+        const model = try queryBuilderEmbeddingIndexModel(alloc, object);
+        errdefer if (model) |value_model| alloc.free(@constCast(value_model));
         return .{
-            .name = try self.alloc.dupe(u8, index_name),
+            .name = try alloc.dupe(u8, index_name),
             .sparse = queryBuilderEmbeddingIndexIsSparse(object),
             .dimension = queryBuilderJsonInt(object.get("dimension")) orelse queryBuilderJsonInt(object.get("dims")),
             .model = model,
@@ -8504,34 +8519,34 @@ pub const ApiHttpServer = struct {
         return queryBuilderJsonBool(object.get("sparse")) orelse false;
     }
 
-    fn queryBuilderEmbeddingIndexModel(self: *ApiHttpServer, object: std.json.ObjectMap) !?[]const u8 {
-        if (queryBuilderJsonString(object.get("model"))) |model| return try self.alloc.dupe(u8, model);
+    fn queryBuilderEmbeddingIndexModel(alloc: std.mem.Allocator, object: std.json.ObjectMap) !?[]const u8 {
+        if (queryBuilderJsonString(object.get("model"))) |model| return try alloc.dupe(u8, model);
         if (object.get("embedder")) |embedder_value| {
             if (embedder_value == .object) {
-                if (queryBuilderJsonString(embedder_value.object.get("model"))) |model| return try self.alloc.dupe(u8, model);
+                if (queryBuilderJsonString(embedder_value.object.get("model"))) |model| return try alloc.dupe(u8, model);
             }
         }
         return null;
     }
 
     fn appendQueryBuilderGraphIndexMetadata(
-        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
         metadata: *std.ArrayListUnmanaged(query_builder_agent.QueryBuilderGraphIndex),
         index_name: []const u8,
         value: std.json.Value,
     ) !void {
-        const name = try self.alloc.dupe(u8, index_name);
-        errdefer self.alloc.free(name);
-        const edge_types = try self.loadQueryBuilderGraphEdgeTypes(value);
-        errdefer freeQueryBuilderGraphEdgeTypes(self.alloc, edge_types);
+        const name = try alloc.dupe(u8, index_name);
+        errdefer alloc.free(name);
+        const edge_types = try loadQueryBuilderGraphEdgeTypes(alloc, value);
+        errdefer freeQueryBuilderGraphEdgeTypes(alloc, edge_types);
         const entry = query_builder_agent.QueryBuilderGraphIndex{
             .name = name,
             .edge_types = edge_types,
         };
-        try metadata.append(self.alloc, entry);
+        try metadata.append(alloc, entry);
     }
 
-    fn loadQueryBuilderGraphEdgeTypes(self: *ApiHttpServer, value: std.json.Value) ![]const query_builder_agent.QueryBuilderGraphEdgeType {
+    fn loadQueryBuilderGraphEdgeTypes(alloc: std.mem.Allocator, value: std.json.Value) ![]const query_builder_agent.QueryBuilderGraphEdgeType {
         const object = switch (value) {
             .object => |object| object,
             else => return &.{},
@@ -8540,22 +8555,24 @@ pub const ApiHttpServer = struct {
         if (edge_types_value != .array) return &.{};
 
         var edge_types = std.ArrayListUnmanaged(query_builder_agent.QueryBuilderGraphEdgeType).empty;
-        defer edge_types.deinit(self.alloc);
-        errdefer freeQueryBuilderGraphEdgeTypeItems(self.alloc, edge_types.items);
+        defer edge_types.deinit(alloc);
+        errdefer freeQueryBuilderGraphEdgeTypeItems(alloc, edge_types.items);
 
         for (edge_types_value.array.items) |item| {
             if (item != .object) continue;
             const name = queryBuilderJsonString(item.object.get("name")) orelse continue;
             const topology_source = queryBuilderJsonString(item.object.get("topology"));
-            const edge_type = query_builder_agent.QueryBuilderGraphEdgeType{
-                .name = try self.alloc.dupe(u8, name),
-                .topology = if (topology_source) |topology| try self.alloc.dupe(u8, topology) else null,
-            };
-            errdefer freeQueryBuilderGraphEdgeTypeItem(self.alloc, edge_type);
-            try edge_types.append(self.alloc, edge_type);
+            try edge_types.ensureUnusedCapacity(alloc, 1);
+            const owned_name = try alloc.dupe(u8, name);
+            errdefer alloc.free(owned_name);
+            const owned_topology = if (topology_source) |topology| try alloc.dupe(u8, topology) else null;
+            edge_types.appendAssumeCapacity(.{
+                .name = owned_name,
+                .topology = owned_topology,
+            });
         }
 
-        return if (edge_types.items.len == 0) &.{} else try edge_types.toOwnedSlice(self.alloc);
+        return if (edge_types.items.len == 0) &.{} else try edge_types.toOwnedSlice(alloc);
     }
 
     pub fn runtimeSchemaDebugAllowed(self: *ApiHttpServer, authenticated_identity: ?AuthenticatedIdentity) bool {
@@ -33316,7 +33333,7 @@ test "api http server query builder maps doc identity mismatch to unavailable" {
     try std.testing.expect((try std.fmt.parseInt(u32, retry_after, 10)) > 0);
 }
 
-test "api http server query builder loads structured table index metadata" {
+test "workload admission query builder loads structured metadata with explicit allocation ownership" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -33414,6 +33431,14 @@ test "api http server query builder loads structured table index metadata" {
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), ColdReads.source(), null);
     defer server.deinit();
+    const AllocationSweep = struct {
+        fn run(failing_alloc: std.mem.Allocator, live_server: *ApiHttpServer) !void {
+            const owned = try live_server.loadQueryBuilderTableContextAlloc(failing_alloc, "docs");
+            defer freeQueryBuilderTableContext(failing_alloc, owned);
+            try std.testing.expectEqual(@as(usize, 1), owned.graph_index_metadata.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationSweep.run, .{&server});
     const context = try server.loadQueryBuilderTableContext("docs");
     defer freeQueryBuilderTableContext(alloc, context);
 
