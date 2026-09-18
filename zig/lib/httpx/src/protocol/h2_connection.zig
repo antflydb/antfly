@@ -375,6 +375,38 @@ pub const H2Connection = struct {
     /// **Caller must hold `write_mutex`**. The mutex is temporarily released
     /// while waiting for window space so the receive loop can process frames.
     pub fn writeDataBlocking(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool) !void {
+        return self.writeDataBlockingDeadline(writer, stream_id, data, end_stream, .none);
+    }
+
+    /// Absolute per-stream lifetime is independent of the progress-based idle
+    /// timer. Neither unrelated wakeups nor trickled DATA extend this bound.
+    pub fn writeDataBlockingDeadline(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, timeout: Io.Timeout) !void {
+        return self.writeDataWithDeadline(writer, stream_id, data, end_stream, timeout, null);
+    }
+
+    /// Own the write mutex so a timed-out stream can leave a flow-control wait
+    /// without reacquiring a mutex held by another stream's blocked writer.
+    pub fn writeDataScoped(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, timeout: Io.Timeout) !void {
+        const deadline = timeout.toDeadline(self.io);
+        try self.lockWriteUntil(deadline);
+        var held = true;
+        defer if (held) self.write_mutex.unlock(self.io);
+        return self.writeDataWithDeadline(writer, stream_id, data, end_stream, deadline, &held);
+    }
+
+    pub fn lockWriteUntil(self: *Self, timeout: Io.Timeout) !void {
+        const deadline = timeout.toDeadline(self.io);
+        if (deadline == .none) return self.write_mutex.lock(self.io);
+        while (true) {
+            const remaining = deadline.toDurationFromNow(self.io).?;
+            if (remaining.raw.nanoseconds <= 0) return error.Timeout;
+            if (self.write_mutex.tryLock()) return;
+            try self.io.sleep(.{ .nanoseconds = @min(remaining.raw.nanoseconds, std.time.ns_per_ms) }, .awake);
+        }
+    }
+
+    fn writeDataWithDeadline(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, timeout: Io.Timeout, lock_held: ?*bool) !void {
+        const absolute_timeout = timeout.toDeadline(self.io);
         const max_size = self.peer_settings.max_frame_size;
 
         // WINDOW_UPDATE for another stream is not progress for this writer.
@@ -388,6 +420,12 @@ pub const H2Connection = struct {
             if (idle_timeout.toDurationFromNow(self.io)) |remaining_time| {
                 if (remaining_time.raw.nanoseconds <= 0) return error.Timeout;
             }
+            const wait_timeout = blk: {
+                const absolute = absolute_timeout.toDurationFromNow(self.io) orelse break :blk idle_timeout;
+                if (absolute.raw.nanoseconds <= 0) return error.Timeout;
+                const idle = idle_timeout.toDurationFromNow(self.io) orelse break :blk absolute_timeout;
+                break :blk if (absolute.raw.nanoseconds <= idle.raw.nanoseconds) absolute_timeout else idle_timeout;
+            };
             const remaining = data.len - offset;
 
             // Available window = min(stream, connection), clamped to 0.
@@ -397,22 +435,20 @@ pub const H2Connection = struct {
             const chunk_size = @min(remaining, @min(window, max_size));
 
             if (chunk_size == 0) {
-                // Window exhausted — release mutex, wait for WINDOW_UPDATE, reacquire.
+                // Reset while holding the lock: WINDOW_UPDATE cannot race the
+                // reset, and its event persists after we release the lock.
+                self.send_window_event.reset();
+                self.write_mutex.unlock(self.io);
+                if (lock_held) |held| held.* = false;
                 {
-                    self.write_mutex.unlock(self.io);
-                    defer self.write_mutex.lockUncancelable(self.io);
-                    self.send_window_event.reset();
-                    // Re-check after reset (receive loop may have updated between our check and reset).
-                    const s2 = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
-                    if (s2.responseWriteError(self.is_server)) |err| return err;
-                    const sw2: usize = if (s2.send_window > 0) @intCast(s2.send_window) else 0;
-                    const cw2: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
-                    if (sw2 == 0 or cw2 == 0) {
-                        self.send_window_event.waitTimeout(self.io, idle_timeout) catch |err| switch (err) {
-                            error.Timeout => return error.Timeout,
-                            error.Canceled => return error.Canceled,
-                        };
-                    }
+                    // Legacy callers require the mutex held on every return.
+                    // Scoped stream writers instead abandon the wait unlocked.
+                    defer if (lock_held == null) self.write_mutex.lockUncancelable(self.io);
+                    try self.send_window_event.waitTimeout(self.io, wait_timeout);
+                }
+                if (lock_held) |held| {
+                    try self.lockWriteUntil(absolute_timeout);
+                    held.* = true;
                 }
                 continue;
             }
@@ -3583,6 +3619,56 @@ test "H2 stalled output deadline survives unrelated window wakeups" {
     try std.testing.expectEqual(@as(usize, 2), fake.wakeups);
     try std.testing.expectEqual(@as(usize, 0), wire.items.len);
     // The write contract reacquires the mutex and leaves other streams usable.
+    const other = try server.stream_manager.getOrCreateStream(3);
+    other.state = .open;
+    try server.writeDataBlocking(writer, 3, "control", true);
+    try std.testing.expect(other.end_stream_sent);
+}
+
+test "H2 stalled output absolute deadline survives DATA progress" {
+    const FakeIo = struct {
+        now_ns: i96 = 0,
+        wakeups: usize = 0,
+        connection: *H2Connection = undefined,
+
+        fn now(raw: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = self.now_ns };
+        }
+
+        fn wait(raw: ?*anyopaque, ptr: *const u32, _: u32, _: Io.Timeout) Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            // Control traffic must retain the connection mutex while output
+            // is stalled, without requiring an extra thread for this waiter.
+            std.debug.assert(self.connection.write_mutex.state.load(.acquire) == .unlocked);
+            self.wakeups += 1;
+            if (self.wakeups > 10) return error.Canceled;
+            self.now_ns += 3 * std.time.ns_per_ms;
+            self.connection.stream_manager.getStream(1).?.send_window = 1;
+            @atomicStore(u32, @constCast(ptr), @intFromEnum(Io.Event.is_set), .release);
+        }
+    };
+    var fake: FakeIo = .{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = FakeIo.now;
+    vtable.futexWait = FakeIo.wait;
+    const io: Io = .{ .userdata = &fake, .vtable = &vtable };
+    var server = H2Connection.initServer(std.testing.allocator, io);
+    defer server.deinit();
+    fake.connection = &server;
+    server.send_window_timeout = .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(50), .clock = .awake } };
+    const stalled = try server.stream_manager.getOrCreateStream(1);
+    stalled.state = .open;
+    stalled.send_window = 0;
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(std.testing.allocator);
+    const writer = testWriter(&wire, std.testing.allocator);
+    try std.testing.expectError(error.Timeout, server.writeDataScoped(writer, 1, "pending", false, .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(5), .clock = .awake } }));
+    try std.testing.expectEqual(@as(usize, 2), fake.wakeups);
+    try std.testing.expect(wire.items.len > 0);
+    try std.testing.expect(server.write_mutex.tryLock());
+    defer server.write_mutex.unlock(io);
+    // Scoped timeout leaves the mutex available to unrelated streams.
     const other = try server.stream_manager.getOrCreateStream(3);
     other.state = .open;
     try server.writeDataBlocking(writer, 3, "control", true);

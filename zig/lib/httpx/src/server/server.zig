@@ -396,6 +396,8 @@ pub const Context = struct {
     /// Records malformed application deadline metadata so authentication can
     /// run before an application-specific validation response is disclosed.
     application_deadline_invalid: bool = false,
+    /// Transport-local absolute output deadline; tightening never extends it.
+    stream_deadline_ns: ?i96 = null,
 
     /// Optional transport-neutral streaming sink. Linked runtime adapters use
     /// this to preserve incremental response delivery without sharing socket
@@ -435,6 +437,7 @@ pub const Context = struct {
         start: *const fn (?*anyopaque, u16, []const u8, *const Headers) anyerror!void,
         write: *const fn (?*anyopaque, []const u8) anyerror!void,
         close: *const fn (?*anyopaque) anyerror!void,
+        constrain_deadline: ?*const fn (?*anyopaque, Io, i96) anyerror!void = null,
     };
 
     pub const BodyDelegate = struct {
@@ -1091,9 +1094,9 @@ pub const Context = struct {
             if (self.closed) return error.StreamClosed;
             if (self.context) |ctx| try ctx.checkStreamActive();
             if (self.suppress_body) return;
-            self.h2.write_mutex.lockUncancelable(self.io);
-            defer self.h2.write_mutex.unlock(self.io);
-            try self.h2.writeDataBlocking(self.sock, self.stream_id, data, false);
+            const timeout = if (self.context) |ctx| ctx.streamTimeout() else .none;
+            const writer = self.sock.deadlineWriter(if (self.context) |ctx| ctx.streamSocketDeadline() else null);
+            try self.h2.writeDataScoped(writer, self.stream_id, data, false, timeout);
         }
 
         /// Sends END_STREAM and marks the writer done.
@@ -1102,9 +1105,9 @@ pub const Context = struct {
             if (self.context) |ctx| try ctx.checkStreamActive();
             self.closed = true;
             if (self.suppress_body) return;
-            self.h2.write_mutex.lockUncancelable(self.io);
+            try self.h2.lockWriteUntil(if (self.context) |ctx| ctx.streamTimeout() else .none);
             defer self.h2.write_mutex.unlock(self.io);
-            try self.h2.writeData(self.sock, self.stream_id, &.{}, true);
+            try self.h2.writeData(self.sock.deadlineWriter(if (self.context) |ctx| ctx.streamSocketDeadline() else null), self.stream_id, &.{}, true);
         }
 
         /// Sends trailing HEADERS with END_STREAM (RFC 7540 §8.1).
@@ -1115,9 +1118,9 @@ pub const Context = struct {
             if (self.context) |ctx| try ctx.checkStreamActive();
             self.closed = true;
             if (self.suppress_body) return;
-            self.h2.write_mutex.lockUncancelable(self.io);
+            try self.h2.lockWriteUntil(if (self.context) |ctx| ctx.streamTimeout() else .none);
             defer self.h2.write_mutex.unlock(self.io);
-            try self.h2.sendHeaders(self.sock, self.stream_id, trailers, true);
+            try self.h2.sendHeaders(self.sock.deadlineWriter(if (self.context) |ctx| ctx.streamSocketDeadline() else null), self.stream_id, trailers, true);
         }
     };
 
@@ -1139,9 +1142,9 @@ pub const Context = struct {
         );
         defer alloc.free(h2_headers);
 
-        h2.write_mutex.lockUncancelable(self.io);
+        try h2.lockWriteUntil(self.streamTimeout());
         defer h2.write_mutex.unlock(self.io);
-        try h2.sendHeaders(sock, self.h2_stream_id, h2_headers, self.request.method == .HEAD);
+        try h2.sendHeaders(sock.deadlineWriter(self.streamSocketDeadline()), self.h2_stream_id, h2_headers, self.request.method == .HEAD);
 
         self.h2_stream_sent = true;
         self.stream_committed = true;
@@ -1174,7 +1177,7 @@ pub const Context = struct {
             } else if (self.h2_writer) |*w| {
                 try w.write(data);
             } else if (self.h1_sock) |sock| {
-                try writeH1Chunk(sock, data);
+                try writeH1Chunk(sock.deadlineWriter(if (self.context) |ctx| ctx.streamSocketDeadline() else null), data);
             } else return error.StreamClosed;
         }
 
@@ -1213,7 +1216,7 @@ pub const Context = struct {
             } else if (self.h1_sock) |sock| {
                 if (self.suppress_body) return;
                 // Terminating chunk: "0\r\n\r\n"
-                try sock.sendAll("0\r\n\r\n");
+                try sock.deadlineWriter(if (self.context) |ctx| ctx.streamSocketDeadline() else null).sendAll("0\r\n\r\n");
             }
         }
 
@@ -1279,8 +1282,42 @@ pub const Context = struct {
         }
     };
 
+    pub fn constrainStreamTimeout(self: *Self, remaining_ns: u64) !void {
+        return self.constrainStreamDeadline(Io.Clock.awake.now(self.io).nanoseconds +| @as(i96, remaining_ns));
+    }
+
+    /// The timestamp belongs to this Context's I/O clock. A delegate receives
+    /// that authority with the absolute value, never a reset duration.
+    pub fn constrainStreamDeadline(self: *Self, deadline: i96) !void {
+        self.stream_deadline_ns = if (self.stream_deadline_ns) |old| @min(old, deadline) else deadline;
+        if (self.stream_delegate) |delegate| {
+            const constrain = delegate.constrain_deadline orelse return error.StreamDeadlineUnsupported;
+            try constrain(delegate.ptr, self.io, self.stream_deadline_ns.?);
+        }
+        try self.checkStreamActive();
+    }
+
+    fn streamTimeout(self: *const Self) Io.Timeout {
+        var deadline = self.stream_deadline_ns;
+        if (self.application_deadline_io) |clock_io| {
+            if (self.application_deadline_ns) |application_deadline| {
+                const remaining = @as(i128, application_deadline) - Io.Clock.awake.now(clock_io).nanoseconds;
+                const local: i96 = @intCast(std.math.clamp(@as(i128, Io.Clock.awake.now(self.io).nanoseconds) + remaining, std.math.minInt(i96), std.math.maxInt(i96)));
+                deadline = if (deadline) |old| @min(old, local) else local;
+            }
+        }
+        return if (deadline) |value| .{ .deadline = .{ .raw = .{ .nanoseconds = value }, .clock = .awake } } else .none;
+    }
+
+    fn streamSocketDeadline(self: *const Self) ?i64 {
+        const timestamp = self.streamTimeout().toTimestamp(self.io) orelse return null;
+        return @intCast(std.math.clamp(@divFloor(timestamp.raw.nanoseconds, std.time.ns_per_ms), std.math.minInt(i64), std.math.maxInt(i64)));
+    }
+
     fn checkStreamActive(self: *const Self) !void {
         if (self.isCancellationRequested()) return error.Canceled;
+        if (self.stream_deadline_ns) |deadline|
+            if (Io.Clock.awake.now(self.io).nanoseconds >= deadline) return error.Timeout;
         // A deadline without clock authority belongs to the embedding's native
         // clock contract; do not reinterpret it using another clock epoch.
         if (self.application_deadline_io) |clock_io| {
@@ -1355,7 +1392,7 @@ pub const Context = struct {
         // Serialize headers only (no body)
         const header_bytes = try serializeToSlice(alloc, &resp);
         defer alloc.free(header_bytes);
-        try sock.sendAll(header_bytes);
+        try sock.deadlineWriter(self.streamSocketDeadline()).sendAll(header_bytes);
 
         self.h1_stream_sent = true;
         self.stream_committed = true;
@@ -6828,4 +6865,29 @@ test "ingress capacity H2 materialization transfers charge to request while mail
         stream_live = false;
         try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
     }
+}
+
+test "stream output deadline tightens once across trickled writes" {
+    const FakeIo = struct {
+        ns: i96 = 0,
+        fn now(raw: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = self.ns };
+        }
+    };
+    var fake = FakeIo{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = FakeIo.now;
+    const io: Io = .{ .userdata = &fake, .vtable = &vtable };
+    var request = try Request.init(std.testing.allocator, .GET, "http://localhost/scan");
+    defer request.deinit();
+    var ctx = Context.init(std.testing.allocator, io, &request);
+    defer ctx.deinit();
+    try ctx.constrainStreamTimeout(100);
+    fake.ns = 50;
+    try ctx.constrainStreamTimeout(200);
+    try std.testing.expectEqual(@as(i96, 100), ctx.stream_deadline_ns.?);
+    try ctx.checkStreamActive();
+    fake.ns = 100;
+    try std.testing.expectError(error.Timeout, ctx.checkStreamActive());
 }

@@ -252,7 +252,15 @@ pub const Socket = struct {
 
     /// Sends data, returning the number of bytes written.
     pub fn send(self: *Self, data: []const u8) !usize {
-        const operation_deadline_ms = self.socketOperationDeadline(.send);
+        return self.sendWithDeadline(data, null);
+    }
+
+    fn sendWithDeadline(self: *Self, data: []const u8, deadline_ms: ?i64) !usize {
+        const socket_deadline = self.socketOperationDeadline(.send);
+        const operation_deadline_ms = if (deadline_ms) |deadline|
+            if (socket_deadline) |existing| @min(existing, deadline) else deadline
+        else
+            socket_deadline;
         while (true) {
             try self.checkRequestCancellation();
             const wait = try self.operationWait(operation_deadline_ms);
@@ -266,6 +274,8 @@ pub const Socket = struct {
                 return error.SendFailed;
             };
             try self.checkRequestDeadline();
+            if (deadline_ms) |deadline|
+                if (common.milliTimestamp(self.io) >= deadline) return error.Timeout;
             return sent;
         }
     }
@@ -310,6 +320,37 @@ pub const Socket = struct {
         while (sent < data.len) {
             sent += try self.send(data[sent..]);
         }
+    }
+
+    /// Per-write deadline; never changes shared receive/connection state.
+    pub const DeadlineWriter = struct {
+        socket: *Self,
+        deadline_ms: ?i64,
+
+        pub fn sendAll(self: @This(), data: []const u8) !void {
+            var sent: usize = 0;
+            while (sent < data.len) {
+                const n = self.socket.sendWithDeadline(data[sent..], self.deadline_ms) catch |err| {
+                    // A frame prefix may already be on the wire. Continuing
+                    // this connection with another H2 frame would corrupt its
+                    // framing; flow-control timeouts never enter this path.
+                    self.socket.shutdown();
+                    return err;
+                };
+                if (n == 0) {
+                    self.socket.shutdown();
+                    return error.SendFailed;
+                }
+                sent += n;
+            }
+        }
+        pub fn writeAll(self: @This(), data: []const u8) !void {
+            return self.sendAll(data);
+        }
+    };
+
+    pub fn deadlineWriter(self: *Self, deadline_ms: ?i64) DeadlineWriter {
+        return .{ .socket = self, .deadline_ms = deadline_ms };
     }
 
     /// Alias for sendAll — provides the `writeAll` interface expected by
@@ -1853,4 +1894,34 @@ test "timed fallback denied write sends no bytes" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     try TimedFallbackTest.denied(true, 0);
     try TimedFallbackTest.denied(true, 1);
+}
+
+test "deadline writer shuts down after a partial physical frame failure" {
+    const Fake = struct {
+        writes: usize = 0,
+        shutdowns: usize = 0,
+        fn now(_: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            return .{ .nanoseconds = 0 };
+        }
+        fn write(raw: ?*anyopaque, _: net.Socket.Handle, _: []const u8, _: []const []const u8, _: usize) net.Stream.Writer.Error!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.writes += 1;
+            if (self.writes == 1) return 1;
+            return error.ConnectionResetByPeer;
+        }
+        fn shutdown(raw: ?*anyopaque, _: net.Socket.Handle, how: net.ShutdownHow) net.ShutdownError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            std.debug.assert(how == .both);
+            self.shutdowns += 1;
+        }
+    };
+    var fake = Fake{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Fake.now;
+    vtable.netWrite = Fake.write;
+    vtable.netShutdown = Fake.shutdown;
+    var socket = Socket{ .handle = 0, .io = .{ .userdata = &fake, .vtable = &vtable } };
+    try std.testing.expectError(error.SendFailed, socket.deadlineWriter(null).sendAll("frame"));
+    try std.testing.expectEqual(@as(usize, 2), fake.writes);
+    try std.testing.expectEqual(@as(usize, 1), fake.shutdowns);
 }
