@@ -822,6 +822,13 @@ test "dense aggregate resource manager bounds callers and helpers together" {
 }
 
 pub const ResourceManager = struct {
+    transaction_completion_mutex: std.atomic.Mutex = .unlocked,
+    transaction_completion: ?struct {
+        workspace: *@import("../common/workload_completion.zig").Workspace,
+        metadata: *@import("../common/workload_completion.zig").Workspace,
+        capacity: usize,
+        host_reservation: Reservation,
+    } = null,
     dense_checkpoint_ready: @import("maintenance_signal.zig").Signal = .{},
     mutex: std.atomic.Mutex = .unlocked,
     reclaimer_mutex: std.atomic.Mutex = .unlocked,
@@ -1635,6 +1642,12 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        if (self.transaction_completion) |*completion| {
+            completion.workspace.destroy();
+            completion.metadata.destroy();
+            completion.host_reservation.release();
+            self.transaction_completion = null;
+        }
         if (self.dense_execution) |runtime| runtime.destroy();
         self.dense_checkpoint_ready.assertUnbound();
         self.dense_rerank_admission.assertIdle();
@@ -2205,6 +2218,45 @@ pub const ResourceManager = struct {
             if (self.reclaimForAllocation(slice, bytes) == 0) return err;
             return self.reserveOnce(slice, bytes);
         };
+    }
+
+    /// Configure at the manager's final address, before publishing ordinary
+    /// work. The complete allocation ceiling remains charged to aggregate host
+    /// memory; foreground work cannot spend idle completion capacity. One pool
+    /// serves every DB sharing this manager, including legacy durable replay.
+    pub fn configureTransactionCompletion(self: *ResourceManager, capacity: usize) !void {
+        if (capacity == 0) return;
+        lockAtomic(&self.transaction_completion_mutex);
+        defer self.transaction_completion_mutex.unlock();
+        if (self.transaction_completion) |completion| {
+            if (completion.capacity < capacity) return error.TransactionCompletionCapacityMismatch;
+            return;
+        }
+        const Workspace = @import("../common/workload_completion.zig").Workspace;
+        if (capacity < 2) return error.InvalidTransactionCompletionCapacity;
+        // Metadata may survive a synchronous resolver RPC. It must not own the
+        // same lane needed by that RPC's local participant row application.
+        const row_capacity = capacity / 2;
+        const metadata_capacity = capacity - row_capacity;
+        const host_bytes = try std.math.add(usize, try Workspace.hostBytes(row_capacity), try Workspace.hostBytes(metadata_capacity));
+        var reservation = try self.reserveWithoutReclaim(.relational_preparation_working_set, host_bytes);
+        errdefer reservation.release();
+        const workspace = try Workspace.create(self.identity_allocator, row_capacity);
+        errdefer workspace.destroy();
+        const metadata = try Workspace.create(self.identity_allocator, metadata_capacity);
+        self.transaction_completion = .{ .workspace = workspace, .metadata = metadata, .capacity = capacity, .host_reservation = reservation };
+    }
+
+    pub fn transactionCompletion(self: *ResourceManager) ?*@import("../common/workload_completion.zig").Workspace {
+        lockAtomic(&self.transaction_completion_mutex);
+        defer self.transaction_completion_mutex.unlock();
+        return if (self.transaction_completion) |completion| completion.workspace else null;
+    }
+
+    pub fn transactionCompletionMetadata(self: *ResourceManager) ?*@import("../common/workload_completion.zig").Workspace {
+        lockAtomic(&self.transaction_completion_mutex);
+        defer self.transaction_completion_mutex.unlock();
+        return if (self.transaction_completion) |completion| completion.metadata else null;
     }
 
     /// Performs the final non-blocking admission check at a commit boundary.
@@ -3421,6 +3473,36 @@ pub const OwnedSplitReservation = struct {
         self.secondary_bytes = 0;
     }
 };
+
+test "workload admission node completion pool owns host capacity before data saturation" {
+    const Workspace = @import("../common/workload_completion.zig").Workspace;
+    const capacity = 1024;
+    const reserved = 2 * try Workspace.hostBytes(capacity / 2);
+    var manager = ResourceManager.init(.{
+        .identity_allocator = std.testing.allocator,
+        .memory_budget = .{ .hard_limit_bytes = reserved + 4096 },
+    });
+    defer manager.deinit(std.testing.allocator);
+    try manager.configureTransactionCompletion(capacity);
+    const workspace = manager.transactionCompletion().?;
+    try manager.configureTransactionCompletion(capacity);
+    try std.testing.expect(workspace == manager.transactionCompletion().?);
+    try std.testing.expectEqual(@as(u64, reserved), manager.snapshot().memory.used_bytes);
+    var data = try manager.reserveWithoutReclaim(.relational_preparation_working_set, 4096);
+    defer data.release();
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserveWithoutReclaim(.relational_preparation_working_set, 1));
+    var completion = try workspace.tryAcquire();
+    defer completion.release();
+    var metadata = try manager.transactionCompletionMetadata().?.tryAcquire();
+    defer metadata.release();
+    const metadata_payload = try metadata.allocator().alloc(u8, capacity / 2);
+    metadata.allocator().free(metadata_payload);
+    const payload = try completion.allocator().alloc(u8, capacity / 2);
+    completion.allocator().free(payload);
+    try std.testing.expectEqual(@as(u64, reserved + 4096), manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.TransactionCompletionBusy, workspace.tryAcquire());
+    try std.testing.expectError(error.TransactionCompletionCapacityMismatch, manager.configureTransactionCompletion(capacity + 1));
+}
 
 /// Accounts allocator-backed working sets before each allocation reaches the
 /// backing allocator. One operation may make bounded progress above the normal
