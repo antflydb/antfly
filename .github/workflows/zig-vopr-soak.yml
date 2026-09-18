@@ -286,7 +286,7 @@ jobs:
   production-e2e:
     if: inputs.diagnostic_run == '' && inputs.qualification_only != true
     runs-on: arc-antfly-heavy
-    timeout-minutes: 240
+    timeout-minutes: 330
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}-restore
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
@@ -356,6 +356,24 @@ jobs:
         run: |
           scripts/ci/zig-e2e-cluster-restore-soak.sh \
             2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/cluster-restore.log"
+      - name: Soak large catalog control and diagnostic isolation
+        timeout-minutes: 45
+        if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
+        env:
+          ANTFLY_E2E_REGRESSION_WORKERS: '2'
+          ANTFLY_E2E_REGRESSION_REPORT_DIR: ${{ runner.temp }}/production-e2e-soak/catalog
+        run: |
+          scripts/ci/zig-e2e-catalog-soak.sh \
+            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/catalog.log"
+      - name: Soak concurrent aggregations and transaction session recovery
+        timeout-minutes: 45
+        if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
+        env:
+          ANTFLY_E2E_REGRESSION_WORKERS: '2'
+          ANTFLY_E2E_REGRESSION_REPORT_DIR: ${{ runner.temp }}/production-e2e-soak/query-transaction
+        run: |
+          scripts/ci/zig-e2e-query-transaction-soak.sh \
+            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/query-transaction.log"
       - name: Verify complete production soak evidence
         if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
         working-directory: zig
@@ -375,6 +393,23 @@ jobs:
               "test_cluster_restore_modes_with_concurrent_observers": 100,
           }
           assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases)
+          for profile in ("normal", "constrained"):
+              reports = list((Path(os.environ["RUNNER_TEMP"]) / "production-e2e-soak/query-transaction" / profile).glob("*.xml"))
+              assert len(reports) == 100, ("query-transaction", profile, len(reports))
+              cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
+              assert Counter(case.attrib["name"] for case in cases) == {
+                  "test_aggregations_remain_exact_during_concurrent_inserts": 50,
+                  "test_session_transform_savepoint_rollback": 50,
+              }, profile
+              assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
+          for profile in ("normal", "constrained"):
+              reports = list((Path(os.environ["RUNNER_TEMP"]) / "production-e2e-soak/catalog" / profile).glob("*.xml"))
+              assert len(reports) == 50, ("catalog", profile, len(reports))
+              cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
+              assert Counter(case.attrib["name"] for case in cases) == {
+                  "test_large_inventory_uses_bounded_control_and_diagnostic_transfers": 50,
+              }, profile
+              assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
           for profile in ("normal", "constrained"):
               reports = list((Path(os.environ["RUNNER_TEMP"]) / "production-e2e-soak/autograph" / profile).glob("*.xml"))
               assert len(reports) == 100, (profile, len(reports))

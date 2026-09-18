@@ -1148,6 +1148,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "native text sort planner ignores fully deleted legacy segments for index sort coverage",
         "text field sort uses sorted segment membership path when index sort matches",
         "text projected source load rejects expired deadline before stored load",
+        "text projected source batch preserves selection and cleans up failed hydration",
         "native numeric sort rejects non-finite doc values",
         "mixed numeric concrete sort keys share one cursor domain",
         "native sort coverage diagnostics classify physical doc value failures",

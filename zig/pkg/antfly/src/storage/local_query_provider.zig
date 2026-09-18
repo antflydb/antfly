@@ -25,6 +25,8 @@ const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const query_api = @import("../api/query.zig");
 const local_query = @import("antfly_source_root").antfly_sources.local_query;
 const distributed_graph = @import("../api/distributed_graph.zig");
+const aggregation_plan = @import("../api/aggregation_plan.zig");
+const local_query_contract = @import("../api/local_query_contract.zig");
 
 pub fn execute(
     request: *const abi.LocalQueryRequest,
@@ -87,8 +89,19 @@ fn executeSearch(
     @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err|
         return fail(err, executeOperation(request.dialect), out_failure);
 
-    // Capture the token and result under the same DB read lease.
-    const captured: db_mod.SearchWithDenseProfileResult = if (owned.req.profile)
+    // The owner has already established read safety. Keep aggregation's page
+    // selection and complete collection inside one physical read generation;
+    // an ABI round trip between them cannot retain that ownership.
+    const finalize_aggregations = owned.req.aggregations_json.len != 0 and
+        !(request.execution_options.enabled != 0 and request.execution_options.raw_search_result != 0);
+    var lease: ?db_mod.DB.QueryReadLease = if (finalize_aggregations)
+        db.beginQueryReadLease() catch |err| return fail(err, executeOperation(request.dialect), out_failure)
+    else
+        null;
+    defer if (lease) |*held| held.release();
+    const captured: db_mod.SearchWithDenseProfileResult = if (lease) |held|
+        held.search(alloc, owned.req) catch |err| return fail(err, executeOperation(request.dialect), out_failure)
+    else if (owned.req.profile)
         db.searchWithDenseProfile(alloc, owned.req) catch |err|
             return fail(err, executeOperation(request.dialect), out_failure)
     else blk: {
@@ -98,6 +111,19 @@ fn executeSearch(
     };
     var result = captured.result;
     defer result.deinit();
+    var meta: query_api.QueryResponseMeta = .{
+        .dense_search = if (captured.dense_profile) |profile|
+            @import("../api/dense_search_profile.zig").fromStorage(profile)
+        else
+            null,
+    };
+    defer meta.deinit(alloc);
+    if (lease) |*held| {
+        applyAggregations(alloc, db, held, captured.request, result, &meta) catch |err|
+            return fail(err, executeOperation(request.dialect), out_failure);
+        held.release();
+        lease = null;
+    }
     @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err|
         return fail(err, executeOperation(request.dialect), out_failure);
 
@@ -105,10 +131,7 @@ fn executeSearch(
         alloc,
         table_name,
         captured.request,
-        .{ .dense_search = if (captured.dense_profile) |profile|
-            @import("../api/dense_search_profile.zig").fromStorage(profile)
-        else
-            null },
+        meta,
         result,
     ) catch |err| return fail(err, encodeOperation(request.dialect), out_failure);
     @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err| {
@@ -122,6 +145,48 @@ fn executeSearch(
         .has_identity_read_generation = @intFromBool(response.identity_read_generation != null),
     };
     return .ok;
+}
+
+fn applyAggregations(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    lease: *db_mod.DB.QueryReadLease,
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+    meta: *query_api.QueryResponseMeta,
+) !void {
+    var full: ?db_mod.types.SearchResult = null;
+    defer if (full) |*value| value.deinit();
+    var aggregation_req = req;
+    const selected = if (aggregation_plan.aggregationCanUseCurrentResult(req, result)) result else blk: {
+        aggregation_req = try aggregation_plan.aggregationFullResultRequest(req, result, "local-owner");
+        full = (try lease.search(alloc, aggregation_req)).result;
+        try aggregation_plan.requireCompleteAggregationFullResult(aggregation_req, full.?, "local-owner");
+        break :blk full.?;
+    };
+    const requests = try query_api.parseAggregationRequestsJson(alloc, aggregation_req.aggregations_json);
+    defer query_api.freeAggregationRequests(alloc, requests);
+    var ctx: db_mod.aggregations.Context = .{
+        .index_manager = db.core.index_manager,
+        .doc_store = db.core.store,
+        .full_text_index_name = if (aggregation_req.full_text_queries.len == 1) aggregation_req.full_text_queries[0].index_name else aggregation_req.index_name,
+        .algebraic_index_name = aggregation_req.index_name,
+        .algebraic_available = try local_query.algebraicIndexFreshEnoughForName(alloc, aggregation_req.index_name, db),
+        .identity_read_generation = aggregation_req.identity_read_generation,
+    };
+    const constraints = if (aggregation_plan.canConsiderAlgebraicAggregations(aggregation_req))
+        try local_query_contract.algebraicConstraintsForRequestAlloc(alloc, aggregation_req)
+    else
+        null;
+    defer if (constraints) |items| local_query_contract.freeAlgebraicConstraints(alloc, items);
+    if (constraints) |items| if (ctx.algebraic_available) {
+        ctx.algebraic_scope = .root;
+        ctx.algebraic_constraints = items;
+    };
+    const results = try db_mod.aggregations.computeSearchAggregations(alloc, requests, selected, ctx);
+    errdefer db_mod.aggregations.deinitResults(alloc, results);
+    for (results) |*aggregation| try db_mod.aggregations.cloneSearchAggregationResultLabelsDeep(alloc, aggregation);
+    meta.aggregation_results = results;
 }
 
 fn executeGraphExpand(

@@ -4122,6 +4122,8 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
+        const execution = try self.api_server.txn_sessions.acquireCommitExecution(txn_id, ctx.io);
+        defer execution.release();
         const alloc = self.api_server.alloc;
         const session = self.api_server.txn_sessions.getInfo(txn_id) orelse {
             _ = ctx.status(404);
