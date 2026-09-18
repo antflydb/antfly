@@ -7489,7 +7489,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn routeQueryToReadSchemaWithResolver(self: *ApiHttpServer, request_alloc: std.mem.Allocator, table_name: []const u8, query_req: *db_mod.types.SearchRequest, resolver: ?*CatalogQueryResolver) !void {
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        var arena = std.heap.ArenaAllocator.init(request_alloc);
         defer arena.deinit();
         const alloc = if (resolver) |cache| cache.arena else arena.allocator();
         const table = (try self.queryTableDefinition(alloc, resolver, table_name, .{ .deadline_ns = query_req.execution_deadline_ns, .cancellation = query_req.cancellation orelse .none })) orelse return;
@@ -7499,11 +7499,12 @@ pub const ApiHttpServer = struct {
     }
 
     fn validatePublicQuerySortCapabilities(self: *ApiHttpServer, table_name: []const u8, query_req: db_mod.types.SearchRequest) !void {
-        return self.validateQuerySortWithResolver(table_name, query_req, null);
+        return self.validateQuerySortWithResolver(self.alloc, table_name, query_req, null);
     }
 
     fn validateQuerySortWithResolver(
         self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
         table_name: []const u8,
         query_req: db_mod.types.SearchRequest,
         resolver: ?*CatalogQueryResolver,
@@ -7513,7 +7514,7 @@ pub const ApiHttpServer = struct {
         // opening table state or validating any physical column.
         if (try validatePublicQuerySortRequestContract(query_req)) return;
 
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const definition_alloc = if (resolver) |cache| cache.arena else arena.allocator();
         const table = (try self.queryTableDefinition(definition_alloc, resolver, table_name, .{ .deadline_ns = query_req.execution_deadline_ns, .cancellation = query_req.cancellation orelse .none })) orelse return;
@@ -7522,13 +7523,13 @@ pub const ApiHttpServer = struct {
         else
             tables_api.effectiveSchemaJson(table.schema_json);
 
-        var parsed_schema = try tables_api.parseValidatedTableSchema(self.alloc, schema_json);
-        defer parsed_schema.deinit(self.alloc);
-        const runtime_schema = try schema_mod.deriveRuntimeTableSchema(self.alloc, parsed_schema);
-        defer storage_schema.freeSchema(self.alloc, runtime_schema);
+        var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer storage_schema.freeSchema(alloc, runtime_schema);
 
-        const physical_sort_fields = try publicPhysicalSortFieldsAlloc(self.alloc, query_req.order_by);
-        defer if (physical_sort_fields.len > 0) self.alloc.free(physical_sort_fields);
+        const physical_sort_fields = try publicPhysicalSortFieldsAlloc(alloc, query_req.order_by);
+        defer if (physical_sort_fields.len > 0) alloc.free(physical_sort_fields);
         const can_observe_physical_coverage = if (self.table_reads) |source|
             source.supportsObservedDynamicFieldCapabilitySets()
         else
@@ -7536,14 +7537,14 @@ pub const ApiHttpServer = struct {
         const observed_dynamic_capability_sets: []table_reads.ObservedDynamicFieldCapabilitySet = if (physical_sort_fields.len == 0 or !can_observe_physical_coverage)
             &.{}
         else
-            try self.queryObservedDynamicFieldCapabilitySets(table_name, query_req, .{
+            try self.queryObservedDynamicFieldCapabilitySets(alloc, table_name, query_req, .{
                 .index_name = query_req.primary_text_index_name orelse query_req.index_name,
                 .fields = physical_sort_fields,
                 .coverage_read_mode = .validate,
                 .execution_deadline_ns = query_req.execution_deadline_ns,
                 .cancellation = query_req.cancellation,
             });
-        defer self.freeObservedDynamicFieldCapabilitySets(observed_dynamic_capability_sets);
+        defer table_reads.freeObservedDynamicFieldCapabilitySets(alloc, observed_dynamic_capability_sets);
         try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
             query_req,
             runtime_schema,
@@ -7554,32 +7555,30 @@ pub const ApiHttpServer = struct {
 
     fn queryObservedDynamicFieldCapabilitySets(
         self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
         table_name: []const u8,
         query_req: db_mod.types.SearchRequest,
         observation: table_reads.DynamicFieldObservationQuery,
     ) ![]table_reads.ObservedDynamicFieldCapabilitySet {
         const source = self.table_reads orelse return &.{};
-        return self.observedDynamicFieldCapabilitySets(table_name, observation) catch |err| switch (err) {
+        return (source.observedDynamicFieldCapabilitySets(alloc, table_name, observation) catch |err| switch (err) {
             error.StorageReadTemporarilyUnavailable => {
                 // A cold provisioned table has not installed a resident query
                 // handle yet. Let the normal preflight retry protocol prepare
                 // it without making GET /tables perform cold index loading,
                 // then re-read the physical coverage used by sort admission.
                 var summary = (try source.preflightQuery(
-                    self.alloc,
+                    alloc,
                     table_name,
                     query_req,
                     .read_index,
                     0,
                 )) orelse return error.StorageReadTemporarilyUnavailable;
-                defer summary.deinit(self.alloc);
-                return self.observedDynamicFieldCapabilitySets(table_name, observation) catch |retry_err| switch (retry_err) {
-                    error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
-                    else => retry_err,
-                };
+                defer summary.deinit(alloc);
+                return (try source.observedDynamicFieldCapabilitySets(alloc, table_name, observation)) orelse &.{};
             },
             else => return err,
-        };
+        }) orelse &.{};
     }
 
     pub fn validateTableWritesAgainstSchema(self: *ApiHttpServer, table_name: []const u8, writes: anytype) !void {
@@ -12421,7 +12420,7 @@ pub const ApiHttpServer = struct {
             error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidQueryRequest,
             else => return err,
         };
-        self.validateQuerySortWithResolver(table_name, query_req.req, resolver) catch |err| switch (err) {
+        self.validateQuerySortWithResolver(alloc, table_name, query_req.req, resolver) catch |err| switch (err) {
             error.TableNotFound => return error.TableNotFound,
             error.InvalidSchemaUpdateRequest => return error.InvalidQueryRequest,
             else => return err,
@@ -12794,7 +12793,7 @@ pub const ApiHttpServer = struct {
         owned.req.cancellation = cancellation;
         try ensureRequestActive(cancellation);
         try self.routeQueryToReadSchemaWithResolver(alloc, table_name, &owned.req, resolver);
-        try self.validateQuerySortWithResolver(table_name, owned.req, resolver);
+        try self.validateQuerySortWithResolver(alloc, table_name, owned.req, resolver);
         return owned;
     }
 
@@ -26076,6 +26075,106 @@ test "api http public table dispatch preserves unsupported sorted query as exact
         alloc,
         "{\"join\":{}}",
     ));
+}
+
+test "workload admission sort planning charges schema coverage and cold preflight memory" {
+    const base_alloc = std.testing.allocator;
+    const Fake = struct {
+        schema_json: []const u8,
+        expected_alloc: std.mem.Allocator,
+        observation_bytes: usize = 0,
+        cold: bool = false,
+        preflight_calls: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn definition(self: *@This()) system_catalog.QueryDefinition {
+            return .{ .table_id = 1, .schema_json = self.schema_json, .read_schema_json = "", .indexes_json = "{}" };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, call: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(call == .query_definition);
+            return std.json.Stringify.valueAlloc(a, self.definition(), .{});
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnexpectedExecution;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnexpectedExecution;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            return error.UnexpectedExecution;
+        }
+        fn observed(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, observation: table_reads.DynamicFieldObservationQuery) !?[]table_reads.ObservedDynamicFieldCapabilitySet {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(a.ptr == self.expected_alloc.ptr and a.vtable == self.expected_alloc.vtable);
+            try std.testing.expectEqualStrings("price", observation.fields[0]);
+            if (self.cold) return error.StorageReadTemporarilyUnavailable;
+            const scratch = try a.alloc(u8, self.observation_bytes);
+            defer a.free(scratch);
+            var capability = storage_schema.observedDynamicFieldCapability(null, "price", .{ .field_type = .numeric, .doc_values = true, .sortable = true, .analyzer = "keyword" });
+            capability.doc_value_coverage = "covered";
+            capability.queryability_state = "queryable";
+            storage_schema.refreshSortLifecycleState(&capability);
+            const sets = try a.alloc(table_reads.ObservedDynamicFieldCapabilitySet, 1);
+            errdefer a.free(sets);
+            const index = try a.dupe(u8, "full_text");
+            errdefer a.free(index);
+            sets[0] = .{ .index_name = index, .field_capabilities = try storage_schema.cloneFieldCapabilitiesAlloc(a, &.{capability}) };
+            return sets;
+        }
+        fn preflight(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) !?db_mod.RuntimePreflightSummary {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(a.ptr == self.expected_alloc.ptr and a.vtable == self.expected_alloc.vtable);
+            self.preflight_calls += 1;
+            self.cold = false;
+            const refs = try a.alloc([]const u8, 1);
+            errdefer a.free(refs);
+            refs[0] = try a.dupe(u8, "ready");
+            return .{ .result_refs = refs };
+        }
+    };
+    const wide_name = try base_alloc.alloc(u8, 128 * 1024);
+    defer base_alloc.free(wide_name);
+    @memset(wide_name, 'x');
+    const wide_schema = try std.fmt.allocPrint(base_alloc,
+        \\{{"dynamic_templates":[{{"name":"{s}","path_match":"price","mapping":{{"type":"numeric","sortable":true}}}}]}}
+    , .{wide_name});
+    defer base_alloc.free(wide_schema);
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(1, .{ .max_retained_bytes = 4 * 1024 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(base_alloc, &gate);
+    defer owner.release();
+    const a = owner.allocator();
+    var fake = Fake{ .schema_json = wide_schema, .expected_alloc = a, .cold = true };
+    const source: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query, .observed_dynamic_field_capability_sets = Fake.observed, .preflight_query = Fake.preflight } };
+    var server = ApiHttpServer.init(base_alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog, .supports_query_definitions = true } }, source, null);
+    defer server.deinit();
+    const order = [_]db_mod.types.SortField{.{ .field = "price" }};
+    const request: db_mod.types.SearchRequest = .{ .order_by = &order, .primary_text_index_name = "full_text" };
+    try server.validateQuerySortWithResolver(a, "docs", request, null);
+    try std.testing.expectEqual(@as(usize, 1), fake.preflight_calls);
+    try std.testing.expectEqual(@as(usize, 0), owner.live.load(.acquire));
+
+    // Pre-existing catalog definitions can be borrowed, but parsing their
+    // schema and deriving runtime mappings still must obey the request ceiling.
+    var cache_arena = std.heap.ArenaAllocator.init(base_alloc);
+    defer cache_arena.deinit();
+    var resolver = ApiHttpServer.CatalogQueryResolver{ .arena = cache_arena.allocator() };
+    try resolver.definitions.put(resolver.arena, "docs", fake.definition());
+    try gate.reconfigure(1, .{ .max_retained_bytes = 64 * 1024 });
+    try std.testing.expectError(error.OutOfMemory, server.validateQuerySortWithResolver(a, "docs", request, &resolver));
+    try std.testing.expect(owner.budget_exhausted.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), owner.live.load(.acquire));
+
+    // Cold catalog scratch and allocator-aware physical coverage are charged,
+    // too; no storage query executes in any of these planning-only failures.
+    try std.testing.expectError(error.OutOfMemory, server.validateQuerySortWithResolver(a, "docs", request, null));
+    try std.testing.expectEqual(@as(usize, 0), owner.live.load(.acquire));
+    fake.schema_json = "{}";
+    fake.observation_bytes = 128 * 1024;
+    try std.testing.expectError(error.OutOfMemory, server.validateQuerySortWithResolver(a, "docs", request, null));
+    try std.testing.expectEqual(@as(usize, 0), owner.live.load(.acquire));
 }
 
 test "api http exact sort observation selects only unique physical fields" {
