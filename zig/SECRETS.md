@@ -124,6 +124,185 @@ replication and consistency semantics; the `native` name makes no distribution
 promise today. Same-open-file metadata/read snapshots remain a separate hardening
 step for rotations that occur between the current stat and read operations.
 
+## Intended native storage architecture
+
+The native store is an Antfly-owned logical service. Its persistence follows the
+storage backend; `native` does not imply a file or a distributed service. All
+implementations share secret identity, encryption, conditional mutation, and
+resolution semantics.
+
+| Deployment | Intended persistence | Commit boundary |
+| --- | --- | --- |
+| Distributed Antfly | Dedicated encrypted metadata records replicated through metadata Raft | Durable quorum commit and application of the conditional mutation |
+| Antfly Lite | Reserved encrypted records inside the native `.aflite` file | Atomic durable commit through the existing single-writer machinery |
+| Antfly Serverless | Immutable encrypted objects and a versioned head per scope | Successful conditional publication of the head |
+
+This is the intended architecture, **not yet the runtime storage implementation**.
+The foundations implemented now are `common/secret_contract.zig` and
+`common/secret_record.zig`. They are exported through `common` and tested, but
+existing runtime consumers still use `FileStore`. Existing JSON files remain
+plaintext and are not silently converted or described as encrypted. Backend
+adapters, migration, key-provider configuration, RPCs, and runtime integration
+remain follow-up work.
+
+### Common source and native writer contract
+
+`Source` borrows a provider handle and exposes `resolve`, `listMetadata`, and
+`refresh` (returning health). `NativeStore` combines a source with a writer that
+exposes `put` and `removeOverride`. Read-only sources have no writer capability.
+Callbacks use the existing checked runtime callback boundary to preserve error
+semantics across separately compiled archives. Providers own their lifecycle;
+they must outlive borrowed handles and all in-flight calls.
+
+- Identity is `(scope, key, revision)`. Scope is a trusted, stable tenant/database
+  identity, not a user-provided namespace that bypasses authorization.
+- Revisions are source-local unsigned 64-bit counters. Native revisions are
+  durable, monotonically increasing per scope; zero means the initial empty
+  snapshot and cannot identify a stored value. Every effective mutation,
+  including deletion, advances the scope revision; writes assign that revision
+  to the entry. Overflow must reject a write, never wrap or reuse a revision.
+- `Lookup` returns a scope snapshot revision and an optional value with its own
+  entry revision. An absent key is a successful lookup with `value = null`, not
+  an I/O error. A present empty byte string is still a winning secret.
+- Read options include a minimum source-local snapshot revision. The wrapper
+  rejects older snapshots even when they report absence. Providers additionally
+  enforce authorization and their declared freshness policy before returning a
+  snapshot. Revisions from different sources must never be compared.
+- `resolveOrdered` accepts named sources in priority order. It falls through only
+  after successful absence; unavailability, corruption, and authorization errors
+  propagate. The caller supplies native first, external sources next, and an
+  environment adapter last only when enabled. No adapter is implicitly added.
+- Writer preconditions are `any`, `absent`, or `exact(entry_revision)`. Backends
+  check these inside their commit boundary. Conflicts return `error.Conflict`;
+  a preliminary read followed by an unconditional write is insufficient.
+- Mutations return the committed scope revision. Removal of an already absent
+  override is a no-op with `changed = false`. Internal deletion markers may be
+  needed for replication/cache invalidation; they must not hide external fallback.
+- Returned values and metadata use the caller's allocator. `SecretBytes.deinit`
+  securely zeros its owned allocation before releasing it. This is best-effort
+  cleanup, not a guarantee about application copies, swap, or crash dumps.
+
+`ExpectedRevision.check` is shared precondition logic, not a transaction engine.
+The common layer validates requests and returned revisions but cannot supply
+backend atomicity, tenant authorization, durability, or cache freshness itself.
+
+### Encrypted record format: AFSE v1
+
+The storage-independent codec implements envelope encryption using Zig's
+`XChaCha20Poly1305`: a new 32-byte data key and 24-byte nonce are generated with
+fallible `Io.randomSecure` on every seal. There is no public caller-selected
+nonce API and no fallback to weaker randomness when entropy is unavailable.
+The extended nonce construction supports randomized nonces; see the
+[libsodium construction documentation](https://libsodium.gitbook.io/doc/secret-key_cryptography/aead/chacha20-poly1305/xchacha20-poly1305_construction).
+
+A caller-supplied `KeyProvider` wraps the data key and returns an opaque wrapped
+blob plus a concrete wrapping-key identifier. Its unwrap callback receives the
+expected identity, key identifier, and blob and fills a temporary 32-byte key.
+A provider must authenticate its wrapping format and enforce allowed key IDs and
+scope policy. Provider configuration is trusted bootstrap state; record bytes
+cannot select an arbitrary provider or credential source. No production KMS,
+raw-key, or OS-keychain provider is introduced in this phase.
+
+The canonical binary format uses unsigned little-endian integers:
+
+| Offset | Field |
+| --- | --- |
+| 0 | Magic `AFSE` (4 bytes) |
+| 4 | Format version `1` (u16) |
+| 6 | Algorithm `1` = XChaCha20-Poly1305 (u16) |
+| 8 | Entry revision (u64, nonzero) |
+| 16 | Scope byte length (u16) |
+| 18 | Secret-name byte length (u16) |
+| 20 | Wrapping-key identifier byte length (u16) |
+| 22 | Wrapped-data-key byte length (u32) |
+| 26 | Ciphertext byte length (u32; equals plaintext length) |
+| 30 | Nonce (24 bytes) |
+| 54 | Scope, secret name, key identifier, wrapped key, in that order |
+| Variable | Ciphertext, then 16-byte authentication tag |
+
+The entire prefix through the wrapped key is AEAD associated data. This binds
+version, algorithm, lengths, scope, name, revision, nonce, wrapping-key identity,
+and wrapped key to the ciphertext. Identities and key IDs are nonempty UTF-8,
+without NUL bytes, limited to 1 KiB each; wrapped keys are limited to 64 KiB and
+values to 1 MiB. Empty values and arbitrary binary secret values are supported.
+The parser rejects unsupported versions/algorithms, oversized lengths,
+truncation, and trailing bytes before asking the key provider to unwrap anything.
+Names, key identifiers, lengths, and revisions are authenticated but not encrypted.
+
+`decode` returns a borrowed **unauthenticated** framing view. It is not a trusted
+metadata or authorization API. `open` requires an expected identity from the
+backend's trusted index/current committed revision and rejects substitution before
+unwrapping. Authentication failure produces `error.CorruptInput`; unavailable key
+providers remain errors rather than triggering source fallback. Temporary data
+keys are erased on success and failure, and failed plaintext buffers are erased
+and freed. A returned plaintext buffer remains the caller's responsibility.
+
+AEAD does not provide rollback protection by itself. A previously valid record
+is still valid at its original revision. Backends must obtain the expected
+revision from their authoritative head and enforce read freshness. Restore must
+not silently reset counters under an existing scope; it needs an explicit
+freshness fence or a new scope incarnation with appropriately re-encrypted data.
+Rewrapping changes authenticated bytes, so v1 requires resealing the record; an
+in-place wrapped-key replacement is invalid.
+
+### Backend implementation plan
+
+**Distributed:** Add a protected metadata namespace and conditional Raft command
+for encrypted secret records. Encrypt before proposing; Raft apply validates and
+persists ciphertext deterministically without KMS calls. Because the revision is
+authenticated, prepare against a scope snapshot, propose the expected scope
+revision and the next revision together, and retry preparation if another writer
+wins. Do not assume a future Raft log index before it has been assigned. Public
+metadata/query/export paths must not expose these records as ordinary documents.
+Authenticated internal RPCs authorize each worker's scope and required secret.
+Publish invalidations after commit and periodically reconcile revisions so missed
+notifications cannot leave permanent stale caches.
+
+**Lite:** Add a reserved internal record namespace to the existing native file
+engine. Commit ciphertext, entry revision, and scope revision atomically with its
+existing writer lock and durability guarantees. Read-only handles have no writer.
+The embedding application supplies a key-provider callback, or CLI integration
+uses an explicit platform/mounted-key provider. The database never stores its
+unwrapped root key. File copies and backups carry ciphertext; key access/recovery
+must be provisioned separately. Opening storage must not require resolving an
+application secret from that same unopened store.
+
+**Serverless:** Store immutable encrypted records or, initially, a small encrypted
+record collection under a dedicated per-scope prefix. Upload objects before
+conditionally publishing a head that identifies the committed revision. Use
+ETag/generation compare-and-swap; concurrent writers fail/retry rather than lose
+updates. Readers follow the head, never infer the latest revision from listings.
+The head/index needs the same trusted access boundary as other control metadata;
+AEAD on records alone does not authenticate a forged absence in an index. Reuse
+object-store conditional-write primitives, but do not couple secret lifetime to
+a table manifest or table deletion. Garbage-collect unreferenced objects only
+after accounting for readers and retained backups. Reject storage providers that
+cannot supply the required conditional publication semantics.
+
+### Bootstrap, caching, and rollout
+
+Startup becomes two phases: obtain storage access, node identity, and key-provider
+access from workload identity, mounted sources, or the host application; then open
+native storage and resolve application secrets. Bootstrap credentials cannot
+reference the store they unlock. Adjust today's eager configuration resolution
+when backend integration lands. The existing `environment` switch controls
+resolver fallback, not cloud workload identity or the encryption provider.
+
+API mutation success means durable publication, not that all workers have already
+refreshed. Return a committed revision, expose observed revisions, and allow
+operations to require a minimum revision. Define bounded cache freshness and
+whether still-valid last-known-good values are usable during outages. Expired
+caches fail; backend outages must not silently change the winning source. Remove
+native override and revoke external credential remain different operations.
+
+Implement Lite persistence first, then distributed Raft persistence and serverless
+publication against the same contract suite. Backend tests must cover crash
+recovery, competing conditional writers, delete/recreate without revision reuse,
+missed invalidations, stale/partitioned reads, key-provider failure and rotation,
+unauthorized scope access, and backup/restore. Migration from existing JSON is an
+explicit, verifiable import; never overwrite the sole plaintext source before
+the encrypted destination is durably committed and readable.
+
 ## Status Summary
 
 Implemented:
@@ -172,8 +351,8 @@ Still needed:
   remote-content credential rotation.
 - Optional Prometheus metrics for reload state if operators need scrape-based
   alerting in addition to `GET /status`.
-- A future encrypted-at-rest codec, if non-Kubernetes deployments need local
-  secret-file encryption.
+- Integrate the shared encrypted record codec with native backends and trusted
+  key providers; existing file-store JSON remains plaintext.
 
 ## Current Implementation
 
@@ -487,26 +666,15 @@ deployments and simpler VM/bare-metal deployments. It is less urgent for the
 Kubernetes enterprise path, where the external manager and Kubernetes secret
 projection own most of the secret lifecycle.
 
-The file store should still be designed with a codec boundary so encrypted files
-can be added without rewriting store semantics:
-
-```zig
-const SecretsCodec = struct {
-    decode: fn (alloc: std.mem.Allocator, bytes: []const u8) anyerror!PersistedSecretsFile,
-    encode: fn (alloc: std.mem.Allocator, file: PersistedSecretsFile) anyerror![]u8,
-};
-```
-
-Initial codec:
-
-- plaintext JSON, protected by filesystem permissions
-
-Future codec:
-
-- authenticated encrypted envelope
-- key supplied by environment variable, key file, or Kubernetes-mounted key
-- ciphertext contains the current inner `PersistedSecretsFile` JSON
-- failed authentication is treated like malformed JSON: keep last known good
+The shared encrypted record codec and key-provider contract are now implemented
+as AFSE v1 above. It encrypts individual secret values with authenticated identity
+metadata; it does not encrypt the existing `PersistedSecretsFile` JSON wholesale.
+The codec has an independently generated libsodium/PyNaCl wire vector and tests
+for tampering, truncation, wrong keys, entropy failure, and allocation cleanup.
+Native backend integration remains pending. Projected external files continue to
+use the existing JSON format and last-known-good reload behavior. Any future
+encrypted-file adapter must enforce an explicit cache freshness policy on failed
+authentication rather than treating an unreadable native store as absence.
 
 ## Runtime Secret Rotation Plan
 
@@ -738,8 +906,8 @@ Additional runtime tests:
 5. Kubernetes-projected files are the primary enterprise integration surface.
    Direct external secret manager integrations are deferred.
 6. Plaintext JSON remains the initial store format, protected by filesystem
-   permissions. Add a codec boundary so encrypted-at-rest support can be added
-   later.
+   permissions. The shared AFSE codec exists; encrypted native backend adapters
+   and explicit migration remain to be implemented.
 7. Start true live rotation with managed embedder API keys.
 8. Support live rotation for all credential-bearing integrations that Antfly
    owns: generator/reranker providers, remote-content credentials, S3/backup
@@ -752,7 +920,7 @@ Additional runtime tests:
 
 1. Should Prometheus metrics mirror the compact `GET /status` secret-store
    state for scrape-based alerting?
-2. What encrypted envelope format and key-source contract should the future
-   encrypted codec use?
+2. Which production key providers and key-recovery workflows should be shipped
+   first, and what bounded cache freshness policy should native backends use?
 3. Should S3/backup and remote-content clients share a generation-keyed
    credential cache, or should each subsystem own its own cache?
