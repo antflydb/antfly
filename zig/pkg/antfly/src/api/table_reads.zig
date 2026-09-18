@@ -8319,12 +8319,13 @@ fn graphHydrateOnPreparedDb(
     return .{
         .hits = hits,
         .has_incoming = if (req.incoming_index_name.len > 0)
-            try db.graphHasIncomingEdgesForInternalRead(
+            try db.graphHasIncomingEdgesForInternalReadWithContext(
                 alloc,
                 req.incoming_index_name,
                 req.keys,
                 .{ .generation = req.incoming_index_identity.incarnation, .config_fingerprint = req.incoming_index_identity.config_hash },
                 req.identity_read_generation,
+                search_req,
             )
         else
             @constCast((&[_]bool{})[0..]),
@@ -15100,33 +15101,80 @@ fn scanNdjsonWithConsistencyToSink(
     consistency: raft_mod.ReadConsistency,
     sink: ScanStreamSink,
 ) !void {
+    const Execution = @import("../storage/dense_execution.zig");
+    const WorkingMemory = @import("../storage/workload_memory.zig").WorkingMemory;
+    var scan_opts = opts;
+    var execution: ?Execution.Runtime.Lease = null;
+    // This defer runs only after db.scanVisit has unwound every cursor, read
+    // transaction, schema pin, columnar scope, and payload cache.
+    defer if (execution) |*lease| lease.release();
+    var memory: ?WorkingMemory = null;
+    defer if (memory) |*owner| owner.deinit();
+    var scan_alloc = alloc;
+    if (scan_opts.read_execution == null and sink.constrain_deadline_fn != null) {
+        if (db.readResourceManager()) |manager| {
+            if (manager.dense_execution) |runtime| {
+                const actual_io = db.backend_runtime.io();
+                // Other backends may clone mutable snapshots outside this
+                // allocator. They remain coarse until that state is certified.
+                if (db.core.store.kind == .lmdb and actual_io != null and runtime.scope == .all_reads and runtime.config.max_scan_state_bytes >= 4096 and
+                    @import("../runtime_io_abi.zig").callerThreadPinned(actual_io.?))
+                {
+                    const io = actual_io.?;
+                    const snapshot_end = platform_time.monotonicNs() +|
+                        @as(u64, runtime.config.max_scan_snapshot_ms) * std.time.ns_per_ms;
+                    scan_opts.execution_deadline_ns = if (opts.execution_deadline_ns) |original| @min(original, snapshot_end) else snapshot_end;
+                    const deadline_enforced = try sink.constrainDeadline(scan_opts.execution_deadline_ns.?);
+                    execution = if (deadline_enforced) try manager.acquireReadDriverWithState(io, .{
+                        .io = io,
+                        .native_now_ns = platform_time.monotonicNs,
+                        .deadline_ns = scan_opts.execution_deadline_ns,
+                        .cancellation = opts.cancellation orelse .none,
+                    }, runtime.config.max_scan_state_bytes) else null;
+                    if (execution) |*lease| {
+                        memory = try WorkingMemory.forReadDriverPrepaid(manager, lease, alloc);
+                        // Reserve logical bookkeeping/pin headroom separately
+                        // from actual scanner buffers; this is not an estimate
+                        // of physical MVCC pages retained by the snapshot.
+                        memory.?.maximum = runtime.config.max_scan_state_bytes - 4096;
+                        scan_alloc = memory.?.allocator();
+                        scan_opts.read_execution = lease;
+                    }
+                }
+            }
+        }
+    }
     const NdjsonVisitor = struct {
         alloc: std.mem.Allocator,
         sink: ScanStreamSink,
+        opts: db_mod.types.ScanOptions,
         line: std.ArrayListUnmanaged(u8) = .empty,
 
         fn visit(raw_context: ?*anyopaque, entry: db_mod.types.ScanVisitEntry) anyerror!void {
             const visitor: *@This() = @ptrCast(@alignCast(raw_context orelse return error.InvalidArgument));
+            try checkScanOptionsActive(visitor.opts);
             visitor.line.clearRetainingCapacity();
-            try appendScanLine(
-                visitor.alloc,
-                &visitor.line,
-                entry.id,
-                entry.document_json,
-                entry.content_hash,
-            );
+            try appendScanLine(visitor.alloc, &visitor.line, entry.id, entry.document_json, entry.content_hash);
+            const suspended = if (visitor.opts.read_execution) |lease| try lease.suspendOutput() else false;
+            // Failure returns through DB cursor/transaction defers first. The
+            // outer execution scope then retires the retained continuation.
             try visitor.sink.write(visitor.line.items);
+            if (suspended) try visitor.opts.read_execution.?.resumeOutput();
+            try checkScanOptionsActive(visitor.opts);
         }
     };
 
-    var visitor = NdjsonVisitor{ .alloc = alloc, .sink = sink };
-    defer visitor.line.deinit(alloc);
-    try reads.reads.prepareScanWithConsistency(reads.group_id, from_key, to_key, opts, consistency);
+    var visitor = NdjsonVisitor{ .alloc = scan_alloc, .sink = sink, .opts = scan_opts };
+    defer visitor.line.deinit(scan_alloc);
+    try checkScanOptionsActive(scan_opts);
+    try reads.reads.prepareScanWithConsistency(reads.group_id, from_key, to_key, scan_opts, consistency);
+    const suspended = if (scan_opts.read_execution) |lease| try lease.suspendOutput() else false;
     try sink.start();
-    try db.scanVisit(alloc, from_key, to_key, opts, .{
+    if (suspended) try scan_opts.read_execution.?.resumeOutput();
+    db.scanVisit(scan_alloc, from_key, to_key, scan_opts, .{
         .context = &visitor,
         .visit = NdjsonVisitor.visit,
-    });
+    }) catch |err| return if (memory) |*owner| owner.allocationFailure(err) else err;
 }
 
 const appendScanLine = local_query_contract.appendScanLine;
@@ -31189,4 +31237,139 @@ fn expectGraphMetricJsonStatus(
         },
     }
     try ant_json.testing.expectSubsetJsonText(alloc, expected_out.written(), actual_json);
+}
+
+test "workload admission streamed scan parks bounded state and retires after snapshot unwind" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("antfly-stream-scan-execution");
+    defer directory.cleanup();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .resource_manager = &manager, .primary_backend = .lmdb });
+    defer db.close();
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"title\":\"alpha\"}" },
+        .{ .key = "b", .value = "{\"title\":\"beta\"}" },
+    } });
+    try manager.configureReadExecution(.{
+        .max_runnable_tasks = 1,
+        .max_outstanding_tasks = 4,
+        .max_queued_tasks = 2,
+        .max_wait_ms = 100,
+        .max_working_bytes = 4 * 1024 * 1024,
+        .max_scan_state_bytes = 1024 * 1024,
+        .max_scan_snapshot_ms = 1000,
+    });
+    const io = db.backend_runtime.io() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(@import("../runtime_io_abi.zig").callerThreadPinned(io));
+    const State = struct {
+        const Mode = enum { normal, cancel, expire };
+        db: *db_mod.DB,
+        manager: *resource_manager_mod.ResourceManager,
+        mode: Mode,
+        io: std.Io,
+        deadline: ?u64 = null,
+        writes: usize = 0,
+        cancelled: bool = false,
+        fn constrain(raw: ?*anyopaque, deadline: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.deadline = if (self.deadline) |old| @min(old, deadline) else deadline;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.cancelled;
+        }
+        fn start(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(u64, 0), self.manager.denseExecutionStats().runnable);
+        }
+        fn write(raw: ?*anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.writes += 1;
+            const stats = self.manager.denseExecutionStats();
+            try std.testing.expectEqual(@as(u64, 0), stats.runnable);
+            try std.testing.expect(stats.working_bytes >= 1024 * 1024);
+            try std.testing.expect(self.db.core.store.portable_import_reader_state.load(.acquire) > 0);
+            // Another actual DB read completes while this output callback owns
+            // a live scan snapshot but no runnable capacity.
+            var other = (try self.db.lookup(std.testing.allocator, "b", .{})).?;
+            defer other.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("{\"title\":\"beta\"}", other.json);
+            try std.testing.expectEqual(@as(u64, 0), self.manager.denseExecutionStats().runnable);
+            switch (self.mode) {
+                .normal => {},
+                .cancel => {
+                    self.cancelled = true;
+                    return error.Canceled;
+                },
+                .expire => {
+                    const remaining = self.deadline.? -| platform_time.monotonicNs();
+                    try self.io.sleep(.{ .nanoseconds = @intCast(remaining + std.time.ns_per_ms) }, .awake);
+                },
+            }
+        }
+    };
+    var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    for ([_]State.Mode{ .normal, .cancel, .expire }) |mode| {
+        manager.dense_execution.?.config.max_scan_snapshot_ms = if (mode == .expire) 5 else 1000;
+        var state = State{ .db = &db, .manager = &manager, .mode = mode, .io = io };
+        const original = platform_time.monotonicNs() + std.time.ns_per_s;
+        const result = source.source().scanStream(alloc, "docs", "", "", .{
+            .include_documents = true,
+            .execution_deadline_ns = original,
+            .cancellation = .{ .ptr = &state, .is_cancelled_fn = State.canceled },
+        }, .read_index, .{ .context = &state, .start_fn = State.start, .write_fn = State.write, .constrain_deadline_fn = State.constrain });
+        switch (mode) {
+            .normal => try std.testing.expect(try result),
+            .cancel => try std.testing.expectError(error.Canceled, result),
+            .expire => try std.testing.expectError(error.DeadlineExceeded, result),
+        }
+        try std.testing.expect(state.deadline.? <= original);
+        try std.testing.expectEqual(@as(usize, if (mode == .normal) 2 else 1), state.writes);
+        try std.testing.expectEqual(@as(usize, 0), db.core.store.portable_import_reader_state.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), manager.dense_execution.?.ledger.snapshot().total.handles);
+        try std.testing.expectEqual(@as(u64, 0), manager.denseExecutionStats().working_bytes);
+    }
+    const Buffered = struct {
+        fn visit(raw: ?*anyopaque, _: db_mod.types.ScanVisitEntry) !void {
+            const runtime: *resource_manager_mod.DenseExecution.Runtime = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(u64, 1), runtime.stats().runnable);
+        }
+    };
+    try db.scanVisit(alloc, "", "", .{}, .{ .context = manager.dense_execution.?, .visit = Buffered.visit });
+    try std.testing.expectEqual(@as(u64, 0), manager.dense_execution.?.ledger.snapshot().total.handles);
+
+    // A native but unaudited snapshot backend must keep its driver even when
+    // the consumer advertises deadlines and scan suspension is configured.
+    var coarse_directory = try TestDirectory.init("antfly-stream-scan-coarse");
+    defer coarse_directory.cleanup();
+    var coarse_db = try db_mod.DB.open(alloc, coarse_directory.path(), .{ .resource_manager = &manager });
+    defer coarse_db.close();
+    try coarse_db.batch(.{ .writes = &.{.{ .key = "a", .value = "{}" }} });
+    const Coarse = struct {
+        runtime: *resource_manager_mod.DenseExecution.Runtime,
+        writes: usize = 0,
+        deadlines: usize = 0,
+        fn constrain(raw: ?*anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.deadlines += 1;
+        }
+        fn start(_: ?*anyopaque) !void {}
+        fn write(raw: ?*anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.writes += 1;
+            try std.testing.expectEqual(@as(u64, 1), self.runtime.stats().runnable);
+        }
+    };
+    var coarse = Coarse{ .runtime = manager.dense_execution.? };
+    var coarse_source = BoundTableReadSource.init("docs", 78, &coarse_db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    try std.testing.expect(try coarse_source.source().scanStream(alloc, "docs", "", "", .{}, .read_index, .{
+        .context = &coarse,
+        .start_fn = Coarse.start,
+        .write_fn = Coarse.write,
+        .constrain_deadline_fn = Coarse.constrain,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), coarse.writes);
+    try std.testing.expectEqual(@as(usize, 0), coarse.deadlines);
+    try std.testing.expectEqual(@as(u64, 0), manager.dense_execution.?.ledger.snapshot().total.handles);
 }

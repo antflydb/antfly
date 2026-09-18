@@ -21,13 +21,23 @@ pub const ScanStreamSink = struct {
     const VTable = struct {
         start: *const fn (?*anyopaque) anyerror!void,
         write: *const fn (?*anyopaque, []const u8) anyerror!void,
+        constrain_deadline: *const fn (?*anyopaque, u64) anyerror!void,
     };
     const Abi = boundary.Boundary(VTable);
 
     context: ?*anyopaque,
     start_fn: @FieldType(VTable, "start"),
     write_fn: @FieldType(VTable, "write"),
+    constrain_deadline_fn: ?@FieldType(VTable, "constrain_deadline") = null,
     boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,
+
+    /// Absolute Antfly native monotonic deadline. Returning false means this
+    /// consumer cannot certify bounded external waits and must stay coarse.
+    pub fn constrainDeadline(self: ScanStreamSink, deadline_ns: u64) !bool {
+        const constrain = self.constrain_deadline_fn orelse return false;
+        try Abi.call("constrain_deadline", self.boundary_dispatch, constrain, .{ self.context, deadline_ns });
+        return true;
+    }
 
     /// Called once after routing validates the table, even for an empty scan.
     pub fn start(self: ScanStreamSink) !void {

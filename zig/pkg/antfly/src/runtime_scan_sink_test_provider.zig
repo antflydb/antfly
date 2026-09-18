@@ -31,3 +31,8 @@ fn write(raw: ?*anyopaque, _: []const u8) !void {
     const failure: *const errors.Status = @ptrCast(@alignCast(raw.?));
     if (!failure.isOk()) return errors.errorFromStatus(failure.*);
 }
+
+export fn scan_sink_test_constrain(sink: *const @import("runtime_scan_sink.zig").ScanStreamSink, deadline: u64) callconv(.c) @import("runtime_error_abi.zig").Status {
+    _ = sink.constrainDeadline(deadline) catch |err| return @import("runtime_error_abi.zig").statusFromError(err);
+    return .ok;
+}

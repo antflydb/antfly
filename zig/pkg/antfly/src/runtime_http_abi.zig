@@ -135,6 +135,9 @@ pub const StreamSink = extern struct {
     start: ?*const fn (?*anyopaque, u16, Bytes, HeaderList) callconv(.c) CallbackStatus = null,
     write: ?*const fn (?*anyopaque, Bytes) callconv(.c) CallbackStatus = null,
     close: ?*const fn (?*anyopaque) callconv(.c) CallbackStatus = null,
+    /// Same-process native monotonic sample prevents dispatch delay from
+    /// extending a remaining output budget across linked runtime archives.
+    constrain_timeout: ?*const fn (?*anyopaque, u64, u64) callconv(.c) CallbackStatus = null,
 };
 
 pub const HttpResponseView = extern struct {

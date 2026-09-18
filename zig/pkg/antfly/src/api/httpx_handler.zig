@@ -1168,6 +1168,18 @@ pub const AntflyApiHandler = struct {
 
     fn mapIngressError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (ctx.stream_committed) return err;
+        const execution_status: ?u16 = switch (err) {
+            error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge, error.AdmissionWaitTimeout => 429,
+            error.AdmissionClosed => 503,
+            error.DeadlineExceeded => 504,
+            else => null,
+        };
+        if (execution_status) |status| return httpx.Response.fromJson(emergencyAllocator(ctx), status, .{
+            .@"error" = @errorName(err),
+            .reason = if (err == error.AdmissionRequestTooLarge or err == error.AdmissionBytesExhausted) "resource_exhausted" else if (status == 503) "draining" else if (status == 504) "deadline_exceeded" else "instance_busy",
+            .stage = "execution",
+            .execution_started = true,
+        });
         if (err == error.OutOfMemory) {
             if (ctx.getData("antfly.workload-body-memory")) |raw| {
                 const owner: *@import("../common/workload_allocator.zig").Owner = @ptrCast(@alignCast(raw));
@@ -3156,7 +3168,14 @@ pub const AntflyApiHandler = struct {
             writer: ?httpx.Context.StreamWriter = null,
 
             fn sink(state: *@This()) table_reads.ScanStreamSink {
-                return .{ .context = state, .start_fn = start, .write_fn = write };
+                return .{ .context = state, .start_fn = start, .write_fn = write, .constrain_deadline_fn = constrainDeadline };
+            }
+
+            fn constrainDeadline(raw: ?*anyopaque, deadline_ns: u64) !void {
+                const state: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+                const local_now = std.Io.Clock.awake.now(state.ctx.io).nanoseconds;
+                const native_now = @import("antfly_platform").time.monotonicNs();
+                try state.ctx.constrainStreamDeadline(local_now +| @as(i96, deadline_ns -| native_now));
             }
 
             fn start(raw: ?*anyopaque) !void {
@@ -6522,7 +6541,14 @@ pub const AntflyApiHandler = struct {
             writer: ?httpx.Context.StreamWriter = null,
 
             fn sink(state: *@This()) table_reads.ScanStreamSink {
-                return .{ .context = state, .start_fn = start, .write_fn = write };
+                return .{ .context = state, .start_fn = start, .write_fn = write, .constrain_deadline_fn = constrainDeadline };
+            }
+
+            fn constrainDeadline(raw: ?*anyopaque, deadline_ns: u64) !void {
+                const state: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+                const local_now = std.Io.Clock.awake.now(state.ctx.io).nanoseconds;
+                const native_now = @import("antfly_platform").time.monotonicNs();
+                try state.ctx.constrainStreamDeadline(local_now +| @as(i96, deadline_ns -| native_now));
             }
 
             fn start(raw: ?*anyopaque) !void {
