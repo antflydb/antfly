@@ -2578,7 +2578,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.catalog,
             table_name,
             fence,
-            fence.admission_deadline_ns,
+            self.catalog.routeFenceDeadline(fence),
         );
         try fence.admission_cancellation.check();
     }
@@ -4553,4 +4553,66 @@ test "publication cancellation and timeout release admission without invalidatin
         var replacement = try source.acquireDescriptor(1, "docs", path, descriptor);
         defer replacement.deinit();
     }
+}
+
+test "workload admission provisioned routed reads translate fence clock domains" {
+    const ns = std.time.ns_per_s;
+    var clock = PublicationWaitTest{ .now_ns = @intCast(@import("antfly_platform").time.monotonicNs() + 1000 * ns) };
+    var clock_vtable: std.Io.VTable = undefined;
+    const io = clock.io(&clock_vtable);
+    const Fixture = struct {
+        io: std.Io,
+        last_deadline: ?u64 = null,
+        fence: metadata_api.CatalogRouteFence = .{
+            .metadata_group_id = 1,
+            .catalog_revision = 1,
+            .table_id = 1,
+            .topology_epoch = 1,
+            .route = .{ .group_id = 2, .range_id = 2, .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 } },
+        },
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshot;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, deadline: ?u64) !table_catalog.RouteResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.last_deadline = deadline;
+            try table_catalog.RoutingBudget.initIo(deadline, self.io).checkpoint();
+            const groups = try alloc.dupe(table_catalog.CatalogGroupRoute, &.{self.fence.route});
+            return .{ .found = .{
+                .metadata_group_id = self.fence.metadata_group_id,
+                .metadata_incarnation = self.fence.metadata_incarnation,
+                .catalog_revision = self.fence.catalog_revision,
+                .table_id = self.fence.table_id,
+                .topology_epoch = self.fence.topology_epoch,
+                .groups = groups,
+            } };
+        }
+    };
+    var fixture = Fixture{ .io = io };
+    const catalog = table_catalog.CatalogSource{
+        .ptr = &fixture,
+        .io = @import("../runtime_io_abi.zig").Borrow.init(&io),
+        .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .validate_route = Fixture.resolve },
+    };
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", catalog, read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    var fence = fixture.fence;
+    const routing_now = catalog.budget(null).nowNs();
+    fence.admission_deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * ns;
+    // The actual worker path receives a native deadline from authenticated
+    // remaining time, but its RemoteMetadataSource owns an Io routing clock.
+    try source.validateRoutedRead(std.testing.allocator, fence, 2, "docs");
+    try std.testing.expect(fixture.last_deadline.? > routing_now);
+    try std.testing.expect(fixture.last_deadline.? <= routing_now + 5 * ns);
+    fence.admission_deadline_ns = 0;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.validateRoutedRead(std.testing.allocator, fence, 2, "docs"));
+    try std.testing.expectEqual(routing_now, fixture.last_deadline.?);
+    fence.admission_deadline_io = catalog.io;
+    fence.admission_deadline_ns = routing_now + ns;
+    try source.validateRoutedRead(std.testing.allocator, fence, 2, "docs");
+    try std.testing.expectEqual(fence.admission_deadline_ns, fixture.last_deadline);
+    fence.admission_deadline_ns = null;
+    try source.validateRoutedRead(std.testing.allocator, fence, 2, "docs");
+    try std.testing.expect(fixture.last_deadline == null);
 }
