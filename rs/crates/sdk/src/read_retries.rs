@@ -50,7 +50,9 @@ impl std::error::Error for QueryRetryError {}
 /// Reuses the caller's reqwest connections and admission pool. Requests must
 /// already include authentication headers. Cancellation drops the operation;
 /// successful response streams retain their pool slot and are never retried.
-/// As with PooledClient, callers bound subsequent stream consumption themselves.
+/// The original operation deadline also bounds successful response consumption.
+/// Supply stricter limits as a request timeout or `execute` deadline: the retry
+/// budget sets reqwest's per-request timeout, overriding its opaque client default.
 #[derive(Clone)]
 pub struct QueryRetryClient {
     client: reqwest::Client,
@@ -185,10 +187,12 @@ impl QueryRetryClient {
         }
         let started = Instant::now();
         let body_budget = query_budget(&request, self.policy.max_elapsed);
-        let end = deadline.map_or(
-            started + body_budget.unwrap_or(self.policy.max_elapsed),
-            |value| value.min(started + body_budget.unwrap_or(self.policy.max_elapsed)),
-        );
+        let budget = request
+            .timeout()
+            .map_or(body_budget.unwrap_or(self.policy.max_elapsed), |timeout| {
+                (*timeout).min(body_budget.unwrap_or(self.policy.max_elapsed))
+            });
+        let end = deadline.map_or(started + budget, |value| value.min(started + budget));
         timeout_at(end, self.execute_until(request, end, body_budget.is_some()))
             .await
             .map_err(|_| QueryRetryError::Request(RunError::RequestDeadlineExceeded))?
@@ -201,12 +205,18 @@ impl QueryRetryClient {
         allow_retry: bool,
     ) -> Result<Admitted<Response>, QueryRetryError> {
         for attempt in 0..self.policy.max_attempts {
-            let next = request
+            let mut next = request
                 .try_clone()
                 .ok_or(QueryRetryError::UnsupportedRequest)?;
             let mut response = self
                 .pool
-                .run(Some(end), || self.client.execute(next))
+                .run(Some(end), || {
+                    // reqwest transfers this total timeout into the response body.
+                    // Compute after local admission, so waiting and prior attempts
+                    // consume the same original budget even after headers arrive.
+                    *next.timeout_mut() = Some(end.saturating_duration_since(Instant::now()));
+                    self.client.execute(next)
+                })
                 .await
                 .map_err(QueryRetryError::Request)?;
             if response.status().is_success() {
@@ -253,6 +263,100 @@ impl QueryRetryClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_body_keeps_original_budget_after_retry_backoff() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            for attempt in 0..2 {
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < end);
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(br#"{"timeout_ms":300}"#) {
+                    let mut part = [0; 1024];
+                    let count = socket.read(&mut part).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&part[..count]);
+                }
+                if attempt == 0 {
+                    let body = r#"{"reason":"instance_busy","stage":"admission","execution_started":false}"#;
+                    write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                } else {
+                    // Headers and one byte succeed; the remaining body arrives
+                    // after both the original and a mistakenly restarted budget.
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\na",
+                        )
+                        .unwrap();
+                    socket.flush().unwrap();
+                    std::thread::sleep(Duration::from_millis(500));
+                    let _ = socket.write_all(b"b");
+                }
+            }
+        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let pool = AdmissionPool::new(crate::AdmissionConfig {
+                    max_in_flight: 1,
+                    max_queued: 0,
+                    max_wait: Duration::ZERO,
+                })
+                .unwrap();
+                let raw = reqwest::Client::new();
+                let client = QueryRetryClient::new(
+                    raw.clone(),
+                    pool.clone(),
+                    ReadRetryPolicy {
+                        max_attempts: 2,
+                        max_elapsed: Duration::from_secs(2),
+                        initial_backoff: Duration::from_millis(180),
+                        max_backoff: Duration::from_millis(180),
+                    },
+                )
+                .unwrap();
+                let started = Instant::now();
+                let mut response = client
+                    .execute(
+                        raw.post(format!("http://{address}/db/v1/query"))
+                            .body(r#"{"timeout_ms":300}"#)
+                            .build()
+                            .unwrap(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.chunk().await.unwrap().unwrap(), "a");
+                let error = response.chunk().await.unwrap_err();
+                assert!(error.is_timeout(), "{error:?}");
+                assert!(
+                    started.elapsed() < Duration::from_millis(440),
+                    "body timeout restarted after backoff"
+                );
+                drop(response);
+                assert!(pool.run(None, || async { Ok::<_, ()>(()) }).await.is_ok());
+            });
+        server.join().unwrap();
+    }
 
     #[test]
     fn query_retries_release_each_attempt_and_keep_final_response_admitted() {
