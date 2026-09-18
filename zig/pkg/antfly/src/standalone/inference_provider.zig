@@ -6,7 +6,9 @@
 //! numeric results, and invocation lifetime; the inference node stays opaque.
 const std = @import("std");
 const builtin = @import("builtin");
-const platform_time = @import("antfly_platform").time;
+const platform = @import("antfly_platform");
+const platform_time = platform.time;
+const process_memory_budget = @import("../common/process_memory_budget.zig");
 const inference_bridge = @import("inference_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const runtime_http_abi = @import("../runtime_http_abi.zig");
@@ -127,27 +129,158 @@ pub const EmbeddedInferenceProviderLifetime = struct {
 /// usable, but every provider call will fail with the same
 /// `ResourceOwnerNotConfigured`-class error a caller reached before this
 /// existed).
+/// Explicit resource-budget overrides for `createEmbeddedInferenceNode`, 0
+/// meaning automatic/host-detected sizing. These mirror the CLI's
+/// `--inference-host-budget-mb`/`--inference-backend-budget-mb`/
+/// `--process-memory-budget-mb` flags (see standalone/runtime.zig's
+/// `CliConfig` and inference_runtime/runtime.zig's `runServer`), letting a
+/// Lite handle opt into the same knobs rather than being stuck with whatever
+/// the default automatic policy resolves to.
+pub const EmbeddedInferenceNodeOptions = struct {
+    host_budget_mb: u32 = 0,
+    backend_budget_mb: u32 = 0,
+    combined_budget_mb: u32 = 0,
+    kv_budget_mb: u32 = 0,
+    scratch_budget_mb: u32 = 0,
+    process_memory_budget_mb: u32 = 0,
+};
+
+// Default embedded per-lane generation budgets (MiB), used whenever the
+// caller leaves the corresponding `EmbeddedInferenceNodeOptions` field at 0.
+// `antfly inference run`'s CLI flags for these same five lanes
+// (`--host-budget-mb`/`--backend-budget-mb`/`--combined-budget-mb`/
+// `--kv-budget-mb`/`--scratch-budget-mb`) also default to 0 (automatic), but
+// that default relies on an operator supplying real values on the command
+// line -- confirmed in production qualification work
+// (pkg/inference/models/gliner2/GLINER25.md's "Memory budget" section) that
+// a boundary-architecture model's admission estimate (encoder + boundary
+// head at worst-case single-window capacity, independent of actual request
+// size) exceeds what the automatic/zero-value policy admits, and that these
+// exact values are known-good: with them, `antfly inference run` extracts
+// real long documents against fastino/gliner2.5-base-v1 without
+// MemoryBudgetExceeded. An embedded Lite handle has no operator to supply
+// overrides, so it defaults to these directly instead of reproducing the
+// CLI's own insufficient zero-value default. `effectiveEmbeddedBudgetMb`
+// still clamps each to the host-detected envelope so a genuinely small box
+// does not get an admission ceiling larger than its own memory.
+const default_host_budget_mb: u32 = 16384;
+const default_backend_budget_mb: u32 = 16384;
+const default_combined_budget_mb: u32 = 32768;
+const default_kv_budget_mb: u32 = 4096;
+const default_scratch_budget_mb: u32 = 16384;
+
 pub const EmbeddedInferenceNode = struct {
     handle: *anyopaque,
     resource_owner: ?*LiteInferenceResourceOwner,
+    // The process-memory envelope this node actually resolved -- either the
+    // caller's explicit `process_memory_budget_mb` override or, when that is
+    // 0 (the default), the same host/cgroup-detected policy
+    // `antfly inference run` and standalone report at startup (see
+    // `resolveEmbeddedProcessMemoryBudget` below).
+    process_memory_limit_bytes: usize,
+    process_memory_limit_source: process_memory_budget.EffectiveSource,
+    // Effective per-lane generation budgets actually installed (MiB): either
+    // the caller's explicit override, or the host-clamped default above.
+    host_budget_mb: u32,
+    backend_budget_mb: u32,
+    combined_budget_mb: u32,
+    kv_budget_mb: u32,
+    scratch_budget_mb: u32,
 };
 
-pub fn createEmbeddedInferenceNode(data_dir: []const u8, io: std.Io) !EmbeddedInferenceNode {
+fn resolveEmbeddedProcessMemoryBudget(process_memory_budget_mb: u32) !process_memory_budget.EffectiveResolution {
+    return process_memory_budget.resolveSystemDetailed(
+        if (process_memory_budget_mb == 0) null else @as(usize, process_memory_budget_mb),
+        platform.env.getenv(process_memory_budget.canonical_env),
+        platform.env.getenv(process_memory_budget.inference_compat_env),
+    );
+}
+
+// Resolves one generation-budget lane: an explicit override always wins;
+// otherwise fall back to `default_mb`, clamped down to the host-detected
+// envelope (`detected_limit_bytes`, 0 meaning detection was unavailable, in
+// which case the generous default is kept as-is rather than clamped to
+// zero).
+fn effectiveEmbeddedBudgetMb(override_mb: u32, default_mb: u32, detected_limit_bytes: usize) u32 {
+    if (override_mb != 0) return override_mb;
+    if (detected_limit_bytes == 0) return default_mb;
+    const detected_mb = detected_limit_bytes / (1024 * 1024);
+    if (detected_mb == 0) return default_mb;
+    return @intCast(@min(@as(usize, default_mb), detected_mb));
+}
+
+fn embeddedInferenceMemoryLimitProvenance(
+    source: process_memory_budget.EffectiveSource,
+) inference_bridge.ProcessMemoryLimitProvenance {
+    return switch (source) {
+        .explicit => .explicit,
+        .cgroup_v2 => .cgroup_v2,
+        .cgroup_v1 => .cgroup_v1,
+        .host => .host,
+        .unavailable => .unavailable,
+    };
+}
+
+pub fn createEmbeddedInferenceNode(
+    data_dir: []const u8,
+    io: std.Io,
+    options: EmbeddedInferenceNodeOptions,
+) !EmbeddedInferenceNode {
     var borrowed_io = io;
     var out_handle: ?*anyopaque = null;
+    // Resolve the same host/cgroup-detected process-memory policy the CLI
+    // ("antfly inference run" and "antfly standalone") reports at startup
+    // instead of hardcoding zero bytes with `.automatic` provenance: an
+    // unresolved envelope here previously left every embedded-node sizing
+    // decision (including per-request extraction scratch/KV budgets) unable
+    // to distinguish "no host information available" from "this box has N
+    // GiB", which is what let large in-process extraction requests trip
+    // `error.MemoryBudgetExceeded` that an out-of-process `antfly inference
+    // run` serving the same input did not.
+    const process_memory_resolution = try resolveEmbeddedProcessMemoryBudget(options.process_memory_budget_mb);
+    // Per-lane generation budgets: an explicit override always wins; absent
+    // one, default to the CLI's own known-good values (see
+    // `default_host_budget_mb` and friends above), clamped to the
+    // host-detected envelope. Passing 0/automatic here -- this function's
+    // previous behavior -- left every embedded node unable to admit a
+    // boundary-architecture model's worst-case single-window estimate
+    // regardless of request size (see GLINER25.md's "Memory budget"
+    // section); `antfly inference run` only worked because an operator
+    // supplied generous flags by hand.
+    const effective_host_budget_mb = effectiveEmbeddedBudgetMb(options.host_budget_mb, default_host_budget_mb, process_memory_resolution.limit_bytes);
+    const effective_backend_budget_mb = effectiveEmbeddedBudgetMb(options.backend_budget_mb, default_backend_budget_mb, process_memory_resolution.limit_bytes);
+    const effective_combined_budget_mb = effectiveEmbeddedBudgetMb(options.combined_budget_mb, default_combined_budget_mb, process_memory_resolution.limit_bytes);
+    const effective_kv_budget_mb = effectiveEmbeddedBudgetMb(options.kv_budget_mb, default_kv_budget_mb, process_memory_resolution.limit_bytes);
+    const effective_scratch_budget_mb = effectiveEmbeddedBudgetMb(options.scratch_budget_mb, default_scratch_budget_mb, process_memory_resolution.limit_bytes);
+    std.log.info(
+        "lite embedded inference resource policy input_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} host_budget_mb={d} backend_budget_mb={d} combined_budget_mb={d} kv_budget_mb={d} scratch_budget_mb={d}",
+        .{
+            @tagName(process_memory_resolution.source),
+            @tagName(process_memory_resolution.effective_source),
+            process_memory_resolution.configured_limit_bytes,
+            process_memory_resolution.limit_bytes,
+            effective_host_budget_mb,
+            effective_backend_budget_mb,
+            effective_combined_budget_mb,
+            effective_kv_budget_mb,
+            effective_scratch_budget_mb,
+        },
+    );
     const create_context = inference_bridge.CreateContext{
         .abi_version = inference_bridge.abi_version,
         .data_dir_ptr = data_dir.ptr,
         .data_dir_len = data_dir.len,
         .models_dir = .{},
         .ml_dir = .{},
-        .host_limit_bytes = 0,
-        .backend_limit_bytes = 0,
-        .combined_limit_bytes = 0,
-        .kv_limit_bytes = 0,
-        .scratch_limit_bytes = 0,
-        .process_memory_limit_bytes = 0,
-        .process_memory_limit_provenance = .automatic,
+        .host_limit_bytes = try process_memory_budget.mibToBytes(@as(usize, effective_host_budget_mb)),
+        .backend_limit_bytes = try process_memory_budget.mibToBytes(@as(usize, effective_backend_budget_mb)),
+        .combined_limit_bytes = try process_memory_budget.mibToBytes(@as(usize, effective_combined_budget_mb)),
+        .kv_limit_bytes = try process_memory_budget.mibToBytes(@as(usize, effective_kv_budget_mb)),
+        .scratch_limit_bytes = try process_memory_budget.mibToBytes(@as(usize, effective_scratch_budget_mb)),
+        .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
+        .process_memory_limit_provenance = embeddedInferenceMemoryLimitProvenance(
+            process_memory_resolution.effective_source,
+        ),
         .preload_ptr = null,
         .preload_len = 0,
         .keep_alive = .{},
@@ -203,7 +336,17 @@ pub fn createEmbeddedInferenceNode(data_dir: []const u8, io: std.Io) !EmbeddedIn
         );
         break :blk null;
     };
-    return .{ .handle = handle, .resource_owner = resource_owner };
+    return .{
+        .handle = handle,
+        .resource_owner = resource_owner,
+        .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
+        .process_memory_limit_source = process_memory_resolution.effective_source,
+        .host_budget_mb = effective_host_budget_mb,
+        .backend_budget_mb = effective_backend_budget_mb,
+        .combined_budget_mb = effective_combined_budget_mb,
+        .kv_budget_mb = effective_kv_budget_mb,
+        .scratch_budget_mb = effective_scratch_budget_mb,
+    };
 }
 
 /// Counterpart to `createEmbeddedInferenceNode`. Callers must quiesce any

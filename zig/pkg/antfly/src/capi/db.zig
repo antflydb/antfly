@@ -739,15 +739,32 @@ const StorageSnapshot = struct {
 /// and for unit tests): that is the only context where the real inference
 /// runtime archive is linked in this binary instead of the
 /// capi/link_anchor(_inference).zig trap.
-fn startLiteEmbeddedInference(handle: *Handle, alloc: Allocator, path: []const u8) !void {
+fn startLiteEmbeddedInference(
+    handle: *Handle,
+    alloc: Allocator,
+    path: []const u8,
+    budget_options: inference_provider.EmbeddedInferenceNodeOptions,
+) !void {
     const io_impl = try alloc.create(std.Io.Threaded);
     errdefer alloc.destroy(io_impl);
     io_impl.* = std.Io.Threaded.init(std.heap.page_allocator, .{});
     errdefer io_impl.deinit();
     const data_dir = std.fs.path.dirname(path) orelse ".";
-    const created = try inference_provider.createEmbeddedInferenceNode(data_dir, io_impl.io());
+    const created = try inference_provider.createEmbeddedInferenceNode(data_dir, io_impl.io(), budget_options);
     handle.lite_inference_io = io_impl;
     handle.lite_inference_lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner };
+    // Report the policy the node actually resolved (host-detected by
+    // default, or the caller's explicit override) rather than leaving
+    // `lite_inference_status` at the pre-open placeholder values.
+    if (handle.lite_inference_status) |*status| {
+        status.process_memory_limit_bytes = @intCast(created.process_memory_limit_bytes);
+        status.process_memory_limit_source = @tagName(created.process_memory_limit_source);
+        status.host_budget_mb = created.host_budget_mb;
+        status.backend_budget_mb = created.backend_budget_mb;
+        status.combined_budget_mb = created.combined_budget_mb;
+        status.kv_budget_mb = created.kv_budget_mb;
+        status.scratch_budget_mb = created.scratch_budget_mb;
+    }
 }
 
 fn stopLiteEmbeddedInference(handle: *Handle) void {
@@ -7267,6 +7284,12 @@ fn resolveLiteOpenOptions(options_ptr: ?*const capi.LiteOpenOptions) !LiteResolv
         .inference = .{
             .remote_provider_configured = (flags & capi.lite_open_flag_remote_provider_configured) != 0,
             .local_runtime_configured = (flags & capi.lite_open_flag_local_runtime_configured) != 0,
+            .host_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_host_budget_mb") orelse 0,
+            .backend_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_backend_budget_mb") orelse 0,
+            .combined_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_combined_budget_mb") orelse 0,
+            .kv_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_kv_budget_mb") orelse 0,
+            .scratch_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_scratch_budget_mb") orelse 0,
+            .process_memory_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_process_memory_budget_mb") orelse 0,
         },
         .generated_enrichment_replay = (flags & capi.lite_open_flag_generated_enrichment_replay) != 0,
     };
@@ -7489,7 +7512,14 @@ fn openLiteHandleAllocWithRuntime(
         // already registered as `errdefer`s above (in that unwind order);
         // adding any of that cleanup here too would run it twice on this
         // error path. Only unwind the state this function itself owns.
-        try startLiteEmbeddedInference(handle, alloc, path);
+        try startLiteEmbeddedInference(handle, alloc, path, .{
+            .host_budget_mb = resolved.inference.host_budget_mb,
+            .backend_budget_mb = resolved.inference.backend_budget_mb,
+            .combined_budget_mb = resolved.inference.combined_budget_mb,
+            .kv_budget_mb = resolved.inference.kv_budget_mb,
+            .scratch_budget_mb = resolved.inference.scratch_budget_mb,
+            .process_memory_budget_mb = resolved.inference.process_memory_budget_mb,
+        });
     }
     // Restores the managed enrichment runtime for indexes/enrichments that
     // were already declared in a prior session (`create` only ever adds the
@@ -14497,6 +14527,125 @@ test "capi lite local-runtime-configured flag reports local_embedded only when t
         const owned_handle = asHandle(handle).?;
         try std.testing.expect(owned_handle.lite_inference_lifetime == null);
     }
+}
+
+// Confirms `EmbeddedInferenceNodeOptions` plumbing end to end: an explicit
+// process-memory budget override passed through `antfly_lite_open_options`
+// is what the embedded node actually resolves and reports back in
+// `antfly_lite_status_json`'s "inference" object, rather than the previous
+// hardcoded zero-bytes/"automatic" policy that gave every Lite handle no way
+// to distinguish "host-detected" from "unset" (see
+// `inference_provider.createEmbeddedInferenceNode` and
+// `LiteResolvedOpenOptions.inference`). Runs on every build (including the
+// default, where the local runtime never actually starts) and only asserts
+// the reported budgets on the build-capability signal, matching the sibling
+// local-runtime test above.
+test "capi lite explicit resource budget overrides are reported in status" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-inference-budget-status");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+        .inference_host_budget_mb = 256,
+        .inference_backend_budget_mb = 128,
+        .inference_process_memory_budget_mb = 512,
+        .inference_combined_budget_mb = 384,
+        .inference_kv_budget_mb = 64,
+        .inference_scratch_budget_mb = 32,
+    };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+
+    var status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(handle, &status));
+    defer antfly_db_buffer_free(status.ptr, status.len);
+    const status_json = status.ptr.?[0..status.len];
+
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"host_budget_mb\":256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"backend_budget_mb\":128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_budget_mb\":512") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"combined_budget_mb\":384") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"kv_budget_mb\":64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"scratch_budget_mb\":32") != null);
+
+    if (capi_build_options.inference_enabled and lite_backend.capabilitiesForProfile(.native).local_inference_runtime) {
+        // The node actually started against the explicit override: the
+        // resolved envelope is exactly the requested 512 MiB (clamped by
+        // `resolveEffectiveDetailed` only when the detected host is
+        // smaller, which a 512 MiB request never exceeds on any test
+        // runner), and its provenance is "explicit", not "automatic".
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_bytes\":536870912") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_source\":\"explicit\"") != null);
+        const owned_handle = asHandle(handle).?;
+        try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+    } else {
+        // No local runtime started, so the resolution never ran; status
+        // still echoes the caller's requested override values (asserted
+        // above) but the resolved fields stay at their zero-value/automatic
+        // defaults.
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_bytes\":0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_source\":\"automatic\"") != null);
+    }
+}
+
+// A Lite handle opened with the local-runtime flag but no explicit budget
+// overrides must not fall back to the previous zero-bytes/automatic
+// generation-budget policy: that policy could not admit even one
+// boundary-architecture extraction window (fastino/gliner2.5-base-v1's
+// admission estimate exceeds it regardless of request size -- see
+// GLINER25.md's "Memory budget" section and this task's
+// gliner25-longdoc-handoff.md), so every such call failed with
+// error.MemoryBudgetExceeded through the embedded/in-process worker path
+// even though `antfly inference run` succeeded (only because an operator
+// supplied `--host-budget-mb`/`--backend-budget-mb`/`--combined-budget-mb`/
+// `--kv-budget-mb`/`--scratch-budget-mb` by hand). Confirms the embedded
+// node instead defaults each lane to
+// `inference_provider.default_{host,backend,combined,kv,scratch}_budget_mb`
+// (clamped to the host-detected envelope), and logs the resolved values for
+// the machine running this test.
+test "capi lite defaults embedded generation budgets when no override is given" {
+    if (!capi_build_options.inference_enabled) return error.SkipZigTest;
+    if (!lite_backend.capabilitiesForProfile(.native).local_inference_runtime) return error.SkipZigTest;
+
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-inference-budget-defaults");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+    };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+
+    var status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(handle, &status));
+    defer antfly_db_buffer_free(status.ptr, status.len);
+    const status_json = status.ptr.?[0..status.len];
+    std.debug.print("capi lite default embedded generation budgets on this machine: {s}\n", .{status_json});
+
+    // None of these lanes may resolve to 0 (the previous automatic/unbounded
+    // policy that admitted no boundary-model window). host/backend/scratch
+    // default to 16384 MiB, combined to 32768, kv to 4096, each clamped to
+    // the host-detected envelope; a real dev/CI machine has well over 4 GiB,
+    // so all five stay at their un-clamped defaults on any realistic runner.
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"host_budget_mb\":0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"backend_budget_mb\":0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"combined_budget_mb\":0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"kv_budget_mb\":0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"scratch_budget_mb\":0") == null);
 }
 
 fn liteLocalEmbeddingModelAvailable(alloc: Allocator) bool {

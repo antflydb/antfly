@@ -425,6 +425,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "dense response identity generation footer",
         "capi aggregate hits rejects stale identity generation before aggregation materialization",
         "capi lite local-runtime-configured flag reports local_embedded only when the build links inference",
+        "capi lite explicit resource budget overrides are reported in status",
+        "capi lite defaults embedded generation budgets when no override is given",
         "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
         "capi get edges json does not double free a non-empty edge slice",
     };

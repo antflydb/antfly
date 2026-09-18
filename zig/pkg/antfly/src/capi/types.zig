@@ -100,6 +100,21 @@ pub const LiteOpenOptions = extern struct {
     ttl_cleanup_lease_ttl_ms: u64 = 0,
     ttl_cleanup_interval_ms: u64 = 0,
     ttl_cleanup_grace_period_ns: u64 = 0,
+    // Explicit embedded-inference resource-budget overrides in MiB, 0
+    // meaning automatic/host-detected sizing. Only consulted when `flags`
+    // carries `lite_open_flag_local_runtime_configured`; mirror the CLI's
+    // `--inference-host-budget-mb`/`--inference-backend-budget-mb`/
+    // `--process-memory-budget-mb` (see standalone/runtime.zig,
+    // inference_runtime/runtime.zig, and
+    // inference_provider.EmbeddedInferenceNodeOptions). Older callers built
+    // against a smaller `abi_size` implicitly get 0/automatic through
+    // `readOptionField`'s forward-compat size check.
+    inference_host_budget_mb: u32 = 0,
+    inference_backend_budget_mb: u32 = 0,
+    inference_process_memory_budget_mb: u32 = 0,
+    inference_combined_budget_mb: u32 = 0,
+    inference_kv_budget_mb: u32 = 0,
+    inference_scratch_budget_mb: u32 = 0,
     reserved: [8]u64 = .{0} ** 8,
 };
 

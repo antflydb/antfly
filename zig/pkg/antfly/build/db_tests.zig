@@ -350,6 +350,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db blocked dense embedding lane does not force the independent asset lane to redo checkpointed work",
         "combined replay cursor gate requires every execution lane to cover a group",
         "each execution lane persists and clears its own replay cursor scope",
+        "asset producer runtime accepts an unrequested boundary-model schema_version upgrade",
+        "asset producer runtime batch path accepts an unrequested boundary-model schema_version upgrade",
     };
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = antfly_test_mod,
