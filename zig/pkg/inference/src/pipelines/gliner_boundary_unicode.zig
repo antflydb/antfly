@@ -83,7 +83,7 @@ pub fn findLiteralMentions(allocator: std.mem.Allocator, text: []const u8, choic
 
 test "record enum literals match pinned Python Unicode regex fixture" {
     const Fixture = struct { format_version: u32, provenance: std.json.Value, pairs: usize, cases: []const struct { text: []const u8, choices: []const []const u8, matches: []const Mention } };
-    const bytes = try @import("../architectures/gliner_boundary_parity_test.zig").fixtureBytes(std.testing.allocator, "case_equivalence.json");
+    const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(std.testing.allocator, "case_equivalence.json");
     defer std.testing.allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(Fixture, std.testing.allocator, bytes, .{});
     defer parsed.deinit();

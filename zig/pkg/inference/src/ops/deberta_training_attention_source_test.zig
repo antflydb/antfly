@@ -6,7 +6,7 @@
 //! No Python, checkpoint, source formula replica, or Torch RNG executes here.
 const std = @import("std");
 const attention = @import("deberta_training_attention.zig");
-const parity = @import("../architectures/gliner_boundary_parity_test.zig");
+const parity = @import("../architectures/gliner/boundary_parity_test.zig");
 const safetensors = @import("../models/safetensors.zig");
 const snapshot = @import("../runtime/file_snapshot.zig");
 const bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
@@ -231,9 +231,9 @@ fn upload(cb: *const ops.ComputeBackend, values: []const f32, shape: []const i32
     return cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = values, .shape = shape } }, .{});
 }
 
-fn deviceCase(a: Allocator, device: *resident.Device, case: Case, input: Inputs) !void {
+fn deviceCase(a: Allocator, device: anytype, case: Case, input: Inputs) !void {
     const cb = device.backend.computeBackend();
-    try std.testing.expect(cb.kind() == .metal);
+    try std.testing.expect(cb.kind() == .metal or cb.kind() == .cuda);
     const bs: i32 = @intCast(case.batch * case.sequence);
     const h: i32 = @intCast(case.hidden_size);
     const r: i32 = @intCast(case.relative_rows);
@@ -277,12 +277,17 @@ fn deviceCase(a: Allocator, device: *resident.Device, case: Case, input: Inputs)
     try compareGradients(case, input.gradient, gradient_values);
 }
 
-fn exercise(comptime on_device: bool) !void {
-    if (comptime on_device) {
+fn exercise(comptime backend: enum { native, metal, cuda }) !void {
+    const on_device = backend != .native;
+    if (comptime backend == .cuda) try resident.CudaDevice.requireAvailable();
+    if (comptime backend == .metal) {
         if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
         if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     }
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_TRAINING_ATTENTION_FIXTURE_DIR") orelse return error.SkipZigTest;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_TRAINING_ATTENTION_FIXTURE_DIR") orelse {
+        if (backend == .cuda and @import("antfly_platform").env.getenvBoolDefault("TERMITE_REQUIRE_CUDA_TESTS", false)) return error.RequiredAttentionFixtureMissing;
+        return error.SkipZigTest;
+    };
     var owner = bounded{ .backing = std.testing.allocator, .limit = 64 * 1024 * 1024 };
     const a = owner.allocator();
     const metadata = try readPinned(a, directory, "capture.json", capture_pin);
@@ -317,7 +322,8 @@ fn exercise(comptime on_device: bool) !void {
     var reference = parity.TensorFixture{ .allocator = a, .reader = try safetensors.MMapReader.fromBorrowedBytesLimited(a, tensor_bytes, 32 * 1024) };
     defer reference.deinit();
     try std.testing.expectEqual(@as(usize, 9 * 17), reference.reader.header.tensors.count());
-    var device: if (on_device) resident.Device else void = if (on_device) try resident.Device.init(a) else {};
+    const Device = if (backend == .cuda) resident.CudaDevice else resident.Device;
+    var device: if (on_device) Device else void = if (on_device) try Device.init(a) else {};
     defer if (comptime on_device) device.deinit();
     for (manifest.cases, 0..) |case, index| {
         errdefer std.debug.print("pinned projected attention case {s} device={}\n", .{ case.id, on_device });
@@ -337,9 +343,13 @@ fn exercise(comptime on_device: bool) !void {
 }
 
 test "replay DeBERTa training attention pinned source CPU nine cases forward and five VJPs" {
-    try exercise(false);
+    try exercise(.native);
 }
 
 test "replay DeBERTa training attention pinned source Metal nine cases forward and five VJPs" {
-    try exercise(true);
+    try exercise(.metal);
+}
+
+test "replay DeBERTa training attention pinned source CUDA nine cases forward and five VJPs" {
+    try exercise(.cuda);
 }

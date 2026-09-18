@@ -76,6 +76,11 @@ pub const CublasLtMatmulHeuristicResult = extern struct {
 const CublasTable = struct {
     create: *const fn (*CublasHandle) callconv(.c) CublasStatus,
     destroy: *const fn (CublasHandle) callconv(.c) CublasStatus,
+    getVersion: *const fn (CublasHandle, *c_int) callconv(.c) CublasStatus,
+    setStream: *const fn (CublasHandle, ?*anyopaque) callconv(.c) CublasStatus,
+    setMathMode: *const fn (CublasHandle, c_int) callconv(.c) CublasStatus,
+    sgemm: *const fn (CublasHandle, c_int, c_int, c_int, c_int, c_int, *const f32, *const anyopaque, c_int, *const anyopaque, c_int, *const f32, *anyopaque, c_int) callconv(.c) CublasStatus,
+    sgemmStridedBatched: *const fn (CublasHandle, c_int, c_int, c_int, c_int, c_int, *const f32, *const anyopaque, c_int, i64, *const anyopaque, c_int, i64, *const f32, *anyopaque, c_int, i64, c_int) callconv(.c) CublasStatus,
 };
 
 pub const CublasLtTable = struct {
@@ -126,20 +131,129 @@ const CublasLibrary = struct {
     lib: std.DynLib,
     fns: CublasTable,
 
-    fn open() !CublasLibrary {
-        var lib = try openAny(&cublas_names);
+    fn open(configured_path: ?[]const u8) !CublasLibrary {
+        // An explicit training runtime is authoritative: never silently fall
+        // back to another major version after a path or symbol failure.
+        if (configured_path) |path| try validateTrainingLibraryPath(path);
+        var lib = if (configured_path) |path| try std.DynLib.open(path) else try openAny(&cublas_names);
         errdefer lib.close();
         return .{
             .lib = lib,
             .fns = .{
                 .create = try lookup(&lib, @TypeOf(@as(CublasTable, undefined).create), "cublasCreate_v2"),
                 .destroy = try lookup(&lib, @TypeOf(@as(CublasTable, undefined).destroy), "cublasDestroy_v2"),
+                .getVersion = try lookup(&lib, @TypeOf(@as(CublasTable, undefined).getVersion), "cublasGetVersion_v2"),
+                .setStream = try lookup(&lib, @TypeOf(@as(CublasTable, undefined).setStream), "cublasSetStream_v2"),
+                .setMathMode = try lookup(&lib, @TypeOf(@as(CublasTable, undefined).setMathMode), "cublasSetMathMode"),
+                .sgemm = try lookup(&lib, @TypeOf(@as(CublasTable, undefined).sgemm), "cublasSgemm_v2"),
+                .sgemmStridedBatched = try lookup(&lib, @TypeOf(@as(CublasTable, undefined).sgemmStridedBatched), "cublasSgemmStridedBatched"),
             },
         };
     }
 
     fn deinit(self: *CublasLibrary) void {
         self.lib.close();
+    }
+};
+
+/// Stream-bound full-precision BLAS for resident training. Keep the standard
+/// SGEMM reduction path used by the Python CUDA reference; serving keeps its
+/// existing cuBLASLt policies. Handle-private driver memory is not an
+/// application-managed allocation, like the existing cuBLASLt handle.
+pub const CublasF32 = struct {
+    library: CublasLibrary,
+    handle: CublasHandle,
+    stream: ?*anyopaque,
+    calls: u64 = 0,
+    /// Vendor runtime version is part of retained-training checkpoint identity.
+    version: u32,
+
+    pub fn init(stream: ?*anyopaque) !CublasF32 {
+        return initWithLibrary(stream, @import("antfly_platform").env.getenv("ANTFLY_INFERENCE_CUDA_TRAINING_CUBLAS_LIBRARY"));
+    }
+
+    pub fn initWithLibrary(stream: ?*anyopaque, configured_path: ?[]const u8) !CublasF32 {
+        if (Policy.current() == .off) return error.CudaLibrariesDisabled;
+        var library = try CublasLibrary.open(configured_path);
+        errdefer library.deinit();
+        var handle: CublasHandle = null;
+        try check(library.fns.create(&handle));
+        errdefer _ = library.fns.destroy(handle);
+        var version: c_int = 0;
+        try check(library.fns.getVersion(handle, &version));
+        if (version <= 0) return error.InvalidCublasVersion;
+        try check(library.fns.setMathMode(handle, 0)); // CUBLAS_DEFAULT_MATH: no TF32.
+        try check(library.fns.setStream(handle, stream));
+        return .{ .library = library, .handle = handle, .stream = stream, .version = @intCast(version) };
+    }
+
+    pub fn deinit(self: *CublasF32) void {
+        _ = self.library.fns.destroy(self.handle);
+        self.library.deinit();
+        self.* = undefined;
+    }
+
+    pub fn linear(self: *CublasF32, stream: ?*anyopaque, output: *anyopaque, input: *const anyopaque, weight: *const anyopaque, rows: usize, width: usize, columns: usize, accumulate: bool) !void {
+        return self.matrix(stream, output, input, weight, rows, width, columns, false, true, accumulate);
+    }
+
+    /// Row-major C = op(lhs) op(rhs), without copying either transpose.
+    pub fn matrix(self: *CublasF32, stream: ?*anyopaque, output: *anyopaque, lhs: *const anyopaque, rhs: *const anyopaque, rows: usize, width: usize, columns: usize, lhs_transposed: bool, rhs_transposed: bool, accumulate: bool) !void {
+        const m = std.math.cast(c_int, rows) orelse return error.InvalidCublasShape;
+        const k = std.math.cast(c_int, width) orelse return error.InvalidCublasShape;
+        const n = std.math.cast(c_int, columns) orelse return error.InvalidCublasShape;
+        if (m <= 0 or k <= 0 or n <= 0) return error.InvalidCublasShape;
+        try self.bindStream(stream);
+        const alpha: f32 = 1;
+        const beta: f32 = if (accumulate) 1 else 0;
+        // Column-major C^T = op(rhs)^T op(lhs)^T.
+        try check(self.library.fns.sgemm(self.handle, if (rhs_transposed) CUBLAS_OP_T else CUBLAS_OP_N, if (lhs_transposed) CUBLAS_OP_T else CUBLAS_OP_N, n, m, k, &alpha, rhs, if (rhs_transposed) k else n, lhs, if (lhs_transposed) m else k, &beta, output, n));
+        self.calls +|= 1;
+    }
+
+    pub fn batched(self: *CublasF32, stream: ?*anyopaque, output: *anyopaque, lhs: *const anyopaque, rhs: *const anyopaque, batches: usize, rows: usize, width: usize, columns: usize, lhs_transposed: bool, rhs_transposed: bool) !void {
+        const count = std.math.cast(c_int, batches) orelse return error.InvalidCublasShape;
+        const m = std.math.cast(c_int, rows) orelse return error.InvalidCublasShape;
+        const k = std.math.cast(c_int, width) orelse return error.InvalidCublasShape;
+        const n = std.math.cast(c_int, columns) orelse return error.InvalidCublasShape;
+        if (count <= 0 or m <= 0 or k <= 0 or n <= 0) return error.InvalidCublasShape;
+        try self.bindStream(stream);
+        const alpha: f32 = 1;
+        const beta: f32 = 0;
+        // View row-major C = A B as column-major C^T = B^T A^T.
+        // Positive int32 dimensions make these int64 element strides safe.
+        try check(self.library.fns.sgemmStridedBatched(
+            self.handle,
+            if (rhs_transposed) CUBLAS_OP_T else CUBLAS_OP_N,
+            if (lhs_transposed) CUBLAS_OP_T else CUBLAS_OP_N,
+            n,
+            m,
+            k,
+            &alpha,
+            rhs,
+            if (rhs_transposed) k else n,
+            @as(i64, n) * k,
+            lhs,
+            if (lhs_transposed) m else k,
+            @as(i64, m) * k,
+            &beta,
+            output,
+            n,
+            @as(i64, m) * n,
+            count,
+        ));
+        self.calls +|= 1;
+    }
+
+    fn bindStream(self: *CublasF32, stream: ?*anyopaque) !void {
+        if (self.stream != stream) {
+            try check(self.library.fns.setStream(self.handle, stream));
+            self.stream = stream;
+        }
+    }
+
+    fn check(status: CublasStatus) !void {
+        if (status != CUBLAS_STATUS_SUCCESS) return error.CublasError;
     }
 };
 
@@ -196,7 +310,7 @@ pub const CudaLibraries = struct {
 
         var libs = CudaLibraries{
             .policy = policy,
-            .cublas = CublasLibrary.open() catch null,
+            .cublas = CublasLibrary.open(null) catch null,
             .cublaslt = CublasLtLibrary.open() catch null,
         };
         errdefer libs.deinit();
@@ -237,9 +351,24 @@ pub const CudaLibraries = struct {
     }
 };
 
+fn validateTrainingLibraryPath(path: []const u8) !void {
+    if (path.len == 0 or path.len > 4096 or !std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null)
+        return error.InvalidCudaTrainingLibraryPath;
+}
+
+test "CUDA training cuBLAS selection requires an explicit absolute library path" {
+    try validateTrainingLibraryPath("/opt/cuda/lib64/libcublas.so.12");
+    for ([_][]const u8{ "", "libcublas.so.12", "../libcublas.so.12", "/opt/cuda/lib\x00ignored" }) |path|
+        try std.testing.expectError(error.InvalidCudaTrainingLibraryPath, validateTrainingLibraryPath(path));
+    const too_long = [_]u8{'/'} ++ [_]u8{'a'} ** 4096;
+    try std.testing.expectError(error.InvalidCudaTrainingLibraryPath, validateTrainingLibraryPath(&too_long));
+}
+
 const cublas_names = [_][]const u8{
     "libcublas.so.13",
     "libcublas.so",
+    "libcublas.so.12",
+    "libcublas.so.11",
     "/usr/local/cuda-13.2/targets/x86_64-linux/lib/libcublas.so.13",
     "/usr/local/cuda-13.2/targets/x86_64-linux/lib/libcublas.so.13.4.0.1",
 };
