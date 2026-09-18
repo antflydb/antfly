@@ -6539,7 +6539,7 @@ pub const AntflyApiHandler = struct {
             error.GenerationTransitionActive,
             => {
                 var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
-                return respondOwnedApiResponse(ctx, &response);
+                return respondOwnedApiResponseWithAllocator(ctx, &response, alloc);
             },
             error.TopologyChanged,
             error.IdentityReadGenerationChanged,
@@ -10215,7 +10215,7 @@ test "httpx inference connection preserves upstream retry guidance" {
 test "workload admission document lookups preserve lifetime and retained output across public aliases and MCP" {
     const alloc = std.testing.allocator;
     const Reads = struct {
-        mode: enum { normal, cancel, expire, budget, backing_oom } = .normal,
+        mode: enum { normal, cancel, expire, budget, backing_oom, storage_busy, storage_unavailable } = .normal,
         signal: std.atomic.Value(bool) = .init(false),
         deadline_ns: u64 = 0,
         calls: usize = 0,
@@ -10228,6 +10228,8 @@ test "workload admission document lookups preserve lifetime and retained output 
             try std.testing.expectEqual(self.deadline_ns, opts.execution_deadline_ns.?);
             try std.testing.expect(opts.cancellation.?.ptr != null);
             if (self.mode == .backing_oom) return error.OutOfMemory;
+            if (self.mode == .storage_busy) return error.StorageBusy;
+            if (self.mode == .storage_unavailable) return error.StorageReadTemporarilyUnavailable;
             if (self.mode == .budget) {
                 const scratch = try a.alloc(u8, 128 * 1024);
                 defer a.free(scratch);
@@ -10252,8 +10254,14 @@ test "workload admission document lookups preserve lifetime and retained output 
     var api_server = ApiHttpServer.init(alloc, .{ .query_max_concurrent_requests = 1, .query_admission_waiting = .{ .max_retained_bytes = 65536 } }, source.iface(), reads.source(), null);
     defer api_server.deinit();
     var handler = AntflyApiHandler{ .api_server = &api_server };
-    for (0..4) |mode| {
-        reads.mode = if (mode < 2) .normal else if (mode == 2) .cancel else .expire;
+    for (0..6) |mode| {
+        reads.mode = switch (mode) {
+            0, 1 => .normal,
+            2 => .cancel,
+            3 => .expire,
+            4 => .storage_busy,
+            else => .storage_unavailable,
+        };
         reads.signal.store(false, .release);
         reads.deadline_ns = @import("antfly_platform").time.monotonicNs() + (if (mode == 3) @as(u64, 20 * std.time.ns_per_ms) else 5 * std.time.ns_per_s);
         var request = try httpx.Request.init(alloc, .GET, "/db/v1/tables/docs/documents/doc:a");
@@ -10263,13 +10271,14 @@ test "workload admission document lookups preserve lifetime and retained output 
         defer if (ctx_live) ctx.deinit();
         ctx.cancellation = &reads.signal;
         ctx.application_deadline_ns = reads.deadline_ns;
-        var response = if (mode == 1)
+        var response = if (mode == 1 or mode == 5)
             try handler.lookupNamespaceTableDocument(&ctx, "default", "public", "docs", "doc:a", .{})
         else
             try handler.lookupKey(&ctx, "docs", "doc:a", .{});
         var response_live = true;
         defer if (response_live) response.deinit();
-        try std.testing.expectEqual(@as(u16, if (mode < 2) 200 else if (mode == 2) 408 else 504), response.status.code);
+        try std.testing.expectEqual(@as(u16, if (mode < 2) 200 else if (mode == 2) 408 else if (mode == 3) 504 else 503), response.status.code);
+        if (mode >= 4) try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
         try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
         ctx.deinit();
         ctx_live = false;
@@ -10334,7 +10343,7 @@ test "workload admission document lookups preserve lifetime and retained output 
     var rejected = try handler.lookupKey(&ctx, "docs", "doc:a", .{});
     defer rejected.deinit();
     try std.testing.expectEqual(@as(u16, 429), rejected.status.code);
-    try std.testing.expectEqual(@as(usize, 7), reads.calls);
+    try std.testing.expectEqual(@as(usize, 9), reads.calls);
 }
 
 test "httpx query admission releases a cancelled query slot" {
