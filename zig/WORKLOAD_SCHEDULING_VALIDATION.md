@@ -177,3 +177,55 @@ Stage 1 production Debug build: clean revision
 Receipt: `/tmp/workload-stage1-production-debug-receipt.json`; build log:
 `/tmp/workload-stage1-production-debug.log`. The isolated checkout preserves this
 source/binary provenance while stage 2 changes proceed in the implementation worktree.
+
+
+## Stage 2 shared read execution
+
+Stage 2 implementation ends at `27146c033f`; documentation revision
+`3f9d2c481eccad7254e680737f1029dd6454b209` has the same compiled inputs.
+The final integration gate and clean production Debug build both passed.
+
+| Check | Result | Local evidence |
+| --- | --- | --- |
+| Final combined scheduling integration, with local TCP access | 156 passed, 1 optional Wasmtime skip, zero failures/leaks, 6 expected / 0 unexpected error logs, exit 0 | `/tmp/workload-stage2-final-integration.log`, `/tmp/workload-stage2-final-integration-receipt.json` |
+| Independently compiled storage-owner boundary, final production tree | 5/5, zero failures/leaks, exit 0 | `/tmp/workload-stage2-production-debug.log` |
+| Transition/demotion scheduler, Debug and ReleaseSafe | 29/29 in each focused run, exit 0; recorded before the transition commit, with only `Bundle.sub` visibility changed afterward | Agent tool receipts |
+| Absolute stream deadline and H2 flow-control regressions | 15/15 selected transport/client tests, exit 0 | `/tmp/workload-scan-stream-deadline-final.log` |
+| Partial physical frame failure and connection shutdown | 10/10 selected socket/client tests, exit 0 | `/tmp/workload-scan-partial-frame.log` |
+| Actual HTTP/1 and HTTP/2 streaming, explicit HEAD, and large response transport | 11/11 selected transport/client tests, exit 0 | `/tmp/workload-scan-stream-real-transport.log` |
+| Independently compiled scan-sink deadline ABI | 4/4, exit 0 | `/tmp/workload-scan-deadline-abi.log` |
+| Formatting and whitespace | All 38 changed Zig files passed `zig fmt --check`; committed diff passed `git diff --check` | Parent tool receipts |
+
+The integration gate exercises actual DB reads, protected LMDB probes under
+saturated general capacity, wide-row demotion and cleanup, nested dense-owner
+borrowing, original deadlines, serverless query saturation with independent
+writes/probes, helper fallback and joined cancellation, and streamed-scan cleanup.
+LMDB scan suspension is tested through completion, cancellation, and snapshot
+expiry; default LSM scans are checked to retain coarse runnable ownership.
+Configuration tests reject scan state that exceeds the general partition after
+protected/transition reservations, including a one-byte boundary overflow.
+The optional real Wasmtime skip has separate stage 1 engine evidence above.
+
+Earlier stage 2 runs exposed compilation errors and fixture mistakes: the
+protected-probe fixture initially used the default LSM backend, and the
+serverless fixture retained prior responses and compared live admission estimates
+with actual allocation charges. Those failures remain in
+`/tmp/workload-stage2-first.log` through `/tmp/workload-stage2-sixth.log`.
+The corrected final gate is the authoritative combined result.
+
+Production command, from `zig/`:
+
+```sh
+python3 tools/run_bounded_zig_build.py --zig zig -- build antfly antfly-storage-owner-test -Dstorage-owner-test-filter='opaque storage context' -j2
+```
+
+The build returned exit 0 with a clean worktree before and after, at revision
+`3f9d2c481eccad7254e680737f1029dd6454b209`. Executable SHA-256:
+`7b22dbc38d0c5fa78292b328916cb8bd8eecbe7660ae749a866d69b6bb832f09`.
+Receipt: `/tmp/workload-stage2-production-debug-receipt.json`.
+
+These checks complete the two follow-up review stages; they do not qualify a
+release matrix row. General operators still have nonyielding coarse regions,
+and unaudited backends do not suspend. Distributed coordinator ownership,
+remaining write-recovery integration, process-wide progress guarantees, and
+optimized resource-constrained performance qualification remain later work.

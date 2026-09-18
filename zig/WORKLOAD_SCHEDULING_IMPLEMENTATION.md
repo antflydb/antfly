@@ -70,8 +70,10 @@ limits remain coarse execution admission, while ingress counts include drain.
 
 Stage 2 extends the fixed scheduler under opt-in `admission.read_execution`.
 It is mutually exclusive with `dense_execution`; both remain disabled by default.
-The validation document records integration and production-build evidence
-separately from release qualification. Review stage 2 in these slices:
+Stage 2 passed the combined gate (156 tests, one optional skip, zero leaks),
+the five compiled storage-owner checks, and a clean production Debug build.
+The validation document records exact source and binary provenance separately
+from release qualification. Review stage 2 in these slices:
 
 | Commit | Change |
 | --- | --- |
