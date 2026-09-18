@@ -15,10 +15,13 @@ python3 scripts/workload_qualification.py run /tmp/workload-plan.json --output /
 The command exits 1 for request correctness or process failures, including
 failures during warmup; it still retains summaries, raw samples, and checksums.
 Exit 2 means generator-invalid evidence without a detected correctness failure.
-Expected overload 429s remain separate from unexpected HTTP/transport failures.
-Exit 0 establishes only clean evidence for the exercised subset; it never marks
-the full release matrix qualified. Inspect `correctness_failures`,
-`generator_valid`, and `shutdown_clean` in `summary.json` together.
+Exit 3 means otherwise-clean requests and load generation lack valid Prometheus
+snapshots. Correctness and generator failures take precedence if telemetry also
+fails. Expected overload 429s remain separate from unexpected HTTP/transport
+failures. Exit 0 establishes clean evidence and valid metrics snapshots for the
+exercised subset; it never marks the full release matrix qualified. Inspect
+`correctness_failures`, `generator_valid`, `shutdown_clean`, `telemetry_complete`,
+and `telemetry_failures` in `summary.json` together.
 
 For a harness smoke test with an existing binary whose build provenance is
 unknown, set both arms' `revision` and `optimization` to `"unknown"`. This is
@@ -35,9 +38,22 @@ disables swap, and verifies effective cgroup-v2 values. The image must include
 `/antfly` (or an explicit `container_binary`) and `cat`. CPU and RAM are enforced;
 the package's disk size is recorded but this bind-mounted fixture does not enforce
 a disk quota. Process runs are always unconstrained host correctness evidence.
-The harness disables inherited image health checks and polls its configured API
-readiness endpoint; the production image's separate health port is disabled in
-these fixtures.
+The harness disables inherited Docker image health checks and polls its configured
+API readiness endpoint. Both process and Docker launches enable the dedicated
+health/metrics listener. Process runs choose a separate free host port; Docker
+publishes container port 4200 on a separate loopback host port. `runtime.json`
+retains the API `port`, `metrics_port`, and exact launch `command`.
+
+Snapshots fetch `/metrics` only from that dedicated listener, validate the content
+type and Prometheus sample text, and retain valid responses as `.prom`. HTTP 200
+with dashboard HTML is invalid: the raw body is retained as `.metrics-invalid.body`
+and the corresponding `.resources.json` records `metrics_valid: false` and the
+error. Every snapshot contributes to `telemetry_complete`; missing snapshots are
+listed as unmeasured evidence. This flag establishes format and collection coverage,
+not the correctness or availability of every metric. Before using ownership or
+recovery counters as release evidence, verify the configured capacities and
+`antfly_admission_query_diagnostics_available` against the retained configuration.
+Historical receipts are never rewritten by these checks.
 
 `purpose: "qualification"` requires Docker, matching ReleaseFast builds with
 declared full revisions, at least 60-second warmup, 300-second measurement,
