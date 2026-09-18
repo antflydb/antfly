@@ -21,30 +21,101 @@ function GraphFirstFigure() {
         and grafts loss nodes onto the end. Two things the graph cannot express — precomputed
         indices and the padding bias — are supplied from outside as placeholders."
     >
-      <rect x={40} y={58} width={110} height={36} rx={5} fill="color-mix(in oklch, var(--kfam-attention) 14%, transparent)" stroke="var(--kfam-attention)" strokeWidth={1.25} />
+      <rect
+        x={40}
+        y={58}
+        width={110}
+        height={36}
+        rx={5}
+        fill="color-mix(in oklch, var(--kfam-attention) 14%, transparent)"
+        stroke="var(--kfam-attention)"
+        strokeWidth={1.25}
+      />
       <text x={95} y={80} textAnchor="middle" fontSize={8.5} className="fill-foreground font-mono">
         DeBERTa encoder
       </text>
       <path d="M 150 76 h 30" stroke="var(--muted-foreground)" strokeWidth={1.25} />
-      <rect x={182} y={58} width={90} height={36} rx={5} fill="color-mix(in oklch, var(--kfam-fusion) 14%, transparent)" stroke="var(--kfam-fusion)" strokeWidth={1.25} />
+      <rect
+        x={182}
+        y={58}
+        width={90}
+        height={36}
+        rx={5}
+        fill="color-mix(in oklch, var(--kfam-fusion) 14%, transparent)"
+        stroke="var(--kfam-fusion)"
+        strokeWidth={1.25}
+      />
       <text x={227} y={80} textAnchor="middle" fontSize={8.5} className="fill-foreground font-mono">
         span head
       </text>
       <path d="M 272 76 h 30" stroke="var(--muted-foreground)" strokeWidth={1.25} />
-      <rect x={304} y={58} width={90} height={36} rx={5} fill="color-mix(in oklch, var(--kfam-sampling) 18%, transparent)" stroke="var(--kfam-sampling)" strokeWidth={1.5} strokeDasharray="6 2 2 2" />
+      <rect
+        x={304}
+        y={58}
+        width={90}
+        height={36}
+        rx={5}
+        fill="color-mix(in oklch, var(--kfam-sampling) 18%, transparent)"
+        stroke="var(--kfam-sampling)"
+        strokeWidth={1.5}
+        strokeDasharray="6 2 2 2"
+      />
       <text x={349} y={80} textAnchor="middle" fontSize={8.5} className="fill-foreground font-mono">
         loss nodes
       </text>
-      <path d="M 95 110 v -16 M 227 110 v -16" stroke="var(--kfam-kv)" strokeWidth={1} strokeDasharray="4 2" />
-      <rect x={38} y={112} width={114} height={22} rx={4} fill="none" stroke="var(--kfam-kv)" strokeWidth={0.9} strokeDasharray="4 2" />
-      <text x={95} y={127} textAnchor="middle" fontSize={7} className="fill-muted-foreground font-mono">
+      <path
+        d="M 95 110 v -16 M 227 110 v -16"
+        stroke="var(--kfam-kv)"
+        strokeWidth={1}
+        strokeDasharray="4 2"
+      />
+      <rect
+        x={38}
+        y={112}
+        width={114}
+        height={22}
+        rx={4}
+        fill="none"
+        stroke="var(--kfam-kv)"
+        strokeWidth={0.9}
+        strokeDasharray="4 2"
+      />
+      <text
+        x={95}
+        y={127}
+        textAnchor="middle"
+        fontSize={7}
+        className="fill-muted-foreground font-mono"
+      >
         attn bias (frozen, −1e9 pads)
       </text>
-      <rect x={168} y={112} width={118} height={22} rx={4} fill="none" stroke="var(--kfam-kv)" strokeWidth={0.9} strokeDasharray="4 2" />
-      <text x={227} y={127} textAnchor="middle" fontSize={7} className="fill-muted-foreground font-mono">
+      <rect
+        x={168}
+        y={112}
+        width={118}
+        height={22}
+        rx={4}
+        fill="none"
+        stroke="var(--kfam-kv)"
+        strokeWidth={0.9}
+        strokeDasharray="4 2"
+      />
+      <text
+        x={227}
+        y={127}
+        textAnchor="middle"
+        fontSize={7}
+        className="fill-muted-foreground font-mono"
+      >
         precomputed indices
       </text>
-      <text x={220} y={170} textAnchor="middle" fontSize={8} className="fill-muted-foreground font-mono">
+      <text
+        x={220}
+        y={170}
+        textAnchor="middle"
+        fontSize={8}
+        className="fill-muted-foreground font-mono"
+      >
         placeholders arrive per step from the host — they are inputs, not ops
       </text>
     </Figure>
@@ -66,21 +137,67 @@ function ObjectiveTreeFigure() {
     >
       {OBJECTIVES.map((o) => (
         <g key={o.id}>
-          <rect x={o.x - 55} y={40} width={110} height={40} rx={5} fill={o.id === "total" ? "color-mix(in oklch, var(--kfam-fusion) 18%, transparent)" : "color-mix(in oklch, var(--kfam-attention) 12%, transparent)"} stroke={o.id === "total" ? "var(--kfam-fusion)" : "var(--kfam-attention)"} strokeWidth={o.id === "total" ? 1.5 : 1} />
-          <text x={o.x} y={57} textAnchor="middle" fontSize={8.5} className="fill-foreground font-mono">
+          <rect
+            x={o.x - 55}
+            y={40}
+            width={110}
+            height={40}
+            rx={5}
+            fill={
+              o.id === "total"
+                ? "color-mix(in oklch, var(--kfam-fusion) 18%, transparent)"
+                : "color-mix(in oklch, var(--kfam-attention) 12%, transparent)"
+            }
+            stroke={o.id === "total" ? "var(--kfam-fusion)" : "var(--kfam-attention)"}
+            strokeWidth={o.id === "total" ? 1.5 : 1}
+          />
+          <text
+            x={o.x}
+            y={57}
+            textAnchor="middle"
+            fontSize={8.5}
+            className="fill-foreground font-mono"
+          >
             {o.label}
           </text>
-          <text x={o.x} y={71} textAnchor="middle" fontSize={6.5} className="fill-muted-foreground font-mono">
+          <text
+            x={o.x}
+            y={71}
+            textAnchor="middle"
+            fontSize={6.5}
+            className="fill-muted-foreground font-mono"
+          >
             {o.sub}
           </text>
           <path d={`M ${o.x} 80 L 220 118`} stroke="var(--muted-foreground)" strokeWidth={0.9} />
         </g>
       ))}
-      <rect x={160} y={122} width={120} height={26} rx={5} fill="color-mix(in oklch, var(--kfam-mmsg) 14%, transparent)" stroke="var(--kfam-mmsg)" strokeWidth={1.25} />
-      <text x={220} y={139} textAnchor="middle" fontSize={8.5} className="fill-foreground font-mono">
+      <rect
+        x={160}
+        y={122}
+        width={120}
+        height={26}
+        rx={5}
+        fill="color-mix(in oklch, var(--kfam-mmsg) 14%, transparent)"
+        stroke="var(--kfam-mmsg)"
+        strokeWidth={1.25}
+      />
+      <text
+        x={220}
+        y={139}
+        textAnchor="middle"
+        fontSize={8.5}
+        className="fill-foreground font-mono"
+      >
         GlinerObjective
       </text>
-      <text x={220} y={172} textAnchor="middle" fontSize={7.5} className="fill-muted-foreground font-mono">
+      <text
+        x={220}
+        y={172}
+        textAnchor="middle"
+        fontSize={7.5}
+        className="fill-muted-foreground font-mono"
+      >
         unweighted sum of three loss nodes
       </text>
     </Figure>
@@ -104,14 +221,45 @@ function MaskedBceFigure() {
     >
       {BCE_GRID.map((c) => (
         <g key={c.id}>
-          <rect x={c.x} y={c.y} width={32} height={24} rx={3} fill={c.gated ? "none" : `color-mix(in oklch, var(--kfam-attention) ${Math.round(c.weight * 55)}%, transparent)`} stroke={c.gated ? "var(--border)" : "var(--kfam-attention)"} strokeWidth={0.8} />
-          {c.gated && <path d={`M ${c.x + 4} ${c.y + 20} L ${c.x + 28} ${c.y + 4}`} stroke="var(--muted-foreground)" strokeWidth={1} />}
+          <rect
+            x={c.x}
+            y={c.y}
+            width={32}
+            height={24}
+            rx={3}
+            fill={
+              c.gated
+                ? "none"
+                : `color-mix(in oklch, var(--kfam-attention) ${Math.round(c.weight * 55)}%, transparent)`
+            }
+            stroke={c.gated ? "var(--border)" : "var(--kfam-attention)"}
+            strokeWidth={0.8}
+          />
+          {c.gated && (
+            <path
+              d={`M ${c.x + 4} ${c.y + 20} L ${c.x + 28} ${c.y + 4}`}
+              stroke="var(--muted-foreground)"
+              strokeWidth={1}
+            />
+          )}
         </g>
       ))}
-      <text x={220} y={158} textAnchor="middle" fontSize={8} className="fill-muted-foreground font-mono">
+      <text
+        x={220}
+        y={158}
+        textAnchor="middle"
+        fontSize={8}
+        className="fill-muted-foreground font-mono"
+      >
         loss = Σ bce·label_weight·m ÷ (Σ m·label_weight + ε)
       </text>
-      <text x={220} y={176} textAnchor="middle" fontSize={7.5} className="fill-muted-foreground font-mono">
+      <text
+        x={220}
+        y={176}
+        textAnchor="middle"
+        fontSize={7.5}
+        className="fill-muted-foreground font-mono"
+      >
         label_weight = label·pos_w + (1−label)·neg_w — per-label weights configurable
       </text>
     </Figure>
@@ -139,25 +287,76 @@ function PackedGradientFigure() {
       title="one backward node, one packed gradient"
       caption="Schematic layout: the custom VJP emits a single fused backward node producing a packed [3·B·S + 2·rel, H] gradient; sliceRows splits it into d_qkv and d_qr/d_kr. The attention bias takes no gradient."
     >
-      <rect x={70} y={32} width={110} height={112} rx={5} fill="color-mix(in oklch, var(--kfam-fusion) 8%, transparent)" stroke="var(--kfam-fusion)" strokeWidth={1.5} />
+      <rect
+        x={70}
+        y={32}
+        width={110}
+        height={112}
+        rx={5}
+        fill="color-mix(in oklch, var(--kfam-fusion) 8%, transparent)"
+        stroke="var(--kfam-fusion)"
+        strokeWidth={1.5}
+      />
       {bands.map((b) => (
         <g key={b.id}>
-          <line x1={72} y1={b.y + b.h} x2={178} y2={b.y + b.h} stroke="var(--kfam-fusion)" strokeWidth={0.5} strokeDasharray="3 3" />
-          <text x={125} y={b.y + b.h / 2 + 3} textAnchor="middle" fontSize={7.5} className="fill-foreground font-mono">
+          <line
+            x1={72}
+            y1={b.y + b.h}
+            x2={178}
+            y2={b.y + b.h}
+            stroke="var(--kfam-fusion)"
+            strokeWidth={0.5}
+            strokeDasharray="3 3"
+          />
+          <text
+            x={125}
+            y={b.y + b.h / 2 + 3}
+            textAnchor="middle"
+            fontSize={7.5}
+            className="fill-foreground font-mono"
+          >
             {b.label}
           </text>
-          <path d={`M 180 ${b.y + b.h / 2} h 60`} stroke="var(--muted-foreground)" strokeWidth={0.8} />
+          <path
+            d={`M 180 ${b.y + b.h / 2} h 60`}
+            stroke="var(--muted-foreground)"
+            strokeWidth={0.8}
+          />
         </g>
       ))}
-      <rect x={244} y={44} width={130} height={48} rx={4} fill="color-mix(in oklch, var(--kfam-attention) 14%, transparent)" stroke="var(--kfam-attention)" strokeWidth={1} />
+      <rect
+        x={244}
+        y={44}
+        width={130}
+        height={48}
+        rx={4}
+        fill="color-mix(in oklch, var(--kfam-attention) 14%, transparent)"
+        stroke="var(--kfam-attention)"
+        strokeWidth={1}
+      />
       <text x={309} y={71} textAnchor="middle" fontSize={8} className="fill-foreground font-mono">
         d_qkv → input 0
       </text>
-      <rect x={244} y={104} width={130} height={36} rx={4} fill="color-mix(in oklch, var(--kfam-mmsg) 14%, transparent)" stroke="var(--kfam-mmsg)" strokeWidth={1} />
+      <rect
+        x={244}
+        y={104}
+        width={130}
+        height={36}
+        rx={4}
+        fill="color-mix(in oklch, var(--kfam-mmsg) 14%, transparent)"
+        stroke="var(--kfam-mmsg)"
+        strokeWidth={1}
+      />
       <text x={309} y={126} textAnchor="middle" fontSize={8} className="fill-foreground font-mono">
         d_qr/d_kr → input 1
       </text>
-      <text x={220} y={178} textAnchor="middle" fontSize={7.5} className="fill-muted-foreground font-mono">
+      <text
+        x={220}
+        y={178}
+        textAnchor="middle"
+        fontSize={7.5}
+        className="fill-muted-foreground font-mono"
+      >
         sliceRows does the split; attn_bias (input 2) is frozen — no VJP
       </text>
     </Figure>
@@ -173,21 +372,61 @@ function BwdKernelsFigure() {
       title="four Metal kernels behind one graph node"
       caption="Schematic: on Metal the fused backward node dispatches four precise-math kernels — the training half of the kernel family the legend documents."
     >
-      <rect x={120} y={28} width={200} height={32} rx={5} fill="color-mix(in oklch, var(--kfam-fusion) 16%, transparent)" stroke="var(--kfam-fusion)" strokeWidth={1.5} strokeDasharray="6 2 2 2" />
+      <rect
+        x={120}
+        y={28}
+        width={200}
+        height={32}
+        rx={5}
+        fill="color-mix(in oklch, var(--kfam-fusion) 16%, transparent)"
+        stroke="var(--kfam-fusion)"
+        strokeWidth={1.5}
+        strokeDasharray="6 2 2 2"
+      />
       <text x={220} y={48} textAnchor="middle" fontSize={7} className="fill-foreground font-mono">
         fused_disentangled_attention_backward
       </text>
       {BWD_KERNELS.map((k, i) => (
         <g key={k}>
           <path d={`M 220 60 L ${75 + i * 98} 96`} stroke="var(--border)" strokeWidth={0.8} />
-          <rect x={30 + i * 98} y={100} width={90} height={24} rx={4} fill="color-mix(in oklch, var(--kfam-attention) 12%, var(--background))" stroke="var(--kfam-attention)" strokeWidth={1} />
-          <text x={75 + i * 98} y={116} textAnchor="middle" fontSize={7} className="fill-foreground font-mono">
+          <rect
+            x={30 + i * 98}
+            y={100}
+            width={90}
+            height={24}
+            rx={4}
+            fill="color-mix(in oklch, var(--kfam-attention) 12%, var(--background))"
+            stroke="var(--kfam-attention)"
+            strokeWidth={1}
+          />
+          <text
+            x={75 + i * 98}
+            y={116}
+            textAnchor="middle"
+            fontSize={7}
+            className="fill-foreground font-mono"
+          >
             …{k}_f32
           </text>
         </g>
       ))}
-      <rect x={155} y={148} width={130} height={20} rx={10} fill="color-mix(in oklch, var(--kfam-kv) 12%, transparent)" stroke="var(--kfam-kv)" strokeWidth={0.9} />
-      <text x={220} y={162} textAnchor="middle" fontSize={7.5} className="fill-foreground font-mono">
+      <rect
+        x={155}
+        y={148}
+        width={130}
+        height={20}
+        rx={10}
+        fill="color-mix(in oklch, var(--kfam-kv) 12%, transparent)"
+        stroke="var(--kfam-kv)"
+        strokeWidth={0.9}
+      />
+      <text
+        x={220}
+        y={162}
+        textAnchor="middle"
+        fontSize={7.5}
+        className="fill-foreground font-mono"
+      >
         precise-math library
       </text>
     </Figure>
@@ -207,33 +446,124 @@ function Rank1FusedFigure({ step }: { step: 0 | 1 }) {
     >
       {step === 0 ? (
         <g>
-          <rect x={60} y={56} width={130} height={70} rx={6} fill="color-mix(in oklch, var(--dtype-f16) 14%, transparent)" stroke="var(--dtype-f16)" strokeWidth={1.25} />
-          <text x={125} y={94} textAnchor="middle" fontSize={8.5} className="fill-muted-foreground font-mono">
+          <rect
+            x={60}
+            y={56}
+            width={130}
+            height={70}
+            rx={6}
+            fill="color-mix(in oklch, var(--dtype-f16) 14%, transparent)"
+            stroke="var(--dtype-f16)"
+            strokeWidth={1.25}
+          />
+          <text
+            x={125}
+            y={94}
+            textAnchor="middle"
+            fontSize={8.5}
+            className="fill-muted-foreground font-mono"
+          >
             frozen W
           </text>
-          <rect x={200} y={56} width={16} height={70} rx={3} fill="color-mix(in oklch, var(--kfam-sampling) 22%, transparent)" stroke="var(--kfam-sampling)" strokeWidth={1} />
-          <rect x={224} y={84} width={70} height={16} rx={3} fill="color-mix(in oklch, var(--kfam-sampling) 22%, transparent)" stroke="var(--kfam-sampling)" strokeWidth={1} />
-          <path d="M 310 66 L 396 66 L 380 58 M 396 66 L 380 74" stroke="var(--kfam-fusion)" strokeWidth={2} fill="none" />
-          <text x={352} y={54} textAnchor="middle" fontSize={7} className="fill-foreground font-mono">
+          <rect
+            x={200}
+            y={56}
+            width={16}
+            height={70}
+            rx={3}
+            fill="color-mix(in oklch, var(--kfam-sampling) 22%, transparent)"
+            stroke="var(--kfam-sampling)"
+            strokeWidth={1}
+          />
+          <rect
+            x={224}
+            y={84}
+            width={70}
+            height={16}
+            rx={3}
+            fill="color-mix(in oklch, var(--kfam-sampling) 22%, transparent)"
+            stroke="var(--kfam-sampling)"
+            strokeWidth={1}
+          />
+          <path
+            d="M 310 66 L 396 66 L 380 58 M 396 66 L 380 74"
+            stroke="var(--kfam-fusion)"
+            strokeWidth={2}
+            fill="none"
+          />
+          <text
+            x={352}
+            y={54}
+            textAnchor="middle"
+            fontSize={7}
+            className="fill-foreground font-mono"
+          >
             rank 1: two fused dispatches
           </text>
-          <path d="M 310 112 h 40 m 8 0 h 38" stroke="var(--muted-foreground)" strokeWidth={1.25} strokeDasharray="5 3" />
-          <text x={352} y={128} textAnchor="middle" fontSize={7} className="fill-muted-foreground font-mono">
+          <path
+            d="M 310 112 h 40 m 8 0 h 38"
+            stroke="var(--muted-foreground)"
+            strokeWidth={1.25}
+            strokeDasharray="5 3"
+          />
+          <text
+            x={352}
+            y={128}
+            textAnchor="middle"
+            fontSize={7}
+            className="fill-muted-foreground font-mono"
+          >
             general: three hops
           </text>
-          <text x={220} y={172} textAnchor="middle" fontSize={7.5} className="fill-muted-foreground font-mono">
+          <text
+            x={220}
+            y={172}
+            textAnchor="middle"
+            fontSize={7.5}
+            className="fill-muted-foreground font-mono"
+          >
             grad_after_a · grad_a · grad_b come back as private device tensors
           </text>
         </g>
       ) : (
         <g>
-          {Array.from({ length: 20 }, (_, i) => ({ id: `t-${i}`, x: 48 + (i % 10) * 35, y: 60 + Math.floor(i / 10) * 34, inert: i >= 18 })).map((t) => (
-            <rect key={t.id} x={t.x} y={t.y} width={28} height={26} rx={3} fill={t.inert ? "none" : "color-mix(in oklch, var(--kfam-attention) 18%, transparent)"} stroke={t.inert ? "var(--muted-foreground)" : "var(--kfam-attention)"} strokeWidth={0.9} strokeDasharray={t.inert ? "3 2" : undefined} />
+          {Array.from({ length: 20 }, (_, i) => ({
+            id: `t-${i}`,
+            x: 48 + (i % 10) * 35,
+            y: 60 + Math.floor(i / 10) * 34,
+            inert: i >= 18,
+          })).map((t) => (
+            <rect
+              key={t.id}
+              x={t.x}
+              y={t.y}
+              width={28}
+              height={26}
+              rx={3}
+              fill={
+                t.inert ? "none" : "color-mix(in oklch, var(--kfam-attention) 18%, transparent)"
+              }
+              stroke={t.inert ? "var(--muted-foreground)" : "var(--kfam-attention)"}
+              strokeWidth={0.9}
+              strokeDasharray={t.inert ? "3 2" : undefined}
+            />
           ))}
-          <text x={220} y={140} textAnchor="middle" fontSize={7.5} className="fill-muted-foreground font-mono">
+          <text
+            x={220}
+            y={140}
+            textAnchor="middle"
+            fontSize={7.5}
+            className="fill-muted-foreground font-mono"
+          >
             (20 drawn for 184) — dashed = inert count_embed out_proj A/B pairs
           </text>
-          <text x={220} y={170} textAnchor="middle" fontSize={7.5} className="fill-muted-foreground font-mono">
+          <text
+            x={220}
+            y={170}
+            textAnchor="middle"
+            fontSize={7.5}
+            className="fill-muted-foreground font-mono"
+          >
             optimizer parity waives only those, and only with proof of zero state
           </text>
         </g>
@@ -248,7 +578,9 @@ function ExecutorGateFigure({ step }: { step: 0 | 1 }) {
   return (
     <Figure
       viewBox="0 0 440 210"
-      title={step === 0 ? "the training-graph executor rail switch" : "the five-step recipe lifecycle"}
+      title={
+        step === 0 ? "the training-graph executor rail switch" : "the five-step recipe lifecycle"
+      }
       caption={
         step === 0
           ? "Schematic: inside the compiled training session, an env flag throws the switch from interpreter dispatch to the training-graph executor, which gates at six host outputs per step. --compiled-required makes engine-preparation fallback fatal."
@@ -261,22 +593,79 @@ function ExecutorGateFigure({ step }: { step: 0 | 1 }) {
           <path d="M 150 100 L 260 60" stroke="var(--kfam-fusion)" strokeWidth={2} />
           <path d="M 150 100 L 260 140" stroke="var(--muted-foreground)" strokeWidth={2} />
           <circle cx={150} cy={100} r={5} fill="var(--kfam-sampling)" />
-          <text x={150} y={86} textAnchor="middle" fontSize={7} className="fill-muted-foreground font-mono">
+          <text
+            x={150}
+            y={86}
+            textAnchor="middle"
+            fontSize={7}
+            className="fill-muted-foreground font-mono"
+          >
             env flag
           </text>
-          <rect x={264} y={44} width={150} height={30} rx={5} fill="color-mix(in oklch, var(--kfam-fusion) 14%, transparent)" stroke="var(--kfam-fusion)" strokeWidth={1.25} />
-          <text x={339} y={63} textAnchor="middle" fontSize={7.5} className="fill-foreground font-mono">
+          <rect
+            x={264}
+            y={44}
+            width={150}
+            height={30}
+            rx={5}
+            fill="color-mix(in oklch, var(--kfam-fusion) 14%, transparent)"
+            stroke="var(--kfam-fusion)"
+            strokeWidth={1.25}
+          />
+          <text
+            x={339}
+            y={63}
+            textAnchor="middle"
+            fontSize={7.5}
+            className="fill-foreground font-mono"
+          >
             training graph executor
           </text>
-          <rect x={264} y={126} width={150} height={30} rx={5} fill="color-mix(in oklch, var(--kfam-attention) 12%, transparent)" stroke="var(--kfam-attention)" strokeWidth={1} />
-          <text x={339} y={145} textAnchor="middle" fontSize={7.5} className="fill-foreground font-mono">
+          <rect
+            x={264}
+            y={126}
+            width={150}
+            height={30}
+            rx={5}
+            fill="color-mix(in oklch, var(--kfam-attention) 12%, transparent)"
+            stroke="var(--kfam-attention)"
+            strokeWidth={1}
+          />
+          <text
+            x={339}
+            y={145}
+            textAnchor="middle"
+            fontSize={7.5}
+            className="fill-foreground font-mono"
+          >
             interpreter dispatch (default)
           </text>
-          <rect x={286} y={78} width={106} height={16} rx={8} fill="none" stroke="var(--kfam-kv)" strokeWidth={0.9} />
-          <text x={339} y={89} textAnchor="middle" fontSize={6.5} className="fill-muted-foreground font-mono">
+          <rect
+            x={286}
+            y={78}
+            width={106}
+            height={16}
+            rx={8}
+            fill="none"
+            stroke="var(--kfam-kv)"
+            strokeWidth={0.9}
+          />
+          <text
+            x={339}
+            y={89}
+            textAnchor="middle"
+            fontSize={6.5}
+            className="fill-muted-foreground font-mono"
+          >
             gate: ≤6 host outputs
           </text>
-          <text x={220} y={186} textAnchor="middle" fontSize={7.5} className="fill-muted-foreground font-mono">
+          <text
+            x={220}
+            y={186}
+            textAnchor="middle"
+            fontSize={7.5}
+            className="fill-muted-foreground font-mono"
+          >
             --compiled-required: a failed compiled path stops the run instead of falling back
           </text>
         </g>
@@ -284,17 +673,50 @@ function ExecutorGateFigure({ step }: { step: 0 | 1 }) {
         <g>
           {LIFECYCLE.map((s, i) => (
             <g key={s}>
-              <rect x={20 + i * 84} y={80} width={76} height={30} rx={5} fill="color-mix(in oklch, var(--kfam-matvec) 14%, transparent)" stroke="var(--kfam-matvec)" strokeWidth={1.1} />
-              <text x={58 + i * 84} y={99} textAnchor="middle" fontSize={7.5} className="fill-foreground font-mono">
+              <rect
+                x={20 + i * 84}
+                y={80}
+                width={76}
+                height={30}
+                rx={5}
+                fill="color-mix(in oklch, var(--kfam-matvec) 14%, transparent)"
+                stroke="var(--kfam-matvec)"
+                strokeWidth={1.1}
+              />
+              <text
+                x={58 + i * 84}
+                y={99}
+                textAnchor="middle"
+                fontSize={7.5}
+                className="fill-foreground font-mono"
+              >
                 {s}
               </text>
-              {i < LIFECYCLE.length - 1 && <path d={`M ${96 + i * 84} 95 h 8`} stroke="var(--muted-foreground)" strokeWidth={1.25} />}
+              {i < LIFECYCLE.length - 1 && (
+                <path
+                  d={`M ${96 + i * 84} 95 h 8`}
+                  stroke="var(--muted-foreground)"
+                  strokeWidth={1.25}
+                />
+              )}
             </g>
           ))}
-          <text x={220} y={136} textAnchor="middle" fontSize={7} className="fill-muted-foreground font-mono">
+          <text
+            x={220}
+            y={136}
+            textAnchor="middle"
+            fontSize={7}
+            className="fill-muted-foreground font-mono"
+          >
             train-gliner2-autodiff · validate-gliner2-autodiff-run · eval adapters
           </text>
-          <text x={220} y={150} textAnchor="middle" fontSize={7} className="fill-muted-foreground font-mono">
+          <text
+            x={220}
+            y={150}
+            textAnchor="middle"
+            fontSize={7}
+            className="fill-muted-foreground font-mono"
+          >
             materialize-gliner2-lora · inspect-gliner2-checkpoint
           </text>
         </g>
@@ -313,24 +735,79 @@ function OperatorGatesFigure() {
       <text x={110} y={34} textAnchor="middle" fontSize={8.5} className="fill-foreground font-mono">
         CI lane
       </text>
-      <rect x={40} y={44} width={140} height={26} rx={5} fill="color-mix(in oklch, var(--kfam-attention) 14%, transparent)" stroke="var(--kfam-attention)" strokeWidth={1.25} />
+      <rect
+        x={40}
+        y={44}
+        width={140}
+        height={26}
+        rx={5}
+        fill="color-mix(in oklch, var(--kfam-attention) 14%, transparent)"
+        stroke="var(--kfam-attention)"
+        strokeWidth={1.25}
+      />
       <text x={110} y={61} textAnchor="middle" fontSize={7.5} className="fill-foreground font-mono">
         unit + contract tests
       </text>
-      <text x={330} y={34} textAnchor="middle" fontSize={8.5} className="fill-muted-foreground font-mono">
+      <text
+        x={330}
+        y={34}
+        textAnchor="middle"
+        fontSize={8.5}
+        className="fill-muted-foreground font-mono"
+      >
         operator lane
       </text>
       {["Python-oracle parity", "Metal hardware gate", "CUDA matrix"].map((g, i) => (
         <g key={g}>
-          <rect x={250} y={44 + i * 34} width={160} height={26} rx={5} fill="none" stroke="var(--muted-foreground)" strokeWidth={1} strokeDasharray="5 3" />
-          <text x={330} y={61 + i * 34} textAnchor="middle" fontSize={7.5} className="fill-muted-foreground font-mono">
+          <rect
+            x={250}
+            y={44 + i * 34}
+            width={160}
+            height={26}
+            rx={5}
+            fill="none"
+            stroke="var(--muted-foreground)"
+            strokeWidth={1}
+            strokeDasharray="5 3"
+          />
+          <text
+            x={330}
+            y={61 + i * 34}
+            textAnchor="middle"
+            fontSize={7.5}
+            className="fill-muted-foreground font-mono"
+          >
             {g}
           </text>
         </g>
       ))}
-      <line x1={40} y1={158} x2={410} y2={158} stroke="var(--border)" strokeWidth={0.9} strokeDasharray="6 3" />
-      <rect x={165} y={166} width={110} height={20} rx={4} fill="none" stroke="var(--dtype-f16)" strokeWidth={0.9} opacity={0.7} />
-      <text x={220} y={180} textAnchor="middle" fontSize={7.5} className="fill-muted-foreground font-mono">
+      <line
+        x1={40}
+        y1={158}
+        x2={410}
+        y2={158}
+        stroke="var(--border)"
+        strokeWidth={0.9}
+        strokeDasharray="6 3"
+      />
+      <rect
+        x={165}
+        y={166}
+        width={110}
+        height={20}
+        rx={4}
+        fill="none"
+        stroke="var(--dtype-f16)"
+        strokeWidth={0.9}
+        opacity={0.7}
+      />
+      <text
+        x={220}
+        y={180}
+        textAnchor="middle"
+        fontSize={7.5}
+        className="fill-muted-foreground font-mono"
+      >
         BF16 — deferred
       </text>
     </Figure>
@@ -363,9 +840,9 @@ export function Gliner2TrainingClient({
           <h1 className="mt-1 text-3xl font-bold tracking-tight">GLiNER2 finetuning</h1>
           <p className="mt-2 max-w-3xl text-muted-foreground">
             GLiNER2 trains the very graph it runs: the losses are written as graph operations,
-            automatic differentiation derives every gradient (with hand-fused backward kernels
-            where it counts), and correctness is proven by matching a pinned PyTorch reference
-            step for step. The{" "}
+            automatic differentiation derives every gradient (with hand-fused backward kernels where
+            it counts), and correctness is proven by matching a pinned PyTorch reference step for
+            step. The{" "}
             <Link className="text-primary underline" href="/models/gliner2">
               GLiNER2 model page
             </Link>{" "}
@@ -384,10 +861,10 @@ export function Gliner2TrainingClient({
             <p>
               The training context plugs the DeBERTa forward graph into the generic{" "}
               <code>RealAutodiffTrainer</code> and appends the GLiNER2 heads. Two things can't be
-              expressed as graph ops and arrive as bound placeholders instead: the index
-              derivations (which sub-token starts a word, where the entity markers sit, span
-              clamping) and the attention bias — a parameter placeholder repopulated every step
-              with −1e9 at padded positions, frozen so it never takes a gradient.
+              expressed as graph ops and arrive as bound placeholders instead: the index derivations
+              (which sub-token starts a word, where the entity markers sit, span clamping) and the
+              attention bias — a parameter placeholder repopulated every step with −1e9 at padded
+              positions, frozen so it never takes a gradient.
             </p>
             <p>
               <CodeLink link={L("gliner2-ft-build-loss")} /> ·{" "}
@@ -410,9 +887,9 @@ export function Gliner2TrainingClient({
               classification as masked cross-entropy, where HF's ignore_index becomes an all-zero
               target row that contributes to neither numerator nor denominator;{" "}
               <code>span_start</code> — span-start states scored against entity labels; and the
-              default <code>gliner2-total-loss</code> — the upstream composite: three loss nodes summed
-              unweighted — structure (with the entity/span scoring folded in), classification,
-              and count.
+              default <code>gliner2-total-loss</code> — the upstream composite: three loss nodes
+              summed unweighted — structure (with the entity/span scoring folded in),
+              classification, and count.
             </p>
             <p>
               <CodeLink link={L("gliner2-ft-objectives")} />
@@ -430,11 +907,11 @@ export function Gliner2TrainingClient({
           <Scene id="semantics" graphic={<MaskedBceFigure />}>
             <p>
               <code>maskedBceWithLogitsLoss</code> treats the mask as a per-position loss{" "}
-              <em>weight</em>, not a multiplier on the logit: an m = 0 position is skipped
-              entirely — a validity gate, so an infinite logit at a masked slot can never poison
-              the scalar with Inf·0 — while m &gt; 0 scales the term (hard-negative weighting rides
-              here). The label weight blends configurable positive and negative class weights,
-              and mean reduction divides by the summed weighted mass only. For 0/1 masks the semantics are
+              <em>weight</em>, not a multiplier on the logit: an m = 0 position is skipped entirely
+              — a validity gate, so an infinite logit at a masked slot can never poison the scalar
+              with Inf·0 — while m &gt; 0 scales the term (hard-negative weighting rides here). The
+              label weight blends configurable positive and negative class weights, and mean
+              reduction divides by the summed weighted mass only. For 0/1 masks the semantics are
               identical to the older formulation.
             </p>
             <p>
@@ -456,8 +933,8 @@ export function Gliner2TrainingClient({
               decomposing into a dozen primitive gradients, it emits a single backward node whose
               output packs every gradient into one <code>[3·B·S + 2·rel, H]</code> matrix. Two{" "}
               <code>sliceRows</code> cuts then route the pieces — d_qkv back to the packed
-              projections, d_qr/d_kr back to the relative-position projections. The padding bias
-              is input 2 and simply has no VJP.
+              projections, d_qr/d_kr back to the relative-position projections. The padding bias is
+              input 2 and simply has no VJP.
             </p>
             <p>
               <CodeLink link={L("gliner2-ft-attn-vjp")} />
@@ -469,9 +946,11 @@ export function Gliner2TrainingClient({
               dQ/dK and dQr/dKr. All four are compiled from the precise-math library, so training
               gradients do not inherit the fast-math shortcuts that are fine for inference but can
               bias a derivative. A documented fallback covers the case where the safe-math compile
-              itself fails. These are the <code>training</code>-family entries listed
-              in the{" "}
-              <Link className="text-primary underline" href="/systems/kernels?family=training&q=bwd">
+              itself fails. These are the <code>training</code>-family entries listed in the{" "}
+              <Link
+                className="text-primary underline"
+                href="/systems/kernels?family=training&q=bwd"
+              >
                 kernel inventory
               </Link>
               .
@@ -493,12 +972,15 @@ export function Gliner2TrainingClient({
             <p>
               When the adapter has rank 1, the Metal backward pass takes a shortcut that is on by
               default: two fused GPU calls instead of the general three. An environment variable
-              turns it off if it ever needs to come off. Defaults: rank 16, alpha 32, dropout 0, targets spanning
-              the encoder plus span_rep, classifier, count_embed and count_pred.
+              turns it off if it ever needs to come off. Defaults: rank 16, alpha 32, dropout 0,
+              targets spanning the encoder plus span_rep, classifier, count_embed and count_pred.
             </p>
             <p>
               <CodeLink link={L("gliner2-ft-rank1-gate")} />{" "}
-              <EnvFlagChip name="TERMITE_METAL_DISABLE_LORA_BACKWARD_RANK1_FUSED" defaultOn={false} />
+              <EnvFlagChip
+                name="TERMITE_METAL_DISABLE_LORA_BACKWARD_RANK1_FUSED"
+                defaultOn={false}
+              />
             </p>
           </Scene>
           <Scene id="tensors" graphic={<Rank1FusedFigure step={1} />}>
@@ -506,10 +988,9 @@ export function Gliner2TrainingClient({
               One asterisk on the tensor count. The pinned adapter configuration registers 184
               tensors, but four of them do nothing in PyTorch: the count_embed attention out-
               projection A/B pairs, which PyTorch bypasses by reading the projection weight
-              directly. Zig trains the 180
-              effective tensors, and optimizer parity waives exactly those four, only when the
-              Python dump proves they carry zero steps, gradients, Adam state, and an
-              identically-zero lora_B.
+              directly. Zig trains the 180 effective tensors, and optimizer parity waives exactly
+              those four, only when the Python dump proves they carry zero steps, gradients, Adam
+              state, and an identically-zero lora_B.
             </p>
             <p>
               <CodeLink link={L("gliner2-ft-tensors-doc")} />
@@ -528,10 +1009,11 @@ export function Gliner2TrainingClient({
             <p>
               On a GPU backend, training walks the compiled graph operation by operation. An
               environment flag switches it instead to a single whole-graph executor, which also
-              unlocks two faster matrix routines. The same flag pair covers CUDA. The strict Metal path budgets at most six host metadata outputs per step (a
-              qualification-contract figure enforced by the operator-run perf gate, not a runtime
-              default), and <code>--compiled-required</code> makes an engine-preparation fallback fatal
-              and blocks a resumed run from silently crossing compiled↔interpreter. Full-task evaluation stays
+              unlocks two faster matrix routines. The same flag pair covers CUDA. The strict Metal
+              path budgets at most six host metadata outputs per step (a qualification-contract
+              figure enforced by the operator-run perf gate, not a runtime default), and{" "}
+              <code>--compiled-required</code> makes an engine-preparation fallback fatal and blocks
+              a resumed run from silently crossing compiled↔interpreter. Full-task evaluation stays
               native-only regardless. GLiNER2 is the one training stack here with all three
               backends: native, Metal, <em>and</em> CUDA.
             </p>
@@ -547,11 +1029,11 @@ export function Gliner2TrainingClient({
           <Scene id="cli" graphic={<ExecutorGateFigure step={1} />}>
             <p>
               Two front doors: the flag CLI (<code>train run gliner2-autodiff</code>, roughly 55
-              flags — epochs 10, batch 2, sequence 256, LR 5e-4 with linear schedule and 10%
-              warmup, seed 42), and the recipe front-door, whose GLiNER2 <code>lora-sft</code>{" "}
-              recipe expands into up to five steps: train, validate the run, evaluate the adapter
-              (when an eval dataset is configured), then materialize the merged model and inspect
-              the checkpoint (when a materialized directory is set).
+              flags — epochs 10, batch 2, sequence 256, LR 5e-4 with linear schedule and 10% warmup,
+              seed 42), and the recipe front-door, whose GLiNER2 <code>lora-sft</code> recipe
+              expands into up to five steps: train, validate the run, evaluate the adapter (when an
+              eval dataset is configured), then materialize the merged model and inspect the
+              checkpoint (when a materialized directory is set).
             </p>
             <p>
               <CodeLink link={L("gliner2-ft-cli-main")} /> ·{" "}
@@ -572,12 +1054,12 @@ export function Gliner2TrainingClient({
             <p>
               The heavyweight quality gates — real-model Python-oracle parity, the Metal and CUDA
               hardware matrices — are operator-run rather than CI-provisioned; ordinary unit and
-              contract tests validate the code surfaces, not model quality. The Metal
-              training-graph executor reproduces native step-for-step but with narrower automated
-              coverage. The Unicode normalizer implements a conservative subset and errors rather
-              than drifting. And BF16 is explicitly deferred: the production contract is FP32 for
-              graph tensors, trainables and optimizer state. GLiNER2.5 answers all of this with a
-              different philosophy —{" "}
+              contract tests validate the code surfaces, not model quality. The Metal training-graph
+              executor reproduces native step-for-step but with narrower automated coverage. The
+              Unicode normalizer implements a conservative subset and errors rather than drifting.
+              And BF16 is explicitly deferred: the production contract is FP32 for graph tensors,
+              trainables and optimizer state. GLiNER2.5 answers all of this with a different
+              philosophy —{" "}
               <Link className="text-primary underline" href="/training/gliner25">
                 the contract-first page
               </Link>{" "}

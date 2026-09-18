@@ -17,7 +17,7 @@ function idsUsedIn(dir: string): string[] {
   return [...out].sort();
 }
 
-test("MODEL_LINK_IDS matches the L(\"…\") ids each content directory references", () => {
+test('MODEL_LINK_IDS matches the L("…") ids each content directory references', () => {
   for (const [dir, ids] of Object.entries(MODEL_LINK_IDS)) {
     assert.deepEqual(
       [...ids].sort(),

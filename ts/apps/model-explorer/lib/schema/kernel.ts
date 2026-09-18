@@ -70,4 +70,3 @@ export const KernelsFile = z.object({
   inventory: z.array(KernelInventoryEntry),
 });
 export type KernelsFile = z.infer<typeof KernelsFile>;
-

@@ -142,7 +142,9 @@ test("extracted enum links point at their actual declaration lines", () => {
     .toString()
     .trim();
   if (dirty) {
-    console.warn("  skipping verifySourceRevision assertion: scanned zig sources are locally modified");
+    console.warn(
+      "  skipping verifySourceRevision assertion: scanned zig sources are locally modified"
+    );
   } else {
     verifySourceRevision(gitCommit());
   }

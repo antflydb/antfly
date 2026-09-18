@@ -31,7 +31,13 @@ export const fixtureSpec: ModelSpec = {
       title: "Decoder layer",
       spine: "graph",
       attention: "gqa_paged",
-      repeat: { count: 4, variants: [{ tag: "swa", layerIdxs: [0, 1, 2] }, { tag: "global", layerIdxs: [3] }] },
+      repeat: {
+        count: 4,
+        variants: [
+          { tag: "swa", layerIdxs: [0, 1, 2] },
+          { tag: "global", layerIdxs: [3] },
+        ],
+      },
     },
     { kind: "head", id: "head", title: "LM head", headType: "lm", spine: "sample" },
   ],
@@ -45,7 +51,10 @@ export const fixtureSpec: ModelSpec = {
           stageId: "embed",
           inputs: [],
           outputs: [],
-          shapes: { in: [{ dims: ["T"], dtype: "i32" }], out: [{ dims: ["T", 512], dtype: "f16" }] },
+          shapes: {
+            in: [{ dims: ["T"], dtype: "i32" }],
+            out: [{ dims: ["T", 512], dtype: "f16" }],
+          },
           attrs: {},
           kernelRouteIds: [],
           kernels: [],
@@ -60,7 +69,10 @@ export const fixtureSpec: ModelSpec = {
           stageId: "layers",
           inputs: [],
           outputs: [],
-          shapes: { in: [{ dims: ["T", 512], dtype: "f16" }], out: [{ dims: ["T", 512], dtype: "f16" }] },
+          shapes: {
+            in: [{ dims: ["T", 512], dtype: "f16" }],
+            out: [{ dims: ["T", 512], dtype: "f16" }],
+          },
           attrs: {},
           kernelRouteIds: [],
           kernels: [],
@@ -75,7 +87,10 @@ export const fixtureSpec: ModelSpec = {
           stageId: "layers",
           inputs: [],
           outputs: [],
-          shapes: { in: [{ dims: ["T", 512], dtype: "f16" }], out: [{ dims: ["T", 2048], dtype: "f16" }] },
+          shapes: {
+            in: [{ dims: ["T", 512], dtype: "f16" }],
+            out: [{ dims: ["T", 2048], dtype: "f16" }],
+          },
           attrs: {},
           kernelRouteIds: ["q4_0/rows_2_8/none"],
           kernels: [],
@@ -90,7 +105,10 @@ export const fixtureSpec: ModelSpec = {
           stageId: "head",
           inputs: [],
           outputs: [],
-          shapes: { in: [{ dims: [1, 512], dtype: "f16" }], out: [{ dims: [1, 32000], dtype: "f32" }] },
+          shapes: {
+            in: [{ dims: [1, 512], dtype: "f16" }],
+            out: [{ dims: [1, 32000], dtype: "f32" }],
+          },
           attrs: {},
           kernelRouteIds: [],
           kernels: [],
@@ -129,7 +147,8 @@ export const fixtureKvTrace: KvTrace = {
       events.push({ kind: "alloc" as const, lane: "global", blockId: block });
       events.push({ kind: "alloc" as const, lane: "swa", blockId: block });
       const evictBefore = Math.floor((t - 128) / 16) - 1;
-      if (evictBefore >= 0) events.push({ kind: "evict" as const, lane: "swa", blockId: evictBefore });
+      if (evictBefore >= 0)
+        events.push({ kind: "evict" as const, lane: "swa", blockId: evictBefore });
     }
     return { t, events };
   }),
@@ -149,23 +168,50 @@ export const fixtureFrame: FrameScenario = {
       label: "attention setup",
       ops: [
         { label: "rms_norm", family: "norm_rope", estBytes: 4096 },
-        { label: "qkv project", kernel: "termite_q4_0_linear_1x_reduce", family: "matvec", estBytes: 5_000_000 },
-        { label: "head_rms⋄rope", kernel: "termite_apply_head_rms_rope", family: "fusion", estBytes: 65536 },
+        {
+          label: "qkv project",
+          kernel: "termite_q4_0_linear_1x_reduce",
+          family: "matvec",
+          estBytes: 5_000_000,
+        },
+        {
+          label: "head_rms⋄rope",
+          kernel: "termite_apply_head_rms_rope",
+          family: "fusion",
+          estBytes: 65536,
+        },
       ],
     },
     {
       id: "s2",
       kind: "compute",
       label: "attention",
-      ops: [{ label: "paged attention", kernel: "termite_paged_attention_kv_decode_gqa_split_stage", family: "attention", estBytes: 9_000_000 }],
+      ops: [
+        {
+          label: "paged attention",
+          kernel: "termite_paged_attention_kv_decode_gqa_split_stage",
+          family: "attention",
+          estBytes: 9_000_000,
+        },
+      ],
     },
     {
       id: "s3",
       kind: "compute",
       label: "FFN",
       ops: [
-        { label: "gate+up (pair)", kernel: "termite_q4_0_pair_activation_multiply_rms_scale_1r_ext", family: "fusion", estBytes: 30_000_000 },
-        { label: "down", kernel: "termite_q4_0_linear_1x_reduce", family: "matvec", estBytes: 15_000_000 },
+        {
+          label: "gate+up (pair)",
+          kernel: "termite_q4_0_pair_activation_multiply_rms_scale_1r_ext",
+          family: "fusion",
+          estBytes: 30_000_000,
+        },
+        {
+          label: "down",
+          kernel: "termite_q4_0_linear_1x_reduce",
+          family: "matvec",
+          estBytes: 15_000_000,
+        },
       ],
     },
     {
@@ -173,8 +219,18 @@ export const fixtureFrame: FrameScenario = {
       kind: "compute",
       label: "sample",
       ops: [
-        { label: "lm head top8", kernel: "termite_lm_head_top8_reduce", family: "sampling", estBytes: 20_000_000 },
-        { label: "gumbel-max", kernel: "termite_sample_gumbel_partials", family: "sampling", estBytes: 128_000 },
+        {
+          label: "lm head top8",
+          kernel: "termite_lm_head_top8_reduce",
+          family: "sampling",
+          estBytes: 20_000_000,
+        },
+        {
+          label: "gumbel-max",
+          kernel: "termite_sample_gumbel_partials",
+          family: "sampling",
+          estBytes: 128_000,
+        },
       ],
     },
   ],

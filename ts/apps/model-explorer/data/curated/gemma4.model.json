@@ -34,61 +34,22 @@
             "variants": [
               {
                 "tag": "SWA \u00b7 owns KV",
-                "layerIdxs": [
-                  0,
-                  1,
-                  2,
-                  3,
-                  5,
-                  6,
-                  7,
-                  8,
-                  10,
-                  11,
-                  12,
-                  13
-                ],
+                "layerIdxs": [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13],
                 "note": "head_dim 256; computes K/V"
               },
               {
                 "tag": "global \u00b7 owns KV",
-                "layerIdxs": [
-                  4,
-                  9,
-                  14
-                ],
+                "layerIdxs": [4, 9, 14],
                 "note": "head_dim 512; computes K/V"
               },
               {
                 "tag": "SWA \u00b7 shared KV",
-                "layerIdxs": [
-                  15,
-                  16,
-                  17,
-                  18,
-                  20,
-                  21,
-                  22,
-                  23,
-                  25,
-                  26,
-                  27,
-                  28,
-                  30,
-                  31,
-                  32,
-                  33
-                ],
+                "layerIdxs": [15, 16, 17, 18, 20, 21, 22, 23, 25, 26, 27, 28, 30, 31, 32, 33],
                 "note": "reads sliding donor 13"
               },
               {
                 "tag": "global \u00b7 shared KV",
-                "layerIdxs": [
-                  19,
-                  24,
-                  29,
-                  34
-                ],
+                "layerIdxs": [19, 24, 29, 34],
                 "note": "reads global donor 14"
               }
             ]
@@ -120,67 +81,23 @@
               {
                 "tag": "SWA \u00b7 owns KV",
                 "layerIdxs": [
-                  0,
-                  1,
-                  2,
-                  3,
-                  4,
-                  6,
-                  7,
-                  8,
-                  9,
-                  10,
-                  12,
-                  13,
-                  14,
-                  15,
-                  16,
-                  18,
-                  19,
-                  20,
-                  21,
-                  22
+                  0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22
                 ],
                 "note": "head_dim 256; computes K/V"
               },
               {
                 "tag": "global \u00b7 owns KV",
-                "layerIdxs": [
-                  5,
-                  11,
-                  17,
-                  23
-                ],
+                "layerIdxs": [5, 11, 17, 23],
                 "note": "head_dim 512; computes K/V"
               },
               {
                 "tag": "SWA \u00b7 shared KV",
-                "layerIdxs": [
-                  24,
-                  25,
-                  26,
-                  27,
-                  28,
-                  30,
-                  31,
-                  32,
-                  33,
-                  34,
-                  36,
-                  37,
-                  38,
-                  39,
-                  40
-                ],
+                "layerIdxs": [24, 25, 26, 27, 28, 30, 31, 32, 33, 34, 36, 37, 38, 39, 40],
                 "note": "reads sliding donor 22"
               },
               {
                 "tag": "global \u00b7 shared KV",
-                "layerIdxs": [
-                  29,
-                  35,
-                  41
-                ],
+                "layerIdxs": [29, 35, 41],
                 "note": "reads global donor 23"
               }
             ]
@@ -263,25 +180,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1
-                ],
+                "dims": [1],
                 "dtype": "i32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ]
           },
-          "kernels": [
-            "termite_embedding_lookup"
-          ],
+          "kernels": ["termite_embedding_lookup"],
           "backend": "metal",
           "attrs": {
             "note": "One text token; hidden activations can be f32 or f16 according to lowering. Diagram omits casts and some residual/normalization details."
@@ -295,25 +205,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1
-                ],
+                "dims": [1],
                 "dtype": "i32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "L\u00b7P"
-                ],
+                "dims": [1, "L\u00b7P"],
                 "dtype": "float (route-dependent)"
               }
             ]
           },
-          "kernels": [
-            "termite_embedding_lookup"
-          ],
+          "kernels": ["termite_embedding_lookup"],
           "source": {
             "path": "zig/pkg/inference/src/architectures/gpt.zig",
             "anchor": "pub fn computePleVectors("
@@ -328,19 +231,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "L\u00b7P"
-                ],
+                "dims": [1, "L\u00b7P"],
                 "dtype": "float (route-dependent)"
               }
             ]
@@ -359,26 +256,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "L\u00b7P"
-                ],
+                "dims": [1, "L\u00b7P"],
                 "dtype": "float"
               },
               {
-                "dims": [
-                  1,
-                  "L\u00b7P"
-                ],
+                "dims": [1, "L\u00b7P"],
                 "dtype": "float"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "L\u00b7P"
-                ],
+                "dims": [1, "L\u00b7P"],
                 "dtype": "float"
               }
             ]
@@ -396,19 +284,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ]
@@ -423,26 +305,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "Hq+2\u00b7Hkv"
-                ],
+                "dims": [1, "Hq+2\u00b7Hkv"],
                 "dtype": "float (route-dependent)"
               }
             ]
           },
-          "kernels": [
-            "termite_q4_0_linear_1x_reduce"
-          ],
+          "kernels": ["termite_q4_0_linear_1x_reduce"],
           "backend": "metal",
           "attrs": {
             "weightFormat": "q4_0",
@@ -454,43 +328,27 @@
           "opKind": "rope",
           "label": "Q and K: head norm + RoPE",
           "stageId": "layers",
-          "fusedOps": [
-            "q_head_rms",
-            "k_head_rms",
-            "rope"
-          ],
+          "fusedOps": ["q_head_rms", "k_head_rms", "rope"],
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  8,
-                  "D"
-                ],
+                "dims": [1, 8, "D"],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  8,
-                  "D"
-                ],
+                "dims": [1, 8, "D"],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_apply_head_rms_rope"
-          ],
+          "kernels": ["termite_apply_head_rms_rope"],
           "source": {
             "path": "zig/pkg/inference/src/architectures/gpt.zig",
             "anchor": "pub fn maybeApplyQKHeadNormRope("
           },
-          "envFlagNames": [
-            "TERMITE_METAL_DISABLE_A4B_HEAD_NORM_ROPE_FUSION"
-          ],
+          "envFlagNames": ["TERMITE_METAL_DISABLE_A4B_HEAD_NORM_ROPE_FUSION"],
           "backend": "metal",
           "attrs": {
             "note": "Q and K are separate fused calls when eligible. Q has 8 heads; K has the model-specific KV head count. V is not a RoPE input."
@@ -504,29 +362,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  8,
-                  "D"
-                ],
+                "dims": [1, 8, "D"],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "pages",
-                  16,
-                  "Dkv"
-                ],
+                "dims": ["pages", 16, "Dkv"],
                 "dtype": "f16"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  8,
-                  "D"
-                ],
+                "dims": [1, 8, "D"],
                 "dtype": "f32"
               }
             ]
@@ -554,26 +400,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "Hq"
-                ],
+                "dims": [1, "Hq"],
                 "dtype": "float (route-dependent)"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ]
           },
-          "kernels": [
-            "termite_q4_0_linear_1x_reduce"
-          ],
+          "kernels": ["termite_q4_0_linear_1x_reduce"],
           "backend": "metal",
           "attrs": {
             "weightFormat": "q4_0"
@@ -584,33 +422,22 @@
           "opKind": "rms_norm",
           "label": "post-attn norm + add",
           "stageId": "layers",
-          "fusedOps": [
-            "rms_norm",
-            "add"
-          ],
+          "fusedOps": ["rms_norm", "add"],
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ]
           },
-          "envFlagNames": [
-            "TERMITE_METAL_DISABLE_A4B_RMS_NORM_ADD_FUSION"
-          ],
+          "envFlagNames": ["TERMITE_METAL_DISABLE_A4B_RMS_NORM_ADD_FUSION"],
           "backend": "metal"
         },
         {
@@ -621,19 +448,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ]
@@ -645,34 +466,22 @@
           "opKind": "linear_no_bias_pair",
           "label": "gate + up (pair-fused)",
           "stageId": "layers",
-          "fusedOps": [
-            "gate",
-            "up",
-            "gelu"
-          ],
+          "fusedOps": ["gate", "up", "gelu"],
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "F"
-                ],
+                "dims": [1, "F"],
                 "dtype": "float (route-dependent)"
               }
             ]
           },
-          "kernels": [
-            "termite_q4_0_pair_activation_1x_reduce"
-          ],
+          "kernels": ["termite_q4_0_pair_activation_1x_reduce"],
           "attrs": {
             "weightFormat": "q4_0",
             "note": "Eligible pair-activation route computes GELU(gate)\u00b7up in one dispatch. Gate and up retain separate weights; fusion shares input work, not weight values."
@@ -687,26 +496,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "F"
-                ],
+                "dims": [1, "F"],
                 "dtype": "float (route-dependent)"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ]
           },
-          "kernels": [
-            "termite_q4_0_linear_1x_reduce"
-          ],
+          "kernels": ["termite_q4_0_linear_1x_reduce"],
           "backend": "metal",
           "attrs": {
             "weightFormat": "q4_0"
@@ -717,26 +518,17 @@
           "opKind": "rms_norm",
           "label": "post-FFN norm + residual",
           "stageId": "layers",
-          "fusedOps": [
-            "rms_norm",
-            "add"
-          ],
+          "fusedOps": ["rms_norm", "add"],
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ]
@@ -751,26 +543,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float"
               },
               {
-                "dims": [
-                  1,
-                  "P"
-                ],
+                "dims": [1, "P"],
                 "dtype": "float"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float"
               }
             ]
@@ -792,27 +575,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "Dkv"
-                ],
+                "dims": [1, "Dkv"],
                 "dtype": "f16"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "pages",
-                  16,
-                  "Dkv"
-                ],
+                "dims": ["pages", 16, "Dkv"],
                 "dtype": "f16"
               }
             ]
           },
-          "kernels": [
-            "termite_paged_f16_kv_seed"
-          ],
+          "kernels": ["termite_paged_f16_kv_seed"],
           "attrs": {
             "note": "Conceptual storage side effect of attention, not scatter-add arithmetic. Appends projected V and normalized/rotated K for owners; tail layers read donor storage."
           },
@@ -830,19 +604,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "float (route-dependent)"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "f32"
               }
             ]
@@ -857,26 +625,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  "H"
-                ],
+                "dims": [1, "H"],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  262144
-                ],
+                "dims": [1, 262144],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_q6_k_linear_1x_reduce"
-          ],
+          "kernels": ["termite_q6_k_linear_1x_reduce"],
           "attrs": {
             "weightFormat": "q6_k",
             "note": "Full-logit path uses original head. Opt-in Q4_K copy nominates greedy candidates, then retained Q6_K weights rescore the top 8; sampling callers retain Q6_K."
@@ -892,26 +652,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  262144
-                ],
+                "dims": [1, 262144],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1
-                ],
+                "dims": [1],
                 "dtype": "i32"
               }
             ]
           },
-          "kernels": [
-            "termite_sample_gumbel_partials",
-            "termite_argmax_logits_reduce"
-          ],
+          "kernels": ["termite_sample_gumbel_partials", "termite_argmax_logits_reduce"],
           "source": {
             "path": "zig/pkg/inference/src/backends/metal_kernels.m",
             "anchor": "kernel void termite_sample_gumbel_partials("

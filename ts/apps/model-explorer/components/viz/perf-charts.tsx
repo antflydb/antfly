@@ -1,6 +1,12 @@
 "use client";
 
-import { cn, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@antfly/design-system";
+import {
+  cn,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@antfly/design-system";
 import type { BytesBreakdownEntry, GapSegment, JourneyEntry, PerfSample } from "@/lib/schema";
 
 /* All perf charts are plain SVG/CSS — the data sets are tiny and the layouts
@@ -25,8 +31,16 @@ export function ComparisonBars({
           return (
             <Tooltip key={`${s.system}-${s.context ?? ""}`}>
               <TooltipTrigger asChild>
-                <button type="button" className="grid w-full text-left grid-cols-[minmax(0,1fr)_minmax(0,2fr)] items-center gap-x-3 gap-y-1 sm:grid-cols-[10rem_minmax(0,1fr)_6rem]">
-                  <span className={cn("min-w-0 break-words text-right text-xs", isAntfly ? "font-semibold" : "text-muted-foreground")}>
+                <button
+                  type="button"
+                  className="grid w-full text-left grid-cols-[minmax(0,1fr)_minmax(0,2fr)] items-center gap-x-3 gap-y-1 sm:grid-cols-[10rem_minmax(0,1fr)_6rem]"
+                >
+                  <span
+                    className={cn(
+                      "min-w-0 break-words text-right text-xs",
+                      isAntfly ? "font-semibold" : "text-muted-foreground"
+                    )}
+                  >
                     {s.system}
                     {s.caveat && <span className="text-primary">*</span>}
                   </span>
@@ -49,7 +63,9 @@ export function ComparisonBars({
                       />
                     )}
                   </div>
-                  <span className="col-span-2 font-mono text-[10px] text-muted-foreground sm:col-span-1">{s.machine}</span>
+                  <span className="col-span-2 font-mono text-[10px] text-muted-foreground sm:col-span-1">
+                    {s.machine}
+                  </span>
                 </button>
               </TooltipTrigger>
               <TooltipContent className="max-w-72 text-xs">
@@ -63,14 +79,22 @@ export function ComparisonBars({
           );
         })}
         {ceiling && (
-          <p className="pt-2 font-mono text-[10px] text-destructive">Dashed line: {ceiling.label}</p>
+          <p className="pt-2 font-mono text-[10px] text-destructive">
+            Dashed line: {ceiling.label}
+          </p>
         )}
       </div>
     </TooltipProvider>
   );
 }
 
-export function JourneyChart({ entries, className }: { entries: JourneyEntry[]; className?: string }) {
+export function JourneyChart({
+  entries,
+  className,
+}: {
+  entries: JourneyEntry[];
+  className?: string;
+}) {
   const landed = entries.filter((e) => !e.refuted);
   const values = landed.map((e) => e.value);
   // Guard degenerate data: empty → ±Infinity, single/equal values → max===min.
@@ -86,11 +110,30 @@ export function JourneyChart({ entries, className }: { entries: JourneyEntry[]; 
   const path = landed.map((e, i) => `${i === 0 ? "M" : "L"} ${x(i)} ${y(e.value)}`).join(" ");
   return (
     <TooltipProvider>
-      <svg viewBox={`0 0 ${W} ${H}`} className={cn("w-full", className)} role="img" aria-label="Perf journey">
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        className={cn("w-full", className)}
+        role="img"
+        aria-label="Perf journey"
+      >
         {[min, (min + max) / 2, max].map((v) => (
           <g key={v}>
-            <line x1={PAD.l} y1={y(v)} x2={W - PAD.r} y2={y(v)} stroke="var(--border)" strokeWidth={0.5} />
-            <text x={PAD.l - 6} y={y(v)} textAnchor="end" dominantBaseline="central" fontSize={9} className="fill-muted-foreground font-mono">
+            <line
+              x1={PAD.l}
+              y1={y(v)}
+              x2={W - PAD.r}
+              y2={y(v)}
+              stroke="var(--border)"
+              strokeWidth={0.5}
+            />
+            <text
+              x={PAD.l - 6}
+              y={y(v)}
+              textAnchor="end"
+              dominantBaseline="central"
+              fontSize={9}
+              className="fill-muted-foreground font-mono"
+            >
               {v.toFixed(0)}
             </text>
           </g>
@@ -100,7 +143,12 @@ export function JourneyChart({ entries, className }: { entries: JourneyEntry[]; 
           <Tooltip key={e.label}>
             <TooltipTrigger asChild>
               {/* biome-ignore lint/a11y/noInteractiveElementToNoninteractiveRole: Focus exposes an informational tooltip; this point has no button action. */}
-              <g className="cursor-default" tabIndex={0} role="img" aria-label={`${e.label}: ${e.value} tok/s`}>
+              <g
+                className="cursor-default"
+                tabIndex={0}
+                role="img"
+                aria-label={`${e.label}: ${e.value} tok/s`}
+              >
                 <circle cx={x(i)} cy={y(e.value)} r={5} fill="var(--primary)" />
                 <text
                   x={x(i)}
@@ -185,16 +233,34 @@ function WaterfallRow({
 }) {
   const barBody = (
     <>
-      <span className={cn("w-52 shrink-0 truncate text-right text-xs", ghost ? "text-destructive/80" : landed ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground")}>
+      <span
+        className={cn(
+          "w-52 shrink-0 truncate text-right text-xs",
+          ghost
+            ? "text-destructive/80"
+            : landed
+              ? "text-emerald-600 dark:text-emerald-400"
+              : "text-muted-foreground"
+        )}
+      >
         {label}
       </span>
       <div className="relative h-5 flex-1 rounded-sm bg-muted/30">
         <div
-          className={cn("absolute h-full rounded-sm", ghost && "border border-dashed border-destructive/60 bg-transparent")}
+          className={cn(
+            "absolute h-full rounded-sm",
+            ghost && "border border-dashed border-destructive/60 bg-transparent"
+          )}
           style={{
             left: `${(from / max) * 100}%`,
             width: `${(Math.max(0, to - from) / max) * 100}%`,
-            background: ghost ? undefined : solid ? "var(--primary)" : landed ? "var(--dtype-q8)" : "var(--muted-foreground)",
+            background: ghost
+              ? undefined
+              : solid
+                ? "var(--primary)"
+                : landed
+                  ? "var(--dtype-q8)"
+                  : "var(--muted-foreground)",
             opacity: ghost ? 1 : solid ? 0.9 : 0.55,
           }}
         />
@@ -223,9 +289,22 @@ function WaterfallRow({
   );
 }
 
-export function BytesBar({ entries, className }: { entries: BytesBreakdownEntry[]; className?: string }) {
+export function BytesBar({
+  entries,
+  className,
+}: {
+  entries: BytesBreakdownEntry[];
+  className?: string;
+}) {
   const total = entries.reduce((n, e) => n + e.mbPerToken, 0);
-  const colors = ["var(--kfam-matvec)", "var(--kfam-sampling)", "var(--kfam-attention)", "var(--kfam-fusion)", "var(--kfam-kv)", "var(--muted-foreground)"];
+  const colors = [
+    "var(--kfam-matvec)",
+    "var(--kfam-sampling)",
+    "var(--kfam-attention)",
+    "var(--kfam-fusion)",
+    "var(--kfam-kv)",
+    "var(--muted-foreground)",
+  ];
   return (
     <TooltipProvider>
       <div className={className}>
@@ -239,7 +318,11 @@ export function BytesBar({ entries, className }: { entries: BytesBreakdownEntry[
                   // biome-ignore lint/a11y/noNoninteractiveTabindex: Focus exposes an informational tooltip; this segment has no button action.
                   tabIndex={0}
                   aria-label={`${e.label}: ${e.mbPerToken.toFixed(0)} MB/token`}
-                  style={{ width: `${(e.mbPerToken / total) * 100}%`, background: colors[i % colors.length], opacity: 0.8 }}
+                  style={{
+                    width: `${(e.mbPerToken / total) * 100}%`,
+                    background: colors[i % colors.length],
+                    opacity: 0.8,
+                  }}
                 />
               </TooltipTrigger>
               <TooltipContent className="text-xs">
@@ -253,13 +336,21 @@ export function BytesBar({ entries, className }: { entries: BytesBreakdownEntry[
         </div>
         <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
           {entries.map((e, i) => (
-            <span key={e.label} className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-              <span className="size-2 rounded-full" style={{ background: colors[i % colors.length] }} />
+            <span
+              key={e.label}
+              className="flex items-center gap-1.5 text-[11px] text-muted-foreground"
+            >
+              <span
+                className="size-2 rounded-full"
+                style={{ background: colors[i % colors.length] }}
+              />
               {e.label} {(e.share * 100).toFixed(1)}%
             </span>
           ))}
         </div>
-        <div className="mt-1 font-mono text-[10px] text-muted-foreground">total ≈ {(total / 1024).toFixed(2)} GB/token</div>
+        <div className="mt-1 font-mono text-[10px] text-muted-foreground">
+          total ≈ {(total / 1024).toFixed(2)} GB/token
+        </div>
       </div>
     </TooltipProvider>
   );

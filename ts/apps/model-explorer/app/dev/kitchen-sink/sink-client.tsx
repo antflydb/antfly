@@ -2,7 +2,13 @@
 
 import { CodeLink } from "@/components/code/code-link";
 import { type ClientSnippet, SnippetProvider } from "@/components/code/snippet-context";
-import { EnvFlagChip, FusionChip, OpKindBadge, QuantChip, TensorShapeBadge } from "@/components/primitives/chips";
+import {
+  EnvFlagChip,
+  FusionChip,
+  OpKindBadge,
+  QuantChip,
+  TensorShapeBadge,
+} from "@/components/primitives/chips";
 import { Divergence, Scene, ScrollyChapter } from "@/components/scrollytelling/scrolly";
 import { SpineStrip } from "@/components/spine-strip";
 import {
@@ -95,7 +101,12 @@ export function KitchenSinkClient({
           </div>
         </section>
 
-        <ScrollyChapter id="sink-ch" number={7} title="Scrollytelling fixture" intro="Two scenes with a pinned graphic.">
+        <ScrollyChapter
+          id="sink-ch"
+          number={7}
+          title="Scrollytelling fixture"
+          intro="Two scenes with a pinned graphic."
+        >
           <Scene
             id="s1"
             graphic={
@@ -105,8 +116,8 @@ export function KitchenSinkClient({
             }
           >
             <p>
-              First scene prose. As this block crosses the viewport band, the pinned graphic shows the attention
-              hexagon. <code>gqa_paged_attention</code> is one of the fused op kinds.
+              First scene prose. As this block crosses the viewport band, the pinned graphic shows
+              the attention hexagon. <code>gqa_paged_attention</code> is one of the fused op kinds.
             </p>
             <Divergence
               others={<p>walks a ggml graph, re-encodes per token.</p>}
@@ -117,16 +128,28 @@ export function KitchenSinkClient({
             id="s2"
             graphic={
               <Figure viewBox="0 0 400 200" title="scene two">
-                <MatmulGlyph x={120} y={80} label="FFN" fused={["gate", "up", "silu"]} dtype="q4_0" highlight />
+                <MatmulGlyph
+                  x={120}
+                  y={80}
+                  label="FFN"
+                  fused={["gate", "up", "silu"]}
+                  dtype="q4_0"
+                  highlight
+                />
               </Figure>
             }
           >
-            <p>Second scene prose — the graphic crossfades to the fused FFN node with the zipper border.</p>
+            <p>
+              Second scene prose — the graphic crossfades to the fused FFN node with the zipper
+              border.
+            </p>
           </Scene>
         </ScrollyChapter>
 
         <section className="px-4">
-          <h2 className="mx-auto mb-3 max-w-7xl text-lg font-semibold">DAG explorer (fixture spec)</h2>
+          <h2 className="mx-auto mb-3 max-w-7xl text-lg font-semibold">
+            DAG explorer (fixture spec)
+          </h2>
           <div className="overflow-hidden rounded-lg border">
             <OpDagExplorer spec={fixtureSpec} routes={routes} height="32rem" />
           </div>

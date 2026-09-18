@@ -50,7 +50,10 @@ export function Gemma4LateChapters({ spec, routes, kernelCensus }: ChaptersProps
           </p>
         }
       >
-        <Scene id="pipeline" graphic={<CompilerPipelineFigure routedSourceFiles={kernelCensus.routedSourceFiles} />}>
+        <Scene
+          id="pipeline"
+          graphic={<CompilerPipelineFigure routedSourceFiles={kernelCensus.routedSourceFiles} />}
+        >
           <p>
             One schedule table describes every route as <code>format × row_bucket × epilogue</code>{" "}
             plus tuning knobs; one renderer expands each row through a shared MSL skeleton into
@@ -75,9 +78,9 @@ export function Gemma4LateChapters({ spec, routes, kernelCensus }: ChaptersProps
         </Scene>
         <Scene id="census" graphic={<KernelCensusFigure census={kernelCensus} />}>
           <p>
-            The kernel inventory contains {kernelCensus.total} extracted Metal entry
-            points. This inventory includes generated and hand-written kernels across inference,
-            training, and supporting operations; it is not the dispatch count for one model.
+            The kernel inventory contains {kernelCensus.total} extracted Metal entry points. This
+            inventory includes generated and hand-written kernels across inference, training, and
+            supporting operations; it is not the dispatch count for one model.
           </p>
           <Divergence
             others={
@@ -207,8 +210,8 @@ export function Gemma4LateChapters({ spec, routes, kernelCensus }: ChaptersProps
         title="MTP: a draft model that reads the main model's mind"
         intro={
           <p>
-            Gemma4 ships an official speculative drafter — a 4-layer, hidden-256 stack that does
-            not build an independent target-style KV cache. It borrows the main model's.
+            Gemma4 ships an official speculative drafter — a 4-layer, hidden-256 stack that does not
+            build an independent target-style KV cache. It borrows the main model's.
           </p>
         }
       >

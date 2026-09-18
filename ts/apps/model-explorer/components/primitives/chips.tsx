@@ -1,6 +1,12 @@
 "use client";
 
-import { cn, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@antfly/design-system";
+import {
+  cn,
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@antfly/design-system";
 import Link from "next/link";
 import type { TensorShape } from "@/lib/schema";
 
@@ -10,7 +16,14 @@ export function dtypeColorVar(dtype: string | undefined): string {
   if (d === "f32") return "var(--dtype-f32)";
   if (d === "f16" || d === "bf16") return "var(--dtype-f16)";
   if (d.startsWith("q8") || d.startsWith("i8")) return "var(--dtype-q8)";
-  if (d.startsWith("q4") || d.startsWith("q5") || d.startsWith("q6") || d.startsWith("iq4") || d.startsWith("mxfp4") || d === "polar4")
+  if (
+    d.startsWith("q4") ||
+    d.startsWith("q5") ||
+    d.startsWith("q6") ||
+    d.startsWith("iq4") ||
+    d.startsWith("mxfp4") ||
+    d === "polar4"
+  )
     return "var(--dtype-q4)";
   if (/^(?:q[123](?:_|$)|iq[123](?:_|$))/.test(d)) return "var(--dtype-sub4)";
   return "var(--muted-foreground)";
@@ -26,7 +39,7 @@ export function QuantChip({ format, className }: { format: string; className?: s
     <span
       className={cn(
         "inline-flex items-center rounded-sm border px-1.5 py-px font-mono text-[10px] font-medium uppercase tracking-wide",
-        className,
+        className
       )}
       style={{ borderColor: dtypeColorVar(format), color: dtypeTextColorVar(format) }}
     >
@@ -38,10 +51,17 @@ export function QuantChip({ format, className }: { format: string; className?: s
 export function TensorShapeBadge({ shape, className }: { shape: TensorShape; className?: string }) {
   const dims = `[${shape.dims.join(", ")}]`;
   return (
-    <span className={cn("inline-flex items-center gap-1 font-mono text-xs text-muted-foreground", className)}>
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 font-mono text-xs text-muted-foreground",
+        className
+      )}
+    >
       {dims}
       {shape.dtype && (
-        <span style={{ color: dtypeTextColorVar(shape.quant ?? shape.dtype) }}>· {shape.quant ?? shape.dtype}</span>
+        <span style={{ color: dtypeTextColorVar(shape.quant ?? shape.dtype) }}>
+          · {shape.quant ?? shape.dtype}
+        </span>
       )}
     </span>
   );
@@ -52,7 +72,7 @@ export function OpKindBadge({ opKind, group }: { opKind: string; group?: "primit
     <span
       className={cn(
         "inline-flex items-center rounded-sm px-1.5 py-px font-mono text-[11px]",
-        group === "fused" ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground",
+        group === "fused" ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"
       )}
     >
       {opKind}
@@ -77,13 +97,16 @@ export function EnvFlagChip({
           <span
             className={cn(
               "inline-flex max-w-full items-center gap-1 rounded-sm border bg-muted/50 px-1.5 py-px font-mono text-[10px]",
-              className,
+              className
             )}
           >
             {defaultOn !== undefined && (
               <span
                 aria-hidden="true"
-                className={cn("size-1.5 shrink-0 rounded-full", defaultOn ? "bg-emerald-500" : "bg-muted-foreground/40")}
+                className={cn(
+                  "size-1.5 shrink-0 rounded-full",
+                  defaultOn ? "bg-emerald-500" : "bg-muted-foreground/40"
+                )}
               />
             )}
             <span className="truncate">{name}</span>
@@ -95,7 +118,9 @@ export function EnvFlagChip({
         </TooltipTrigger>
         <TooltipContent className="font-mono text-xs">
           {name}
-          {defaultOn !== undefined && <span className="ml-2">({defaultOn ? "default on" : "default off"})</span>}
+          {defaultOn !== undefined && (
+            <span className="ml-2">({defaultOn ? "default on" : "default off"})</span>
+          )}
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>

@@ -97,57 +97,43 @@
       "afterScope": "attn-setup",
       "afterOpIndex": 0,
       "hazard": "raw",
-      "tensors": [
-        "normed_x"
-      ]
+      "tensors": ["normed_x"]
     },
     {
       "afterScope": "attn-setup",
       "afterOpIndex": 1,
       "hazard": "raw",
-      "tensors": [
-        "qkv"
-      ]
+      "tensors": ["qkv"]
     },
     {
       "afterScope": "attn",
       "afterOpIndex": 0,
       "hazard": "raw",
-      "tensors": [
-        "attn_out"
-      ]
+      "tensors": ["attn_out"]
     },
     {
       "afterScope": "ffn",
       "afterOpIndex": 0,
       "hazard": "waw",
-      "tensors": [
-        "gate_out"
-      ]
+      "tensors": ["gate_out"]
     },
     {
       "afterScope": "ffn",
       "afterOpIndex": 1,
       "hazard": "raw",
-      "tensors": [
-        "up_out"
-      ]
+      "tensors": ["up_out"]
     },
     {
       "afterScope": "ffn",
       "afterOpIndex": 2,
       "hazard": "raw",
-      "tensors": [
-        "act"
-      ]
+      "tensors": ["act"]
     },
     {
       "afterScope": "tail",
       "afterOpIndex": 0,
       "hazard": "raw",
-      "tensors": [
-        "logits"
-      ]
+      "tensors": ["logits"]
     }
   ],
   "source": {

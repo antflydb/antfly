@@ -177,7 +177,7 @@ export function extractKernelInventory(): KernelInventoryEntry[] {
   // kernel declarations on the comment-blanked text (same offsets).
   const beginMarker = mContent.indexOf("quant-kernel-codegen:begin generated quant kernels");
   const endMarker = mContent.indexOf("quant-kernel-codegen:end generated quant kernels");
-  if ((beginMarker >= 0) !== (endMarker >= 0) || (beginMarker >= 0 && endMarker < beginMarker)) {
+  if (beginMarker >= 0 !== endMarker >= 0 || (beginMarker >= 0 && endMarker < beginMarker)) {
     throw new Error(`unpaired quant-kernel-codegen markers in ${KERNELS_M}`);
   }
   const kernelRe = /kernel void ([a-zA-Z0-9_]+)/g;
@@ -211,7 +211,9 @@ export function extractKernelInventory(): KernelInventoryEntry[] {
     }
   }
 
-  const inventory = [...seen.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const inventory = [...seen.values()].sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0
+  );
   if (inventory.length < 300)
     throw new Error(`suspiciously few kernels found: ${inventory.length}`);
   return inventory;

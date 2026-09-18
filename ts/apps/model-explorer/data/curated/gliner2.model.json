@@ -61,33 +61,22 @@
           "opKind": "embedding_lookup",
           "label": "embed + LayerNorm + mask",
           "stageId": "embed",
-          "fusedOps": [
-            "embedding_lookup",
-            "layer_norm",
-            "embedding_mask"
-          ],
+          "fusedOps": ["embedding_lookup", "layer_norm", "embedding_mask"],
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "B·T"
-                ],
+                "dims": ["B·T"],
                 "dtype": "i64"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ]
           },
-          "envFlagNames": [
-            "TERMITE_METAL_DISABLE_DEBERTA_FUSED_EMBEDDINGS"
-          ],
+          "envFlagNames": ["TERMITE_METAL_DISABLE_DEBERTA_FUSED_EMBEDDINGS"],
           "backend": "metal"
         },
         {
@@ -98,19 +87,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "B·T",
-                  2304
-                ],
+                "dims": ["B·T", 2304],
                 "dtype": "f32"
               }
             ]
@@ -130,25 +113,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  512,
-                  768
-                ],
+                "dims": [512, 768],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "2T−1"
-                ],
+                "dims": ["2T−1"],
                 "dtype": "i64"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "2T−1",
-                  768
-                ],
+                "dims": ["2T−1", 768],
                 "dtype": "f32"
               }
             ]
@@ -172,26 +147,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "2T−1",
-                  768
-                ],
+                "dims": ["2T−1", 768],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "2T−1",
-                  768
-                ],
+                "dims": ["2T−1", 768],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "2T−1",
-                  768
-                ],
+                "dims": ["2T−1", 768],
                 "dtype": "f32"
               }
             ]
@@ -207,44 +173,25 @@
           "opKind": "disentangled_relative_attention",
           "label": "disentangled attention",
           "stageId": "encoder",
-          "fusedOps": [
-            "c2c",
-            "c2p",
-            "p2c",
-            "softmax",
-            "context"
-          ],
+          "fusedOps": ["c2c", "c2p", "p2c", "softmax", "context"],
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "3·B·T",
-                  768
-                ],
+                "dims": ["3·B·T", 768],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "2·(2T−1)",
-                  768
-                ],
+                "dims": ["2·(2T−1)", 768],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "B·heads",
-                  "T",
-                  "T"
-                ],
+                "dims": ["B·heads", "T", "T"],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ]
@@ -253,9 +200,7 @@
             "termite_disentangled_relative_attention_f32",
             "termite_disentangled_relative_attention_f32_flash4"
           ],
-          "envFlagNames": [
-            "TERMITE_METAL_DISABLE_DEBERTA_FLASH_ATTENTION"
-          ],
+          "envFlagNames": ["TERMITE_METAL_DISABLE_DEBERTA_FLASH_ATTENTION"],
           "attrs": {
             "scale": "1/√(3·head_dim)",
             "note": "Schematic fused graph node: packed Q/K/V, packed relative Q/K and additive padding mask. Scores combine all three terms; no causal mask."
@@ -274,19 +219,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ]
@@ -305,19 +244,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ]
@@ -329,33 +262,22 @@
           "opKind": "linear",
           "label": "FFN up + GELU",
           "stageId": "encoder",
-          "fusedOps": [
-            "linear",
-            "gelu"
-          ],
+          "fusedOps": ["linear", "gelu"],
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "B·T",
-                  3072
-                ],
+                "dims": ["B·T", 3072],
                 "dtype": "f32"
               }
             ]
           },
-          "envFlagNames": [
-            "TERMITE_METAL_DISABLE_GLINER_DEBERTA_DIRECT_FFN"
-          ],
+          "envFlagNames": ["TERMITE_METAL_DISABLE_GLINER_DEBERTA_DIRECT_FFN"],
           "backend": "metal",
           "attrs": {
             "weightFormat": "q4_k weights; activations use the displayed dtype",
@@ -370,19 +292,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "B·T",
-                  3072
-                ],
+                "dims": ["B·T", 3072],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ]
@@ -401,19 +317,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ]
@@ -428,26 +338,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "W",
-                  768
-                ],
+                "dims": ["W", 768],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_gliner_word_embeddings_f32"
-          ],
+          "kernels": ["termite_gliner_word_embeddings_f32"],
           "attrs": {
             "note": "Serving path selects the first subtoken per word using words_mask. The separate graph-training helper averages subtokens; its pooling semantics differ."
           },
@@ -465,19 +367,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "B·T",
-                  768
-                ],
+                "dims": ["B·T", 768],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "L",
-                  768
-                ],
+                "dims": ["L", 768],
                 "dtype": "f32"
               }
             ]
@@ -499,33 +395,22 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "W",
-                  768
-                ],
+                "dims": ["W", 768],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "W",
-                  768
-                ],
+                "dims": ["W", 768],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "W",
-                  768
-                ],
+                "dims": ["W", 768],
                 "dtype": "f32"
               }
             ]
           },
-          "envFlagNames": [
-            "TERMITE_METAL_DISABLE_GLINER_HEAD_CUSTOM_MLP2"
-          ],
+          "envFlagNames": ["TERMITE_METAL_DISABLE_GLINER_HEAD_CUSTOM_MLP2"],
           "source": {
             "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
             "anchor": "pub fn spanMarkerForward("
@@ -537,34 +422,21 @@
           "opKind": "concat",
           "label": "span start ∥ end",
           "stageId": "head",
-          "fusedOps": [
-            "gather_start",
-            "gather_end",
-            "concat"
-          ],
+          "fusedOps": ["gather_start", "gather_end", "concat"],
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "W",
-                  768
-                ],
+                "dims": ["W", 768],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "W",
-                  768
-                ],
+                "dims": ["W", 768],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "S",
-                  1536
-                ],
+                "dims": ["S", 1536],
                 "dtype": "f32"
               }
             ]
@@ -582,19 +454,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "S",
-                  1536
-                ],
+                "dims": ["S", 1536],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "S",
-                  768
-                ],
+                "dims": ["S", 768],
                 "dtype": "f32"
               }
             ]
@@ -610,26 +476,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "L",
-                  768
-                ],
+                "dims": ["L", 768],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "L",
-                  768
-                ],
+                "dims": ["L", 768],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_gliner_gru_combine_f32"
-          ],
+          "kernels": ["termite_gliner_gru_combine_f32"],
           "source": {
             "path": "zig/pkg/inference/src/architectures/gliner_head_graph.zig",
             "anchor": "pub fn downscaledTransformer("
@@ -647,26 +505,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "S",
-                  768
-                ],
+                "dims": ["S", 768],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "L",
-                  768
-                ],
+                "dims": ["L", 768],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "S",
-                  "L"
-                ],
+                "dims": ["S", "L"],
                 "dtype": "f32"
               }
             ]
@@ -685,19 +534,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "S",
-                  "L"
-                ],
+                "dims": ["S", "L"],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "S",
-                  "L"
-                ],
+                "dims": ["S", "L"],
                 "dtype": "f32"
               }
             ]

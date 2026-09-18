@@ -149,9 +149,13 @@ export function KvClient(props: KvClientProps) {
 function KvInner({ snippets, gitCommit, permalinkBase }: KvClientProps) {
   const [model, setModel] = useQueryState(
     "model",
-    parseAsStringLiteral(["gemma4", "qwen3-embedding", "qwen3-vl", "gliner2", "gliner25"] as const).withDefault(
-      "gemma4"
-    )
+    parseAsStringLiteral([
+      "gemma4",
+      "qwen3-embedding",
+      "qwen3-vl",
+      "gliner2",
+      "gliner25",
+    ] as const).withDefault("gemma4")
   );
   const trace = TRACES[model];
   const note = MODEL_NOTES[model];
@@ -199,16 +203,18 @@ function KvInner({ snippets, gitCommit, permalinkBase }: KvClientProps) {
           </div>
         ) : model === "gliner25" ? (
           <div className="max-w-2xl rounded-lg border bg-muted/20 p-6">
-            <h2 className="text-lg font-semibold">GLiNER2.5 windows long documents — still no KV cache</h2>
+            <h2 className="text-lg font-semibold">
+              GLiNER2.5 windows long documents — still no KV cache
+            </h2>
             <p className="mt-2 text-sm text-muted-foreground">
               Like GLiNER2, GLiNER2.5 is an encoder: no autoregressive loop, no persistent paged
-              decode KV cache. Where GLiNER2 stopped at a single 512-token pass, one GLiNER2.5 pass takes up to
-                4,096 body words — as many as 16,384 tokens. Longer documents, up to 131,072
-                words, are cut into overlapping 4,096-word windows, and the schema header is re-
-                encoded in front of each one. Attention keys and values live only for as long as their window. On the
-                  optimized Metal path the per-layer relative-position projections do stay
-                  resident for the session. Nothing else survives from one window or request to
-                  the next.
+              decode KV cache. Where GLiNER2 stopped at a single 512-token pass, one GLiNER2.5 pass
+              takes up to 4,096 body words — as many as 16,384 tokens. Longer documents, up to
+              131,072 words, are cut into overlapping 4,096-word windows, and the schema header is
+              re- encoded in front of each one. Attention keys and values live only for as long as
+              their window. On the optimized Metal path the per-layer relative-position projections
+              do stay resident for the session. Nothing else survives from one window or request to
+              the next.
             </p>
           </div>
         ) : (

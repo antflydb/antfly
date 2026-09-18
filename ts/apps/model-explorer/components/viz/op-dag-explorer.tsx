@@ -344,7 +344,8 @@ function OpDagExplorerInner({
   );
   const { resolvedTheme } = useTheme();
   const activePhase = phase === "prefill" && spec.graphs.prefill ? "prefill" : "decode";
-  const forwardOnly = spec.id === "gliner2" || spec.id === "gliner25" || spec.id === "qwen3-embedding";
+  const forwardOnly =
+    spec.id === "gliner2" || spec.id === "gliner25" || spec.id === "qwen3-embedding";
   const [colorBy, setColorBy] = useQueryState(
     "colorBy",
     parseAsStringLiteral(["dtype", "backend", "kernel"] as const).withDefault("dtype")

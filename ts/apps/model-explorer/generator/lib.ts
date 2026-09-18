@@ -104,7 +104,11 @@ export function verifyAnchor(
 ): AnchorResult {
   const content = readRepoFile(relPath);
   const lines = content.split("\n");
-  if (line !== undefined && lines[line - 1] !== undefined && containsAnchor(lines[line - 1], anchor)) {
+  if (
+    line !== undefined &&
+    lines[line - 1] !== undefined &&
+    containsAnchor(lines[line - 1], anchor)
+  ) {
     return { line, healed: false };
   }
   const hits: number[] = [];

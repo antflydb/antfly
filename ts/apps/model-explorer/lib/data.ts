@@ -17,8 +17,9 @@ export { L };
 export const manifest = Manifest.parse(manifestJson);
 export const kernels = KernelsFile.parse(kernelsJson);
 
-export const opKinds = (opKindsJson as { opKinds: Array<{ name: string; group: string; source: SourceLink }> })
-  .opKinds;
+export const opKinds = (
+  opKindsJson as { opKinds: Array<{ name: string; group: string; source: SourceLink }> }
+).opKinds;
 
 export interface Snippet {
   path: string;

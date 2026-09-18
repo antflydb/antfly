@@ -11,12 +11,7 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import {
-  type FrameScenario,
-  KernelsFile,
-  Manifest,
-  SCHEMA_VERSION,
-} from "../lib/schema/index.ts";
+import { type FrameScenario, KernelsFile, Manifest, SCHEMA_VERSION } from "../lib/schema/index.ts";
 import {
   extractEnvFlags,
   extractKernelInventory,

@@ -699,7 +699,11 @@ export function RuntimeClient({
               items={[
                 { slug: "gemma4-e4b", label: "gemma4", note: "chat + generate" },
                 { slug: "gliner2", label: "gliner2", note: "extraction" },
-                { slug: "gliner25", label: "gliner25", note: "extraction_v2 — serving gated by qualification" },
+                {
+                  slug: "gliner25",
+                  label: "gliner25",
+                  note: "extraction_v2 — serving gated by qualification",
+                },
                 { slug: "qwen3-embedding", label: "qwen3-embedding", note: "embeddings" },
                 { slug: "qwen3-vl", label: "qwen3-vl", note: "multimodal chat" },
               ]}
@@ -726,22 +730,40 @@ export function RuntimeClient({
               <CodeLink link={L("session-factory")} /> ·{" "}
               <CodeLink link={L("runtime-execution-control")} />
             </p>
-            <aside className="my-4 space-y-2 rounded-md border bg-muted/20 p-4 text-sm" aria-label="Upstream serving update">
+            <aside
+              className="my-4 space-y-2 rounded-md border bg-muted/20 p-4 text-sm"
+              aria-label="Upstream serving update"
+            >
               <p className="font-semibold">Serving update · 9 September 2026</p>
               <p>
                 After this tour's generated source snapshot, revision <code>aa44bddd</code> adds
                 bounded batching across qualified embedding and GLiNER requests. Compatible stages
                 whose rows can execute independently share a tensor-forward boundary. Grouping
-                happens before model execution gates, while each caller retains its cancellation
-                and deadline ownership.
+                happens before model execution gates, while each caller retains its cancellation and
+                deadline ownership.
               </p>
               <p>
                 Cached Metal providers also retain their weight-store lease through execution and
-                teardown; an overlapping provider owner receives <code>QueueFull</code>.
-                These serving boundaries are described in the newer{" "}
-                <a className="underline" href="https://github.com/antflydb/antfly/blob/aa44bddd1dd8befb5d0aec8bdb6c304054b89149/zig/pkg/inference/BATCHING.md#L95" target="_blank" rel="noreferrer">batching documentation</a>
+                teardown; an overlapping provider owner receives <code>QueueFull</code>. These
+                serving boundaries are described in the newer{" "}
+                <a
+                  className="underline"
+                  href="https://github.com/antflydb/antfly/blob/aa44bddd1dd8befb5d0aec8bdb6c304054b89149/zig/pkg/inference/BATCHING.md#L95"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  batching documentation
+                </a>
                 {" and "}
-                <a className="underline" href="https://github.com/antflydb/antfly/blob/aa44bddd1dd8befb5d0aec8bdb6c304054b89149/zig/pkg/inference/src/ops/metal_compute.zig#L4319" target="_blank" rel="noreferrer">provider lease implementation</a>.
+                <a
+                  className="underline"
+                  href="https://github.com/antflydb/antfly/blob/aa44bddd1dd8befb5d0aec8bdb6c304054b89149/zig/pkg/inference/src/ops/metal_compute.zig#L4319"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  provider lease implementation
+                </a>
+                .
               </p>
             </aside>
             <ModelUses
@@ -776,7 +798,11 @@ export function RuntimeClient({
               items={[
                 { slug: "gemma4-e4b", label: "gemma4", note: "SentencePiece, 262k vocab" },
                 { slug: "gliner2", label: "gliner2", note: "SentencePiece via DeBERTa-v3" },
-                { slug: "gliner25", label: "gliner25", note: "SentencePiece Unigram + strict normalizer" },
+                {
+                  slug: "gliner25",
+                  label: "gliner25",
+                  note: "SentencePiece Unigram + strict normalizer",
+                },
                 { slug: "qwen3-embedding", label: "qwen3-embedding", note: "BPE" },
                 { slug: "qwen3-vl", label: "qwen3-vl", note: "BPE + image placeholder tokens" },
               ]}
@@ -806,7 +832,11 @@ export function RuntimeClient({
               items={[
                 { slug: "gemma4-e4b", label: "gemma4", note: "windowed attention + shared KV" },
                 { slug: "gliner2", label: "gliner2", note: "disentangled_relative_attention" },
-                { slug: "gliner25", label: "gliner25", note: "disentangled attention via boundary mega-kernel" },
+                {
+                  slug: "gliner25",
+                  label: "gliner25",
+                  note: "disentangled attention via boundary mega-kernel",
+                },
                 { slug: "qwen3-embedding", label: "qwen3-embedding", note: "gqa attention" },
                 { slug: "qwen3-vl", label: "qwen3-vl", note: "patch projection + GQA" },
               ]}
@@ -842,9 +872,9 @@ export function RuntimeClient({
           </Scene>
           <Scene id="rebind" graphic={<RebindFigure />}>
             <p>
-              Each step then only has to point the saved plan at this step's buffers and submit
-              it. A historical Gemma4 Q4_0 census recorded one compute encoder, 143 planned scopes
-              and zero planned barriers. Those counts depend on the workload and route. Eligible
+              Each step then only has to point the saved plan at this step's buffers and submit it.
+              A historical Gemma4 Q4_0 census recorded one compute encoder, 143 planned scopes and
+              zero planned barriers. Those counts depend on the workload and route. Eligible
               device-token paths can encode frame N+1 before waiting on N.
             </p>
             <Divergence
@@ -913,7 +943,11 @@ export function RuntimeClient({
               items={[
                 { slug: "gemma4-e4b", label: "gemma4" },
                 { slug: "gliner2", label: "gliner2", note: "fastest backend is batch-dependent" },
-                { slug: "gliner25", label: "gliner25", note: "Metal device path + native FP32 reference" },
+                {
+                  slug: "gliner25",
+                  label: "gliner25",
+                  note: "Metal device path + native FP32 reference",
+                },
                 { slug: "qwen3-embedding", label: "qwen3-embedding" },
                 { slug: "qwen3-vl", label: "qwen3-vl" },
               ]}
@@ -951,7 +985,11 @@ export function RuntimeClient({
                   note: "shared-KV tail; eligible split retention",
                 },
                 { slug: "gliner2", label: "gliner2", note: "encoder — no persistent decode KV" },
-                { slug: "gliner25", label: "gliner25", note: "encoder — windowed long docs, no persistent KV" },
+                {
+                  slug: "gliner25",
+                  label: "gliner25",
+                  note: "encoder — windowed long docs, no persistent KV",
+                },
                 {
                   slug: "qwen3-embedding",
                   label: "qwen3-embedding",

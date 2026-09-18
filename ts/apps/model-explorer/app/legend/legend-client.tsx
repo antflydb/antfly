@@ -43,11 +43,27 @@ const KERNEL_FAMILIES = [
   ["moe", "var(--kfam-moe)", "expert routing, scatter, slot arena"],
   ["sampling", "var(--kfam-sampling)", "token selection and candidate reduction routes"],
   ["kv", "var(--kfam-kv)", "KV seed / compress (polar4, turbo3)"],
-  ["gliner", "var(--kfam-attention)", "DeBERTa / GLiNER span and boundary-head kernels (shares the attention hue)"],
-  ["vision", "var(--kfam-mmsg)", "vision tower: patchify, window pack, conv (shares the mm_sg hue)"],
+  [
+    "gliner",
+    "var(--kfam-attention)",
+    "DeBERTa / GLiNER span and boundary-head kernels (shares the attention hue)",
+  ],
+  [
+    "vision",
+    "var(--kfam-mmsg)",
+    "vision tower: patchify, window pack, conv (shares the mm_sg hue)",
+  ],
   ["norm_rope", "var(--kfam-fusion)", "standalone norm / RoPE kernels (shares the fusion hue)"],
-  ["training", "var(--muted-foreground)", "backward passes, optimizers, gradient utilities — explained in the Training section"],
-  ["data_movement", "var(--muted-foreground)", "copies, transposes, dtype conversion, embedding gathers"],
+  [
+    "training",
+    "var(--muted-foreground)",
+    "backward passes, optimizers, gradient utilities — explained in the Training section",
+  ],
+  [
+    "data_movement",
+    "var(--muted-foreground)",
+    "copies, transposes, dtype conversion, embedding gathers",
+  ],
   ["other", "var(--muted-foreground)", "everything the family rules don't claim"],
 ] as const;
 

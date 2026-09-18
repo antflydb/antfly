@@ -156,7 +156,10 @@ export function SankeyFlow({
           return (
             <linearGradient
               key={linkKey({ source, target, label: link.label })}
-              id={`${uid}-${linkKey({ source, target, label: link.label })}`.replace(/[^\w-]/g, "_")}
+              id={`${uid}-${linkKey({ source, target, label: link.label })}`.replace(
+                /[^\w-]/g,
+                "_"
+              )}
               gradientUnits="userSpaceOnUse"
               x1={source.x1 ?? 0}
               x2={target.x0 ?? 0}

@@ -17,13 +17,27 @@
 
 /* The compiled design system provides color tokens but no SVG utilities.
    Bind diagram labels and strokes explicitly so they follow both themes. */
-.fill-foreground { fill: var(--foreground); }
-.fill-muted-foreground { fill: var(--muted-foreground); }
-.fill-background { fill: var(--background); }
-.fill-primary { fill: var(--primary); }
-.fill-destructive { fill: var(--destructive); }
-.stroke-muted-foreground { stroke: var(--muted-foreground); }
-.stroke-destructive { stroke: var(--destructive); }
+.fill-foreground {
+  fill: var(--foreground);
+}
+.fill-muted-foreground {
+  fill: var(--muted-foreground);
+}
+.fill-background {
+  fill: var(--background);
+}
+.fill-primary {
+  fill: var(--primary);
+}
+.fill-destructive {
+  fill: var(--destructive);
+}
+.stroke-muted-foreground {
+  stroke: var(--muted-foreground);
+}
+.stroke-destructive {
+  stroke: var(--destructive);
+}
 
 /* ---- Model-explorer visual vocabulary tokens (see /legend) ---- */
 :root {
@@ -94,13 +108,17 @@
 .scrolly-pane {
   display: none;
 }
-.scrolly-inline { display: block; }
+.scrolly-inline {
+  display: block;
+}
 
 @media (min-width: 64rem) {
   .scrolly-pane {
     display: block;
   }
-  .scrolly-inline { display: none; }
+  .scrolly-inline {
+    display: none;
+  }
 }
 
 .scrolly-graphic {
@@ -123,10 +141,19 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .scrolly-layout { grid-template-columns: minmax(0, 1fr); max-width: 48rem; }
-  .scrolly-pane { display: none; }
-  .scrolly-inline { display: block; }
-  *, *::before, *::after {
+  .scrolly-layout {
+    grid-template-columns: minmax(0, 1fr);
+    max-width: 48rem;
+  }
+  .scrolly-pane {
+    display: none;
+  }
+  .scrolly-inline {
+    display: block;
+  }
+  *,
+  *::before,
+  *::after {
     /* biome-ignore lint/complexity/noImportantStyles: honor reduced-motion preference across library and inline styles */
     animation-duration: 0.01ms !important;
     /* biome-ignore lint/complexity/noImportantStyles: honor reduced-motion preference across library and inline styles */
@@ -139,11 +166,29 @@
 }
 
 /* Keep controls usable on narrow screens, independently of library utilities. */
-.site-desktop-nav { display: none; }
-.site-mobile-nav { display: flex; }
-@media (min-width: 48rem) {
-  .site-desktop-nav { display: flex; }
-  .site-mobile-nav { display: none; }
+.site-desktop-nav {
+  display: none;
 }
-.skip-link { position: fixed; top: -5rem; left: 1rem; z-index: 100; padding: .75rem; background: var(--background); border: 2px solid var(--primary); }
-.skip-link:focus { top: .5rem; }
+.site-mobile-nav {
+  display: flex;
+}
+@media (min-width: 48rem) {
+  .site-desktop-nav {
+    display: flex;
+  }
+  .site-mobile-nav {
+    display: none;
+  }
+}
+.skip-link {
+  position: fixed;
+  top: -5rem;
+  left: 1rem;
+  z-index: 100;
+  padding: 0.75rem;
+  background: var(--background);
+  border: 2px solid var(--primary);
+}
+.skip-link:focus {
+  top: 0.5rem;
+}

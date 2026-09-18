@@ -82,15 +82,22 @@ function usePaneGate(): boolean | null {
  * scenes activate. Degrades to a stacked layout on small screens and
  * under prefers-reduced-motion (see .scrolly-graphic in globals.css).
  */
-export function ScrollyChapter({ id, number, title, intro, children, className }: ScrollyChapterProps) {
+export function ScrollyChapter({
+  id,
+  number,
+  title,
+  intro,
+  children,
+  className,
+}: ScrollyChapterProps) {
   const scenes = useMemo(() => {
     const all = Children.toArray(children);
     const kept = all.filter(
-      (c): c is ReactElement<SceneProps> => isValidElement(c) && c.type === Scene,
+      (c): c is ReactElement<SceneProps> => isValidElement(c) && c.type === Scene
     );
     if (process.env.NODE_ENV !== "production" && kept.length !== all.length) {
       console.warn(
-        `ScrollyChapter "${id}": ${all.length - kept.length} non-Scene child(ren) dropped — wrap chapter content in <Scene>.`,
+        `ScrollyChapter "${id}": ${all.length - kept.length} non-Scene child(ren) dropped — wrap chapter content in <Scene>.`
       );
     }
     return kept;
@@ -128,7 +135,7 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
         const sceneId = best?.getAttribute("data-scene");
         if (sceneId) setActiveScene(sceneId);
       },
-      { rootMargin: "-25% 0px -55% 0px" },
+      { rootMargin: "-25% 0px -55% 0px" }
     );
     for (const el of proseRefs.current.values()) observer.observe(el);
     return () => observer.disconnect();
@@ -136,7 +143,7 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
 
   const activeIndex = Math.max(
     0,
-    scenes.findIndex((s) => s.props.id === activeScene),
+    scenes.findIndex((s) => s.props.id === activeScene)
   );
 
   return (
@@ -146,7 +153,9 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
           <header className="mb-8 max-w-2xl">
             <h2 className="text-2xl font-bold tracking-tight">
               {number !== undefined && (
-                <span className="mr-3 font-mono text-lg text-primary">{String(number).padStart(2, "0")}</span>
+                <span className="mr-3 font-mono text-lg text-primary">
+                  {String(number).padStart(2, "0")}
+                </span>
               )}
               {title}
             </h2>
@@ -164,14 +173,16 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
                   ref={(el) => registerProse(scene.props.id, el)}
                   className={cn(
                     "scroll-mt-32 border-l-2 py-10 pl-5 pr-2 transition-colors lg:min-h-[55vh]",
-                    activeScene === scene.props.id ? "border-primary" : "border-border/60",
+                    activeScene === scene.props.id ? "border-primary" : "border-border/60"
                   )}
                 >
                   <div className="prose-sm space-y-3 text-[15px] leading-relaxed [&_code]:font-mono [&_code]:text-[13px]">
                     {scene.props.children}
                   </div>
                   {/* Mobile / reduced-motion: graphic inline under its prose */}
-                  {pane !== true && <div className="scrolly-inline mt-6">{scene.props.graphic}</div>}
+                  {pane !== true && (
+                    <div className="scrolly-inline mt-6">{scene.props.graphic}</div>
+                  )}
                 </div>
               ))}
             </div>
@@ -187,7 +198,7 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
                       inert={i !== activeIndex}
                       className={cn(
                         "absolute inset-0 overflow-auto p-4 transition-opacity duration-300",
-                        i === activeIndex ? "opacity-100" : "pointer-events-none opacity-0",
+                        i === activeIndex ? "opacity-100" : "pointer-events-none opacity-0"
                       )}
                     >
                       {pane !== false && scene.props.graphic}
@@ -205,7 +216,9 @@ export function ScrollyChapter({ id, number, title, intro, children, className }
                         aria-current={i === activeIndex ? "step" : undefined}
                         className={cn(
                           "size-2.5 rounded-full transition-colors",
-                          i === activeIndex ? "bg-primary" : "bg-muted-foreground/30 hover:bg-muted-foreground/60",
+                          i === activeIndex
+                            ? "bg-primary"
+                            : "bg-muted-foreground/30 hover:bg-muted-foreground/60"
                         )}
                       />
                     ))}
@@ -254,7 +267,9 @@ export function Divergence({
           {others}
         </div>
         <div>
-          <div className="mb-1 text-[11px] font-medium uppercase tracking-wide text-primary">Antfly</div>
+          <div className="mb-1 text-[11px] font-medium uppercase tracking-wide text-primary">
+            Antfly
+          </div>
           {antfly}
         </div>
       </div>

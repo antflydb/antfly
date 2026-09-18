@@ -87,11 +87,11 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         </Scene>
         <Scene id="ple" graphic={<PleRibbonFigure layers={layers} />}>
           <p>
-            <strong>Then the second lookup.</strong> Gemma4's per-layer embeddings (PLE) run a
-            token lookup alongside a projection of the initial hidden state. The projection is
-            normalized in 256-wide chunks and combined with the scaled token embeddings. The
-            resulting vector is sliced across all {layers} layers, each receiving its own gated
-            slice. It's part of the model — skipping it means running a different network.
+            <strong>Then the second lookup.</strong> Gemma4's per-layer embeddings (PLE) run a token
+            lookup alongside a projection of the initial hidden state. The projection is normalized
+            in 256-wide chunks and combined with the scaled token embeddings. The resulting vector
+            is sliced across all {layers} layers, each receiving its own gated slice. It's part of
+            the model — skipping it means running a different network.
           </p>
           <p>
             <CodeLink link={L("gpt-compute-ple")} /> · <CodeLink link={L("config-ple-hidden")} />
@@ -132,8 +132,8 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
         title="Attention: windows, groups, and norms in the right places"
         intro={
           <p>
-            One attention block, taken apart: Gemma4 puts RMS norms on the Q and K heads
-            themselves; eligible Metal routes fuse each head norm with its RoPE operation.
+            One attention block, taken apart: Gemma4 puts RMS norms on the Q and K heads themselves;
+            eligible Metal routes fuse each head norm with its RoPE operation.
           </p>
         }
       >

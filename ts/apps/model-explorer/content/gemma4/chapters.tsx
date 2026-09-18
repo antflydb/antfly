@@ -127,7 +127,12 @@ export function Gemma4Chapters({ spec, routes, frames, kernelCensus }: ChaptersP
         </Scene>
       </ScrollyChapter>
 
-      <Gemma4EarlyChapters spec={spec} routes={routes} frames={frames} kernelCensus={kernelCensus} />
+      <Gemma4EarlyChapters
+        spec={spec}
+        routes={routes}
+        frames={frames}
+        kernelCensus={kernelCensus}
+      />
 
       {/* ── Ch 7 · From graph to frames ──────────────────────────── */}
       <ScrollyChapter
@@ -247,10 +252,10 @@ export function Gemma4Chapters({ spec, routes, frames, kernelCensus }: ChaptersP
           }
         >
           <p>
-            <strong>The journey.</strong> On the fanless M4 Air worktree, E2B went from about 44 tok/s at branch start to 56.5
-              — roughly +28%. Four changes account for it: pipelined decode frames, an opt-in Q4_K
-              repack of the LM head, pair-fusion, and PLE Q8_0 staging. The notes also record a sumsq-fusion
-            probe at <em>−12%</em>, measured and struck.
+            <strong>The journey.</strong> On the fanless M4 Air worktree, E2B went from about 44
+            tok/s at branch start to 56.5 — roughly +28%. Four changes account for it: pipelined
+            decode frames, an opt-in Q4_K repack of the LM head, pair-fusion, and PLE Q8_0 staging.
+            The notes also record a sumsq-fusion probe at <em>−12%</em>, measured and struck.
           </p>
           <p className="text-xs text-muted-foreground">{machines.air}</p>
         </Scene>
@@ -263,10 +268,10 @@ export function Gemma4Chapters({ spec, routes, frames, kernelCensus }: ChaptersP
           }
         >
           <p>
-            <strong>The initial comparison</strong> recorded E4B Q4_0, 64-token benchmark-suite results on an
-            M4 Pro. Its internal and end-to-end timing boundaries differ, and peer runtime settings
-            were not fully reconciled. Treat these as historical observations; they do not establish
-            a current ranking or prove another runtime omitted model work.
+            <strong>The initial comparison</strong> recorded E4B Q4_0, 64-token benchmark-suite
+            results on an M4 Pro. Its internal and end-to-end timing boundaries differ, and peer
+            runtime settings were not fully reconciled. Treat these as historical observations; they
+            do not establish a current ranking or prove another runtime omitted model work.
           </p>
           <p>
             <CodeLink link={L("perf-plan-comparison")} />

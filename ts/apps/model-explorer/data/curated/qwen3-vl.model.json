@@ -26,10 +26,7 @@
       "id": "vision",
       "title": "Vision tower",
       "spine": "vision",
-      "patch": [
-        16,
-        16
-      ],
+      "patch": [16, 16],
       "summary": "Temporal-split Conv3D patch embed, learned-position interpolation, two-axis vision RoPE, 24 bidirectional attention blocks — with DeepStack feature taps exiting at blocks 5, 11, and 17. Antfly accepts still images and rejects video; frame duplication fills the temporal patch.",
       "source": {
         "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
@@ -108,25 +105,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1
-                ],
+                "dims": [1],
                 "dtype": "i64"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_embedding_lookup"
-          ],
+          "kernels": ["termite_embedding_lookup"],
           "backend": "metal"
         },
         {
@@ -137,19 +127,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ]
@@ -164,33 +148,21 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  1,
-                  1024
-                ],
+                "dims": [1, 1024],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  1,
-                  1024
-                ],
+                "dims": [1, 1024],
                 "dtype": "f32"
               }
             ]
@@ -210,37 +182,21 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  16,
-                  128
-                ],
+                "dims": [1, 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  1,
-                  8,
-                  128
-                ],
+                "dims": [1, 8, 128],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  16,
-                  128
-                ],
+                "dims": [1, 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  1,
-                  8,
-                  128
-                ],
+                "dims": [1, 8, 128],
                 "dtype": "f32"
               }
             ]
@@ -255,51 +211,30 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  16,
-                  128
-                ],
+                "dims": [1, 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  1,
-                  8,
-                  128
-                ],
+                "dims": [1, 8, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  3,
-                  1
-                ],
+                "dims": [3, 1],
                 "dtype": "i32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  16,
-                  128
-                ],
+                "dims": [1, 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  1,
-                  8,
-                  128
-                ],
+                "dims": [1, 8, 128],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_apply_mrope"
-          ],
+          "kernels": ["termite_apply_mrope"],
           "attrs": {
             "note": "interleaved m-RoPE: head-dim sections rotate on text-time, image-height, and image-width position streams (θ = 5e6)"
           },
@@ -317,39 +252,21 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  16,
-                  128
-                ],
+                "dims": [1, 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "P",
-                  "page_size",
-                  8,
-                  128
-                ],
+                "dims": ["P", "page_size", 8, 128],
                 "dtype": "f16"
               },
               {
-                "dims": [
-                  "P",
-                  "page_size",
-                  8,
-                  128
-                ],
+                "dims": ["P", "page_size", 8, 128],
                 "dtype": "f16"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  16,
-                  128
-                ],
+                "dims": [1, 16, 128],
                 "dtype": "f32"
               }
             ]
@@ -372,19 +289,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ]
@@ -403,19 +314,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ]
@@ -427,34 +332,22 @@
           "opKind": "linear_no_bias_pair",
           "label": "gated FFN expansion + SiLU × up",
           "stageId": "layers",
-          "fusedOps": [
-            "gate",
-            "up",
-            "silu"
-          ],
+          "fusedOps": ["gate", "up", "silu"],
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  6144
-                ],
+                "dims": [1, 6144],
                 "dtype": "f32"
               }
             ]
           },
-          "envFlagNames": [
-            "TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_FFN"
-          ],
+          "envFlagNames": ["TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_FFN"],
           "backend": "metal",
           "attrs": {
             "weightFormat": "q4_k weights; activations use the displayed dtype"
@@ -468,19 +361,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  6144
-                ],
+                "dims": [1, 6144],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ]
@@ -499,39 +386,21 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  8,
-                  128
-                ],
+                "dims": [1, 8, 128],
                 "dtype": "f16"
               },
               {
-                "dims": [
-                  1,
-                  8,
-                  128
-                ],
+                "dims": [1, 8, 128],
                 "dtype": "f16"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "P",
-                  "page_size",
-                  8,
-                  128
-                ],
+                "dims": ["P", "page_size", 8, 128],
                 "dtype": "f16"
               },
               {
-                "dims": [
-                  "P",
-                  "page_size",
-                  8,
-                  128
-                ],
+                "dims": ["P", "page_size", 8, 128],
                 "dtype": "f16"
               }
             ]
@@ -546,19 +415,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ]
@@ -573,19 +436,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  151936
-                ],
+                "dims": [1, 151936],
                 "dtype": "f32"
               }
             ]
@@ -603,18 +460,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  151936
-                ],
+                "dims": [1, 151936],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1
-                ],
+                "dims": [1],
                 "dtype": "i32"
               }
             ]
@@ -636,26 +488,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ]
@@ -670,26 +513,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ]
@@ -818,21 +652,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  3,
-                  2,
-                  "H",
-                  "W"
-                ],
+                "dims": [3, 2, "H", "W"],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "patches",
-                  1024
-                ],
+                "dims": ["patches", 1024],
                 "dtype": "f32"
               }
             ]
@@ -856,19 +682,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  2304,
-                  1024
-                ],
+                "dims": [2304, 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "patches",
-                  1024
-                ],
+                "dims": ["patches", 1024],
                 "dtype": "f32"
               }
             ]
@@ -890,21 +710,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "patches",
-                  16,
-                  64
-                ],
+                "dims": ["patches", 16, 64],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "patches",
-                  16,
-                  64
-                ],
+                "dims": ["patches", 16, 64],
                 "dtype": "f32"
               }
             ]
@@ -922,19 +734,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "patches",
-                  1024
-                ],
+                "dims": ["patches", 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "patches",
-                  1024
-                ],
+                "dims": ["patches", 1024],
                 "dtype": "f32"
               }
             ]
@@ -954,19 +760,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "patches",
-                  1024
-                ],
+                "dims": ["patches", 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "patches/4",
-                  4096
-                ],
+                "dims": ["patches/4", 4096],
                 "dtype": "f32"
               }
             ]
@@ -988,19 +788,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "patches/4",
-                  4096
-                ],
+                "dims": ["patches/4", 4096],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "V",
-                  2048
-                ],
+                "dims": ["V", 2048],
                 "dtype": "f32"
               }
             ]
@@ -1015,20 +809,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "patches",
-                  1024
-                ],
+                "dims": ["patches", 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  3,
-                  "V",
-                  2048
-                ],
+                "dims": [3, "V", 2048],
                 "dtype": "f32"
               }
             ]
@@ -1050,25 +837,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp"
-                ],
+                "dims": ["T_exp"],
                 "dtype": "i64"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_embedding_lookup"
-          ],
+          "kernels": ["termite_embedding_lookup"],
           "backend": "metal"
         },
         {
@@ -1079,26 +859,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "V",
-                  2048
-                ],
+                "dims": ["V", 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ]
@@ -1120,19 +891,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ]
@@ -1147,33 +912,21 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T_exp",
-                  1024
-                ],
+                "dims": ["T_exp", 1024],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T_exp",
-                  1024
-                ],
+                "dims": ["T_exp", 1024],
                 "dtype": "f32"
               }
             ]
@@ -1193,37 +946,21 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  16,
-                  128
-                ],
+                "dims": ["T_exp", 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T_exp",
-                  8,
-                  128
-                ],
+                "dims": ["T_exp", 8, 128],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  16,
-                  128
-                ],
+                "dims": ["T_exp", 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T_exp",
-                  8,
-                  128
-                ],
+                "dims": ["T_exp", 8, 128],
                 "dtype": "f32"
               }
             ]
@@ -1238,51 +975,30 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  16,
-                  128
-                ],
+                "dims": ["T_exp", 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T_exp",
-                  8,
-                  128
-                ],
+                "dims": ["T_exp", 8, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  3,
-                  "T_exp"
-                ],
+                "dims": [3, "T_exp"],
                 "dtype": "i32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  16,
-                  128
-                ],
+                "dims": ["T_exp", 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T_exp",
-                  8,
-                  128
-                ],
+                "dims": ["T_exp", 8, 128],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_apply_mrope"
-          ],
+          "kernels": ["termite_apply_mrope"],
           "attrs": {
             "note": "interleaved m-RoPE: head-dim sections rotate on text-time, image-height, and image-width position streams (θ = 5e6)"
           },
@@ -1300,39 +1016,21 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  16,
-                  128
-                ],
+                "dims": ["T_exp", 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "P",
-                  "page_size",
-                  8,
-                  128
-                ],
+                "dims": ["P", "page_size", 8, 128],
                 "dtype": "f16"
               },
               {
-                "dims": [
-                  "P",
-                  "page_size",
-                  8,
-                  128
-                ],
+                "dims": ["P", "page_size", 8, 128],
                 "dtype": "f16"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  16,
-                  128
-                ],
+                "dims": ["T_exp", 16, 128],
                 "dtype": "f32"
               }
             ]
@@ -1355,19 +1053,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ]
@@ -1386,19 +1078,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ]
@@ -1410,34 +1096,22 @@
           "opKind": "linear_no_bias_pair",
           "label": "gated FFN expansion + SiLU × up",
           "stageId": "layers",
-          "fusedOps": [
-            "gate",
-            "up",
-            "silu"
-          ],
+          "fusedOps": ["gate", "up", "silu"],
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  6144
-                ],
+                "dims": ["T_exp", 6144],
                 "dtype": "f32"
               }
             ]
           },
-          "envFlagNames": [
-            "TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_FFN"
-          ],
+          "envFlagNames": ["TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_FFN"],
           "backend": "metal",
           "attrs": {
             "weightFormat": "q4_k weights; activations use the displayed dtype"
@@ -1451,19 +1125,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  6144
-                ],
+                "dims": ["T_exp", 6144],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ]
@@ -1482,39 +1150,21 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  8,
-                  128
-                ],
+                "dims": ["T_exp", 8, 128],
                 "dtype": "f16"
               },
               {
-                "dims": [
-                  "T_exp",
-                  8,
-                  128
-                ],
+                "dims": ["T_exp", 8, 128],
                 "dtype": "f16"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "P",
-                  "page_size",
-                  8,
-                  128
-                ],
+                "dims": ["P", "page_size", 8, 128],
                 "dtype": "f16"
               },
               {
-                "dims": [
-                  "P",
-                  "page_size",
-                  8,
-                  128
-                ],
+                "dims": ["P", "page_size", 8, 128],
                 "dtype": "f16"
               }
             ]
@@ -1529,19 +1179,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ]
@@ -1556,19 +1200,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  151936
-                ],
+                "dims": [1, 151936],
                 "dtype": "f32"
               }
             ]
@@ -1586,26 +1224,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ]
@@ -1620,26 +1249,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ]
@@ -1657,26 +1277,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "V",
-                  2048
-                ],
+                "dims": ["V", 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ]
@@ -1694,19 +1305,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T_exp",
-                  2048
-                ],
+                "dims": ["T_exp", 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  2048
-                ],
+                "dims": [1, 2048],
                 "dtype": "f32"
               }
             ]

@@ -1,4 +1,11 @@
-import { Badge, Card, CardContent, CardDescription, CardHeader, CardTitle } from "@antfly/design-system";
+import {
+  Badge,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@antfly/design-system";
 import { ArrowRight } from "lucide-react";
 import Link from "next/link";
 import { SpineStrip } from "@/components/spine-strip";
@@ -115,10 +122,16 @@ export default function HomePage() {
           {MODEL_CARDS.map((m) => (
             <Link key={m.slug} href={`/models/${m.slug}`} className="group">
               <Card className="relative h-full overflow-hidden transition-all group-hover:-translate-y-0.5 group-hover:border-primary/40 group-hover:shadow-md">
-                <div className="absolute inset-x-0 top-0 h-1" style={{ background: m.accent, opacity: 0.75 }} />
+                <div
+                  className="absolute inset-x-0 top-0 h-1"
+                  style={{ background: m.accent, opacity: 0.75 }}
+                />
                 <CardHeader>
                   <CardDescription className="flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wider">
-                    <span className="inline-block size-1.5 rounded-full" style={{ background: m.accent }} />
+                    <span
+                      className="inline-block size-1.5 rounded-full"
+                      style={{ background: m.accent }}
+                    />
                     {m.kind}
                   </CardDescription>
                   <CardTitle className="flex items-center gap-2">
@@ -148,7 +161,10 @@ export default function HomePage() {
         </h2>
         <Link href="/training" className="group block">
           <Card className="relative overflow-hidden transition-all group-hover:-translate-y-0.5 group-hover:border-primary/40 group-hover:shadow-md">
-            <div className="absolute inset-x-0 top-0 h-1" style={{ background: "var(--kfam-sampling)", opacity: 0.75 }} />
+            <div
+              className="absolute inset-x-0 top-0 h-1"
+              style={{ background: "var(--kfam-sampling)", opacity: 0.75 }}
+            />
             <CardHeader>
               <CardDescription className="font-mono text-[11px] uppercase tracking-wider">
                 how these models learn

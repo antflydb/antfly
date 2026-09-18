@@ -141,10 +141,7 @@
           "stageId": "encoder",
           "shapes": {
             "in": [{ "dims": [512, 768], "dtype": "f32" }],
-            "out": [
-              { "dims": [512, 768], "dtype": "f32" },
-              { "dims": [512, 768], "dtype": "f32" }
-            ]
+            "out": [{ "dims": [512, 768], "dtype": "f32" }, { "dims": [512, 768], "dtype": "f32" }]
           },
           "attrs": {
             "note": "Per-layer relative Q/K projections of the 512-row shared position table. On the optimized resident path they are computed once per session and kept on the device; the reference path recomputes them per request."
@@ -257,10 +254,7 @@
           "stageId": "boundary",
           "shapes": {
             "in": [{ "dims": ["B·T", 768], "dtype": "f32" }],
-            "out": [
-              { "dims": ["W", 768], "dtype": "f32" },
-              { "dims": ["Q", 768], "dtype": "f32" }
-            ]
+            "out": [{ "dims": ["W", 768], "dtype": "f32" }, { "dims": ["Q", 768], "dtype": "f32" }]
           },
           "kernels": ["termite_gliner_boundary_f32"],
           "attrs": {
@@ -388,10 +382,7 @@
           "stageId": "pool",
           "fusedOps": ["linear", "mul", "add", "gelu"],
           "shapes": {
-            "in": [
-              { "dims": [192, 128], "dtype": "f32" },
-              { "dims": ["Q", 768], "dtype": "f32" }
-            ],
+            "in": [{ "dims": [192, 128], "dtype": "f32" }, { "dims": ["Q", 768], "dtype": "f32" }],
             "out": [{ "dims": ["Q", 192], "dtype": "f32" }]
           },
           "kernels": ["termite_gliner_boundary_f32"],
@@ -410,14 +401,8 @@
           "label": "gather start/end boundary states",
           "stageId": "scorer",
           "shapes": {
-            "in": [
-              { "dims": ["W+1", 128], "dtype": "f32" },
-              { "dims": ["S"], "dtype": "i32" }
-            ],
-            "out": [
-              { "dims": ["S", 128], "dtype": "f32" },
-              { "dims": ["S", 128], "dtype": "f32" }
-            ]
+            "in": [{ "dims": ["W+1", 128], "dtype": "f32" }, { "dims": ["S"], "dtype": "i32" }],
+            "out": [{ "dims": ["S", 128], "dtype": "f32" }, { "dims": ["S", 128], "dtype": "f32" }]
           },
           "kernels": ["termite_gliner_boundary_f32"],
           "attrs": {
@@ -451,10 +436,7 @@
           "label": "8-head compatibility mix",
           "stageId": "scorer",
           "shapes": {
-            "in": [
-              { "dims": ["S", 256], "dtype": "f32" },
-              { "dims": ["Q", 768], "dtype": "f32" }
-            ],
+            "in": [{ "dims": ["S", 256], "dtype": "f32" }, { "dims": ["Q", 768], "dtype": "f32" }],
             "out": [{ "dims": ["S", 8], "dtype": "f32" }]
           },
           "kernels": ["termite_gliner_boundary_f32"],
@@ -484,10 +466,7 @@
           "label": "pair logit assembly",
           "stageId": "scorer",
           "shapes": {
-            "in": [
-              { "dims": ["S", 8], "dtype": "f32" },
-              { "dims": ["S", 4], "dtype": "f32" }
-            ],
+            "in": [{ "dims": ["S", 8], "dtype": "f32" }, { "dims": ["S", 4], "dtype": "f32" }],
             "out": [{ "dims": ["S"], "dtype": "f32" }]
           },
           "kernels": ["termite_gliner_boundary_f32"],
@@ -568,9 +547,7 @@
           "label": "relation scorer (biaffine content)",
           "stageId": "tasks",
           "shapes": {
-            "in": [
-              { "dims": ["pairs", 4610], "dtype": "f32" }
-            ],
+            "in": [{ "dims": ["pairs", 4610], "dtype": "f32" }],
             "out": [{ "dims": ["pairs"], "dtype": "f32" }]
           },
           "kernels": ["termite_gliner_boundary_f32"],
@@ -622,17 +599,32 @@
         { "id": "e.split.wattn", "from": "bnd.split", "to": "bnd.wattn", "kind": "data" },
         { "id": "e.wattn.refine", "from": "bnd.wattn", "to": "bnd.refine", "kind": "data" },
         { "id": "e.refine.marginals", "from": "bnd.refine", "to": "bnd.marginals", "kind": "data" },
-        { "id": "e.route.marginals", "from": "bnd.route", "to": "bnd.marginals", "kind": "routing" },
+        {
+          "id": "e.route.marginals",
+          "from": "bnd.route",
+          "to": "bnd.marginals",
+          "kind": "routing"
+        },
         { "id": "e.marginals.topk", "from": "bnd.marginals", "to": "bnd.topk", "kind": "data" },
         { "id": "e.topk.pool", "from": "bnd.topk", "to": "pool.assemble", "kind": "data" },
         { "id": "e.pool.film", "from": "pool.assemble", "to": "pool.film", "kind": "data" },
         { "id": "e.route.film", "from": "bnd.route", "to": "pool.film", "kind": "routing" },
         { "id": "e.film.sigmoid", "from": "pool.film", "to": "sc.sigmoid", "kind": "data" },
-        { "id": "e.refine.endpoints", "from": "bnd.refine", "to": "sc.endpoints", "kind": "routing" },
+        {
+          "id": "e.refine.endpoints",
+          "from": "bnd.refine",
+          "to": "sc.endpoints",
+          "kind": "routing"
+        },
         { "id": "e.endpoints.rope", "from": "sc.endpoints", "to": "sc.rope", "kind": "data" },
         { "id": "e.rope.compat", "from": "sc.rope", "to": "sc.compat", "kind": "data" },
         { "id": "e.compat.pair", "from": "sc.compat", "to": "sc.pair", "kind": "data" },
-        { "id": "e.marginals.inside", "from": "bnd.marginals", "to": "sc.inside", "kind": "routing" },
+        {
+          "id": "e.marginals.inside",
+          "from": "bnd.marginals",
+          "to": "sc.inside",
+          "kind": "routing"
+        },
         { "id": "e.inside.pair", "from": "sc.inside", "to": "sc.pair", "kind": "data" },
         { "id": "e.pair.sigmoid", "from": "sc.pair", "to": "sc.sigmoid", "kind": "data" },
         { "id": "e.route.null", "from": "bnd.route", "to": "sc.null", "kind": "routing" },

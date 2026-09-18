@@ -31,7 +31,7 @@ export function SnippetProvider({
 }: SnippetContextValue & { children: React.ReactNode }) {
   const value = useMemo(
     () => ({ snippets, gitCommit, permalinkBase }),
-    [snippets, gitCommit, permalinkBase],
+    [snippets, gitCommit, permalinkBase]
   );
   return <SnippetContext.Provider value={value}>{children}</SnippetContext.Provider>;
 }

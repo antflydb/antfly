@@ -17,7 +17,10 @@ export default async function ExplorePage({ params }: { params: Promise<{ slug: 
   const { slug } = await params;
   const spec = getModelSpec(slug);
   if (!spec) notFound();
-  const snippets = snippetsFor([...collectSourceLinks(spec), ...kernels.routes.map((r) => r.source)]);
+  const snippets = snippetsFor([
+    ...collectSourceLinks(spec),
+    ...kernels.routes.map((r) => r.source),
+  ]);
   return (
     <ExploreClient
       spec={spec}

@@ -13,7 +13,15 @@ function basename(path: string): string {
  * A `file.zig:line` pill. Opens the commit-pinned GitHub permalink; hovering
  * shows a pre-highlighted 11-line code peek when the snippet cache has one.
  */
-export function CodeLink({ link, label, className }: { link: SourceLink; label?: string; className?: string }) {
+export function CodeLink({
+  link,
+  label,
+  className,
+}: {
+  link: SourceLink;
+  label?: string;
+  className?: string;
+}) {
   const { getSnippet, permalinkFor } = useSnippets();
   const snippet = getSnippet(link);
   const href = permalinkFor(link);
@@ -21,12 +29,18 @@ export function CodeLink({ link, label, className }: { link: SourceLink; label?:
 
   const pillClass = cn(
     "inline-flex items-center gap-1 rounded-sm border bg-muted/40 px-1.5 py-px font-mono text-[11px] text-foreground/80 transition-colors hover:border-primary/60 hover:text-foreground",
-    className,
+    className
   );
   // Without a permalink base there is nothing to open: render a span, not a
   // dead <a href={undefined}> that looks clickable but does nothing.
   const pill = href ? (
-    <a href={href} target="_blank" rel="noreferrer" className={pillClass} title={`${link.path}:${link.line ?? ""}`}>
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      className={pillClass}
+      title={`${link.path}:${link.line ?? ""}`}
+    >
       {text}
       <ExternalLink className="size-2.5 opacity-60" />
     </a>

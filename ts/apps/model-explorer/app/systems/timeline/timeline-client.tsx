@@ -40,10 +40,10 @@ function TimelineInner({ frames, snippets, gitCommit, permalinkBase }: TimelineP
           <p className="mt-2 text-muted-foreground">
             One Metal command frame — one <strong>Gemma4</strong> decode step — laid out
             Perfetto-style. (Encoder models like GLiNER2/2.5 have no decode frames; this page is the
-            Gemma4 frame anatomy.) Both views here are{" "}
-            <em>planned</em> mode: representative encoder scopes, operations and barriers, informed
-            by historical census reports. Operations use equal widths because these examples contain
-            no byte estimates or measured GPU timings. Captured data could instead scale widths by{" "}
+            Gemma4 frame anatomy.) Both views here are <em>planned</em> mode: representative encoder
+            scopes, operations and barriers, informed by historical census reports. Operations use
+            equal widths because these examples contain no byte estimates or measured GPU timings.
+            Captured data could instead scale widths by{" "}
             <code className="font-mono text-sm">gpuNanos</code>.
           </p>
         </header>

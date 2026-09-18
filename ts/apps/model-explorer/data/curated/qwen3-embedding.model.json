@@ -77,25 +77,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T"
-                ],
+                "dims": ["T"],
                 "dtype": "i64"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_embedding_lookup"
-          ],
+          "kernels": ["termite_embedding_lookup"],
           "backend": "metal"
         },
         {
@@ -106,19 +99,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ]
@@ -133,40 +120,26 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  2048
-                ],
+                "dims": ["T", 2048],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_q8_0_linear_mm_sg"
-          ],
+          "kernels": ["termite_q8_0_linear_mm_sg"],
           "attrs": {
             "note": "Q width=16×128=2048; K and V each have width=8×128=1024. Projection widths need not equal model hidden width. Exact dispatch depends on shape.",
             "weightFormat": "q8_0 weights; activations use the displayed dtype",
@@ -182,37 +155,21 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  16,
-                  128
-                ],
+                "dims": ["T", 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T",
-                  8,
-                  128
-                ],
+                "dims": ["T", 8, 128],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  16,
-                  128
-                ],
+                "dims": ["T", 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T",
-                  8,
-                  128
-                ],
+                "dims": ["T", 8, 128],
                 "dtype": "f32"
               }
             ]
@@ -227,44 +184,26 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  16,
-                  128
-                ],
+                "dims": ["T", 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T",
-                  8,
-                  128
-                ],
+                "dims": ["T", 8, 128],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  16,
-                  128
-                ],
+                "dims": ["T", 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T",
-                  8,
-                  128
-                ],
+                "dims": ["T", 8, 128],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_apply_rope"
-          ],
+          "kernels": ["termite_apply_rope"],
           "backend": "metal"
         },
         {
@@ -275,37 +214,21 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  8,
-                  128
-                ],
+                "dims": ["T", 8, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T",
-                  8,
-                  128
-                ],
+                "dims": ["T", 8, 128],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  8,
-                  128
-                ],
+                "dims": ["T", 8, 128],
                 "dtype": "f16"
               },
               {
-                "dims": [
-                  "T",
-                  8,
-                  128
-                ],
+                "dims": ["T", 8, 128],
                 "dtype": "f16"
               }
             ]
@@ -323,44 +246,26 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  16,
-                  128
-                ],
+                "dims": ["T", 16, 128],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T",
-                  8,
-                  128
-                ],
+                "dims": ["T", 8, 128],
                 "dtype": "f16"
               },
               {
-                "dims": [
-                  "T",
-                  8,
-                  128
-                ],
+                "dims": ["T", 8, 128],
                 "dtype": "f16"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  16,
-                  128
-                ],
+                "dims": ["T", 16, 128],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_attention_f32_dense_causal_sg_q16_f16kv_gqa2"
-          ],
+          "kernels": ["termite_attention_f32_dense_causal_sg_q16_f16kv_gqa2"],
           "envFlagNames": [
             "TERMITE_METAL_DISABLE_DENSE_CAUSAL_SG_ATTENTION_Q16",
             "TERMITE_METAL_DISABLE_DENSE_CAUSAL_SG_ATTENTION_F16KV"
@@ -379,26 +284,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  2048
-                ],
+                "dims": ["T", 2048],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_q8_0_linear_mm_sg"
-          ],
+          "kernels": ["termite_q8_0_linear_mm_sg"],
           "backend": "metal",
           "attrs": {
             "weightFormat": "q8_0 weights; activations use the displayed dtype",
@@ -413,19 +310,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ]
@@ -437,34 +328,22 @@
           "opKind": "linear_no_bias_pair",
           "label": "gated FFN expansion + SiLU × up",
           "stageId": "layers",
-          "fusedOps": [
-            "gate",
-            "up",
-            "silu"
-          ],
+          "fusedOps": ["gate", "up", "silu"],
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  3072
-                ],
+                "dims": ["T", 3072],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_q8_0_linear_mm_sg"
-          ],
+          "kernels": ["termite_q8_0_linear_mm_sg"],
           "attrs": {
             "note": "Schematic fused gate/up activation: SiLU(gate) × up produces one T×3072 activation. No measured speedup is implied.",
             "weightFormat": "q8_0 weights; activations use the displayed dtype"
@@ -479,26 +358,18 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  3072
-                ],
+                "dims": ["T", 3072],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ]
           },
-          "kernels": [
-            "termite_q8_0_linear_mm_sg"
-          ],
+          "kernels": ["termite_q8_0_linear_mm_sg"],
           "backend": "metal",
           "attrs": {
             "weightFormat": "q8_0 weights; activations use the displayed dtype"
@@ -512,19 +383,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ]
@@ -539,19 +404,13 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  1024
-                ],
+                "dims": [1, 1024],
                 "dtype": "f32"
               }
             ]
@@ -570,27 +429,17 @@
           "opKind": "mul",
           "label": "L2 normalize (x / ‖x‖)",
           "stageId": "out",
-          "fusedOps": [
-            "reduce_sumsq",
-            "rsqrt",
-            "scale"
-          ],
+          "fusedOps": ["reduce_sumsq", "rsqrt", "scale"],
           "shapes": {
             "in": [
               {
-                "dims": [
-                  1,
-                  1024
-                ],
+                "dims": [1, 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  1,
-                  1024
-                ],
+                "dims": [1, 1024],
                 "dtype": "f32"
               }
             ]
@@ -605,26 +454,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ]
@@ -639,26 +479,17 @@
           "shapes": {
             "in": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               },
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ],
             "out": [
               {
-                "dims": [
-                  "T",
-                  1024
-                ],
+                "dims": ["T", 1024],
                 "dtype": "f32"
               }
             ]

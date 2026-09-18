@@ -23,18 +23,30 @@ export interface ChaptersProps {
   kernelCensus: KernelCensus;
 }
 
-const loading = () => <div className="mx-auto max-w-3xl px-4 py-16 text-muted-foreground">Loading chapters…</div>;
+const loading = () => (
+  <div className="mx-auto max-w-3xl px-4 py-16 text-muted-foreground">Loading chapters…</div>
+);
 
 // One dynamic chunk per model family: a model page downloads only its own
 // chapters instead of every model's.
-const Gemma4Chapters = dynamic(() => import("./gemma4/chapters").then((m) => m.Gemma4Chapters), { loading });
-const Gliner2Chapters = dynamic(() => import("./gliner2/chapters").then((m) => m.Gliner2Chapters), { loading });
-const Gliner25Chapters = dynamic(() => import("./gliner25/chapters").then((m) => m.Gliner25Chapters), { loading });
+const Gemma4Chapters = dynamic(() => import("./gemma4/chapters").then((m) => m.Gemma4Chapters), {
+  loading,
+});
+const Gliner2Chapters = dynamic(() => import("./gliner2/chapters").then((m) => m.Gliner2Chapters), {
+  loading,
+});
+const Gliner25Chapters = dynamic(
+  () => import("./gliner25/chapters").then((m) => m.Gliner25Chapters),
+  { loading }
+);
 const Qwen3EmbeddingChapters = dynamic(
   () => import("./qwen3-embedding/chapters").then((m) => m.Qwen3EmbeddingChapters),
   { loading }
 );
-const Qwen3VlChapters = dynamic(() => import("./qwen3-vl/chapters").then((m) => m.Qwen3VlChapters), { loading });
+const Qwen3VlChapters = dynamic(
+  () => import("./qwen3-vl/chapters").then((m) => m.Qwen3VlChapters),
+  { loading }
+);
 
 const registry: Record<string, ComponentType<ChaptersProps>> = {
   "gemma4-e2b": Gemma4Chapters,
@@ -48,7 +60,8 @@ const registry: Record<string, ComponentType<ChaptersProps>> = {
 function MissingChapters({ spec }: ChaptersProps) {
   return (
     <div className="mx-auto max-w-3xl px-4 py-16 text-muted-foreground">
-      Chapters for {spec.displayName} are not written yet — explore the graph via the operation explorer above.
+      Chapters for {spec.displayName} are not written yet — explore the graph via the operation
+      explorer above.
     </div>
   );
 }

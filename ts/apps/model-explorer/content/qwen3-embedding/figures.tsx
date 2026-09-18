@@ -26,26 +26,94 @@ export function VectorNotTokenFigure() {
           opacity={0.28 + (i % 3) * 0.08}
         />
       ))}
-      <text x={150} y={22} textAnchor="middle" fontSize={9} className="fill-muted-foreground font-mono">
+      <text
+        x={150}
+        y={22}
+        textAnchor="middle"
+        fontSize={9}
+        className="fill-muted-foreground font-mono"
+      >
         28 × Qwen3 decoder layer
       </text>
       {/* ghosted LM head path */}
-      <line x1={150} y1={158} x2={150} y2={186} stroke="var(--muted-foreground)" strokeWidth={1.25} strokeDasharray="5 4" opacity={0.4} />
+      <line
+        x1={150}
+        y1={158}
+        x2={150}
+        y2={186}
+        stroke="var(--muted-foreground)"
+        strokeWidth={1.25}
+        strokeDasharray="5 4"
+        opacity={0.4}
+      />
       <g>
-        <rect x={95} y={190} width={110} height={24} rx={3} fill="none" stroke="var(--kfam-sampling)" strokeWidth={1} strokeDasharray="4 3" opacity={0.35} />
-        <text x={150} y={206} textAnchor="middle" fontSize={8.5} className="fill-muted-foreground font-mono">
+        <rect
+          x={95}
+          y={190}
+          width={110}
+          height={24}
+          rx={3}
+          fill="none"
+          stroke="var(--kfam-sampling)"
+          strokeWidth={1}
+          strokeDasharray="4 3"
+          opacity={0.35}
+        />
+        <text
+          x={150}
+          y={206}
+          textAnchor="middle"
+          fontSize={8.5}
+          className="fill-muted-foreground font-mono"
+        >
           LM head · sampler
         </text>
-        <line x1={120} y1={186} x2={180} y2={218} stroke="var(--destructive)" strokeWidth={1.25} opacity={0.35} />
-        <line x1={120} y1={218} x2={180} y2={186} stroke="var(--destructive)" strokeWidth={1.25} opacity={0.35} />
+        <line
+          x1={120}
+          y1={186}
+          x2={180}
+          y2={218}
+          stroke="var(--destructive)"
+          strokeWidth={1.25}
+          opacity={0.35}
+        />
+        <line
+          x1={120}
+          y1={218}
+          x2={180}
+          y2={186}
+          stroke="var(--destructive)"
+          strokeWidth={1.25}
+          opacity={0.35}
+        />
       </g>
       {/* the bend */}
-      <path d="M 240 152 C 290 152, 300 120, 330 110" fill="none" stroke="var(--primary)" strokeWidth={2} />
-      <rect x={318} y={78} width={84} height={56} rx={6} fill="color-mix(in oklch, var(--dtype-f32) 14%, transparent)" stroke="var(--dtype-f32)" strokeWidth={1.5} />
+      <path
+        d="M 240 152 C 290 152, 300 120, 330 110"
+        fill="none"
+        stroke="var(--primary)"
+        strokeWidth={2}
+      />
+      <rect
+        x={318}
+        y={78}
+        width={84}
+        height={56}
+        rx={6}
+        fill="color-mix(in oklch, var(--dtype-f32) 14%, transparent)"
+        stroke="var(--dtype-f32)"
+        strokeWidth={1.5}
+      />
       <text x={360} y={100} textAnchor="middle" fontSize={9} className="fill-foreground font-mono">
         [1024]
       </text>
-      <text x={360} y={116} textAnchor="middle" fontSize={8} className="fill-muted-foreground font-mono">
+      <text
+        x={360}
+        y={116}
+        textAnchor="middle"
+        fontSize={8}
+        className="fill-muted-foreground font-mono"
+      >
         ‖x‖ = 1
       </text>
       <text x={360} y={150} textAnchor="middle" fontSize={8.5} className="fill-primary font-mono">
@@ -66,7 +134,9 @@ export function TokenizerContrastFigure() {
   const row = (label: string, pieces: string[], color: string, note: string) => (
     <div>
       <div className="mb-1.5 flex items-baseline justify-between">
-        <span className="font-mono text-[11px] uppercase tracking-wider text-muted-foreground">{label}</span>
+        <span className="font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
+          {label}
+        </span>
         <span className="font-mono text-[10px] text-muted-foreground">{note}</span>
       </div>
       <div className="flex flex-wrap gap-1">
@@ -84,9 +154,21 @@ export function TokenizerContrastFigure() {
   );
   return (
     <div className="flex h-full flex-col justify-center gap-6">
-      <div className="rounded-lg border bg-muted/30 p-3 text-center font-mono text-sm">"antfly runs on Metal"</div>
-      {row("Qwen3 · byte-level BPE", BPE_PIECES, "var(--kfam-attention)", "byte-level vocabulary coverage")}
-      {row("Gemma · SentencePiece", SP_PIECES, "var(--kfam-fusion)", "▁ represents whitespace in pieces")}
+      <div className="rounded-lg border bg-muted/30 p-3 text-center font-mono text-sm">
+        "antfly runs on Metal"
+      </div>
+      {row(
+        "Qwen3 · byte-level BPE",
+        BPE_PIECES,
+        "var(--kfam-attention)",
+        "byte-level vocabulary coverage"
+      )}
+      {row(
+        "Gemma · SentencePiece",
+        SP_PIECES,
+        "var(--kfam-fusion)",
+        "▁ represents whitespace in pieces"
+      )}
       <p className="text-center font-mono text-[10px] text-muted-foreground">
         illustrative split — the point is the two families, not these exact pieces
       </p>
@@ -135,11 +217,33 @@ export function LastTokenPoolFigure({ step }: { step: 0 | 1 }) {
       })}
       {step === 1 && (
         <>
-          <circle cx={330} cy={110} r={52} fill="none" stroke="var(--muted-foreground)" strokeWidth={1} strokeDasharray="3 3" />
+          <circle
+            cx={330}
+            cy={110}
+            r={52}
+            fill="none"
+            stroke="var(--muted-foreground)"
+            strokeWidth={1}
+            strokeDasharray="3 3"
+          />
           <line x1={330} y1={110} x2={366} y2={73} stroke="var(--primary)" strokeWidth={2} />
           <circle cx={366} cy={73} r={3.5} fill="var(--primary)" />
-          <line x1={330} y1={110} x2={352} y2={88} stroke="var(--muted-foreground)" strokeWidth={1.25} strokeDasharray="4 3" />
-          <text x={330} y={185} textAnchor="middle" fontSize={8.5} className="fill-muted-foreground font-mono">
+          <line
+            x1={330}
+            y1={110}
+            x2={352}
+            y2={88}
+            stroke="var(--muted-foreground)"
+            strokeWidth={1.25}
+            strokeDasharray="4 3"
+          />
+          <text
+            x={330}
+            y={185}
+            textAnchor="middle"
+            fontSize={8.5}
+            className="fill-muted-foreground font-mono"
+          >
             x / ‖x‖ → cos(a,b) = a·b
           </text>
         </>
@@ -218,7 +322,8 @@ export function BatchingWinsFigure() {
       <div className="rounded-lg border bg-muted/30 p-3">
         <p className="text-sm text-muted-foreground">
           Conceptual mechanisms, not a measured speedup breakdown. Dispatch depends on shape,
-          precision, hardware and runtime flags; endpoint timing includes more than the encoder graph.
+          precision, hardware and runtime flags; endpoint timing includes more than the encoder
+          graph.
         </p>
       </div>
     </div>
