@@ -1208,10 +1208,13 @@ test "generating backend tools complete agent conversations across all remote ad
             }
         }
         fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
-            for (0..2) |_| server.handleOne() catch |err| {
-                failure.* = err;
-                return;
-            };
+            for (0..2) |_| {
+                server.handleOne() catch |err| {
+                    failure.* = err;
+                    return;
+                };
+                server.routes = server.routes[1..];
+            }
         }
     };
     for ([_]Provider{ .openai, .openrouter, .ollama, .antfly, .gemini, .vertex }) |provider| {
@@ -1231,7 +1234,7 @@ test "generating backend tools complete agent conversations across all remote ad
         else
             "{\"choices\":[{\"message\":{\"content\":\"done\"}}]}";
         var server = try httpx.TestServer.start(alloc, io, &.{
-            .{ .method = .POST, .path = path, .assert_request = Check.request, .respond = .{ .body = call_response }, .max_uses = 1 },
+            .{ .method = .POST, .path = path, .assert_request = Check.request, .respond = .{ .body = call_response } },
             .{ .method = .POST, .path = path, .assert_request = Check.request, .respond = .{ .body = final_response } },
         });
         defer server.deinit();
