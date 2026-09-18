@@ -4415,14 +4415,6 @@ pub const Backend = struct {
     /// Caller must run normal maintenance afterward; this path only marks its
     /// debt, and never schedules/allocates maintenance after the seal.
     pub fn applyCompletionPointBatchWithWal(self: *Backend, namespace: backend_types.Namespace, operations: []const CompletionPointOperation, limits: CompletionPointLimits) !void {
-        const native = self.storage_owner orelse return error.UnsupportedCompletionBackend;
-        const root = self.root_dir orelse return error.UnsupportedCompletionBackend;
-        if (!std.fs.path.isAbsolute(root) or std.mem.indexOfScalar(u8, root, 0) != null) return error.UnsupportedCompletionPath;
-        if (!self.options.wal_enabled or self.storage == null or
-            self.storage.?.ptr != native.storage().ptr or self.storage.?.vtable != native.storage().vtable)
-            return error.UnsupportedCompletionBackend;
-        if (self.options.backend.read_only) return error.ReadOnly;
-        const manager = self.options.resource_manager orelse return error.CompletionResourceManagerRequired;
         if (operations.len == 0 or operations.len > limits.max_operations) return error.CompletionBatchTooLarge;
         var bounded_input: usize = 0;
         for (operations) |op| {
@@ -4446,6 +4438,17 @@ pub const Backend = struct {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer self.unlockCompletionBoundary(locked, false);
         if (self.closing.load(.acquire)) return error.LsmBackendClosed;
+        // Close drains readers under this mutex before destroying native
+        // storage and root paths. Validate owned state only after excluding
+        // close, then pin its lifetime before any admission can unlock.
+        const native = self.storage_owner orelse return error.UnsupportedCompletionBackend;
+        const root = self.root_dir orelse return error.UnsupportedCompletionBackend;
+        if (!std.fs.path.isAbsolute(root) or std.mem.indexOfScalar(u8, root, 0) != null) return error.UnsupportedCompletionPath;
+        if (!self.options.wal_enabled or self.storage == null or
+            self.storage.?.ptr != native.storage().ptr or self.storage.?.vtable != native.storage().vtable)
+            return error.UnsupportedCompletionBackend;
+        if (self.options.backend.read_only) return error.ReadOnly;
+        const manager = self.options.resource_manager orelse return error.CompletionResourceManagerRequired;
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         if (self.bulkIngestActive()) return error.UnsupportedCompletionBackend;
         self.retainReaderKind(.write_txn);
@@ -23334,6 +23337,38 @@ fn implementationTests() type {
             defer read_only.close();
             try std.testing.expectError(error.ReadOnly, read_only.applyCompletionPointBatchWithWal(.{}, &operations, limits));
             try std.testing.expectEqualStrings("next", try read_only.getMergedWithMutable(&read_only.mutable, .{}, "after-pressure"));
+        }
+
+        test "workload admission lsm native prepaid point commit rejects entry while close drains readers" {
+            const Fixture = struct {
+                fn close(backend: *Backend) void {
+                    backend.close();
+                }
+            };
+            const alloc = std.testing.allocator;
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+            defer manager.deinit(alloc);
+            var path_buffer: [256]u8 = undefined;
+            const root_z = repository_mod.tmpPath(&path_buffer, "native-prepaid-entry-close");
+            defer repository_mod.cleanupTmp(root_z);
+            var backend = try Backend.open(alloc, std.mem.span(root_z), .{ .resource_manager = &manager });
+            // An existing reader keeps the Backend object alive while close
+            // has already refused new operations. Calling after close returns
+            // would be invalid: close destroys the entire Backend value.
+            backend.retainReaderKind(.other);
+            const closer = try std.Thread.spawn(.{}, Fixture.close, .{&backend});
+            while (!backend.closing.load(.acquire)) platform.time.yieldBriefly();
+            const outcome = backend.applyCompletionPointBatchWithWal(.{}, &.{.{ .key = "closed", .value = "must-not-write" }}, .{
+                .max_operations = 1,
+                .max_encoded_bytes = 256,
+                .physical_capacity = 256 * 1024,
+            });
+            const cleanup_locked = runtime_mod.lockBackend(Backend, &backend);
+            backend.releaseReaderKind(.other);
+            backend.unlockCompletionBoundary(cleanup_locked, false);
+            closer.join();
+            try std.testing.expectError(error.LsmBackendClosed, outcome);
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
         }
 
         test "workload admission lsm native prepaid point commit keeps backend alive through sealed close" {
