@@ -71,15 +71,19 @@ pub const ChatMessage = struct {
     content: ?ChatMessageContent = null,
     tool_calls: ?[]const ToolCall = null,
     tool_call_id: ?[]const u8 = null,
+    /// Opaque Google response parts, replayed only by Google adapters.
+    google_parts_json: ?[]const u8 = null,
 };
 
 pub const GenerateResult = struct {
     content: []const u8,
     tool_calls: []ToolCall = &.{},
+    google_parts_json: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *GenerateResult) void {
         self.allocator.free(self.content);
+        if (self.google_parts_json) |parts| self.allocator.free(parts);
         for (self.tool_calls) |*tool_call| tool_call.deinit(self.allocator);
         if (self.tool_calls.len > 0) self.allocator.free(self.tool_calls);
         self.* = undefined;
@@ -94,6 +98,14 @@ pub const Provider = enum {
     ollama,
     antfly,
     mock,
+
+    /// Adapter capability; the selected model must also support function calling.
+    pub fn supportsTools(self: Provider) bool {
+        return switch (self) {
+            .antfly, .openai, .openrouter, .ollama, .gemini, .vertex => true,
+            .mock => false,
+        };
+    }
 
     pub fn validate(self: Provider) !void {
         _ = self;
