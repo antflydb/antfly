@@ -998,6 +998,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, documents_suffix)) return null;
+        if (rest.len <= tables_prefix.len + documents_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - documents_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1008,6 +1009,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, query_suffix)) return null;
+        if (rest.len <= tables_prefix.len + query_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - query_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1018,6 +1020,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, query_preflight_suffix)) return null;
+        if (rest.len <= tables_prefix.len + query_preflight_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - query_preflight_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1028,6 +1031,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, text_stats_suffix)) return null;
+        if (rest.len <= tables_prefix.len + text_stats_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - text_stats_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1038,6 +1042,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, algebraic_partials_suffix)) return null;
+        if (rest.len <= tables_prefix.len + algebraic_partials_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - algebraic_partials_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1048,6 +1053,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, join_partition_suffix)) return null;
+        if (rest.len <= tables_prefix.len + join_partition_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - join_partition_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1058,6 +1064,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, join_rows_suffix)) return null;
+        if (rest.len <= tables_prefix.len + join_rows_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - join_rows_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1068,6 +1075,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, join_unmatched_suffix)) return null;
+        if (rest.len <= tables_prefix.len + join_unmatched_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - join_unmatched_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1078,6 +1086,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, join_finalize_suffix)) return null;
+        if (rest.len <= tables_prefix.len + join_finalize_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - join_finalize_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1088,6 +1097,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, join_job_state_suffix)) return null;
+        if (rest.len <= tables_prefix.len + join_job_state_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - join_job_state_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1106,6 +1116,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, suffix)) return null;
+        if (rest.len <= tables_prefix.len + suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1132,6 +1143,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, reprocess_suffix)) return null;
+        if (rest.len <= tables_prefix.len + reprocess_suffix.len) return null;
         const effective_rest = rest[0 .. rest.len - reprocess_suffix.len];
         const table_rest = effective_rest[tables_prefix.len..];
         const artifacts_index = std.mem.indexOf(u8, table_rest, artifacts_marker) orelse return null;
@@ -1160,6 +1172,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, suffix)) return null;
+        if (rest.len <= tables_prefix.len + suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1170,6 +1183,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, artifacts_suffix)) return null;
+        if (rest.len <= tables_prefix.len + artifacts_suffix.len) return null;
         const table_rest = rest[tables_prefix.len .. rest.len - artifacts_suffix.len];
         const documents_index = std.mem.indexOf(u8, table_rest, documents_marker) orelse return null;
         if (documents_index == 0) return null;
@@ -1266,6 +1280,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, graph_expand_suffix)) return null;
+        if (rest.len <= tables_prefix.len + graph_expand_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - graph_expand_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1276,6 +1291,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, graph_hydrate_suffix)) return null;
+        if (rest.len <= tables_prefix.len + graph_hydrate_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - graph_hydrate_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1286,6 +1302,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, graph_edges_suffix)) return null;
+        if (rest.len <= tables_prefix.len + graph_edges_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - graph_edges_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1296,6 +1313,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, vector_worker_suffix)) return null;
+        if (rest.len <= tables_prefix.len + vector_worker_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - vector_worker_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1306,6 +1324,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, txn_begin_suffix)) return null;
+        if (rest.len <= tables_prefix.len + txn_begin_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - txn_begin_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1316,6 +1335,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, txn_prepare_suffix)) return null;
+        if (rest.len <= tables_prefix.len + txn_prepare_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - txn_prepare_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1326,6 +1346,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, txn_resolve_suffix)) return null;
+        if (rest.len <= tables_prefix.len + txn_resolve_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - txn_resolve_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1336,6 +1357,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, txn_status_suffix)) return null;
+        if (rest.len <= tables_prefix.len + txn_status_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - txn_status_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1346,6 +1368,7 @@ pub const Routes = struct {
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, rest, txn_acknowledge_suffix)) return null;
+        if (rest.len <= tables_prefix.len + txn_acknowledge_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - txn_acknowledge_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
@@ -1685,4 +1708,48 @@ test "public api routes compile" {
     try std.testing.expectEqual(@as(u64, 7), group_observe_merge.group_id);
     const group_execute = Routes.matchGroupShardExecute("/internal/v1/groups/7/shard-ops/execute").?;
     try std.testing.expectEqual(@as(u64, 7), group_execute.group_id);
+}
+
+test "workload admission group routes reject overlapping and empty table names" {
+    // Prefix/suffix checks alone permit their common slash to overlap. The
+    // request-task classifier uses these matchers before authentication, so a
+    // malformed path must return null without ever forming an inverted slice.
+    inline for (.{
+        .{ Routes.matchGroupScan, Routes.documents_suffix },
+        .{ Routes.matchGroupQuery, Routes.query_suffix },
+        .{ Routes.matchGroupQueryPreflight, Routes.query_preflight_suffix },
+        .{ Routes.matchGroupTextStats, Routes.text_stats_suffix },
+        .{ Routes.matchGroupAlgebraicPartials, Routes.algebraic_partials_suffix },
+        .{ Routes.matchGroupJoinPartition, Routes.join_partition_suffix },
+        .{ Routes.matchGroupJoinRows, Routes.join_rows_suffix },
+        .{ Routes.matchGroupJoinUnmatched, Routes.join_unmatched_suffix },
+        .{ Routes.matchGroupJoinFinalize, Routes.join_finalize_suffix },
+        .{ Routes.matchGroupJoinJobState, Routes.join_job_state_suffix },
+        .{ Routes.matchGroupBatch, Routes.batch_suffix },
+        .{ Routes.matchGroupRoutedBatch, Routes.routed_batch_suffix },
+        .{ Routes.matchGroupTableArtifactRepair, Routes.artifact_repair_suffix },
+        .{ Routes.matchGroupTableArtifactRepairRun, Routes.artifact_repair_run_suffix },
+        .{ Routes.matchGroupGraphExpand, Routes.graph_expand_suffix },
+        .{ Routes.matchGroupGraphHydrate, Routes.graph_hydrate_suffix },
+        .{ Routes.matchGroupGraphEdges, Routes.graph_edges_suffix },
+        .{ Routes.matchGroupVectorWorker, Routes.vector_worker_suffix },
+        .{ Routes.matchGroupTxnBegin, Routes.txn_begin_suffix },
+        .{ Routes.matchGroupTxnPrepare, Routes.txn_prepare_suffix },
+        .{ Routes.matchGroupTxnResolve, Routes.txn_resolve_suffix },
+        .{ Routes.matchGroupTxnStatus, Routes.txn_status_suffix },
+        .{ Routes.matchGroupTxnAcknowledge, Routes.txn_acknowledge_suffix },
+    }) |case| {
+        const matcher = case[0];
+        const suffix = case[1];
+        try std.testing.expect(matcher("/internal/v1/groups/7/tables" ++ suffix) == null);
+        try std.testing.expect(matcher("/internal/v1/groups/7/tables/" ++ suffix) == null);
+        try std.testing.expect(matcher("/internal/v1/groups/7/tables/outer/inner" ++ suffix) == null);
+        const valid = matcher("/internal/v1/groups/7/tables/docs" ++ suffix).?;
+        try std.testing.expectEqual(@as(u64, 7), valid.group_id);
+        try std.testing.expectEqualStrings("docs", valid.table_name);
+    }
+    try std.testing.expect(Routes.matchGroupTableArtifactReprocess("/internal/v1/groups/7/tables/reprocess") == null);
+    try std.testing.expect(Routes.matchGroupTableArtifactReprocess("/internal/v1/groups/7/tables//reprocess") == null);
+    try std.testing.expect(Routes.matchGroupDocumentArtifacts("/internal/v1/groups/7/tables/artifacts") == null);
+    try std.testing.expect(Routes.matchGroupDocumentArtifacts("/internal/v1/groups/7/tables//artifacts") == null);
 }
