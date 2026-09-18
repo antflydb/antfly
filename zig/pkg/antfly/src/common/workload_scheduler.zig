@@ -15,9 +15,10 @@ pub const Policy = struct {
     max_bypasses: u8 = 8,
     barrier_age_ms: u32 = 25,
     max_wait_ms: u32 = 100,
+    max_transition_ms: u32 = 100,
 
     pub fn validate(self: Policy) !void {
-        if (self.max_wait_ms > 60_000 or self.barrier_age_ms > 60_000) return error.InvalidPolicy;
+        if (self.max_transition_ms == 0 or self.max_transition_ms > 60_000 or self.max_wait_ms > 60_000 or self.barrier_age_ms > 60_000) return error.InvalidPolicy;
         for (self.weights) |weight| if (weight == 0) return error.InvalidPolicy;
     }
 };
@@ -44,6 +45,7 @@ pub const Scheduler = struct {
         queue: ?resources.QueueLease = null,
         resume_queue: ?resources.ResumeQueueLease = null,
         continuation: ?*resources.RetainedStateLease = null,
+        demoted_request: ?*const resources.RequestLease = null,
         job: ?resources.RunnableLease = null,
         minimum: resources.Bundle,
         estimate: u16,
@@ -61,6 +63,8 @@ pub const Scheduler = struct {
 
     pub const Job = struct {
         scheduler: *Scheduler,
+        request: resources.RequestLease,
+        options: ?Options = null,
         lease: ?resources.RunnableLease,
         lane: resources.Lane,
         estimate: u16,
@@ -73,6 +77,8 @@ pub const Scheduler = struct {
             const owner = self.scheduler;
             owner.lock();
             defer owner.mutex.unlock();
+            _ = lease.reserved() catch return;
+            _ = owner.ledger.recordService(&self.request, measured_units) catch unreachable;
             lease.release() catch unreachable;
             owner.account(self.lane, @as(i128, @min(measured_units, max_debt)) - self.estimate);
             owner.schedule();
@@ -88,9 +94,60 @@ pub const Scheduler = struct {
             defer owner.mutex.unlock();
             const retained = try lease.exchange(.retained_state, .{ .retained_bytes = retained_bytes });
             self.lease = null;
+            _ = owner.ledger.recordService(&self.request, measured_units) catch unreachable;
             owner.account(self.lane, @as(i128, @min(measured_units, max_debt)) - self.estimate);
             owner.schedule();
             return retained;
+        }
+
+        /// One-way demotion at an audited, quiescent yield. The ticket was
+        /// reserved before protected execution; no new capacity is needed here.
+        /// Cancellation/closure do not prevent this ownership cleanup boundary.
+        pub fn demoteAtYield(self: *Job, ticket: *resources.TransitionTicket, retained_bytes: u64, measured_units: u64) !Demoted {
+            const options = self.options orelse return error.MissingDemotionContext;
+            const lease = if (self.lease) |*value| value else return error.LeaseRetired;
+            const owner = self.scheduler;
+            owner.lock();
+            defer owner.mutex.unlock();
+            const result = try owner.ledger.demoteAtYield(&self.request, lease, ticket, retained_bytes, measured_units);
+            self.lease = null;
+            owner.account(self.lane, @as(i128, @min(measured_units, max_debt)) - self.estimate);
+            // Move the bounded accumulated measured debt with its request. The
+            // general lane cannot treat a parked continuation as fresh work.
+            owner.account(self.lane, -@as(i128, result.service_units));
+            owner.account(.general_read, result.service_units);
+            owner.schedule();
+            const transition_deadline_ns = @min(options.deadline_ns orelse std.math.maxInt(u64), options.now() +| @as(u64, owner.policy.max_transition_ms) * std.time.ns_per_ms);
+            return .{ .scheduler = owner, .request = self.request, .state = result.state, .options = options, .transition_deadline_ns = transition_deadline_ns };
+        }
+    };
+
+    /// Owns only continuation credits. The caller still owns the request and
+    /// actual saved buffers, which must be destroyed before release(). Failed
+    /// or cancelled resume retains state here, including cancellation after a
+    /// grant. There is no API for resetting its original budget/token.
+    pub const Demoted = struct {
+        scheduler: *Scheduler,
+        request: resources.RequestLease,
+        state: resources.RetainedStateLease,
+        options: Options,
+        transition_deadline_ns: u64,
+
+        pub fn acquireResume(self: *Demoted, minimum: resources.Bundle, estimated_units: u16, queue_bytes: u64) !Job {
+            var wait_options = self.options;
+            wait_options.deadline_ns = self.transition_deadline_ns;
+            var job = try self.scheduler.acquireInner(&self.request, .general_read, minimum, estimated_units, queue_bytes, wait_options, &self.state, true);
+            // Residence limits suspension, not execution after the general grant.
+            job.options = self.options;
+            return job;
+        }
+
+        pub fn release(self: *Demoted) !void {
+            const owner = self.scheduler;
+            owner.lock();
+            defer owner.mutex.unlock();
+            try self.state.release();
+            owner.schedule();
         }
     };
 
@@ -114,7 +171,7 @@ pub const Scheduler = struct {
         };
         self.lanes[@intFromEnum(lane)].service = @max(self.lanes[@intFromEnum(lane)].service, self.virtual_service);
         self.account(lane, estimated_units);
-        return .{ .scheduler = self, .lease = lease, .lane = lane, .estimate = estimated_units };
+        return .{ .scheduler = self, .request = request.*, .lease = lease, .lane = lane, .estimate = estimated_units };
     }
 
     fn lock(self: *Scheduler) void {
@@ -238,7 +295,9 @@ pub const Scheduler = struct {
                         break; // recompute the head/barrier after retirement
                     }
                     if (!self.mayBorrow(waiter, oldest)) break;
-                    const result = if (waiter.resume_queue) |*continuation|
+                    const result = if (waiter.demoted_request) |request|
+                        self.ledger.resumeDemoted(.resume_queue, request, &waiter.resume_queue.?, waiter.minimum)
+                    else if (waiter.resume_queue) |*continuation|
                         continuation.exchange(.runnable, waiter.minimum)
                     else
                         waiter.queue.?.exchange(.runnable, waiter.minimum);
@@ -293,14 +352,14 @@ pub const Scheduler = struct {
     /// The request and its separately owned retained state outlive this call.
     /// Queue bytes are a reference to that state, not a second memory charge.
     pub fn acquire(self: *Scheduler, request: *const resources.RequestLease, lane: resources.Lane, minimum: resources.Bundle, estimated_units: u16, queue_bytes: u64, options: Options) !Job {
-        return self.acquireInner(request, lane, minimum, estimated_units, queue_bytes, options, null);
+        return self.acquireInner(request, lane, minimum, estimated_units, queue_bytes, options, null, false);
     }
 
     pub fn acquireResume(self: *Scheduler, request: *const resources.RequestLease, lane: resources.Lane, continuation: *resources.RetainedStateLease, minimum: resources.Bundle, estimated_units: u16, queue_bytes: u64, options: Options) !Job {
-        return self.acquireInner(request, lane, minimum, estimated_units, queue_bytes, options, continuation);
+        return self.acquireInner(request, lane, minimum, estimated_units, queue_bytes, options, continuation, false);
     }
 
-    fn acquireInner(self: *Scheduler, request: *const resources.RequestLease, lane: resources.Lane, minimum: resources.Bundle, estimated_units: u16, queue_bytes: u64, options: Options, continuation: ?*resources.RetainedStateLease) !Job {
+    fn acquireInner(self: *Scheduler, request: *const resources.RequestLease, lane: resources.Lane, minimum: resources.Bundle, estimated_units: u16, queue_bytes: u64, options: Options, continuation: ?*resources.RetainedStateLease, demoted: bool) !Job {
         if (estimated_units == 0 or estimated_units > 1024) return error.InvalidEstimate;
         if (continuation) |state| {
             try self.ledger.validateContinuation(request, state);
@@ -319,7 +378,7 @@ pub const Scheduler = struct {
             self.mutex.unlock();
             return err;
         };
-        if (request_lane != lane) {
+        if (request_lane != lane and !(demoted and request_lane == .transition and lane == .general_read)) {
             self.mutex.unlock();
             return error.InvalidLease;
         }
@@ -329,12 +388,12 @@ pub const Scheduler = struct {
             break;
         };
         if (empty) {
-            const immediate = if (continuation) |state| state.exchange(.runnable, minimum) else self.ledger.acquire(.runnable, request, minimum);
+            const immediate = if (demoted) self.ledger.resumeDemoted(.retained_state, request, continuation.?, minimum) else if (continuation) |state| state.exchange(.runnable, minimum) else self.ledger.acquire(.runnable, request, minimum);
             if (immediate) |lease| {
                 self.lanes[@intFromEnum(lane)].service = @max(self.lanes[@intFromEnum(lane)].service, self.virtual_service);
                 self.account(lane, estimated_units);
                 self.mutex.unlock();
-                var job: Job = .{ .scheduler = self, .lease = lease, .lane = lane, .estimate = estimated_units };
+                var job: Job = .{ .scheduler = self, .request = request.*, .options = options, .lease = lease, .lane = lane, .estimate = estimated_units };
                 errdefer if (continuation) |state| {
                     state.* = job.yieldState(minimum.retained_bytes, 0) catch unreachable;
                 } else job.release(0);
@@ -377,6 +436,7 @@ pub const Scheduler = struct {
             .queue = queue,
             .resume_queue = resume_queue,
             .continuation = continuation,
+            .demoted_request = if (demoted) request else null,
             .minimum = minimum,
             .estimate = estimated_units,
             .lane = lane,
@@ -398,7 +458,7 @@ pub const Scheduler = struct {
             if (waiter.finished) {
                 self.mutex.unlock();
                 if (waiter.failure) |err| return err;
-                var job: Job = .{ .scheduler = self, .lease = waiter.job, .lane = lane, .estimate = estimated_units };
+                var job: Job = .{ .scheduler = self, .request = request.*, .options = options, .lease = waiter.job, .lane = lane, .estimate = estimated_units };
                 errdefer if (continuation) |state| {
                     state.* = job.yieldState(minimum.retained_bytes, 0) catch unreachable;
                 } else job.release(0);
@@ -617,5 +677,154 @@ test "workload admission weighted service is work conserving and does not accrue
     try std.testing.expect(completions[1] >= 29 and completions[1] <= 31);
     for (&pending) |*waiter| {
         if (waiter.finished) try waiter.job.?.release() else scheduler.finish(waiter, error.AdmissionClosed);
+    }
+}
+
+fn demotionTestPolicy() resources.Policy {
+    const total: resources.Bundle = .{ .handles = 16, .requests = 4, .queued = 4, .queued_bytes = 100, .runnable = 2, .retained_bytes = 100 };
+    var lanes: [resources.lane_count]resources.LanePolicy = @splat(.{ .ceiling = total });
+    lanes[@intFromEnum(resources.Lane.bounded_read)].floor = .{ .handles = 3, .requests = 1, .runnable = 1, .retained_bytes = 20 };
+    lanes[@intFromEnum(resources.Lane.transition)].floor = .{ .handles = 3, .requests = 1, .retained_bytes = 20 };
+    lanes[@intFromEnum(resources.Lane.general_read)].ceiling.retained_bytes = 50;
+    return .{ .total = total, .lanes = lanes };
+}
+
+test "workload admission scheduler demotion carries measured debt across protected quanta" {
+    var ledger = try resources.Ledger.init(std.testing.allocator, demotionTestPolicy());
+    defer ledger.deinit();
+    var scheduler = try Scheduler.init(&ledger, .{});
+    var request = try ledger.admit(.bounded_read, 5);
+    defer request.release() catch unreachable;
+    var ticket = try ledger.reserveTransition(&request, .{ .handles = 2, .requests = 1, .retained_bytes = 10 });
+    var first = try scheduler.acquire(&request, .bounded_read, .{ .runnable = 1, .retained_bytes = 5 }, 2, 10, .{ .io = std.testing.io });
+    var state = try first.yieldState(5, 3);
+    var second = try scheduler.acquireResume(&request, .bounded_read, &state, .{ .runnable = 1, .retained_bytes = 5 }, 2, 10, .{ .io = std.testing.io });
+    const before = ledger.snapshot().total;
+    var demoted = try second.demoteAtYield(&ticket, 5, 5);
+    defer demoted.release() catch unreachable;
+    try std.testing.expectEqual(@as(u64, 8), try ledger.serviceDebt(&request));
+    try std.testing.expectEqual(@as(i128, 0), scheduler.lanes[@intFromEnum(resources.Lane.bounded_read)].service);
+    try std.testing.expectEqual(@as(i128, 8 * 65_536), scheduler.lanes[@intFromEnum(resources.Lane.general_read)].service);
+    try std.testing.expectEqual(before.retained_bytes, ledger.snapshot().total.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), ledger.snapshot().lanes[@intFromEnum(resources.Lane.bounded_read)].handles);
+    var resumed = try demoted.acquireResume(.{ .runnable = 1, .retained_bytes = 5 }, 2, 10);
+    var copied_job = resumed;
+    resumed.release(4);
+    const finished_service = scheduler.lanes[@intFromEnum(resources.Lane.general_read)].service;
+    copied_job.release(4);
+    try std.testing.expectEqual(finished_service, scheduler.lanes[@intFromEnum(resources.Lane.general_read)].service);
+    try std.testing.expectEqual(@as(u64, 12), try ledger.serviceDebt(&request));
+}
+
+test "workload admission scheduler cancellation after transition grant retains exactly one state owner" {
+    var ledger = try resources.Ledger.init(std.testing.allocator, demotionTestPolicy());
+    defer ledger.deinit();
+    var scheduler = try Scheduler.init(&ledger, .{});
+    var other = try ledger.admit(.general_read, 1);
+    defer other.release() catch unreachable;
+    var blocker = try scheduler.acquire(&other, .general_read, .{ .runnable = 1, .retained_bytes = 49 }, 1, 50, .{ .io = std.testing.io });
+    defer blocker.release(1);
+    const Cancel = struct {
+        blocker: *Scheduler.Job,
+        armed: bool = false,
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (!self.armed) return false;
+            self.calls += 1;
+            if (self.calls == 1) return false;
+            self.blocker.release(1);
+            return true;
+        }
+    };
+    var cancel: Cancel = .{ .blocker = &blocker };
+    var request = try ledger.admit(.bounded_read, 5);
+    defer request.release() catch unreachable;
+    var ticket = try ledger.reserveTransition(&request, .{ .handles = 2, .requests = 1, .retained_bytes = 10 });
+    var job = try scheduler.acquire(&request, .bounded_read, .{ .runnable = 1, .retained_bytes = 5 }, 1, 10, .{
+        .io = std.testing.io,
+        .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancel.check },
+    });
+    var demoted = try job.demoteAtYield(&ticket, 5, 7);
+    defer demoted.release() catch unreachable;
+    try std.testing.expectEqual(resources.Lane.transition, try ledger.requestLane(&request));
+    cancel.armed = true;
+    try std.testing.expectError(error.Canceled, demoted.acquireResume(.{ .runnable = 1, .retained_bytes = 5 }, 1, 10));
+    try std.testing.expectEqual(resources.Lane.general_read, try ledger.requestLane(&request));
+    try std.testing.expectEqual(@as(u64, 11), ledger.snapshot().total.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), ledger.snapshot().total.runnable);
+    try std.testing.expectEqual(@as(u64, 5), (try demoted.state.reserved()).retained_bytes);
+    try std.testing.expectEqual(@as(u64, 7), try ledger.serviceDebt(&request));
+    try std.testing.expectEqualDeep(resources.Bundle{}, ledger.snapshot().transition_reserved);
+}
+
+test "workload admission scheduler transition residence cannot reset original deadline or lose cleanup" {
+    const Clock = struct {
+        var now: u64 = 1000;
+        fn read() u64 {
+            return now;
+        }
+    };
+    Clock.now = 1000;
+    var ledger = try resources.Ledger.init(std.testing.allocator, demotionTestPolicy());
+    defer ledger.deinit();
+    var scheduler = try Scheduler.init(&ledger, .{ .max_transition_ms = 2 });
+    var blocker = try ledger.admit(.general_read, 50);
+    defer blocker.release() catch unreachable;
+    var request = try ledger.admit(.bounded_read, 5);
+    defer request.release() catch unreachable;
+    var ticket = try ledger.reserveTransition(&request, .{ .handles = 2, .requests = 1, .retained_bytes = 10 });
+    var job = try scheduler.acquire(&request, .bounded_read, .{ .runnable = 1, .retained_bytes = 5 }, 1, 10, .{
+        .io = std.testing.io,
+        .deadline_ns = 1500,
+        .native_now_ns = Clock.read,
+    });
+    var demoted = try job.demoteAtYield(&ticket, 5, 1);
+    try std.testing.expectEqual(@as(?u64, 1500), demoted.options.deadline_ns);
+    Clock.now = 1500;
+    const before = ledger.snapshot();
+    try std.testing.expectError(error.DeadlineExceeded, demoted.acquireResume(.{ .runnable = 1, .retained_bytes = 5 }, 1, 10));
+    try std.testing.expectEqualDeep(before, ledger.snapshot());
+    scheduler.close();
+    try demoted.release();
+    try std.testing.expectEqual(@as(u64, 0), ledger.snapshot().total.runnable);
+    try std.testing.expectEqual(@as(u64, 5), ledger.snapshot().lanes[@intFromEnum(resources.Lane.transition)].retained_bytes);
+}
+
+test "workload admission transition residence expires independently but successful resume restores original budget" {
+    const Clock = struct {
+        var now: u64 = 1000;
+        fn read() u64 {
+            return now;
+        }
+    };
+    for ([_]bool{ false, true }) |expire| {
+        Clock.now = 1000;
+        var ledger = try resources.Ledger.init(std.testing.allocator, demotionTestPolicy());
+        defer ledger.deinit();
+        var scheduler = try Scheduler.init(&ledger, .{ .max_transition_ms = 2 });
+        var blocker = try ledger.admit(.general_read, 50);
+        defer blocker.release() catch unreachable;
+        var request = try ledger.admit(.bounded_read, 5);
+        defer request.release() catch unreachable;
+        var ticket = try ledger.reserveTransition(&request, .{ .handles = 2, .requests = 1, .retained_bytes = 10 });
+        var job = try scheduler.acquire(&request, .bounded_read, .{ .runnable = 1, .retained_bytes = 5 }, 1, 10, .{
+            .io = std.testing.io,
+            .deadline_ns = 100_000_000,
+            .native_now_ns = Clock.read,
+        });
+        var demoted = try job.demoteAtYield(&ticket, 5, 1);
+        defer demoted.release() catch unreachable;
+        try std.testing.expectEqual(@as(u64, 2_001_000), demoted.transition_deadline_ns);
+        if (expire) {
+            Clock.now = 2_001_000;
+            try std.testing.expectError(error.DeadlineExceeded, demoted.acquireResume(.{ .runnable = 1, .retained_bytes = 5 }, 1, 10));
+            try std.testing.expectEqual(resources.Lane.transition, try ledger.requestLane(&request));
+        } else {
+            try blocker.release();
+            var resumed = try demoted.acquireResume(.{ .runnable = 1, .retained_bytes = 5 }, 1, 10);
+            defer resumed.release(1);
+            try std.testing.expectEqual(@as(?u64, 100_000_000), resumed.options.?.deadline_ns);
+        }
     }
 }
