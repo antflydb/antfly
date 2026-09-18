@@ -356,6 +356,8 @@ fn scoreColumnWorker(
     failure: *?anyerror,
     cancel_siblings: *std.atomic.Value(bool),
 ) void {
+    child.beginExecutionHelper();
+    defer child.releaseExecutionHelper();
     if (pass == .prepare) {
         plan.* = preparePointScoresAlloc(std.heap.smp_allocator, child, graph_index_name, metric_name, node_ids, candidate_order, scores) catch |err| {
             failure.* = err;
@@ -541,7 +543,10 @@ fn scoreColumnsWithScopeAlloc(
                 children[i].cancellation = cancellations[i].token();
                 if (session.diagnostics != null) children[i].setDiagnostics(&diagnostics[i]);
                 const args = .{ &children[i], graph_index_name, metric_name, node_ids, candidate_order, buffers[start + i].?, &plans[start + i], pass, &failures[i], &sibling_failure };
-                if (session.io) |io| group.async(io, scoreColumnWorker, args) else @call(.auto, scoreColumnWorker, args);
+                if (session.io != null and children[i].acquireExecutionHelper())
+                    group.async(session.io.?, scoreColumnWorker, args)
+                else
+                    @call(.auto, scoreColumnWorker, args);
             }
             const joined = if (session.io) |io| group.await(io) else {};
             for (children[0..count]) |*child| child.deinit();
@@ -1976,6 +1981,8 @@ fn fetchMetricRangeWorker(
     failure: *?anyerror,
     kind: MetricRangeKind,
 ) void {
+    child.beginExecutionHelper();
+    defer child.releaseExecutionHelper();
     const fetched = fetchMetricRangeAlloc(
         std.heap.smp_allocator,
         child,
@@ -2035,9 +2042,11 @@ fn fetchMetricRangeBatchAlloc(
         for (ranges, 0..) |range, index| {
             children[index] = session.forkGraphMetricRead(std.heap.smp_allocator);
             children[index].graph_metric_transport_credit = transportMemoryBytes(range.len, range.last_block -| range.first_block + 1) catch unreachable;
-            group.async(io, fetchMetricRangeWorker, .{
-                &children[index], metric_index, segment_version, entries, range, &payloads[index], &failures[index], kind,
-            });
+            const args = .{ &children[index], metric_index, segment_version, entries, range, &payloads[index], &failures[index], kind };
+            if (children[index].acquireExecutionHelper())
+                group.async(io, fetchMetricRangeWorker, args)
+            else
+                @call(.auto, fetchMetricRangeWorker, args);
         }
         const await_result = group.await(io);
         for (children[0..ranges.len]) |*child| child.deinit();

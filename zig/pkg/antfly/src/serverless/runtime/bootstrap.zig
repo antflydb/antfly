@@ -79,6 +79,7 @@ pub const BootstrapConfig = struct {
     query_admission_waiting: @import("../../common/workload_admission.zig").Config = .{},
     write_admission_waiting: @import("../../common/workload_admission.zig").Config = .{},
     ingress_admission: @import("../../common/workload_ingress.zig").Config = .{},
+    read_execution: @import("../../storage/dense_execution.zig").Config = .{},
     graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// CPU fanout available to one graph-metric kernel. Work is scheduled on
@@ -456,6 +457,8 @@ pub const OwnedStack = struct {
 
     pub fn init(self: *OwnedStack, alloc: Allocator, cfg: BootstrapConfig, io: std.Io) !void {
         try cfg.ingress_admission.validate();
+        try cfg.read_execution.validate();
+        if (cfg.read_execution.protected.enabled() or cfg.read_execution.max_scan_state_bytes != 0) return error.UnsupportedReadExecutionPolicy;
         if (cfg.node_config) |node_config| if (node_config.admission.remote_attempt_worker.max_attempts != 0)
             return error.RemoteAttemptDurabilityRequired;
         try validateConfig(alloc, cfg);
@@ -681,6 +684,11 @@ pub const OwnedStack = struct {
         try self.handler.query_admission.configure(cfg.query_admission_waiting);
         try self.handler.write_admission.configure(cfg.write_admission_waiting);
         self.handler.ingress_admission = .init(cfg.ingress_admission);
+        if (cfg.read_execution.max_runnable_tasks != 0) {
+            self.handler.read_execution = try @import("../../storage/dense_execution.zig").Runtime.create(alloc, cfg.read_execution);
+            self.handler.read_execution.?.scope = .all_reads;
+        }
+        errdefer if (self.handler.read_execution) |execution| execution.destroy();
         self.handler.setRemoteContent(cfg.remote_content);
         if (self.query_cache) |*query_cache| self.handler.setQueryCache(query_cache);
         self.handler.setPublishedSearchSources(search_sources.publishedSearchSourcesForNames(
@@ -716,6 +724,7 @@ pub const OwnedStack = struct {
         self.handler.query_admission.deinitMemory();
         self.handler.write_admission.deinitMemory();
         self.handler.ingress_admission.deinitMemory();
+        if (self.handler.read_execution) |execution| execution.destroy();
         self.runtime.deinit();
         if (self.managed_query_embedder) |*query_embedder| query_embedder.deinit();
         self.embedding_provider_runtime.deinit();

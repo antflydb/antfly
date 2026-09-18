@@ -158,6 +158,7 @@ pub fn runFromIterator(
         .query_admission_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
         .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
         .ingress_admission = if (loaded_config) |*cfg| cfg.admission.ingress else .{},
+        .read_execution = if (loaded_config) |*cfg| cfg.admission.read_execution else .{},
         .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
         .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
         .graph_metric_max_parallelism = cli.graph_metric_max_parallelism orelse try parseEnvIntOrDefault(

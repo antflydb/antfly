@@ -112,6 +112,7 @@ pub const ServerlessServer = struct {
         self.stack.handler.query_admission.close();
         self.stack.handler.write_admission.close();
         self.stack.handler.ingress_admission.close();
+        if (self.stack.handler.read_execution) |execution| execution.scheduler.close();
         if (self.owned_listener) |listener| {
             self.stopListenerWithDeadline(deadline);
             listener.deinit();
