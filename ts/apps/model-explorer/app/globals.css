@@ -1,0 +1,149 @@
+/* Keep production and CI builds hermetic: Fontsource packages the same
+   variable font locally instead of fetching Google Fonts during `next build`. */
+@import "@fontsource-variable/roboto-mono";
+@import "tailwindcss";
+@import "@antfly/design-system/styles.css";
+@import "@antfly/design-system/charts.css";
+@import "@xyflow/react/dist/style.css";
+
+/* Match the library's class-based dark variant (see playground/globals.css). */
+@custom-variant dark (&:is(.dark *));
+
+/* Scan the library's source so Tailwind picks up utility classes it uses. */
+@source "../../../packages/design-system/src/**/*.{ts,tsx,js,jsx}";
+@source "../app/**/*.{ts,tsx}";
+@source "../components/**/*.{ts,tsx}";
+@source "../content/**/*.{ts,tsx}";
+
+/* The compiled design system provides color tokens but no SVG utilities.
+   Bind diagram labels and strokes explicitly so they follow both themes. */
+.fill-foreground { fill: var(--foreground); }
+.fill-muted-foreground { fill: var(--muted-foreground); }
+.fill-background { fill: var(--background); }
+.fill-primary { fill: var(--primary); }
+.fill-destructive { fill: var(--destructive); }
+.stroke-muted-foreground { stroke: var(--muted-foreground); }
+.stroke-destructive { stroke: var(--destructive); }
+
+/* ---- Model-explorer visual vocabulary tokens (see /legend) ---- */
+:root {
+  /* Text-bearing accents must remain readable on the light canvas. */
+  --primary: #805400;
+  --primary-foreground: #ffffff;
+  --dtype-text-f32: var(--dtype-f32);
+  --kfam-text-matvec: #1d4ed8;
+  --dtype-text-f16: #0369a1;
+  --dtype-text-q8: #854d0e;
+  --dtype-text-q4: #9a3412;
+  --dtype-text-sub4: #9f1239;
+  --kfam-text-attention: #046343;
+  --kfam-text-fusion: #775000;
+  --kfam-text-sampling: #0e6176;
+  --kfam-text-kv: #9d174d;
+  /* dtype/precision ramp: f32 -> f16/bf16 -> q8 -> q4 -> sub-4-bit */
+  --dtype-f32: oklch(0.55 0.16 255);
+  --dtype-f16: oklch(0.68 0.12 245);
+  --dtype-q8: oklch(0.75 0.14 85);
+  --dtype-q4: oklch(0.68 0.17 55);
+  --dtype-sub4: oklch(0.6 0.2 35);
+
+  /* kernel families (7 categorical hues, shared by timeline/kernel table/DAG) */
+  --kfam-matvec: oklch(0.62 0.15 255);
+  --kfam-mmsg: oklch(0.6 0.17 300);
+  --kfam-attention: oklch(0.65 0.16 155);
+  --kfam-fusion: oklch(0.72 0.15 85);
+  --kfam-moe: oklch(0.64 0.18 25);
+  --kfam-sampling: oklch(0.66 0.14 200);
+  --kfam-kv: oklch(0.68 0.12 330);
+
+  --diverge-accent: var(--primary, oklch(0.62 0.15 255));
+}
+
+.dark {
+  --primary: #e3a112;
+  --primary-foreground: #191919;
+  --dtype-text-f16: var(--dtype-f16);
+  --dtype-text-q8: var(--dtype-q8);
+  --dtype-text-q4: var(--dtype-q4);
+  --dtype-text-sub4: var(--dtype-sub4);
+  --kfam-text-matvec: #93c5fd;
+  --kfam-text-attention: #6ee7b7;
+  --kfam-text-fusion: #fcd34d;
+  --kfam-text-sampling: #67e8f9;
+  --kfam-text-kv: #f0abfc;
+  --dtype-f32: oklch(0.65 0.14 255);
+  --dtype-f16: oklch(0.74 0.1 245);
+  --dtype-q8: oklch(0.78 0.13 85);
+  --dtype-q4: oklch(0.72 0.16 55);
+  --dtype-sub4: oklch(0.66 0.18 35);
+}
+
+/* Shiki dual-theme: light by default, dark vars under .dark */
+.dark .shiki,
+.dark .shiki span {
+  /* biome-ignore lint/complexity/noImportantStyles: overrides Shiki inline light-theme colors */
+  color: var(--shiki-dark) !important;
+  /* biome-ignore lint/complexity/noImportantStyles: overrides Shiki inline light-theme backgrounds */
+  background-color: var(--shiki-dark-bg) !important;
+}
+
+/* Scrollytelling layout helpers.
+   .scrolly-pane is deliberately an unlayered rule: the design-system's
+   compiled stylesheet ships an unlayered `.hidden`, which would override a
+   Tailwind-layered `lg:block` at every width. */
+.scrolly-pane {
+  display: none;
+}
+.scrolly-inline { display: block; }
+
+@media (min-width: 64rem) {
+  .scrolly-pane {
+    display: block;
+  }
+  .scrolly-inline { display: none; }
+}
+
+.scrolly-graphic {
+  position: sticky;
+  top: 4rem;
+  height: calc(100vh - 5rem);
+}
+
+/* Travelling dashes along a sankey ribbon, reading as direction of flow.
+   The component omits this path entirely under prefers-reduced-motion; the
+   media query below is the belt-and-braces for anyone forcing the class on. */
+.sankey-flow-dash {
+  animation: sankey-flow-dash 1.4s linear infinite;
+}
+
+@keyframes sankey-flow-dash {
+  to {
+    stroke-dashoffset: -33;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scrolly-layout { grid-template-columns: minmax(0, 1fr); max-width: 48rem; }
+  .scrolly-pane { display: none; }
+  .scrolly-inline { display: block; }
+  *, *::before, *::after {
+    /* biome-ignore lint/complexity/noImportantStyles: honor reduced-motion preference across library and inline styles */
+    animation-duration: 0.01ms !important;
+    /* biome-ignore lint/complexity/noImportantStyles: honor reduced-motion preference across library and inline styles */
+    animation-iteration-count: 1 !important;
+    /* biome-ignore lint/complexity/noImportantStyles: honor reduced-motion preference across library and inline styles */
+    transition-duration: 0.01ms !important;
+    /* biome-ignore lint/complexity/noImportantStyles: honor reduced-motion preference across library and inline styles */
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Keep controls usable on narrow screens, independently of library utilities. */
+.site-desktop-nav { display: none; }
+.site-mobile-nav { display: flex; }
+@media (min-width: 48rem) {
+  .site-desktop-nav { display: flex; }
+  .site-mobile-nav { display: none; }
+}
+.skip-link { position: fixed; top: -5rem; left: 1rem; z-index: 100; padding: .75rem; background: var(--background); border: 2px solid var(--primary); }
+.skip-link:focus { top: .5rem; }

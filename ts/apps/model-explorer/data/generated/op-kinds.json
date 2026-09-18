@@ -1,0 +1,653 @@
+{
+ "schemaVersion": 1,
+ "opKinds": [
+  {
+   "name": "parameter",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 28,
+    "anchor": "parameter,"
+   }
+  },
+  {
+   "name": "constant",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 29,
+    "anchor": "constant,"
+   }
+  },
+  {
+   "name": "neg",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 32,
+    "anchor": "neg,"
+   }
+  },
+  {
+   "name": "sqrt",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 33,
+    "anchor": "sqrt,"
+   }
+  },
+  {
+   "name": "rsqrt",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 34,
+    "anchor": "rsqrt,"
+   }
+  },
+  {
+   "name": "exp",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 35,
+    "anchor": "exp,"
+   }
+  },
+  {
+   "name": "log",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 36,
+    "anchor": "log,"
+   }
+  },
+  {
+   "name": "sin",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 37,
+    "anchor": "sin,"
+   }
+  },
+  {
+   "name": "cos",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 38,
+    "anchor": "cos,"
+   }
+  },
+  {
+   "name": "tanh",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 39,
+    "anchor": "tanh,"
+   }
+  },
+  {
+   "name": "erf",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 40,
+    "anchor": "erf,"
+   }
+  },
+  {
+   "name": "abs",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 41,
+    "anchor": "abs,"
+   }
+  },
+  {
+   "name": "add",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 44,
+    "anchor": "add,"
+   }
+  },
+  {
+   "name": "mul",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 45,
+    "anchor": "mul,"
+   }
+  },
+  {
+   "name": "sub",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 46,
+    "anchor": "sub,"
+   }
+  },
+  {
+   "name": "div",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 47,
+    "anchor": "div,"
+   }
+  },
+  {
+   "name": "less_than",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 50,
+    "anchor": "less_than,"
+   }
+  },
+  {
+   "name": "where_select",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 51,
+    "anchor": "where_select,"
+   }
+  },
+  {
+   "name": "reduce_sum",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 54,
+    "anchor": "reduce_sum,"
+   }
+  },
+  {
+   "name": "reduce_max",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 55,
+    "anchor": "reduce_max,"
+   }
+  },
+  {
+   "name": "reduce_mean",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 56,
+    "anchor": "reduce_mean,"
+   }
+  },
+  {
+   "name": "argmax",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 57,
+    "anchor": "argmax,"
+   }
+  },
+  {
+   "name": "reshape",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 60,
+    "anchor": "reshape,"
+   }
+  },
+  {
+   "name": "transpose",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 61,
+    "anchor": "transpose,"
+   }
+  },
+  {
+   "name": "broadcast_in_dim",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 62,
+    "anchor": "broadcast_in_dim,"
+   }
+  },
+  {
+   "name": "slice",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 63,
+    "anchor": "slice,"
+   }
+  },
+  {
+   "name": "concat",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 64,
+    "anchor": "concat,"
+   }
+  },
+  {
+   "name": "range",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 65,
+    "anchor": "range,"
+   }
+  },
+  {
+   "name": "shape_of",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 66,
+    "anchor": "shape_of,"
+   }
+  },
+  {
+   "name": "gather",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 69,
+    "anchor": "gather,"
+   }
+  },
+  {
+   "name": "scatter_add",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 70,
+    "anchor": "scatter_add,"
+   }
+  },
+  {
+   "name": "dot_general",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 73,
+    "anchor": "dot_general,"
+   }
+  },
+  {
+   "name": "conv_general",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 76,
+    "anchor": "conv_general,"
+   }
+  },
+  {
+   "name": "convert_dtype",
+   "group": "primitive",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 79,
+    "anchor": "convert_dtype,"
+   }
+  },
+  {
+   "name": "linear",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 85,
+    "anchor": "linear,"
+   }
+  },
+  {
+   "name": "linear_no_bias",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 86,
+    "anchor": "linear_no_bias,"
+   }
+  },
+  {
+   "name": "linear_no_bias_pair",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 87,
+    "anchor": "linear_no_bias_pair,"
+   }
+  },
+  {
+   "name": "embedding_lookup",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 88,
+    "anchor": "embedding_lookup,"
+   }
+  },
+  {
+   "name": "layer_norm",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 89,
+    "anchor": "layer_norm,"
+   }
+  },
+  {
+   "name": "rms_norm",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 90,
+    "anchor": "rms_norm,"
+   }
+  },
+  {
+   "name": "gelu",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 91,
+    "anchor": "gelu,"
+   }
+  },
+  {
+   "name": "relu",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 92,
+    "anchor": "relu,"
+   }
+  },
+  {
+   "name": "silu",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 93,
+    "anchor": "silu,"
+   }
+  },
+  {
+   "name": "quick_gelu",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 94,
+    "anchor": "quick_gelu,"
+   }
+  },
+  {
+   "name": "sigmoid",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 95,
+    "anchor": "sigmoid,"
+   }
+  },
+  {
+   "name": "tanh_act",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 96,
+    "anchor": "tanh_act,"
+   }
+  },
+  {
+   "name": "concat",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 97,
+    "anchor": "concat,"
+   }
+  },
+  {
+   "name": "elem_add",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 98,
+    "anchor": "elem_add,"
+   }
+  },
+  {
+   "name": "elem_multiply",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 99,
+    "anchor": "elem_multiply,"
+   }
+  },
+  {
+   "name": "scaled_dot_product_attention",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 100,
+    "anchor": "scaled_dot_product_attention,"
+   }
+  },
+  {
+   "name": "causal_self_attention",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 101,
+    "anchor": "causal_self_attention,"
+   }
+  },
+  {
+   "name": "cross_attention",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 102,
+    "anchor": "cross_attention,"
+   }
+  },
+  {
+   "name": "gqa_causal_attention",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 103,
+    "anchor": "gqa_causal_attention,"
+   }
+  },
+  {
+   "name": "gqa_paged_attention",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 104,
+    "anchor": "gqa_paged_attention,"
+   }
+  },
+  {
+   "name": "relative_position_bias",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 105,
+    "anchor": "relative_position_bias,"
+   }
+  },
+  {
+   "name": "disentangled_relative_attention",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 106,
+    "anchor": "disentangled_relative_attention,"
+   }
+  },
+  {
+   "name": "windowed_self_attention",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 107,
+    "anchor": "windowed_self_attention,"
+   }
+  },
+  {
+   "name": "channel_self_attention",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 108,
+    "anchor": "channel_self_attention,"
+   }
+  },
+  {
+   "name": "rope",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 109,
+    "anchor": "rope,"
+   }
+  },
+  {
+   "name": "rope_per_item",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 110,
+    "anchor": "rope_per_item,"
+   }
+  },
+  {
+   "name": "conv1d",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 111,
+    "anchor": "conv1d,"
+   }
+  },
+  {
+   "name": "conv2d",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 112,
+    "anchor": "conv2d,"
+   }
+  },
+  {
+   "name": "token_grid_conv2d",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 113,
+    "anchor": "token_grid_conv2d,"
+   }
+  },
+  {
+   "name": "from_float32",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 114,
+    "anchor": "from_float32,"
+   }
+  },
+  {
+   "name": "from_float32_shape",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 115,
+    "anchor": "from_float32_shape,"
+   }
+  },
+  {
+   "name": "to_float32",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 116,
+    "anchor": "to_float32,"
+   }
+  },
+  {
+   "name": "moe_linear_no_bias",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 117,
+    "anchor": "moe_linear_no_bias,"
+   }
+  },
+  {
+   "name": "moe_linear_no_bias_pair",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 118,
+    "anchor": "moe_linear_no_bias_pair,"
+   }
+  },
+  {
+   "name": "moe_scatter_add",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 119,
+    "anchor": "moe_scatter_add,"
+   }
+  },
+  {
+   "name": "moe_select_routes",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 120,
+    "anchor": "moe_select_routes,"
+   }
+  },
+  {
+   "name": "take_rows",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 121,
+    "anchor": "take_rows,"
+   }
+  },
+  {
+   "name": "zero_tensor",
+   "group": "fused",
+   "source": {
+    "path": "zig/lib/ml/src/graph/node.zig",
+    "line": 122,
+    "anchor": "zero_tensor,"
+   }
+  }
+ ]
+}
