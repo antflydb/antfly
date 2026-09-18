@@ -37,6 +37,7 @@ GATES = {
     "throughput_ratio": 0.95,
     "cgroup_peak_ratio": 0.90,
 }
+RELEASE_BASELINE = "64f1afbb373d5da0a932f08e456116da139e9e9a"
 TABLE = "workload_scheduling_fixture"
 
 
@@ -110,6 +111,61 @@ def template(runtime: str) -> dict[str, Any]:
     }
 
 
+def release_plan(
+    tier: str,
+    baseline_image: str | None = None,
+    candidate_image: str | None = None,
+    candidate_revision: str | None = None,
+) -> dict[str, Any]:
+    plan = template("docker")
+    _, memory, _ = TIERS[tier]
+    waiting = {
+        "max_queued_requests": 160,
+        "max_queued_bytes": memory // 64,
+        "max_retained_bytes": memory // 8,
+        "max_wait_ms": 1000,
+    }
+    fixed_config = {
+        "admission": {
+            kind: {"max_concurrent_requests": 80, "waiting": waiting.copy()}
+            for kind in ("query", "write")
+        }
+    }
+    plan.update(
+        purpose="qualification",
+        tier=tier,
+        warmup_seconds=60,
+        seconds=300,
+        runs=3,
+        concurrency=[1, 5, 10, 20, 30, 40, 60, 80],
+        open_factors=[0.5, 0.8, 1.0, 1.25, 2.0],
+        overload_seconds=60,
+        recovery_seconds=60,
+        request_timeout=30,
+        generator_workers=160,
+        generator_queue=320,
+        documents=4096,
+    )
+    plan["arms"] = {
+        "baseline": {
+            "revision": RELEASE_BASELINE,
+            "optimization": "ReleaseFast",
+            "image": baseline_image,
+            "config": json.loads(json.dumps(fixed_config)),
+        },
+        "candidate": {
+            "revision": candidate_revision,
+            "optimization": "ReleaseFast",
+            "image": candidate_image,
+            "config": json.loads(json.dumps(fixed_config)),
+        },
+    }
+    plan["note"] = (
+        "Prepared fixed-policy single-node lookup/mixed workload subset. Null image/candidate revision fields are deliberately unresolved until builds from the final committed sources exist. Both arms use identical fixed admission; this isolates implementation overhead. This plan does not qualify lane isolation, dense/graph/aggregate work, remote ownership or write recovery. Record actual storage class and retain build receipts before running. Untouched legacy-default UX comparisons require a separate plan."
+    )
+    return plan
+
+
 def validate(plan: dict[str, Any]) -> None:
     if (
         plan.get("schema") != 1
@@ -162,7 +218,7 @@ def validate(plan: dict[str, Any]) -> None:
         raise ValueError("exactly baseline and candidate arms are required")
     modes = set()
     for arm in plan["arms"].values():
-        if not re.fullmatch(r"[0-9a-f]{40}", arm.get("revision", "")) and not (
+        if not re.fullmatch(r"[0-9a-f]{40}", arm.get("revision") or "") and not (
             plan.get("purpose") == "smoke" and arm.get("revision") == "unknown"
         ):
             raise ValueError("pin each declared source revision with a full Git SHA")
@@ -606,6 +662,7 @@ def docker_command(
         "docker",
         "run",
         "--detach",
+        "--no-healthcheck",
         "--name",
         name,
         "--cpus",
@@ -1120,11 +1177,28 @@ def main() -> None:
     execute = sub.add_parser("run")
     execute.add_argument("plan", type=Path)
     execute.add_argument("--output", type=Path, required=True)
+    releases = sub.add_parser("release-plans")
+    releases.add_argument("--output", type=Path, required=True)
+    releases.add_argument("--baseline-image")
+    releases.add_argument("--candidate-image")
+    releases.add_argument("--candidate-revision")
     args = parser.parse_args()
     if args.command == "template":
         if args.output.exists():
             parser.error("template output already exists")
         save(args.output, template(args.runtime))
+    elif args.command == "release-plans":
+        args.output.mkdir(parents=True, exist_ok=False)
+        for tier in TIERS:
+            save(
+                args.output / f"{tier}.json",
+                release_plan(
+                    tier,
+                    args.baseline_image,
+                    args.candidate_image,
+                    args.candidate_revision,
+                ),
+            )
     else:
         result = run(json.loads(args.plan.read_text()), args.output)
         print(

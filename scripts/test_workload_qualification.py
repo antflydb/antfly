@@ -32,6 +32,7 @@ class WorkloadQualificationTests(unittest.TestCase):
             plan, plan["arms"]["baseline"], Path("/tmp/fixture"), 1234, "owned-test"
         )
         self.assertEqual(argv[argv.index("--cpus") + 1], "1")
+        self.assertIn("--no-healthcheck", argv)
         self.assertEqual(argv[argv.index("--memory") + 1], str(4 << 30))
         self.assertEqual(argv[argv.index("--memory-swap") + 1], str(4 << 30))
         values = {
@@ -58,6 +59,35 @@ class WorkloadQualificationTests(unittest.TestCase):
                     body["inserts"][f"doc{document}"],
                     qualification.fixture_document(document),
                 )
+
+    def test_release_plans_pin_baseline_and_leave_candidate_unattested(self):
+        for tier, (_, memory, _) in qualification.TIERS.items():
+            pending = qualification.release_plan(tier)
+            self.assertEqual(
+                pending["arms"]["baseline"]["revision"],
+                "64f1afbb373d5da0a932f08e456116da139e9e9a",
+            )
+            self.assertIsNone(pending["arms"]["candidate"]["revision"])
+            self.assertIsNone(pending["arms"]["candidate"]["image"])
+            with self.assertRaises(ValueError):
+                qualification.validate(pending)
+            ready = qualification.release_plan(
+                tier,
+                "baseline@sha256:" + "a" * 64,
+                "candidate@sha256:" + "b" * 64,
+                "c" * 40,
+            )
+            qualification.validate(ready)
+            self.assertEqual(
+                ready["arms"]["baseline"]["config"],
+                ready["arms"]["candidate"]["config"],
+            )
+            self.assertEqual(
+                ready["arms"]["candidate"]["config"]["admission"]["query"]["waiting"][
+                    "max_retained_bytes"
+                ],
+                memory // 8,
+            )
 
     def test_correctness_checks_reject_partial_results_and_wrong_documents(self):
         self.assertEqual(

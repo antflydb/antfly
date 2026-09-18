@@ -27,6 +27,9 @@ disables swap, and verifies effective cgroup-v2 values. The image must include
 `/antfly` (or an explicit `container_binary`) and `cat`. CPU and RAM are enforced;
 the package's disk size is recorded but this bind-mounted fixture does not enforce
 a disk quota. Process runs are always unconstrained host correctness evidence.
+The harness disables inherited image health checks and polls its configured API
+readiness endpoint; the production image's separate health port is disabled in
+these fixtures.
 
 `purpose: "qualification"` requires Docker, matching ReleaseFast builds with
 declared full revisions, at least 60-second warmup, 300-second measurement,
@@ -34,6 +37,34 @@ three lifecycles, C1/5/10/20/30/40/60/80, open factors .5/.8/1/1.25/2, and
 60-second overload/recovery intervals. Even then, the output remains partial
 matrix evidence. A revision/mode label is a declaration; retain build receipts
 separately to establish that an artifact was built from the claimed source.
+
+Prepared paired plans in `scripts/workload-qualification-plans/` cover Starter
+(1 CPU, 4 GiB), Standard (2 CPU, 4 GiB), and Pro (4 CPU, 8 GiB). They declare
+baseline source `64f1afbb373d5da0a932f08e456116da139e9e9a`, ReleaseFast for both
+arms, all required windows/concurrency points, and three fresh pairs per tier.
+Candidate source and both images are intentionally unresolved; validation rejects
+the plans until the final committed candidate and independently built artifacts
+are supplied. Generate executable copies after retaining source/build receipts:
+
+```sh
+python3 scripts/workload_qualification.py release-plans --output /tmp/release-plans \
+  --baseline-image antfly:baseline-releasefast \
+  --candidate-image antfly:candidate-releasefast \
+  --candidate-revision FULL_COMMITTED_CANDIDATE_SHA
+python3 scripts/workload_qualification.py run /tmp/release-plans/starter.json --output /tmp/starter-receipts
+```
+
+Run the Standard and Pro files separately on an otherwise idle Docker host with
+sufficient resources. Record the host storage details in each plan first. These
+plans use identical explicit fixed admission envelopes in both arms: query and
+write limits of 80 active/160 queued, a 1-second queue wait, queued request bytes
+of RAM/64, and retained bytes of RAM/8. This isolates implementation overhead
+for document lookups, small queries, and 90/10 and 50/50 read/write mixes.
+It does not qualify automatic policy or the legacy default configuration, and
+does not exercise vector execution. Do not substitute a convenient existing
+binary for a declared build. Generator drops, including drops during overload,
+invalidate coverage and require a generator with sufficient capacity before
+using the results as qualification evidence.
 
 The first baseline's fastest error-free measured closed-loop rate fixes all
 open-loop offered rates for that workload. Later pairs alternate arm order.

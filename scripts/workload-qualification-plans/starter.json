@@ -1,0 +1,107 @@
+{
+  "arms": {
+    "baseline": {
+      "config": {
+        "admission": {
+          "query": {
+            "max_concurrent_requests": 80,
+            "waiting": {
+              "max_queued_bytes": 67108864,
+              "max_queued_requests": 160,
+              "max_retained_bytes": 536870912,
+              "max_wait_ms": 1000
+            }
+          },
+          "write": {
+            "max_concurrent_requests": 80,
+            "waiting": {
+              "max_queued_bytes": 67108864,
+              "max_queued_requests": 160,
+              "max_retained_bytes": 536870912,
+              "max_wait_ms": 1000
+            }
+          }
+        }
+      },
+      "image": null,
+      "optimization": "ReleaseFast",
+      "revision": "64f1afbb373d5da0a932f08e456116da139e9e9a"
+    },
+    "candidate": {
+      "config": {
+        "admission": {
+          "query": {
+            "max_concurrent_requests": 80,
+            "waiting": {
+              "max_queued_bytes": 67108864,
+              "max_queued_requests": 160,
+              "max_retained_bytes": 536870912,
+              "max_wait_ms": 1000
+            }
+          },
+          "write": {
+            "max_concurrent_requests": 80,
+            "waiting": {
+              "max_queued_bytes": 67108864,
+              "max_queued_requests": 160,
+              "max_retained_bytes": 536870912,
+              "max_wait_ms": 1000
+            }
+          }
+        }
+      },
+      "image": null,
+      "optimization": "ReleaseFast",
+      "revision": null
+    }
+  },
+  "concurrency": [
+    1,
+    5,
+    10,
+    20,
+    30,
+    40,
+    60,
+    80
+  ],
+  "documents": 4096,
+  "generator_queue": 320,
+  "generator_workers": 160,
+  "note": "Prepared fixed-policy single-node lookup/mixed workload subset. Null image/candidate revision fields are deliberately unresolved until builds from the final committed sources exist. Both arms use identical fixed admission; this isolates implementation overhead. This plan does not qualify lane isolation, dense/graph/aggregate work, remote ownership or write recovery. Record actual storage class and retain build receipts before running. Untouched legacy-default UX comparisons require a separate plan.",
+  "open_factors": [
+    0.5,
+    0.8,
+    1.0,
+    1.25,
+    2.0
+  ],
+  "overload_seconds": 60,
+  "purpose": "qualification",
+  "recovery_seconds": 60,
+  "request_timeout": 30,
+  "runs": 3,
+  "runtime": "docker",
+  "schema": 1,
+  "seconds": 300,
+  "storage_description": "REPLACE_WITH_ACTUAL_HOST_DISK_AND_FILESYSTEM",
+  "tier": "starter",
+  "warmup_seconds": 60,
+  "workloads": [
+    {
+      "name": "lookup",
+      "query_percent_of_reads": 0,
+      "read_percent": 100
+    },
+    {
+      "name": "mixed90",
+      "query_percent_of_reads": 50,
+      "read_percent": 90
+    },
+    {
+      "name": "mixed50",
+      "query_percent_of_reads": 50,
+      "read_percent": 50
+    }
+  ]
+}
