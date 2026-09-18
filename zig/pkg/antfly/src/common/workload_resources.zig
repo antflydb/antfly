@@ -118,6 +118,16 @@ pub fn Lease(comptime kind: Kind) type {
             return (try self.owner.entry(self.handle, kind)).bundle;
         }
 
+        /// Return unused memory credits only after actual storage is released.
+        pub fn shrinkRetained(self: *@This(), bytes: u64) !void {
+            self.owner.lock();
+            defer self.owner.mutex.unlock();
+            const owned = try self.owner.entry(self.handle, kind);
+            if (bytes > owned.bundle.retained_bytes) return error.InvalidLease;
+            owned.bundle.retained_bytes -= bytes;
+            self.owner.uncharge(owned.lane, .{ .retained_bytes = bytes });
+        }
+
         /// At an audited handoff, replace queue/runnable/state ownership without
         /// an uncharged interval or an extra metadata slot. `bundle` describes
         /// the complete new ownership, including all state still retained.
@@ -138,6 +148,16 @@ pub fn Lease(comptime kind: Kind) type {
             if (kind == .request or kind == .runnable or kind == .queue or kind == .resume_queue)
                 @compileError("request execution cannot detach from its lifetime owner");
             const handle = try self.owner.detach(self.handle, kind, destination);
+            self.handle.generation = 0;
+            return .{ .owner = self.owner, .handle = handle };
+        }
+
+        /// Keep the current lane while detaching, atomically with a concurrent
+        /// request demotion. A separate lane lookup could resurrect old charges.
+        pub fn detachCurrent(self: *@This()) !@This() {
+            if (kind == .request or kind == .runnable or kind == .queue or kind == .resume_queue)
+                @compileError("request execution cannot detach from its lifetime owner");
+            const handle = try self.owner.detach(self.handle, kind, null);
             self.handle.generation = 0;
             return .{ .owner = self.owner, .handle = handle };
         }
@@ -313,10 +333,11 @@ pub const Ledger = struct {
         owned.bundle = next;
     }
 
-    fn detach(self: *Ledger, handle: Handle, kind: Kind, destination: Lane) !Handle {
+    fn detach(self: *Ledger, handle: Handle, kind: Kind, requested_destination: ?Lane) !Handle {
         self.lock();
         defer self.mutex.unlock();
         const owned = try self.entry(handle, kind);
+        const destination = requested_destination orelse owned.lane;
         if (owned.generation == std.math.maxInt(u64)) return error.GenerationExhausted;
         var proposed = self.used;
         proposed[@intFromEnum(owned.lane)] = proposed[@intFromEnum(owned.lane)].sub(owned.bundle);

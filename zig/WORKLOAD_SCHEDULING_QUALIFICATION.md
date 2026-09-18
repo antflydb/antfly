@@ -4,6 +4,19 @@ This is the release matrix and acceptance policy selected before measuring the
 new scheduling policies. No row is qualified yet. Admission unit tests and the
 HTTP C80 fixture do not substitute for these workloads.
 
+Kubernetes is not a prerequisite. Run scheduler correctness in deterministic
+tests, real-runtime behavior in direct processes, and resource/performance gates
+in Docker containers with explicit CPU, memory, and swap limits matching the
+packages below. Direct multi-process/container clusters can exercise remote
+accounting and failure schedules without an operator or Kubernetes networking.
+
+The optional [kind environment](WORKLOAD_SCHEDULING_KIND.md) covers deployment
+integration: operator reconciliation, pod lifecycle, PVCs, service routing, and
+deployment-level HA/recovery. It applies package envelopes, checks Docker's
+aggregate capacity, verifies effective cgroup limits, and retains evidence.
+Its local-path storage and shared host are recorded qualification conditions.
+Keep those integration results separate from direct-container scheduling results.
+
 ## Cloud resource envelopes
 
 The Cloud tier catalog at revision `bdc9fe51`, inspected September 17, 2026,
@@ -36,6 +49,12 @@ overlap exclusion for unaudited/non-yielding operators rather than claiming
 latency isolation from weights alone.
 
 ## Workloads and measurements
+
+Use Debug for iteration, deterministic/model tests, allocation failure, and
+cancellation/ownership checks. Add ReleaseSafe coverage for optimized execution
+with safety checks. Neither Kubernetes nor ReleaseFast is required for those
+correctness tests. Reserve ReleaseFast for final production smoke tests and
+performance qualification while it is the shipped optimization mode.
 
 Use the same binary optimization, data, query semantics, and recall setting for
 baseline and candidate. Pin their revisions and configuration in every receipt.

@@ -82,6 +82,23 @@ for resource-manager allocation reservations, worker fencing, or durable write
 recovery. Production operators do not use this scheduler yet. Their integration
 must supply audited completion bundles and separately charged actual allocations.
 
+`storage/workload_memory.zig` connects an allocation owner to both the class
+ledger and `ResourceManager`. It reserves both without waiting or invoking
+reclaimers while holding a partial bundle, rolls back failed grants/allocations,
+and preserves pinned minimum completion memory across suspend/resume. Actual
+freeing precedes returning byte credits. This adapter is tested but not yet
+installed on an operator path.
+
+`common/workload_attempts.zig` models bounded coordinator attempt ownership,
+pre-reserved reconciliation capacity, deadline-preserving retransmission, and
+destination isolation. A timeout does not release uncertain work. Authenticated
+terminal/quiescence evidence reconciles once; delayed evidence cannot reopen a
+fenced generation. Restart begins with dispatch disabled until each destination
+acknowledges the previous generation is fenced and quiescent. Wire encoding,
+worker deduplication/expiry, membership evidence, and shutdown/restart integration
+remain necessary before enabling it. The module does not claim that an ordinary
+HTTP error proves remote retirement.
+
 ## Configuration
 
 The canonical schema exposes `admission.query.waiting` and
@@ -170,3 +187,7 @@ Passing queue correctness tests does not satisfy the full design's release gates
 Automatic/adaptive modes and new default waiting policies remain unavailable.
 The [qualification matrix](WORKLOAD_SCHEDULING_QUALIFICATION.md) records actual
 Cloud package sizes and numerical release thresholds selected before measurement.
+Debug is the normal development correctness gate; final performance runs use
+the shipped optimization mode. The optional kind helper is deployment integration
+tooling, with offline rendering/unit coverage so far; scheduler development and
+direct-container qualification do not wait for it.
