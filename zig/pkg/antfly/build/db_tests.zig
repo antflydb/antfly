@@ -347,6 +347,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db split cutover preserves enrichment resume and fencing across reopen",
         "storage.db.db.test.db merge-style cutover fences enrichment to the merged receiver range",
         "storage.db.db.test.db merge-style cutover preserves enrichment resume and fencing across reopen",
+        "db blocked dense embedding lane does not force the independent asset lane to redo checkpointed work",
+        "combined replay cursor gate requires every execution lane to cover a group",
+        "each execution lane persists and clears its own replay cursor scope",
     };
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = antfly_test_mod,

@@ -88910,6 +88910,96 @@ test "db retryable asset producer batches do not block independent dense publica
     try std.testing.expect(gated_asset.successful_requests.load(.acquire) != 0);
 }
 
+test "db blocked dense embedding lane does not force the independent asset lane to redo checkpointed work" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var gated_dense = GateDenseEmbedder{};
+    gated_dense.allowed_successes.store(0, .release);
+    var gated_asset = GateAssetProducer{};
+    gated_asset.allowAll();
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = gated_asset.interface(),
+            .dense_embedder = gated_dense.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    try db.addIndex(.{
+        .name = "title_dense",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"title\":\"independent title\",\"body\":\"available summary source\"}",
+        }},
+        .sync_level = .write,
+    });
+
+    // The dense lane is blocked from the first attempt onward. The
+    // asset-producer lane is an independent execution lane with its own
+    // window and replay cursor (scope "generated.assets"), so it must
+    // publish and checkpoint without waiting on the still-failing dense
+    // lane (scope "generated.dense"). See "Two-Stream Execution Model" in
+    // ENRICHMENTS.md.
+    var asset_published = false;
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        if (gated_dense.blocked_requests.load(.acquire) != 0 and
+            gated_asset.successful_requests.load(.acquire) != 0)
+        {
+            asset_published = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    try std.testing.expect(asset_published);
+    const first_asset_successes = gated_asset.successful_requests.load(.acquire);
+
+    // The asset lane's own replay cursor is durable even though the dense
+    // lane, which never completed a batch, has none: this is only true of
+    // the per-stream design. Under the historical single shared cursor, no
+    // cursor would exist under either scope until *both* lanes published.
+    const assets_cursor = try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.assets");
+    try std.testing.expect(assets_cursor != null);
+    var owned_assets_cursor = assets_cursor.?;
+    owned_assets_cursor.deinit(alloc);
+
+    gated_dense.allowAll();
+    try db.runUntilIdle();
+
+    var result = try db.search(alloc, .{
+        .index_name = "title_dense",
+        .dense = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    // The already-checkpointed asset lane is not redone once the sibling
+    // dense lane finally publishes.
+    try std.testing.expectEqual(first_asset_successes, gated_asset.successful_requests.load(.acquire));
+}
+
 test "db managed dense enrichment retries temporary model capacity without terminal coverage" {
     const alloc = std.testing.allocator;
 

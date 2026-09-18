@@ -155,6 +155,77 @@ worker resumes after the exact last published document instead of replaying the
 beginning of a large ingestion batch; a missing, stale, or corrupt cursor is
 discarded and safely repeats work from the authoritative applied sequence.
 
+### Two-Stream Execution Model
+
+Within one preparation quantum, the asset-producer (extraction, for example
+GLiNER2) and dense-embedding (for example Qwen3) producer classes run as two
+independent execution lanes instead of one strictly sequential
+extract-then-embed pipeline. Each lane:
+
+- keeps its own model resident and issues consecutive provider batches
+  without waiting on the other lane's round trip,
+- owns a private `GeneratedReplayWindow` so its writes never interleave with
+  the sibling lane's writes,
+- publishes that window as its own durable batch as soon as its own work is
+  ready, and
+- checkpoints its own replay cursor scope (`generated.assets` for the asset
+  lane, `generated.dense` for the dense lane) immediately after its own
+  publish succeeds, independent of the sibling lane's progress.
+
+Both lanes are handed the same document group's classified work and, when
+both have real work for the quantum, are scheduled with `Io.concurrent` so
+their provider round trips overlap; the calling task runs the dense lane
+inline while awaiting the concurrently spawned asset lane. If the `Io`
+backend does not support concurrency (for example a deterministic
+single-flow VOPR/simulation harness), both lanes still run, just
+sequentially, with identical outcomes -- concurrency is a scheduling
+optimization, not a correctness requirement. In-flight work is bounded to
+exactly one preparation quantum per lane (no deeper cross-quantum
+pipelining in this slice), so memory stays bounded to today's window sizes
+without new configuration.
+
+Replay skip-ahead on the next pass still requires *both* per-stream cursors
+to cover a document group before that group is skipped
+(`replayCursorsCoverGroup`); a group covered by only one lane's cursor is
+re-derived (cheaply, since chunk/document parsing is not the bottleneck) so
+the lagging lane's work is retried. The final `applied_sequence` watermark --
+the actual crash-recovery/visibility boundary -- still only advances after
+*every* group in the pass has been fully handled by both lanes; per-stream
+cursors are a resume optimization layered on top of that unchanged
+durability contract, not a new source of truth. As already documented above,
+a cursor (of either stream) is purely an optimization: the underlying
+artifact-level source-hash skip checks make re-deriving a group's work safe
+and idempotent even when a stale or missing cursor forces a redo.
+
+One behavior changed deliberately from the historical strictly-sequential
+implementation: a fatal (non-retryable) error in one lane no longer aborts
+the sibling lane's attempt within the same quantum. Previously, a fatal
+asset-producer error skipped the dense-embedding stage entirely for that
+quantum; now both lanes still run to completion (each independently safe
+and crash-idempotent) before the fatal error propagates to the replay pass.
+Retryable-failure handling is unchanged: each producer class remains an
+independent availability domain, and a retryable failure in one lane never
+discards the sibling lane's successful, durably published output.
+
+Model residency across the two lanes relies on the embedded inference node
+being configured with an unbounded model cache (`max_loaded_models = 0` for
+Lite's `createEmbeddedInferenceNode`, see `standalone/inference_provider.zig`)
+specifically so an interleaved/concurrent extract+embed workload does not
+evict and reload either model between batches. The worker-subprocess RPC
+transport (`standalone/inference_worker.zig`, `inference_worker_rpc.zig`)
+already multiplexes concurrent in-flight requests by request ID over one
+pipe pair, so the two lanes' provider calls can be genuinely in flight at
+the same time without any transport-level change.
+
+Follow-up (out of this slice's ownership): per-batch measurements on the
+dogfood corpus showed embed/extract batches taking roughly 1.6-2x their
+direct-call-baseline time at the same batch size, pointing at fixed
+per-call overhead inside the linked inference runtime invocation path
+(`zig/pkg/inference/**`) rather than in the enrichment runtime or the RPC
+transport. Closing that gap on top of this concurrency change is likely
+necessary to fully reach the direct-call baseline wall time on large
+corpora; see the handoff note left for that ownership area.
+
 Lazy HBC posting centroid and quantized-payload freshness is a separate,
 bounded maintenance concern. Dirty posting caches remain exactly searchable by
 falling back to member scoring/recomputation and drain through the background

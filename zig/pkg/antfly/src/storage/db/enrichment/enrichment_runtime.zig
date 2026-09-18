@@ -284,6 +284,24 @@ pub const StatusHook = struct {
 };
 
 pub const scope_name = "generated";
+/// The asset-producer (extraction) and dense-embedding execution lanes are
+/// independent providers with independent models and independent recovery
+/// history. Each keeps its own replay cursor, scoped under `scope_name`, so
+/// one lane's checkpoint never depends on the other lane's completion. See
+/// "Two-Stream Execution Model" in ENRICHMENTS.md.
+const ReplayStream = enum {
+    assets,
+    dense,
+
+    fn cursorScope(self: ReplayStream) []const u8 {
+        return switch (self) {
+            .assets => assets_replay_cursor_scope,
+            .dense => dense_replay_cursor_scope,
+        };
+    }
+};
+const assets_replay_cursor_scope = scope_name ++ ".assets";
+const dense_replay_cursor_scope = scope_name ++ ".dense";
 const writer_locked_retry_count: usize = 1000;
 const writer_locked_retry_sleep_ns: u64 = 100_000;
 const generated_replay_default_window_items: usize = 2048;
@@ -530,6 +548,76 @@ test "enrichment replay cursor is sequence and document ordered" {
     try std.testing.expect(!replayCursorCoversGroup(cursor, 10, .{ .sequence = 12, .doc_key = "doc:n" }));
     try std.testing.expect(!replayCursorCoversGroup(cursor, 10, .{ .sequence = 13, .doc_key = "doc:a" }));
     try std.testing.expect(!replayCursorCoversGroup(cursor, 9, .{ .sequence = 11, .doc_key = "doc:a" }));
+}
+
+test "combined replay cursor gate requires every execution lane to cover a group" {
+    const assets_cursor = enrichment_state.ReplayCursor{
+        .base_applied_sequence = 5,
+        .sequence = 20,
+        .doc_key = @constCast("doc:m"),
+    };
+    const dense_cursor = enrichment_state.ReplayCursor{
+        .base_applied_sequence = 5,
+        .sequence = 10,
+        .doc_key = @constCast("doc:z"),
+    };
+    // The asset lane is far ahead of the dense lane; the combined gate must
+    // not let a lagging lane's work be skipped just because its sibling
+    // lane already published independently.
+    try std.testing.expect(!replayCursorsCoverGroup(assets_cursor, dense_cursor, 5, .{ .sequence = 15, .doc_key = "doc:a" }));
+    try std.testing.expect(!replayCursorsCoverGroup(assets_cursor, null, 5, .{ .sequence = 1, .doc_key = "doc:a" }));
+    try std.testing.expect(replayCursorsCoverGroup(assets_cursor, dense_cursor, 5, .{ .sequence = 9, .doc_key = "doc:a" }));
+}
+
+test "each execution lane persists and clears its own replay cursor scope" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+
+    const group: enrichment_worker.PendingDocumentGroup = .{ .sequence = 4, .doc_key = "doc:a" };
+    // The asset lane checkpoints on its own; the sibling dense scope stays
+    // absent until the dense lane independently publishes.
+    try saveReplayCursorForGroup(&runtime, .assets, 1, group);
+    {
+        const loaded = try loadReplayCursorForPass(&runtime, 1, .assets);
+        try std.testing.expect(loaded != null);
+        var owned = loaded.?;
+        owned.deinit(alloc);
+    }
+    try std.testing.expect((try loadReplayCursorForPass(&runtime, 1, .dense)) == null);
+
+    try saveReplayCursorForGroup(&runtime, .dense, 1, group);
+    {
+        const loaded = try loadReplayCursorForPass(&runtime, 1, .dense);
+        try std.testing.expect(loaded != null);
+        var owned = loaded.?;
+        owned.deinit(alloc);
+    }
+
+    // A full pass completion clears both streams' checkpoints together.
+    try clearReplayCursorWithRetry(&runtime);
+    try std.testing.expect((try loadReplayCursorForPass(&runtime, 1, .assets)) == null);
+    try std.testing.expect((try loadReplayCursorForPass(&runtime, 1, .dense)) == null);
 }
 
 fn generatedEmbedBatchItems() usize {
@@ -3989,8 +4077,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         try scavengeSharedPdfConsumerAttempts(self);
         const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.replay_source, self.applied_sequence);
         defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
-        var replay_cursor = try loadReplayCursorForPass(self, self.applied_sequence);
-        defer if (replay_cursor) |*cursor| cursor.deinit(self.alloc);
+        var replay_cursor_assets = try loadReplayCursorForPass(self, self.applied_sequence, .assets);
+        defer if (replay_cursor_assets) |*cursor| cursor.deinit(self.alloc);
+        var replay_cursor_dense = try loadReplayCursorForPass(self, self.applied_sequence, .dense);
+        defer if (replay_cursor_dense) |*cursor| cursor.deinit(self.alloc);
 
         var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
         defer freeWorkerChunkCache(self.alloc, &chunk_cache);
@@ -4013,7 +4103,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         for (pending) |group| {
             try guard.check();
             max_seen = @max(max_seen, group.sequence);
-            if (replayCursorCoversGroup(replay_cursor, self.applied_sequence, group)) continue;
+            if (replayCursorsCoverGroup(replay_cursor_assets, replay_cursor_dense, self.applied_sequence, group)) continue;
             try processPendingDocumentGroup(self, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count, guard);
             last_processed = group;
             if (deferredGeneratedWorkShouldFlush(
@@ -4022,16 +4112,16 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 deferred_assets.items.len,
                 max_preparation_items,
             )) {
-                try flushDeferredGeneratedWork(self, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window);
-                try saveReplayCursorForGroup(self, self.applied_sequence, group);
+                // Cursor checkpoints are saved per-lane inside
+                // flushDeferredGeneratedWork as each stream durably publishes.
+                try flushDeferredGeneratedWork(self, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, self.applied_sequence, group);
             } else if (window.itemCount() >= max_window_items) {
                 try flushGeneratedReplayWindow(self, &window);
-                try saveReplayCursorForGroup(self, self.applied_sequence, group);
+                try saveReplayCursorForGroupBothStreams(self, self.applied_sequence, group);
             }
         }
         try guard.check();
-        try flushDeferredGeneratedWork(self, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window);
-        if (last_processed) |group| try saveReplayCursorForGroup(self, self.applied_sequence, group);
+        try flushDeferredGeneratedWork(self, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, self.applied_sequence, last_processed);
         if (pending.len == 0) {
             max_seen = sequence;
         }
@@ -6309,8 +6399,10 @@ fn runForegroundCatchUpPassOwned(
     try scavengeSharedPdfConsumerAttempts(runtime);
     const pending = try enrichment_worker.collectPendingDocumentGroups(runtime.alloc, runtime.replay_source, runtime.applied_sequence);
     defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
-    var replay_cursor = try loadReplayCursorForPass(runtime, runtime.applied_sequence);
-    defer if (replay_cursor) |*cursor| cursor.deinit(runtime.alloc);
+    var replay_cursor_assets = try loadReplayCursorForPass(runtime, runtime.applied_sequence, .assets);
+    defer if (replay_cursor_assets) |*cursor| cursor.deinit(runtime.alloc);
+    var replay_cursor_dense = try loadReplayCursorForPass(runtime, runtime.applied_sequence, .dense);
+    defer if (replay_cursor_dense) |*cursor| cursor.deinit(runtime.alloc);
     try guard.check();
 
     var processed_request_count: u64 = 0;
@@ -6340,7 +6432,7 @@ fn runForegroundCatchUpPassOwned(
         for (pending) |group| {
             try guard.check();
             max_seen = @max(max_seen, group.sequence);
-            if (replayCursorCoversGroup(replay_cursor, runtime.applied_sequence, group)) continue;
+            if (replayCursorsCoverGroup(replay_cursor_assets, replay_cursor_dense, runtime.applied_sequence, group)) continue;
             processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count, guard) catch |err| {
                 if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
                 // The embedder already performed its bounded inline retry
@@ -6356,11 +6448,12 @@ fn runForegroundCatchUpPassOwned(
                 deferred_assets.items.len,
                 max_preparation_items,
             )) {
-                flushDeferredGeneratedWork(runtime, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window) catch |err| {
+                // Cursor checkpoints are saved per-lane inside
+                // flushDeferredGeneratedWork as each stream durably publishes.
+                flushDeferredGeneratedWork(runtime, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, runtime.applied_sequence, group) catch |err| {
                     if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
                     return err;
                 };
-                try saveReplayCursorForGroup(runtime, runtime.applied_sequence, group);
             } else {
                 const publish_window = window.itemCount() >= max_window_items;
                 flushGeneratedReplayWindowIfNeeded(runtime, &window, max_window_items) catch |err| {
@@ -6368,16 +6461,15 @@ fn runForegroundCatchUpPassOwned(
                     return err;
                 };
                 if (publish_window) {
-                    try saveReplayCursorForGroup(runtime, runtime.applied_sequence, group);
+                    try saveReplayCursorForGroupBothStreams(runtime, runtime.applied_sequence, group);
                 }
             }
         }
         try guard.check();
-        flushDeferredGeneratedWork(runtime, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window) catch |err| {
+        flushDeferredGeneratedWork(runtime, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, runtime.applied_sequence, last_processed) catch |err| {
             if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
             return err;
         };
-        if (last_processed) |group| try saveReplayCursorForGroup(runtime, runtime.applied_sequence, group);
         break;
     }
     if (pending.len == 0) {
@@ -10561,10 +10653,100 @@ fn processPendingDocumentGroup(
     }
 }
 
+/// The asset-producer (extraction, e.g. GLiNER2) execution lane. Owns a
+/// private window and replay cursor scope so it can publish independently of
+/// the dense-embedding lane; see "Two-Stream Execution Model" in
+/// ENRICHMENTS.md.
+const AssetExecutionLane = struct {
+    runtime: *EnrichmentRuntime,
+    requests: []const enrichment_types.GeneratedEnrichmentRequest,
+    window: GeneratedReplayWindow,
+    applied_sequence: u64,
+    group: ?enrichment_worker.PendingDocumentGroup,
+
+    fn run(self: *AssetExecutionLane) !void {
+        if (runtimeShuttingDown(self.runtime)) return error.EnrichmentRetryAborted;
+        var deferred_retry_error: ?anyerror = null;
+        var deferred_retry_fingerprint: u64 = 0;
+        if (self.requests.len > 0) {
+            processDeferredAssets(self.runtime, self.requests, &self.window) catch |err| {
+                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                    return err;
+                deferred_retry_error = err;
+                deferred_retry_fingerprint = self.runtime.active_failure_fingerprint;
+            };
+        }
+        try flushGeneratedReplayWindow(self.runtime, &self.window);
+        if (deferred_retry_error) |err| {
+            // The source cursor remains unchanged until this lane's next
+            // durable publish, so the failed request is retried and this
+            // quantum's successful writes remain crash-idempotent.
+            restoreDeferredRequestRetryAuthorization(self.runtime, deferred_retry_fingerprint);
+            return err;
+        }
+        if (self.group) |group| try saveReplayCursorForGroup(self.runtime, .assets, self.applied_sequence, group);
+    }
+};
+
+/// The dense-embedding execution lane (plain-document and chunked sources).
+/// Owns a private window and replay cursor scope, independent of the sibling
+/// asset-producer lane.
+const DenseExecutionLane = struct {
+    runtime: *EnrichmentRuntime,
+    plain_dense: []const enrichment_types.GeneratedEnrichmentRequest,
+    chunked_dense: []const enrichment_types.GeneratedEnrichmentRequest,
+    chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
+    window: GeneratedReplayWindow,
+    applied_sequence: u64,
+    group: ?enrichment_worker.PendingDocumentGroup,
+
+    fn run(self: *DenseExecutionLane) !void {
+        if (runtimeShuttingDown(self.runtime)) return error.EnrichmentRetryAborted;
+        var deferred_retry_error: ?anyerror = null;
+        var deferred_retry_fingerprint: u64 = 0;
+        if (self.plain_dense.len > 0) {
+            processPlainDenseWindow(self.runtime, self.plain_dense, &self.window) catch |err| {
+                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                    return err;
+                deferred_retry_error = err;
+                deferred_retry_fingerprint = self.runtime.active_failure_fingerprint;
+            };
+        }
+        try flushGeneratedReplayWindow(self.runtime, &self.window);
+        if (runtimeShuttingDown(self.runtime)) return error.EnrichmentRetryAborted;
+        if (self.chunked_dense.len > 0) {
+            processChunkedDenseWindow(self.runtime, self.chunked_dense, self.chunk_cache, &self.window) catch |err| {
+                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
+                    return err;
+                if (deferred_retry_error == null) {
+                    deferred_retry_error = err;
+                    deferred_retry_fingerprint = self.runtime.active_failure_fingerprint;
+                }
+            };
+        }
+        try flushGeneratedReplayWindow(self.runtime, &self.window);
+        if (deferred_retry_error) |err| {
+            restoreDeferredRequestRetryAuthorization(self.runtime, deferred_retry_fingerprint);
+            return err;
+        }
+        if (self.group) |group| try saveReplayCursorForGroup(self.runtime, .dense, self.applied_sequence, group);
+    }
+};
+
 /// Finish one bounded preparation quantum and publish all output before
 /// inspecting more source documents. Request and chunk caches own the strings
 /// borrowed by the deferred queues, so they are cleared only after every queue
-/// has completed and the derived window is durable.
+/// has completed and both derived windows are durable.
+///
+/// The asset-producer (extraction) and dense-embedding classes run as two
+/// independent execution lanes so each provider's model stays resident and
+/// serves consecutive batches without waiting on the other's round trip. Each
+/// lane owns a private `GeneratedReplayWindow` and publishes (and checkpoints
+/// its own replay cursor) as soon as its own work is durable -- neither lane
+/// blocks on the other's completion. A fatal (non-retryable) error in one
+/// lane no longer prevents the sibling lane's independent, crash-idempotent
+/// work from being attempted and published in the same quantum; see
+/// "Two-Stream Execution Model" in ENRICHMENTS.md.
 fn flushDeferredGeneratedWork(
     runtime: *EnrichmentRuntime,
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
@@ -10573,52 +10755,73 @@ fn flushDeferredGeneratedWork(
     deferred_chunked_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     deferred_assets: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     window: *GeneratedReplayWindow,
+    applied_sequence: u64,
+    group: ?enrichment_worker.PendingDocumentGroup,
 ) !void {
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-    var deferred_retry_error: ?anyerror = null;
-    var deferred_retry_fingerprint: u64 = 0;
-    processDeferredAssets(runtime, deferred_assets.items, window) catch |err| {
-        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
-            return err;
-        deferred_retry_error = err;
-        deferred_retry_fingerprint = runtime.active_failure_fingerprint;
+    // Publish any synchronous inline writes (chunk_text, sparse_embedding, and
+    // copy/document_extraction assets) the single-threaded scan already
+    // accumulated in the shared window before the two independent lanes
+    // below start, each with its own private window.
+    try flushGeneratedReplayWindow(runtime, window);
+
+    var asset_lane = AssetExecutionLane{
+        .runtime = runtime,
+        .requests = deferred_assets.items,
+        .window = .{ .alloc = runtime.alloc },
+        .applied_sequence = applied_sequence,
+        .group = group,
     };
+    defer asset_lane.window.deinit();
+    var dense_lane = DenseExecutionLane{
+        .runtime = runtime,
+        .plain_dense = deferred_plain_dense.items,
+        .chunked_dense = deferred_chunked_dense.items,
+        .chunk_cache = chunk_cache,
+        .window = .{ .alloc = runtime.alloc },
+        .applied_sequence = applied_sequence,
+        .group = group,
+    };
+    defer dense_lane.window.deinit();
+
+    var asset_result: anyerror!void = {};
+    var dense_result: anyerror!void = {};
+    // Only worth a concurrent task when both lanes have real provider work to
+    // overlap; an empty lane's own run() call is a cheap no-op either way.
+    const both_lanes_have_work = asset_lane.requests.len > 0 and
+        (dense_lane.plain_dense.len > 0 or dense_lane.chunked_dense.len > 0);
+
+    if (both_lanes_have_work) {
+        const io = if (runtime.io_impl) |impl| impl.io() else std.Io.Threaded.global_single_threaded.io();
+        if (io.concurrent(AssetExecutionLane.run, .{&asset_lane})) |spawned| {
+            var future = spawned;
+            dense_result = DenseExecutionLane.run(&dense_lane);
+            asset_result = future.await(io);
+        } else |_| {
+            // This Io backend does not support concurrency (for example a
+            // deterministic single-flow simulation harness). Fall back to the
+            // historical strictly sequential order; correctness is
+            // unaffected, only the overlap is lost.
+            asset_result = AssetExecutionLane.run(&asset_lane);
+            dense_result = DenseExecutionLane.run(&dense_lane);
+        }
+    } else {
+        asset_result = AssetExecutionLane.run(&asset_lane);
+        dense_result = DenseExecutionLane.run(&dense_lane);
+    }
+
     deferred_assets.clearRetainingCapacity();
-    // Each producer class is an independent availability domain. Publish a
-    // completed class before invoking the next provider so a retryable outage
-    // cannot discard useful sibling output accumulated in this replay
-    // quantum. The source cursor remains unchanged until every class has been
-    // visited, so the failed request is retried and successful writes remain
-    // crash-idempotent.
-    try flushGeneratedReplayWindow(runtime, window);
-    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-    processPlainDenseWindow(runtime, deferred_plain_dense.items, window) catch |err| {
-        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
-            return err;
-        if (deferred_retry_error == null) {
-            deferred_retry_error = err;
-            deferred_retry_fingerprint = runtime.active_failure_fingerprint;
-        }
-    };
     deferred_plain_dense.clearRetainingCapacity();
-    try flushGeneratedReplayWindow(runtime, window);
-    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-    processChunkedDenseWindow(runtime, deferred_chunked_dense.items, chunk_cache, window) catch |err| {
-        if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
-            return err;
-        if (deferred_retry_error == null) {
-            deferred_retry_error = err;
-            deferred_retry_fingerprint = runtime.active_failure_fingerprint;
-        }
-    };
     deferred_chunked_dense.clearRetainingCapacity();
-    try flushGeneratedReplayWindow(runtime, window);
     clearWorkerChunkCache(runtime.alloc, chunk_cache);
     clearRequestPlanCache(runtime.alloc, request_plan_cache);
-    if (deferred_retry_error) |err| {
-        restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
-        return err;
-    }
+
+    // Preserve the historical error priority (assets, then dense) for
+    // whichever representative error a lane returns. Each lane has already
+    // recorded its own retry authorization and cursor state before
+    // returning, independent of the other lane's outcome.
+    asset_result catch |err| return err;
+    dense_result catch |err| return err;
 }
 
 fn processAsset(
@@ -26223,10 +26426,11 @@ fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, 
 fn loadReplayCursorForPass(
     runtime: *EnrichmentRuntime,
     applied_sequence: u64,
+    stream: ReplayStream,
 ) !?enrichment_state.ReplayCursor {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        const loaded = enrichment_state.loadReplayCursor(runtime.alloc, runtime.store, scope_name) catch |err| switch (err) {
+        const loaded = enrichment_state.loadReplayCursor(runtime.alloc, runtime.store, stream.cursorScope()) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -26236,8 +26440,8 @@ fn loadReplayCursorForPass(
                 // A cursor is only an optimization. Corruption must never
                 // fabricate progress or strand the worker; discard it and
                 // replay idempotently from the authoritative applied fence.
-                std.log.warn("discarding corrupt enrichment replay cursor", .{});
-                try clearReplayCursorWithRetry(runtime);
+                std.log.warn("discarding corrupt enrichment replay cursor stream={s}", .{@tagName(stream)});
+                try clearReplayCursorForStreamWithRetry(runtime, stream);
                 return null;
             },
             else => return err,
@@ -26246,7 +26450,7 @@ fn loadReplayCursorForPass(
             if (cursor.base_applied_sequence == applied_sequence) return cursor;
             var stale = cursor;
             stale.deinit(runtime.alloc);
-            try clearReplayCursorWithRetry(runtime);
+            try clearReplayCursorForStreamWithRetry(runtime, stream);
         }
         return null;
     }
@@ -26263,14 +26467,29 @@ fn replayCursorCoversGroup(
     return std.mem.order(u8, group.doc_key, value.doc_key) != .gt;
 }
 
+/// A group is safe to skip re-deriving only once every independent execution
+/// lane has durably published through it. Each lane still advances its own
+/// cursor on its own schedule; this is only the combined skip gate used at
+/// the top of a replay pass.
+fn replayCursorsCoverGroup(
+    assets_cursor: ?enrichment_state.ReplayCursor,
+    dense_cursor: ?enrichment_state.ReplayCursor,
+    applied_sequence: u64,
+    group: enrichment_worker.PendingDocumentGroup,
+) bool {
+    return replayCursorCoversGroup(assets_cursor, applied_sequence, group) and
+        replayCursorCoversGroup(dense_cursor, applied_sequence, group);
+}
+
 fn saveReplayCursorForGroup(
     runtime: *EnrichmentRuntime,
+    stream: ReplayStream,
     applied_sequence: u64,
     group: enrichment_worker.PendingDocumentGroup,
 ) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        enrichment_state.saveReplayCursor(runtime.store, scope_name, .{
+        enrichment_state.saveReplayCursor(runtime.store, stream.cursorScope(), .{
             .base_applied_sequence = applied_sequence,
             .sequence = group.sequence,
             .doc_key = @constCast(group.doc_key),
@@ -26286,10 +26505,23 @@ fn saveReplayCursorForGroup(
     }
 }
 
-fn clearReplayCursorWithRetry(runtime: *EnrichmentRuntime) !void {
+/// Used where no execution lane owns the checkpoint exclusively: a purely
+/// synchronous quantum (chunk_text/sparse_embedding/copy/document_extraction
+/// only, no deferred asset or dense-embedding work) has nothing lane-specific
+/// to publish independently, so both streams' cursors advance together.
+fn saveReplayCursorForGroupBothStreams(
+    runtime: *EnrichmentRuntime,
+    applied_sequence: u64,
+    group: enrichment_worker.PendingDocumentGroup,
+) !void {
+    try saveReplayCursorForGroup(runtime, .assets, applied_sequence, group);
+    try saveReplayCursorForGroup(runtime, .dense, applied_sequence, group);
+}
+
+fn clearReplayCursorForStreamWithRetry(runtime: *EnrichmentRuntime, stream: ReplayStream) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        enrichment_state.clearReplayCursor(runtime.store, scope_name) catch |err| switch (err) {
+        enrichment_state.clearReplayCursor(runtime.store, stream.cursorScope()) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -26299,6 +26531,11 @@ fn clearReplayCursorWithRetry(runtime: *EnrichmentRuntime) !void {
         };
         return;
     }
+}
+
+fn clearReplayCursorWithRetry(runtime: *EnrichmentRuntime) !void {
+    try clearReplayCursorForStreamWithRetry(runtime, .assets);
+    try clearReplayCursorForStreamWithRetry(runtime, .dense);
 }
 
 fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, status: enrichment_state.RuntimeStatus) !void {
