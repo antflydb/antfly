@@ -590,3 +590,46 @@ previous ceilings. The actual data-runtime owning target passed both listener
 configuration tests with no leaks and actual exit zero
 (`/tmp/workload-ingress-transport-capacity.log`). This wiring change does not
 yet qualify native C40/C80 or protect lanes at transport dispatch.
+
+
+### Frontend C40/C80 correctness after listener capacity wiring
+
+The strengthened frontend cell passed on frozen Debug product
+`3eea19e0277b4edf4df70ec82b991d657350d0ed`, binary
+`/tmp/workload-transport-3eea19e027-antfly`, SHA256
+`5f94c71d37b309f3b21d622ce42db343dc7b68190dfda5f5e82bc4cc60539aa8`.
+The production build exited zero; its receipt is
+`/tmp/workload-transport-3ee-production-debug-receipt.json`. This artifact
+predates integrated WAL fix `b7a751239a` and protected transport task partitions.
+
+The native run exited zero and retained
+`/tmp/workload-frontend-3eea19e027-receipts` (21/21 checksums reverified).
+C40 produced 12 exact successful reads and 28 structured HTTP 429 responses;
+C80 produced 12 exact reads and 68 structured 429 responses. Rejections carried
+`AdmissionQueueFull`, `reason=instance_busy`, `stage=admission`,
+`execution_started=false`, and `Retry-After: 1`. There were no unexpected
+HTTP statuses or transport failures. The assertions require successful reads
+and valid rejections, not these exact observed counts.
+
+Both bursts dispatched within their predeclared 100 ms generator bound:
+the last dispatch followed the common submission barrier by 1.644 ms and
+7.359 ms respectively. With query active=4 and queued=8 observed, API-listener
+`/healthz` and `/readyz` returned semantic `ok`/`ready` responses while twelve
+client calls remained pending before and after the probe pair. After healing
+the upstream delay, exact lookup plus stable idle ownership completed in
+1.289 s and 1.301 s, within the original ten-second recovery bound.
+
+All 75 sampled metric checks passed; maximum measured source age was
+0.313 s. Query peak active remained four, and final active, queued, outstanding,
+and retained-byte values were zero. Connection and request dispatch rejection
+counters stayed zero. Request-task capacity and reservation were both 144
+(128 API plus 16 health tasks). All three owned processes exited zero without
+forced termination or cleanup errors. General/control ingress gauges were not
+exported by this artifact; their configuration is retained, while metric checks
+cover the exported query, write, and recovery capacities.
+
+This isolates frontend correctness with remote attempts and backend read
+scheduling disabled. It demonstrates control progress during query saturation,
+not protected task or connection capacity under transport saturation. It is
+not throughput, Cloud resource-envelope, or release qualification. The earlier
+failed C40 receipt remains unchanged.
