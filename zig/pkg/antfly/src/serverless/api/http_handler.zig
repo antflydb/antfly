@@ -103,7 +103,7 @@ const SyncWaitCancellation = struct {
 
 /// Query execution checkpoints retain the deadline captured before admission.
 /// This borrowed scope ends only after synchronous execution and helpers join.
-const QueryDeadlineCancellation = struct {
+const RequestDeadlineCancellation = struct {
     upstream: CancellationToken,
     deadline_ns: ?u64,
 
@@ -261,6 +261,9 @@ pub const HttpHandler = struct {
     graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
     query_admission: RequestAdmission = RequestAdmission.init(common_config.default_query_max_concurrent_requests),
     write_admission: RequestAdmission = RequestAdmission.init(common_config.default_write_max_concurrent_requests),
+    // Request facades borrow diagnostics; the controllers themselves contain
+    // live locks and ownership and must never be copied into a facade.
+    admission_stats_source: ?*const HttpHandler = null,
 
     pub fn init(
         alloc: Allocator,
@@ -297,7 +300,7 @@ pub const HttpHandler = struct {
         var req = incoming;
         req.ensureActive() catch |err| return admissionFailureResponse(self.alloc, err);
         const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
-        const admission_class = http_routes.admissionClass(route);
+        const admission_class = http_routes.admissionClass(route, req.method);
         const admission: ?*RequestAdmission = switch (admission_class) {
             .none => null,
             .query => &self.query_admission,
@@ -310,7 +313,7 @@ pub const HttpHandler = struct {
             null;
         defer if (memory) |owner| owner.release();
         const request_alloc = if (memory) |owner| owner.allocator() else self.alloc;
-        if (admission_class == .query) {
+        if (admission_class != .none) {
             const RoutingBudget = @import("../../api/table_catalog.zig").RoutingBudget;
             req.deadline_ns = RoutingBudget.init(null).deadlineFrom(RoutingBudget.initIo(req.deadline_ns, req.deadline_io));
             req.deadline_io = null;
@@ -344,9 +347,9 @@ pub const HttpHandler = struct {
         defer if (admission_lease) |*lease| lease.release();
         req.ensureActive() catch |err| return admissionFailureResponse(self.alloc, err);
 
-        const query_deadline: QueryDeadlineCancellation = .{ .upstream = req.cancellation, .deadline_ns = req.deadline_ns };
-        if (admission_class == .query) req.cancellation = query_deadline.token();
-        var write_outcome: api_service.WriteOutcome = .{};
+        const request_deadline: RequestDeadlineCancellation = .{ .upstream = req.cancellation, .deadline_ns = req.deadline_ns };
+        if (admission_class != .none) req.cancellation = request_deadline.token();
+        var write_outcome: api_service.WriteOutcome = .{ .cancellation = req.cancellation };
         var response = (if (memory != null or admission_class == .write)
             self.withRequestAllocator(request_alloc, if (admission_class == .write) &write_outcome else null, HttpHandler.dispatchAdmitted, .{ req, route })
         else
@@ -354,6 +357,7 @@ pub const HttpHandler = struct {
             if (write_outcome.started) return writeOutcomeFailureResponse(self.alloc, write_outcome);
             if (memory) |owner| if (owner.budget_exhausted.load(.acquire))
                 return requestMemoryFailureResponse(self.alloc, admission_class == .write, if (admission_class == .write) "planning" else "execution", admission_class != .write);
+            if (admission_class == .write) req.ensureActive() catch |cause| return admissionFailureResponse(self.alloc, cause);
             if (admission_class == .query) {
                 // Some operators expose only boolean cancellation and translate
                 // it into Canceled. The outer scope preserves the timeout cause.
@@ -362,7 +366,10 @@ pub const HttpHandler = struct {
             }
             return err;
         };
-        if (write_outcome.started and response.status >= 400) {
+        // Preserve authoritative metadata conflicts/not-found responses. WAL
+        // writes can have partial effects even when an adapter returns 4xx.
+        const append_route = route == .ingest_batch or route == .ingest_table_batch or route == .table_batch;
+        if (write_outcome.started and (response.status >= 500 or (append_route and response.status >= 400))) {
             response.deinit(request_alloc);
             return writeOutcomeFailureResponse(self.alloc, write_outcome);
         }
@@ -375,7 +382,7 @@ pub const HttpHandler = struct {
             owner.retain();
             response.memory_owner = owner;
         }
-        // Once an append began, cancellation cannot turn a committed or
+        // Once a durable operation began, cancellation cannot turn a committed or
         // ambiguous outcome into a pre-execution failure. Mandatory append/sync
         // work has unwound before this response or its allocator may retire.
         if (!write_outcome.started) req.ensureActive() catch |err| {
@@ -684,8 +691,9 @@ pub const HttpHandler = struct {
             query_mod.QueryCacheStats{};
         const query_metrics = self.query.metricsSnapshot();
         const query_count_f32: f32 = if (query_metrics.total_queries == 0) 0 else @floatFromInt(query_metrics.total_queries);
-        const query_admission = self.query_admission.stats();
-        const write_admission = self.write_admission.stats();
+        const stats_source = self.admission_stats_source orelse self;
+        const query_admission = stats_source.query_admission.stats();
+        const write_admission = stats_source.write_admission.stats();
 
         var result = api_types.MetricsResult{
             .live = true,
@@ -834,7 +842,9 @@ pub const HttpHandler = struct {
         if (try self.requireMutableRoute()) |resp| return resp;
         const req = parseEnsureNamespaceRequest(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid namespace request");
         const policy = req.policy orelse catalog_mod.NamespacePolicy{};
+        try self.beginWriteEffect();
         const created = try self.catalog.ensureNamespaceWithPolicy(namespace, req.created_at_ns, policy);
+        self.completeWriteEffect();
 
         var result = api_types.EnsureNamespaceResult{
             .namespace = try self.alloc.dupe(u8, namespace),
@@ -863,6 +873,7 @@ pub const HttpHandler = struct {
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
             else => return err,
         };
+        try self.beginWriteEffect();
         const created = try self.catalog.ensureTableWithDefinition(
             table_name,
             req.created_at_ns,
@@ -871,18 +882,21 @@ pub const HttpHandler = struct {
             req.read_schema_json orelse "",
             indexes_json,
         );
+        self.completeWriteEffect();
 
         if (!created) {
             const has_definition_update = req.schema_json != null or req.read_schema_json != null or req.indexes_json != null;
             if (has_definition_update) {
                 var table = (try self.catalog.getTableAlloc(self.alloc, table_name)) orelse return try textResponse(self.alloc, 404, "not found");
                 defer table.deinit(self.alloc);
+                try self.beginWriteEffect();
                 _ = try self.catalog.setTableDefinition(
                     table_name,
                     req.schema_json orelse table.schema_json,
                     req.read_schema_json orelse table.read_schema_json,
                     indexes_json,
                 );
+                self.completeWriteEffect();
             }
             return try jsonResponse(self.alloc, 200, struct {}{});
         }
@@ -1072,12 +1086,14 @@ pub const HttpHandler = struct {
             else => return err,
         };
 
+        try self.beginWriteEffect();
         const updated = try self.catalog.setTableDefinition(
             table_name,
             table.schema_json,
             table.read_schema_json,
             next_indexes_json,
         );
+        self.completeWriteEffect();
         if (!updated) return try textResponse(self.alloc, 404, "not found");
         return try jsonResponse(self.alloc, 201, struct {}{});
     }
@@ -1092,12 +1108,14 @@ pub const HttpHandler = struct {
         };
         defer self.alloc.free(next_indexes_json);
 
+        try self.beginWriteEffect();
         const updated = try self.catalog.setTableDefinition(
             table_name,
             table.schema_json,
             table.read_schema_json,
             next_indexes_json,
         );
+        self.completeWriteEffect();
         if (!updated) return try textResponse(self.alloc, 404, "not found");
         return try jsonResponse(self.alloc, 201, struct {}{});
     }
@@ -1237,23 +1255,27 @@ pub const HttpHandler = struct {
 
     fn handleBuildNamespace(self: *HttpHandler, namespace: []const u8) !HttpResponse {
         if (try self.requirePublishRoute()) |resp| return resp;
+        try self.beginWriteEffect();
         var result = self.catalog.buildNamespace(namespace) catch |err| switch (err) {
             error.HeadChanged => return try textResponse(self.alloc, 409, "head changed"),
             error.LakeSidecarBuildBudgetExceeded => return try textResponse(self.alloc, 422, "sidecar build exceeds resource limits; published head is unchanged"),
             else => return (try publicationFailureResponse(self.alloc, err)) orelse try textResponse(self.alloc, 500, "build failed"),
         };
+        self.completeWriteEffect();
         defer result.deinit(self.alloc);
         return try jsonResponse(self.alloc, 202, result);
     }
 
     fn handleBuildTable(self: *HttpHandler, table_name: []const u8) !HttpResponse {
         if (try self.requirePublishRoute()) |resp| return resp;
+        try self.beginWriteEffect();
         var result = self.catalog.buildTable(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.HeadChanged => return try textResponse(self.alloc, 409, "head changed"),
             error.LakeSidecarBuildBudgetExceeded => return try textResponse(self.alloc, 422, "sidecar build exceeds resource limits; published head is unchanged"),
             else => return (try publicationFailureResponse(self.alloc, err)) orelse try textResponse(self.alloc, 500, "build failed"),
         };
+        self.completeWriteEffect();
         defer result.deinit(self.alloc);
         var table_result = api_types.TableBuildResult{
             .table_name = try self.alloc.dupe(u8, table_name),
@@ -1320,7 +1342,9 @@ pub const HttpHandler = struct {
     fn handleSetPolicy(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
         const req = parseNamespacePolicyRequest(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid policy request");
+        try self.beginWriteEffect();
         const policy = self.catalog.setPolicy(namespace, req) catch return try textResponse(self.alloc, 404, "not found");
+        self.completeWriteEffect();
         var result = api_types.NamespacePolicyResult{
             .namespace = try self.alloc.dupe(u8, namespace),
             .policy = policy,
@@ -1332,10 +1356,12 @@ pub const HttpHandler = struct {
     fn handleSetTablePolicy(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
         const req = parseNamespacePolicyRequest(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid policy request");
+        try self.beginWriteEffect();
         const policy = self.catalog.setTablePolicy(table_name, req) catch |err| switch (err) {
             error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "policy failed"),
         };
+        self.completeWriteEffect();
         var result = api_types.TablePolicyResult{
             .table_name = try self.alloc.dupe(u8, table_name),
             .policy = policy,
@@ -1363,7 +1389,9 @@ pub const HttpHandler = struct {
             else => return try textResponse(self.alloc, 500, "head publish failed"),
         };
         defer manifest.deinit(self.alloc);
+        try self.beginWriteEffect();
         const published = self.progress.compareAndSwapHead(namespace, req.expected_head, req.version) catch return try textResponse(self.alloc, 500, "head publish failed");
+        self.completeWriteEffect();
         const current_head = self.progress.getHead(namespace) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return try textResponse(self.alloc, 500, "head publish failed"),
@@ -1506,7 +1534,20 @@ pub const HttpHandler = struct {
         execution.published_search_sources = self.published_search_sources;
         execution.runtime_metrics = self.runtime_metrics;
         execution.graph_execution_limits = self.graph_execution_limits;
+        execution.admission_stats_source = self.admission_stats_source orelse self;
         return @call(.auto, operation, .{&execution} ++ args);
+    }
+
+    fn beginWriteEffect(self: *HttpHandler) !void {
+        if (self.api.write_outcome) |outcome| {
+            if (!outcome.started) try outcome.cancellation.check();
+            outcome.started = true;
+            outcome.completed = false;
+        }
+    }
+
+    fn completeWriteEffect(self: *HttpHandler) void {
+        if (self.api.write_outcome) |outcome| outcome.completed = true;
     }
 
     fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
@@ -6429,12 +6470,18 @@ pub const HttpHandler = struct {
             error.DeadlineExceeded => return error.DeadlineExceeded,
             else => unreachable,
         };
+        self.beginWriteEffect() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.InternalFailure,
+        };
         const updated = self.catalog.setTableDefinition(
             table_name,
             table.schema_json,
             table.read_schema_json,
             next_indexes_json,
         ) catch return error.InternalFailure;
+        self.completeWriteEffect();
         if (!updated) return error.NotFound;
         return response_body;
     }
@@ -6460,12 +6507,18 @@ pub const HttpHandler = struct {
             error.DeadlineExceeded => return error.DeadlineExceeded,
             else => unreachable,
         };
+        self.beginWriteEffect() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.InternalFailure,
+        };
         const updated = self.catalog.setTableDefinition(
             table_name,
             table.schema_json,
             table.read_schema_json,
             next_indexes_json,
         ) catch return error.InternalFailure;
+        self.completeWriteEffect();
         if (!updated) return error.NotFound;
     }
 
@@ -10764,7 +10817,7 @@ test "serverless http handler serves internal namespace lifecycle, admission, an
     var parsed_admission_metrics = try parseJsonTestBody(api_types.MetricsResult, alloc, admission_metrics.body);
     defer parsed_admission_metrics.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.query_capacity);
-    try std.testing.expectEqual(@as(usize, 0), parsed_admission_metrics.value.query_in_flight);
+    try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.query_in_flight);
     try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.query_peak_in_flight);
     try std.testing.expectEqual(@as(u64, 1), parsed_admission_metrics.value.query_rejected_total);
     try std.testing.expectEqual(@as(usize, 1), parsed_admission_metrics.value.write_capacity);
@@ -12850,6 +12903,7 @@ test "workload admission serverless admitted execution uses retained allocator" 
         try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().retained_bytes);
     }
 
+    try testServerlessMetadataOwnership(&handler, namespace);
     try testServerlessWriteOwnership(&handler, &wal_store, namespace, ingest_body);
 
     // The tiny returned projection fits this ceiling; reading and searching
@@ -12863,6 +12917,85 @@ test "workload admission serverless admitted execution uses retained allocator" 
     try std.testing.expect(std.mem.indexOf(u8, rejected.body, "\"execution_started\":true") != null);
     try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().in_flight);
     try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().retained_bytes);
+}
+
+fn testServerlessMetadataOwnership(handler: *HttpHandler, namespace: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const head_path = try std.fmt.allocPrint(alloc, "/internal/v1/namespaces/{s}/head", .{namespace});
+    defer alloc.free(head_path);
+    const namespace_path = try std.fmt.allocPrint(alloc, "/internal/v1/namespaces/{s}", .{namespace});
+    defer alloc.free(namespace_path);
+    try handler.write_admission.configure(.{ .max_retained_bytes = 64 * 1024 * 1024 });
+    const reads = [_][]const u8{
+        "/health",              "/status",                               "/metrics",                        "/tables", "/internal/v1/namespaces",
+        "/tables/docs/indexes", "/internal/v1/tables/docs/build-status", "/internal/v1/tables/docs/policy", head_path,
+    };
+    for (reads) |path| {
+        var response = try handler.handle(.{ .method = .get, .path = path });
+        var live = true;
+        defer if (live) response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        try std.testing.expect(response.memory_owner != null);
+        try std.testing.expect(handler.query_admission.stats().retained_bytes >= response.body.len);
+        if (std.mem.eql(u8, path, "/metrics")) {
+            var metrics = try parseJsonTestBody(api_types.MetricsResult, alloc, response.body);
+            defer metrics.deinit();
+            // The facade must report the original active controller and its
+            // configured memory ceiling, not its own unused default gate.
+            try std.testing.expectEqual(@as(usize, 1), metrics.value.query_admission.?.in_flight);
+            try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), metrics.value.query_admission.?.max_retained_bytes);
+            try std.testing.expect(metrics.value.query_admission.?.retained_bytes > 0);
+        }
+        response.deinit(alloc);
+        live = false;
+        try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().retained_bytes);
+    }
+    const writes = [_]HttpRequest{
+        .{ .method = .put, .path = namespace_path, .body = "{}" },
+        .{ .method = .put, .path = "/tables/docs", .body = "{}" },
+        .{ .method = .put, .path = "/internal/v1/tables/docs/policy", .body = "{\"keep_latest_versions\":3}" },
+        .{ .method = .put, .path = head_path, .body = "{\"expected_head\":1,\"version\":1}" },
+        .{ .method = .post, .path = "/internal/v1/tables/docs/build" },
+    };
+    for (writes) |request| {
+        var response = try handler.handle(request);
+        var live = true;
+        defer if (live) response.deinit(alloc);
+        try std.testing.expect(response.status >= 200 and response.status < 300);
+        try std.testing.expect(response.memory_owner != null);
+        try std.testing.expect(handler.write_admission.stats().retained_bytes >= response.body.len);
+        response.deinit(alloc);
+        live = false;
+        try std.testing.expectEqual(@as(usize, 0), handler.write_admission.stats().retained_bytes);
+    }
+    try handler.query_admission.reconfigure(1, .{ .max_retained_bytes = 16 * 1024 * 1024 });
+    try handler.write_admission.reconfigure(1, .{ .max_retained_bytes = 64 * 1024 * 1024 });
+    {
+        try std.testing.expect(handler.query_admission.tryAcquire());
+        defer handler.query_admission.release();
+        try std.testing.expect(handler.write_admission.tryAcquire());
+        defer handler.write_admission.release();
+        for (reads) |path| {
+            var response = try handler.handle(.{ .method = .get, .path = path });
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 429), response.status);
+        }
+        for (writes) |request| {
+            var response = try handler.handle(request);
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 429), response.status);
+        }
+        for ([_][]const u8{ "/healthz", "/readyz" }) |path| {
+            var response = try handler.handle(.{ .method = .get, .path = path });
+            defer response.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            try std.testing.expect(response.memory_owner == null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), handler.write_admission.stats().retained_bytes);
+    try handler.query_admission.reconfigure(32, .{ .max_retained_bytes = 16 * 1024 * 1024 });
+    try handler.write_admission.reconfigure(32, .{ .max_retained_bytes = 64 * 1024 * 1024 });
 }
 
 fn testServerlessWriteOwnership(handler: *HttpHandler, wal: *@import("../wal/mod.zig").WalStore, namespace: []const u8, large_body: []const u8) !void {

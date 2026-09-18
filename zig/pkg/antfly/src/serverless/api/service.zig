@@ -24,6 +24,7 @@ const wal_mod = @import("../wal/mod.zig");
 pub const WriteOutcome = struct {
     started: bool = false,
     completed: bool = false,
+    cancellation: @import("../../common/cancellation.zig").CancellationToken = .none,
 };
 
 pub const Service = struct {
@@ -63,7 +64,10 @@ pub const Service = struct {
         }
         var start_lsn: u64 = 0;
         var end_lsn: u64 = 0;
-        if (self.write_outcome) |outcome| outcome.started = true;
+        if (self.write_outcome) |outcome| {
+            if (!outcome.started) try outcome.cancellation.check();
+            outcome.started = true;
+        }
         for (encoded, 0..) |bytes, idx| {
             const lsn = try self.wal.append(req.namespace, req.timestamp_ns, bytes);
             if (idx == 0) start_lsn = lsn;
@@ -308,4 +312,13 @@ test "workload admission serverless write prepares all allocations before durabl
     try std.testing.expectError(error.InputOutput, service.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 1, .mutations = &mutations }));
     try std.testing.expect(outcome.started and !outcome.completed);
     try std.testing.expectEqual(@as(u64, 2), fake.calls);
+
+    // Cancellation observed after preparation still precedes the first append.
+    // Once an append starts, the loop remains mandatory and does not recheck it.
+    var cancelled = std.atomic.Value(bool).init(true);
+    fake = .{};
+    outcome = .{ .cancellation = .fromAtomic(&cancelled) };
+    try std.testing.expectError(error.Canceled, service.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 2, .mutations = &mutations }));
+    try std.testing.expectEqual(@as(u64, 0), fake.calls);
+    try std.testing.expect(!outcome.started);
 }

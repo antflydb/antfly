@@ -128,7 +128,7 @@ pub fn isInternal(route: Route) bool {
 
 /// Classify every serverless route explicitly. This switch intentionally has
 /// no catch-all: adding a route requires an admission decision at compile time.
-pub fn admissionClass(route: Route) AdmissionClass {
+pub fn admissionClass(route: Route, method: HttpMethod) AdmissionClass {
     return switch (route) {
         .query,
         .table_query,
@@ -151,28 +151,29 @@ pub fn admissionClass(route: Route) AdmissionClass {
         .query_version_graph_shortest_path,
         .query_head_artifact,
         .query_version_artifact,
-        => .query,
-        .ingest_batch, .ingest_table_batch, .table_batch => .write,
         .health,
-        .healthz,
-        .readyz,
         .metrics,
         .status,
         .list_namespaces,
         .list_tables,
+        .table_indexes,
+        .build_status,
+        .internal_table_build_status,
+        .head,
+        => .query,
+        .ingest_batch,
+        .ingest_table_batch,
+        .table_batch,
         .ensure_namespace,
         .ensure_table,
-        .table_indexes,
-        .table_index,
         .build_namespace,
-        .build_status,
-        .policy,
         .internal_table_build,
-        .internal_table_build_status,
-        .internal_table_policy,
-        .head,
         .publish_head,
-        => .none,
+        => .write,
+        .table_index, .policy, .internal_table_policy => if (method == .get) .query else .write,
+        // These probes inspect scalar readiness state only. /health and
+        // /metrics enumerate namespaces and are deliberately admitted above.
+        .healthz, .readyz => .none,
     };
 }
 
@@ -206,6 +207,39 @@ pub fn match(method: HttpMethod, path: []const u8) ?Route {
         return matchTableRoute(method, &segments);
     }
     return null;
+}
+
+test "workload admission serverless metadata and publication routes are substantive" {
+    const Case = struct { method: HttpMethod, path: []const u8, class: AdmissionClass };
+    const cases = [_]Case{
+        .{ .method = .get, .path = "/healthz", .class = .none },
+        .{ .method = .get, .path = "/readyz", .class = .none },
+        .{ .method = .get, .path = "/health", .class = .query },
+        .{ .method = .get, .path = "/status", .class = .query },
+        .{ .method = .get, .path = "/metrics", .class = .query },
+        .{ .method = .get, .path = "/tables", .class = .query },
+        .{ .method = .get, .path = "/internal/v1/namespaces", .class = .query },
+        .{ .method = .put, .path = "/tables/docs", .class = .write },
+        .{ .method = .put, .path = "/internal/v1/namespaces/docs", .class = .write },
+        .{ .method = .get, .path = "/tables/docs/indexes", .class = .query },
+        .{ .method = .get, .path = "/tables/docs/indexes/idx", .class = .query },
+        .{ .method = .post, .path = "/tables/docs/indexes/idx", .class = .write },
+        .{ .method = .delete, .path = "/tables/docs/indexes/idx", .class = .write },
+        .{ .method = .post, .path = "/internal/v1/namespaces/docs/build", .class = .write },
+        .{ .method = .get, .path = "/internal/v1/namespaces/docs/build-status", .class = .query },
+        .{ .method = .post, .path = "/internal/v1/tables/docs/build", .class = .write },
+        .{ .method = .get, .path = "/internal/v1/tables/docs/build-status", .class = .query },
+        .{ .method = .get, .path = "/internal/v1/namespaces/docs/policy", .class = .query },
+        .{ .method = .put, .path = "/internal/v1/namespaces/docs/policy", .class = .write },
+        .{ .method = .get, .path = "/internal/v1/tables/docs/policy", .class = .query },
+        .{ .method = .put, .path = "/internal/v1/tables/docs/policy", .class = .write },
+        .{ .method = .get, .path = "/internal/v1/namespaces/docs/head", .class = .query },
+        .{ .method = .put, .path = "/internal/v1/namespaces/docs/head", .class = .write },
+    };
+    for (cases) |case| {
+        const route = match(case.method, case.path) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(case.class, admissionClass(route, case.method));
+    }
 }
 
 fn matchInternalTableRoute(method: HttpMethod, segments: *std.mem.SplitIterator(u8, .scalar)) ?Route {
