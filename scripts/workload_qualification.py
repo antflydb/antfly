@@ -1403,6 +1403,11 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                                 observation["finished_monotonic"]
                                 - measured["monotonic_origin"]
                             )
+                            if "metrics_sample_monotonic" in observation:
+                                observation["metrics_sample_s"] = (
+                                    observation["metrics_sample_monotonic"]
+                                    - measured["monotonic_origin"]
+                                )
                         measured["periodic_telemetry"] = evidence.periodic_gates(
                             observations, plan["telemetry"], kwargs["seconds"]
                         )

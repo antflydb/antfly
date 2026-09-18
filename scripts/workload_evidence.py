@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import threading
@@ -90,6 +91,35 @@ def observe(http, command, runtime, path, spec):
             ):
                 raise ValueError("dedicated listener did not return Prometheus metrics")
             record["metrics"] = metrics(body)
+            received = time.monotonic()
+            record["metrics_received_monotonic"] = received
+            record["metrics_body_sha256"] = hashlib.sha256(body).hexdigest()
+            normalized_headers = {key.lower(): value for key, value in headers.items()}
+            age_header = normalized_headers.get("x-antfly-metrics-age-ms")
+            collected = record["metrics"].get(
+                "antfly_metrics_collected_timestamp_seconds"
+            )
+            if age_header is not None:
+                age = float(age_header) / 1000 + received - sample_start
+                record["metrics_freshness_source"] = (
+                    "server cache age header plus full scrape duration"
+                )
+            elif collected is not None:
+                age = time.time() - collected
+                record["metrics_freshness_source"] = (
+                    "source collection wall timestamp (same host clock required)"
+                )
+            else:
+                age = None
+                record["metrics_freshness_source"] = (
+                    "unavailable; HTTP polling is not underlying sample collection"
+                )
+            record["metrics_age_seconds"] = age
+            record["metrics_fresh"] = (
+                age is not None and math.isfinite(age) and 0 <= age <= 1
+            )
+            if record["metrics_fresh"]:
+                record["metrics_sample_monotonic"] = received - age
             if runtime.get("container"):
                 result = command(
                     [
@@ -188,6 +218,10 @@ def periodic_gates(observations, spec, seconds):
     if max(gaps) > 2:
         unavailable.append("periodic coverage gap exceeds two seconds")
     for row in observations:
+        if row.get("metrics_fresh") is not True:
+            unavailable.append(
+                "ownership source sample freshness unavailable or older than one second"
+            )
         if not row.get("memory_limit"):
             unavailable.append("cgroup memory limit/peak unavailable")
         elif row["memory_peak"] > row["memory_limit"] * 0.90:
@@ -209,6 +243,21 @@ def periodic_gates(observations, spec, seconds):
         "failures": sorted(set(failures)),
         "unavailable": sorted(set(unavailable)),
         "max_sample_gap_seconds": max(gaps),
+        "memory_gate_status": (
+            "failed"
+            if any("cgroup" in failure for failure in failures)
+            else (
+                "unavailable"
+                if any(
+                    "cgroup" in missing or "failed periodic" in missing
+                    for missing in unavailable
+                )
+                else "passed"
+            )
+        ),
+        "ownership_source_freshness_verified": all(
+            row.get("metrics_fresh") is True for row in observations
+        ),
         "scope": "kernel memory peak and sampled declared series; unseen gauge excursions and exact ownership require runtime evidence",
     }
 
@@ -296,7 +345,10 @@ def recovery_gate(
         if ordered[math.ceil(0.99 * len(ordered)) - 1] > limit:
             failures.append(second)
         telemetry = [
-            row for row in observations if second <= row["finished_s"] < second + 1
+            row
+            for row in observations
+            if row.get("metrics_fresh") is True
+            and second <= row.get("metrics_sample_s", row["finished_s"]) < second + 1
         ]
         if not telemetry or any(
             any(name not in row.get("metrics", {}) for name in queues)

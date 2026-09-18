@@ -203,6 +203,7 @@ class EvidenceTests(unittest.TestCase):
             "started_s": second - 0.1,
             "finished_s": second,
             "metrics": {"queue": 0, "bytes": 12},
+            "metrics_fresh": True,
             "memory_limit": 1000,
             "memory_peak": 800,
             "memory_events": {"oom": 0},
@@ -238,15 +239,52 @@ class EvidenceTests(unittest.TestCase):
             ) as observations:
                 time.sleep(0.02)
             self.assertEqual(observations[0]["memory_peak"], 800)
+            self.assertFalse(observations[0]["metrics_fresh"])
+            self.assertIsNone(observations[0]["metrics_age_seconds"])
             self.assertIn("/sys/fs/cgroup/memory.peak", commands[0])
             self.assertNotIn("metrics_raw", observations[0])
             retained = json.loads(path.read_text().splitlines()[0])
             self.assertEqual(retained["metrics_raw"], "queue 0\nbytes 12\n")
             self.assertIn("memory_events", retained)
 
+    def test_cache_age_not_scrape_frequency_controls_freshness(self):
+        class Client:
+            age = "0"
+
+            def __init__(self, *_):
+                pass
+
+            def request(self, *_):
+                return (
+                    200,
+                    b"queue 0\n",
+                    {"Content-Type": "text/plain", "X-Antfly-Metrics-Age-Ms": self.age},
+                )
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for age, expected in (("0", True), ("5000", False)):
+                Client.age = age
+                with evidence.observe(
+                    Client,
+                    lambda *a, **k: None,
+                    {"metrics_port": 1},
+                    Path(tmp) / age,
+                    {"interval_seconds": 0.1},
+                ) as rows:
+                    time.sleep(0.01)
+                self.assertEqual(rows[0]["metrics_fresh"], expected)
+                self.assertIn("metrics_body_sha256", rows[0])
+
     def test_memory_peaks_and_missing_metrics_fail_closed(self):
         spec = {"ceilings": {"bytes": 15}}
         rows = [self.sample(0.5), self.sample(1.5)]
+        stale = [dict(rows[0], metrics_fresh=False)]
+        result = evidence.periodic_gates(stale, spec, 1)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["memory_gate_status"], "passed")
         self.assertEqual(evidence.periodic_gates(rows, spec, 2)["status"], "passed")
         rows[1]["memory_peak"] = 901
         self.assertEqual(evidence.periodic_gates(rows, spec, 2)["status"], "failed")
