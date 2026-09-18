@@ -688,7 +688,26 @@ pub const FileStore = struct {
         defer alloc.free(encoded);
 
         try ensureParentDir(self.path);
-        try writeFileAtomically(self.path, encoded);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        // Resolve only for this write: renaming over the logical path would
+        // replace its final symlink. Keep self.path unchanged for future reads
+        // and resolve again on the next write after an external rotation.
+        const write_path: ?[:0]u8 = std.Io.Dir.cwd().realPathFileAlloc(io, self.path, alloc) catch |err| switch (err) {
+            error.FileNotFound => missing: {
+                // A new regular store may be created, but a dangling symlink
+                // must survive a missing target so a later rotation can recover.
+                _ = std.Io.Dir.cwd().statFile(io, self.path, .{ .follow_symlinks = false }) catch |stat_err| switch (stat_err) {
+                    error.FileNotFound => break :missing null,
+                    else => return stat_err,
+                };
+                return err;
+            },
+            else => return err,
+        };
+        defer if (write_path) |path| alloc.free(path);
+        try writeFileAtomically(write_path orelse self.path, encoded);
         var content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(encoded, &content_hash, .{});
         return content_hash;
@@ -1202,6 +1221,29 @@ test "file secret store reloads valid external replacements including deletions"
     const deleted = try store.getOwned(alloc, "deleted.dynamic_secret");
     defer if (deleted) |value| alloc.free(value);
     try std.testing.expectEqual(@as(?[]u8, null), deleted);
+}
+
+test "file secret store writes preserve symlinks across target rotation" {
+    try @import("secret_projection_test_support.zig").expectRuntimeWrites(FileStore.initLayered);
+}
+
+test "file secret store refuses to replace a dangling symlink" {
+    const projection_test = @import("secret_projection_test_support.zig");
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var projection = try projection_test.Projection.init(io, "projected.primary");
+    defer projection.deinit();
+    var store = try FileStore.init(alloc, projection.path);
+    defer store.deinit();
+    try projection.tmp.dir.deleteFile(io, "..2026_01/secrets.json");
+    try std.testing.expectError(error.FileNotFound, store.put(alloc, "projected.primary", "updated"));
+    try std.testing.expectError(error.FileNotFound, store.delete("projected.primary"));
+    try std.testing.expectEqual(.sym_link, (try projection.tmp.dir.statFile(io, "secrets.json", .{ .follow_symlinks = false })).kind);
+    try projection_test.expectValue(&store, "projected.primary", "first");
+    try projection.rotate();
+    try projection_test.expectValue(&store, "projected.primary", "other");
 }
 
 test "file secret store detects projected volume symlink target replacement" {

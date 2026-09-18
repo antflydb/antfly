@@ -22351,21 +22351,17 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
     return cfg;
 }
 
+test "data runtime secret store follows projected symlink rotation" {
+    try @import("../common/secret_projection_test_support.zig").expectRuntimeRotation(initLayeredSecretStore);
+}
+
 fn initLayeredSecretStore(
     alloc: std.mem.Allocator,
     raw_paths: []const []const u8,
 ) !antfly.common.secrets.FileStore {
-    var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (normalized_paths.items) |path| alloc.free(path);
-        normalized_paths.deinit(alloc);
-    }
-    for (raw_paths) |raw_path| {
-        const normalized_path = try normalizeResolvedPathAlloc(alloc, raw_path);
-        errdefer alloc.free(normalized_path);
-        try normalized_paths.append(alloc, normalized_path);
-    }
-    return try antfly.common.secrets.FileStore.initLayered(alloc, normalized_paths.items);
+    // FileStore owns these paths and must follow their current symlink targets
+    // on reload, including Kubernetes projected-volume generation switches.
+    return try antfly.common.secrets.FileStore.initLayered(alloc, raw_paths);
 }
 
 fn resolveLocalBaseDir(
