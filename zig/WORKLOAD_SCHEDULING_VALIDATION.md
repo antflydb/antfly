@@ -486,3 +486,28 @@ other succeed, fresh coordinator debt samples, and retirement after healing.
 The coordinator has two total attempts and one per destination. An earlier
 setup fixture expected table-space creation status 200 instead of the actual
 201; that failed receipt remains preserved, and setup2 used a fresh lifecycle.
+
+
+### Prepaid memory publication integration
+
+Commit `013b533924` integrates the internal memory-only sealed point-batch path.
+Its isolated Debug and ReleaseSafe gates each passed 27 tests without leaks,
+including exhaustion, reduced limits after sealing, unchanged-root failure
+unwind, pinned readers, stale-root retirement outside the writer mutex, and
+close waiting for live ownership. Logs: `/tmp/workload-lsm-prepaid-debug.log`
+and `/tmp/workload-lsm-prepaid-release-safe.log`.
+
+The scheduling integration gate then exited zero: compiled storage owner 33/33,
+metadata 132/132, request/runtime 222 passed and one optional Wasmtime skip,
+all without failures/leaks. Error logs were one expected for storage owner and
+six expected for request/runtime, with none unexpected. Artifact counts overlap.
+Log: `/tmp/workload-prepaid-integrated.log`. Persistent completion remains
+unsupported by this internal entry point.
+
+The public lookup/scan availability regression also passed 1/1 without leaks
+(`/tmp/workload-distributed-read-503.log`). Commit `39cd8b34b8` maps distributed
+read unavailability to the shared HTTP 503 response with Retry-After. Its frozen
+production Debug build exited zero; SHA-256:
+`69c36d8db8835a9a7acacc096aed9d901d612126dccc9388680e8b042ac49d64`.
+Receipt: `/tmp/workload-recovery-read503-production-debug-receipt.json`.
+This frozen binary predates the internal prepaid-memory stage.
