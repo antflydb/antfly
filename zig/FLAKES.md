@@ -8,6 +8,41 @@ The later [Antfly E2E failures](e2e/FLAKES.md#2026-09-18-concurrent-aggregations
 add full-text hydration contention, aggregation generation races, and overlapping transaction session recovery;
 their deterministic regressions and native soak evidence are recorded there.
 
+## 2026-09-18: HTTP cancellation lost a socket published after the watchdog won
+
+[PR #801's x86 unit job](https://github.com/antflydb/antfly/actions/runs/35382288964/job/105721669088)
+hit the idle watchdog after 1,815 seconds. The new per-process progress log
+identified `native_chat.test.server request cancellation interrupts a blocked
+response`: it entered the test but never reached runner I/O teardown. PID 17421
+had 11 threads, waited in `futex_wait_queue`, and had no OOM kill. Debugger
+attachment was denied again. This resembles the earlier anonymous stall below,
+but the earlier artifacts cannot prove that it was the same test.
+
+The unchanged Debug test reproduced under Linux x86 container emulation on
+repetition 41 of one of four concurrent workers. A second instrumented run hung
+on repetition 51. Cancellation won before the request registered its socket;
+the surviving worker was blocked in a socket read while its caller joined the
+request task. Publication's already-canceled branch attempted `netShutdown`,
+discarded its error, and continued without installing the cancellation callback.
+Because shutdown is itself cancelable, it could return `Canceled` without
+shutting down the socket. The subsequent native read had no timeout or callback
+to release it after the watchdog had finished.
+
+Socket publication now returns `Cancelled` when cancellation already won.
+Every buffered/streamed, pooled/unpooled HTTP/1 path propagates it, including TLS;
+existing connection ownership closes or evicts the socket before sending. The
+publication mutex still serializes registration against the watchdog's shutdown.
+No test timeout was raised and the original chat test is unchanged.
+
+A deterministic regression forces the late-publication ordering with a shutdown
+backend that returns `Canceled`, covering buffered and streamed requests with
+and without pooling. It fails against the old client, which sends and accepts a
+response, and passes with the fix, requiring no server request, output, or retained
+pooled connection. All nine client lifecycle tests and the active-read cancellation
+and timeout regressions pass on native macOS. The unchanged chat test passes
+1,000 Linux x86 Debug repetitions across four workers after the fix. These Linux
+results use local emulation; native ARC qualification remains a CI gate.
+
 ## 2026-09-17: unit watchdog lost attribution outside the DB partitions
 
 [Run 35298670343's x86 unit job](https://github.com/antflydb/antfly/actions/runs/35298670343/job/105456824907)
