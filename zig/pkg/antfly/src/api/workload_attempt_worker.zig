@@ -3,9 +3,8 @@
 
 //! Durable worker admission. Active records never expire into terminal records.
 //! A fresh process preserves unknown prior-incarnation work and its capacity.
-//! This opt-in prerequisite uses bounded O(N) snapshot mutations. Coordinator
-//! rollout requires point-key storage/counters and performance qualification;
-//! metrics and duplicate reconciliation already avoid durable writes.
+//! Point-key mutations and counters share one serialized write transaction.
+//! Only startup reconstruction and generation fences scan bounded records.
 const std = @import("std");
 const protocol = @import("workload_attempt_protocol.zig");
 const transactions = @import("transactions.zig");
@@ -13,9 +12,9 @@ const CancellationToken = @import("../common/cancellation.zig").CancellationToke
 pub const Config = @import("../common/workload_worker_config.zig").Config;
 const base_charge: u64 = 2048;
 const record_charge: u64 = 1024;
-const fence_charge: u64 = 128;
+const fence_charge: u64 = 192;
 const hard_record_limit = 4096;
-const hard_snapshot_bytes = 64 * 1024 * 1024;
+const key_capacity = 192;
 
 const Record = struct {
     id: protocol.AttemptId,
@@ -101,18 +100,56 @@ test "workload admission worker restart preserves uncertainty and reduced durabl
     try std.testing.expectError(error.AttemptIdentityMismatch, worker.closeGeneration(7, 2, 10));
     try std.testing.expectEqual(@as(usize, 1), (try worker.usage()).uncertain);
 }
-const Closure = struct { coordinator: u64, through: u64 = 0 };
-const Encoded = struct { version: u16, incarnation: u64, records: []Record = &.{}, closures: []Closure = &.{} };
-const State = struct {
-    incarnation: u64 = 0,
-    records: std.ArrayListUnmanaged(Record) = .empty,
-    closures: std.ArrayListUnmanaged(Closure) = .empty,
-    fn deinit(self: *State, alloc: std.mem.Allocator) void {
-        self.records.deinit(alloc);
-        self.closures.deinit(alloc);
+test "workload admission worker point journal refuses legacy state and only actual old execution reconciles" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var storage = try backend.runtimeStore(alloc, .{ .name = "system/worker-point-journal" });
+    defer storage.deinit();
+    var durable = transactions.DurableSessionStore.initRuntime(alloc, &storage);
+    {
+        var txn = try storage.beginWrite();
+        errdefer txn.abort();
+        try txn.put("workload-attempt-worker/v1/9", "{}");
+        try txn.commit();
     }
-    fn bytes(self: *const State) u64 {
-        return base_charge + self.records.items.len * record_charge + self.closures.items.len * fence_charge;
+    try std.testing.expectError(error.WorkerJournalMigrationRequired, Store.init(alloc, &durable, 9, 10, .{ .max_attempts = 2, .max_bytes = 8192 }));
+    var previous = try Store.init(alloc, &durable, 8, 10, .{ .max_attempts = 2, .max_bytes = 8192 });
+    defer previous.deinit();
+    var lease = (try previous.begin(testRequest(10, 2, 1))).started;
+    var current = try Store.init(alloc, &durable, 8, 11, .{ .max_attempts = 2, .max_bytes = 8192 });
+    defer current.deinit();
+    try std.testing.expectEqual(@as(usize, 1), (try current.usage()).uncertain);
+    try std.testing.expectError(error.WorkerIncarnationSuperseded, previous.begin(testRequest(10, 3, 1)));
+    try std.testing.expectError(error.WorkerUncertaintyUnreconciled, current.begin(testRequest(11, 3, 1)));
+    try std.testing.expectError(error.WorkerIncarnationSuperseded, previous.closeGeneration(7, 2, 10));
+    try std.testing.expect(!lease.cancellation().isCancelled());
+    try std.testing.expect((try current.closeGeneration(7, 2, 11)) == null);
+    // Only the still-live previous executor can supply actual completion.
+    // Reopening and fencing alone left this uncertainty and charge intact.
+    try lease.finish();
+    try std.testing.expectEqual(@as(usize, 0), (try current.usage()).uncertain);
+    try std.testing.expectEqual(@as(usize, 0), (try current.usage()).attempts);
+    try std.testing.expect((try current.closeGeneration(7, 2, 11)) != null);
+    var next = (try current.begin(testRequest(11, 3, 1))).started;
+    try next.finish();
+}
+
+const Closure = struct { coordinator: u64, through: u64 = 0 };
+const Metadata = struct {
+    version: u16 = 2,
+    incarnation: u64,
+    attempts: u32 = 0,
+    coordinators: u32 = 0,
+    active: u32 = 0,
+    uncertain: u32 = 0,
+
+    fn bytes(self: Metadata) u64 {
+        return base_charge + @as(u64, self.attempts) * record_charge + @as(u64, self.coordinators) * fence_charge;
+    }
+    fn validate(self: Metadata) !void {
+        if (self.version != 2 or self.incarnation == 0 or self.attempts > hard_record_limit or self.coordinators > hard_record_limit or
+            self.active > self.attempts or self.uncertain > self.active) return error.InvalidWorkerJournal;
     }
 };
 
@@ -160,9 +197,8 @@ pub const Store = struct {
         finish: protocol.AttemptId,
         close: struct { coordinator: u64, through: u64 },
         observe: struct { coordinator: u64, through: u64 },
-        usage,
     };
-    const Result = struct { disposition: enum { started, active, terminal } = .started, quiescent: bool = false, usage: Usage = .{ .attempts = 0, .bytes = 0, .uncertain = 0 } };
+    const Result = struct { disposition: enum { started, active, terminal } = .started, quiescent: bool = false };
 
     /// incarnation must be a fresh secure random process identity. Store
     /// continuity is required; restoring/deleting this journal is not fencing.
@@ -254,62 +290,47 @@ pub const Store = struct {
                 self.retireQuiesced(value);
             }
         }
-        const result = try self.transact(.{ .observe = .{ .coordinator = coordinator, .through = through } });
+        const result = try self.readOperation(.{ .observe = .{ .coordinator = coordinator, .through = through } });
         if (!result.quiescent) return null;
         return .{ .version = 1, .coordinator = coordinator, .destination = self.node_id, .worker_incarnation = worker_incarnation, .fenced_through = through, .quiesced_through = through };
     }
 
     pub fn usage(self: *Store) !Usage {
-        var state = try self.readState();
-        defer state.deinit(self.allocator);
-        var result: Usage = .{ .attempts = state.records.items.len, .bytes = state.bytes(), .uncertain = 0 };
-        for (state.records.items) |record| if (!record.terminal and record.id.worker_incarnation != self.incarnation) {
-            result.uncertain += 1;
-        };
-        return result;
+        const meta = (try self.readOperation(.usage)).metadata.?;
+        return .{ .attempts = meta.attempts, .bytes = meta.bytes(), .uncertain = meta.uncertain };
     }
 
     fn readOnly(self: *Store, request: protocol.Request) !?Begin {
-        var state = try self.readState();
-        defer state.deinit(self.allocator);
-        if (state.incarnation != self.incarnation) return error.WorkerIncarnationSuperseded;
-        for (state.closures.items) |closure| if (closure.coordinator == request.attempt.coordinator and closure.through >= request.attempt.generation)
-            return error.AttemptGenerationClosed;
-        for (state.records.items) |record| {
-            if (record.id.coordinator == request.attempt.coordinator and record.id.generation == request.attempt.generation and record.id.sequence == request.attempt.sequence) {
-                if (!std.meta.eql(record.id, request.attempt) or !std.mem.eql(u8, &record.digest, &request.request_digest)) return error.AttemptIdentityMismatch;
-                return if (record.terminal) .terminal else .active;
-            }
-        }
-        return null;
+        return (try self.readOperation(.{ .duplicate = request })).known;
     }
 
-    fn readState(self: *Store) !State {
-        var key_buffer: [96]u8 = undefined;
-        const key = try std.fmt.bufPrint(&key_buffer, "workload-attempt-worker/v1/{d}", .{self.node_id});
-        const raw = switch (self.durable.backend) {
-            .docstore => |store| try store.get(self.allocator, key),
+    const Read = union(enum) { usage, duplicate: protocol.Request, observe: struct { coordinator: u64, through: u64 } };
+    const ReadResult = struct { metadata: ?Metadata = null, known: ?Begin = null, quiescent: bool = false };
+
+    fn readOperation(self: *Store, op: Read) !ReadResult {
+        return switch (self.durable.backend) {
+            .docstore => |store| blk: {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                break :blk try self.readTxn(&txn, op);
+            },
             .runtime => |store| blk: {
                 var txn = try store.beginRead();
                 defer txn.abort();
-                break :blk try self.allocator.dupe(u8, try txn.get(key));
+                break :blk try self.readTxn(&txn, op);
             },
         };
-        defer self.allocator.free(raw);
-        return self.decodeState(raw);
     }
 
-    fn decodeState(self: *Store, raw: []const u8) !State {
-        if (raw.len > hard_snapshot_bytes) return error.WorkerJournalTooLarge;
-        var decoded = try std.json.parseFromSlice(Encoded, self.allocator, raw, .{});
-        defer decoded.deinit();
-        if (decoded.value.version != 1 or decoded.value.incarnation == 0 or decoded.value.records.len > hard_record_limit or decoded.value.closures.len > hard_record_limit)
-            return error.InvalidWorkerJournal;
-        var state: State = .{ .incarnation = decoded.value.incarnation };
-        errdefer state.deinit(self.allocator);
-        try state.records.appendSlice(self.allocator, decoded.value.records);
-        try state.closures.appendSlice(self.allocator, decoded.value.closures);
-        return state;
+    fn readTxn(self: *Store, txn: anytype, op: Read) !ReadResult {
+        const meta = try self.loadMetadata(txn) orelse return error.InvalidWorkerJournal;
+        if (op == .usage) return .{ .metadata = meta };
+        if (meta.incarnation != self.incarnation) return error.WorkerIncarnationSuperseded;
+        switch (op) {
+            .duplicate => |request| return .{ .known = try self.knownAttempt(txn, request) },
+            .observe => |value| return .{ .quiescent = try self.observe(txn, value.coordinator, value.through) },
+            .usage => unreachable,
+        }
     }
 
     fn transact(self: *Store, op: Op) !Result {
@@ -333,90 +354,243 @@ pub const Store = struct {
         };
     }
 
-    fn update(self: *Store, txn: anytype, op: Op) !Result {
-        var key_buffer: [96]u8 = undefined;
-        const key = try std.fmt.bufPrint(&key_buffer, "workload-attempt-worker/v1/{d}", .{self.node_id});
-        var state: State = .{};
-        defer state.deinit(self.allocator);
-        if (txn.get(key) catch |err| switch (err) {
-            error.NotFound => null,
+    fn metadataKey(self: *Store, buffer: *[key_capacity]u8) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "workload-attempt-worker/v2/{d}/metadata", .{self.node_id});
+    }
+    fn attemptsPrefix(self: *Store, buffer: *[key_capacity]u8, coordinator: ?u64) ![]const u8 {
+        return if (coordinator) |id|
+            std.fmt.bufPrint(buffer, "workload-attempt-worker/v2/{d}/attempt/{x:0>16}/", .{ self.node_id, id })
+        else
+            std.fmt.bufPrint(buffer, "workload-attempt-worker/v2/{d}/attempt/", .{self.node_id});
+    }
+    fn attemptKey(self: *Store, buffer: *[key_capacity]u8, id: protocol.AttemptId) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "workload-attempt-worker/v2/{d}/attempt/{x:0>16}/{x:0>16}/{x:0>16}", .{ self.node_id, id.coordinator, id.generation, id.sequence });
+    }
+    fn closureKey(self: *Store, buffer: *[key_capacity]u8, coordinator: u64) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "workload-attempt-worker/v2/{d}/fence/{x:0>16}", .{ self.node_id, coordinator });
+    }
+
+    fn decode(self: *Store, comptime T: type, raw: []const u8, limit: u64) !T {
+        if (raw.len > limit) return error.WorkerJournalTooLarge;
+        var parsed = try std.json.parseFromSlice(T, self.allocator, raw, .{});
+        defer parsed.deinit();
+        // All records contain only scalar fields and fixed arrays.
+        return parsed.value;
+    }
+    fn get(self: *Store, comptime T: type, txn: anytype, key: []const u8, limit: u64) !?T {
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
             else => return err,
-        }) |raw| {
-            state = try self.decodeState(raw);
-        }
+        };
+        return try self.decode(T, raw, limit);
+    }
+    fn put(self: *Store, txn: anytype, key: []const u8, value: anytype, charge: u64) !void {
+        const raw = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
+        defer self.allocator.free(raw);
+        if (key.len + raw.len > charge) return error.WorkerJournalTooLarge;
+        try txn.put(key, raw);
+    }
+    fn loadMetadata(self: *Store, txn: anytype) !?Metadata {
+        var buffer: [key_capacity]u8 = undefined;
+        const value = try self.get(Metadata, txn, try self.metadataKey(&buffer), base_charge) orelse return null;
+        try value.validate();
+        return value;
+    }
+    fn loadClosure(self: *Store, txn: anytype, coordinator: u64) !?Closure {
+        var buffer: [key_capacity]u8 = undefined;
+        const value = try self.get(Closure, txn, try self.closureKey(&buffer, coordinator), fence_charge) orelse return null;
+        if (value.coordinator != coordinator) return error.InvalidWorkerJournal;
+        return value;
+    }
+    fn knownAttempt(self: *Store, txn: anytype, request: protocol.Request) !?Begin {
+        if (try self.loadClosure(txn, request.attempt.coordinator)) |closure| if (closure.through >= request.attempt.generation)
+            return error.AttemptGenerationClosed;
+        var buffer: [key_capacity]u8 = undefined;
+        const record = try self.get(Record, txn, try self.attemptKey(&buffer, request.attempt), record_charge) orelse return null;
+        if (!std.meta.eql(record.id, request.attempt) or !std.mem.eql(u8, &record.digest, &request.request_digest)) return error.AttemptIdentityMismatch;
+        return if (record.terminal) .terminal else .active;
+    }
+
+    fn update(self: *Store, txn: anytype, op: Op) !Result {
+        const previous = try self.loadMetadata(txn);
+        if (previous == null and op != .open) return error.InvalidWorkerJournal;
+        var meta = previous orelse Metadata{ .incarnation = self.incarnation };
         var result: Result = .{};
         switch (op) {
             .open => {
-                if (state.incarnation == self.incarnation) return error.WorkerIncarnationReused;
-                state.incarnation = self.incarnation;
+                // Old binaries do not maintain v2 counters. Refuse an earlier
+                // journal until an explicit offline migration fences writers;
+                // ignoring its unknown attempts would manufacture capacity.
+                var legacy_buffer: [key_capacity]u8 = undefined;
+                const legacy_key = try std.fmt.bufPrint(&legacy_buffer, "workload-attempt-worker/v1/{d}", .{self.node_id});
+                if (txn.get(legacy_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                }) |_| return error.WorkerJournalMigrationRequired;
+                if (previous) |value| if (value.incarnation == self.incarnation) return error.WorkerIncarnationReused;
+                meta = try self.reconstruct(txn);
+                if (previous == null and (meta.attempts != 0 or meta.coordinators != 0)) return error.InvalidWorkerJournal;
             },
             .begin => |request| {
-                if (state.incarnation != self.incarnation) return error.WorkerIncarnationSuperseded;
-                for (state.closures.items) |closure| if (closure.coordinator == request.attempt.coordinator and closure.through >= request.attempt.generation)
-                    return error.AttemptGenerationClosed;
-                for (state.records.items) |record| {
-                    if (record.id.coordinator == request.attempt.coordinator and record.id.generation == request.attempt.generation and record.id.sequence == request.attempt.sequence) {
-                        if (!std.meta.eql(record.id, request.attempt) or !std.mem.eql(u8, &record.digest, &request.request_digest)) return error.AttemptIdentityMismatch;
-                        result.disposition = if (record.terminal) .terminal else .active;
-                        return result;
-                    }
-                    if (!record.terminal and record.id.worker_incarnation != self.incarnation) return error.WorkerUncertaintyUnreconciled;
+                if (meta.incarnation != self.incarnation) return error.WorkerIncarnationSuperseded;
+                if (try self.knownAttempt(txn, request)) |known| {
+                    result.disposition = if (known == .terminal) .terminal else .active;
+                    return result;
                 }
-                if (state.records.items.len >= self.config.max_attempts) return error.AttemptCapacityExhausted;
-                try self.ensureCoordinator(&state, request.attempt.coordinator);
-                try state.records.append(self.allocator, .{ .id = request.attempt, .digest = request.request_digest });
-                if (state.bytes() > self.config.max_bytes) return error.AttemptCapacityExhausted;
+                if (meta.uncertain != 0) return error.WorkerUncertaintyUnreconciled;
+                if (meta.attempts >= self.config.max_attempts) return error.AttemptCapacityExhausted;
+                _ = try self.ensureCoordinator(txn, &meta, request.attempt.coordinator);
+                if (meta.bytes() + record_charge > self.config.max_bytes) return error.AttemptCapacityExhausted;
+                var buffer: [key_capacity]u8 = undefined;
+                try self.put(txn, try self.attemptKey(&buffer, request.attempt), Record{ .id = request.attempt, .digest = request.request_digest }, record_charge);
+                meta.attempts += 1;
+                meta.active += 1;
             },
             .finish => |id| {
-                for (state.records.items) |*record| {
-                    if (std.meta.eql(record.id, id)) {
-                        record.terminal = true;
-                        break;
+                var buffer: [key_capacity]u8 = undefined;
+                const key = try self.attemptKey(&buffer, id);
+                const closure = try self.loadClosure(txn, id.coordinator) orelse return error.InvalidWorkerJournal;
+                var record = try self.get(Record, txn, key, record_charge) orelse {
+                    // A concurrent fence can already have persisted this same
+                    // quiescent completion and removed its closed tombstone.
+                    if (closure.through >= id.generation) return result;
+                    return error.AttemptIdentityMismatch;
+                };
+                if (!std.meta.eql(record.id, id)) return error.AttemptIdentityMismatch;
+                if (!record.terminal) {
+                    if (meta.active == 0) return error.InvalidWorkerJournal;
+                    meta.active -= 1;
+                    if (id.worker_incarnation != meta.incarnation) {
+                        if (meta.uncertain == 0) return error.InvalidWorkerJournal;
+                        meta.uncertain -= 1;
                     }
-                } else return error.AttemptIdentityMismatch;
+                }
+                if (closure.through >= id.generation) {
+                    try txn.delete(key);
+                    if (meta.attempts == 0) return error.InvalidWorkerJournal;
+                    meta.attempts -= 1;
+                } else {
+                    record.terminal = true;
+                    try self.put(txn, key, record, record_charge);
+                }
             },
             .close => |close| {
-                if (state.incarnation != self.incarnation) return error.WorkerIncarnationSuperseded;
-                try self.ensureCoordinator(&state, close.coordinator);
-                for (state.closures.items) |*closure| if (closure.coordinator == close.coordinator) {
-                    closure.through = @max(closure.through, close.through);
-                };
+                if (meta.incarnation != self.incarnation) return error.WorkerIncarnationSuperseded;
+                var closure = try self.ensureCoordinator(txn, &meta, close.coordinator);
+                closure.through = @max(closure.through, close.through);
+                var buffer: [key_capacity]u8 = undefined;
+                try self.put(txn, try self.closureKey(&buffer, close.coordinator), closure, fence_charge);
+                try self.removeClosedTerminals(txn, &meta, closure);
             },
-            .observe => |observe| {
-                if (state.incarnation != self.incarnation) return error.WorkerIncarnationSuperseded;
-                result.quiescent = true;
-                for (state.records.items) |record| if (record.id.coordinator == observe.coordinator and record.id.generation <= observe.through and !record.terminal) {
-                    result.quiescent = false;
-                };
-            },
-            .usage => {},
+            .observe => unreachable,
         }
-        // Only durable generation closure lets terminal tombstones be removed.
-        var index: usize = 0;
-        while (index < state.records.items.len) {
-            const record = state.records.items[index];
-            const closed = for (state.closures.items) |closure| {
-                if (closure.coordinator == record.id.coordinator and closure.through >= record.id.generation) break true;
-            } else false;
-            if (record.terminal and closed) {
-                _ = state.records.swapRemove(index);
-            } else index += 1;
-        }
-        result.usage = .{ .attempts = state.records.items.len, .bytes = state.bytes(), .uncertain = 0 };
-        for (state.records.items) |record| if (!record.terminal and record.id.worker_incarnation != self.incarnation) {
-            result.usage.uncertain += 1;
-        };
-        const encoded = try std.json.Stringify.valueAlloc(self.allocator, Encoded{ .version = 1, .incarnation = state.incarnation, .records = state.records.items, .closures = state.closures.items }, .{});
-        defer self.allocator.free(encoded);
-        if (encoded.len > state.bytes() or encoded.len > hard_snapshot_bytes) return error.WorkerJournalTooLarge;
-        try txn.put(key, encoded);
+        try meta.validate();
+        var buffer: [key_capacity]u8 = undefined;
+        try self.put(txn, try self.metadataKey(&buffer), meta, base_charge);
         return result;
     }
 
-    fn ensureCoordinator(self: *Store, state: *State, coordinator: u64) !void {
-        for (state.closures.items) |closure| if (closure.coordinator == coordinator) return;
-        if (state.closures.items.len >= self.config.max_attempts or state.bytes() + fence_charge > self.config.max_bytes)
+    fn ensureCoordinator(self: *Store, txn: anytype, meta: *Metadata, coordinator: u64) !Closure {
+        if (try self.loadClosure(txn, coordinator)) |value| return value;
+        if (meta.coordinators >= self.config.max_attempts or meta.bytes() + fence_charge > self.config.max_bytes)
             return error.AttemptCapacityExhausted;
-        try state.closures.append(self.allocator, .{ .coordinator = coordinator });
+        const value: Closure = .{ .coordinator = coordinator };
+        var buffer: [key_capacity]u8 = undefined;
+        try self.put(txn, try self.closureKey(&buffer, coordinator), value, fence_charge);
+        meta.coordinators += 1;
+        return value;
+    }
+
+    fn validateRecord(self: *Store, key: []const u8, record: Record) !void {
+        const id = record.id;
+        if (id.coordinator == 0 or id.generation == 0 or id.sequence == 0 or id.operation == 0 or id.worker_incarnation == 0 or id.destination != self.node_id)
+            return error.InvalidWorkerJournal;
+        var buffer: [key_capacity]u8 = undefined;
+        if (!std.mem.eql(u8, key, try self.attemptKey(&buffer, id))) return error.InvalidWorkerJournal;
+    }
+
+    fn reconstruct(self: *Store, txn: anytype) !Metadata {
+        var meta: Metadata = .{ .incarnation = self.incarnation };
+        var prefix_buffer: [key_capacity]u8 = undefined;
+        const prefix = try self.attemptsPrefix(&prefix_buffer, null);
+        {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry = try cursor.seekAtOrAfter(prefix);
+            while (entry) |row| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                if (meta.attempts >= hard_record_limit) return error.WorkerJournalTooLarge;
+                const record = try self.decode(Record, row.value, record_charge);
+                try self.validateRecord(row.key, record);
+                if (record.id.worker_incarnation == self.incarnation) return error.WorkerIncarnationReused;
+                if ((try self.loadClosure(txn, record.id.coordinator)) == null) return error.InvalidWorkerJournal;
+                meta.attempts += 1;
+                if (!record.terminal) {
+                    meta.active += 1;
+                    meta.uncertain += 1;
+                }
+            }
+        }
+        const fence_prefix = try std.fmt.bufPrint(&prefix_buffer, "workload-attempt-worker/v2/{d}/fence/", .{self.node_id});
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(fence_prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, fence_prefix)) break;
+            if (meta.coordinators >= hard_record_limit) return error.WorkerJournalTooLarge;
+            const closure = try self.decode(Closure, row.value, fence_charge);
+            var buffer: [key_capacity]u8 = undefined;
+            if (closure.coordinator == 0 or !std.mem.eql(u8, row.key, try self.closureKey(&buffer, closure.coordinator))) return error.InvalidWorkerJournal;
+            meta.coordinators += 1;
+        }
+        return meta;
+    }
+
+    fn removeClosedTerminals(self: *Store, txn: anytype, meta: *Metadata, closure: Closure) !void {
+        var ids: std.ArrayListUnmanaged(protocol.AttemptId) = .empty;
+        defer ids.deinit(self.allocator);
+        var prefix_buffer: [key_capacity]u8 = undefined;
+        const prefix = try self.attemptsPrefix(&prefix_buffer, closure.coordinator);
+        {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var count: usize = 0;
+            var entry = try cursor.seekAtOrAfter(prefix);
+            while (entry) |row| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                if (count >= hard_record_limit) return error.WorkerJournalTooLarge;
+                count += 1;
+                const record = try self.decode(Record, row.value, record_charge);
+                try self.validateRecord(row.key, record);
+                if (record.terminal and record.id.generation <= closure.through) try ids.append(self.allocator, record.id);
+            }
+        }
+        // Never mutate the cursor's backing storage while borrowed keys exist.
+        for (ids.items) |id| {
+            var buffer: [key_capacity]u8 = undefined;
+            try txn.delete(try self.attemptKey(&buffer, id));
+            if (meta.attempts == 0) return error.InvalidWorkerJournal;
+            meta.attempts -= 1;
+        }
+    }
+
+    fn observe(self: *Store, txn: anytype, coordinator: u64, through: u64) !bool {
+        const closure = try self.loadClosure(txn, coordinator) orelse return false;
+        if (closure.through < through) return false;
+        var buffer: [key_capacity]u8 = undefined;
+        const prefix = try self.attemptsPrefix(&buffer, coordinator);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var count: usize = 0;
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            if (count >= hard_record_limit) return error.WorkerJournalTooLarge;
+            count += 1;
+            const record = try self.decode(Record, row.value, record_charge);
+            try self.validateRecord(row.key, record);
+            if (record.id.generation <= through and !record.terminal) return false;
+        }
+        return true;
     }
 };
