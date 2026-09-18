@@ -53,6 +53,67 @@ const intent_keys_prefix = "\x00\x00__txn_intent_keys__:";
 const intent_members_prefix = "\x00\x00__txn_intent_members__:";
 const intent_admission_prefix = "\x00\x00__txn_intent_admission__:";
 const IntentAdmission = struct { count: u64 = 0, bytes: u64 = 0 };
+const completion_prefix = "\x00\x00__txn_completion_v1__:";
+const completion_summary_key = "\x00\x00__metadata__:txn_completion_v1";
+pub const CompletionLimits = struct {
+    max_transaction_bytes: u64 = 0,
+    max_count: u64 = 0,
+    max_bytes: u64 = 0,
+
+    fn enabled(self: @This()) bool {
+        return self.max_count != 0 or self.max_bytes != 0;
+    }
+};
+const CompletionRecord = struct {
+    metadata_bytes: u64,
+    intent_bytes: u64 = 0,
+
+    fn bytes(self: @This()) !u64 {
+        return std.math.add(u64, self.metadata_bytes, self.intent_bytes) catch error.TransactionTooLarge;
+    }
+
+    fn encode(self: @This()) [16]u8 {
+        var out: [16]u8 = undefined;
+        std.mem.writeInt(u64, out[0..8], self.metadata_bytes, .little);
+        std.mem.writeInt(u64, out[8..16], self.intent_bytes, .little);
+        return out;
+    }
+
+    fn decode(raw: []const u8) !@This() {
+        if (raw.len != 16) return error.InvalidTxnRecord;
+        return .{ .metadata_bytes = std.mem.readInt(u64, raw[0..8], .little), .intent_bytes = std.mem.readInt(u64, raw[8..16], .little) };
+    }
+};
+const CompletionUsage = struct {
+    count: u64 = 0,
+    bytes: u64 = 0,
+
+    fn encode(self: @This()) [16]u8 {
+        var out: [16]u8 = undefined;
+        std.mem.writeInt(u64, out[0..8], self.count, .little);
+        std.mem.writeInt(u64, out[8..16], self.bytes, .little);
+        return out;
+    }
+
+    fn decode(raw: []const u8) !@This() {
+        if (raw.len != 16) return error.InvalidTxnRecord;
+        return .{ .count = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u64, raw[8..16], .little) };
+    }
+};
+
+const CompletionChange = struct {
+    key: [completion_prefix.len + 16]u8,
+    record: ?[16]u8,
+    summary: [16]u8,
+    previous: ?CompletionRecord,
+
+    fn append(self: *const @This(), alloc: Allocator, writes: *std.ArrayListUnmanaged(docstore.KVPair), deletes: *std.ArrayListUnmanaged([]const u8)) !void {
+        if (self.record) |*record| {
+            try writes.append(alloc, .{ .key = &self.key, .value = record });
+        } else try deletes.append(alloc, &self.key);
+        try writes.append(alloc, .{ .key = completion_summary_key, .value = &self.summary });
+    }
+};
 // Durable epoch leases. A prepare vote and its schema identity are one atomic
 // mutation; resolution retires both. Historical immutable schemas remain
 // usable after a new active epoch is published and after participant restart.
@@ -153,6 +214,9 @@ pub const RecoveryStats = struct {
 };
 
 pub const RecoveryOptions = struct {
+    /// A DB resolver owns physical row/index application. If it deferred,
+    /// metadata cleanup must not retry through a different allocator/pipeline.
+    resolve_terminal_intents: bool = true,
     /// Distributed decisions must be replicated by their coordinator. DB-local
     /// maintenance disables this and asks the coordinator callback to propose
     /// the decision through data Raft instead.
@@ -184,6 +248,7 @@ pub const TxnSummaryPage = struct {
 };
 
 pub const ResolutionExtraBatch = struct {
+    preparation_allocator: ?Allocator = null,
     /// Recovery owns one budgeted snapshot through atomic resolution.
     captured_intents: ?[]backend_scan.OwnedKVPair = null,
     cleanup_context: ?*anyopaque = null,
@@ -351,6 +416,9 @@ pub const TxnManager = struct {
     alloc: Allocator,
     trace_writer: ?tracing.AntflyTraceWriter = null,
     shard_id: []const u8 = "local",
+    /// Must come from the replicated table catalog. The caller's apply lock
+    /// serializes these point reads with the batch that publishes the change.
+    completion_limits: CompletionLimits = .{},
 
     pub const RecoveryExtraBatchHooks = struct {
         ctx: ?*anyopaque = null,
@@ -377,6 +445,171 @@ pub const TxnManager = struct {
     pub fn deinit(self: *TxnManager) void {
         if (self.owns_store) self.store.deinit();
         self.* = undefined;
+    }
+
+    fn completionMetadataBytes(participants: []const []const u8) !u64 {
+        var bytes: u64 = 4096;
+        for (participants) |participant| {
+            const payload = std.math.mul(u64, participant.len, 64) catch return error.TransactionTooLarge;
+            bytes = std.math.add(u64, bytes, std.math.add(u64, payload, 128) catch return error.TransactionTooLarge) catch return error.TransactionTooLarge;
+        }
+        return bytes;
+    }
+
+    fn completionRecord(self: *TxnManager, txn_id: TxnId) !?CompletionRecord {
+        const key = makeSidecarKey(completion_prefix, txn_id);
+        const raw = self.getAlloc(self.alloc, &key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        return try CompletionRecord.decode(raw);
+    }
+
+    fn completionUsage(self: *TxnManager) !?CompletionUsage {
+        const raw = self.getAlloc(self.alloc, completion_summary_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        return try CompletionUsage.decode(raw);
+    }
+
+    /// Bootstrap once from authoritative records. New stores pay an empty
+    /// scan. A catalog upgrade cannot invent an empty ledger for old pending
+    /// work. Large or legacy unmetered state requires explicit reconciliation
+    /// before admission; terminal cleanup remains available in the meantime.
+    pub fn reconcileCompletionAdmission(self: *TxnManager) !void {
+        if (!self.completion_limits.enabled() or try self.completionUsage() != null) return;
+        const page = try self.listTransactionsPage(self.alloc, null, 65_536);
+        defer self.alloc.free(page.items);
+        if (page.next_after != null) return error.TransactionRecoveryReconciliationRequired;
+        const Entry = struct { key: [completion_prefix.len + 16]u8, value: [16]u8 };
+        var entries = std.ArrayListUnmanaged(Entry).empty;
+        defer entries.deinit(self.alloc);
+        var usage: CompletionUsage = .{};
+        for (page.items) |txn| {
+            // Inspect metadata lengths before copying participant arrays from
+            // a legacy store. The current policy is an explicit hard bound on
+            // bootstrap working state, not just a post-allocation check.
+            {
+                var read = try self.store.beginRead();
+                defer read.abort();
+                inline for (.{ participants_prefix, resolved_participants_prefix }) |prefix| {
+                    const key = makeSidecarKey(prefix, txn.txn_id);
+                    const raw = read.get(&key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (raw) |value| {
+                        const bound = if (self.completion_limits.max_bytes != 0) self.completion_limits.max_bytes else 128 * 1024 * 1024;
+                        if (value.len > bound / 64) return error.TransactionRecoveryReconciliationRequired;
+                    }
+                }
+            }
+            if (txn.status != .pending and txn.intents_resolved_known and txn.intents_resolved) {
+                if (try self.completionCanRetire(txn.txn_id, null)) continue;
+            }
+            const participants = try self.getParticipants(self.alloc, txn.txn_id);
+            defer freeParticipantList(self.alloc, participants);
+            const admission = try self.loadIntentAdmission(self.alloc, txn.txn_id);
+            if (admission == null) {
+                var prefix: [intents_prefix.len + 17]u8 = undefined;
+                @memcpy(prefix[0..intents_prefix.len], intents_prefix);
+                @memcpy(prefix[intents_prefix.len..][0..16], &txn.txn_id);
+                prefix[intents_prefix.len + 16] = ':';
+                var read = try self.store.beginRead();
+                defer read.abort();
+                if (try readHasPrefix(&read, &prefix)) return error.TransactionRecoveryReconciliationRequired;
+            }
+            const record: CompletionRecord = .{
+                .metadata_bytes = try completionMetadataBytes(participants),
+                .intent_bytes = if (admission) |value| value.bytes else 0,
+            };
+            usage.count = std.math.add(u64, usage.count, 1) catch return error.TransactionRecoveryReconciliationRequired;
+            usage.bytes = std.math.add(u64, usage.bytes, try record.bytes()) catch return error.TransactionRecoveryReconciliationRequired;
+            if ((self.completion_limits.max_count != 0 and usage.count > self.completion_limits.max_count) or
+                (self.completion_limits.max_bytes != 0 and usage.bytes > self.completion_limits.max_bytes))
+                return error.TransactionRecoveryReconciliationRequired;
+            try entries.append(self.alloc, .{ .key = makeSidecarKey(completion_prefix, txn.txn_id), .value = record.encode() });
+        }
+        var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+        defer writes.deinit(self.alloc);
+        for (entries.items) |*entry| try writes.append(self.alloc, .{ .key = &entry.key, .value = &entry.value });
+        const summary = usage.encode();
+        try writes.append(self.alloc, .{ .key = completion_summary_key, .value = &summary });
+        var batch = try self.store.beginBatch();
+        errdefer batch.abort();
+        if (batch.get(completion_summary_key)) |_| {
+            // Another owner initialized the ledger after our read snapshot.
+            // Never overwrite its subsequent admitted work with this snapshot.
+            batch.abort();
+            return;
+        } else |err| if (err != error.NotFound) return err;
+        for (writes.items) |write| try batch.put(write.key, write.value);
+        try batch.commit();
+    }
+
+    fn completionChange(self: *TxnManager, txn_id: TxnId, next: ?CompletionRecord) !?CompletionChange {
+        if (next != null and self.completion_limits.enabled()) try self.reconcileCompletionAdmission();
+        const before = (try self.completionUsage()) orelse return null;
+        const previous = try self.completionRecord(txn_id);
+        if (previous == null and next == null) return null;
+        const after = try self.adjustCompletionUsage(before, previous, next);
+        return .{ .key = makeSidecarKey(completion_prefix, txn_id), .record = if (next) |record| record.encode() else null, .summary = after.encode(), .previous = previous };
+    }
+
+    fn adjustCompletionUsage(self: *TxnManager, before: CompletionUsage, previous: ?CompletionRecord, next: ?CompletionRecord) !CompletionUsage {
+        var after = before;
+        if (previous) |record| {
+            after.count = std.math.sub(u64, after.count, 1) catch return error.InvalidTxnRecord;
+            after.bytes = std.math.sub(u64, after.bytes, try record.bytes()) catch return error.InvalidTxnRecord;
+        }
+        if (next) |record| {
+            if (self.completion_limits.max_transaction_bytes != 0 and
+                try record.bytes() > self.completion_limits.max_transaction_bytes and
+                (previous == null or try record.bytes() > try previous.?.bytes())) return error.TransactionTooLarge;
+            after.count = std.math.add(u64, after.count, 1) catch return error.TransactionRecoveryCapacityExhausted;
+            after.bytes = std.math.add(u64, after.bytes, try record.bytes()) catch return error.TransactionRecoveryCapacityExhausted;
+        }
+        // Lowered ceilings never block retirement, a shrinking prepare, or
+        // idempotent work needed to finish an already accepted obligation.
+        if ((self.completion_limits.max_count != 0 and after.count > self.completion_limits.max_count and after.count > before.count) or
+            (self.completion_limits.max_bytes != 0 and after.bytes > self.completion_limits.max_bytes and after.bytes > before.bytes))
+            return error.TransactionRecoveryCapacityExhausted;
+        return after;
+    }
+
+    fn completionCanRetire(self: *TxnManager, txn_id: TxnId, resolved_participant: ?[]const u8) !bool {
+        return self.completionCanRetireClearingOutbox(txn_id, resolved_participant, null);
+    }
+
+    fn completionCanRetireClearingOutbox(self: *TxnManager, txn_id: TxnId, resolved_participant: ?[]const u8, cleared: ?HAOutboxKind) !bool {
+        const batch_key = makeTransactionHABatchOutboxKey(txn_id);
+        const replay_key = makeTransactionHAReplayOutboxKey(txn_id);
+        if (cleared != .batch and try self.keyExists(&batch_key)) return false;
+        if (cleared != .replay and try self.keyExists(&replay_key)) return false;
+        const record = try self.loadTransactionRecord(txn_id);
+        // Followers own local intent application; only the coordinator owns
+        // fanout/acknowledgement debt for the entire participant set.
+        if (record.coordinator_known and !record.coordinator) return true;
+        const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
+        defer freeParticipantList(self.alloc, unresolved);
+        for (unresolved) |participant| {
+            if (resolved_participant) |resolved| if (std.mem.eql(u8, participant, resolved)) continue;
+            return false;
+        }
+        return true;
+    }
+
+    fn completionRetirement(self: *TxnManager, txn_id: TxnId, resolved_participant: ?[]const u8, writes: []const docstore.KVPair) !?CompletionChange {
+        if (try self.completionRecord(txn_id) == null) return null;
+        for (writes) |write| {
+            if (std.mem.startsWith(u8, write.key, ha_batch_outbox_prefix) or
+                std.mem.startsWith(u8, write.key, ha_replay_outbox_prefix)) return null;
+        }
+        if (!(try self.completionCanRetire(txn_id, resolved_participant))) return null;
+        return self.completionChange(txn_id, null);
     }
 
     /// Create a new pending transaction record.
@@ -488,6 +721,7 @@ pub const TxnManager = struct {
             .coordinator = coordinator,
             .retain_terminal = retain_terminal,
         };
+        var completion = try self.completionChange(txn_id, .{ .metadata_bytes = try completionMetadataBytes(participants) });
         const record_value = try self.encodeRecord(record);
         defer self.alloc.free(record_value);
         const participant_key = makeSidecarKey(participants_prefix, txn_id);
@@ -503,13 +737,14 @@ pub const TxnManager = struct {
         try writes.appendSlice(self.alloc, extra_batch.writes);
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer deletes.deinit(self.alloc);
+        if (completion) |*change| try change.append(self.alloc, &writes, &deletes);
         if (participants.len > 0) {
             try deletes.append(self.alloc, &resolved_key);
         } else {
             try deletes.appendSlice(self.alloc, &.{ &participant_key, &resolved_key });
         }
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
-        try self.applyBatch(writes.items, deletes.items, null);
+        try self.applyBatchWithCompletion(writes.items, deletes.items, null, completion);
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
                 .name = "InitTransaction",
@@ -647,6 +882,14 @@ pub const TxnManager = struct {
             admission.bytes > (if (previous_admission) |previous| previous.bytes else 0))
             return error.TransactionTooLarge;
 
+        var completion: ?CompletionChange = null;
+        if (self.completion_limits.enabled()) try self.reconcileCompletionAdmission();
+        if (try self.completionUsage() != null) {
+            var reserved = (try self.completionRecord(txn_id)) orelse return error.InvalidTxnRecord;
+            reserved.intent_bytes = admission.bytes;
+            completion = try self.completionChange(txn_id, reserved);
+        }
+
         for (intents, 0..) |intent, index| {
             if (last_intents.get(intent.key).? != index) continue;
             const member_key = try makeIntentMemberKey(self.alloc, txn_id, intent.key);
@@ -708,7 +951,11 @@ pub const TxnManager = struct {
 
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
-        try self.applyBatch(writes.items, extra_batch.deletes, null);
+        var completion_deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer completion_deletes.deinit(self.alloc);
+        try completion_deletes.appendSlice(self.alloc, extra_batch.deletes);
+        if (completion) |*change| try change.append(self.alloc, &writes, &completion_deletes);
+        try self.applyBatchWithCompletion(writes.items, completion_deletes.items, null, completion);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
     }
@@ -789,8 +1036,13 @@ pub const TxnManager = struct {
             if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
             }
-            if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0) {
-                try self.applyBatch(completion_writes.items, extra_batch.completion_deletes, null);
+            var completion_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer completion_deletes.deinit(self.alloc);
+            try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
+            var retirement = try self.completionRetirement(txn_id, extra_batch.resolved_participant, completion_writes.items);
+            if (retirement) |*change| try change.append(self.alloc, &completion_writes, &completion_deletes);
+            if (completion_writes.items.len != 0 or completion_deletes.items.len != 0) {
+                try self.applyBatchWithCompletion(completion_writes.items, completion_deletes.items, null, retirement);
             }
             return .{
                 .applied = false,
@@ -841,7 +1093,9 @@ pub const TxnManager = struct {
             try completion_deletes.append(self.alloc, &stale_admission_key);
             try completion_deletes.append(self.alloc, &schema_lease_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
-            try self.applyBatch(completion_writes.items, completion_deletes.items, null);
+            var retirement = try self.completionRetirement(txn_id, extra_batch.resolved_participant, completion_writes.items);
+            if (retirement) |*change| try change.append(self.alloc, &completion_writes, &completion_deletes);
+            try self.applyBatchWithCompletion(completion_writes.items, completion_deletes.items, null, retirement);
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -936,7 +1190,10 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
 
-        try self.applyBatch(writes.items, deletes.items, extra_batch.replay);
+        var retirement = try self.completionRetirement(txn_id, extra_batch.resolved_participant, writes.items);
+        if (retirement) |*change| try change.append(self.alloc, &writes, &deletes);
+
+        try self.applyBatchWithCompletion(writes.items, deletes.items, extra_batch.replay, retirement);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -1081,16 +1338,26 @@ pub const TxnManager = struct {
     }
 
     pub fn clearHAOutbox(self: *TxnManager, txn_id: TxnId, kind: HAOutboxKind) !void {
-        switch (kind) {
-            .batch => {
-                const key = makeTransactionHABatchOutboxKey(txn_id);
-                try self.applyBatch(&.{}, &.{&key}, null);
-            },
-            .replay => {
-                const key = makeTransactionHAReplayOutboxKey(txn_id);
-                try self.applyBatch(&.{}, &.{&key}, null);
-            },
+        const batch_key = makeTransactionHABatchOutboxKey(txn_id);
+        const replay_key = makeTransactionHAReplayOutboxKey(txn_id);
+        const key: []const u8 = switch (kind) {
+            .batch => &batch_key,
+            .replay => &replay_key,
+        };
+        var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+        defer writes.deinit(self.alloc);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(self.alloc);
+        try deletes.append(self.alloc, key);
+        var retirement: ?CompletionChange = null;
+        if (try self.completionRecord(txn_id) != null) {
+            const record = try self.loadTransactionRecord(txn_id);
+            if (record.status != .pending and record.intents_resolved_known and record.intents_resolved and
+                try self.completionCanRetireClearingOutbox(txn_id, null, kind))
+                retirement = try self.completionChange(txn_id, null);
         }
+        if (retirement) |*change| try change.append(self.alloc, &writes, &deletes);
+        try self.applyBatchWithCompletion(writes.items, deletes.items, null, retirement);
     }
 
     pub fn collectIntentDocumentKeys(
@@ -1288,7 +1555,7 @@ pub const TxnManager = struct {
         // has already cleaned the transaction. Do not recreate an orphaned
         // resolved-participants sidecar in that case, and reject corrupt
         // acknowledgements for participants that were never enlisted.
-        _ = try self.loadTransactionRecord(txn_id);
+        const record = try self.loadTransactionRecord(txn_id);
         const participants = try self.getParticipants(self.alloc, txn_id);
         defer freeParticipantList(self.alloc, participants);
         var enlisted = false;
@@ -1330,7 +1597,15 @@ pub const TxnManager = struct {
         defer writes.deinit(self.alloc);
         try writes.append(self.alloc, .{ .key = &key, .value = encoded });
         try writes.appendSlice(self.alloc, extra_batch.writes);
-        try self.applyBatch(writes.items, extra_batch.deletes, null);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(self.alloc);
+        try deletes.appendSlice(self.alloc, extra_batch.deletes);
+        var retirement = if (record.status != .pending and record.intents_resolved_known and record.intents_resolved)
+            try self.completionRetirement(txn_id, participant, writes.items)
+        else
+            null;
+        if (retirement) |*change| try change.append(self.alloc, &writes, &deletes);
+        try self.applyBatchWithCompletion(writes.items, deletes.items, null, retirement);
     }
 
     pub fn getParticipants(self: *TxnManager, alloc: Allocator, txn_id: TxnId) ![][]u8 {
@@ -1451,6 +1726,10 @@ pub const TxnManager = struct {
             }
 
             if (!(summary.intents_resolved_known and summary.intents_resolved) and try self.hasAnyIntents(txn_id)) {
+                if (!options.resolve_terminal_intents) {
+                    stats.deferred_unresolved += 1;
+                    continue;
+                }
                 const resolve_ts = switch (summary.status) {
                     .committed => if (summary.commit_version > 0) summary.commit_version else summary.begin_timestamp,
                     .aborted => if (summary.finalized_at > 0) summary.finalized_at else resolution_timestamp,
@@ -1882,7 +2161,12 @@ pub const TxnManager = struct {
         try deletes.append(self.alloc, &admission_key);
         try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &ha_batch_key, &ha_replay_key, &intent_keys_key, &schema_lease_key });
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
-        try self.applyBatch(extra_batch.writes, deletes.items, null);
+        var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+        defer writes.deinit(self.alloc);
+        try writes.appendSlice(self.alloc, extra_batch.writes);
+        var retirement = try self.completionChange(txn_id, null);
+        if (retirement) |*change| try change.append(self.alloc, &writes, &deletes);
+        try self.applyBatchWithCompletion(writes.items, deletes.items, null, retirement);
     }
 
     fn saveParticipantSet(self: *TxnManager, comptime prefix: []const u8, txn_id: TxnId, participants: []const []const u8) !void {
@@ -1953,8 +2237,27 @@ pub const TxnManager = struct {
     }
 
     fn applyBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {
+        return self.applyBatchWithCompletion(writes, deletes, replay, null);
+    }
+
+    fn applyBatchWithCompletion(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, completion: ?CompletionChange) !void {
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
+        var summary: ?[16]u8 = null;
+        if (completion) |change| {
+            const current_record = batch.get(&change.key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            const previous: ?CompletionRecord = if (current_record) |raw| try CompletionRecord.decode(raw) else null;
+            if (!std.meta.eql(previous, change.previous)) return error.TransactionCompletionChanged;
+            const current_summary = try CompletionUsage.decode(try batch.get(completion_summary_key));
+            const next: ?CompletionRecord = if (change.record) |raw| try CompletionRecord.decode(&raw) else null;
+            // Background acknowledgements do not hold the foreground DB apply
+            // mutex. Recompute against the serialized backend write snapshot,
+            // so independent transactions cannot lose each other's credits.
+            summary = (try self.adjustCompletionUsage(current_summary, previous, next)).encode();
+        }
         for (deletes) |key| {
             batch.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
@@ -1962,8 +2265,10 @@ pub const TxnManager = struct {
             };
         }
         for (writes) |kv| {
+            if (completion != null and std.mem.eql(u8, kv.key, completion_summary_key)) continue;
             try batch.put(kv.key, kv.value);
         }
+        if (summary) |*value| try batch.put(completion_summary_key, value);
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
         try batch.commit();
     }
@@ -2343,6 +2648,10 @@ fn decodeParticipantList(alloc: Allocator, raw: []const u8) ![][]u8 {
     var count_buf: [4]u8 = undefined;
     @memcpy(&count_buf, raw[0..4]);
     const count = std.mem.readInt(u32, &count_buf, .little);
+    // Every element needs its own length word, even when its payload is empty.
+    // Reject impossible counts before they turn a small corrupt record into a
+    // huge decoded allocation during recovery.
+    if (count > (raw.len - 4) / 4) return TxnError.InvalidTxnRecord;
     var result = try alloc.alloc([]u8, count);
     var initialized: usize = 0;
     errdefer {
@@ -2426,6 +2735,157 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "workload admission storage completion debt is atomic through coordinator handoff" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    manager.completion_limits = .{ .max_count = 1, .max_bytes = 64 * 1024 };
+    const first: TxnId = .{71} ** 16;
+    const second: TxnId = .{72} ** 16;
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(first, 100, 100, &.{"coordinator"}, true, true);
+    const begun = (try manager.completionUsage()).?;
+    try std.testing.expectEqual(@as(u64, 1), begun.count);
+    try std.testing.expectError(error.TransactionRecoveryCapacityExhausted, manager.initTransaction(second, 101));
+    try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(second));
+    try manager.writeIntents(first, &.{.{ .key = "a", .value = "value" }}, &.{});
+    const prepared = (try manager.completionUsage()).?;
+    try std.testing.expect(prepared.bytes > begun.bytes);
+    const excessive: [2048]u8 = @splat('x');
+    try std.testing.expectError(error.TransactionRecoveryCapacityExhausted, manager.writeIntents(first, &.{.{ .key = "b", .value = &excessive }}, &.{}));
+    try std.testing.expectEqualDeep(prepared, (try manager.completionUsage()).?);
+    try manager.checkOrdinaryWriteConflict("b");
+
+    // A tighter policy cannot revoke accepted obligations or prevent terminal
+    // completion, and an idempotent prepare cannot spend the credits twice.
+    manager.completion_limits.max_bytes = 1;
+    try manager.writeIntents(first, &.{.{ .key = "a", .value = "value" }}, &.{});
+    try std.testing.expectEqualDeep(prepared, (try manager.completionUsage()).?);
+    try manager.resolveIntents(first, .committed, 200);
+    try std.testing.expectEqualDeep(prepared, (try manager.completionUsage()).?);
+    try manager.markParticipantResolved(first, "coordinator");
+    try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+    try manager.markParticipantResolved(first, "coordinator");
+    try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+    manager.completion_limits.max_bytes = 64 * 1024;
+    try manager.initTransaction(second, 201);
+    try manager.resolveIntents(second, .aborted, 202);
+    try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+}
+
+test "workload admission storage completion survives reopen and restores legacy pending debt" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-completion-reopen");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    const first: TxnId = .{73} ** 16;
+    const second: TxnId = .{74} ** 16;
+    {
+        var store = try DocStore.open(alloc, path, .{});
+        defer store.close();
+        var writer = try TxnManager.init(alloc, &store);
+        defer writer.deinit();
+        // Simulate an older writer: no completion summary exists yet.
+        try writer.initTransaction(first, 100);
+        try writer.writeIntents(first, &.{.{ .key = "a", .value = "value" }}, &.{});
+    }
+    {
+        var store = try DocStore.open(alloc, path, .{});
+        defer store.close();
+        var reader = try TxnManager.init(alloc, &store);
+        defer reader.deinit();
+        reader.completion_limits = .{ .max_count = 1, .max_bytes = 64 * 1024 };
+        try reader.reconcileCompletionAdmission();
+        try std.testing.expectEqual(@as(u64, 1), (try reader.completionUsage()).?.count);
+        try std.testing.expectError(error.TransactionRecoveryCapacityExhausted, reader.initTransaction(second, 101));
+    }
+    {
+        var store = try DocStore.open(alloc, path, .{});
+        defer store.close();
+        var reader = try TxnManager.init(alloc, &store);
+        defer reader.deinit();
+        reader.completion_limits = .{ .max_count = 1, .max_bytes = 1 };
+        try std.testing.expectEqual(@as(u64, 1), (try reader.completionUsage()).?.count);
+        try reader.resolveIntents(first, .committed, 200);
+        try std.testing.expectEqualDeep(CompletionUsage{}, (try reader.completionUsage()).?);
+        const value = try getVisibleDocRuntime(&reader.store, alloc, "a");
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("value", value);
+    }
+}
+
+test "workload admission follower completion does not wait for coordinator fanout acknowledgements" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    manager.completion_limits = .{ .max_count = 1, .max_bytes = 64 * 1024 };
+    const id: TxnId = .{75} ** 16;
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 100, &.{ "coordinator", "follower" }, false, false);
+    try manager.writeIntents(id, &.{.{ .key = "a", .value = "value" }}, &.{});
+    try manager.resolveIntents(id, .committed, 200);
+    try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+}
+
+test "workload admission independent storage writers cannot overspend one completion slot" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-completion-concurrent");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const State = struct {
+        store: *DocStore,
+        ready: std.atomic.Value(usize) = .init(0),
+        go: std.atomic.Value(bool) = .init(false),
+        failures: [2]?anyerror = .{ null, null },
+
+        fn run(self: *@This(), index: usize) void {
+            var manager = TxnManager.init(std.testing.allocator, self.store) catch |err| {
+                self.failures[index] = err;
+                _ = self.ready.fetchAdd(1, .release);
+                return;
+            };
+            defer manager.deinit();
+            manager.completion_limits = .{ .max_count = 1, .max_bytes = 64 * 1024 };
+            _ = self.ready.fetchAdd(1, .release);
+            while (!self.go.load(.acquire)) std.atomic.spinLoopHint();
+            const id: TxnId = @splat(@intCast(90 + index));
+            manager.initTransaction(id, 100) catch |err| {
+                self.failures[index] = err;
+            };
+        }
+    };
+    var state: State = .{ .store = &store };
+    const first = try std.Thread.spawn(.{}, State.run, .{ &state, @as(usize, 0) });
+    const second = std.Thread.spawn(.{}, State.run, .{ &state, @as(usize, 1) }) catch |err| {
+        state.go.store(true, .release);
+        first.join();
+        return err;
+    };
+    while (state.ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    state.go.store(true, .release);
+    first.join();
+    second.join();
+    var successes: usize = 0;
+    for (state.failures) |failure| {
+        if (failure) |err| try std.testing.expectEqual(error.TransactionRecoveryCapacityExhausted, err) else successes += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), successes);
+    var reader = try TxnManager.init(alloc, &store);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u64, 1), (try reader.completionUsage()).?.count);
+    const records = try reader.listTransactions(alloc);
+    defer alloc.free(records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+}
 
 test "transaction cumulative admission is atomic and membership metadata is incremental" {
     const alloc = std.testing.allocator;

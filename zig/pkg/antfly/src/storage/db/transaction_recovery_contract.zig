@@ -6,6 +6,11 @@ const resolution_mod = @import("transaction_resolution.zig");
 const transactions_mod = @import("../transactions.zig");
 
 pub const Config = struct {
+    /// Pre-reserved metadata lane, distinct from participant row application.
+    completion_metadata: ?*@import("../../common/workload_completion.zig").Workspace = null,
+    /// Optional one-shot continuation, accessed only while the metadata lane
+    /// is exclusively held. Background Runtime owns its own cursor.
+    completion_scan_after: ?*?transactions_mod.TxnId = null,
     enabled: bool = false,
     lease_owned: bool = false,
     owner_id: []const u8 = "local",

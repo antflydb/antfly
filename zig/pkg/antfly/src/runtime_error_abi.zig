@@ -432,6 +432,12 @@ pub const Detail = enum(c_int) {
     admission_request_too_large,
     admission_wait_timeout,
     admission_closed,
+    transaction_recovery_capacity_exhausted,
+    transaction_recovery_reconciliation_required,
+    transaction_completion_busy,
+    transaction_completion_capacity_mismatch,
+    transaction_completion_policy_required,
+    transaction_completion_changed,
 };
 
 pub const Status = extern struct {
@@ -512,6 +518,12 @@ pub fn statusFromError(err: anyerror) Status {
         error.TableTransitionActive => status(.conflict, .table_transition_active),
         error.SchemaInUse => status(.conflict, .schema_in_use),
         error.TransactionTooLarge => status(.invalid_argument, .transaction_too_large),
+        error.TransactionRecoveryCapacityExhausted => status(.retryable, .transaction_recovery_capacity_exhausted),
+        error.TransactionRecoveryReconciliationRequired => status(.unavailable, .transaction_recovery_reconciliation_required),
+        error.TransactionCompletionBusy => status(.retryable, .transaction_completion_busy),
+        error.TransactionCompletionCapacityMismatch => status(.unavailable, .transaction_completion_capacity_mismatch),
+        error.TransactionCompletionPolicyRequired => status(.unavailable, .transaction_completion_policy_required),
+        error.TransactionCompletionChanged => status(.retryable, .transaction_completion_changed),
         error.ExtensionOwnedObject => status(.conflict, .extension_owned_object),
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
@@ -975,6 +987,12 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .table_transition_active => "TableTransitionActive",
         .schema_in_use => "SchemaInUse",
         .transaction_too_large => "TransactionTooLarge",
+        .transaction_recovery_capacity_exhausted => "TransactionRecoveryCapacityExhausted",
+        .transaction_recovery_reconciliation_required => "TransactionRecoveryReconciliationRequired",
+        .transaction_completion_busy => "TransactionCompletionBusy",
+        .transaction_completion_capacity_mismatch => "TransactionCompletionCapacityMismatch",
+        .transaction_completion_policy_required => "TransactionCompletionPolicyRequired",
+        .transaction_completion_changed => "TransactionCompletionChanged",
         .extension_owned_object => "ExtensionOwnedObject",
         .restore_intent_conflict => "RestoreIntentConflict",
         .unauthorized => "Unauthorized",
@@ -1275,6 +1293,14 @@ test "transaction capacity rejection retains a permanent public status" {
     const value = statusFromError(error.TransactionTooLarge);
     try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), value.code);
     try std.testing.expectEqual(error.TransactionTooLarge, errorFromStatus(value));
+}
+
+test "workload admission transaction recovery failures survive the native boundary" {
+    for ([_]anyerror{ error.TransactionRecoveryCapacityExhausted, error.TransactionRecoveryReconciliationRequired, error.TransactionCompletionBusy, error.TransactionCompletionCapacityMismatch, error.TransactionCompletionPolicyRequired, error.TransactionCompletionChanged }) |err| {
+        const value = statusFromError(err);
+        try std.testing.expectEqual(err, errorFromStatus(value));
+        try std.testing.expect(value.code == @intFromEnum(Code.retryable) or value.code == @intFromEnum(Code.unavailable));
+    }
 }
 
 test "stable status preserves public boundary semantics" {

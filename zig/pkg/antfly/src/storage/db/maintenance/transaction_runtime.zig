@@ -324,6 +324,26 @@ const RunSummary = struct {
 };
 
 fn runRecovery(runtime: *Runtime, now_ns: u64) !RunSummary {
+    if (runtime.config.completion_metadata != null) {
+        var combined: RunSummary = .{};
+        var remaining = @max(1, runtime.config.max_records_per_run);
+        while (remaining != 0 and !isShutdown(runtime)) : (remaining -= 1) {
+            // Each call drops the metadata lane before the next record. Keep
+            // the configured per-pass work quota without allocating that many
+            // records together or holding one lease over a full keyspace pass.
+            const page = try runRecoveryPageWithConfig(runtime.alloc, runtime.store, runtime.config, now_ns, runtime.scan_after, 1);
+            runtime.scan_after = page.next_scan_after;
+            combined.next_scan_after = page.next_scan_after;
+            inline for (std.meta.fields(transactions_mod.RecoveryStats)) |field|
+                @field(combined.recovery, field.name) +|= @field(page.recovery, field.name);
+            combined.notification_attempts +|= page.notification_attempts;
+            combined.notification_successes +|= page.notification_successes;
+            combined.notification_failures +|= page.notification_failures;
+            combined.record_failures +|= page.record_failures;
+            if (page.next_scan_after == null) break;
+        }
+        return combined;
+    }
     const summary = try runRecoveryPageWithConfig(
         runtime.alloc,
         runtime.store,
@@ -353,6 +373,21 @@ fn runRecoveryPageWithConfig(
     after: ?transactions_mod.TxnId,
     limit: usize,
 ) !RunSummary {
+    if (config.completion_metadata) |workspace| {
+        var memory = try workspace.tryAcquire();
+        defer memory.release();
+        var scoped = config;
+        scoped.completion_metadata = null;
+        // One record per rotation keeps metadata scratch independent of total
+        // retained history. The other lane remains available to resolver RPCs.
+        const effective_after = if (config.completion_scan_after) |cursor| cursor.* else after;
+        const result = runRecoveryPageWithConfig(memory.allocator(), store, scoped, now_ns, effective_after, @min(limit, 1)) catch |err| {
+            if (err == error.OutOfMemory and memory.denied()) return error.TransactionCompletionCapacityMismatch;
+            return err;
+        };
+        if (config.completion_scan_after) |cursor| cursor.* = result.next_scan_after;
+        return result;
+    }
     var summary: RunSummary = .{};
     var manager = try transactions_mod.TxnManager.init(alloc, try backend_erased.storeFrom(alloc, store));
     defer manager.deinit();
@@ -500,6 +535,7 @@ fn runRecoveryPageWithConfig(
         config.resolution_extra_hooks,
         .{
             .presume_abort_distributed = false,
+            .resolve_terminal_intents = config.resolve_local_fn == null,
             .retained_cutoff_timestamp = now_ns -| config.retained_terminal_ns,
         },
     );

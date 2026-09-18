@@ -45,7 +45,7 @@ pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
     return @import("../common/vector_migration.zig").admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
-        lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
+        std.meta.eql(lhs.storage, rhs.storage) and
         lhs.table_id == rhs.table_id and
         std.mem.eql(u8, lhs.name, rhs.name) and
         std.mem.eql(u8, lhs.description, rhs.description) and
@@ -85,6 +85,14 @@ pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerp
     // Preserve fingerprints of existing default-mode tables.
     if (table.storage.dense_embeddings != .primary_lsm)
         hashTableDefinitionPart(&hasher, @tagName(table.storage.dense_embeddings));
+    if (table.storage.transaction_recovery) |policy| {
+        hashTableDefinitionPart(&hasher, "transaction-recovery-v1");
+        inline for (std.meta.fields(@TypeOf(policy))) |field| {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, @field(policy, field.name), .little);
+            hasher.update(&bytes);
+        }
+    }
     var encoded: [@sizeOf(u64)]u8 = undefined;
     std.mem.writeInt(u64, &encoded, table.table_id, .little);
     hasher.update(&encoded);
@@ -1411,6 +1419,8 @@ pub const TableManager = struct {
     pub fn publishVectorMigrationTable(self: *TableManager, expected: TableRecord, record: TableRecord) !void {
         const current = self.tables.get(expected.table_id) orelse return error.UnknownTable;
         if (!tableDefinitionsEqual(current, expected)) return error.TableGenerationChanged;
+        if (!std.meta.eql(expected.storage.transaction_recovery, record.storage.transaction_recovery))
+            return error.ImmutableTableStorageSettings;
         var contract = record;
         contract.storage = expected.storage;
         contract.storage_migration = expected.storage_migration;
@@ -3532,4 +3542,16 @@ test "system catalog table name index replacement is atomic on allocation failur
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "workload admission recovery policy participates in table identity" {
+    const base: TableDefinition = .{ .table_id = 7, .name = "docs" };
+    var active = base;
+    active.storage.transaction_recovery = .{ .protocol_version = 1, .max_count = 2, .max_bytes = 65536, .max_transaction_bytes = 8192 };
+    try std.testing.expect(!tableDefinitionsEqual(base, active));
+    try std.testing.expect(!std.mem.eql(u8, &tableDefinitionFingerprint(base), &tableDefinitionFingerprint(active)));
+    const previous = active;
+    active.storage.transaction_recovery.?.max_count += 1;
+    try std.testing.expect(!tableDefinitionsEqual(previous, active));
+    try std.testing.expect(!std.mem.eql(u8, &tableDefinitionFingerprint(previous), &tableDefinitionFingerprint(active)));
 }

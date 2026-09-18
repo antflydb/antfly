@@ -1373,9 +1373,10 @@ pub const DBCore = struct {
         const candidate_catalog_data = next_catalog.encode();
         if (!std.mem.eql(u8, &previous_catalog_data, &candidate_catalog_data))
             next_catalog.generation +|= 1;
-        const catalog_data = next_catalog.encode();
+        var catalog_buffer: [table_catalog_mod.encoded_len]u8 = undefined;
+        const catalog_data = next_catalog.encodeForPersistence(&catalog_buffer);
         @memcpy(prepared.combined_writes[0..metadata_writes.len], metadata_writes);
-        prepared.combined_writes[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = &catalog_data };
+        prepared.combined_writes[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = catalog_data };
         const changed = try schema_mod.saveEncodedSchemaWithMetadata(
             self.store,
             self.alloc,
@@ -1519,8 +1520,9 @@ pub const DBCore = struct {
         var next = self.table_catalog;
         next.index_state = state;
         next.generation +|= 1;
-        const encoded = next.encode();
-        try self.store.putBatch(&.{.{ .key = table_catalog_mod.key, .value = &encoded }}, &.{});
+        var buffer: [table_catalog_mod.encoded_len]u8 = undefined;
+        const encoded = next.encodeForPersistence(&buffer);
+        try self.store.putBatch(&.{.{ .key = table_catalog_mod.key, .value = encoded }}, &.{});
         self.table_catalog = next;
     }
 
@@ -1831,8 +1833,42 @@ pub const DBCore = struct {
         }
     }
 
+    /// Local startup policy affects only accepting new transaction obligations,
+    /// never ordinary table opens/reads and never retirement of existing debt.
+    pub fn validateTransactionCompletionPolicy(self: *DBCore) !void {
+        const active = self.table_catalog.transaction_recovery_max_count != 0;
+        const workspace = if (self.index_manager.resource_manager) |manager| manager.transactionCompletion() else null;
+        if (workspace == null) {
+            if (active) return error.TransactionCompletionPolicyRequired;
+            return;
+        }
+        if (!active)
+            return error.TransactionCompletionPolicyRequired;
+        const required = std.math.add(u64, self.table_catalog.transaction_admission_bytes, 64 * 1024) catch
+            return error.TransactionCompletionCapacityMismatch;
+        if (workspace.?.capacity < required) return error.TransactionCompletionCapacityMismatch;
+    }
+
     fn initTxnManager(self: *DBCore) !transactions_mod.TxnManager {
-        return try transactions_mod.TxnManager.init(self.alloc, self.store);
+        var manager = try transactions_mod.TxnManager.init(self.alloc, self.store);
+        manager.completion_limits = .{
+            .max_transaction_bytes = if (self.table_catalog.transaction_recovery_max_count != 0) self.table_catalog.transaction_admission_bytes else 0,
+            .max_count = self.table_catalog.transaction_recovery_max_count,
+            .max_bytes = self.table_catalog.transaction_recovery_max_bytes,
+        };
+        return manager;
+    }
+
+    fn initTxnManagerForAdmission(self: *DBCore, txn_id: transactions_mod.TxnId) !transactions_mod.TxnManager {
+        var manager = try self.initTxnManager();
+        errdefer manager.deinit();
+        // Retrying an existing obligation must not reinterpret a local
+        // configuration change as a transaction rollback.
+        if (manager.getTransactionStatus(txn_id)) |_| {} else |err| switch (err) {
+            transactions_mod.TxnError.TxnNotFound => try self.validateTransactionCompletionPolicy(),
+            else => return err,
+        }
+        return manager;
     }
 
     pub fn beginTransactionWithParticipants(
@@ -1851,7 +1887,7 @@ pub const DBCore = struct {
         created_at_ns: u64,
         participants: []const []const u8,
     ) !transactions_mod.TxnId {
-        var manager = try self.initTxnManager();
+        var manager = try self.initTxnManagerForAdmission(txn_id);
         defer manager.deinit();
         try manager.initTransactionWithParticipantsCreatedAt(txn_id, timestamp_ns, created_at_ns, participants);
         return txn_id;
@@ -1884,7 +1920,7 @@ pub const DBCore = struct {
         coordinator: bool,
         retain_terminal: bool,
     ) !transactions_mod.TxnId {
-        var manager = try self.initTxnManager();
+        var manager = try self.initTxnManagerForAdmission(txn_id);
         defer manager.deinit();
         try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(
             txn_id,
@@ -1907,7 +1943,7 @@ pub const DBCore = struct {
         retain_terminal: bool,
         extra_batch: transactions_mod.MutationExtraBatch,
     ) !transactions_mod.TxnId {
-        var manager = try self.initTxnManager();
+        var manager = try self.initTxnManagerForAdmission(txn_id);
         defer manager.deinit();
         try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
             txn_id,
@@ -1939,6 +1975,13 @@ pub const DBCore = struct {
     ) !void {
         var manager = try transactions_mod.TxnManager.init(extra_batch.preparation_allocator orelse self.alloc, self.store);
         defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = if (self.table_catalog.transaction_recovery_max_count != 0) self.table_catalog.transaction_admission_bytes else 0,
+            .max_count = self.table_catalog.transaction_recovery_max_count,
+            .max_bytes = self.table_catalog.transaction_recovery_max_bytes,
+        };
+        if (try manager.getTransactionStatus(txn_id) == .pending)
+            try self.validateTransactionCompletionPolicy();
         var bound = extra_batch;
         if (bound.max_intent_admission_bytes == 0)
             bound.max_intent_admission_bytes = self.table_catalog.transaction_admission_bytes;
@@ -1987,13 +2030,18 @@ pub const DBCore = struct {
         commit_version: u64,
         extra_batch: transactions_mod.ResolutionExtraBatch,
     ) !transactions_mod.ResolutionOutcome {
-        var manager = try self.initTxnManager();
+        var manager = try transactions_mod.TxnManager.init(extra_batch.preparation_allocator orelse self.alloc, self.store);
+        manager.completion_limits = .{
+            .max_transaction_bytes = if (self.table_catalog.transaction_recovery_max_count != 0) self.table_catalog.transaction_admission_bytes else 0,
+            .max_count = self.table_catalog.transaction_recovery_max_count,
+            .max_bytes = self.table_catalog.transaction_recovery_max_bytes,
+        };
         defer manager.deinit();
         return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
     }
 
     pub fn collectTransactionIntentBatch(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) !transactions_mod.IntentBatch {
-        var manager = try self.initTxnManager();
+        var manager = try transactions_mod.TxnManager.init(alloc, self.store);
         defer manager.deinit();
         return try manager.collectIntentBatch(alloc, txn_id);
     }

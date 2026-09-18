@@ -2905,6 +2905,9 @@ const BatchExecutionOptions = struct {
     store_batch_options: backend_types.BatchOptions = .{},
     snapshot_mutation: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease = null,
     wait_for_sync_level: bool = true,
+    /// Capture the durable replay target while delaying only visibility waits
+    /// until the caller has released its mandatory-completion workspace.
+    deferred_transaction_sequence: ?*u64 = null,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,
@@ -5067,6 +5070,7 @@ const GraphRestoreParseCache = struct {
 
 pub const DB = struct {
     table_storage: table_storage_mod.Settings = .{},
+    transaction_recovery_scan_after: ?transactions_mod.TxnId = null,
     vector_migration_offline_candidate: bool = false,
     vector_migration_active: std.atomic.Value(bool) = .init(false),
     vector_migration_reopen_required: std.atomic.Value(bool) = .init(false),
@@ -6204,6 +6208,7 @@ pub const DB = struct {
             var parsed = try std.json.parseFromSlice(table_storage_mod.Settings, self.alloc, value, .{});
             defer parsed.deinit();
             if (requested) |settings| {
+                if (!std.meta.eql(settings.transaction_recovery, parsed.value.transaction_recovery)) return error.ImmutableTableStorageSettings;
                 if (settings.dense_embeddings != parsed.value.dense_embeddings) {
                     // Only this table's durable ownership publication can
                     // bridge a catalog update interrupted after DB commit.
@@ -6212,6 +6217,13 @@ pub const DB = struct {
                     if (!job.published() or settings.dense_embeddings != .primary_lsm or
                         parsed.value.dense_embeddings != .vector_store) return error.ImmutableTableStorageSettings;
                 }
+            }
+            if (parsed.value.transaction_recovery) |policy| {
+                try policy.validate();
+                if (self.core.table_catalog.transaction_recovery_max_count != policy.max_count or
+                    self.core.table_catalog.transaction_recovery_max_bytes != policy.max_bytes or
+                    self.core.table_catalog.transaction_admission_bytes != policy.max_transaction_bytes)
+                    return error.InvalidTableStorageSettings;
             }
             self.table_storage = parsed.value;
             if (self.table_storage.dense_embeddings == .vector_store) {
@@ -6524,7 +6536,7 @@ pub const DB = struct {
         if (job.value.phase != .ready) return error.VectorMigrationNotReady;
         errdefer self.requireVectorMigrationRecovery();
         try vector_migration.publish(self.alloc, self.core.store, job.value);
-        self.table_storage = .{ .dense_embeddings = .vector_store };
+        self.table_storage.dense_embeddings = .vector_store;
         self.core.store.configurePayloadPolicy(self.source_vectors.load(.acquire).?.interface(), false, job.value.budget.temporary_bytes);
         self.core.index_manager.table_owns_embedding_artifacts = true;
         self.core.index_manager.source_payload_store = self.source_vectors.load(.acquire);
@@ -6645,6 +6657,7 @@ pub const DB = struct {
     /// Creation/provisioning-only configuration. Existing persisted authority
     /// cannot be changed, and populated roots require an explicit migration.
     pub fn configureTableStorage(self: *DB, settings: table_storage_mod.Settings) !void {
+        if (settings.transaction_recovery) |policy| try policy.validate();
         lockApply(self);
         defer self.core.unlockApply();
         const raw = self.core.store.get(self.alloc, &internal_keys.table_storage_settings_key) catch |err| switch (err) {
@@ -6655,7 +6668,8 @@ pub const DB = struct {
         if (raw) |value| {
             var parsed = try std.json.parseFromSlice(table_storage_mod.Settings, self.alloc, value, .{});
             defer parsed.deinit();
-            if (parsed.value.dense_embeddings != settings.dense_embeddings) return error.ImmutableTableStorageSettings;
+            if (parsed.value.dense_embeddings != settings.dense_embeddings or
+                !std.meta.eql(parsed.value.transaction_recovery, settings.transaction_recovery)) return error.ImmutableTableStorageSettings;
             return;
         }
         if (settings.dense_embeddings == .vector_store) {
@@ -6668,6 +6682,20 @@ pub const DB = struct {
             }
             try self.openSourceVectors(true);
         }
+        var next_catalog = self.core.table_catalog;
+        if (settings.transaction_recovery) |policy| {
+            // Creation only. Existing obligations need a separate, fenced
+            // migration; this path never silently activates legacy records.
+            var manager = try transactions_mod.TxnManager.init(self.alloc, self.core.store);
+            defer manager.deinit();
+            const records = try manager.listTransactionsPage(self.alloc, null, 1);
+            defer self.alloc.free(records.items);
+            if (records.items.len != 0) return error.ImmutableTableStorageSettings;
+            next_catalog.transaction_recovery_max_count = policy.max_count;
+            next_catalog.transaction_recovery_max_bytes = policy.max_bytes;
+            next_catalog.transaction_admission_bytes = policy.max_transaction_bytes;
+            next_catalog.generation +|= 1;
+        }
         const encoded = try std.json.Stringify.valueAlloc(self.alloc, settings, .{});
         defer self.alloc.free(encoded);
         // A failed primary append/sync may have persisted the marker. Fence
@@ -6676,8 +6704,14 @@ pub const DB = struct {
         errdefer if (self.source_vectors.load(.acquire)) |source| {
             source.poison();
         };
-        try self.core.store.put(&internal_keys.table_storage_settings_key, encoded);
+        var catalog_buffer: [table_catalog_mod.encoded_len]u8 = undefined;
+        const catalog_data = next_catalog.encodeForPersistence(&catalog_buffer);
+        try self.core.store.putBatch(&.{
+            .{ .key = &internal_keys.table_storage_settings_key, .value = encoded },
+            .{ .key = table_catalog_mod.key, .value = catalog_data },
+        }, &.{});
         try self.core.store.sync(true);
+        self.core.table_catalog = next_catalog;
         self.table_storage = settings;
         if (settings.dense_embeddings == .vector_store) {
             const source = self.source_vectors.load(.acquire).?;
@@ -7492,6 +7526,10 @@ pub const DB = struct {
         errdefer self.runtime_alloc.destroy(local_ctx);
         local_ctx.* = .{};
         var effective_cfg = cfg;
+        if (self.core.table_catalog.transaction_recovery_max_count != 0) {
+            if (self.core.index_manager.resource_manager) |manager|
+                effective_cfg.completion_metadata = manager.transactionCompletionMetadata();
+        }
         effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
         effective_cfg.local_resolution_ctx = local_ctx;
         effective_cfg.resolve_local_fn = resolveRecoveredLocalTransaction;
@@ -7863,6 +7901,21 @@ pub const DB = struct {
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         if (!config.enabled) return .{};
+        if (self.core.table_catalog.transaction_recovery_max_count != 0) if (self.core.index_manager.resource_manager) |manager| if (manager.transactionCompletionMetadata()) |metadata| {
+            var effective = config;
+            effective.completion_metadata = metadata;
+            effective.completion_scan_after = &self.transaction_recovery_scan_after;
+            if (!effective.replicated_metadata) {
+                effective.local_resolution_ctx = self;
+                effective.resolve_local_fn = struct {
+                    fn call(ptr: *anyopaque, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, version: u64) !void {
+                        const db: *DB = @ptrCast(@alignCast(ptr));
+                        try db.resolveTransactionIntents(txn_id, status, version);
+                    }
+                }.call;
+            }
+            return transaction_runtime_mod.recoverOnce(self.alloc, self.core.batchExecutionResources().store, effective);
+        };
         if (config.replicated_metadata) {
             return try transaction_runtime_mod.recoverOnce(
                 self.alloc,
@@ -9920,6 +9973,7 @@ pub const DB = struct {
                     resolution.status,
                     resolution.commit_version,
                     .{
+                        .preparation_allocator = preparation_alloc,
                         .completion_writes = completion_writes,
                         .resolved_participant = resolution.resolved_participant,
                         .expected_intent_revision = resolution.expected_intent_revision,
@@ -9928,7 +9982,7 @@ pub const DB = struct {
                 );
                 unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
                 if (!opts.bypass_ha_write_gate) try self.flushTransactionHAOutbox(resolution.txn_id);
-                try self.waitForResolvedTransactionSync(req.sync_level, outcome.replay_sequence);
+                if (opts.deferred_transaction_sequence) |out| out.* = outcome.replay_sequence else try self.waitForResolvedTransactionSync(req.sync_level, outcome.replay_sequence);
                 return;
             }
         }
@@ -10659,14 +10713,13 @@ pub const DB = struct {
                 catalog.reconciled != previous.reconciled)
             {
                 catalog.generation +|= 1;
-                table_catalog_value = catalog.encode();
                 next_table_catalog = catalog;
             }
         }
         try store_writes.appendSlice(self.alloc, identity_writes.items);
         if (next_table_catalog != null) try store_writes.append(self.alloc, .{
             .key = table_catalog_mod.key,
-            .value = &table_catalog_value,
+            .value = next_table_catalog.?.encodeForPersistence(&table_catalog_value),
         });
         try appendDocumentChildRangeOutboxWrites(
             self.alloc,
@@ -10973,6 +11026,7 @@ pub const DB = struct {
                 resolution.status,
                 resolution.commit_version,
                 .{
+                    .preparation_allocator = preparation_alloc,
                     .writes = store_writes.items,
                     .deletes = delete_keys.items,
                     .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
@@ -11000,9 +11054,11 @@ pub const DB = struct {
             schedule_ha_recovery_on_exit = durable_ha_batch_outbox_key != null or durable_ha_replay_outbox_key != null;
             break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
         };
+        if (opts.deferred_transaction_sequence) |out| out.* = transaction_applied.replay_sequence;
         if (!transaction_applied.applied) {
             unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
-            try self.waitForResolvedTransactionSync(effective_req.sync_level, transaction_applied.replay_sequence);
+            if (opts.deferred_transaction_sequence == null)
+                try self.waitForResolvedTransactionSync(effective_req.sync_level, transaction_applied.replay_sequence);
             return;
         }
         if (next_table_catalog) |catalog| self.core.table_catalog = catalog;
@@ -11130,7 +11186,7 @@ pub const DB = struct {
         }
         const wait_sync_start_ns = monotonicTimeNs();
         if (append_derived_replay and self.executor.hasWorkers()) {
-            if (opts.wait_for_sync_level) {
+            if (opts.wait_for_sync_level and opts.deferred_transaction_sequence == null) {
                 const sync_wait_start_ns = monotonicTimeNs();
                 try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
@@ -11145,7 +11201,7 @@ pub const DB = struct {
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.derived_apply_ns, derived_apply_start_ns);
             }
-            if (opts.wait_for_sync_level) {
+            if (opts.wait_for_sync_level and opts.deferred_transaction_sequence == null) {
                 const sync_wait_start_ns = monotonicTimeNs();
                 try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
@@ -25164,6 +25220,25 @@ pub const DB = struct {
         raft_entry: ?RaftAppliedEntryIdentity,
         resolved_participant: ?[]const u8,
     ) !void {
+        if (self.core.table_catalog.transaction_recovery_max_count != 0) if (self.core.index_manager.resource_manager) |manager| if (manager.transactionCompletion()) |workspace| {
+            var resolved_sequence: u64 = 0;
+            {
+                var completion = try workspace.tryAcquire();
+                defer completion.release();
+                var guard: PreparedRowAllocator = .{
+                    .child = completion.allocator(),
+                    .io = self.backend_runtime.io() orelse std.Options.debug_io,
+                };
+                self.resolveTransactionIntentsPrepared(txn_id, status, commit_version, sync_level, .none, raft_entry, resolved_participant, &guard, &resolved_sequence) catch |err| {
+                    // The durable decision remains authoritative. A private reserve
+                    // shortage is deferred work, never evidence of an abort.
+                    if (err == error.OutOfMemory and completion.denied()) return error.TransactionCompletionCapacityMismatch;
+                    return err;
+                };
+            }
+            if (status == .committed) try self.waitForResolvedTransactionSyncWithCancellation(sync_level, resolved_sequence, visibility_cancellation);
+            return;
+        };
         var preparation: RequestPreparationContext = undefined;
         preparation.init(self);
         defer preparation.deinit();
@@ -25176,6 +25251,7 @@ pub const DB = struct {
             raft_entry,
             resolved_participant,
             &preparation.guard,
+            null,
         ) catch |err| return preparation.mapError(err);
     }
 
@@ -25189,6 +25265,7 @@ pub const DB = struct {
         raft_entry: ?RaftAppliedEntryIdentity,
         resolved_participant: ?[]const u8,
         preparation: *PreparedRowAllocator,
+        deferred_sequence: ?*u64,
     ) !void {
         const alloc = preparation.allocator();
         var ha_mutation = if (raft_entry == null) self.acquireHAMutationShared() else null;
@@ -25206,6 +25283,7 @@ pub const DB = struct {
                 break :blk &.{raftAppliedEntryWrite(identity, &marker_value_buf)};
             } else &.{};
             _ = self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
+                .preparation_allocator = alloc,
                 .completion_writes = marker_writes,
                 .resolved_participant = resolved_participant,
             }) catch |err| switch (err) {
@@ -25252,6 +25330,7 @@ pub const DB = struct {
                     status,
                     commit_version,
                     .{
+                        .preparation_allocator = alloc,
                         .completion_writes = marker_writes,
                         .resolved_participant = resolved_participant,
                         .expected_intent_revision = intents.revision,
@@ -25264,7 +25343,7 @@ pub const DB = struct {
                 };
                 self.core.unlockApply();
                 try self.flushTransactionHAOutbox(txn_id);
-                try self.waitForResolvedTransactionSyncWithCancellation(sync_level, outcome.replay_sequence, visibility_cancellation);
+                if (deferred_sequence) |out| out.* = outcome.replay_sequence else try self.waitForResolvedTransactionSyncWithCancellation(sync_level, outcome.replay_sequence, visibility_cancellation);
                 return;
             }
 
@@ -25283,6 +25362,7 @@ pub const DB = struct {
                 .sync_level = sync_level,
             }, null, .{
                 .visibility_cancellation = visibility_cancellation,
+                .deferred_transaction_sequence = deferred_sequence,
                 .bypass_ha_write_gate = raft_entry != null,
                 .raft_applied_entry_marker = raft_entry,
                 .durable_rows = &durable_rows,
@@ -25410,6 +25490,32 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        if (self.core.table_catalog.transaction_recovery_max_count != 0) if (self.core.index_manager.resource_manager) |resources| if (resources.transactionCompletionMetadata()) |workspace| {
+            var metadata = try workspace.tryAcquire();
+            defer metadata.release();
+            const alloc = metadata.allocator();
+            var manager = try transactions_mod.TxnManager.init(alloc, self.core.store);
+            defer manager.deinit();
+            const page = try manager.listTransactionsPage(alloc, self.transaction_recovery_scan_after, 1);
+            defer alloc.free(page.items);
+            // Advancing past a blocked row preserves fairness without erasing
+            // its durable obligation. The next rotation retries it.
+            self.transaction_recovery_scan_after = page.next_after;
+            var resolved: u64 = 0;
+            for (page.items) |txn| {
+                if (txn.status == .pending or (!try manager.hasIntents(txn.txn_id) and !try manager.hasHAOutbox(txn.txn_id))) continue;
+                try self.resolveTransactionIntentsWithSyncLevel(txn.txn_id, txn.status, if (txn.status == .committed and txn.commit_version != 0) txn.commit_version else resolution_timestamp, .propose);
+                resolved += 1;
+            }
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            var page_stats = try manager.recoverTransactionSummariesWithExtraBatchHooksAndOptions(page.items, cutoff_timestamp, resolution_timestamp, .{}, .{
+                .presume_abort_distributed = false,
+                .resolve_terminal_intents = false,
+            });
+            page_stats.resolved_finalized += resolved;
+            return page_stats;
+        };
         const resolved_finalized = try self.resolveFinalizedTransactionIntentsForRecovery(resolution_timestamp);
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -68428,6 +68534,45 @@ test "relational prepared intents reject physical overflow before voting and per
     const stored = try db.core.store.get(alloc, row_key);
     defer alloc.free(stored);
     try std.testing.expectEqual(digest, try relational_row_codec.rowSemanticHash(stored));
+}
+
+test "workload admission replicated transaction backlog rejection preserves applied entry and restart debt" {
+    const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(512 * 1024);
+    const policy: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 1,
+        .max_bytes = 64 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+    } };
+    var path_tmp = try TestDirectory.init("db-completion-ledger");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const first: types.TxnId = .{81} ** 16;
+    const second: types.TxnId = .{82} ** 16;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &resources, .table_storage = policy, .start_optional_runtimes = false });
+        defer db.close();
+        _ = try db.beginReplicatedTransactionAtRaftEntry(first, 100, 100, &.{}, false, false, .{ .term = 1, .index = 1 });
+        try std.testing.expectError(error.TransactionRecoveryCapacityExhausted, db.beginReplicatedTransactionAtRaftEntry(second, 101, 101, &.{}, false, false, .{ .term = 1, .index = 2 }));
+        try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+        try db.writeReplicatedTransactionAtRaftEntry(first, .{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }, .{ .term = 1, .index = 3 });
+    }
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .resource_manager = &resources, .table_storage = policy, .start_optional_runtimes = false });
+        defer db.close();
+        try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.transaction_recovery_max_count);
+        try std.testing.expectError(error.TransactionRecoveryCapacityExhausted, db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(second, 101, 101, &.{}, false, false));
+        try db.resolveReplicatedTransactionAtRaftEntry(first, .committed, 200, .propose, .none, .{ .term = 1, .index = 4 }, null);
+        _ = try db.beginReplicatedTransactionAtRaftEntry(second, 201, 201, &.{}, false, false, .{ .term = 1, .index = 5 });
+        try std.testing.expectEqual(@as(u64, 5), (try db.raftAppliedEntry()).?.index);
+        const row = (try db.get(alloc, "a")).?;
+        defer alloc.free(row);
+        try std.testing.expectEqualStrings("{\"n\":1}", row);
+    }
 }
 
 test "relational cumulative prepares remain committable within the preparation envelope" {
@@ -131292,4 +131437,271 @@ test "workload admission protected existence probes progress and demote wide row
     defer demoted.deinit(alloc);
     try std.testing.expectEqualStrings("{}", demoted.json);
     try std.testing.expectEqual(@as(u64, 0), runtime.ledger.snapshot().total.handles);
+}
+
+test "workload admission protected recovery rows survive reentrant metadata and restart" {
+    const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(512 * 1024);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    const policy: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 512 * 1024,
+        .max_transaction_bytes = 128 * 1024,
+    } };
+    const coordinator: transactions_mod.TxnId = .{1} ** 16;
+    const participant: transactions_mod.TxnId = .{2} ** 16;
+    const later_coordinator: transactions_mod.TxnId = .{3} ** 16;
+    {
+        var setup = try DB.open(alloc, std.mem.span(path), .{
+            .resource_manager = &resources,
+            .table_storage = policy,
+            .start_optional_runtime_workers = false,
+            .start_index_workers = false,
+        });
+        defer setup.close();
+        _ = try setup.beginTransactionWithIdAndParticipants(coordinator, 1000, &.{"remote"});
+        _ = try setup.beginTransactionWithIdAndParticipants(participant, 1000, &.{});
+        try setup.writeTransaction(participant, .{ .writes = &.{.{ .key = "recovered", .value = "{}" }} });
+        try setup.resolveTransactionIntents(coordinator, .committed, 2000);
+        _ = try setup.beginTransactionWithIdAndParticipants(later_coordinator, 1000, &.{"remote"});
+        try setup.resolveTransactionIntents(later_coordinator, .committed, 2000);
+    }
+    const Resolver = struct {
+        db: ?*DB = null,
+        resources: *resource_manager_mod.ResourceManager,
+        calls: usize = 0,
+        fn resolve(ptr: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: transactions_mod.TxnStatus, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.resources.transactionCompletionMetadata().?.in_use.load(.acquire));
+            // The metadata lane remains live through this in-process RPC;
+            // the distinct row lane must make mandatory completion progress.
+            try self.db.?.resolveTransactionIntents(participant, .committed, 3000);
+            self.calls += 1;
+        }
+    };
+    var resolver: Resolver = .{ .resources = &resources };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .resource_manager = &resources,
+        .table_storage = policy,
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &resolver,
+            .resolve_participant_fn = Resolver.resolve,
+            .cutoff_ns = std.math.maxInt(u64),
+            .max_records_per_run = 2,
+        },
+    });
+    defer db.close();
+    resolver.db = &db;
+    try db.prepareTransactionRecoveryOwner();
+    const stats = resources.sliceStats(.relational_preparation_working_set);
+    var ordinary = try resources.reserveWithoutReclaim(.relational_preparation_working_set, stats.hard_limit_bytes - stats.used_bytes);
+    defer ordinary.release();
+    try std.testing.expectError(error.ResourceBudgetExceeded, resources.reserveWithoutReclaim(.relational_preparation_working_set, 1));
+    try db.transaction_runtime.?.runOnce();
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(u64, 2), db.transaction_runtime.?.stats().scanned_records);
+    try db.transaction_runtime.?.runOnce();
+    try std.testing.expectEqual(@as(usize, 2), resolver.calls);
+    try std.testing.expectEqual(@as(u64, 3), db.transaction_runtime.?.stats().scanned_records);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(participant));
+    const value = (try db.get(alloc, "recovered")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{}", value);
+    try std.testing.expect(!resources.transactionCompletion().?.in_use.load(.acquire));
+    try std.testing.expect(!resources.transactionCompletionMetadata().?.in_use.load(.acquire));
+}
+
+test "workload admission completion policy never blocks ordinary table opening" {
+    const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{
+        .resource_manager = &resources,
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "ordinary", .value = "{}" }} });
+    const value = (try db.get(alloc, "ordinary")).?;
+    defer alloc.free(value);
+    try std.testing.expectError(error.TransactionCompletionPolicyRequired, db.beginTransaction(1000));
+}
+
+test "workload admission transaction releases completion lane before cancelable visibility" {
+    const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(2 * 1024 * 1024);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{
+        .resource_manager = &resources,
+        .table_storage = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 512 * 1024,
+            .max_transaction_bytes = 128 * 1024,
+        } },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "full_text", .kind = .full_text, .config_json = "{}" });
+    const txn_id = try db.beginTransaction(1000);
+    try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "durable", .value = "{\"title\":\"hello\"}" }} });
+    const Probe = struct {
+        resources: *resource_manager_mod.ResourceManager,
+        fn check(ptr: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(!self.resources.transactionCompletion().?.in_use.load(.acquire));
+            var peer = try self.resources.transactionCompletion().?.tryAcquire();
+            peer.release();
+            return error.Canceled;
+        }
+    };
+    var probe: Probe = .{ .resources = &resources };
+    try std.testing.expectError(error.EnrichmentWaitCanceled, db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, .committed, 2000, .full_text, .{ .ptr = &probe, .check_fn = Probe.check }));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
+    const value = (try db.get(alloc, "durable")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"title\":\"hello\"}", value);
+}
+
+test "workload admission missing completion pool blocks new debt but never existing replay" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
+    const policy: table_storage_mod.Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 512 * 1024,
+        .max_transaction_bytes = 128 * 1024,
+    } };
+    const txn_id: transactions_mod.TxnId = .{3} ** 16;
+    {
+        var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+        defer resources.deinit(alloc);
+        try resources.configureTransactionCompletion(512 * 1024);
+        var db = try DB.open(alloc, path, .{ .resource_manager = &resources, .table_storage = policy, .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        _ = try db.beginTransactionWithId(txn_id, 1000);
+        try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "existing", .value = "{}" }} });
+    }
+    var db = try DB.open(alloc, path, .{ .table_storage = policy, .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try std.testing.expectError(error.TransactionCompletionPolicyRequired, db.beginTransaction(2000));
+    _ = try db.beginTransactionWithId(txn_id, 1000);
+    try db.resolveTransactionIntents(txn_id, .committed, 3000);
+    const value = (try db.get(alloc, "existing")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{}", value);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
+}
+
+test "workload admission one-shot recovery never bypasses a busy protected row lane" {
+    const alloc = std.testing.allocator;
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(512 * 1024);
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{
+        .resource_manager = &resources,
+        .table_storage = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 512 * 1024,
+            .max_transaction_bytes = 128 * 1024,
+        } },
+        .start_optional_runtimes = false,
+        .start_index_workers = false,
+    });
+    defer db.close();
+    const txn_id = try db.beginTransaction(1000);
+    try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "deferred", .value = "{}" }} });
+    // Crash fixture: the terminal decision survived, while prepared physical
+    // intents still await local application. Preserve all other record flags.
+    const prefix = "\x00\x00__txn_records__:";
+    var key: [prefix.len + 16]u8 = undefined;
+    @memcpy(key[0..prefix.len], prefix);
+    @memcpy(key[prefix.len..], &txn_id);
+    const record = try db.core.store.get(alloc, &key);
+    defer alloc.free(record);
+    record[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+    std.mem.writeInt(u64, record[9..17], 2000, .little);
+    std.mem.writeInt(u64, record[25..33], 2000, .little);
+    try db.core.store.put(&key, record);
+    var recorder = TxnResolverRecorder{};
+    const config: transaction_runtime_mod.Config = .{
+        .enabled = true,
+        .cutoff_ns = std.math.maxInt(u64),
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = TxnResolverRecorder.resolve,
+    };
+    {
+        var competing = try resources.transactionCompletion().?.tryAcquire();
+        defer competing.release();
+        try std.testing.expectError(error.TransactionCompletionBusy, db.recoverTransactions(0, 3000));
+        const deferred = try db.runTransactionRecoveryOnce(config);
+        try std.testing.expectEqual(@as(u64, 1), deferred.notification_failures);
+        try std.testing.expect(try db.core.transactionHasIntents(txn_id));
+        const still_absent = try db.get(alloc, "deferred");
+        defer if (still_absent) |value| alloc.free(value);
+        try std.testing.expect(still_absent == null);
+    }
+    const completed = try db.runTransactionRecoveryOnce(config);
+    try std.testing.expectEqual(@as(u64, 0), completed.notification_failures);
+    try std.testing.expect(!try db.core.transactionHasIntents(txn_id));
+    const value = (try db.get(alloc, "deferred")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{}", value);
+}
+
+test "workload admission enabling small node reserve never strands legacy committed rows" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
+    const txn_id: transactions_mod.TxnId = .{4} ** 16;
+    const body = try std.fmt.allocPrint(alloc, "{{\"payload\":\"{s}\"}}", .{([_]u8{'a'} ** 8192)[0..]});
+    defer alloc.free(body);
+    {
+        var db = try DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        _ = try db.beginTransactionWithId(txn_id, 1000);
+        try db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "legacy", .value = body }} });
+        const prefix = "\x00\x00__txn_records__:";
+        var key: [prefix.len + 16]u8 = undefined;
+        @memcpy(key[0..prefix.len], prefix);
+        @memcpy(key[prefix.len..], &txn_id);
+        const record = try db.core.store.get(alloc, &key);
+        defer alloc.free(record);
+        record[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+        std.mem.writeInt(u64, record[9..17], 2000, .little);
+        std.mem.writeInt(u64, record[25..33], 2000, .little);
+        try db.core.store.put(&key, record);
+    }
+    var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    try resources.configureTransactionCompletion(1024);
+    var db = try DB.open(alloc, path, .{ .resource_manager = &resources, .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try std.testing.expectError(error.TransactionCompletionPolicyRequired, db.beginTransaction(3000));
+    _ = try db.recoverTransactions(0, 3000);
+    const recovered = (try db.get(alloc, "legacy")).?;
+    defer alloc.free(recovered);
+    try std.testing.expectEqualStrings(body, recovered);
+    try std.testing.expect(!try db.core.transactionHasIntents(txn_id));
 }
