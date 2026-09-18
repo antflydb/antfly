@@ -84,6 +84,12 @@ runtimes. Replace `query` with `write` or `inference` for the corresponding clas
 Check `antfly_admission_query_diagnostics_available` first: zero means that the
 provider supplies only partial legacy statistics, not that pressure is absent.
 
+The dedicated health endpoint refreshes its cached metrics asynchronously every
+five seconds. A scrape immediately after a request may still show startup or
+pre-request counters. Before using idle zeroes as cleanup evidence, observe a
+refreshed snapshot that includes known admitted work. These cached metrics alone
+cannot establish the finer queue-retirement or recovery timing gates.
+
 | Observation | Interpretation |
 | --- | --- |
 | `rejections_by_reason_total{reason="execution_capacity"}` increases | Fail-fast capacity rejection, or a legacy caller refused because earlier work is queued |

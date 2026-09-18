@@ -86,6 +86,44 @@ carried only the four legacy counters. Its zero queue/retained observations
 cannot establish ownership retirement. This failed probe is retained unchanged
 at `/tmp/workload-metrics-native-95aba99ad4-probe/`.
 
+The full snapshot fix (`811956a541`, API ABI 24) passed the 94/94 admission
+suite with zero leaks. Its regression exercises live queue and retained bytes,
+policy generation, rejection/allocation diagnostics, completed wait histograms,
+and draining through the kernel export and host conversion. The clean production
+build exposed a data-runtime caller still using removed flat fields;
+`c6ad0692ec` corrects that caller. The failed build receipt remains at
+`/tmp/workload-native-debug-811956a541-build.json`.
+
+`488637eb6b` additionally carries full query/write snapshots through the data-node
+health exporter. Its focused data-runtime regression passed 1/1 with zero leaks,
+using actual runtime collection and real retained query/write leases. Logs are
+`/tmp/workload-admission-telemetry-gate.log` and
+`/tmp/workload-data-admission-telemetry.log`.
+
+The clean Debug production build at
+`488637eb6bca782387c612f8c4d1f6fbe7945a72` passed, with executable SHA-256
+`826916e2620f72ce370a5aeab80726dc49e747b780da3f8074cc5340c5dac508`.
+The native dedicated-metrics probe then passed: both query and write snapshots
+reported diagnostics available, capacity 32, queue capacity 128 / 8 MiB,
+retained ceiling 64 MiB, and wait ceiling 100 ms. After observing nonzero query
+and write admission peaks, active requests, queued requests, and retained bytes
+were zero for both classes. The stored-table query returned 200 and the process
+exited cleanly. All 35 receipt checksums were verified.
+
+The health endpoint refreshes its cached body asynchronously every five seconds.
+An initial 100 ms post-query assertion saw the unchanged startup snapshot and
+failed its nonzero-peak check. That probe remains at
+`/tmp/workload-metrics-native-488637eb6b-probe/`. The corrected probe retained
+every observation and polled within a 15-second limit until the snapshot had
+observed both kinds of admission; this took 5.12 seconds. It establishes correct
+projection and eventual idle ownership, not a 50 ms retirement or performance
+gate. Retained evidence:
+
+```text
+/tmp/workload-native-debug-488637eb6b-build.json
+/tmp/workload-metrics-native-488637eb6b-refreshed-probe/
+```
+
 ## Interpretation
 
 The mixed smoke verifies that the two original process crashes no longer

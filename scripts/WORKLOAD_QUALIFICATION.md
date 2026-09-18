@@ -55,6 +55,13 @@ recovery counters as release evidence, verify the configured capacities and
 `antfly_admission_query_diagnostics_available` against the retained configuration.
 Historical receipts are never rewritten by these checks.
 
+The native health endpoint refreshes its metrics cache asynchronously every five
+seconds. Short smoke points can therefore collect the same cached body despite
+intervening requests. For cleanup checks, first observe admission peaks from known
+completed work before interpreting idle zeroes; retain the polling observations.
+Snapshot collection time is not proof of the underlying measurements' freshness.
+The cache cannot establish the subsecond ownership-retirement release gate.
+
 `purpose: "qualification"` requires Docker, matching ReleaseFast builds with
 declared full revisions, at least 60-second warmup, 300-second measurement,
 three lifecycles, C1/5/10/20/30/40/60/80, open factors .5/.8/1/1.25/2, and

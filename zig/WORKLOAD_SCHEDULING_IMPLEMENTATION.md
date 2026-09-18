@@ -25,7 +25,7 @@ main contracts and representative commits, rather than an exhaustive history.
 | Request/output lifetime | Tracked allocation ownership through kernel, HTTP, and serverless handoffs; lookup admission | `1b527c5129`, `42b8c19983`, `fe9ede7c7c`, `afe3c72ae3`, `803b886294`, `85c22d2c8b`, `3d9b3aaa1b`, `8213869f68`, `9920f56295`, `18af5c041a`, `288746b7c5`, `95aba99ad4` |
 | Recovery and remote workers | Reserve durable obligations before prepare; authenticate attempts; persist opt-in worker deduplication and generation closure | `341f08a8b5`, `43ed43cabd`, `0d07db7932`, `b11a01530b`, `7fc30a22ef` |
 | Runtime pressure | Defer background submissions on finite executor pressure; preserve admission failures across the compiled callback ABI | `9511272560`, `2be51d61ad` |
-| Evidence and operations | Retained native/container harness, vector calibration, numerical Cloud gates, explicit failure outcomes and telemetry validation | `ebe085a24d`, `0f9a1a05f2`, `dff1a3d9f7`, `0c9395fc32`, `fc2d5878ec`, `f550aefaf0` |
+| Evidence and operations | Retained native/container harness, vector calibration, numerical Cloud gates, explicit failure outcomes and telemetry validation | `ebe085a24d`, `0f9a1a05f2`, `dff1a3d9f7`, `0c9395fc32`, `fc2d5878ec`, `f550aefaf0`, `811956a541`, `c6ad0692ec`, `488637eb6b` |
 
 The [validation record](WORKLOAD_SCHEDULING_VALIDATION.md) identifies exact tested
 source revisions and failures. The remaining-phase table below distinguishes
@@ -82,7 +82,7 @@ The REST/httpx, alternate-listener API-kernel paths, MCP, query builder, A2A,
 extension-host query/write calls, and serverless query/write handlers share this
 owner at their existing admission boundaries. Legacy nonwaiting callers cannot
 jump ahead of queued work. Metadata/data teardown can close admission across the
-compiled API boundary. The current API ABI is 23, storage-owner ABI is 63, and
+compiled API boundary. The current API ABI is 24, storage-owner ABI is 63, and
 native runtime ABI is 8; these include admission diagnostics, dense I/O context,
 executor capabilities, and worker configuration. Incompatible layouts are
 rejected. No inference-provider admission or transaction durability contract
@@ -115,7 +115,10 @@ queue count, queue bytes, total retained bytes, oversized requests, wait expiry,
 draining, and policy reductions remain distinguishable. Allocation-attempt
 denials have a separate counter: a failed allocator growth is not another
 rejected request. Providers that expose only legacy statistics report diagnostics
-as unavailable rather than implying zero pressure. These are engine contracts
+as unavailable rather than implying zero pressure. Standalone and data-node rendering carry
+the full snapshot through the versioned API kernel boundary; compile-time field
+checks prevent future additions from silently disappearing in the projection.
+These are engine contracts
 for Cloud observability; no Cloud dashboard or automatic scaling is implemented.
 
 The Go, TypeScript, Python, and Rust SDKs have optional shared client pools. They bound active operations and
