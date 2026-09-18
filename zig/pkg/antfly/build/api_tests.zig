@@ -1055,6 +1055,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "api-table-read-tests",
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
+            "relational row query response budget",
             "table reads translate request deadlines into the routing clock",
             "distributed reranking widens retrieval and stays coordinator owned",
             "reranker candidate and output windows have distinct bounds",

@@ -451,6 +451,43 @@ pub const LookupResponse = table_read_source.LookupResponse;
 pub const ScanResponse = table_read_source.ScanResponse;
 pub const ScanStreamSink = table_read_source.ScanStreamSink;
 
+/// One response budget across every owner and transport chunk. Keep ordinary
+/// document scans unchanged; typed-row APIs have a 16 MiB wire-response limit.
+const ScanResponseCapture = struct {
+    alloc: std.mem.Allocator,
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+    max_bytes: usize,
+
+    fn init(alloc: std.mem.Allocator, opts: db_mod.types.ScanOptions) ScanResponseCapture {
+        return .{ .alloc = alloc, .max_bytes = if (opts.relational_query_json.len == 0) std.math.maxInt(usize) else 16 * 1024 * 1024 };
+    }
+
+    fn deinit(self: *ScanResponseCapture) void {
+        self.bytes.deinit(self.alloc);
+    }
+
+    fn append(self: *ScanResponseCapture, bytes: []const u8) !void {
+        // Check before growing or copying, including for oversized first chunks.
+        if (bytes.len > self.max_bytes -| self.bytes.items.len) return error.RelationalRowsOutputBudgetExceeded;
+        try self.bytes.appendSlice(self.alloc, bytes);
+    }
+
+    fn finish(self: *ScanResponseCapture) !ScanResponse {
+        return .{ .ndjson = try self.bytes.toOwnedSlice(self.alloc) };
+    }
+
+    fn sink(self: *ScanResponseCapture) ScanStreamSink {
+        return .{ .context = self, .start_fn = start, .write_fn = write };
+    }
+
+    fn start(_: ?*anyopaque) anyerror!void {}
+
+    fn write(raw: ?*anyopaque, bytes: []const u8) anyerror!void {
+        const self: *ScanResponseCapture = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
+        try self.append(bytes);
+    }
+};
+
 const ScanStartOnce = struct {
     downstream: ScanStreamSink,
     started: bool = false,
@@ -3984,8 +4021,8 @@ pub const ProvisionedTableReadSource = struct {
             const group_ids = prepared.group_ids;
             if (group_ids.len == 0) return null;
             try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-            var out = std.ArrayListUnmanaged(u8).empty;
-            defer out.deinit(alloc);
+            var out = ScanResponseCapture.init(alloc, opts);
+            defer out.deinit();
             var ordered = if (index_order) try ordered_rows.Merger.init(alloc, if (opts.limit == 0) 128 else opts.limit) else null;
             defer if (ordered) |*merge| merge.deinit();
 
@@ -4020,11 +4057,11 @@ pub const ProvisionedTableReadSource = struct {
                     merge.beginGroup();
                     try merge.write(result.ndjson);
                     try merge.endGroup();
-                } else try out.appendSlice(alloc, result.ndjson);
+                } else try out.append(result.ndjson);
                 emitted += @intCast(std.mem.count(u8, result.ndjson, "\n"));
             }
             if (ordered) |*merge| return .{ .ndjson = try merge.finishAlloc() };
-            return .{ .ndjson = try out.toOwnedSlice(alloc) };
+            return try out.finish();
         }
         unreachable;
     }
@@ -6313,28 +6350,11 @@ pub const HostedProvisionedTableReadSource = struct {
         opts: db_mod.types.ScanOptions,
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
-        const Capture = struct {
-            alloc: std.mem.Allocator,
-            bytes: std.ArrayListUnmanaged(u8) = .empty,
-            max_bytes: usize = std.math.maxInt(usize),
-
-            fn sink(state: *@This()) ScanStreamSink {
-                return .{ .context = state, .start_fn = start, .write_fn = write };
-            }
-
-            fn start(_: ?*anyopaque) anyerror!void {}
-
-            fn write(raw: ?*anyopaque, bytes: []const u8) anyerror!void {
-                const state: *@This() = @ptrCast(@alignCast(raw orelse return error.InvalidArgument));
-                if (bytes.len > state.max_bytes -| state.bytes.items.len) return error.RelationalRowsOutputBudgetExceeded;
-                try state.bytes.appendSlice(state.alloc, bytes);
-            }
-        };
-        var capture = Capture{ .alloc = alloc, .max_bytes = if (opts.relational_query_json.len == 0) std.math.maxInt(usize) else 16 * 1024 * 1024 };
-        defer capture.bytes.deinit(alloc);
+        var capture = ScanResponseCapture.init(alloc, opts);
+        defer capture.deinit();
         if (!(try scanStream(ptr, alloc, table_name, from_key, to_key, opts, consistency, capture.sink())))
             return null;
-        return .{ .ndjson = try capture.bytes.toOwnedSlice(alloc) };
+        return try capture.finish();
     }
 
     fn scanStream(
@@ -15560,6 +15580,83 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(builtin.is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "relational row query response budget spans native shard owners" {
+            const Fixture = struct {
+                reads: usize = 0,
+                extra_byte: bool = false,
+
+                fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                    const groups = try alloc.alloc(table_catalog.CatalogGroupRoute, 2);
+                    for (groups, 0..) |*group, i| {
+                        const id: u64 = 7001 + @as(u64, @intCast(i));
+                        group.* = .{ .group_id = id, .range_id = id, .identity_namespace = .{ .table_id = 7, .shard_id = id, .range_id = id } };
+                    }
+                    return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .groups = groups } };
+                }
+
+                fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group: u64, _: []const u8, _: []const u8, _: []const u8, opts: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?ScanResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(@as(u64, 7001) + self.reads, group);
+                    try std.testing.expectEqual(group, fence.route.group_id);
+                    try std.testing.expectEqual(@as(u32, @intCast(2 - self.reads)), opts.limit);
+                    self.reads += 1;
+                    // Both owners are individually below 16 MiB. Only their
+                    // combined response can exceed the public wire budget.
+                    const len = 8 * 1024 * 1024 + @as(usize, if (self.extra_byte and group == 7002) 1 else 0);
+                    const bytes = try alloc.alloc(u8, len);
+                    @memset(bytes, 'x');
+                    const prefix = "{\"_id\":\"row\",\"row\":{\"body\":\"";
+                    const suffix = "\"}}\n";
+                    @memcpy(bytes[0..prefix.len], prefix);
+                    @memcpy(bytes[len - suffix.len ..], suffix);
+                    return .{ .ndjson = bytes };
+                }
+            };
+            const alloc = std.testing.allocator;
+            var fixture: Fixture = .{};
+            const catalog: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = SingleGroupReadTestCatalog.adminSnapshot, .free_admin_snapshot = SingleGroupReadTestCatalog.freeAdminSnapshot, .resolve_route = Fixture.resolve } };
+            var source = ProvisionedTableReadSource.init("unused", catalog, raft_mod.read_gate.alreadyReadSafeBarrier());
+            _ = source.withLocalReadSource(.{ .ptr = &fixture, .vtable = &.{ .lookup = unsupportedPhysicalTopLevelLookup, .scan = unsupportedPhysicalTopLevelScan, .query = unsupportedPhysicalTopLevelQuery, .scan_group_local_routed = Fixture.scan } });
+            var opts: db_mod.types.ScanOptions = .{ .relational_query_json = "{\"fields\":[\"body\"]}", .limit = 2 };
+            {
+                var result = (try source.source().scan(alloc, "docs", "", "", opts, .stale)).?;
+                defer result.deinit(alloc);
+                try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), result.ndjson.len);
+                try std.testing.expectEqual(@as(usize, 2), fixture.reads);
+            }
+            fixture = .{ .extra_byte = true };
+            try std.testing.expectError(error.RelationalRowsOutputBudgetExceeded, source.source().scan(alloc, "docs", "", "", opts, .stale));
+            try std.testing.expectEqual(@as(usize, 2), fixture.reads);
+            // The new row-query limit must not change document-scan behavior.
+            fixture = .{ .extra_byte = true };
+            opts.relational_query_json = "";
+            var documents = (try source.source().scan(alloc, "docs", "", "", opts, .stale)).?;
+            defer documents.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024 + 1), documents.ndjson.len);
+        }
+
+        test "relational row query response budget spans transport chunks without partial append" {
+            const alloc = std.testing.allocator;
+            var capture = ScanResponseCapture.init(alloc, .{ .relational_query_json = "{}" });
+            defer capture.deinit();
+            try std.testing.expectEqual(@as(usize, 16 * 1024 * 1024), capture.max_bytes);
+            // Exercise the shared hosted-stream adapter with a tiny budget.
+            capture.max_bytes = 6;
+            const sink = capture.sink();
+            try sink.start();
+            try std.testing.expectError(error.RelationalRowsOutputBudgetExceeded, sink.write("1234567"));
+            try std.testing.expectEqual(@as(usize, 0), capture.bytes.capacity);
+            try sink.write("abc");
+            try sink.write("def");
+            try sink.write("");
+            try std.testing.expectError(error.RelationalRowsOutputBudgetExceeded, sink.write("g"));
+            try std.testing.expectEqualStrings("abcdef", capture.bytes.items);
+            var result = try capture.finish();
+            defer result.deinit(alloc);
+            try std.testing.expectEqualStrings("abcdef", result.ndjson);
+            try std.testing.expectEqual(@as(usize, 0), capture.bytes.items.len);
+        }
+
         test "distributed txn native read-index absence avoids placement refresh and replica reads" {
             const Fixture = struct {
                 reads: usize = 0,
