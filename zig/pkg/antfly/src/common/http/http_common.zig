@@ -34,6 +34,8 @@ pub const Method = enum {
 /// Executors must only borrow it synchronously; it is not serializable and
 /// must never outlive the request that supplied it.
 pub const RequestCancellation = struct {
+    /// Borrowed class allocation owner, including ingress ancestors.
+    allocation_owner: ?*@import("../workload_allocator.zig").Owner = null,
     cancelled: std.atomic.Value(bool) = .init(false),
     /// Optional listener-owned signal (for example an H2 RST_STREAM). It is
     /// borrowed for the request lifetime and complements local cancellation.

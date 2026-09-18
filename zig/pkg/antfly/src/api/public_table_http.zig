@@ -104,6 +104,7 @@ pub const TableApi = struct {
     }
 
     pub const ExecuteBatchError = error{
+        OutOfMemory,
         InvalidBatchRequest,
         UnsupportedSyncLevel,
         GraphMetricFeatureNotEnabled,
@@ -1661,6 +1662,7 @@ pub fn handleTableBatch(
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
         error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
         error.HAFencedPrimary => return .{ .status = 409, .body = try alloc.dupe(u8, "fenced primary rejects writes") },
+        error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
         error.DeadlineExceeded => return error.DeadlineExceeded,
         error.InternalFailure => {

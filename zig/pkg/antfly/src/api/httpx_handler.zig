@@ -220,9 +220,11 @@ fn gunzipRequestBodyAlloc(ctx: ?*httpx.Context, alloc: std.mem.Allocator, encode
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var decompressor = std.compress.flate.Decompress.init(&encoded_reader, .gzip, &window);
     var out = std.ArrayListUnmanaged(u8).empty;
+    const budget = if (ctx) |request_ctx| request_ctx.request.body_budget else null;
+    var reserved: usize = 0;
     errdefer {
-        if (ctx) |request_ctx| request_ctx.releaseRequestBodyBuffer(out.capacity);
         out.deinit(alloc);
+        if (budget) |shared| shared.release(reserved);
     }
     var buf: [16 * 1024]u8 = undefined;
     while (true) {
@@ -236,19 +238,13 @@ fn gunzipRequestBodyAlloc(ctx: ?*httpx.Context, alloc: std.mem.Allocator, encode
         if (required > out.capacity) {
             const geometric = out.capacity +| @max(out.capacity / 2, @as(usize, 16 * 1024));
             const new_capacity = @min(max_size, @max(required, geometric));
-            const growth = new_capacity - out.capacity;
-            if (ctx) |request_ctx| {
-                if (!request_ctx.tryReserveRequestBodyBuffer(growth)) return error.BodyCapacityExceeded;
-            }
-            out.ensureTotalCapacityPrecise(alloc, new_capacity) catch |err| {
-                if (ctx) |request_ctx| request_ctx.releaseRequestBodyBuffer(growth);
-                return err;
-            };
+            try httpx.ensureBodyBufferCapacityPrecise(budget, alloc, &out, new_capacity, &reserved);
         }
         out.appendSliceAssumeCapacity(buf[0..count]);
     }
     const body = out.items;
     const allocation = out.allocatedSlice();
+    if (ctx) |request_ctx| request_ctx.request.body_budget_reserved += reserved;
     out = .empty;
     return .{ .body = body, .allocation = allocation };
 }
@@ -635,7 +631,154 @@ pub const AntflyApiHandler = struct {
         try self.registerRaftAdminRoutes(server);
     }
 
+    const IngressOwner = @import("../common/workload_allocator.zig").Owner;
+    const ingress_context_key = "antfly.workload-ingress";
+    const IngressState = struct {
+        owner: *IngressOwner,
+        base_allocator: std.mem.Allocator,
+        lease: @import("../common/workload_admission.zig").MemoryAccount.OutstandingLease,
+        refs: std.atomic.Value(usize) = .init(1),
+        previous: ?httpx.Response.Retirement = null,
+        attached: bool = false,
+
+        fn release(self: *@This()) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            const owner = self.owner;
+            var lease = self.lease;
+            owner.allocator().destroy(self);
+            lease.release();
+            owner.release();
+        }
+
+        fn releaseContext(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.release();
+        }
+
+        fn releaseResponse(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.previous) |previous| previous.release(previous.ptr);
+            self.release();
+        }
+
+        fn attach(self: *@This(), response: *httpx.Response) void {
+            std.debug.assert(!self.attached);
+            self.attached = true;
+            self.previous = response.retirement;
+            _ = self.refs.fetchAdd(1, .monotonic);
+            response.retirement = .{ .ptr = self, .release = releaseResponse };
+        }
+    };
+
+    fn ingressState(ctx: *const httpx.Context) ?*IngressState {
+        return if (ctx.getData(ingress_context_key)) |raw| @ptrCast(@alignCast(raw)) else null;
+    }
+
+    fn ownerBodyMemory(owner: *IngressOwner) httpx.Response.BodyMemory {
+        return .{
+            .allocator = owner.allocator(),
+            .ptr = owner,
+            .retain = struct {
+                fn call(raw: *anyopaque) void {
+                    const value: *IngressOwner = @ptrCast(@alignCast(raw));
+                    value.retain();
+                }
+            }.call,
+            .release = struct {
+                fn call(raw: *anyopaque) void {
+                    const value: *IngressOwner = @ptrCast(@alignCast(raw));
+                    value.release();
+                }
+            }.call,
+        };
+    }
+
+    fn emergencyAllocator(ctx: *const httpx.Context) std.mem.Allocator {
+        return if (ingressState(ctx)) |state| state.base_allocator else ctx.allocator;
+    }
+
+    fn ownerMemoryExhausted(owner: *IngressOwner) bool {
+        var current: ?*IngressOwner = owner;
+        while (current) |value| : (current = value.parent) {
+            if (value.budget_exhausted.load(.acquire)) return true;
+        }
+        return false;
+    }
+
+    fn ingressAllocationError(owner: *IngressOwner, err: anyerror) anyerror {
+        return if (err == error.OutOfMemory and ownerMemoryExhausted(owner)) error.AdmissionBytesExhausted else err;
+    }
+
+    fn installIngressOwner(self: *AntflyApiHandler, ctx: *httpx.Context) !?*IngressState {
+        if (ingressState(ctx)) |state| return state;
+        const runtime = &self.api_server.ingress_admission;
+        if (!runtime.enabled()) return null;
+        // A first middleware owns the allocator before parsing/authentication.
+        // Linked adapters may already hold a managed data map or headers; the
+        // former preserves its allocator and the latter is migrated below.
+        if (ctx.decoded_query_values.capacity != 0 or ctx.response.body_owned or
+            ctx.response.body_memory != null or ctx.request_memory != null)
+            return error.IngressAllocatorAlreadyInUse;
+        const control = (ctx.request.method == .GET or ctx.request.method == .HEAD) and
+            (std.mem.eql(u8, ctx.request.uri.path, routes.healthz) or std.mem.eql(u8, ctx.request.uri.path, routes.readyz)) and
+            ctx.request.bodyLen() == 0 and (ctx.request.headers.getContentLength() orelse 0) == 0 and
+            ctx.header("transfer-encoding") == null and !ctx.hasStreamingRequestBody();
+        const gate = if (control) &runtime.control else &runtime.general;
+        const account = try gate.memoryAccount(self.api_server.alloc);
+        defer account.release();
+        var lease = try account.acquireOutstanding();
+        errdefer lease.release();
+        const owner = try IngressOwner.create(self.api_server.alloc, gate);
+        errdefer owner.release();
+        const alloc = owner.allocator();
+        const state = alloc.create(IngressState) catch |err| return ingressAllocationError(owner, err);
+        errdefer alloc.destroy(state);
+        state.* = .{ .owner = owner, .base_allocator = self.api_server.alloc, .lease = lease };
+        var headers = ctx.response.headers.clone(alloc) catch |err| return ingressAllocationError(owner, err);
+        errdefer headers.deinit();
+        var data = ctx.data orelse std.StringHashMap(httpx.Context.DataEntry).init(alloc);
+        errdefer if (ctx.data == null) data.deinit();
+        // No fallible operation may follow publication into Context.
+        data.ensureUnusedCapacity(2) catch |err| return ingressAllocationError(owner, err);
+        data.putAssumeCapacity(ingress_context_key, .{ .ptr = state, .dtor = IngressState.releaseContext });
+        data.putAssumeCapacity("antfly.workload-body-memory", .{ .ptr = owner });
+        ctx.data = data;
+        ctx.response.headers.deinit();
+        ctx.response.headers = headers;
+        ctx.allocator = alloc;
+        ctx.response.allocator = alloc;
+        owner.retain();
+        ctx.request_memory = ownerBodyMemory(owner);
+        owner.retain();
+        ctx.response.body_memory = ownerBodyMemory(owner);
+        return state;
+    }
+
+    fn ingressRejection(self: *AntflyApiHandler, err: anyerror) !httpx.Response {
+        const busy = err == error.AdmissionFull;
+        const exhausted = err == error.AdmissionBytesExhausted or err == error.AdmissionRequestTooLarge;
+        const closed = err == error.AdmissionClosed;
+        if (!busy and !exhausted and !closed) return err;
+        var response = try httpx.Response.fromJson(self.api_server.alloc, if (closed) 503 else 429, .{
+            .@"error" = @errorName(err),
+            .reason = if (busy) "instance_busy" else if (closed) "draining" else "resource_exhausted",
+            .stage = "admission",
+            .execution_started = false,
+        });
+        errdefer response.deinit();
+        if (busy) try response.headers.set("Retry-After", "1");
+        return response;
+    }
+
+    fn enforceIngress(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
+        const state = self.installIngressOwner(ctx) catch |err| return self.ingressRejection(err);
+        var response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
+        if (state) |owner| owner.attach(&response);
+        return response;
+    }
+
     fn installMiddleware(self: *AntflyApiHandler, server: *httpx.Server) !void {
+        try server.useFirst(httpx.Middleware.bind("antfly-workload-ingress", self, enforceIngress));
         try server.use(httpx.Middleware.bind("antfly-request-stats", self, recordRequest));
         try server.use(httpx.Middleware.bind("antfly-internal-service-auth", self, enforceInternalServiceAuth));
         try server.use(httpx.Middleware.bind("antfly-auth-before-encoded-body", self, authorizeBeforeEncodedBody));
@@ -702,7 +845,7 @@ pub const AntflyApiHandler = struct {
 
         const encoded = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid gzip request body");
         const expanded_limit = @min(ctx.max_request_body_size, http_server_mod.public_api_max_request_body_bytes);
-        const decoded = gunzipRequestBodyAlloc(ctx, ctx.allocator, encoded, expanded_limit) catch |err| switch (err) {
+        const decoded = gunzipRequestBodyAlloc(ctx, ctx.request.allocator, encoded, expanded_limit) catch |err| switch (err) {
             error.RequestBodyTooLarge => return textResponse(ctx, 413, "request body too large"),
             error.BodyCapacityExceeded => {
                 try ctx.setHeader("Retry-After", "1");
@@ -883,6 +1026,13 @@ pub const AntflyApiHandler = struct {
     /// policy in the API kernel also prevents host runtimes from duplicating
     /// application configuration or error classification.
     pub fn dispatchLinkedRoute(self: *AntflyApiHandler, ctx: *httpx.Context, route_handler: httpx.Handler) !httpx.Response {
+        const state = self.installIngressOwner(ctx) catch |err| return self.ingressRejection(err);
+        var response = self.dispatchLinkedRouteAdmitted(ctx, route_handler) catch |err| try mapIngressError(ctx, err);
+        if (state) |owner| owner.attach(&response);
+        return response;
+    }
+
+    fn dispatchLinkedRouteAdmitted(self: *AntflyApiHandler, ctx: *httpx.Context, route_handler: httpx.Handler) !httpx.Response {
         self.api_server.recordHandledRequest();
         try self.api_server.reachRequestLifecycle(.ingress, null);
         establishInternalRoutedBatchDeadline(ctx);
@@ -1007,8 +1157,8 @@ pub const AntflyApiHandler = struct {
         if (err != error.OutOfMemory) return null;
         const raw = ctx.getData("antfly.workload-body-memory") orelse return null;
         const owner: *@import("../common/workload_allocator.zig").Owner = @ptrCast(@alignCast(raw));
-        if (!owner.budget_exhausted.load(.acquire)) return null;
-        return try httpx.Response.fromJson(ctx.allocator, 429, .{
+        if (!ownerMemoryExhausted(owner)) return null;
+        return try httpx.Response.fromJson(emergencyAllocator(ctx), 429, .{
             .@"error" = "QueryMemoryExhausted",
             .reason = "resource_exhausted",
             .stage = stage,
@@ -1017,13 +1167,14 @@ pub const AntflyApiHandler = struct {
     }
 
     fn mapIngressError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (ctx.stream_committed) return err;
         if (err == error.OutOfMemory) {
             if (ctx.getData("antfly.workload-body-memory")) |raw| {
                 const owner: *@import("../common/workload_allocator.zig").Owner = @ptrCast(@alignCast(raw));
-                if (owner.budget_exhausted.load(.acquire)) {
+                if (ownerMemoryExhausted(owner)) {
                     // Output may follow a committed write. Do not claim that
                     // execution never began or attach automatic retry advice.
-                    return httpx.Response.fromJson(ctx.allocator, 429, .{
+                    return httpx.Response.fromJson(emergencyAllocator(ctx), 429, .{
                         .@"error" = "ResponseMemoryExhausted",
                         .reason = "resource_exhausted",
                         .stage = "output",
@@ -1335,31 +1486,48 @@ pub const AntflyApiHandler = struct {
         body_data: []const u8,
         api: public_table_http.TableApi,
     ) !httpx.Response {
-        const runtime = backend_runtime orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
-        var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
-        const job_alloc = std.heap.page_allocator;
-        const owned_table_name = job_alloc.dupe(u8, table_name) catch |err| {
-            std.log.warn("batch offload table-name allocation failed; executing inline err={s}", .{@errorName(err)});
-            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+        const request_alloc = ctx.response.bodyAllocator();
+        const runtime = backend_runtime orelse return handleTableBatchInline(ctx, request_alloc, table_name, body_data, api);
+        var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, request_alloc, table_name, body_data, api);
+        const Owner = @import("../common/workload_allocator.zig").Owner;
+        const request_owner: ?*Owner = if (ctx.getData("antfly.workload-body-memory")) |raw| @ptrCast(@alignCast(raw)) else null;
+        const job_owner = if (request_owner) |owner| owner.fork(std.heap.page_allocator) catch |err| switch (err) {
+            error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge => return httpx.Response.fromJson(ctx.allocator, 429, .{
+                .@"error" = "WriteMemoryExhausted",
+                .reason = "resource_exhausted",
+                .stage = "planning",
+                .execution_started = false,
+            }),
+            error.AdmissionClosed => return httpx.Response.fromJson(ctx.allocator, 503, .{
+                .@"error" = "AdmissionClosed",
+                .reason = "draining",
+                .stage = "planning",
+                .execution_started = false,
+            }),
+            else => return err,
+        } else null;
+        defer if (job_owner) |owner| {
+            if (owner.budget_exhausted.load(.acquire)) request_owner.?.budget_exhausted.store(true, .release);
+            owner.release();
         };
-        defer job_alloc.free(owned_table_name);
-        const owned_body_data = job_alloc.dupe(u8, body_data) catch |err| {
-            std.log.warn("batch offload body allocation failed; executing inline err={s}", .{@errorName(err)});
-            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
-        };
-        defer job_alloc.free(owned_body_data);
+        const job_alloc = if (job_owner) |owner| owner.allocator() else std.heap.page_allocator;
+        // The request retains its table/body until the unconditional join below,
+        // even after cancellation. Borrow those buffers rather than making a
+        // second unaccounted copy. Background parsing/results use a thread-safe
+        // backing allocator charged to the originating write account.
         var job = OffloadedTableBatch{
             .alloc = job_alloc,
-            .table_name = owned_table_name,
-            .body_data = owned_body_data,
+            .table_name = table_name,
+            .body_data = body_data,
             .api = api,
         };
         var future = runtime_io.concurrent(OffloadedTableBatch.run, .{&job}) catch |err| {
             // Saturating the backend executor must not turn a valid write into
             // an empty HTTP disconnect. The request still owns its buffers, so
             // executing synchronously is a safe bounded degradation path.
-            std.log.warn("batch offload scheduling failed; executing inline err={s}", .{@errorName(err)});
-            return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api);
+            if (err != error.ConcurrencyUnavailable)
+                std.log.warn("batch offload scheduling failed; executing inline err={s}", .{@errorName(err)});
+            return handleTableBatchInline(ctx, job_alloc, table_name, body_data, api);
         };
         while (!job.done.load(.acquire)) {
             // The borrowed request token is consumed only by post-commit
@@ -1436,7 +1604,7 @@ pub const AntflyApiHandler = struct {
         };
         const path = ctx.request.uri.path;
         const body = (try ctx.body()) orelse "";
-        var response = self.api_server.executeExtensionRoute(method, path, body) catch |err| {
+        var response = self.api_server.executeExtensionRouteWithAllocator(ctx.allocator, method, path, body) catch |err| {
             if (metadata_authority.isRetryableError(err) and
                 ApiHttpServer.extensionRouteMutatesMetadata(method, path))
             {
@@ -1444,7 +1612,7 @@ pub const AntflyApiHandler = struct {
             }
             return err;
         } orelse return jsonResponse(ctx, 404, "{\"error\":\"not found\"}");
-        defer response.deinit(self.api_server.alloc);
+        defer response.deinit(ctx.allocator);
         _ = ctx.status(response.status);
         try ctx.setHeader("content-type", response.content_type);
         _ = ctx.response.body(response.body);
@@ -1479,7 +1647,7 @@ pub const AntflyApiHandler = struct {
             error.InvalidArdAgentsRequest => jsonResponse(ctx, 400, "{\"error\":\"invalid ARD agents request\"}"),
             else => return err,
         };
-        defer response.deinit(self.api_server.alloc);
+        defer response.deinit(ctx.allocator);
         _ = ctx.status(response.status);
         try ctx.setHeader("content-type", response.content_type);
         if (response.public_cors) try ctx.setHeader("Access-Control-Allow-Origin", "*");
@@ -1498,7 +1666,8 @@ pub const AntflyApiHandler = struct {
             .DELETE => .delete,
             else => return jsonResponse(ctx, 405, "{\"error\":\"method not allowed\"}"),
         };
-        var response = self.api_server.executeExtensionAgent(
+        var response = self.api_server.executeExtensionAgentWithAllocator(
+            ctx.allocator,
             method,
             ctx.request.uri.path,
             ctx.request.uri.query orelse "",
@@ -1508,7 +1677,7 @@ pub const AntflyApiHandler = struct {
             error.MethodNotAllowed => jsonResponse(ctx, 405, "{\"error\":\"method not allowed\"}"),
             else => return err,
         };
-        defer response.deinit(self.api_server.alloc);
+        defer response.deinit(ctx.allocator);
         _ = ctx.status(response.status);
         try ctx.setHeader("content-type", response.content_type);
         _ = ctx.response.body(response.body);
@@ -1530,17 +1699,18 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |response| return response;
         const body = (try ctx.body()) orelse "";
-        var response = try protocol_adapters.executeA2aRequest(
+        var response = try protocol_adapters.executeA2aRequestWithOwner(
             self.api_server,
             ctx.header("authorization"),
             body,
             ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity),
             authenticated_identity,
+            if (ingressState(ctx)) |state| state.owner else null,
         );
         defer response.deinit(self.api_server.alloc);
         _ = ctx.status(response.status);
         try ctx.setHeader("content-type", response.content_type);
-        _ = ctx.response.body(response.body);
+        adoptContextualBody(ctx, &response);
         return ctx.response.build();
     }
 
@@ -1567,6 +1737,7 @@ pub const AntflyApiHandler = struct {
         }
         const body = (try ctx.body()) orelse "";
         const request = protocol_adapters.McpRequest{
+            .parent_owner = if (ingressState(ctx)) |state| state.owner else null,
             .context = operationContext(ctx, authenticated_identity),
             .method = method,
             .endpoint_path = endpoint_path,
@@ -1581,11 +1752,34 @@ pub const AntflyApiHandler = struct {
         else
             try protocol_adapters.executeMcpRequest(self.api_server, request, authenticated_identity);
         defer response.deinit(self.api_server.alloc);
+        errdefer for (response.headers) |header| {
+            // Only initialize returns a new session ID. A response that could
+            // not be built must not leave an unreachable session until TTL.
+            if (std.ascii.eqlIgnoreCase(header.name, mcp.session_id_header))
+                _ = self.api_server.mcp_sessions.iface().close(header.value);
+        };
+        // The protocol envelope already owns its bytes. Transfer that buffer
+        // through the builder so transport drain, including HEAD, retires the
+        // same charge instead of allocating an untracked second copy.
         _ = ctx.status(response.status);
         try ctx.setHeader("content-type", response.content_type);
         for (response.headers) |header| try ctx.setHeader(header.name, header.value);
-        _ = ctx.response.body(response.body);
+        adoptContextualBody(ctx, &response);
         return ctx.response.build();
+    }
+
+    fn adoptContextualBody(ctx: *httpx.Context, response: *contextual_operations.OwnedResponse) void {
+        std.debug.assert(!ctx.response.body_owned);
+        if (response.memory_owner) |owner| {
+            owner.retain();
+            if (ctx.response.body_memory) |previous| previous.release(previous.ptr);
+            ctx.response.body_memory = ownerBodyMemory(owner);
+        }
+        _ = ctx.response.body(response.body);
+        if (response.memory_owner != null) {
+            ctx.response.body_owned = true;
+            response.body = &.{};
+        }
     }
 
     fn authorizeStorageMaintenance(
@@ -1667,6 +1861,7 @@ pub const AntflyApiHandler = struct {
 
     fn requestCancellation(ctx: *const httpx.Context) http_common.RequestCancellation {
         return .{
+            .allocation_owner = if (ctx.getData("antfly.workload-body-memory")) |raw| @ptrCast(@alignCast(raw)) else null,
             .query_deadline_ns = @import("table_catalog.zig").RoutingBudget.init(null).deadlineFrom(.{
                 .deadline_ns = ctx.application_deadline_ns,
                 .io = if (ctx.application_deadline_io) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null,
@@ -3252,7 +3447,7 @@ pub const AntflyApiHandler = struct {
 
     fn authenticate(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
         if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null) return null;
-        return self.api_server.authenticateRequest(.{
+        return self.api_server.authenticateRequestWithAllocator(ctx.allocator, .{
             .authorization = ctx.header("authorization"),
             .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
         }) catch |err| switch (err) {
@@ -3397,24 +3592,30 @@ pub const AntflyApiHandler = struct {
         };
         if (lease.*) |owned| {
             const gate = owned.owner.?;
-            if (gate.stats().max_retained_bytes != 0 and ctx.response.body_memory == null) {
-                const Owner = @import("../common/workload_allocator.zig").Owner;
-                const memory = Owner.create(ctx.allocator, gate) catch |err| {
+            const parent = if (ingressState(ctx)) |state| state.owner else null;
+            const needs_owner = ctx.response.body_memory == null or
+                (parent != null and ctx.response.body_memory.?.ptr == @as(*anyopaque, @ptrCast(parent.?)));
+            if (gate.stats().max_retained_bytes != 0 and needs_owner) {
+                const memory = (if (parent) |owner|
+                    IngressOwner.createChild(owner, gate)
+                else
+                    IngressOwner.create(self.api_server.alloc, gate)) catch |err| {
                     self.releasePublicOperation(operation_id, lease);
-                    return switch (err) {
-                        error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge => try httpx.Response.fromJson(ctx.allocator, 429, .{
-                            .@"error" = @errorName(err),
+                    const failure = if (parent) |owner| ingressAllocationError(owner, err) else err;
+                    return switch (failure) {
+                        error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge => try httpx.Response.fromJson(emergencyAllocator(ctx), 429, .{
+                            .@"error" = @errorName(failure),
                             .reason = "resource_exhausted",
                             .stage = "admission",
                             .execution_started = false,
                         }),
-                        error.AdmissionClosed => try httpx.Response.fromJson(ctx.allocator, 503, .{
+                        error.AdmissionClosed => try httpx.Response.fromJson(emergencyAllocator(ctx), 503, .{
                             .@"error" = "AdmissionClosed",
                             .reason = "draining",
                             .stage = "admission",
                             .execution_started = false,
                         }),
-                        else => return err,
+                        else => return failure,
                     };
                 };
                 ctx.setData("antfly.workload-body-memory", memory, null) catch |err| {
@@ -3422,27 +3623,13 @@ pub const AntflyApiHandler = struct {
                     self.releasePublicOperation(operation_id, lease);
                     return err;
                 };
-                // Header/authentication allocations predate this owner. Only
-                // body allocations use it; errors retain the base allocator.
                 std.debug.assert(!ctx.response.body_owned);
-                ctx.response.body_memory = .{
-                    .allocator = memory.allocator(),
-                    .ptr = memory,
-                    .retain = struct {
-                        fn retain(raw: *anyopaque) void {
-                            const owner: *Owner = @ptrCast(@alignCast(raw));
-                            owner.retain();
-                        }
-                    }.retain,
-                    .release = struct {
-                        fn release(raw: *anyopaque) void {
-                            const owner: *Owner = @ptrCast(@alignCast(raw));
-                            owner.release();
-                        }
-                    }.release,
-                };
+                const previous = ctx.response.body_memory;
+                ctx.response.body_memory = ownerBodyMemory(memory);
+                if (previous) |value| value.release(value.ptr);
             }
         }
+
         self.api_server.reachRequestLifecycle(.admission_acquired, operation_id) catch |err| {
             self.releasePublicOperation(operation_id, lease);
             return err;
@@ -3497,7 +3684,7 @@ pub const AntflyApiHandler = struct {
             identity.* = cached.identity;
             cached.identity = null;
         } else {
-            identity.* = self.api_server.authenticateRequest(.{
+            identity.* = self.api_server.authenticateRequestWithAllocator(ctx.allocator, .{
                 .authorization = ctx.header("authorization"),
                 .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
             }) catch |err| switch (err) {
@@ -3975,8 +4162,8 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const alloc = self.api_server.alloc;
-        const sessions = try self.api_server.listAuthorizedTransactionSessions(authenticated_identity);
+        const alloc = ctx.allocator;
+        const sessions = try self.api_server.listAuthorizedTransactionSessionsAlloc(alloc, authenticated_identity);
         defer alloc.free(sessions);
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
@@ -4008,8 +4195,9 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        try self.api_server.ensureTransactionSessionMemory();
         const body_data = (try ctx.body()) orelse "";
-        const alloc = self.api_server.alloc;
+        const alloc = ctx.allocator;
         const begin_req = transactions_api.parseBeginRequest(alloc, body_data) catch {
             _ = ctx.status(400);
             return ctx.text("invalid transaction begin request");
@@ -4036,11 +4224,11 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, "")) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+        if (!(try self.api_server.transactionSessionAccessibleAlloc(ctx.allocator, txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        const alloc = self.api_server.alloc;
+        const alloc = ctx.allocator;
         var details = (self.api_server.txn_sessions.getDetails(alloc, txn_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
@@ -4068,11 +4256,11 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+        if (!(try self.api_server.transactionSessionAccessibleAlloc(ctx.allocator, txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        const alloc = self.api_server.alloc;
+        const alloc = ctx.allocator;
         var stage_req = transactions_api.parseCommitRequest(alloc, body_data) catch |err| switch (err) {
             error.InvalidTransactionCommitRequest => {
                 _ = ctx.status(400);
@@ -4117,11 +4305,11 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+        if (!(try self.api_server.transactionSessionAccessibleAlloc(ctx.allocator, txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        const alloc = self.api_server.alloc;
+        const alloc = ctx.allocator;
         var read_req = transactions_api.parseStageReadPayload(alloc, body_data) catch {
             _ = ctx.status(400);
             return ctx.text("invalid transaction read request");
@@ -4233,11 +4421,11 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+        if (!(try self.api_server.transactionSessionAccessibleAlloc(ctx.allocator, txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        const alloc = self.api_server.alloc;
+        const alloc = ctx.allocator;
         var stage_req = switch (kind) {
             .write => transactions_api.parseStageWriteRequest(alloc, body_data) catch {
                 _ = ctx.status(400);
@@ -4285,7 +4473,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+        if (!(try self.api_server.transactionSessionAccessibleAlloc(ctx.allocator, txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
@@ -4328,7 +4516,7 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid savepoint id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+        if (!(try self.api_server.transactionSessionAccessibleAlloc(ctx.allocator, txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
@@ -4367,11 +4555,11 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+        if (!(try self.api_server.transactionSessionAccessibleAlloc(ctx.allocator, txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        const alloc = self.api_server.alloc;
+        const alloc = ctx.allocator;
         const session = self.api_server.txn_sessions.getInfo(txn_id) orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -4397,19 +4585,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(409);
                 return ctx.text("transaction commit retry body does not match the sealed request");
             },
-            error.SessionLeaseLost => {
-                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionCommitResponse(
-                    arena_impl.allocator(),
-                    txn_id,
-                    "aborted",
-                    transactions_api.sessionLeaseLostConflict(if (parsed_req) |value| if (value.tables.len > 0) value.tables[0].table_name else "" else ""),
-                    null,
-                );
-                _ = ctx.status(409);
-                return ctx.openApiJson(response);
-            },
+            error.SessionLeaseLost, error.TransactionCommitAlreadyStarted => return transactionOutcomeUnknown(ctx, txn_id),
             else => return err,
         }) orelse {
             _ = ctx.status(400);
@@ -4469,34 +4645,45 @@ pub const AntflyApiHandler = struct {
 
         const distributed_tables = try commit_req.distributedTables(alloc);
         defer if (distributed_tables.len > 0) alloc.free(distributed_tables);
-        self.api_server.validateCommitTablesAgainstSchema(operationContext(ctx, null), distributed_tables) catch |err| switch (err) {
-            error.InvalidBatchRequest,
-            error.InvalidArgument,
-            error.InvalidGraphEdges,
-            error.UnsupportedTransformOperation,
-            => {
-                _ = ctx.status(400);
-                return ctx.text("invalid transaction commit request");
-            },
-            error.TableNotFound => return textResponse(ctx, 404, "not found"),
-            error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return textResponse(ctx, 503, "catalog validation unavailable"),
-            error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return textResponse(ctx, 504, "request deadline exceeded"),
-            error.Canceled, error.Cancelled => return textResponse(ctx, 408, "request canceled"),
-            else => return err,
-        };
-        if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
-            _ = self.api_server.txn_sessions.remove(alloc, txn_id);
-            var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-            defer arena_impl.deinit();
-            const response = try transactions_api.buildSessionCommitResponse(
-                arena_impl.allocator(),
-                txn_id,
-                "aborted",
-                conflict,
-                null,
-            );
-            _ = ctx.status(409);
-            return ctx.openApiJson(response);
+        preflight: {
+            // A retry replays the sealed transaction ID. Rechecking a changed read
+            // set after durable start must not invent an abort or retire recovery.
+            if ((try self.api_server.txn_sessions.executionStarted(alloc, txn_id)) orelse false) break :preflight;
+            self.api_server.validateCommitTablesAgainstSchema(operationContext(ctx, null), distributed_tables) catch |err| switch (err) {
+                error.InvalidBatchRequest,
+                error.InvalidArgument,
+                error.InvalidGraphEdges,
+                error.UnsupportedTransformOperation,
+                => {
+                    _ = ctx.status(400);
+                    return ctx.text("invalid transaction commit request");
+                },
+                error.TableNotFound => return textResponse(ctx, 404, "not found"),
+                error.ResourceTemporarilyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired => return textResponse(ctx, 503, "catalog validation unavailable"),
+                error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return textResponse(ctx, 504, "request deadline exceeded"),
+                error.Canceled, error.Cancelled => return textResponse(ctx, 408, "request canceled"),
+                else => return err,
+            };
+            if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
+                // Another retry can pass preflight and start while this one reads.
+                // The stripe/store transaction makes abort vs. start exclusive.
+                const aborted = self.api_server.txn_sessions.abortOpenSession(alloc, txn_id) catch |err| switch (err) {
+                    error.TransactionCommitAlreadyStarted => break :preflight,
+                    else => return err,
+                };
+                if (!aborted) return textResponse(ctx, 404, "not found");
+                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
+                defer arena_impl.deinit();
+                const response = try transactions_api.buildSessionCommitResponse(
+                    arena_impl.allocator(),
+                    txn_id,
+                    "aborted",
+                    conflict,
+                    null,
+                );
+                _ = ctx.status(409);
+                return ctx.openApiJson(response);
+            }
         }
 
         var admission_lease: ?RequestAdmission.Lease = null;
@@ -4508,7 +4695,9 @@ pub const AntflyApiHandler = struct {
         // maintenance can replay the same transaction ID without duplicating
         // non-idempotent transforms.
         _ = (self.api_server.txn_sessions.markCommitExecutionStarted(alloc, txn_id) catch |err| switch (err) {
-            error.RecoveryCapacityExhausted => {
+            error.RecoveryCapacityExhausted, error.SessionRecordTooLarge, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge, error.OutOfMemory => {
+                const started = self.api_server.txn_sessions.executionStarted(alloc, txn_id) catch return transactionOutcomeUnknown(ctx, txn_id);
+                if (started == null or started.?) return transactionOutcomeUnknown(ctx, txn_id);
                 // No participant preparation/commit has started. The durable
                 // session remains sealed and may be retried explicitly.
                 return httpx.Response.fromJson(ctx.allocator, 429, .{
@@ -4537,86 +4726,30 @@ pub const AntflyApiHandler = struct {
             session.sync_level,
             commit_request.cancellation,
         ) catch |err| switch (err) {
-            error.TransactionTooLarge => {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
-                return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions");
-            },
+            error.TransactionTooLarge,
             error.InvalidBatchRequest,
             error.InvalidArgument,
             error.InvalidGraphEdges,
             error.UnsupportedTransformOperation,
+            error.TopologyChanged,
+            error.DecisionConflict,
+            error.DocIdentityNamespaceMismatch,
+            error.UnsupportedOperation,
+            error.TableNotFound,
+            error.UnknownGroup,
             => {
-                // Participant validation terminally aborts this transaction
-                // ID, so retaining the session would only produce conflicts.
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
-                _ = ctx.status(400);
-                return ctx.text("invalid transaction commit request");
-            },
-            error.TopologyChanged => {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
-                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionCommitResponse(
-                    arena_impl.allocator(),
-                    txn_id,
-                    "aborted",
-                    transactions_api.topologyChangedConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                    null,
-                );
-                _ = ctx.status(409);
-                return ctx.openApiJson(response);
-            },
-            error.DecisionConflict => {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
-                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionCommitResponse(
-                    arena_impl.allocator(),
-                    txn_id,
-                    "aborted",
-                    transactions_api.decisionConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                    null,
-                );
-                _ = ctx.status(409);
-                return ctx.openApiJson(response);
-            },
-            error.DocIdentityNamespaceMismatch => {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
-                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionCommitResponse(
-                    arena_impl.allocator(),
-                    txn_id,
-                    "aborted",
-                    transactions_api.docIdentityUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                    null,
-                );
-                _ = ctx.status(409);
-                return ctx.openApiJson(response);
-            },
-            error.UnsupportedOperation => {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
-                _ = ctx.status(405);
-                return ctx.text("method not allowed");
-            },
-            error.TableNotFound => {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
-                _ = ctx.status(404);
-                return ctx.text("not found");
-            },
-            error.UnknownGroup => {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
-                var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-                defer arena_impl.deinit();
-                const response = try transactions_api.buildSessionCommitResponse(
-                    arena_impl.allocator(),
-                    txn_id,
-                    "aborted",
-                    transactions_api.participantUnavailableConflict(if (commit_req.tables.len > 0) commit_req.tables[0].table_name else ""),
-                    null,
-                );
-                _ = ctx.status(409);
-                return ctx.openApiJson(response);
+                // A legacy error is not authoritative terminal evidence for a
+                // stable ID that may have run previously. Keep its recovery
+                // record and completion memory until a typed outcome resolves it.
+                const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
+                return httpx.Response.fromJson(ctx.allocator, 503, .{
+                    .@"error" = "TransactionOutcomeUnknown",
+                    .reason = "outcome_unknown",
+                    .stage = "execution",
+                    .execution_started = true,
+                    .transaction_id = txn_hex[0..],
+                    .message = "observe or retry this transaction id; do not submit a replacement transaction",
+                });
             },
             error.CommitVisibilityNotSatisfied,
             error.EnrichmentWaitCanceled,
@@ -4659,10 +4792,7 @@ pub const AntflyApiHandler = struct {
                     std.log.err("failed to persist stable transaction repair handoff txn_id={x} err={s}", .{ txn_id, @errorName(persist_err) });
                     _ = ctx.status(503);
                     return ctx.text("transaction committed; durable repair handoff is pending");
-                }) orelse {
-                    _ = ctx.status(503);
-                    return ctx.text("transaction committed; durable repair handoff is pending");
-                };
+                }) orelse return transactionOutcomeUnknown(ctx, txn_id);
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildSessionCommitResponse(
@@ -4752,6 +4882,7 @@ pub const AntflyApiHandler = struct {
                 return ctx.openApiJson(response);
             },
             .conflict => |conflict| {
+                if (!transactions_api.conflictProvesAbort(conflict)) return transactionOutcomeUnknown(ctx, txn_id);
                 _ = self.api_server.txn_sessions.remove(alloc, txn_id);
                 const enriched_conflict = try self.api_server.enrichCommitConflict(commit_req, conflict);
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -4769,6 +4900,18 @@ pub const AntflyApiHandler = struct {
         }
     }
 
+    fn transactionOutcomeUnknown(ctx: *httpx.Context, txn_id: db_mod.types.TxnId) !httpx.Response {
+        const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
+        return httpx.Response.fromJson(ctx.allocator, 503, .{
+            .@"error" = "TransactionOutcomeUnknown",
+            .reason = "outcome_unknown",
+            .stage = "execution",
+            .execution_started = true,
+            .transaction_id = txn_hex[0..],
+            .message = "observe or retry this transaction id; do not submit a replacement transaction",
+        });
+    }
+
     pub fn abortTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -4779,17 +4922,15 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction id");
         };
         if (try self.forwardTransactionSession(ctx, txn_id, body_data)) |response| return response;
-        if (!(try self.api_server.transactionSessionAccessible(txn_id, authenticated_identity))) {
+        if (!(try self.api_server.transactionSessionAccessibleAlloc(ctx.allocator, txn_id, authenticated_identity))) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
-        if (try self.api_server.txn_sessions.getTerminalCommit(self.api_server.alloc, txn_id)) |terminal_value| {
-            var terminal = terminal_value;
-            defer terminal.deinit(self.api_server.alloc);
-            _ = ctx.status(409);
-            return ctx.text("transaction is already committed");
-        }
-        if (!self.api_server.txn_sessions.remove(self.api_server.alloc, txn_id)) {
+        const aborted = self.api_server.txn_sessions.abortOpenSession(self.api_server.alloc, txn_id) catch |err| switch (err) {
+            error.TransactionCommitAlreadyStarted => return textResponse(ctx, 409, "transaction execution has started; observe or retry this transaction id"),
+            else => return err,
+        };
+        if (!aborted) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
@@ -4974,12 +5115,12 @@ pub const AntflyApiHandler = struct {
         const body_data = (try ctx.body()) orelse {
             return jsonErrorResponse(ctx, 400, "invalid query builder request");
         };
-        var response = try self.api_server.executeQueryBuilderAgentWithContext(body_data, authenticated_identity, self.agentRequestContext(ctx));
+        var response = try self.api_server.executeQueryBuilderAgentWithOwner(body_data, authenticated_identity, self.agentRequestContext(ctx), if (ingressState(ctx)) |state| state.owner else null);
         defer response.deinit(self.api_server.alloc);
         _ = ctx.status(response.status);
         try ctx.setHeader("content-type", response.content_type);
         for (response.headers) |header| try ctx.setHeader(header.name, header.value);
-        _ = ctx.response.body(response.body);
+        adoptContextualBody(ctx, &response);
         return ctx.response.build();
     }
 
@@ -5596,7 +5737,10 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         if (params.pattern != null) return textResponse(ctx, 400, "unsupported table pattern");
-        const route = try system_catalog_routes.parseAlloc(ctx.allocator, http_server_mod.stripApiPrefix(ctx.request.uri.path));
+        var planning_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer planning_arena.deinit();
+        const planning_alloc = planning_arena.allocator();
+        const route = try system_catalog_routes.parseAlloc(planning_alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path));
         var request: @import("../system_catalog/domain.zig").TableList = .{
             .database = if (route) |value| value.database else "default",
             .namespace = if (route) |value| value.namespace else "public",
@@ -5606,16 +5750,16 @@ pub const AntflyApiHandler = struct {
             request.limit = std.fmt.parseInt(u32, limit, 10) catch return textResponse(ctx, 400, "invalid page limit");
             if (request.limit.? == 0 or request.limit.? > 1000) return textResponse(ctx, 400, "page limit must be between 1 and 1000");
         }
-        if (params.cursor) |cursor| @import("system_catalog_pagination.zig").apply(ctx.allocator, &request, cursor) catch |err| switch (err) {
+        if (params.cursor) |cursor| @import("system_catalog_pagination.zig").apply(planning_alloc, &request, cursor) catch |err| switch (err) {
             error.InvalidCatalogName => return textResponse(ctx, 400, "invalid catalog cursor"),
             else => return err,
         };
-        const page = self.api_server.encodeCatalogTablePage(operationContext(ctx, authenticated_identity), request, authenticated_identity) catch |err| switch (err) {
+        const page = self.api_server.encodeCatalogTablePageAlloc(ctx.allocator, operationContext(ctx, authenticated_identity), request, authenticated_identity) catch |err| switch (err) {
             error.CatalogGenerationChanged => return jsonErrorResponse(ctx, 409, "catalog changed; restart pagination"),
             error.InvalidCatalogName => return textResponse(ctx, 400, "invalid catalog cursor"),
             else => return err,
         };
-        defer page.deinit(self.api_server.alloc);
+        defer page.deinit(ctx.allocator);
         if (page.cursor) |cursor| {
             try ctx.setHeader("X-Antfly-Next-Cursor", cursor);
         }
@@ -5641,8 +5785,8 @@ pub const AntflyApiHandler = struct {
         const route = try system_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path));
         defer if (route) |value| value.deinit(alloc);
         const target = if (route) |value| try value.target() else try system_catalog.Target.literal(logical_name);
-        const body = (self.api_server.encodeScopedTableStatus(operationContext(ctx, authenticated_identity), target, logical_name, authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err))) orelse return textResponse(ctx, 404, "not found");
-        defer self.api_server.alloc.free(body);
+        const body = (self.api_server.encodeScopedTableStatusAlloc(ctx.allocator, operationContext(ctx, authenticated_identity), target, logical_name, authenticated_identity) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err))) orelse return textResponse(ctx, 404, "not found");
+        defer ctx.allocator.free(body);
         return jsonResponse(ctx, 200, body);
     }
 
@@ -6340,16 +6484,17 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const alloc = ctx.allocator;
         const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
-        defer alloc.free(decoded_table_name);
+        defer ctx.allocator.free(decoded_table_name);
         // The OpenAPI request body is optional; an absent body is the default
         // unbounded-range scan, just like an explicitly empty legacy request.
         const body_data = (try ctx.body()) orelse "";
         var admission_lease: ?RequestAdmission.Lease = null;
         if (try self.acquirePublicOperation(ctx, "scanKeys", &admission_lease)) |response| return response;
         defer self.releasePublicOperation("scanKeys", &admission_lease);
+        const alloc = ctx.response.bodyAllocator();
         var scan_req = http_route_helpers.parseScanKeysRequest(alloc, body_data) catch |err| {
+            if (try queryMemoryFailureResponse(ctx, err, "planning", false)) |response| return response;
             if (http_route_helpers.scanRequestError(err)) |response| {
                 _ = ctx.status(response.status);
                 return ctx.text(response.message);
@@ -6403,6 +6548,7 @@ pub const AntflyApiHandler = struct {
             stream.sink(),
         ) catch |err| {
             if (stream.writer != null) return err;
+            if (try queryMemoryFailureResponse(ctx, err, "execution", true)) |response| return response;
             return switch (err) {
                 error.TableNotFound => {
                     _ = ctx.status(404);
@@ -6426,7 +6572,7 @@ pub const AntflyApiHandler = struct {
                 error.GenerationTransitionActive,
                 => {
                     var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
-                    return respondOwnedApiResponse(ctx, &response);
+                    return respondOwnedApiResponseWithAllocator(ctx, &response, alloc);
                 },
                 error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.UnknownGroup, error.ReadIndexTimeout => {
                     try ctx.setHeader("Retry-After", "1");
@@ -8752,7 +8898,63 @@ test "httpx multi batch route uses the batch commit hook and public response con
     try std.testing.expectEqual(@as(usize, 2), writes.cancellation_transaction_calls);
 }
 
-test "httpx stable transaction commit durably hands off recovery before acknowledgement" {
+test "workload admission session retry and abort cannot retire uncertain execution" {
+    const alloc = std.testing.allocator;
+    const Backend = struct {
+        calls: usize = 0,
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.TestUnexpectedResult;
+        }
+        fn commit(raw: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) !?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.TableNotFound;
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.RetryMustNotRevalidateReadSet;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.TestUnexpectedResult;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var backend = Backend{};
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), .{ .ptr = &backend, .vtable = &.{ .lookup = Backend.lookup, .scan = Backend.scan, .query = Backend.query } }, .{ .ptr = &backend, .vtable = &.{ .batch = Backend.batch, .commit_transaction_with_id = Backend.commit } });
+    defer server.deinit();
+    try server.ensureTransactionSessionMemory();
+    const session = try server.txn_sessions.beginForPrincipal(alloc, .{}, server.localSessionNodeId(), null);
+    var staged = try transactions_api.parseCommitRequest(alloc,
+        \\{"read_set":[{"table":"docs","key":"doc","version":"1"}],"tables":{"docs":{"inserts":{"doc":{"value":1}}}}}
+    );
+    defer staged.deinit(alloc);
+    _ = try server.txn_sessions.stage(alloc, session.txn_id, &staged);
+    var sealed = (try server.txn_sessions.cloneCommitRequest(alloc, session.txn_id, null)).?;
+    defer sealed.deinit(alloc);
+    _ = try server.txn_sessions.markCommitExecutionStarted(alloc, session.txn_id);
+    const txn_hex = distributed_txn.encodeTxnIdHex(session.txn_id);
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(alloc, .POST, "/db/v1/transactions/retry/commit");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try handler.commitTransactionSession(&ctx, &txn_hex);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqual(@as(usize, 1), backend.calls);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"execution_started\":true") != null);
+    var abort_ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer abort_ctx.deinit();
+    var aborted = try handler.abortTransactionSession(&abort_ctx, &txn_hex);
+    defer aborted.deinit();
+    try std.testing.expectEqual(@as(u16, 409), aborted.status.code);
+    try std.testing.expect((try server.txn_sessions.executionStarted(alloc, session.txn_id)).?);
+    try std.testing.expect(server.session_memory_admission.stats().retained_bytes > 0);
+}
+
+test "workload admission stable transaction commit durably hands off recovery before acknowledgement" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
     const FakeWrites = struct {
@@ -8834,7 +9036,12 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
     const alloc = std.testing.allocator;
     var status = AuthStatusSource{};
     var writes = FakeWrites{};
-    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+    var api_server = ApiHttpServer.init(alloc, .{ .ingress_admission = .{
+        .max_requests = 8,
+        .max_retained_bytes = 512 * 1024,
+        .control_requests = 2,
+        .control_retained_bytes = 16 * 1024,
+    } }, status.iface(), null, writes.source());
     defer api_server.deinit();
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.init(alloc, &api_server) catch |err| switch (err) {
@@ -8866,6 +9073,27 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
     try std.testing.expectEqual(@as(u16, 201), begin.status.code);
     var parsed_begin = try std.json.parseFromSlice(transactions_api.BeginResponse, alloc, begin.body.?, .{});
     defer parsed_begin.deinit();
+    // Exercise real frontend allocator handoffs before the durable commit.
+    const list_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/transactions", .{base_url});
+    defer alloc.free(list_url);
+    var listed = try requestWithRetry(&client, client_io.io(), .GET, list_url, null, &headers, 20);
+    defer listed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), listed.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body.?, parsed_begin.value.transaction_id) != null);
+    const stage_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/transactions/{s}/stage", .{ base_url, parsed_begin.value.transaction_id });
+    defer alloc.free(stage_url);
+    var staged = try requestWithRetry(&client, client_io.io(), .POST, stage_url,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"staged":{"value":2}}}}}
+    , &headers, 20);
+    defer staged.deinit();
+    try std.testing.expectEqual(@as(u16, 200), staged.status.code);
+    const details_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/transactions/{s}", .{ base_url, parsed_begin.value.transaction_id });
+    defer alloc.free(details_url);
+    var details = try requestWithRetry(&client, client_io.io(), .GET, details_url, null, &headers, 20);
+    defer details.deinit();
+    try std.testing.expectEqual(@as(u16, 200), details.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, details.body.?, "staged_write_count") != null);
+    try std.testing.expect(api_server.ingress_admission.general.stats().peak_in_flight > 0);
     const commit_url = try std.fmt.allocPrint(
         alloc,
         "{s}/db/v1/transactions/{s}/commit",
@@ -9694,6 +9922,89 @@ test "workload admission output bytes survive context and retire with response" 
     chunked.deinit();
     chunked_live = false;
     try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().retained_bytes);
+}
+
+test "workload admission native batch offload keeps parsing and output charged" {
+    const alloc = std.testing.allocator;
+    const Fixture = struct {
+        gate: *RequestAdmission,
+        called: bool = false,
+        deny: bool = false,
+
+        fn execute(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest, _: operation_contract.RequestContext) public_table_http.TableApi.ExecuteBatchError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.called = true;
+            const before = self.gate.stats().retained_bytes;
+            const scratch = try a.alloc(u8, if (self.deny) 2 * 1024 * 1024 else 32 * 1024);
+            defer a.free(scratch);
+            std.debug.assert(self.gate.stats().retained_bytes >= before + scratch.len);
+        }
+    };
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = threaded.io() } });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{ .write_admission_waiting = .{ .max_retained_bytes = 1024 * 1024 } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for ([_]bool{ false, true }) |deny| {
+        var fixture = Fixture{ .gate = &server.write_admission, .deny = deny };
+        var api = server.tableApi(.{});
+        var vtable = api.vtable.*;
+        vtable.execute_table_batch = Fixture.execute;
+        api.vtable = &vtable;
+        api.ptr = &fixture;
+        var request = try httpx.Request.init(alloc, .POST, "/db/v1/tables/docs/batch");
+        defer request.deinit();
+        // The admission account persists between requests; it must not use
+        // this short-lived arena for its metadata or offloaded allocations.
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var ctx = httpx.Context.init(arena.allocator(), threaded.io(), &request);
+        var ctx_live = true;
+        defer if (ctx_live) ctx.deinit();
+        var lease: ?RequestAdmission.Lease = null;
+        defer if (lease) |*value| value.release();
+        try std.testing.expect((try handler.acquirePublicOperation(&ctx, "batchWrite", &lease)) == null);
+        var response = AntflyApiHandler.handleTableBatchOffEventLoop(&ctx, runtime.ptr(), "docs", "{\"inserts\":{\"doc\":{\"title\":\"alpha\"}}}", api) catch |err| try AntflyApiHandler.mapIngressError(&ctx, err);
+        var response_live = true;
+        defer if (response_live) response.deinit();
+        try std.testing.expect(fixture.called);
+        try std.testing.expectEqual(@as(u16, if (deny) 429 else 201), response.status.code);
+        if (deny) try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"execution_started\":true") != null);
+        handler.releasePublicOperation("batchWrite", &lease);
+        ctx.deinit();
+        ctx_live = false;
+        if (!deny) try std.testing.expect(server.write_admission.stats().retained_bytes >= response.body.?.len);
+        response.deinit();
+        response_live = false;
+        try std.testing.expectEqual(@as(usize, 0), server.write_admission.stats().retained_bytes);
+    }
+}
+
+test "workload admission MCP HTTP envelope retains original allocation through drain" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{ .query_admission_waiting = .{ .max_retained_bytes = 1024 * 1024 } }, source.iface(), null, null);
+    var server_live = true;
+    defer if (server_live) server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(alloc, .POST, "/mcp/v1");
+    defer request.deinit();
+    try request.setBody("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    var ctx_live = true;
+    defer if (ctx_live) ctx.deinit();
+    var response = try handler.mcpRoute(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expect(response.retirement != null);
+    ctx.deinit();
+    ctx_live = false;
+    server.deinit();
+    server_live = false;
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "protocolVersion") != null);
 }
 
 test "workload admission output owner allocation failure returns structured overload" {
@@ -11069,7 +11380,7 @@ test "httpx antfly reads preserve availability and terminal failures" {
     }
 }
 
-test "httpx antfly scan honors optional body and documented bad requests" {
+test "workload admission scan owns runtime buffers and honors optional body and bad requests" {
     const alloc = std.testing.allocator;
     const db_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-httpx-handler-scan-{d}", .{platform_time.monotonicNs()});
     defer alloc.free(db_path);
@@ -11095,7 +11406,8 @@ test "httpx antfly scan honors optional body and documented bad requests" {
 
     var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = LookupStatusSource{};
-    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
+    var api_server = ApiHttpServer.init(alloc, .{ .query_admission_waiting = .{ .max_retained_bytes = 1024 * 1024 } }, source.iface(), table_source.source(), null);
+    defer api_server.deinit();
 
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.init(alloc, &api_server) catch |err| switch (err) {
@@ -11431,4 +11743,178 @@ test "httpx antfly cluster restore preserves backup location validation" {
         "{\"error\":\"unsupported backup location\"}",
         resp.body.?,
     );
+}
+
+test "workload admission ingress retains generic and foreign response ownership through drain with protected probes" {
+    const alloc = std.testing.allocator;
+    const Endpoint = struct {
+        retired: bool = false,
+        fn run(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            try std.testing.expectEqualStrings("hello world", (try ctx.queryDecoded("q")).?);
+            try ctx.setCookie("session", "bounded", .{});
+            var response = try httpx.Response.fromJson(ctx.allocator, 200, .{ .ok = true });
+            response.retirement = .{ .ptr = self, .release = retire };
+            return response;
+        }
+        fn retire(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.retired);
+            self.retired = true;
+        }
+        fn unexpected(_: *httpx.Context) !httpx.Response {
+            return error.UnexpectedTestCall;
+        }
+    };
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{ .ingress_admission = .{
+        .max_requests = 2,
+        .max_retained_bytes = 65536,
+        .control_requests = 1,
+        .control_retained_bytes = 4096,
+    } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var endpoint = Endpoint{};
+    var request = try httpx.Request.init(alloc, .GET, "/db/v1/test?q=hello+world");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    var ctx_live = true;
+    defer if (ctx_live) ctx.deinit();
+    // Linked contexts can carry a previously established response policy.
+    try ctx.setHeader("x-prior-policy", "retained");
+    var response = try handler.dispatchLinkedRoute(&ctx, httpx.Handler.bind(&endpoint, Endpoint.run));
+    var response_live = true;
+    defer if (response_live) response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    ctx.deinit();
+    ctx_live = false;
+    try std.testing.expect(!endpoint.retired);
+    try std.testing.expectEqual(@as(usize, 1), server.ingress_admission.general.stats().in_flight);
+    try std.testing.expect(server.ingress_admission.general.stats().retained_bytes > 0);
+
+    var rejected_request = try httpx.Request.init(alloc, .GET, "/db/v1/test");
+    defer rejected_request.deinit();
+    var rejected_ctx = httpx.Context.init(alloc, std.testing.io, &rejected_request);
+    defer rejected_ctx.deinit();
+    var rejected = try handler.dispatchLinkedRoute(&rejected_ctx, httpx.Handler.from(Endpoint.unexpected));
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 429), rejected.status.code);
+    var probe_request = try httpx.Request.init(alloc, .GET, routes.healthz);
+    defer probe_request.deinit();
+    var probe_ctx = httpx.Context.init(alloc, std.testing.io, &probe_request);
+    var probe = try handler.dispatchLinkedRoute(&probe_ctx, httpx.Handler.bind(&handler, AntflyApiHandler.healthz));
+    try std.testing.expectEqual(@as(u16, 200), probe.status.code);
+    probe_ctx.deinit();
+    try std.testing.expectEqual(@as(usize, 1), server.ingress_admission.control.stats().in_flight);
+    probe.deinit();
+    try std.testing.expectEqual(@as(usize, 0), server.ingress_admission.control.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), server.ingress_admission.control.stats().retained_bytes);
+    response.deinit();
+    response_live = false;
+    try std.testing.expect(endpoint.retired);
+    try std.testing.expectEqual(@as(usize, 0), server.ingress_admission.general.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), server.ingress_admission.general.stats().retained_bytes);
+}
+
+test "workload admission ingress child cannot bypass class memory and survives detached server" {
+    const alloc = std.testing.allocator;
+    const Endpoint = struct {
+        handler: *AntflyApiHandler,
+        fn run(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            var lease: ?RequestAdmission.Lease = null;
+            if (try self.handler.acquirePublicOperation(ctx, "queryTable", &lease)) |response| return response;
+            defer self.handler.releasePublicOperation("queryTable", &lease);
+            const owner: *AntflyApiHandler.IngressOwner = @ptrCast(@alignCast(ctx.getData("antfly.workload-body-memory").?));
+            try std.testing.expect(owner.parent == AntflyApiHandler.ingressState(ctx).?.owner);
+            const body = try ctx.response.bodyAllocator().alloc(u8, 32768);
+            defer ctx.response.bodyAllocator().free(body);
+            return error.UnexpectedTestCall;
+        }
+    };
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .ingress_admission = .{ .max_requests = 2, .max_retained_bytes = 65536, .control_requests = 1, .control_retained_bytes = 4096 },
+        .query_max_concurrent_requests = 1,
+        .query_admission_waiting = .{ .max_retained_bytes = 16384 },
+    }, source.iface(), null, null);
+    var server_live = true;
+    defer if (server_live) server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var endpoint = Endpoint{ .handler = &handler };
+    var request = try httpx.Request.init(alloc, .GET, "/db/v1/test");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    var ctx_live = true;
+    defer if (ctx_live) ctx.deinit();
+    var response = try handler.dispatchLinkedRoute(&ctx, httpx.Handler.bind(&endpoint, Endpoint.run));
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 429), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "resource_exhausted") != null);
+    ctx.deinit();
+    ctx_live = false;
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), server.ingress_admission.general.stats().in_flight);
+    // Escaped response retirement uses the stable account, not a freed server.
+    server.deinit();
+    server_live = false;
+}
+
+test "workload admission ingress rejects metadata allocation before invoking handlers" {
+    const alloc = std.testing.allocator;
+    const Endpoint = struct {
+        fn run(_: *httpx.Context) !httpx.Response {
+            return error.UnexpectedTestCall;
+        }
+    };
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{ .ingress_admission = .{
+        .max_requests = 2,
+        .max_retained_bytes = 4097,
+        .control_requests = 1,
+        .control_retained_bytes = 4096,
+    } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(alloc, .GET, "/db/v1/test");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try handler.dispatchLinkedRoute(&ctx, httpx.Handler.from(Endpoint.run));
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 429), response.status.code);
+    try std.testing.expectEqual(@as(usize, 0), server.ingress_admission.general.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), server.ingress_admission.general.stats().retained_bytes);
+}
+
+test "workload admission gzip growth charges simultaneous allocations and retires failure" {
+    const alloc = std.testing.allocator;
+    const encoded = [_]u8{ 31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 237, 193, 49, 1, 0, 0, 0, 194, 160, 218, 139, 239, 101, 11, 160, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 27, 71, 93, 202, 115, 64, 156, 0, 0 };
+    for ([_]usize{ 40000, 100000 }) |capacity| {
+        var budget = httpx.SharedBodyBudget.init(capacity);
+        var request = try httpx.Request.init(alloc, .POST, "/");
+        request.body_budget = &budget;
+        var request_live = true;
+        defer if (request_live) request.deinit();
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var backing = std.testing.FailingAllocator.init(alloc, .{ .resize_fail_index = 0 });
+        if (capacity == 40000) {
+            try std.testing.expectError(error.BodyCapacityExceeded, gunzipRequestBodyAlloc(&ctx, backing.allocator(), &encoded, 40000));
+            try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+            try std.testing.expectEqual(@as(usize, 0), request.body_budget_reserved);
+            try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+        } else {
+            const decoded = try gunzipRequestBodyAlloc(&ctx, backing.allocator(), &encoded, 40000);
+            try std.testing.expectEqual(@as(usize, 40000), decoded.body.len);
+            try std.testing.expectEqual(decoded.allocation.len, budget.stats().in_use);
+            try std.testing.expect(budget.stats().peak_in_use > decoded.allocation.len);
+            // The FailingAllocator owns this test buffer; production decoding
+            // uses Request.allocator and transfers directly to Request.
+            backing.allocator().free(decoded.allocation);
+            request.releaseBodyBuffer(decoded.allocation.len);
+        }
+        request.deinit();
+        request_live = false;
+        try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+    }
 }

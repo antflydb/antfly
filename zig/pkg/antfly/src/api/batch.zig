@@ -133,6 +133,7 @@ fn parseBatchRequestWithOptions(
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, options) catch |err| switch (err) {
         error.ValueTooLong => return error.ValueTooLong,
+        error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidBatchRequest,
     };
     defer parsed.deinit();

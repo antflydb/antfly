@@ -1286,6 +1286,9 @@ pub const ApiHttpServerConfig = struct {
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
     session_max_count: ?usize = null,
+    /// Shared retained MCP/transaction session memory; separate from execution lanes.
+    ingress_admission: @import("../common/workload_ingress.zig").Config = .{},
+    session_max_retained_bytes: usize = 64 * 1024 * 1024,
     session_max_record_bytes: ?usize = null,
     session_max_recovery_count: ?usize = null,
     session_max_recovery_bytes: ?u64 = null,
@@ -1397,6 +1400,7 @@ pub const TableVisibility = enum {
 pub const AuthenticatedIdentity = struct {
     const CatalogAlias = struct { logical: []u8, physical: []u8 };
     username: []u8,
+    allocation_allocator: ?std.mem.Allocator = null,
     /// Borrowed from the serving ApiHttpServer. Target-table operations
     /// intersect the request's admitted permission snapshot with this live
     /// policy source so revocation can take effect within a long request.
@@ -1414,7 +1418,8 @@ pub const AuthenticatedIdentity = struct {
     metadata_json: []u8 = &.{},
     roles: [][]u8 = &.{},
 
-    pub fn deinit(self: *AuthenticatedIdentity, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *AuthenticatedIdentity, fallback_alloc: std.mem.Allocator) void {
+        const alloc = self.allocation_allocator orelse fallback_alloc;
         for (self.catalog_aliases) |alias| {
             alloc.free(alias.logical);
             alloc.free(alias.physical);
@@ -3086,6 +3091,10 @@ pub const ApiHttpServer = struct {
     query_admission: RequestAdmission,
     write_admission: RequestAdmission,
     inference_admission: RequestAdmission,
+    ingress_admission: @import("../common/workload_ingress.zig").Runtime,
+    session_memory_admission: RequestAdmission,
+    txn_session_memory_mutex: std.Io.Mutex = .init,
+    txn_session_memory: ?*@import("../common/workload_allocator.zig").Owner = null,
     source: StatusSource,
     metadata_mutation_retry_policy: MetadataMutationRetryPolicy = .{},
     table_reads: ?table_reads.TableReadSource = null,
@@ -3138,7 +3147,11 @@ pub const ApiHttpServer = struct {
     backup_maintenance_mutex: std.atomic.Mutex = .unlocked,
     backup_maintenance_queue: BackupRepositoryMaintenanceQueue = .{},
     mcp_sessions: mcp.InMemorySessionStore = .{},
+    mcp_memory_mutex: std.Io.Mutex = .init,
+    mcp_session_memory: ?*@import("../common/workload_allocator.zig").Owner = null,
     a2a_tasks: a2a.InMemoryTaskStore = .{},
+    a2a_memory_mutex: std.Io.Mutex = .init,
+    a2a_task_memory: ?*@import("../common/workload_allocator.zig").Owner = null,
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
@@ -3295,6 +3308,8 @@ pub const ApiHttpServer = struct {
             .query_admission = RequestAdmission.initConfigured(cfg.query_max_concurrent_requests, cfg.query_admission_waiting),
             .write_admission = RequestAdmission.initConfigured(cfg.write_max_concurrent_requests, cfg.write_admission_waiting),
             .inference_admission = RequestAdmission.init(cfg.inference_max_concurrent_requests),
+            .ingress_admission = .init(cfg.ingress_admission),
+            .session_memory_admission = RequestAdmission.initConfigured(0, .{ .max_retained_bytes = cfg.session_max_retained_bytes }),
             .source = source,
             .table_reads = table_read_source,
             .table_writes = table_write_source,
@@ -3475,6 +3490,8 @@ pub const ApiHttpServer = struct {
         self.query_admission.close();
         self.write_admission.close();
         self.inference_admission.close();
+        self.ingress_admission.close();
+        self.session_memory_admission.close();
     }
 
     fn foregroundAdmissionFailure(self: *ApiHttpServer, err: anyerror) !contextual_operations.OwnedResponse {
@@ -3832,6 +3849,8 @@ pub const ApiHttpServer = struct {
         self.query_admission.deinitMemory();
         self.write_admission.deinitMemory();
         self.inference_admission.deinitMemory();
+        self.ingress_admission.deinitMemory();
+        self.session_memory_admission.deinitMemory();
         self.restore_jobs_closing.store(true, .release);
         self.signalRestoreRetryWakeup();
         self.signalRestoreBackoffWaiters();
@@ -3853,8 +3872,11 @@ pub const ApiHttpServer = struct {
         self.backup_maintenance_queue.deinit(self.owner_alloc);
         self.backup_maintenance_mutex.unlock();
         self.mcp_sessions.deinit(self.owner_alloc);
+        if (self.mcp_session_memory) |owner| owner.release();
         self.a2a_tasks.deinit(self.owner_alloc);
+        if (self.a2a_task_memory) |owner| owner.release();
         self.txn_sessions.deinit(self.alloc);
+        if (self.txn_session_memory) |owner| owner.release();
         if (self.remote_attempt_worker) |worker| {
             worker.deinit();
             self.owner_alloc.destroy(worker);
@@ -4330,6 +4352,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn retryPendingTransactionRecovery(self: *ApiHttpServer, limit: usize) !void {
+        try self.ensureTransactionSessionMemory();
         const source = self.table_writes orelse return;
         const pending = try self.txn_sessions.listPendingRecoveryIds(self.alloc, limit);
         defer self.alloc.free(pending);
@@ -4409,7 +4432,10 @@ pub const ApiHttpServer = struct {
                         error.TableNotFound,
                         error.UnknownGroup,
                         => {
-                            _ = self.txn_sessions.remove(self.alloc, txn_id);
+                            // Legacy errors are not terminal evidence for an
+                            // execution-started retry; retain both durable debt
+                            // and its prepaid completion workspace.
+                            std.log.warn("stable transaction commit recovery outcome remains uncertain txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                             continue;
                         },
                         else => {
@@ -4418,9 +4444,10 @@ pub const ApiHttpServer = struct {
                         },
                     }) orelse continue;
                     switch (outcome) {
-                        .conflict => {
-                            // A replayed transaction ID can only conflict when
-                            // the coordinator durably chose abort.
+                        .conflict => |conflict| {
+                            // An unavailable coordinator at begin does not
+                            // establish the outcome of an earlier attempt.
+                            if (!transactions_api.conflictProvesAbort(conflict)) continue;
                             _ = self.txn_sessions.remove(self.alloc, txn_id);
                         },
                         .committed => |committed| {
@@ -6181,15 +6208,20 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn cleanupExpiredSessions(self: *ApiHttpServer, cutoff_ns: u64) !usize {
+        try self.ensureTransactionSessionMemory();
         return try self.txn_sessions.cleanupExpired(self.alloc, cutoff_ns);
     }
 
     pub fn authenticateRequest(self: *ApiHttpServer, request: AuthenticatedRequest) !AuthenticatedIdentity {
+        return self.authenticateRequestWithAllocator(self.alloc, request);
+    }
+
+    pub fn authenticateRequestWithAllocator(self: *ApiHttpServer, alloc: std.mem.Allocator, request: AuthenticatedRequest) !AuthenticatedIdentity {
         if (request.trusted_principal) |trusted_principal| {
             const token = std.mem.trim(u8, trusted_principal, " \t\r\n");
             const secret = self.cfg.trusted_principal_secret orelse return error.Unauthorized;
             if (secret.len == 0) return error.Unauthorized;
-            return try self.authenticateTrustedPrincipal(token, secret);
+            return try self.authenticateTrustedPrincipalWithIssuerAllocated(alloc, token, secret, self.cfg.trusted_principal_issuer);
         }
 
         const value = request.authorization orelse return error.Unauthorized;
@@ -6198,8 +6230,8 @@ pub const ApiHttpServer = struct {
         if (std.mem.startsWith(u8, value, "Basic ")) {
             const encoded = value["Basic ".len..];
             const raw_size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
-            const raw = try self.alloc.alloc(u8, raw_size);
-            defer self.alloc.free(raw);
+            const raw = try alloc.alloc(u8, raw_size);
+            defer alloc.free(raw);
             try std.base64.standard.Decoder.decode(raw, encoded);
             const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return error.Unauthorized;
             var user = try manager.authenticateUser(raw[0..colon_pos], raw[colon_pos + 1 ..]);
@@ -6210,9 +6242,10 @@ pub const ApiHttpServer = struct {
             defer freeRowFilters(manager.alloc, manager_row_filters);
             const manager_roles = try manager.getRolesForUser(user.username);
             defer freeOwnedStrings(manager.alloc, manager_roles);
-            const credential_principal = try std.fmt.allocPrint(self.alloc, "basic:{s}", .{user.username});
-            defer self.alloc.free(credential_principal);
-            var identity = try cloneAuthenticatedIdentity(self.alloc, user.username, credential_principal, manager_permissions, manager_row_filters, user.metadata_json, manager_roles);
+            const credential_principal = try std.fmt.allocPrint(alloc, "basic:{s}", .{user.username});
+            defer alloc.free(credential_principal);
+            var identity = try cloneAuthenticatedIdentity(alloc, user.username, credential_principal, manager_permissions, manager_row_filters, user.metadata_json, manager_roles);
+            identity.allocation_allocator = alloc;
             identity.live_user_manager = manager;
             return identity;
         }
@@ -6220,15 +6253,16 @@ pub const ApiHttpServer = struct {
         if (std.mem.startsWith(u8, value, "ApiKey ") or std.mem.startsWith(u8, value, "Bearer ")) {
             const encoded = if (std.mem.startsWith(u8, value, "ApiKey ")) value["ApiKey ".len..] else value["Bearer ".len..];
             const raw_size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
-            const raw = try self.alloc.alloc(u8, raw_size);
-            defer self.alloc.free(raw);
+            const raw = try alloc.alloc(u8, raw_size);
+            defer alloc.free(raw);
             try std.base64.standard.Decoder.decode(raw, encoded);
             const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return error.Unauthorized;
             var validated = try manager.validateApiKey(raw[0..colon_pos], raw[colon_pos + 1 ..]);
             defer validated.deinit(manager.alloc);
-            const credential_principal = try std.fmt.allocPrint(self.alloc, "api-key:{s}", .{raw[0..colon_pos]});
-            defer self.alloc.free(credential_principal);
-            var identity = try cloneAuthenticatedIdentity(self.alloc, validated.username, credential_principal, validated.permissions, validated.row_filter, validated.metadata_json, validated.roles);
+            const credential_principal = try std.fmt.allocPrint(alloc, "api-key:{s}", .{raw[0..colon_pos]});
+            defer alloc.free(credential_principal);
+            var identity = try cloneAuthenticatedIdentity(alloc, validated.username, credential_principal, validated.permissions, validated.row_filter, validated.metadata_json, validated.roles);
+            identity.allocation_allocator = alloc;
             identity.live_user_manager = manager;
             return identity;
         }
@@ -6307,24 +6341,28 @@ pub const ApiHttpServer = struct {
         secret: []const u8,
         expected_issuer: ?[]const u8,
     ) !AuthenticatedIdentity {
+        return self.authenticateTrustedPrincipalWithIssuerAllocated(self.alloc, token, secret, expected_issuer);
+    }
+
+    fn authenticateTrustedPrincipalWithIssuerAllocated(self: *ApiHttpServer, alloc: std.mem.Allocator, token: []const u8, secret: []const u8, expected_issuer: ?[]const u8) !AuthenticatedIdentity {
         var parts = std.mem.splitScalar(u8, token, '.');
         const header_b64 = parts.next() orelse return error.Unauthorized;
         const payload_b64 = parts.next() orelse return error.Unauthorized;
         const signature_b64 = parts.next() orelse return error.Unauthorized;
         if (parts.next() != null or header_b64.len == 0 or payload_b64.len == 0 or signature_b64.len == 0) return error.Unauthorized;
 
-        const signing_input = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ header_b64, payload_b64 });
-        defer self.alloc.free(signing_input);
+        const signing_input = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ header_b64, payload_b64 });
+        defer alloc.free(signing_input);
 
         var expected_mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
         std.crypto.auth.hmac.sha2.HmacSha256.create(expected_mac[0..], signing_input, secret);
-        const signature = try base64UrlDecodeAlloc(self.alloc, signature_b64);
-        defer self.alloc.free(signature);
+        const signature = try base64UrlDecodeAlloc(alloc, signature_b64);
+        defer alloc.free(signature);
         if (!constantTimeEql(signature, expected_mac[0..])) return error.Unauthorized;
 
-        const header_json = try base64UrlDecodeAlloc(self.alloc, header_b64);
-        defer self.alloc.free(header_json);
-        var parsed_header = try std.json.parseFromSlice(std.json.Value, self.alloc, header_json, .{});
+        const header_json = try base64UrlDecodeAlloc(alloc, header_b64);
+        defer alloc.free(header_json);
+        var parsed_header = try std.json.parseFromSlice(std.json.Value, alloc, header_json, .{});
         defer parsed_header.deinit();
         const header_obj = switch (parsed_header.value) {
             .object => |object| object,
@@ -6332,9 +6370,9 @@ pub const ApiHttpServer = struct {
         };
         if (!std.mem.eql(u8, jsonStringField(header_obj.get("alg")) orelse "", "HS256")) return error.Unauthorized;
 
-        const payload_json = try base64UrlDecodeAlloc(self.alloc, payload_b64);
-        defer self.alloc.free(payload_json);
-        var parsed_payload = try std.json.parseFromSlice(std.json.Value, self.alloc, payload_json, .{});
+        const payload_json = try base64UrlDecodeAlloc(alloc, payload_b64);
+        defer alloc.free(payload_json);
+        var parsed_payload = try std.json.parseFromSlice(std.json.Value, alloc, payload_json, .{});
         defer parsed_payload.deinit();
         const payload = switch (parsed_payload.value) {
             .object => |object| object,
@@ -6366,33 +6404,35 @@ pub const ApiHttpServer = struct {
             internal_service_auth.principal_kind,
         ) and bounded_service_lifetime;
 
-        const permissions = try trustedPrincipalPermissionsFromPayload(self.alloc, payload);
+        const permissions = try trustedPrincipalPermissionsFromPayload(alloc, payload);
         errdefer {
-            for (permissions) |*permission| permission.deinit(self.alloc);
-            if (permissions.len > 0) self.alloc.free(permissions);
+            for (permissions) |*permission| permission.deinit(alloc);
+            if (permissions.len > 0) alloc.free(permissions);
         }
-        const row_filters = try trustedPrincipalRowFiltersFromPayload(self.alloc, payload);
+        const row_filters = try trustedPrincipalRowFiltersFromPayload(alloc, payload);
         errdefer {
-            for (row_filters) |*entry| entry.deinit(self.alloc);
-            if (row_filters.len > 0) self.alloc.free(row_filters);
+            for (row_filters) |*entry| entry.deinit(alloc);
+            if (row_filters.len > 0) alloc.free(row_filters);
         }
         const metadata_json = if (payload.get("metadata")) |metadata|
-            try std.json.Stringify.valueAlloc(self.alloc, metadata, .{})
+            try std.json.Stringify.valueAlloc(alloc, metadata, .{})
         else
-            try self.alloc.dupe(u8, "{}");
+            try alloc.dupe(u8, "{}");
 
+        errdefer alloc.free(metadata_json);
+        const username = try alloc.dupe(u8, subject);
+        errdefer alloc.free(username);
+        const credential_principal = try std.fmt.allocPrint(alloc, "trusted:{s}:{s}", .{ jsonStringField(payload.get("iss")) orelse "", subject });
+        errdefer alloc.free(credential_principal);
         return .{
-            .username = try self.alloc.dupe(u8, subject),
-            .credential_principal = try std.fmt.allocPrint(
-                self.alloc,
-                "trusted:{s}:{s}",
-                .{ jsonStringField(payload.get("iss")) orelse "", subject },
-            ),
+            .allocation_allocator = alloc,
+            .username = username,
+            .credential_principal = credential_principal,
             .is_internal_service = is_internal_service,
             .permissions = permissions,
             .row_filter = row_filters,
             .metadata_json = metadata_json,
-            .roles = try self.alloc.alloc([]u8, 0),
+            .roles = try alloc.alloc([]u8, 0),
         };
     }
 
@@ -6587,14 +6627,25 @@ pub const ApiHttpServer = struct {
         query: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
+        return self.executeExtensionAgentWithAllocator(self.alloc, method, path, query, authenticated_identity);
+    }
+
+    pub fn executeExtensionAgentWithAllocator(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        method: contextual_operations.Method,
+        path: []const u8,
+        query: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
         const parsed = parseExtensionAgentRunRoute(path) orelse return error.NotFound;
-        const descriptor = (try self.visibleExtensionAgentDescriptorJsonAlloc(parsed.extension_name, parsed.agent_name, query, authenticated_identity)) orelse
+        const descriptor = (try self.visibleExtensionAgentDescriptorJsonAllocWithAllocator(alloc, parsed.extension_name, parsed.agent_name, query, authenticated_identity)) orelse
             return error.NotFound;
-        self.alloc.free(descriptor);
+        alloc.free(descriptor);
 
         if (std.mem.eql(u8, parsed.tail, "runs")) {
             if (method != .post) return error.MethodNotAllowed;
-            const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, null);
+            const body = try extensionAgentUnsupportedRuntimeJsonAlloc(alloc, parsed.extension_name, parsed.agent_name, null);
             return .{ .status = 501, .content_type = "application/json", .body = body };
         }
         if (!std.mem.startsWith(u8, parsed.tail, "runs/")) return error.NotFound;
@@ -6604,19 +6655,19 @@ pub const ApiHttpServer = struct {
             if (method != .get) return error.MethodNotAllowed;
             const run_id = run_tail[0 .. run_tail.len - "/events".len];
             if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return error.NotFound;
-            const body = try extensionAgentUnsupportedRuntimeEventAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_id);
+            const body = try extensionAgentUnsupportedRuntimeEventAlloc(alloc, parsed.extension_name, parsed.agent_name, run_id);
             return .{ .status = 501, .content_type = "text/event-stream", .body = body };
         }
         if (std.mem.endsWith(u8, run_tail, "/cancel")) {
             if (method != .post) return error.MethodNotAllowed;
             const run_id = run_tail[0 .. run_tail.len - "/cancel".len];
             if (run_id.len == 0 or std.mem.indexOfScalar(u8, run_id, '/') != null) return error.NotFound;
-            const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_id);
+            const body = try extensionAgentUnsupportedRuntimeJsonAlloc(alloc, parsed.extension_name, parsed.agent_name, run_id);
             return .{ .status = 501, .content_type = "application/json", .body = body };
         }
         if (std.mem.indexOfScalar(u8, run_tail, '/') != null) return error.NotFound;
         if (method != .get) return error.MethodNotAllowed;
-        const body = try extensionAgentUnsupportedRuntimeJsonAlloc(self.alloc, parsed.extension_name, parsed.agent_name, run_tail);
+        const body = try extensionAgentUnsupportedRuntimeJsonAlloc(alloc, parsed.extension_name, parsed.agent_name, run_tail);
         return .{ .status = 501, .content_type = "application/json", .body = body };
     }
 
@@ -6627,14 +6678,25 @@ pub const ApiHttpServer = struct {
         query: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !?[]u8 {
-        const route = try std.fmt.allocPrint(self.alloc, "extensions/{s}/{s}", .{ extension_name, agent_name });
-        defer self.alloc.free(route);
+        return self.visibleExtensionAgentDescriptorJsonAllocWithAllocator(self.alloc, extension_name, agent_name, query, authenticated_identity);
+    }
+
+    fn visibleExtensionAgentDescriptorJsonAllocWithAllocator(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        extension_name: []const u8,
+        agent_name: []const u8,
+        query: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !?[]u8 {
+        const route = try std.fmt.allocPrint(alloc, "extensions/{s}/{s}", .{ extension_name, agent_name });
+        defer alloc.free(route);
         var snapshot_opt = try self.source.adminSnapshot();
         defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
-        var query_arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        var query_arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer query_arena_impl.deinit();
         return try ard_catalog.agentDescriptorJsonAlloc(
-            self.alloc,
+            alloc,
             route,
             try self.ardCatalogOptions(query_arena_impl.allocator(), .tenant, query, authenticated_identity),
             self.ardExtensionCatalogContext(snapshot_opt, authenticated_identity),
@@ -6713,136 +6775,150 @@ pub const ApiHttpServer = struct {
         path: []const u8,
         body: []const u8,
     ) !?contextual_operations.OwnedResponse {
+        return self.executeExtensionRouteWithAllocator(self.alloc, method, path, body);
+    }
+
+    pub fn executeExtensionRouteWithAllocator(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        method: contextual_operations.Method,
+        path: []const u8,
+        body: []const u8,
+    ) !?contextual_operations.OwnedResponse {
         if (!isExtensionPath(path)) return null;
 
         if (method != .get) {
             if (method == .post) {
                 if (routes.Routes.matchInstalledExtensionUpdate(path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, self.alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try contextualJsonErrorResponse(self.alloc, 400, "invalid extension update request");
+                    var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        return try contextualJsonErrorResponse(alloc, 400, "invalid extension update request");
                     };
                     defer parsed.deinit();
-                    var installed = self.source.updateExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleContextualResponse(self.alloc, err);
+                    var installed = self.source.updateExtension(alloc, installed_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleContextualResponse(alloc, err);
                     };
-                    defer installed.deinitOwned(self.alloc);
+                    defer installed.deinitOwned(alloc);
                     self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(alloc, 500, "extension lifecycle did not converge"),
                         else => return err,
                     };
-                    return try contextualJsonResponse(self.alloc, 200, installed);
+                    return try contextualJsonResponse(alloc, 200, installed);
                 }
                 if (routes.Routes.matchInstalledExtensionDrop(path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, self.alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try contextualJsonErrorResponse(self.alloc, 400, "invalid extension drop request");
+                    var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        return try contextualJsonErrorResponse(alloc, 400, "invalid extension drop request");
                     };
                     defer parsed.deinit();
-                    self.source.dropExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleContextualResponse(self.alloc, err);
+                    self.source.dropExtension(alloc, installed_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleContextualResponse(alloc, err);
                     };
-                    return try contextualJsonResponse(self.alloc, 200, .{ .dropped = installed_route.name, .dry_run = parsed.value.dry_run });
+                    return try contextualJsonResponse(alloc, 200, .{ .dropped = installed_route.name, .dry_run = parsed.value.dry_run });
                 }
                 if (routes.Routes.matchInstalledExtensionEnable(path)) |installed_route| {
-                    var installed = self.source.enableExtension(self.alloc, installed_route.name) catch |err| {
-                        return try extensionLifecycleContextualResponse(self.alloc, err);
+                    var installed = self.source.enableExtension(alloc, installed_route.name) catch |err| {
+                        return try extensionLifecycleContextualResponse(alloc, err);
                     };
-                    defer installed.deinitOwned(self.alloc);
+                    defer installed.deinitOwned(alloc);
                     self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(alloc, 500, "extension lifecycle did not converge"),
                         else => return err,
                     };
-                    return try contextualJsonResponse(self.alloc, 200, installed);
+                    return try contextualJsonResponse(alloc, 200, installed);
                 }
                 if (routes.Routes.matchInstalledExtensionDisable(path)) |installed_route| {
-                    var installed = self.source.disableExtension(self.alloc, installed_route.name) catch |err| {
-                        return try extensionLifecycleContextualResponse(self.alloc, err);
+                    var installed = self.source.disableExtension(alloc, installed_route.name) catch |err| {
+                        return try extensionLifecycleContextualResponse(alloc, err);
                     };
-                    defer installed.deinitOwned(self.alloc);
+                    defer installed.deinitOwned(alloc);
                     self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(alloc, 500, "extension lifecycle did not converge"),
                         else => return err,
                     };
-                    return try contextualJsonResponse(self.alloc, 200, installed);
+                    return try contextualJsonResponse(alloc, 200, installed);
                 }
                 if (routes.Routes.matchInstalledExtension(path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, self.alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try contextualJsonErrorResponse(self.alloc, 400, "invalid extension install request");
+                    var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        return try contextualJsonErrorResponse(alloc, 400, "invalid extension install request");
                     };
                     defer parsed.deinit();
-                    var installed = self.source.installExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleContextualResponse(self.alloc, err);
+                    var installed = self.source.installExtension(alloc, installed_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleContextualResponse(alloc, err);
                     };
-                    defer installed.deinitOwned(self.alloc);
+                    defer installed.deinitOwned(alloc);
                     if (!parsed.value.dry_run) {
                         self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                            error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                            error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(alloc, 500, "extension lifecycle did not converge"),
                             else => return err,
                         };
                     }
-                    return try contextualJsonResponse(self.alloc, 200, installed);
+                    return try contextualJsonResponse(alloc, 200, installed);
                 }
             }
             if (method == .put) {
                 if (routes.Routes.matchInstalledExtensionConfig(path)) |installed_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, self.alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try contextualJsonErrorResponse(self.alloc, 400, "invalid extension config request");
+                    var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, alloc, jsonBodyOrEmptyObject(body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        return try contextualJsonErrorResponse(alloc, 400, "invalid extension config request");
                     };
                     defer parsed.deinit();
-                    var installed = self.source.configureExtension(self.alloc, installed_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleContextualResponse(self.alloc, err);
+                    var installed = self.source.configureExtension(alloc, installed_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleContextualResponse(alloc, err);
                     };
-                    defer installed.deinitOwned(self.alloc);
+                    defer installed.deinitOwned(alloc);
                     self.waitForProjectedExtensionLifecycle(installed) catch |err| switch (err) {
-                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(self.alloc, 500, "extension lifecycle did not converge"),
+                        error.ExtensionVisibilityTimeout => return try contextualJsonErrorResponse(alloc, 500, "extension lifecycle did not converge"),
                         else => return err,
                     };
-                    return try contextualJsonResponse(self.alloc, 200, installed);
+                    return try contextualJsonResponse(alloc, 200, installed);
                 }
             }
-            return try contextualJsonErrorResponse(self.alloc, 405, "method not allowed");
+            return try contextualJsonErrorResponse(alloc, 405, "method not allowed");
         }
 
         if (std.mem.eql(u8, path, routes.Routes.extensions_v1)) {
-            return try contextualJsonResponse(self.alloc, 200, .{
+            return try contextualJsonResponse(alloc, 200, .{
                 .packages = routes.Routes.extensions_v1_packages,
                 .installed = routes.Routes.extensions_v1_installed,
             });
         }
 
-        var snapshot = (try self.source.adminSnapshot()) orelse return try contextualJsonErrorResponse(self.alloc, 404, "not found");
+        var snapshot = (try self.source.adminSnapshot()) orelse return try contextualJsonErrorResponse(alloc, 404, "not found");
         defer self.source.freeAdminSnapshot(&snapshot);
 
         if (std.mem.eql(u8, path, routes.Routes.extensions_v1_packages)) {
-            return try contextualJsonResponse(self.alloc, 200, snapshot.extension_packages);
+            return try contextualJsonResponse(alloc, 200, snapshot.extension_packages);
         }
         if (routes.Routes.matchExtensionPackageVersion(path)) |package_version| {
             const package = findExtensionPackageVersion(&snapshot, package_version.name, package_version.version) orelse {
-                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(alloc, 404, "not found");
             };
-            return try contextualJsonResponse(self.alloc, 200, package.*);
+            return try contextualJsonResponse(alloc, 200, package.*);
         }
         if (routes.Routes.matchExtensionPackage(path)) |package_route| {
             const package = findLatestExtensionPackage(&snapshot, package_route.name) orelse {
-                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(alloc, 404, "not found");
             };
-            return try contextualJsonResponse(self.alloc, 200, package.*);
+            return try contextualJsonResponse(alloc, 200, package.*);
         }
         if (std.mem.eql(u8, path, routes.Routes.extensions_v1_installed)) {
-            return try contextualJsonResponse(self.alloc, 200, snapshot.installed_extensions);
+            return try contextualJsonResponse(alloc, 200, snapshot.installed_extensions);
         }
         if (routes.Routes.matchInstalledExtensionObjects(path)) |installed_route| {
-            const members = try extensionMembersForName(self.alloc, snapshot.extension_members, installed_route.name);
-            defer if (members.len > 0) self.alloc.free(members);
+            const members = try extensionMembersForName(alloc, snapshot.extension_members, installed_route.name);
+            defer if (members.len > 0) alloc.free(members);
             if (members.len == 0 and findInstalledExtension(&snapshot, installed_route.name) == null) {
-                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(alloc, 404, "not found");
             }
-            return try contextualJsonResponse(self.alloc, 200, members);
+            return try contextualJsonResponse(alloc, 200, members);
         }
         if (routes.Routes.matchInstalledExtension(path)) |installed_route| {
             const installed = findInstalledExtension(&snapshot, installed_route.name) orelse {
-                return try contextualJsonErrorResponse(self.alloc, 404, "not found");
+                return try contextualJsonErrorResponse(alloc, 404, "not found");
             };
-            return try contextualJsonResponse(self.alloc, 200, installed.*);
+            return try contextualJsonResponse(alloc, 200, installed.*);
         }
         return null;
     }
@@ -6871,32 +6947,54 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         request_context: managed_embedder.RequestContext,
     ) !contextual_operations.OwnedResponse {
+        return self.executeQueryBuilderAgentWithOwner(body, authenticated_identity, request_context, null);
+    }
+
+    pub fn executeQueryBuilderAgentWithOwner(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity, request_context: managed_embedder.RequestContext, parent: ?*@import("../common/workload_allocator.zig").Owner) !contextual_operations.OwnedResponse {
         try request_context.check();
         var admission_lease = self.acquireQuery(body.len, .{ .deadline_ns = request_context.deadline_ns, .cancellation = request_context.cancellation orelse .none }) catch |err|
             return self.foregroundAdmissionFailure(err);
         defer admission_lease.release();
-        var parsed = metadata_openapi.server.parseQueryBuilderAgentBody(self.alloc, body) catch
-            return try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request");
+        const Owner = @import("../common/workload_allocator.zig").Owner;
+        const memory = if (parent) |owner| (Owner.createChild(owner, &self.query_admission) catch |err| switch (err) {
+            error.DuplicateMemoryAccount => try owner.fork(self.owner_alloc),
+            else => return err,
+        }) else try Owner.create(self.owner_alloc, &self.query_admission);
+        defer memory.release();
+        var response = self.executeQueryBuilderAgentAllocated(memory.allocator(), body, authenticated_identity, request_context) catch |err| {
+            if (err == error.OutOfMemory and memory.budget_exhausted.load(.acquire)) return self.queryMemoryExhaustedResponse();
+            return err;
+        };
+        memory.retain();
+        response.memory_owner = memory;
+        return response;
+    }
+
+    fn executeQueryBuilderAgentAllocated(self: *ApiHttpServer, alloc: std.mem.Allocator, body: []const u8, authenticated_identity: ?AuthenticatedIdentity, request_context: managed_embedder.RequestContext) !contextual_operations.OwnedResponse {
+        var parsed = metadata_openapi.server.parseQueryBuilderAgentBody(alloc, body) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return contextual_operations.jsonErrorAlloc(alloc, 400, "invalid query builder request"),
+        };
         defer parsed.deinit();
         if (parsed.value.intent.len == 0)
-            return try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request");
+            return try contextual_operations.jsonErrorAlloc(alloc, 400, "invalid query builder request");
         comptime std.debug.assert(request_admission_policy.publicOperationClass("queryBuilderAgent").? == .query);
 
-        var catalog_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
-        defer if (catalog_identity) |*identity| identity.deinit(self.alloc);
+        var catalog_identity = try cloneCatalogIdentity(alloc, authenticated_identity);
+        defer if (catalog_identity) |*identity| identity.deinit(alloc);
         var physical_table: ?[]u8 = null;
-        defer if (physical_table) |name| self.alloc.free(name);
+        defer if (physical_table) |name| alloc.free(name);
         var table_context: ?query_builder_agent.QueryBuilderTableContext = null;
-        defer if (table_context) |context| freeQueryBuilderTableContext(self.alloc, context);
+        defer if (table_context) |context| freeQueryBuilderTableContext(alloc, context);
         var runtime_validator_context: ?QueryBuilderRuntimeQueryRequestValidatorContext = null;
         if (parsed.value.table) |table_name| {
             if (authenticated_identity) |identity| {
                 if (!permissionsAllow(identity.permissions, .table, table_name, .read))
-                    return try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
+                    return try contextual_operations.jsonErrorAlloc(alloc, 403, "forbidden");
             }
-            physical_table = try self.resolveCatalogNameAlloc(self.alloc, .{ .deadline_ns = request_context.deadline_ns, .cancellation = request_context.cancellation orelse .none }, table_name, &catalog_identity);
-            table_context = self.loadQueryBuilderTableContext(physical_table.?) catch |err| switch (err) {
-                error.TableNotFound => return try contextual_operations.jsonErrorAlloc(self.alloc, 404, "not found"),
+            physical_table = try self.resolveCatalogNameAlloc(alloc, .{ .deadline_ns = request_context.deadline_ns, .cancellation = request_context.cancellation orelse .none }, table_name, &catalog_identity);
+            table_context = self.loadQueryBuilderTableContextAlloc(alloc, physical_table.?) catch |err| switch (err) {
+                error.TableNotFound => return try contextual_operations.jsonErrorAlloc(alloc, 404, "not found"),
                 else => return err,
             };
             if (self.table_reads) |reads| {
@@ -6912,7 +7010,7 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const QueryBuilderGenerationRunner = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
@@ -6927,14 +7025,14 @@ pub const ApiHttpServer = struct {
 
             fn executeChain(
                 ptr: *anyopaque,
-                alloc: std.mem.Allocator,
+                generation_alloc: std.mem.Allocator,
                 chain: []const generating_runtime.ChainLink,
                 messages: []const generating_runtime.ChatMessage,
             ) !generating_runtime.GenerateResult {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var client = httpx.Client.initWithConfig(alloc, runner.io, .{ .keep_alive = false });
+                var client = httpx.Client.initWithConfig(generation_alloc, runner.io, .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{
+                return try generating_runtime.executeChainWithOptions(generation_alloc, &client, chain, .{
                     .antfly_provider = runner.antfly_provider,
                     .secret_store = runner.secret_store,
                     .inference_api_key = runner.inference_api_key,
@@ -6955,11 +7053,11 @@ pub const ApiHttpServer = struct {
             parsed.value,
             &collected_context,
             generation_runner.iface(),
-        ) catch |err| return queryBuilderFailureResponse(self.alloc, err);
+        ) catch |err| return queryBuilderFailureResponse(alloc, err);
         return contextual_operations.json(
             // Imported optional query components must be omitted when absent,
             // not emitted as null: the public request schema is non-nullable.
-            try std.json.Stringify.valueAlloc(self.alloc, response, .{ .emit_null_optional_fields = false }),
+            try std.json.Stringify.valueAlloc(alloc, response, .{ .emit_null_optional_fields = false }),
             false,
         );
     }
@@ -6970,12 +7068,12 @@ pub const ApiHttpServer = struct {
         try request_context.check();
         const table = request.table orelse return error.InvalidQueryBuilderRequest;
         if (identity) |subject| if (!permissionsAllow(subject.permissions, .table, table, .read)) return error.Forbidden;
-        var catalog_identity = try cloneCatalogIdentity(self.alloc, identity);
-        defer if (catalog_identity) |*owned| owned.deinit(self.alloc);
-        const physical = try self.resolveCatalogNameAlloc(self.alloc, .{ .deadline_ns = request_context.deadline_ns, .cancellation = request_context.cancellation orelse .none }, table, &catalog_identity);
-        defer self.alloc.free(physical);
-        const context = try self.loadQueryBuilderTableContext(physical);
-        defer freeQueryBuilderTableContext(self.alloc, context);
+        var catalog_identity = try cloneCatalogIdentity(alloc, identity);
+        defer if (catalog_identity) |*owned| owned.deinit(alloc);
+        const physical = try self.resolveCatalogNameAlloc(alloc, .{ .deadline_ns = request_context.deadline_ns, .cancellation = request_context.cancellation orelse .none }, table, &catalog_identity);
+        defer alloc.free(physical);
+        const context = try self.loadQueryBuilderTableContextAlloc(alloc, physical);
+        defer freeQueryBuilderTableContext(alloc, context);
         var validator = QueryBuilderRuntimeQueryRequestValidatorContext{
             .server = self,
             .source = self.table_reads orelse return error.TableNotFound,
@@ -7111,8 +7209,8 @@ pub const ApiHttpServer = struct {
                 exclusion_query_json: ?[]const u8,
             ) !retrieval_agent.QueryRunner.KeyPage {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                var catalog_identity = try cloneCatalogIdentity(runner.server.alloc, runner.authenticated_identity);
-                defer if (catalog_identity) |*owned| owned.deinit(runner.server.alloc);
+                var catalog_identity = try cloneCatalogIdentity(inner_alloc, runner.authenticated_identity);
+                defer if (catalog_identity) |*owned| owned.deinit(inner_alloc);
                 const table_name = try runner.server.resolveCatalogNameAlloc(inner_alloc, .{ .deadline_ns = runner.deadline_ns }, logical_name, &catalog_identity);
                 defer inner_alloc.free(table_name);
                 if (catalog_identity) |identity| {
@@ -7139,8 +7237,8 @@ pub const ApiHttpServer = struct {
                 keys: []const []const u8,
             ) ![]bool {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                var catalog_identity = try cloneCatalogIdentity(runner.server.alloc, runner.authenticated_identity);
-                defer if (catalog_identity) |*owned| owned.deinit(runner.server.alloc);
+                var catalog_identity = try cloneCatalogIdentity(inner_alloc, runner.authenticated_identity);
+                defer if (catalog_identity) |*owned| owned.deinit(inner_alloc);
                 const table_name = try runner.server.resolveCatalogNameAlloc(inner_alloc, .{ .deadline_ns = runner.deadline_ns }, logical_name, &catalog_identity);
                 defer inner_alloc.free(table_name);
                 if (catalog_identity) |identity| {
@@ -7453,6 +7551,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn maybeCleanupExpiredSessions(self: *ApiHttpServer) !void {
+        try self.ensureTransactionSessionMemory();
         const ttl_ns = self.cfg.session_ttl_ns orelse return;
         const now_ns = platform_time.realtimeNs();
         const interval_ns = self.cfg.session_cleanup_interval_ns orelse ttl_ns;
@@ -7591,28 +7690,32 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn validateTableWritesAgainstSchemaWithContext(self: *ApiHttpServer, context: api_operation.RequestContext, table_name: []const u8, writes: anytype) !void {
+        return self.validateTableWritesAgainstSchemaWithAllocator(self.alloc, context, table_name, writes);
+    }
+
+    fn validateTableWritesAgainstSchemaWithAllocator(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, table_name: []const u8, writes: anytype) !void {
         try context.ensureActive();
         if (writes.len == 0) return;
         if (self.source.vtable.system_catalog != null) {
-            const bytes = try self.source.systemCatalog(self.alloc, context, .{ .write_validation = table_name });
-            defer self.alloc.free(bytes);
-            var parsed = try std.json.parseFromSlice(@import("../system_catalog/projection.zig").WriteValidation, self.alloc, bytes, .{});
+            const bytes = try self.source.systemCatalog(alloc, context, .{ .write_validation = table_name });
+            defer alloc.free(bytes);
+            var parsed = try std.json.parseFromSlice(@import("../system_catalog/projection.zig").WriteValidation, alloc, bytes, .{});
             defer parsed.deinit();
             try context.ensureActive();
             if (parsed.value.schema_json.len != 0) {
-                var schema = try tables_api.parseValidatedTableSchema(self.alloc, parsed.value.schema_json);
-                defer schema.deinit(self.alloc);
-                try tables_api.validateWritesAgainstTableSchema(self.alloc, schema, writes);
+                var schema = try tables_api.parseValidatedTableSchema(alloc, parsed.value.schema_json);
+                defer schema.deinit(alloc);
+                try tables_api.validateWritesAgainstTableSchema(alloc, schema, writes);
             }
             for (parsed.value.data_shapes) |shape| {
                 try context.ensureActive();
-                try validateExtensionDataShapeSchema(self.alloc, shape);
-                var schema = tables_api.parseValidatedTableSchema(self.alloc, shape) catch |err| switch (err) {
+                try validateExtensionDataShapeSchema(alloc, shape);
+                var schema = tables_api.parseValidatedTableSchema(alloc, shape) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.InvalidExtensionShape,
                 };
-                defer schema.deinit(self.alloc);
-                try tables_api.validateWritesAgainstTableSchema(self.alloc, schema, writes);
+                defer schema.deinit(alloc);
+                try tables_api.validateWritesAgainstTableSchema(alloc, schema, writes);
             }
             return context.ensureActive();
         }
@@ -7623,11 +7726,11 @@ pub const ApiHttpServer = struct {
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
         if (table.schema_json.len != 0) {
-            var parsed_schema = try tables_api.parseValidatedTableSchema(self.alloc, table.schema_json);
-            defer parsed_schema.deinit(self.alloc);
-            try tables_api.validateWritesAgainstTableSchema(self.alloc, parsed_schema, writes);
+            var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, table.schema_json);
+            defer parsed_schema.deinit(alloc);
+            try tables_api.validateWritesAgainstTableSchema(alloc, parsed_schema, writes);
         }
-        try validateWritesAgainstExtensionDataShapes(self.alloc, &snapshot, table_name, writes);
+        try validateWritesAgainstExtensionDataShapes(alloc, &snapshot, table_name, writes);
         try context.ensureActive();
     }
 
@@ -7667,18 +7770,26 @@ pub const ApiHttpServer = struct {
         return self.encodeTableStatusTarget(context, .{ .physical = table_name }, label, include_runtime);
     }
     pub fn encodeScopedTableStatus(self: *ApiHttpServer, context: api_operation.RequestContext, target: system_catalog.Target, label: []const u8, identity: ?AuthenticatedIdentity) !?[]u8 {
-        const key = try target.resourceNameAlloc(self.alloc);
-        defer self.alloc.free(key);
+        return self.encodeScopedTableStatusAlloc(self.alloc, context, target, label, identity);
+    }
+
+    pub fn encodeScopedTableStatusAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, target: system_catalog.Target, label: []const u8, identity: ?AuthenticatedIdentity) !?[]u8 {
+        const key = try target.resourceNameAlloc(alloc);
+        defer alloc.free(key);
         if (!try tablePermissionCurrentlyAllowed(identity, key, .read)) return error.Forbidden;
-        return self.encodeTableStatusTarget(context, .{ .logical = target }, label, true);
+        return self.encodeTableStatusTargetAlloc(alloc, context, .{ .logical = target }, label, true);
     }
     fn encodeTableStatusTarget(self: *ApiHttpServer, context: api_operation.RequestContext, target: system_catalog.TableStatusTarget, label: []const u8, include_runtime: bool) !?[]u8 {
+        return self.encodeTableStatusTargetAlloc(self.alloc, context, target, label, include_runtime);
+    }
+
+    fn encodeTableStatusTargetAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, target: system_catalog.TableStatusTarget, label: []const u8, include_runtime: bool) !?[]u8 {
         var table_name = switch (target) {
             .physical => |name| name,
             .logical => |name| name.table,
         };
         try context.ensureActive();
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         var legacy: ?metadata_api.AdminSnapshot = null;
         defer if (legacy) |*snapshot| self.source.freeAdminSnapshot(snapshot);
@@ -7703,15 +7814,19 @@ pub const ApiHttpServer = struct {
         if (tables_api.findTableByName(&snapshot, table_name) == null) return null;
         var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
         const storage_statuses = if (include_runtime) try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf) else null;
-        const observed: []table_reads.ObservedDynamicFieldCapabilitySet = if (storage_statuses != null) self.bestEffortObservedDynamicFieldCapabilitySets(table_name) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => &.{},
+        const observed: []table_reads.ObservedDynamicFieldCapabilitySet = if (storage_statuses != null) observations: {
+            const source = self.table_reads orelse break :observations &.{};
+            break :observations (source.observedDynamicFieldCapabilitySets(alloc, table_name, .{ .coverage_read_mode = .cached_only }) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable => null,
+                error.OutOfMemory => return err,
+                else => null,
+            }) orelse &.{};
         } else &.{};
-        defer self.freeObservedDynamicFieldCapabilitySets(observed);
+        defer table_reads.freeObservedDynamicFieldCapabilitySets(alloc, observed);
         if (storage_statuses != null) storage_status_buf[0].observed_dynamic_field_capability_sets = observed;
-        var definitions: tables_api.DefinitionCache.Leases = .{ .cache = &self.table_definition_cache, .alloc = self.alloc };
+        var definitions: tables_api.DefinitionCache.Leases = .{ .cache = &self.table_definition_cache, .alloc = alloc, .cache_alloc = self.owner_alloc };
         defer definitions.deinit();
-        return tables_api.encodeSingleTableStatusWithDefinitions(self.alloc, &snapshot, table_name, label, storage_statuses, &definitions);
+        return tables_api.encodeSingleTableStatusWithDefinitions(alloc, &snapshot, table_name, label, storage_statuses, &definitions);
     }
 
     pub fn encodeSchemaUpdateResponse(self: *ApiHttpServer, table_name: []const u8, schema_json: []const u8) ![]u8 {
@@ -11067,6 +11182,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
+        try self.ensureTransactionSessionMemory();
         const owner_node_id = (try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id)) orelse
             if (self.txn_sessions.durableMissIsAuthoritative())
                 return null
@@ -11109,6 +11225,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn tryAdoptSession(self: *ApiHttpServer, txn_id: db_mod.types.TxnId) !bool {
+        try self.ensureTransactionSessionMemory();
         const local_node_id = self.localSessionNodeId();
         if (local_node_id == 0) return false;
         return try self.txn_sessions.adoptIfLeaseExpired(self.alloc, txn_id, local_node_id, null);
@@ -11143,13 +11260,18 @@ pub const ApiHttpServer = struct {
         txn_id: db_mod.types.TxnId,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !bool {
+        return self.transactionSessionAccessibleAlloc(self.alloc, txn_id, authenticated_identity);
+    }
+
+    pub fn transactionSessionAccessibleAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, authenticated_identity: ?AuthenticatedIdentity) !bool {
+        try self.ensureTransactionSessionMemory();
         if ((try self.txn_sessions.principalAccess(
-            self.alloc,
+            alloc,
             txn_id,
             transactionPrincipal(authenticated_identity),
         )) != .allowed) return false;
-        var details = (try self.txn_sessions.getDetails(self.alloc, txn_id)) orelse return false;
-        defer details.deinit(self.alloc);
+        var details = (try self.txn_sessions.getDetails(alloc, txn_id)) orelse return false;
+        defer details.deinit(alloc);
         return try self.transactionSessionDetailsAuthorized(authenticated_identity, details);
     }
 
@@ -11157,18 +11279,23 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]transactions_api.SessionStatus {
+        return self.listAuthorizedTransactionSessionsAlloc(self.alloc, authenticated_identity);
+    }
+
+    pub fn listAuthorizedTransactionSessionsAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, authenticated_identity: ?AuthenticatedIdentity) ![]transactions_api.SessionStatus {
+        try self.ensureTransactionSessionMemory();
         const candidates = try self.txn_sessions.listStatusesForPrincipal(
-            self.alloc,
+            alloc,
             transactionPrincipal(authenticated_identity),
         );
-        defer self.alloc.free(candidates);
+        defer alloc.free(candidates);
         var authorized = std.ArrayListUnmanaged(transactions_api.SessionStatus).empty;
-        errdefer authorized.deinit(self.alloc);
+        errdefer authorized.deinit(alloc);
         for (candidates) |status| {
-            if (try self.transactionSessionAccessible(status.txn_id, authenticated_identity))
-                try authorized.append(self.alloc, status);
+            if (try self.transactionSessionAccessibleAlloc(alloc, status.txn_id, authenticated_identity))
+                try authorized.append(alloc, status);
         }
-        return try authorized.toOwnedSlice(self.alloc);
+        return try authorized.toOwnedSlice(alloc);
     }
 
     fn transactionSessionDetailsAuthorized(
@@ -11335,7 +11462,8 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
-        self.validateTableWritesAgainstSchemaWithContext(request, table_name, req.writes) catch |err| switch (err) {
+        self.validateTableWritesAgainstSchemaWithAllocator(alloc, request, table_name, req.writes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
             error.InvalidBatchRequest => return error.InvalidBatchRequest,
             error.TableNotFound => return error.NotFound,
             error.Timeout, error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded => return error.DeadlineExceeded,
@@ -11364,6 +11492,9 @@ pub const ApiHttpServer = struct {
         // reporting cancellation for a write that may already be durable.
         try ensureTableOperationActive(request);
         const outcome = (source.commitBatchWithCancellation(alloc, &tables, req.sync_level, request.cancellation) catch |err| switch (err) {
+            // The HTTP owner distinguishes configured pressure from backing
+            // OOM, and conservatively marks this failure as execution started.
+            error.OutOfMemory => return error.OutOfMemory,
             error.InvalidBatchRequest,
             error.InvalidArgument,
             error.InvalidGraphEdges,
@@ -15396,14 +15527,31 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
     ) ![]u8 {
+        return self.executeExtensionHostBatchWithOwner(result_alloc, table_name, body, null, .{});
+    }
+
+    pub fn executeExtensionHostBatchWithOwner(
+        self: *ApiHttpServer,
+        result_alloc: std.mem.Allocator,
+        table_name: []const u8,
+        body: []const u8,
+        parent: ?*@import("../common/workload_allocator.zig").Owner,
+        request_context: api_operation.RequestContext,
+    ) ![]u8 {
+        try request_context.ensureActive();
+        const Owner = @import("../common/workload_allocator.zig").Owner;
+        const memory = if (parent) |owner| try Owner.createChild(owner, &self.write_admission) else try Owner.create(self.owner_alloc, &self.write_admission);
+        defer memory.release();
+        const alloc = memory.allocator();
+
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.batch) == .write);
-        var admission_lease = self.acquireWrite(body.len, .{}) catch |err| switch (err) {
+        var admission_lease = self.acquireWrite(body.len, request_context) catch |err| switch (err) {
             error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionWaitTimeout => return error.RequestAdmissionExhausted,
             else => return err,
         };
         defer admission_lease.release();
-        var response = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi(.{}));
-        defer response.deinit(self.alloc);
+        var response = try public_table_http.handleTableBatch(alloc, table_name, body, self.tableApi(.{}));
+        defer response.deinit(alloc);
         if (response.status < 200 or response.status >= 300) return error.ExtensionHostApiFailed;
         return try result_alloc.dupe(u8, response.body);
     }
@@ -15415,36 +15563,54 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) ![]u8 {
+        return self.executeExtensionHostQueryWithOwner(result_alloc, table_name, body, authenticated_identity, null, .{});
+    }
+
+    pub fn executeExtensionHostQueryWithOwner(
+        self: *ApiHttpServer,
+        result_alloc: std.mem.Allocator,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        parent: ?*@import("../common/workload_allocator.zig").Owner,
+        request_context: api_operation.RequestContext,
+    ) ![]u8 {
+        try request_context.ensureActive();
+        const Owner = @import("../common/workload_allocator.zig").Owner;
+        const memory = if (parent) |owner| try Owner.createChild(owner, &self.query_admission) else try Owner.create(self.owner_alloc, &self.query_admission);
+        defer memory.release();
+        const alloc = memory.allocator();
+
         var diagnostic_context: query_request_diagnostics.Context = .{};
         const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
 
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.query) == .query);
-        const deadline = try query_contract.publicQueryDeadline(self.alloc, body, false, null);
-        var admission_lease = self.acquireQuery(body.len, .{ .deadline_ns = deadline }) catch |err| switch (err) {
+        const deadline = try query_contract.publicQueryDeadline(alloc, body, false, request_context.deadline_ns);
+        var admission_lease = self.acquireQuery(body.len, .{ .deadline_ns = deadline, .deadline_io = request_context.deadline_io, .cancellation = request_context.cancellation }) catch |err| switch (err) {
             error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionWaitTimeout => return error.RequestAdmissionExhausted,
             else => return err,
         };
         defer admission_lease.release();
-        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
-        defer if (row_filter_json) |value| self.alloc.free(value);
+        const row_filter_json = try resolveEffectiveRowFilterJson(alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| alloc.free(value);
         const source = self.table_reads orelse return error.TableNotFound;
         db_mod.resetLastSortRejectionDiagnostic();
         query_request_diagnostics.reset();
         var query_response = try self.executePublicTableQueryDispatchWithReadinessRetry(
-            self.alloc,
+            alloc,
             source,
             table_name,
             body,
             row_filter_json,
             authenticated_identity,
-            null,
+            request_context.cancellation,
             null,
             null,
             null,
             deadline,
         );
-        defer query_response.deinit(self.alloc);
+        defer query_response.deinit(alloc);
         return try result_alloc.dupe(u8, query_response.json);
     }
 
@@ -15584,12 +15750,20 @@ pub const ApiHttpServer = struct {
         }
     };
     pub fn encodeCatalogTableList(self: *ApiHttpServer, context: api_operation.RequestContext, request: system_catalog.TableList, identity: ?AuthenticatedIdentity) ![]u8 {
-        const result = try self.encodeCatalogTablePage(context, request, identity);
-        if (result.cursor) |cursor| self.alloc.free(cursor);
+        return self.encodeCatalogTableListAlloc(self.alloc, context, request, identity);
+    }
+
+    pub fn encodeCatalogTableListAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, request: system_catalog.TableList, identity: ?AuthenticatedIdentity) ![]u8 {
+        const result = try self.encodeCatalogTablePageAlloc(alloc, context, request, identity);
+        if (result.cursor) |cursor| alloc.free(cursor);
         return result.body;
     }
     pub fn encodeCatalogTablePage(self: *ApiHttpServer, context: api_operation.RequestContext, request: system_catalog.TableList, identity: ?AuthenticatedIdentity) !EncodedCatalogPage {
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        return self.encodeCatalogTablePageAlloc(self.alloc, context, request, identity);
+    }
+
+    pub fn encodeCatalogTablePageAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, request: system_catalog.TableList, identity: ?AuthenticatedIdentity) !EncodedCatalogPage {
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
         var legacy: ?metadata_api.AdminSnapshot = null;
@@ -15597,12 +15771,12 @@ pub const ApiHttpServer = struct {
         var labels: std.StringHashMapUnmanaged([]const u8) = .empty;
         var snapshot: metadata_api.AdminSnapshot = undefined;
         var next_cursor: ?[]u8 = null;
-        errdefer if (next_cursor) |cursor| self.alloc.free(cursor);
+        errdefer if (next_cursor) |cursor| alloc.free(cursor);
         if (self.source.vtable.system_catalog != null) {
             const bytes = try self.source.systemCatalog(arena, context, .{ .list_tables = request });
             const listing = try std.json.parseFromSliceLeaky(@import("../system_catalog/projection.zig").TableListing, arena, bytes, .{});
             snapshot = try listing.adminSnapshot(arena);
-            if (listing.next_table_id) |after| next_cursor = try @import("system_catalog_pagination.zig").encode(self.alloc, request, listing.revision, listing.legacy_membership, after);
+            if (listing.next_table_id) |after| next_cursor = try @import("system_catalog_pagination.zig").encode(alloc, request, listing.revision, listing.legacy_membership, after);
             var selected: std.ArrayListUnmanaged(metadata_table_manager.TableRecord) = .empty;
             for (listing.entries) |entry| {
                 const key = try (system_catalog.Target{ .database = request.database, .namespace = request.namespace, .table = entry.name }).resourceNameAlloc(arena);
@@ -15620,9 +15794,9 @@ pub const ApiHttpServer = struct {
             snapshot = selected.snapshot;
             labels = selected.labels;
         }
-        const storage_statuses = try self.collectTableStorageStatuses(self.alloc, &snapshot, null);
-        defer if (storage_statuses) |items| tables_api.freeTableStorageStatuses(self.alloc, items);
-        var definitions: tables_api.DefinitionCache.Leases = .{ .cache = &self.table_definition_cache, .alloc = self.alloc };
+        const storage_statuses = try self.collectTableStorageStatuses(alloc, &snapshot, null);
+        defer if (storage_statuses) |items| tables_api.freeTableStorageStatuses(alloc, items);
+        var definitions: tables_api.DefinitionCache.Leases = .{ .cache = &self.table_definition_cache, .alloc = alloc, .cache_alloc = self.owner_alloc };
         defer definitions.deinit();
         const listed = try tables_api.buildTableListWithDefinitions(arena, &snapshot, null, storage_statuses, &definitions);
         for (listed) |*item| item.name = labels.get(item.name) orelse return error.InvalidCatalogRecord;
@@ -15632,7 +15806,7 @@ pub const ApiHttpServer = struct {
             }
         }.less);
         try context.ensureActive();
-        return .{ .body = try std.json.Stringify.valueAlloc(self.alloc, listed, .{}), .cursor = next_cursor };
+        return .{ .body = try std.json.Stringify.valueAlloc(alloc, listed, .{}), .cursor = next_cursor };
     }
 
     pub fn selectCatalogTables(arena: std.mem.Allocator, snapshot: metadata_api.AdminSnapshot, state: system_catalog.State, database: []const u8, namespace_name: []const u8, prefix: ?[]const u8, identity: ?AuthenticatedIdentity) !struct { snapshot: metadata_api.AdminSnapshot, labels: std.StringHashMapUnmanaged([]const u8) } {
@@ -15724,25 +15898,21 @@ pub const ApiHttpServer = struct {
         borrowed_identity: ?AuthenticatedIdentity,
         request_context: api_operation.RequestContext,
     ) !contextual_operations.OwnedResponse {
+        return self.executeMcpApplicationOperationWithOwner(input, borrowed_identity, request_context, null);
+    }
+
+    pub fn executeMcpApplicationOperationWithOwner(
+        self: *ApiHttpServer,
+        input: contextual_operations.McpApplicationOperation,
+        borrowed_identity: ?AuthenticatedIdentity,
+        request_context: api_operation.RequestContext,
+        parent: ?*@import("../common/workload_allocator.zig").Owner,
+    ) !contextual_operations.OwnedResponse {
         try request_context.ensureActive();
-        var operation = input;
-        var authenticated_identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
-        defer if (authenticated_identity) |*identity| identity.deinit(self.alloc);
-        var physical_name: ?[]u8 = null;
-        defer if (physical_name) |name| self.alloc.free(name);
-        switch (operation) {
-            .list_tables, .create_table, .query, .describe_table => {},
-            .restore => |*request| {
-                physical_name = try self.resolveCatalogRestoreNameAlloc(self.alloc, .{}, request.table_name, &authenticated_identity, null);
-                request.table_name = physical_name.?;
-            },
-            inline else => |*request| {
-                physical_name = self.resolveCatalogKeyAlloc(self.alloc, request_context, request.table_name, &authenticated_identity) catch |err| return contextualJsonErrorResponse(self.alloc, system_catalog.httpStatus(err), @errorName(err));
-                request.table_name = physical_name.?;
-            },
-        }
-        const admission_class = request_admission_policy.mcpOperationClass(operation);
-        const body_bytes = switch (operation) {
+        const Owner = @import("../common/workload_allocator.zig").Owner;
+        const class = request_admission_policy.mcpOperationClass(input);
+        const admission_class = class;
+        const body_bytes = switch (input) {
             .query, .sample_documents, .batch => |value| value.body.len,
             .get_document => |value| value.table_name.len +| value.key.len +| (if (value.fields) |fields| fields.len else @as(usize, 0)),
             else => 0,
@@ -15758,40 +15928,102 @@ pub const ApiHttpServer = struct {
         if (admission_class == .inference and !self.tryAcquireInference()) return self.inferenceOverloadedResponse();
         defer if (admission_lease) |*lease| lease.release() else if (admission_class == .inference) self.releaseInference();
 
+        const gate = switch (class) {
+            .query => &self.query_admission,
+            .write => &self.write_admission,
+            .none, .inference => null,
+        };
+        const memory = (if (gate) |value|
+            if (parent) |owner| Owner.createChild(owner, value) else Owner.create(self.owner_alloc, value)
+        else
+            self.mcpAllocationOwner(parent)) catch |err| return self.foregroundAdmissionFailure(err);
+        defer memory.release();
+        var execution_started = false;
+        var response = self.executeMcpApplicationOperationAllocated(input, borrowed_identity, request_context, memory, &execution_started) catch |err| {
+            if (err == error.OutOfMemory and memory.budget_exhausted.load(.acquire))
+                return self.mcpMemoryExhaustedResponse(execution_started);
+            return err;
+        };
+        if (response.status >= 400 and memory.budget_exhausted.load(.acquire)) {
+            response.deinit(if (response.memory_owner) |owned| owned.allocator() else memory.allocator());
+            return self.mcpMemoryExhaustedResponse(execution_started);
+        }
+        // Query execution may return its own fork. Other helpers use this
+        // allocator directly, so transfer its lifetime with their response.
+        if (response.memory_owner == null) {
+            memory.retain();
+            response.memory_owner = memory;
+        }
+        return response;
+    }
+
+    fn executeMcpApplicationOperationAllocated(
+        self: *ApiHttpServer,
+        input: contextual_operations.McpApplicationOperation,
+        borrowed_identity: ?AuthenticatedIdentity,
+        request_context: api_operation.RequestContext,
+        memory: *@import("../common/workload_allocator.zig").Owner,
+        execution_started: *bool,
+    ) !contextual_operations.OwnedResponse {
+        const alloc = memory.allocator();
+        var operation = input;
+        var authenticated_identity = try cloneCatalogIdentity(alloc, borrowed_identity);
+        defer if (authenticated_identity) |*identity| identity.deinit(alloc);
+        var physical_name: ?[]u8 = null;
+        defer if (physical_name) |name| alloc.free(name);
+        switch (operation) {
+            .list_tables, .create_table, .query, .describe_table => {},
+            .restore => |*request| {
+                physical_name = try self.resolveCatalogRestoreNameAlloc(alloc, .{}, request.table_name, &authenticated_identity, null);
+                request.table_name = physical_name.?;
+            },
+            inline else => |*request| {
+                physical_name = self.resolveCatalogKeyAlloc(alloc, request_context, request.table_name, &authenticated_identity) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    return contextualJsonErrorResponse(alloc, system_catalog.httpStatus(err), @errorName(err));
+                };
+                request.table_name = physical_name.?;
+            },
+        }
+        execution_started.* = true;
         switch (operation) {
             .list_tables => {
-                const body = try self.encodeCatalogTableList(.{}, .{}, authenticated_identity);
+                const body = try self.encodeCatalogTableListAlloc(alloc, .{}, .{}, authenticated_identity);
                 return contextual_operations.json(body, false);
             },
-            .create_table => |request| return try self.executeMcpCreateTable(request.table_name, request.body, authenticated_identity),
-            .drop_table => |request| return try self.executeMcpDropTable(request.table_name),
+            .create_table => |request| return try self.executeMcpCreateTableAlloc(alloc, request.table_name, request.body, authenticated_identity),
+            .drop_table => |request| return try self.executeMcpDropTableAlloc(alloc, request.table_name),
             .describe_table => |request| {
                 const target = try system_catalog.Target.parse(request.table_name);
-                const label = try target.displayNameAlloc(self.alloc);
-                defer self.alloc.free(label);
-                const body = (self.encodeScopedTableStatus(.{}, target, label, authenticated_identity) catch |err| return contextualJsonErrorResponse(self.alloc, system_catalog.httpStatus(err), @errorName(err))) orelse
-                    return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+                const label = try target.displayNameAlloc(alloc);
+                defer alloc.free(label);
+                const body = (self.encodeScopedTableStatusAlloc(alloc, .{}, target, label, authenticated_identity) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    return contextualJsonErrorResponse(alloc, system_catalog.httpStatus(err), @errorName(err));
+                }) orelse
+                    return try contextual_operations.textAlloc(alloc, 404, "not found");
                 return contextual_operations.json(body, false);
             },
             .list_indexes => |request| {
-                var response = try public_table_http.handleTableListIndexes(self.alloc, request.table_name, self.tableApi(.{}));
-                defer response.deinit(self.alloc);
-                return try contextualResponseFromPublicTable(self.alloc, response);
+                var response = try public_table_http.handleTableListIndexes(alloc, request.table_name, self.tableApi(.{}));
+                defer response.deinit(alloc);
+                return try contextualResponseFromPublicTable(alloc, response);
             },
             .create_index => |request| {
                 const allowed = graphResolverDestinationsAllowedForIdentity(
-                    self.alloc,
+                    alloc,
                     authenticated_identity,
                     request.body,
                     true,
                 ) catch |err| {
+                    if (err == error.OutOfMemory) return err;
                     if (err == error.StoredDestinationCredentialUnsupported)
-                        return try contextualJsonErrorResponse(self.alloc, 422, "durable destinations require Basic or API-key authentication");
-                    return try contextual_operations.textAlloc(self.alloc, 400, "invalid graph resolver destination configuration");
+                        return try contextualJsonErrorResponse(alloc, 422, "durable destinations require Basic or API-key authentication");
+                    return try contextual_operations.textAlloc(alloc, 400, "invalid graph resolver destination configuration");
                 };
-                if (!allowed) return try contextualJsonErrorResponse(self.alloc, 403, "forbidden");
+                if (!allowed) return try contextualJsonErrorResponse(alloc, 403, "forbidden");
                 var response = try public_table_http.handleTableCreateIndex(
-                    self.alloc,
+                    alloc,
                     request.table_name,
                     request.index_name,
                     request.body,
@@ -15799,20 +16031,30 @@ pub const ApiHttpServer = struct {
                         .destination_authorization_principal = storedDestinationPrincipal(authenticated_identity),
                     }),
                 );
-                defer response.deinit(self.alloc);
-                return try contextualResponseFromPublicTable(self.alloc, response);
+                defer response.deinit(alloc);
+                return try contextualResponseFromPublicTable(alloc, response);
             },
             .drop_index => |request| {
-                var response = try public_table_http.handleTableDeleteIndex(self.alloc, request.table_name, request.index_name, self.tableApi(.{}));
-                defer response.deinit(self.alloc);
-                return try contextualResponseFromPublicTable(self.alloc, response);
+                var response = try public_table_http.handleTableDeleteIndex(alloc, request.table_name, request.index_name, self.tableApi(.{}));
+                defer response.deinit(alloc);
+                return try contextualResponseFromPublicTable(alloc, response);
             },
-            .get_document => |request| return try self.executeMcpGetDocument(request, authenticated_identity, request_context),
-            .sample_documents => |request| return try self.executeMcpSampleDocuments(request, authenticated_identity),
-            .query => |request| return self.handleAdmittedPublicTableQueryWithContentTypeCancellation(request.table_name, request.body, null, authenticated_identity, null),
+            .get_document => |request| return try self.executeMcpGetDocumentAllocated(alloc, request, authenticated_identity, request_context),
+            .sample_documents => |request| return try self.executeMcpSampleDocumentsAlloc(alloc, request, authenticated_identity),
+            .query => |request| {
+                var cancellation = http_common.RequestCancellation.fromToken(request_context.cancellation);
+                cancellation.query_deadline_ns = request_context.deadline_ns;
+                cancellation.allocation_owner = memory;
+                var response = try self.handleAdmittedPublicTableQueryWithContentTypeCancellation(request.table_name, request.body, null, authenticated_identity, &cancellation);
+                if (response.memory_owner != null) return response;
+                // Admission/error helpers use the server allocator; normalize
+                // that fallback before the wrapper attaches our tracked owner.
+                defer response.deinit(self.alloc);
+                return cloneContextualResponse(alloc, response);
+            },
             .backup => |request| {
                 var response = try public_table_http.handleTableBackup(
-                    self.alloc,
+                    alloc,
                     request.table_name,
                     request.body,
                     self.tableApi(.{}),
@@ -15821,41 +16063,46 @@ pub const ApiHttpServer = struct {
                     self.sharedApiNetworkIo(),
                     self.sharedApiFilesystemIo(),
                 );
-                defer response.deinit(self.alloc);
-                return try contextualResponseFromPublicTable(self.alloc, response);
+                defer response.deinit(alloc);
+                return try contextualResponseFromPublicTable(alloc, response);
             },
             .restore => |request| {
-                var response = try self.handlePublicTableRestore(
+                var response = try self.handlePublicTableRestoreAlloc(
+                    alloc,
                     request.table_name,
                     request.body,
                     null,
                     authenticated_identity,
                 );
-                defer response.deinit(self.alloc);
-                return try cloneContextualResponse(self.alloc, response);
+                defer response.deinit(alloc);
+                return try cloneContextualResponse(alloc, response);
             },
             .batch => |request| {
-                var response = try public_table_http.handleTableBatch(self.alloc, request.table_name, request.body, self.tableApi(.{}));
-                defer response.deinit(self.alloc);
-                return try contextualResponseFromPublicTable(self.alloc, response);
+                var response = try public_table_http.handleTableBatch(alloc, request.table_name, request.body, self.tableApi(.{}));
+                defer response.deinit(alloc);
+                return try contextualResponseFromPublicTable(alloc, response);
             },
         }
     }
 
     fn createNativeOrLegacyTable(self: *ApiHttpServer, logical_name: []const u8, physical_name: []const u8, request: tables_api.CreateTableRequest, identity: ?AuthenticatedIdentity) !void {
-        if (self.source.vtable.system_catalog == null) return self.source.createTable(self.alloc, physical_name, request);
+        return self.createNativeOrLegacyTableAlloc(self.alloc, logical_name, physical_name, request, identity);
+    }
+
+    fn createNativeOrLegacyTableAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, logical_name: []const u8, physical_name: []const u8, request: tables_api.CreateTableRequest, identity: ?AuthenticatedIdentity) !void {
+        if (self.source.vtable.system_catalog == null) return self.source.createTable(alloc, physical_name, request);
         const target = try system_catalog.Target.parse(logical_name);
         if (request.tablespace_name) |name| if (identity) |value| {
             if (!permissionsAllow(value.permissions, .tablespace, name, .read)) return error.Forbidden;
         };
-        const body = try tables_api.encodeStoredCreateTableRequestAlloc(self.alloc, request);
-        defer self.alloc.free(body);
-        const result = try self.source.systemCatalog(self.alloc, .{}, .{ .mutate = .{
+        const body = try tables_api.encodeStoredCreateTableRequestAlloc(alloc, request);
+        defer alloc.free(body);
+        const result = try self.source.systemCatalog(alloc, .{}, .{ .mutate = .{
             .mutation = .{ .action = .create, .kind = .table, .database = target.database, .namespace = target.namespace, .name = target.table, .tablespace = request.tablespace_name },
             .create_table_json = body,
             .physical_name = physical_name,
         } });
-        self.alloc.free(result);
+        alloc.free(result);
     }
 
     fn executeMcpCreateTable(
@@ -15864,15 +16111,27 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
-        const table_name = if (self.source.vtable.system_catalog != null) try self.catalogStorageNameAlloc(self.alloc) else try self.alloc.dupe(u8, logical_name);
-        defer self.alloc.free(table_name);
+        return self.executeMcpCreateTableAlloc(self.alloc, logical_name, body, authenticated_identity);
+    }
+
+    fn executeMcpCreateTableAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        logical_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        const table_name = if (self.source.vtable.system_catalog != null) try self.catalogStorageNameAlloc(alloc) else try alloc.dupe(u8, logical_name);
+        defer alloc.free(table_name);
         if (body.len > tables_api.max_table_create_body_bytes)
-            return try contextual_operations.textAlloc(self.alloc, 413, "create table request too large");
-        var request = table_contract.parseCreateTableRequest(self.alloc, body) catch |err|
-            return try contextual_operations.textAlloc(self.alloc, 400, table_contract.createTableRequestErrorMessage(err, body));
-        defer request.deinit(self.alloc);
+            return try contextual_operations.textAlloc(alloc, 413, "create table request too large");
+        var request = table_contract.parseCreateTableRequest(alloc, body) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return try contextual_operations.textAlloc(alloc, 400, table_contract.createTableRequestErrorMessage(err, body));
+        };
+        defer request.deinit(alloc);
         const normalized_indexes_json = table_index_config.normalizeManagedEmbeddingIndexDimensionsJsonWithOptions(
-            self.alloc,
+            alloc,
             request.indexes_json orelse tables_api.default_indexes_json,
             .{
                 .antfly_provider = self.antfly_provider,
@@ -15883,21 +16142,23 @@ pub const ApiHttpServer = struct {
                 .inference_api_key = self.cfg.inference_api_key,
             },
         ) catch |err| return switch (err) {
-            error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
-            error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
-            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
-            error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
-            error.EmbeddingArtifactDimensionRequired => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment must declare positive expected_dims"),
-            error.ConflictingEmbeddingArtifactDimensions => try contextual_operations.textAlloc(self.alloc, 400, "embedding index sources declare different dimensions"),
+            error.ModelNotFound => try contextualJsonErrorResponse(alloc, 404, "model not found"),
+            error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(alloc),
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => try contextual_operations.textAlloc(alloc, 400, "unsupported table index configuration"),
+            error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(alloc, 400, "embedding index source has no matching embedding enrichment"),
+            error.EmbeddingArtifactDimensionRequired => try contextual_operations.textAlloc(alloc, 400, "embedding enrichment must declare positive expected_dims"),
+            error.ConflictingEmbeddingArtifactDimensions => try contextual_operations.textAlloc(alloc, 400, "embedding index sources declare different dimensions"),
             else => return err,
         };
-        if (request.indexes_json) |old| self.alloc.free(old);
+        if (request.indexes_json) |old| alloc.free(old);
         request.indexes_json = normalized_indexes_json;
-        tables_api.validatePublicAlgebraicIndexesJson(self.alloc, request.indexes_json orelse tables_api.default_indexes_json) catch
-            return try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration");
+        tables_api.validatePublicAlgebraicIndexesJson(alloc, request.indexes_json orelse tables_api.default_indexes_json) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return try contextual_operations.textAlloc(alloc, 400, "unsupported table index configuration");
+        };
 
         table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
-            self.alloc,
+            alloc,
             request.indexes_json orelse tables_api.default_indexes_json,
             .{
                 .antfly_provider = self.antfly_provider,
@@ -15908,47 +16169,52 @@ pub const ApiHttpServer = struct {
                 .inference_api_key = self.cfg.inference_api_key,
             },
         ) catch |err| return switch (err) {
-            error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
-            error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
-            error.InvalidCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
-            error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(self.alloc, 400, "embedding index source has no matching embedding enrichment"),
-            error.MissingEmbeddingArtifactProducer => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment has no producer configuration"),
-            error.InvalidEmbeddingArtifactProducer => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment producer is not runnable"),
-            error.EmbeddingArtifactDimensionRequired => try contextual_operations.textAlloc(self.alloc, 400, "embedding enrichment must declare positive expected_dims"),
-            error.ConflictingEmbeddingArtifactDimensions => try contextual_operations.textAlloc(self.alloc, 400, "embedding index sources declare different dimensions"),
+            error.ModelNotFound => try contextualJsonErrorResponse(alloc, 404, "model not found"),
+            error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(alloc),
+            error.InvalidCreateTableRequest => try contextual_operations.textAlloc(alloc, 400, "unsupported table index configuration"),
+            error.MissingEmbeddingArtifactEnrichment => try contextual_operations.textAlloc(alloc, 400, "embedding index source has no matching embedding enrichment"),
+            error.MissingEmbeddingArtifactProducer => try contextual_operations.textAlloc(alloc, 400, "embedding enrichment has no producer configuration"),
+            error.InvalidEmbeddingArtifactProducer => try contextual_operations.textAlloc(alloc, 400, "embedding enrichment producer is not runnable"),
+            error.EmbeddingArtifactDimensionRequired => try contextual_operations.textAlloc(alloc, 400, "embedding enrichment must declare positive expected_dims"),
+            error.ConflictingEmbeddingArtifactDimensions => try contextual_operations.textAlloc(alloc, 400, "embedding index sources declare different dimensions"),
             else => return err,
         };
 
         const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
-            self.alloc,
+            alloc,
             request.indexes_json orelse tables_api.default_indexes_json,
-        ) catch return try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration");
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return try contextual_operations.textAlloc(alloc, 400, "unsupported table index configuration");
+        };
         self.admitArtifactSources(.{}, uses_artifact_sources) catch |err| return switch (err) {
-            error.UnsupportedArtifactIndexSources => try contextualUnsupportedArtifactSourcesResponse(self.alloc),
-            error.ArtifactIndexSourcesTemporarilyUnavailable => try contextualArtifactSourcesUpgradePendingResponse(self.alloc),
+            error.UnsupportedArtifactIndexSources => try contextualUnsupportedArtifactSourcesResponse(alloc),
+            error.ArtifactIndexSourcesTemporarilyUnavailable => try contextualArtifactSourcesUpgradePendingResponse(alloc),
             error.Canceled, error.DeadlineExceeded => return err,
         };
 
         const destinations_allowed = (replicationDestinationsAllowedForIdentity(
-            self.alloc,
+            alloc,
             authenticated_identity,
             request.replication_sources_json orelse "[]",
         ) catch |err| {
+            if (err == error.OutOfMemory) return err;
             if (err == error.StoredDestinationCredentialUnsupported)
-                return try contextualJsonErrorResponse(self.alloc, 422, "durable destinations require Basic or API-key authentication");
-            return try contextual_operations.textAlloc(self.alloc, 400, "invalid replication destination configuration");
+                return try contextualJsonErrorResponse(alloc, 422, "durable destinations require Basic or API-key authentication");
+            return try contextual_operations.textAlloc(alloc, 400, "invalid replication destination configuration");
         }) and
             (graphResolverDestinationsAllowedForIdentity(
-                self.alloc,
+                alloc,
                 authenticated_identity,
                 request.indexes_json orelse tables_api.default_indexes_json,
                 false,
             ) catch |err| {
+                if (err == error.OutOfMemory) return err;
                 if (err == error.StoredDestinationCredentialUnsupported)
-                    return try contextualJsonErrorResponse(self.alloc, 422, "durable destinations require Basic or API-key authentication");
-                return try contextual_operations.textAlloc(self.alloc, 400, "invalid graph resolver destination configuration");
+                    return try contextualJsonErrorResponse(alloc, 422, "durable destinations require Basic or API-key authentication");
+                return try contextual_operations.textAlloc(alloc, 400, "invalid graph resolver destination configuration");
             });
-        if (!destinations_allowed) return try contextualJsonErrorResponse(self.alloc, 403, "forbidden");
+        if (!destinations_allowed) return try contextualJsonErrorResponse(alloc, 403, "forbidden");
 
         const destination_principal = storedDestinationPrincipal(authenticated_identity);
         const destination_authorizer: stored_destination_authorization.Authorizer = .{
@@ -15956,49 +16222,49 @@ pub const ApiHttpServer = struct {
             .auth_enabled = self.cfg.auth_enabled,
         };
         const sealed_replication_sources_json = try stored_destination_authorization.sealReplicationSourcesJsonForPrincipalAlloc(
-            self.alloc,
+            alloc,
             request.replication_sources_json orelse "[]",
             table_name,
             destination_principal,
             destination_authorizer,
         );
-        if (request.replication_sources_json) |old| self.alloc.free(old);
+        if (request.replication_sources_json) |old| alloc.free(old);
         request.replication_sources_json = sealed_replication_sources_json;
         const sealed_indexes_json = try stored_destination_authorization.sealIndexesJsonForPrincipalAlloc(
-            self.alloc,
+            alloc,
             request.indexes_json orelse tables_api.default_indexes_json,
             table_name,
             destination_principal,
             destination_authorizer,
         );
-        if (request.indexes_json) |old| self.alloc.free(old);
+        if (request.indexes_json) |old| alloc.free(old);
         request.indexes_json = sealed_indexes_json;
 
-        self.createNativeOrLegacyTable(logical_name, table_name, request, authenticated_identity) catch |err| return switch (err) {
-            error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.InvalidCatalogName, error.InvalidCatalogMutation, error.CatalogCommandTooLarge, error.Forbidden => try contextualJsonErrorResponse(self.alloc, system_catalog.httpStatus(err), @errorName(err)),
-            error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
-            error.InvalidCreateTableRequest, error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
-            error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => try contextual_operations.textAlloc(self.alloc, 400, "vector_store requires a fresh local single-shard standalone table without replication"),
-            error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(self.alloc, 400, tables_api.table_initial_ranges_error_message),
-            error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "create table request too large"),
-            error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
-            error.RaftMutationDeadlineExceeded => try contextualRetryableTextResponse(self.alloc, 503, "metadata mutation deadline exceeded before admission; retry later"),
-            error.NotLeader => try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later"),
-            error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
-            error.MetadataMutationNotApplied => try contextualMutationNotAppliedResponse(self.alloc),
-            error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying"),
-            error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
+        self.createNativeOrLegacyTableAlloc(alloc, logical_name, table_name, request, authenticated_identity) catch |err| return switch (err) {
+            error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.InvalidCatalogName, error.InvalidCatalogMutation, error.CatalogCommandTooLarge, error.Forbidden => try contextualJsonErrorResponse(alloc, system_catalog.httpStatus(err), @errorName(err)),
+            error.TableAlreadyExists => try contextual_operations.textAlloc(alloc, 409, "table already exists"),
+            error.InvalidCreateTableRequest, error.InvalidTableName => try contextual_operations.textAlloc(alloc, 400, "invalid table configuration"),
+            error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => try contextual_operations.textAlloc(alloc, 400, "vector_store requires a fresh local single-shard standalone table without replication"),
+            error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(alloc, 400, tables_api.table_initial_ranges_error_message),
+            error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(alloc, 413, "create table request too large"),
+            error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(alloc, 503, "metadata cluster upgrade in progress; retry later"),
+            error.RaftMutationDeadlineExceeded => try contextualRetryableTextResponse(alloc, 503, "metadata mutation deadline exceeded before admission; retry later"),
+            error.NotLeader => try contextualRetryableTextResponse(alloc, 503, "metadata leader unavailable; retry later"),
+            error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => try contextual_operations.textAlloc(alloc, 409, "table topology changed; retry with the current table state"),
+            error.MetadataMutationNotApplied => try contextualMutationNotAppliedResponse(alloc),
+            error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownTextResponse(alloc, "table mutation outcome is unknown; observe table state before retrying"),
+            error.UnsupportedOperation => try contextual_operations.textAlloc(alloc, 405, "method not allowed"),
             else => if (metadata_authority.isMutationNotAdmittedError(err))
-                try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later")
+                try contextualRetryableTextResponse(alloc, 503, "metadata leader unavailable; retry later")
             else if (err == error.UnexpectedHttpStatus or metadata_authority.isRetryableError(err))
-                try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying")
+                try contextualMutationOutcomeUnknownTextResponse(alloc, "table mutation outcome is unknown; observe table state before retrying")
             else
                 return err,
         };
-        const local_outcome = self.materializeCommittedTableCreate(self.alloc, table_name, request);
+        const local_outcome = self.materializeCommittedTableCreate(alloc, table_name, request);
         switch (local_outcome) {
-            .repair_required => return try contextualCommittedCreateOutcomeResponse(self.alloc, .repair_required),
-            .repair_unavailable => return try contextualCommittedCreateOutcomeResponse(self.alloc, .repair_unavailable),
+            .repair_required => return try contextualCommittedCreateOutcomeResponse(alloc, .repair_required),
+            .repair_unavailable => return try contextualCommittedCreateOutcomeResponse(alloc, .repair_unavailable),
             .applied, .delegated => {},
         }
         const local_handled = local_outcome == .applied;
@@ -16006,14 +16272,14 @@ pub const ApiHttpServer = struct {
             self.waitForProjectedTablePresence(table_name) catch |err| switch (err) {
                 else => {
                     std.log.warn("MCP table create committed before projected presence was observable table={s} err={s}", .{ table_name, @errorName(err) });
-                    return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                    return try contextualCommittedCreateOutcomeResponse(alloc, .visibility_pending);
                 },
             };
             if (!self.cfg.deployment_mode.isStandalone()) {
                 self.waitForProjectedTableWriteQuorum(table_name) catch |err| switch (err) {
                     else => {
                         std.log.warn("MCP table create committed before write quorum was observable table={s} err={s}", .{ table_name, @errorName(err) });
-                        return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                        return try contextualCommittedCreateOutcomeResponse(alloc, .visibility_pending);
                     },
                 };
             }
@@ -16024,14 +16290,14 @@ pub const ApiHttpServer = struct {
                         self.waitForProjectedTableCreateReadiness(table_name) catch |fallback_err| switch (fallback_err) {
                             else => {
                                 std.log.warn("MCP table create committed before projected readiness was observable table={s} err={s}", .{ table_name, @errorName(fallback_err) });
-                                return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                                return try contextualCommittedCreateOutcomeResponse(alloc, .visibility_pending);
                             },
                         };
                         break :lifecycle true;
                     },
                     else => {
                         std.log.warn("MCP table create committed with lifecycle observation failure table={s} err={s}", .{ table_name, @errorName(err) });
-                        return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                        return try contextualCommittedCreateOutcomeResponse(alloc, .visibility_pending);
                     },
                 };
             };
@@ -16039,39 +16305,43 @@ pub const ApiHttpServer = struct {
                 self.waitForTableVisibility(table_name, .present) catch |err| switch (err) {
                     else => {
                         std.log.warn("MCP table create committed before visibility was observable table={s} err={s}", .{ table_name, @errorName(err) });
-                        return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                        return try contextualCommittedCreateOutcomeResponse(alloc, .visibility_pending);
                     },
                 };
             }
         }
-        const response_body = (try self.maybeEncodeTableStatus(table_name)) orelse
-            return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
-        defer self.alloc.free(response_body);
-        return contextual_operations.json(try projectCatalogStatusAlloc(self.alloc, response_body, logical_name), false);
+        const response_body = (try self.encodeTableStatusTargetAlloc(alloc, .{}, .{ .physical = table_name }, table_name, true)) orelse
+            return try contextualCommittedCreateOutcomeResponse(alloc, .visibility_pending);
+        defer alloc.free(response_body);
+        return contextual_operations.json(try projectCatalogStatusAlloc(alloc, response_body, logical_name), false);
     }
 
     fn executeMcpDropTable(self: *ApiHttpServer, table_name: []const u8) !contextual_operations.OwnedResponse {
-        var drop_result = self.source.dropTableExact(self.alloc, table_name) catch |err| return switch (err) {
-            error.VectorMigrationActive => try contextual_operations.textAlloc(self.alloc, 409, "table storage migration is active"),
-            error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table name"),
-            error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
-            error.MetadataTopologyCommandTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "table topology exceeds the 3 MiB metadata command limit; reduce the initial shard count or table definition size"),
-            error.TableTransitionActive, error.TableGenerationChanged => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
-            error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
-            error.RaftMutationDeadlineExceeded => try contextualRetryableTextResponse(self.alloc, 503, "metadata mutation deadline exceeded before admission; retry later"),
-            error.NotLeader => try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later"),
-            error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table is owned by an extension"),
-            error.MetadataMutationNotApplied => try contextualMutationNotAppliedResponse(self.alloc),
-            error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying"),
-            error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
+        return self.executeMcpDropTableAlloc(self.alloc, table_name);
+    }
+
+    fn executeMcpDropTableAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8) !contextual_operations.OwnedResponse {
+        var drop_result = self.source.dropTableExact(alloc, table_name) catch |err| return switch (err) {
+            error.VectorMigrationActive => try contextual_operations.textAlloc(alloc, 409, "table storage migration is active"),
+            error.InvalidTableName => try contextual_operations.textAlloc(alloc, 400, "invalid table name"),
+            error.TableNotFound => try contextual_operations.textAlloc(alloc, 404, "not found"),
+            error.MetadataTopologyCommandTooLarge => try contextual_operations.textAlloc(alloc, 413, "table topology exceeds the 3 MiB metadata command limit; reduce the initial shard count or table definition size"),
+            error.TableTransitionActive, error.TableGenerationChanged => try contextual_operations.textAlloc(alloc, 409, "table topology changed; retry with the current table state"),
+            error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(alloc, 503, "metadata cluster upgrade in progress; retry later"),
+            error.RaftMutationDeadlineExceeded => try contextualRetryableTextResponse(alloc, 503, "metadata mutation deadline exceeded before admission; retry later"),
+            error.NotLeader => try contextualRetryableTextResponse(alloc, 503, "metadata leader unavailable; retry later"),
+            error.ExtensionOwnedObject => try contextual_operations.textAlloc(alloc, 409, "table is owned by an extension"),
+            error.MetadataMutationNotApplied => try contextualMutationNotAppliedResponse(alloc),
+            error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownTextResponse(alloc, "table mutation outcome is unknown; observe table state before retrying"),
+            error.UnsupportedOperation => try contextual_operations.textAlloc(alloc, 405, "method not allowed"),
             else => if (metadata_authority.isMutationNotAdmittedError(err))
-                try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later")
+                try contextualRetryableTextResponse(alloc, 503, "metadata leader unavailable; retry later")
             else if (err == error.UnexpectedHttpStatus or metadata_authority.isRetryableError(err))
-                try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying")
+                try contextualMutationOutcomeUnknownTextResponse(alloc, "table mutation outcome is unknown; observe table state before retrying")
             else
                 return err,
         };
-        defer drop_result.deinit(self.alloc);
+        defer drop_result.deinit(alloc);
         var repair_required = false;
         // The metadata commit can complete on a remote leader before this
         // node applies the resulting catalog projection. Prefer observing the
@@ -16086,12 +16356,12 @@ pub const ApiHttpServer = struct {
             );
         };
         if (self.table_writes) |writes| {
-            _ = writes.dropTable(self.alloc, table_name, drop_result.cleanupContract()) catch |err| switch (err) {
+            _ = writes.dropTable(alloc, table_name, drop_result.cleanupContract()) catch |err| switch (err) {
                 error.TableNotFound => null,
                 error.DropCleanupIntentNotDurable => {
                     std.log.err("MCP drop table committed but cleanup intent was not durable table={s}", .{table_name});
                     const body = try std.json.Stringify.valueAlloc(
-                        self.alloc,
+                        alloc,
                         .{ .status = "committed_repair_unavailable" },
                         .{},
                     );
@@ -16107,13 +16377,13 @@ pub const ApiHttpServer = struct {
         }
         if (repair_required) {
             const body = try std.json.Stringify.valueAlloc(
-                self.alloc,
+                alloc,
                 .{ .status = "committed_repair_required" },
                 .{},
             );
             return contextual_operations.jsonWithStatus(202, body, false);
         }
-        return try contextual_operations.textAlloc(self.alloc, 204, "");
+        return try contextual_operations.textAlloc(alloc, 204, "");
     }
 
     fn executeMcpGetDocument(
@@ -16122,7 +16392,7 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         request_context: api_operation.RequestContext,
     ) !contextual_operations.OwnedResponse {
-        const memory = self.queryAllocationOwner() catch |err| return self.foregroundAdmissionFailure(err);
+        const memory = self.queryAllocationOwner(null) catch |err| return self.foregroundAdmissionFailure(err);
         defer if (memory) |owner| owner.release();
         const alloc = if (memory) |owner| owner.allocator() else self.alloc;
         var response = self.executeMcpGetDocumentAllocated(alloc, request, authenticated_identity, request_context) catch |err| {
@@ -16159,7 +16429,7 @@ pub const ApiHttpServer = struct {
         const row_filter_json = try resolveEffectiveRowFilterJson(alloc, authenticated_identity, request.table_name);
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| {
-            if (!(try self.docJsonMatchesRowFilter(request.key, result.json, value)))
+            if (!(try search_pattern_filter.storedDocMatchesPatternFilter(alloc, request.key, result.json, value)))
                 return try contextual_operations.textAlloc(alloc, 404, "not found");
         }
         return contextual_operations.json(try alloc.dupe(u8, result.json), false);
@@ -16170,24 +16440,35 @@ pub const ApiHttpServer = struct {
         request: contextual_operations.McpApplicationOperation.TableBody,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
-        const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
-        var scan_request = http_route_helpers.parseScanKeysRequest(self.alloc, request.body) catch
-            return try contextual_operations.textAlloc(self.alloc, 400, "invalid scan request");
-        defer scan_request.deinit(self.alloc);
-        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, request.table_name);
-        defer if (row_filter_json) |value| self.alloc.free(value);
+        return self.executeMcpSampleDocumentsAlloc(self.alloc, request, authenticated_identity);
+    }
+
+    fn executeMcpSampleDocumentsAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        request: contextual_operations.McpApplicationOperation.TableBody,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        const source = self.table_reads orelse return try contextual_operations.textAlloc(alloc, 404, "not found");
+        var scan_request = http_route_helpers.parseScanKeysRequest(alloc, request.body) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return try contextual_operations.textAlloc(alloc, 400, "invalid scan request");
+        };
+        defer scan_request.deinit(alloc);
+        const row_filter_json = try resolveEffectiveRowFilterJson(alloc, authenticated_identity, request.table_name);
+        defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value|
-            try injectRowFilterIntoScanRequest(self.alloc, &scan_request, value);
+            try injectRowFilterIntoScanRequest(alloc, &scan_request, value);
         var result = (try source.scan(
-            self.alloc,
+            alloc,
             request.table_name,
             scan_request.from,
             scan_request.to,
             scan_request.opts,
             .read_index,
-        )) orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
-        defer result.deinit(self.alloc);
-        return contextual_operations.json(try mcpSampleDocumentsJsonAlloc(self.alloc, result.ndjson), false);
+        )) orelse return try contextual_operations.textAlloc(alloc, 404, "not found");
+        defer result.deinit(alloc);
+        return contextual_operations.json(try mcpSampleDocumentsJsonAlloc(alloc, result.ndjson), false);
     }
 
     pub fn handlePublicTableQueryWithContentType(
@@ -16209,6 +16490,7 @@ pub const ApiHttpServer = struct {
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
         var scoped = http_common.RequestCancellation.fromToken(if (cancellation) |signal| signal.token() else .none);
+        scoped.allocation_owner = if (cancellation) |signal| signal.allocation_owner else null;
         scoped.query_deadline_ns = query_contract.publicQueryDeadline(self.alloc, body, isNdjsonContentType(content_type), if (cancellation) |signal| signal.query_deadline_ns else null) catch
             return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
         var admission_lease = self.acquireQuery(body.len, .{ .cancellation = scoped.token(), .deadline_ns = scoped.query_deadline_ns }) catch |err|
@@ -16235,7 +16517,7 @@ pub const ApiHttpServer = struct {
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
         if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithCancellation(table_name, body, borrowed_identity, cancellation, null, null);
-        const memory = self.queryAllocationOwner() catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
+        const memory = self.queryAllocationOwner(cancellation) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer if (memory) |owner| owner.release();
         const alloc = if (memory) |owner| owner.allocator() else self.alloc;
         var identity = cloneCatalogIdentity(alloc, borrowed_identity) catch |err|
@@ -16243,6 +16525,7 @@ pub const ApiHttpServer = struct {
         defer if (identity) |*owned| owned.deinit(alloc);
         const deadline = query_contract.publicQueryDeadline(self.alloc, body, false, if (cancellation) |signal| signal.query_deadline_ns else null) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
         var scoped = http_common.RequestCancellation.fromToken(if (cancellation) |signal| signal.token() else .none);
+        scoped.allocation_owner = if (cancellation) |signal| signal.allocation_owner else null;
         scoped.query_deadline_ns = deadline;
         var catalog_arena = std.heap.ArenaAllocator.init(alloc);
         defer catalog_arena.deinit();
@@ -16252,7 +16535,62 @@ pub const ApiHttpServer = struct {
         return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, &scoped, binding.label, if (binding.join) |*value| value else null, &resolver);
     }
 
-    fn queryAllocationOwner(self: *ApiHttpServer) !?*@import("../common/workload_allocator.zig").Owner {
+    /// Install only after this server reaches its final address: the controller
+    /// must never be copied after its heap-stable account has been attached.
+    pub fn ensureMcpSessionMemory(self: *ApiHttpServer) !void {
+        // Existing durable completion debt gets capacity before new MCP sessions.
+        try self.ensureTransactionSessionMemory();
+        const io = configuredApiIo(self.cfg) orelse std.Io.Threaded.global_single_threaded.io();
+        self.mcp_memory_mutex.lockUncancelable(io);
+        defer self.mcp_memory_mutex.unlock(io);
+        if (self.mcp_session_memory != null) return;
+        const owner = try @import("../common/workload_allocator.zig").Owner.create(self.owner_alloc, &self.session_memory_admission);
+        errdefer owner.release();
+        try self.mcp_sessions.installAllocator(owner.allocator());
+        self.mcp_session_memory = owner;
+    }
+
+    /// Persistent task state has a separate lifetime from each request envelope,
+    /// but shares the hard session ceiling with transactions and MCP sessions.
+    pub fn ensureA2aTaskMemory(self: *ApiHttpServer) !void {
+        try self.ensureTransactionSessionMemory();
+        const io = configuredApiIo(self.cfg) orelse std.Io.Threaded.global_single_threaded.io();
+        self.a2a_memory_mutex.lockUncancelable(io);
+        defer self.a2a_memory_mutex.unlock(io);
+        if (self.a2a_task_memory != null) return;
+        const owner = try @import("../common/workload_allocator.zig").Owner.create(self.owner_alloc, &self.session_memory_admission);
+        errdefer owner.release();
+        try self.a2a_tasks.installAllocator(owner.allocator());
+        self.a2a_task_memory = owner;
+    }
+
+    pub fn ensureTransactionSessionMemory(self: *ApiHttpServer) !void {
+        const io = configuredApiIo(self.cfg) orelse std.Io.Threaded.global_single_threaded.io();
+        self.txn_session_memory_mutex.lockUncancelable(io);
+        defer self.txn_session_memory_mutex.unlock(io);
+        if (self.txn_session_memory != null) return;
+        const owner = try @import("../common/workload_allocator.zig").Owner.create(self.owner_alloc, &self.session_memory_admission);
+        errdefer owner.release();
+        try self.txn_sessions.installRetainedOwner(owner, &self.session_memory_admission);
+        self.txn_session_memory = owner;
+    }
+
+    pub fn mcpAllocationOwner(self: *ApiHttpServer, parent: ?*@import("../common/workload_allocator.zig").Owner) !*@import("../common/workload_allocator.zig").Owner {
+        if (parent) |owner| return owner.fork(self.owner_alloc);
+        return @import("../common/workload_allocator.zig").Owner.create(self.alloc, &self.query_admission);
+    }
+
+    pub fn mcpMemoryExhaustedResponse(self: *ApiHttpServer, execution_started: bool) !contextual_operations.OwnedResponse {
+        return contextualJsonResponse(self.alloc, 429, .{
+            .@"error" = "McpMemoryExhausted",
+            .reason = "resource_exhausted",
+            .stage = if (execution_started) "execution" else "admission",
+            .execution_started = execution_started,
+        });
+    }
+
+    fn queryAllocationOwner(self: *ApiHttpServer, cancellation: ?*const http_common.RequestCancellation) !?*@import("../common/workload_allocator.zig").Owner {
+        if (cancellation) |signal| if (signal.allocation_owner) |owner| return try owner.fork(self.owner_alloc);
         if (self.query_admission.stats().max_retained_bytes == 0) return null;
         return try @import("../common/workload_allocator.zig").Owner.create(self.alloc, &self.query_admission);
     }
@@ -16300,6 +16638,7 @@ pub const ApiHttpServer = struct {
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
         var scoped = http_common.RequestCancellation.fromToken(if (cancellation) |signal| signal.token() else .none);
+        scoped.allocation_owner = if (cancellation) |signal| signal.allocation_owner else null;
         scoped.query_deadline_ns = query_contract.publicQueryDeadline(self.alloc, body, true, if (cancellation) |signal| signal.query_deadline_ns else null) catch
             return self.publicQueryOperationErrorResponse("", body, error.InvalidQueryRequest);
         var admission_lease = self.acquireQuery(body.len, .{ .cancellation = scoped.token(), .deadline_ns = scoped.query_deadline_ns }) catch |err|
@@ -16470,7 +16809,7 @@ pub const ApiHttpServer = struct {
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
         catalog_resolver: ?*CatalogQueryResolver,
     ) !contextual_operations.OwnedResponse {
-        const memory = self.queryAllocationOwner() catch |err|
+        const memory = self.queryAllocationOwner(cancellation) catch |err|
             return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer if (memory) |owner| owner.release();
         var response = self.handlePublicTableQueryAllocated(table_name, body, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver, memory) catch |err| {
@@ -16564,7 +16903,7 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
     ) !contextual_operations.OwnedResponse {
-        const memory = self.queryAllocationOwner() catch |err|
+        const memory = self.queryAllocationOwner(cancellation) catch |err|
             return self.publicQueryOperationErrorResponse(route_table_name orelse "", body, err);
         defer if (memory) |owner| owner.release();
         var response = self.handlePublicTableMultiQueryAllocated(route_table_name, body, authenticated_identity, cancellation, response_label, bound_join, memory) catch |err| {
@@ -17579,70 +17918,95 @@ pub const ApiHttpServer = struct {
         idempotency_key: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
-        const parsed = backups_api.parseRestoreRequest(self.alloc, body) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid restore request");
+        return self.handlePublicTableRestoreAlloc(self.alloc, table_name, body, idempotency_key, authenticated_identity);
+    }
+
+    pub fn handlePublicTableRestoreAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        body: []const u8,
+        idempotency_key: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !contextual_operations.OwnedResponse {
+        const parsed = backups_api.parseRestoreRequest(alloc, body) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return try contextualJsonErrorResponse(alloc, 400, "invalid restore request");
+        };
         defer parsed.deinit();
-        backups_api.validateBackupId(parsed.value.backup_id) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup id");
+        backups_api.validateBackupId(parsed.value.backup_id) catch return try contextualJsonErrorResponse(alloc, 400, "invalid backup id");
         const connection = parsed.value.connection;
-        var location = backups_api.openBackupLocationWithOptions(self.alloc, parsed.value.location, .{
+        var location = backups_api.openBackupLocationWithOptions(alloc, parsed.value.location, .{
             .secret_store = self.cfg.secret_store,
             .node_config = self.cfg.node_config,
             .connection = connection,
             .required_capability = "restore.read",
             .network_io = self.sharedApiNetworkIo(),
             .filesystem_io = self.sharedApiFilesystemIo(),
-        }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
-        defer location.deinit(self.alloc);
-        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
+        }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return try contextualJsonErrorResponse(alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
+        };
+        defer location.deinit(alloc);
+        self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(alloc, err);
         var manifest = backups_api.readManifestFromLocationWithArtifactBackupId(
-            self.alloc,
+            alloc,
             &location,
             parsed.value.backup_id,
             parsed.value.backup_id,
-        ) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup manifest");
-        defer manifest.deinit(self.alloc);
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return try contextualJsonErrorResponse(alloc, 400, "invalid backup manifest");
+        };
+        defer manifest.deinit(alloc);
         const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
-            self.alloc,
+            alloc,
             manifest.indexes_json,
-        ) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup manifest");
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return try contextualJsonErrorResponse(alloc, 400, "invalid backup manifest");
+        };
         self.admitArtifactSources(.{}, uses_artifact_sources) catch |err| return switch (err) {
-            error.UnsupportedArtifactIndexSources => try contextualUnsupportedArtifactSourcesResponse(self.alloc),
-            error.ArtifactIndexSourcesTemporarilyUnavailable => try contextualArtifactSourcesUpgradePendingResponse(self.alloc),
+            error.UnsupportedArtifactIndexSources => try contextualUnsupportedArtifactSourcesResponse(alloc),
+            error.ArtifactIndexSourcesTemporarilyUnavailable => try contextualArtifactSourcesUpgradePendingResponse(alloc),
             error.Canceled, error.DeadlineExceeded => return err,
         };
         const destinations_allowed = (replicationDestinationsAllowedForIdentity(
-            self.alloc,
+            alloc,
             authenticated_identity,
             manifest.replication_sources_json,
         ) catch |err| {
+            if (err == error.OutOfMemory) return err;
             if (err == error.StoredDestinationCredentialUnsupported)
-                return try contextualJsonErrorResponse(self.alloc, 422, "durable destinations require Basic or API-key authentication");
-            return try contextualJsonErrorResponse(self.alloc, 400, "invalid replication destination configuration");
+                return try contextualJsonErrorResponse(alloc, 422, "durable destinations require Basic or API-key authentication");
+            return try contextualJsonErrorResponse(alloc, 400, "invalid replication destination configuration");
         }) and
             (graphResolverDestinationsAllowedForIdentity(
-                self.alloc,
+                alloc,
                 authenticated_identity,
                 manifest.indexes_json,
                 false,
             ) catch |err| {
+                if (err == error.OutOfMemory) return err;
                 if (err == error.StoredDestinationCredentialUnsupported)
-                    return try contextualJsonErrorResponse(self.alloc, 422, "durable destinations require Basic or API-key authentication");
-                return try contextualJsonErrorResponse(self.alloc, 400, "invalid graph resolver destination configuration");
+                    return try contextualJsonErrorResponse(alloc, 422, "durable destinations require Basic or API-key authentication");
+                return try contextualJsonErrorResponse(alloc, 400, "invalid graph resolver destination configuration");
             });
-        if (!destinations_allowed) return try contextualJsonErrorResponse(self.alloc, 403, "forbidden");
+        if (!destinations_allowed) return try contextualJsonErrorResponse(alloc, 403, "forbidden");
         const destination_authorization_fingerprint = try stored_destination_authorization.destinationConfigFingerprintAlloc(
-            self.alloc,
+            alloc,
             manifest.replication_sources_json,
             manifest.indexes_json,
         );
-        defer self.alloc.free(destination_authorization_fingerprint);
+        defer alloc.free(destination_authorization_fingerprint);
         const idempotency_namespace = try restoreIdempotencyNamespaceAlloc(
-            self.alloc,
+            alloc,
             transactionPrincipal(authenticated_identity),
             .table,
             table_name,
         );
-        defer self.alloc.free(idempotency_namespace);
-        const admission = self.restore_job_store.startRecoverable(self.alloc, .{
+        defer alloc.free(idempotency_namespace);
+        const admission = self.restore_job_store.startRecoverable(alloc, .{
             .scope = .table,
             .table_name = table_name,
             .backup_id = parsed.value.backup_id,
@@ -17652,20 +18016,20 @@ pub const ApiHttpServer = struct {
             .idempotency_key = idempotency_key,
             .destination_authorization_fingerprint = destination_authorization_fingerprint,
             .destination_authorization_principal = storedDestinationPrincipal(authenticated_identity),
-        }) catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
+        }) catch |err| return try restoreJobStartErrorResponse(alloc, err);
         const encoded = switch (admission) {
             .accepted => |value| value,
             .unknown => |value| {
-                defer self.alloc.free(value);
-                return restoreJobAdmissionUnknownResponse(self.alloc, value);
+                defer alloc.free(value);
+                return restoreJobAdmissionUnknownResponse(alloc, value);
             },
         };
-        defer self.alloc.free(encoded);
-        var state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
+        defer alloc.free(encoded);
+        var state = try std.json.parseFromSlice(restore_jobs.JobState, alloc, encoded, .{ .ignore_unknown_fields = true });
         defer state.deinit();
         if (!restore_jobs.isTerminal(state.value.phase)) self.schedulePendingRestoreJobs() catch |err|
             std.log.err("accepted table restore job scheduling deferred job_id={d} err={s}", .{ state.value.job_id, @errorName(err) });
-        return try self.restoreJobResponse(202, encoded);
+        return try self.restoreJobResponseAlloc(alloc, 202, encoded);
     }
 
     pub fn handlePublicClusterRestore(
@@ -18410,29 +18774,33 @@ pub const ApiHttpServer = struct {
     }
 
     fn restoreJobResponse(self: *ApiHttpServer, status: u16, encoded: []const u8) !contextual_operations.OwnedResponse {
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        return self.restoreJobResponseAlloc(self.alloc, status, encoded);
+    }
+
+    fn restoreJobResponseAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, status: u16, encoded: []const u8) !contextual_operations.OwnedResponse {
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
         const view = try self.restoreJobViewAlloc(arena, encoded);
-        var response = try contextualJsonResponseOmitNullOptionals(self.alloc, status, view);
-        errdefer response.deinit(self.alloc);
+        var response = try contextualJsonResponseOmitNullOptionals(alloc, status, view);
+        errdefer response.deinit(alloc);
         if (status == 202) {
             var state = try std.json.parseFromSlice(restore_jobs.JobState, arena, encoded, .{ .ignore_unknown_fields = true });
             defer state.deinit();
-            response.headers = try self.alloc.alloc(contextual_operations.Header, 3);
+            response.headers = try alloc.alloc(contextual_operations.Header, 3);
             var initialized: usize = 0;
             errdefer {
-                for (response.headers[0..initialized]) |*header| header.deinit(self.alloc);
-                self.alloc.free(response.headers);
+                for (response.headers[0..initialized]) |*header| header.deinit(alloc);
+                alloc.free(response.headers);
                 response.headers = &.{};
             }
-            const location_value = try std.fmt.allocPrint(self.alloc, "/db/v1/restore/jobs/{s}", .{view.job_id});
-            defer self.alloc.free(location_value);
-            response.headers[0] = try ownedContextualHeader(self.alloc, "Location", location_value);
+            const location_value = try std.fmt.allocPrint(alloc, "/db/v1/restore/jobs/{s}", .{view.job_id});
+            defer alloc.free(location_value);
+            response.headers[0] = try ownedContextualHeader(alloc, "Location", location_value);
             initialized += 1;
-            response.headers[1] = try ownedContextualHeader(self.alloc, "Retry-After", "1");
+            response.headers[1] = try ownedContextualHeader(alloc, "Retry-After", "1");
             initialized += 1;
-            response.headers[2] = try ownedContextualHeader(self.alloc, "Idempotency-Key", state.value.idempotency_key);
+            response.headers[2] = try ownedContextualHeader(alloc, "Idempotency-Key", state.value.idempotency_key);
         }
         return response;
     }
@@ -23185,6 +23553,7 @@ fn cloneAuthenticatedIdentity(
     roles: []const []const u8,
 ) !AuthenticatedIdentity {
     var identity = AuthenticatedIdentity{
+        .allocation_allocator = alloc,
         .username = try alloc.dupe(u8, username),
         .metadata_json = &.{},
     };
@@ -49793,7 +50162,8 @@ test "query builder dependency 503 responses preserve public retry contract" {
     }
 }
 
-pub fn projectCatalogIdentity(alloc: std.mem.Allocator, identity: *AuthenticatedIdentity, logical: []const u8, physical: []const u8) !void {
+pub fn projectCatalogIdentity(fallback_alloc: std.mem.Allocator, identity: *AuthenticatedIdentity, logical: []const u8, physical: []const u8) !void {
+    const alloc = identity.allocation_allocator orelse fallback_alloc;
     try appendCatalogAlias(alloc, identity, logical, physical);
     const permission_count = identity.permissions.len;
     for (0..permission_count) |i| {
@@ -49812,7 +50182,8 @@ pub fn projectCatalogIdentity(alloc: std.mem.Allocator, identity: *Authenticated
     }
 }
 
-fn appendCatalogAlias(alloc: std.mem.Allocator, identity: *AuthenticatedIdentity, logical: []const u8, physical: []const u8) !void {
+fn appendCatalogAlias(fallback_alloc: std.mem.Allocator, identity: *AuthenticatedIdentity, logical: []const u8, physical: []const u8) !void {
+    const alloc = identity.allocation_allocator orelse fallback_alloc;
     for (identity.catalog_aliases) |alias| if (std.mem.eql(u8, alias.physical, physical)) return;
     const logical_copy = try alloc.dupe(u8, logical);
     errdefer alloc.free(logical_copy);
@@ -49826,6 +50197,7 @@ pub fn cloneCatalogIdentity(alloc: std.mem.Allocator, identity: ?AuthenticatedId
     const value = identity orelse return null;
     var owned = try cloneAuthenticatedIdentity(alloc, value.username, value.credential_principal, value.permissions, value.row_filter, value.metadata_json, value.roles);
     errdefer owned.deinit(alloc);
+    owned.allocation_allocator = alloc;
     owned.is_internal_service = value.is_internal_service;
     owned.live_user_manager = value.live_user_manager;
     for (value.catalog_aliases) |alias| try appendCatalogAlias(alloc, &owned, alias.logical, alias.physical);
@@ -50702,4 +51074,343 @@ test "system catalog identity failures remain unavailable across status adapters
         try std.testing.expectEqual(@as(u16, 503), response.status);
         try std.testing.expectEqualStrings("CatalogRoutingUnavailable", response.body);
     }
+}
+
+test "workload admission MCP envelope and persistent sessions retain separate ownership" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status } }, null, null);
+    var server_live = true;
+    defer if (server_live) server.deinit();
+    try server.query_admission.configure(.{ .max_retained_bytes = 1024 * 1024 });
+    var response = try protocol_adapters.executeMcpRequest(&server, .{
+        .method = .post,
+        .endpoint_path = routes.Routes.mcp_v1,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    }, @as(?AuthenticatedIdentity, null));
+    var response_live = true;
+    defer if (response_live) response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    const response_owner = response.memory_owner orelse return error.TestUnexpectedResult;
+    const session_owner = server.mcp_session_memory orelse return error.TestUnexpectedResult;
+    try std.testing.expect(response_owner != session_owner);
+    try std.testing.expect(response_owner.live.load(.acquire) >= response.body.len);
+    try std.testing.expect(session_owner.live.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(usize, 1), server.mcp_sessions.sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), server.query_admission.stats().in_flight);
+    const account = response_owner.account;
+    account.retain();
+    defer account.release();
+    server.deinit();
+    server_live = false;
+    try mcp.testing.expectResultSubset(alloc, response.body, "{\"protocolVersion\":\"2025-06-18\"}");
+    // The escaped envelope still owns live bytes after the server and its
+    // persistent session store have been torn down.
+    try std.testing.expect(response_owner.live.load(.acquire) > 0);
+    response.deinit(alloc);
+    response_live = false;
+    try std.testing.expectEqual(@as(usize, 0), account.retainedBytes());
+}
+
+test "workload admission MCP cancellation rolls back unpublished session" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        checks: usize = 3,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn cancelled(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.checks -|= 1;
+            return self.checks == 0;
+        }
+    };
+    var fake = Fake{};
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status } }, null, null);
+    defer server.deinit();
+    try std.testing.expectError(error.Canceled, protocol_adapters.executeMcpRequest(&server, .{
+        .context = .{ .cancellation = .{ .ptr = &fake, .is_cancelled_fn = Fake.cancelled } },
+        .method = .post,
+        .endpoint_path = routes.Routes.mcp_v1,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    }, @as(?AuthenticatedIdentity, null)));
+    try std.testing.expectEqual(@as(usize, 0), server.mcp_sessions.sessions.count());
+    const owner = server.mcp_session_memory.?;
+    try std.testing.expectEqual(owner.live.load(.acquire) + 2 * @sizeOf(@import("../common/workload_allocator.zig").Owner), server.session_memory_admission.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), server.query_admission.stats().retained_bytes);
+}
+
+test "workload admission MCP envelope rejects byte exhaustion without execution" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status } }, null, null);
+    defer server.deinit();
+    try server.query_admission.configure(.{ .max_retained_bytes = 1024 });
+    var response = try protocol_adapters.executeMcpRequest(&server, .{
+        .method = .post,
+        .endpoint_path = routes.Routes.mcp_v1,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"execution_started\":false") != null);
+    try std.testing.expectEqual(@as(usize, 0), server.mcp_sessions.sessions.count());
+    try std.testing.expect(server.query_admission.stats().retained_bytes <= 1024);
+}
+
+test "workload admission MCP envelope cleans up every failed allocation" {
+    const Fixture = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn run(failing: std.mem.Allocator) !void {
+            var server = ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = undefined, .vtable = &.{ .status = status } }, null, null);
+            defer server.deinit();
+            // Fail request/envelope allocations while keeping the independent
+            // persistent store usable, including rollback after session create.
+            server.alloc = failing;
+            defer server.alloc = std.testing.allocator;
+            var response = protocol_adapters.executeMcpRequest(&server, .{
+                .method = .post,
+                .endpoint_path = routes.Routes.mcp_v1,
+                .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+            }, @as(?AuthenticatedIdentity, null)) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), server.mcp_sessions.sessions.count());
+                return err;
+            };
+            defer response.deinit(failing);
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "workload admission MCP ingress envelope and class output retain parent after teardown" {
+    const alloc = std.testing.allocator;
+    const Owner = @import("../common/workload_allocator.zig").Owner;
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var ingress = RequestAdmission.initConfigured(2, .{ .max_retained_bytes = 1024 * 1024 });
+    defer ingress.deinitMemory();
+    const parent = try Owner.create(alloc, &ingress);
+    var parent_live = true;
+    defer if (parent_live) parent.release();
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status } }, null, null);
+    try server.query_admission.configure(.{ .max_retained_bytes = 65536 });
+    var server_live = true;
+    defer if (server_live) server.deinit();
+    var envelope = try protocol_adapters.executeMcpRequest(&server, .{
+        .parent_owner = parent,
+        .method = .post,
+        .endpoint_path = routes.Routes.mcp_v1,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
+    }, @as(?AuthenticatedIdentity, null));
+    var envelope_live = true;
+    defer if (envelope_live) envelope.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), envelope.status);
+    try std.testing.expectEqual(@as(usize, 0), server.query_admission.stats().retained_bytes);
+    // Query planning errors are produced by base-allocator error helpers.
+    // The adapter must normalize that provenance before attaching its owner.
+    var invalid = try server.executeMcpApplicationOperationWithOwner(.{ .query = .{ .table_name = "docs", .body = "{" } }, null, .{}, parent);
+    try std.testing.expectEqual(@as(u16, 400), invalid.status);
+    try std.testing.expect(invalid.memory_owner != null);
+    invalid.deinit(alloc);
+    var missing = try server.executeMcpApplicationOperationWithOwner(.{ .get_document = .{ .table_name = "docs", .key = "absent" } }, null, .{}, parent);
+    var missing_live = true;
+    defer if (missing_live) missing.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), missing.status);
+    const class_account = missing.memory_owner.?.account;
+    class_account.retain();
+    defer class_account.release();
+    const ingress_account = parent.account;
+    ingress_account.retain();
+    defer ingress_account.release();
+    try std.testing.expect(class_account.retainedBytes() > 0);
+    try std.testing.expect(ingress_account.retainedBytes() > class_account.retainedBytes());
+    server.deinit();
+    server_live = false;
+    ingress.close();
+    parent.release();
+    parent_live = false;
+    try std.testing.expectEqualStrings("not found", missing.body);
+    try mcp.testing.expectResultSubset(alloc, envelope.body, "{\"protocolVersion\":\"2025-06-18\"}");
+    missing.deinit(alloc);
+    missing_live = false;
+    try std.testing.expectEqual(@as(usize, 0), class_account.retainedBytes());
+    try std.testing.expect(ingress_account.retainedBytes() > 0);
+    envelope.deinit(alloc);
+    envelope_live = false;
+    try std.testing.expectEqual(@as(usize, 0), ingress_account.retainedBytes());
+}
+
+test "workload admission authentication and catalog projection preserve ingress allocation ownership" {
+    const alloc = std.testing.allocator;
+    const Owner = @import("../common/workload_allocator.zig").Owner;
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(alloc, .{ .trusted_principal_secret = "test-only-secret" }, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status } }, null, null);
+    defer server.deinit();
+    var gate = RequestAdmission.initConfigured(2, .{ .max_retained_bytes = 8192 });
+    defer gate.deinitMemory();
+    const owner = try Owner.create(alloc, &gate);
+    defer owner.release();
+    const scoped = owner.allocator();
+    const token = try alloc.alloc(u8, 16384);
+    defer alloc.free(token);
+    @memset(token, 'a');
+    token[1] = '.';
+    token[token.len - 2] = '.';
+    try std.testing.expectError(error.OutOfMemory, server.authenticateRequestWithAllocator(scoped, .{ .trusted_principal = token }));
+    try std.testing.expect(owner.budget_exhausted.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), owner.live.load(.acquire));
+    var identity = try cloneAuthenticatedIdentity(scoped, "user", "basic:user", &.{}, &.{}, "{}", &.{});
+    identity.allocation_allocator = scoped;
+    try appendCatalogAlias(alloc, &identity, "logical", "physical");
+    try std.testing.expect(owner.live.load(.acquire) > 0);
+    identity.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), owner.live.load(.acquire));
+}
+
+test "workload admission extension host query keeps ingress and class ownership through execution" {
+    const alloc = std.testing.allocator;
+    const Owner = @import("../common/workload_allocator.zig").Owner;
+    const Fake = struct {
+        server: *ApiHttpServer = undefined,
+        parent: *Owner = undefined,
+        calls: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+        fn query(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const bytes = try a.alloc(u8, 4096);
+            defer a.free(bytes);
+            try std.testing.expectEqual(@as(usize, 1), self.server.query_admission.stats().in_flight);
+            try std.testing.expect(self.server.query_admission.stats().retained_bytes >= 4096);
+            try std.testing.expect(self.parent.account.retainedBytes() >= 4096);
+            return .{ .json = try a.dupe(u8, "{\"responses\":[]}") };
+        }
+        fn cancelled(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    var fake = Fake{};
+    var ingress = RequestAdmission.initConfigured(2, .{ .max_retained_bytes = 1024 * 1024 });
+    defer ingress.deinitMemory();
+    const parent = try Owner.create(alloc, &ingress);
+    defer parent.release();
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status } }, .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } }, null);
+    defer server.deinit();
+    fake.server = &server;
+    fake.parent = parent;
+    const result = try server.executeExtensionHostQueryWithOwner(parent.allocator(), "docs", "{\"query\":{\"match_all\":{}}}", null, parent, .{});
+    try std.testing.expectEqualStrings("{\"responses\":[]}", result);
+    try std.testing.expectEqual(@as(usize, 0), server.query_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), server.query_admission.stats().retained_bytes);
+    try std.testing.expectEqual(result.len, parent.live.load(.acquire));
+    parent.allocator().free(result);
+    try std.testing.expectError(error.Canceled, server.executeExtensionHostQueryWithOwner(parent.allocator(), "docs", "{}", null, parent, .{ .cancellation = .{ .ptr = &fake, .is_cancelled_fn = Fake.cancelled } }));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(@as(usize, 0), parent.live.load(.acquire));
+}
+
+test "workload admission A2A task state charges capacity and replacement overlap" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status } }, null, null);
+    var server_live = true;
+    defer if (server_live) server.deinit();
+    try server.session_memory_admission.configure(.{ .max_retained_bytes = 64 * 1024 });
+    try server.ensureA2aTaskMemory();
+    const owner = server.a2a_task_memory.?;
+    try server.ensureA2aTaskMemory();
+    try std.testing.expect(owner == server.a2a_task_memory.?);
+    const store = server.a2a_tasks.iface();
+    const original = try alloc.alloc(u8, 12 * 1024);
+    defer alloc.free(original);
+    @memset(original, 'a');
+    const generation = try store.reserve(alloc, "authority", "task", .{ .string = original });
+    // The retained ledger includes hash capacity, not only serialized content.
+    try std.testing.expect(owner.live.load(.acquire) > server.a2a_tasks.total_bytes);
+    const before = owner.live.load(.acquire);
+    // Each value fits on its own; publishing a replacement must also account
+    // for the old value while the new serialized allocation is prepared.
+    const huge = try alloc.alloc(u8, 14 * 1024);
+    defer alloc.free(huge);
+    @memset(huge, 'x');
+    try std.testing.expectError(error.OutOfMemory, store.save(alloc, "authority", "task", generation, .{ .string = huge }));
+    try std.testing.expect(owner.budget_exhausted.load(.acquire));
+    try std.testing.expectEqual(before, owner.live.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), server.a2a_tasks.task_count);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings(original, (try store.get(arena.allocator(), "authority", "task")).string);
+    store.release("authority", "task", generation);
+    try std.testing.expectEqual(@as(usize, 0), server.a2a_tasks.task_count);
+    // The identical replacement succeeds once the old task has retired, proving
+    // the denial above was simultaneous retained state rather than its size.
+    const replacement_generation = try store.reserve(alloc, "authority", "replacement", .{ .string = huge });
+    store.release("authority", "replacement", replacement_generation);
+    // Empty outer-map capacity stays charged until actual teardown.
+    try std.testing.expect(owner.live.load(.acquire) > 0);
+    const account = owner.account;
+    account.retain();
+    defer account.release();
+    server.deinit();
+    server_live = false;
+    try std.testing.expectEqual(@as(usize, 0), account.retainedBytes());
+}
+
+test "workload admission agent protocol and query builder keep class and ingress output ownership" {
+    const alloc = std.testing.allocator;
+    const Owner = @import("../common/workload_allocator.zig").Owner;
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var ingress = RequestAdmission.initConfigured(2, .{ .max_retained_bytes = 1024 * 1024 });
+    defer ingress.deinitMemory();
+    const parent = try Owner.create(alloc, &ingress);
+    defer parent.release();
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status } }, null, null);
+    var server_live = true;
+    defer if (server_live) server.deinit();
+    try server.query_admission.configure(.{ .max_retained_bytes = 262144 });
+    var protocol = try protocol_adapters.executeA2aRequestWithOwner(&server, null, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"unknown\"}", ApiHttpServer.QueryEmbeddingSecurityScope{ .domain = .internal, .value = "" }, @as(?AuthenticatedIdentity, null), parent);
+    defer protocol.deinit(alloc);
+    var builder = try server.executeQueryBuilderAgentWithOwner("{}", null, .{ .io = std.testing.io, .deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_min }, parent);
+    defer builder.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), builder.status);
+    try std.testing.expect(protocol.memory_owner != null and builder.memory_owner != null);
+    try std.testing.expect(server.query_admission.stats().retained_bytes > 0);
+    try std.testing.expect(ingress.stats().retained_bytes > server.query_admission.stats().retained_bytes);
+    server.deinit();
+    server_live = false;
+    try std.testing.expect(protocol.body.len > 0 and builder.body.len > 0);
 }

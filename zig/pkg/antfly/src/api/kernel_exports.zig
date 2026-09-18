@@ -202,6 +202,12 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         }
     else
         server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, imported_cfg, source.*, reads.*, writes.*);
+    // Reconstruct mandatory completion reservations at the final address,
+    // before any foreground/session traffic can consume the retained budget.
+    state.server.ensureTransactionSessionMemory() catch |err| {
+        state.server.deinit();
+        return fail(err);
+    };
     if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(&state.server.incoming_graph_routes);
     state.request_alloc = state.server.alloc;
     state.request_alloc_abi = .fromStd(&state.request_alloc);

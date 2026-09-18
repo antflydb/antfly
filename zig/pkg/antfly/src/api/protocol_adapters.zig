@@ -322,6 +322,7 @@ const ExtensionRuntimeBinding = struct {
 };
 
 pub const McpRequest = struct {
+    parent_owner: ?*@import("../common/workload_allocator.zig").Owner = null,
     context: @import("operation.zig").RequestContext = .{},
     method: contextual_operations.Method,
     endpoint_path: []const u8,
@@ -342,7 +343,7 @@ pub fn executeExtensionMcpRequest(server_ptr: anytype, request: McpRequest, auth
 
 fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype, extension_name_filter: ?[]const u8) !contextual_operations.OwnedResponse {
     try request.context.ensureActive();
-    const memory = server_ptr.mcpAllocationOwner() catch |err| switch (err) {
+    const memory = server_ptr.mcpAllocationOwner(request.parent_owner) catch |err| switch (err) {
         error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge => return server_ptr.mcpMemoryExhaustedResponse(false),
         else => return err,
     };
@@ -352,7 +353,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         else => return err,
     };
     var execution_started = false;
-    var response = executeMcpRequestFilteredAllocated(server_ptr, request, authenticated_identity, extension_name_filter, memory.allocator(), &execution_started) catch |err| {
+    var response = executeMcpRequestFilteredAllocated(server_ptr, request, authenticated_identity, extension_name_filter, memory, &execution_started) catch |err| {
         if (err == error.OutOfMemory and (memory.budget_exhausted.load(.acquire) or server_ptr.mcp_session_memory.?.budget_exhausted.load(.acquire))) {
             return server_ptr.mcpMemoryExhaustedResponse(execution_started);
         }
@@ -363,11 +364,13 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
     return response;
 }
 
-fn executeMcpRequestFilteredAllocated(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype, extension_name_filter: ?[]const u8, protocol_alloc: std.mem.Allocator, execution_started: *bool) !contextual_operations.OwnedResponse {
+fn executeMcpRequestFilteredAllocated(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype, extension_name_filter: ?[]const u8, memory: *@import("../common/workload_allocator.zig").Owner, execution_started: *bool) !contextual_operations.OwnedResponse {
+    const protocol_alloc = memory.allocator();
     const Server = @TypeOf(server_ptr);
     const ToolContext = struct {
         server: Server,
         request_context: @import("operation.zig").RequestContext,
+        parent_owner: ?*@import("../common/workload_allocator.zig").Owner,
         authenticated_identity: @TypeOf(authenticated_identity),
         permissions: ?[]const usermgr.Permission,
         spec: McpToolSpec,
@@ -649,7 +652,7 @@ fn executeMcpRequestFilteredAllocated(server_ptr: anytype, request: McpRequest, 
         }
 
         fn executeOperation(ctx: *@This(), alloc: std.mem.Allocator, operation: contextual_operations.McpApplicationOperation) !mcp.CallToolResult {
-            var resp = try ctx.server.executeMcpApplicationOperationWithContext(operation, ctx.authenticated_identity, ctx.request_context);
+            var resp = try ctx.server.executeMcpApplicationOperationWithOwner(operation, ctx.authenticated_identity, ctx.request_context, ctx.parent_owner);
             defer resp.deinit(ctx.server.alloc);
             return try mcpResultFromOwnedResponse(alloc, resp);
         }
@@ -659,6 +662,8 @@ fn executeMcpRequestFilteredAllocated(server_ptr: anytype, request: McpRequest, 
         authenticated_identity: @TypeOf(authenticated_identity),
         permissions: ?[]const usermgr.Permission,
         installed: *const extension_domain.InstalledExtension,
+        parent_owner: ?*@import("../common/workload_allocator.zig").Owner,
+        request_context: @import("operation.zig").RequestContext,
         tool: *const ExtensionMcpTool,
 
         fn handler(ctx: *@This()) mcp.ToolHandler {
@@ -672,7 +677,7 @@ fn executeMcpRequestFilteredAllocated(server_ptr: anytype, request: McpRequest, 
                     return mcpError(alloc, "permission denied");
                 }
             }
-            return try callExtensionMcpTool(alloc, ctx.server, ctx.authenticated_identity, ctx.installed, ctx.tool.*, args);
+            return try callExtensionMcpTool(alloc, ctx.server, ctx.authenticated_identity, ctx.installed, ctx.tool.*, args, ctx.parent_owner, ctx.request_context);
         }
     };
 
@@ -681,6 +686,7 @@ fn executeMcpRequestFilteredAllocated(server_ptr: anytype, request: McpRequest, 
         ctx.* = .{
             .server = server_ptr,
             .request_context = request.context,
+            .parent_owner = request.parent_owner,
             .authenticated_identity = authenticated_identity,
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .spec = spec,
@@ -726,6 +732,8 @@ fn executeMcpRequestFilteredAllocated(server_ptr: anytype, request: McpRequest, 
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .installed = installed,
             .tool = &extension_tools.items[i],
+            .parent_owner = request.parent_owner,
+            .request_context = request.context,
         };
     }
 
@@ -1213,7 +1221,7 @@ fn findInstalledExtensionForRuntimeTool(installed_extensions: []const extension_
     return null;
 }
 
-fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated_identity: anytype, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value) !mcp.CallToolResult {
+fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated_identity: anytype, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value, parent_owner: ?*@import("../common/workload_allocator.zig").Owner, request_context: @import("operation.zig").RequestContext) !mcp.CallToolResult {
     if (parseWasmHandler(tool.handler)) |handler| {
         const tool_name = handler.tool_name;
         if (!std.mem.eql(u8, tool_name, tool.member.object_name)) {
@@ -1226,7 +1234,10 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated
             .server = server,
             .authenticated_identity = authenticated_identity,
             .installed = installed,
+            .parent_owner = parent_owner,
+            .request_context = request_context,
         };
+        try request_context.ensureActive();
         if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
             .package_store_root = server.cfg.extension_package_store_dir,
             .host_imports = .{
@@ -1264,27 +1275,32 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
         server: Server,
         authenticated_identity: Identity,
         installed: *const extension_domain.InstalledExtension,
+        parent_owner: ?*@import("../common/workload_allocator.zig").Owner,
+        request_context: @import("operation.zig").RequestContext,
 
         fn dbQuery(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, query_json: []const u8) anyerror![]u8 {
             const ctx = hostContext(ptr);
+            try ctx.request_context.ensureActive();
             try ctx.requireCapability("db:read");
             const table_name = try ctx.resolveTableName(table);
             const body = try extensionQueryBodyAlloc(alloc, query_json);
             defer alloc.free(body);
-            return try ctx.server.executeExtensionHostQuery(alloc, table_name, body, ctx.authenticated_identity);
+            return try ctx.server.executeExtensionHostQueryWithOwner(alloc, table_name, body, ctx.authenticated_identity, ctx.parent_owner, ctx.request_context);
         }
 
         fn dbWrite(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, writes_json: []const u8) anyerror![]u8 {
             const ctx = hostContext(ptr);
+            try ctx.request_context.ensureActive();
             try ctx.requireCapability("db:write");
             const table_name = try ctx.resolveTableName(table);
             const body = try extensionBatchBodyAlloc(alloc, writes_json);
             defer alloc.free(body);
-            return try ctx.server.executeExtensionHostBatch(alloc, table_name, body);
+            return try ctx.server.executeExtensionHostBatchWithOwner(alloc, table_name, body, ctx.parent_owner, ctx.request_context);
         }
 
         fn aiEmbed(ptr: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, text: []const u8) anyerror![]f32 {
             const ctx = hostContext(ptr);
+            try ctx.request_context.ensureActive();
             try ctx.requireCapability("ai:embed");
             const out = try alloc.alloc(f32, 8);
             var hash = std.hash.Wyhash.init(0);
@@ -1465,7 +1481,29 @@ pub fn executeA2aRequest(
     query_embedding_security_scope: anytype,
     authenticated_identity: anytype,
 ) !contextual_operations.OwnedResponse {
-    var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
+    return executeA2aRequestWithOwner(server_ptr, authorization, body, query_embedding_security_scope, authenticated_identity, null);
+}
+
+pub fn executeA2aRequestWithOwner(server_ptr: anytype, authorization: ?[]const u8, body: []const u8, query_embedding_security_scope: anytype, authenticated_identity: anytype, parent: ?*@import("../common/workload_allocator.zig").Owner) !contextual_operations.OwnedResponse {
+    const Owner = @import("../common/workload_allocator.zig").Owner;
+    const memory = if (parent) |owner| try Owner.createChild(owner, &server_ptr.query_admission) else try Owner.create(server_ptr.owner_alloc, &server_ptr.query_admission);
+    defer memory.release();
+    return executeA2aRequestAllocated(server_ptr, authorization, body, query_embedding_security_scope, authenticated_identity, memory) catch |err| {
+        if (err == error.OutOfMemory and memory.budget_exhausted.load(.acquire)) {
+            return contextual_operations.jsonWithStatus(429, try std.json.Stringify.valueAlloc(server_ptr.alloc, .{
+                .@"error" = "AgentMemoryExhausted",
+                .reason = "resource_exhausted",
+                .stage = "execution",
+                .execution_started = true,
+            }, .{}), false);
+        }
+        return err;
+    };
+}
+
+fn executeA2aRequestAllocated(server_ptr: anytype, authorization: ?[]const u8, body: []const u8, query_embedding_security_scope: anytype, authenticated_identity: anytype, memory: *@import("../common/workload_allocator.zig").Owner) !contextual_operations.OwnedResponse {
+    const alloc = memory.allocator();
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
     var dispatcher = try buildA2aDispatcher(
         server_ptr,
@@ -1473,18 +1511,25 @@ pub fn executeA2aRequest(
         authorization,
         query_embedding_security_scope,
         authenticated_identity,
+        memory,
     );
     if (isJsonRpcMethod(arena_impl.allocator(), body, "message/stream")) {
         var sink = A2aSseSink{};
-        defer sink.out.deinit(server_ptr.alloc);
-        try dispatcher.handleJsonRpcStream(server_ptr.alloc, body, sink.iface());
-        try sink.out.appendSlice(server_ptr.alloc, "event: done\ndata: {}\n\n");
+        defer sink.out.deinit(alloc);
+        try dispatcher.handleJsonRpcStream(alloc, body, sink.iface());
+        try sink.out.appendSlice(alloc, "event: done\ndata: {}\n\n");
+        const body_bytes = try sink.out.toOwnedSlice(alloc);
+        memory.retain();
         return .{
+            .memory_owner = memory,
             .content_type = "text/event-stream",
-            .body = try sink.out.toOwnedSlice(server_ptr.alloc),
+            .body = body_bytes,
         };
     }
-    return contextual_operations.json(try dispatcher.handleJsonRpc(server_ptr.alloc, body), false);
+    var response = contextual_operations.json(try dispatcher.handleJsonRpc(alloc, body), false);
+    memory.retain();
+    response.memory_owner = memory;
+    return response;
 }
 
 const A2aSseSink = struct {
@@ -1515,6 +1560,7 @@ pub fn a2aCardJsonAlloc(
         null,
         query_embedding_security_scope,
         authenticated_identity,
+        null,
     );
     const card = try dispatcher.agentCard(arena_impl.allocator());
     return stringifyJsonValue(server_ptr.alloc, card);
@@ -1526,6 +1572,7 @@ fn buildA2aDispatcher(
     authorization: ?[]const u8,
     query_embedding_security_scope: anytype,
     authenticated_identity: anytype,
+    parent_owner: ?*@import("../common/workload_allocator.zig").Owner,
 ) !a2a.Dispatcher {
     const Server = @TypeOf(server_ptr);
     const HandlerKind = enum { query_builder, retrieval };
@@ -1535,6 +1582,7 @@ fn buildA2aDispatcher(
         query_embedding_security_scope: @TypeOf(query_embedding_security_scope),
         authenticated_identity: @TypeOf(authenticated_identity),
         kind: HandlerKind,
+        parent_owner: ?*@import("../common/workload_allocator.zig").Owner,
 
         fn iface(ctx: *@This()) a2a.AgentHandler {
             return .{
@@ -1580,7 +1628,7 @@ fn buildA2aDispatcher(
                 }
             }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
-            var resp = try ctx.server.executeQueryBuilderAgent(body_json, ctx.authenticated_identity);
+            var resp = try ctx.server.executeQueryBuilderAgentWithOwner(body_json, ctx.authenticated_identity, .{ .io = ctx.server.inferenceIo(), .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_min }, ctx.parent_owner);
             defer resp.deinit(ctx.server.alloc);
             if (resp.status < 200 or resp.status >= 300) {
                 try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", resp.body);
@@ -1628,6 +1676,7 @@ fn buildA2aDispatcher(
         }
     };
 
+    try server_ptr.ensureA2aTaskMemory();
     const task_authority = try std.fmt.allocPrint(
         dispatcher_alloc,
         "{s}:{d}:{s}",
@@ -1648,6 +1697,7 @@ fn buildA2aDispatcher(
     const contexts = try dispatcher_alloc.alloc(HandlerContext, 2);
     contexts[0] = .{
         .server = server_ptr,
+        .parent_owner = parent_owner,
         .authorization = authorization,
         .query_embedding_security_scope = query_embedding_security_scope,
         .authenticated_identity = authenticated_identity,
@@ -1655,6 +1705,7 @@ fn buildA2aDispatcher(
     };
     contexts[1] = .{
         .server = server_ptr,
+        .parent_owner = parent_owner,
         .authorization = authorization,
         .query_embedding_security_scope = query_embedding_security_scope,
         .authenticated_identity = authenticated_identity,

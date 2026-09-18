@@ -958,13 +958,16 @@ pub const DefinitionCache = struct {
     pub const Leases = struct {
         cache: *DefinitionCache,
         alloc: std.mem.Allocator,
+        /// Cache entries and flight bookkeeping can outlive these request
+        /// leases. Request-tracked callers supply the cache's stable allocator.
+        cache_alloc: ?std.mem.Allocator = null,
         entries: std.ArrayListUnmanaged(*Entry) = .empty,
         pub fn deinit(self: *Leases) void {
             for (self.entries.items) |entry| entry.release();
             self.entries.deinit(self.alloc);
         }
         fn get(self: *Leases, table: *const metadata_table_manager.TableRecord) !*const Entry {
-            const entry = try self.cache.acquire(self.alloc, table);
+            const entry = try self.cache.acquire(self.cache_alloc orelse self.alloc, table);
             errdefer entry.release();
             try self.entries.append(self.alloc, entry);
             return entry;
@@ -6293,4 +6296,30 @@ test "system catalog detail preserves replication runtime through its projection
     defer std.testing.allocator.free(listed);
     try std.testing.expect(std.mem.indexOf(u8, listed, "\"action_hint\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "\"status\":{\"source_kind\":\"postgres\"") == null);
+}
+
+test "workload admission catalog cache outlives request tracked leases" {
+    const alloc = std.testing.allocator;
+    var cache: DefinitionCache = .{};
+    defer cache.deinit();
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(0, .{ .max_retained_bytes = 4096 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(alloc, &gate);
+    var owner_live = true;
+    defer if (owner_live) owner.release();
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "physical", .schema_json = "{\"version\":1}" };
+    var leases: DefinitionCache.Leases = .{ .cache = &cache, .alloc = owner.allocator(), .cache_alloc = alloc };
+    var leases_live = true;
+    defer if (leases_live) leases.deinit();
+    _ = try leases.get(&table);
+    try std.testing.expect(owner.live.load(.acquire) > 0);
+    leases.deinit();
+    leases_live = false;
+    try std.testing.expectEqual(@as(usize, 0), owner.live.load(.acquire));
+    owner.release();
+    owner_live = false;
+    const cached = try cache.acquire(alloc, &table);
+    defer cached.release();
+    try std.testing.expectEqual(@as(i64, 1), cached.schema.?.version.?);
+    try std.testing.expectEqual(@as(usize, 0), gate.stats().retained_bytes);
 }
