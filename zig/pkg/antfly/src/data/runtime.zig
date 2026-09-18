@@ -3143,7 +3143,6 @@ fn writeLsmCacheMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.CacheStat
     try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_data_block_used_bytes", "gauge", "Decoded and physical LSM data-block bytes currently resident", @intCast(stats.data_block_used_bytes));
     try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_data_block_peak_used_bytes", "gauge", "Lifetime peak decoded and physical LSM data-block bytes resident at the same instant", @intCast(stats.data_block_peak_used_bytes));
     try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_entries", "gauge", "Shared LSM cache entry count", @intCast(stats.entry_count));
-    try writeLsmCacheKindMetricFamily(writer, stats, .used_bytes, "antfly_lsm_cache_kind_used_bytes", "gauge", "Shared LSM cache resident bytes by entry kind");
     try writeLsmCacheKindMetricFamily(writer, stats, .hits, "antfly_lsm_cache_hits_total", "counter", "Shared LSM cache hits");
     try writeLsmCacheKindMetricFamily(writer, stats, .misses, "antfly_lsm_cache_misses_total", "counter", "Shared LSM cache misses");
     try writeLsmCacheKindMetricFamily(writer, stats, .inserts, "antfly_lsm_cache_inserts_total", "counter", "Shared LSM cache inserts");
@@ -45287,6 +45286,25 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 0), retired.query.retained_bytes);
             try std.testing.expectEqual(@as(usize, 0), retired.write.in_flight);
             try std.testing.expectEqual(@as(usize, 0), retired.write.retained_bytes);
+        }
+
+        test "workload admission cache metrics emit unique sample identities" {
+            var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer output.deinit();
+            try writeLsmCacheMetrics(&output.writer, .{});
+            var identities: std.StringHashMapUnmanaged(void) = .empty;
+            defer identities.deinit(std.testing.allocator);
+            var lines = std.mem.splitScalar(u8, output.writer.buffered(), '\n');
+            var kind_samples: usize = 0;
+            while (lines.next()) |line| {
+                if (line.len == 0 or line[0] == '#') continue;
+                const split = std.mem.lastIndexOfScalar(u8, line, ' ') orelse return error.InvalidMetricSample;
+                const identity = line[0..split];
+                const entry = try identities.getOrPut(std.testing.allocator, identity);
+                try std.testing.expect(!entry.found_existing);
+                if (std.mem.startsWith(u8, identity, "antfly_lsm_cache_kind_used_bytes{")) kind_samples += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 5), kind_samples);
         }
 
         test "data runtime metrics use prometheus labels for resource and cache dimensions" {
