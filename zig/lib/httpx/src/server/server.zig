@@ -104,6 +104,48 @@ pub const SseEvent = struct {
 /// Pre-route hook called after parsing the request and before route matching.
 pub const PreRouteHook = *const fn (*Context) anyerror!void;
 
+/// Borrowed header-only classification view. The callback must be bounded,
+/// allocation-free, nonblocking, and must not retain this view. It is called on
+/// the connection/frame-pump thread before an application task exists.
+pub const RequestDispatchView = struct {
+    method: []const u8,
+    target: []const u8,
+    body_received_bytes: usize = 0,
+    body_complete: bool = true,
+    headers: union(enum) { h1: *const Headers, h2: []const hpack.DecodedHeader },
+
+    pub fn header(self: @This(), name: []const u8) ?[]const u8 {
+        return switch (self.headers) {
+            .h1 => |headers| headers.get(name),
+            .h2 => |headers| blk: {
+                for (headers) |entry| if (std.ascii.eqlIgnoreCase(entry.name, name)) break :blk entry.value;
+                break :blk null;
+            },
+        };
+    }
+
+    pub fn path(self: @This()) []const u8 {
+        return self.target[0 .. std.mem.indexOfScalar(u8, self.target, '?') orelse self.target.len];
+    }
+};
+
+pub const RequestTaskLane = enum(u8) { general, control, recovery };
+pub const RequestDispatchConfig = struct {
+    /// Nonborrowable partitions INSIDE max_request_tasks. This protects only
+    /// request-task capacity, not connection slots or header/body ingress.
+    control_tasks: u32 = 0,
+    recovery_tasks: u32 = 0,
+    classifier: ?struct {
+        ctx: ?*anyopaque,
+        classify: *const fn (?*anyopaque, RequestDispatchView) RequestTaskLane,
+    } = null,
+    /// Fixed, borrowed response wire bytes for HTTP/1 dispatch rejection. Must
+    /// include complete status/headers/body and Connection: close, and remain
+    /// valid until Server.deinit. Sending performs no response allocation.
+    /// HTTP/2 still sends REFUSED_STREAM; it never runs handlers inline.
+    h1_rejection_response: ?[]const u8 = null,
+};
+
 pub const H1DisconnectCancellation = enum {
     /// Every active HTTP/1 request must be registered with HttpRuntime. If the
     /// observer is unavailable, fail the request closed before dispatch.
@@ -1530,6 +1572,8 @@ pub const Server = struct {
         connection_dispatch_rejections_total: u64,
         request_dispatch_rejections_total: u64,
         h2_stream_dispatch_rejections_total: u64,
+        request_permit_rejections_total: u64,
+        request_executor_rejections_total: u64,
         request_cancellations_total: u64,
         body_buffer_capacity_bytes: usize,
         body_buffer_in_use_bytes: usize,
@@ -1567,6 +1611,11 @@ pub const Server = struct {
     request_dispatch_rejections_total: std.atomic.Value(u64) = .init(0),
     h2_stream_dispatch_rejections_total: std.atomic.Value(u64) = .init(0),
     request_permits: std.atomic.Value(u32),
+    control_request_permits: std.atomic.Value(u32) = .init(0),
+    recovery_request_permits: std.atomic.Value(u32) = .init(0),
+    request_dispatch_config: RequestDispatchConfig = .{},
+    request_permit_rejections_total: std.atomic.Value(u64) = .init(0),
+    request_executor_rejections_total: std.atomic.Value(u64) = .init(0),
     request_cancellations_total: std.atomic.Value(u64) = .init(0),
     connection_controls_mutex: std.atomic.Mutex = .unlocked,
     connection_controls: std.ArrayListUnmanaged(*ConnectionControl) = .empty,
@@ -1763,6 +1812,26 @@ pub const Server = struct {
         };
     }
 
+    /// Configure before bind/start, while the server is exclusively owned.
+    /// No route automatically receives privilege: authenticating recovery
+    /// callers and validating bounded framing is the classifier's responsibility.
+    pub fn configureRequestDispatch(self: *Self, config: RequestDispatchConfig) !void {
+        if (self.listener != null or self.listen_started.load(.acquire) or self.active_requests.load(.acquire) != 0)
+            return error.RequestDispatchAlreadyStarted;
+        const reserved = @as(u64, config.control_tasks) + config.recovery_tasks;
+        if (reserved >= self.config.max_request_tasks or (reserved != 0 and config.classifier == null))
+            return error.InvalidRequestDispatchConfiguration;
+        if (config.h1_rejection_response) |wire| {
+            if (wire.len > 4096 or !std.mem.startsWith(u8, wire, "HTTP/1.1 ") or
+                std.mem.indexOf(u8, wire, "\r\nConnection: close\r\n") == null or
+                std.mem.indexOf(u8, wire, "\r\n\r\n") == null) return error.InvalidRequestDispatchConfiguration;
+        }
+        self.request_dispatch_config = config;
+        self.request_permits.store(self.config.max_request_tasks - @as(u32, @intCast(reserved)), .release);
+        self.control_request_permits.store(config.control_tasks, .release);
+        self.recovery_request_permits.store(config.recovery_tasks, .release);
+    }
+
     /// Lock-free snapshot suitable for health and metrics endpoints. The
     /// configured limit is immutable after initialization and the remaining
     /// fields are atomically maintained by the accept/request paths.
@@ -1779,6 +1848,8 @@ pub const Server = struct {
             .connection_dispatch_rejections_total = self.connection_dispatch_rejections_total.load(.acquire),
             .request_dispatch_rejections_total = self.request_dispatch_rejections_total.load(.acquire),
             .h2_stream_dispatch_rejections_total = self.h2_stream_dispatch_rejections_total.load(.acquire),
+            .request_permit_rejections_total = self.request_permit_rejections_total.load(.acquire),
+            .request_executor_rejections_total = self.request_executor_rejections_total.load(.acquire),
             .request_cancellations_total = self.request_cancellations_total.load(.acquire),
             .body_buffer_capacity_bytes = body.capacity,
             .body_buffer_in_use_bytes = body.in_use,
@@ -2315,7 +2386,8 @@ pub const Server = struct {
 
         var first_request = true;
         var request_active = false;
-        defer if (request_active) self.finishRequest();
+        var request_lane: RequestTaskLane = .general;
+        defer if (request_active) self.finishRequestInLane(request_lane);
         var request_count: u32 = 0;
         var first_recv_done = true; // We already did the first recv.
         var buffer: [8192]u8 = undefined;
@@ -2450,9 +2522,17 @@ pub const Server = struct {
                 h1_body_reserved = false;
             }
 
-            if (!self.tryStartRequest()) {
+            request_lane = self.classifyRequest(.{
+                .method = @tagName(parser.method orelse .GET),
+                .target = parser.path orelse "/",
+                .body_received_bytes = parser.getBody().len,
+                .body_complete = !parser.headers_only or (!parser.chunked and (parser.content_length orelse 0) == 0),
+                .headers = .{ .h1 = &parser.headers },
+            });
+            if (!self.tryStartRequestInLane(request_lane)) {
                 self.recordRequestDispatchRejection();
-                try self.sendError(&sock, 503);
+                _ = self.request_permit_rejections_total.fetchAdd(1, .monotonic);
+                try self.sendDispatchRejection(&sock);
                 return;
             }
             request_active = true;
@@ -2503,7 +2583,7 @@ pub const Server = struct {
                 // the upgrade handler releases it as soon as that request
                 // finishes, before entering the long-lived frame loop.
                 request_active = false;
-                return self.handleH2cUpgrade(&connection.control, &sock, &req, buffer[0..leftover]);
+                return self.handleH2cUpgrade(&connection.control, &sock, &req, buffer[0..leftover], request_lane);
             }
 
             var ctx = Context.init(self.allocator, self.io, &req);
@@ -2573,9 +2653,10 @@ pub const Server = struct {
 
             var request_future = self.requestIo().concurrent(executeH1Application, .{ self, &ctx, &req }) catch {
                 self.recordRequestDispatchRejection();
-                self.finishRequest();
+                _ = self.request_executor_rejections_total.fetchAdd(1, .monotonic);
+                self.finishRequestInLane(request_lane);
                 request_active = false;
-                try self.sendError(&sock, 503);
+                try self.sendDispatchRejection(&sock);
                 return;
             };
             const application = request_future.await(self.requestIo()) catch |err| {
@@ -2603,7 +2684,7 @@ pub const Server = struct {
             // clean state for the next request.
             if (ctx.h1_stream_sent) {
                 ctx.h1_stream_sent = false;
-                self.finishRequest();
+                self.finishRequestInLane(request_lane);
                 request_active = false;
                 const stream_keep_alive = ctx.h1_keep_alive and
                     self.shutdown_mode.load(.acquire) == 0;
@@ -2639,7 +2720,7 @@ pub const Server = struct {
 
             try sendBuffered(self.allocator, &sock, &response);
 
-            self.finishRequest();
+            self.finishRequestInLane(request_lane);
             request_active = false;
 
             if (!keep_alive) return;
@@ -2725,9 +2806,9 @@ pub const Server = struct {
     /// Sends 101 Switching Protocols, handles the original request as stream 1,
     /// then enters the normal H2 receive loop for subsequent requests.
     /// `initial_h2_data` contains any bytes pipelined beyond the upgrade request.
-    fn handleH2cUpgrade(self: *Self, control: *ConnectionControl, sock: *Socket, original_req: *Request, initial_h2_data: []const u8) !void {
+    fn handleH2cUpgrade(self: *Self, control: *ConnectionControl, sock: *Socket, original_req: *Request, initial_h2_data: []const u8, request_lane: RequestTaskLane) !void {
         var stream1_request_active = true;
-        defer if (stream1_request_active) self.finishRequest();
+        defer if (stream1_request_active) self.finishRequestInLane(request_lane);
         // 1. Send 101 Switching Protocols.
         try sock.sendAll("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n");
 
@@ -2784,7 +2865,7 @@ pub const Server = struct {
         ) catch null;
         if (stream1_future) |*future| {
             const result = future.await(self.requestIo());
-            self.finishRequest();
+            self.finishRequestInLane(request_lane);
             stream1_request_active = false;
             result catch |err| {
                 // RFC 7540 §6.8: Send GOAWAY before closing so the client
@@ -2796,7 +2877,8 @@ pub const Server = struct {
             stream1_processed = true;
         } else {
             self.recordH2StreamDispatchRejection();
-            self.finishRequest();
+            _ = self.request_executor_rejections_total.fetchAdd(1, .monotonic);
+            self.finishRequestInLane(request_lane);
             stream1_request_active = false;
             h2.write_mutex.lockUncancelable(h2.io);
             h2.sendRstStream(sock, 1, .refused_stream) catch {};
@@ -2876,12 +2958,13 @@ pub const Server = struct {
             // Reserve drain ownership before publishing the handler fiber. A
             // concurrent graceful shutdown must not observe an accepted stream
             // as idle during the scheduler handoff.
-            if (!self.tryStartRequest()) {
-                self.rejectH2StreamDispatch(&h2, sock, sid, data_event, false);
+            const lane = self.classifyH2Request(&h2, sid);
+            if (!self.tryStartRequestInLane(lane)) {
+                self.rejectH2StreamDispatch(&h2, sock, sid, data_event, null);
                 continue;
             }
-            stream_fibers.concurrent(self.requestIo(), handleH2StreamFiber, .{ self, &h2, sock, sid, data_event }) catch {
-                self.rejectH2StreamDispatch(&h2, sock, sid, data_event, true);
+            stream_fibers.concurrent(self.requestIo(), handleH2StreamFiber, .{ self, &h2, sock, sid, data_event, lane }) catch {
+                self.rejectH2StreamDispatch(&h2, sock, sid, data_event, lane);
             };
         }
     }
@@ -3013,19 +3096,20 @@ pub const Server = struct {
             // task lane is saturated, reject before application execution;
             // running inline here can deadlock a streaming body waiting for
             // DATA that only this loop can receive.
-            if (!self.tryStartRequest()) {
-                self.rejectH2StreamDispatch(&h2, sock, sid, data_event, false);
+            const lane = self.classifyH2Request(&h2, sid);
+            if (!self.tryStartRequestInLane(lane)) {
+                self.rejectH2StreamDispatch(&h2, sock, sid, data_event, null);
                 continue;
             }
-            stream_fibers.concurrent(self.requestIo(), handleH2StreamFiber, .{ self, &h2, sock, sid, data_event }) catch {
-                self.rejectH2StreamDispatch(&h2, sock, sid, data_event, true);
+            stream_fibers.concurrent(self.requestIo(), handleH2StreamFiber, .{ self, &h2, sock, sid, data_event, lane }) catch {
+                self.rejectH2StreamDispatch(&h2, sock, sid, data_event, lane);
             };
         }
     }
 
     /// Fiber entry point for per-stream HTTP/2 request handling.
-    fn handleH2StreamFiber(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event) Io.Cancelable!void {
-        self.handleH2Stream(h2, sock, stream_id, data_event) catch |err| {
+    fn handleH2StreamFiber(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event, lane: RequestTaskLane) Io.Cancelable!void {
+        self.handleH2Stream(h2, sock, stream_id, data_event, lane) catch |err| {
             std.debug.print("H2 stream handler error: {}\n", .{err});
         };
     }
@@ -3033,8 +3117,8 @@ pub const Server = struct {
     /// Handles a single HTTP/2 stream: reads pre-decoded headers from the
     /// mailbox, routes the request, and sends the response. Dispatched as
     /// soon as HEADERS arrive — the body may still be streaming.
-    fn handleH2Stream(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event) !void {
-        defer self.finishRequest();
+    fn handleH2Stream(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event, lane: RequestTaskLane) !void {
+        defer self.finishRequestInLane(lane);
         // Ensure cleanup: detach event from stream, remove stream, free event.
         // All stream map mutations happen under write_mutex so the receive
         // loop (which holds write_mutex in processOneFrameLocked) cannot
@@ -3203,10 +3287,40 @@ pub const Server = struct {
     /// work to the shared runtime. Runtime reservations guarantee aggregate
     /// executor capacity; this local permit prevents one listener from using
     /// capacity reserved for another.
+    fn classifyRequest(self: *Self, view: RequestDispatchView) RequestTaskLane {
+        const classifier = self.request_dispatch_config.classifier orelse return .general;
+        return classifier.classify(classifier.ctx, view);
+    }
+
+    fn classifyH2Request(self: *Self, h2: *H2Connection, stream_id: u31) RequestTaskLane {
+        const stream = getH2Stream(h2, stream_id) orelse return .general;
+        const headers = stream.request_headers orelse return .general;
+        var method: []const u8 = "";
+        var target: []const u8 = "";
+        for (headers) |header| {
+            if (std.mem.eql(u8, header.name, ":method")) method = header.value;
+            if (std.mem.eql(u8, header.name, ":path")) target = header.value;
+        }
+        return self.classifyRequest(.{ .method = method, .target = target, .body_received_bytes = stream.data_buf.items.len, .body_complete = stream.end_stream_received, .headers = .{ .h2 = headers } });
+    }
+
+    fn lanePermits(self: *Self, lane: RequestTaskLane) *std.atomic.Value(u32) {
+        return switch (lane) {
+            .general => &self.request_permits,
+            .control => &self.control_request_permits,
+            .recovery => &self.recovery_request_permits,
+        };
+    }
+
     fn tryStartRequest(self: *Self) bool {
-        var observed = self.request_permits.load(.acquire);
+        return self.tryStartRequestInLane(.general);
+    }
+
+    fn tryStartRequestInLane(self: *Self, lane: RequestTaskLane) bool {
+        const permits = self.lanePermits(lane);
+        var observed = permits.load(.acquire);
         while (observed != 0) {
-            if (self.request_permits.cmpxchgWeak(observed, observed - 1, .acq_rel, .acquire)) |actual| {
+            if (permits.cmpxchgWeak(observed, observed - 1, .acq_rel, .acquire)) |actual| {
                 observed = actual;
                 continue;
             }
@@ -3218,10 +3332,19 @@ pub const Server = struct {
     }
 
     fn finishRequest(self: *Self) void {
+        self.finishRequestInLane(.general);
+    }
+
+    fn finishRequestInLane(self: *Self, lane: RequestTaskLane) void {
         const previous_active = self.active_requests.fetchSub(1, .acq_rel);
         std.debug.assert(previous_active > 0);
-        const previous_permits = self.request_permits.fetchAdd(1, .release);
-        std.debug.assert(previous_permits < self.config.max_request_tasks);
+        const previous_permits = self.lanePermits(lane).fetchAdd(1, .release);
+        const lane_capacity = switch (lane) {
+            .general => self.config.max_request_tasks - self.request_dispatch_config.control_tasks - self.request_dispatch_config.recovery_tasks,
+            .control => self.request_dispatch_config.control_tasks,
+            .recovery => self.request_dispatch_config.recovery_tasks,
+        };
+        std.debug.assert(previous_permits < lane_capacity);
     }
 
     fn recordRequestDispatchRejection(self: *Self) void {
@@ -3541,10 +3664,15 @@ pub const Server = struct {
         sock: anytype,
         stream_id: u31,
         data_event: *Io.Event,
-        request_started: bool,
+        started_lane: ?RequestTaskLane,
     ) void {
         self.recordH2StreamDispatchRejection();
-        if (request_started) self.finishRequest();
+        if (started_lane) |lane| {
+            _ = self.request_executor_rejections_total.fetchAdd(1, .monotonic);
+            self.finishRequestInLane(lane);
+        } else {
+            _ = self.request_permit_rejections_total.fetchAdd(1, .monotonic);
+        }
         h2.write_mutex.lockUncancelable(h2.io);
         if (h2.stream_manager.getStream(stream_id)) |stream| {
             stream.cancellation.store(true, .release);
@@ -3560,6 +3688,11 @@ pub const Server = struct {
         h2.write_mutex.lockUncancelable(h2.io);
         defer h2.write_mutex.unlock(h2.io);
         return h2.stream_manager.activeStreamCount();
+    }
+
+    fn sendDispatchRejection(self: *Self, socket: *Socket) !void {
+        if (self.request_dispatch_config.h1_rejection_response) |wire| return socket.sendAll(wire);
+        return self.sendError(socket, 503);
     }
 
     /// Sends an error response.
@@ -5369,7 +5502,7 @@ test "H2 request rejection resets an unprocessed stream and unwinds ownership" {
     var writer = TestWriter{ .list = &wire, .alloc = allocator };
 
     try std.testing.expect(server.tryStartRequest());
-    server.rejectH2StreamDispatch(&h2, &writer, 1, data_event, true);
+    server.rejectH2StreamDispatch(&h2, &writer, 1, data_event, .general);
 
     try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().active_requests);
     try std.testing.expectEqual(@as(u64, 1), server.runtimeStats().request_dispatch_rejections_total);
@@ -6890,4 +7023,211 @@ test "stream output deadline tightens once across trickled writes" {
     try ctx.checkStreamActive();
     fake.ns = 100;
     try std.testing.expectError(error.Timeout, ctx.checkStreamActive());
+}
+
+const DispatchPartitionTest = struct {
+    started: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn classify(_: ?*anyopaque, view: RequestDispatchView) RequestTaskLane {
+        if (mem.eql(u8, view.method, "GET") and mem.eql(u8, view.path(), "/health") and
+            view.header("content-length") == null and view.header("transfer-encoding") == null and
+            view.body_complete and view.body_received_bytes == 0) return .control;
+        // A test credential, not production authentication: this verifies the
+        // library never privileges the URL without a classifier's approval.
+        if (mem.eql(u8, view.path(), "/recover") and mem.eql(u8, view.header("authorization") orelse "", "test-secret")) return .recovery;
+        return .general;
+    }
+
+    fn handler(self: *@This(), ctx: *Context) anyerror!Response {
+        if (mem.eql(u8, ctx.request.uri.path, "/work")) {
+            self.started.store(true, .release);
+            while (!self.release.load(.acquire)) ctx.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        return ctx.text("done");
+    }
+
+    const rejection = "HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: 27\r\n\r\n{\"execution_started\":false}";
+
+    fn h1(address: Address, io: Io, raw: []const u8, expected: []const u8) !void {
+        var socket = try Socket.connect(address, io);
+        defer socket.close();
+        try socket.setRecvTimeout(5000);
+        try socket.sendAll(raw);
+        var buf: [2048]u8 = undefined;
+        var used: usize = 0;
+        while (used < buf.len) {
+            const n = try socket.recv(buf[used..]);
+            if (n == 0) break;
+            used += n;
+        }
+        try std.testing.expect(mem.indexOf(u8, buf[0..used], expected) != null);
+    }
+};
+
+test "request task partitions preserve H1 control recovery and reject untrusted paths" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var state: DispatchPartitionTest = .{};
+    var server = Server.initWithConfig(alloc, io, .{ .host = "127.0.0.1", .port = 0, .max_connections = 8, .max_request_tasks = 3, .h1_disconnect_cancellation = .disabled });
+    defer server.deinit();
+    try server.configureRequestDispatch(.{ .control_tasks = 1, .recovery_tasks = 1, .classifier = .{ .ctx = null, .classify = DispatchPartitionTest.classify }, .h1_rejection_response = DispatchPartitionTest.rejection });
+    try server.any("/work", Handler.bind(&state, DispatchPartitionTest.handler));
+    // Bodyless requests stay complete even when the route streams bodies.
+    try server.routeStreamingRaw(.GET, "/health", Handler.bind(&state, DispatchPartitionTest.handler));
+    try server.any("/recover", Handler.bind(&state, DispatchPartitionTest.handler));
+    var task = Server.ListenerTask.init(&server);
+    try task.start();
+    defer {
+        state.release.store(true, .release);
+        task.requestStop();
+        task.join() catch {};
+    }
+    while (!server.listen_started.load(.acquire)) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    try std.testing.expectError(error.RequestDispatchAlreadyStarted, server.configureRequestDispatch(.{}));
+    var first = try Socket.connect(server.boundAddress().?, io);
+    defer first.close();
+    try first.setRecvTimeout(5000);
+    try first.sendAll("GET /work HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    while (!state.started.load(.acquire)) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    try DispatchPartitionTest.h1(server.boundAddress().?, io, "GET /recover HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n", DispatchPartitionTest.rejection);
+    try DispatchPartitionTest.h1(server.boundAddress().?, io, "GET /health HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n", " 200 ");
+    try DispatchPartitionTest.h1(server.boundAddress().?, io, "POST /recover HTTP/1.1\r\nHost: test\r\nAuthorization: test-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", " 200 ");
+    // The reserved lane is returned on upgrade setup failure too.
+    try DispatchPartitionTest.h1(server.boundAddress().?, io, "GET /health HTTP/1.1\r\nHost: test\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: !!!\r\n\r\n", " 101 ");
+    try DispatchPartitionTest.h1(server.boundAddress().?, io, "GET /health HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n", " 200 ");
+    // A successful h2c stream 1 keeps the control permit through response
+    // drain, then hands subsequent streams back to the same classifier.
+    var upgrade = try Socket.connect(server.boundAddress().?, io);
+    defer upgrade.close();
+    try upgrade.setRecvTimeout(5000);
+    try upgrade.sendAll("GET /health HTTP/1.1\r\nHost: test\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n");
+    var switching: [1024]u8 = undefined;
+    var switching_len: usize = 0;
+    while (switching_len < switching.len and !mem.endsWith(u8, switching[0..switching_len], "\r\n\r\n")) {
+        const n = try upgrade.recv(switching[switching_len..][0..1]);
+        if (n == 0) return error.UnexpectedEof;
+        switching_len += n;
+    }
+    try std.testing.expect(mem.indexOf(u8, switching[0..switching_len], " 101 ") != null);
+    var h2c = H2Connection.initClient(alloc, io);
+    defer h2c.deinit();
+    const upgraded = try h2c.stream_manager.createStream();
+    upgraded.sendEndStream();
+    try h2c.sendClientPreface(&upgrade);
+    while (!upgraded.completed) _ = try h2c.processOneFrame(&upgrade, &upgrade);
+    try std.testing.expect(upgraded.stream_error == null);
+    try std.testing.expectEqualStrings("done", upgraded.data_buf.items);
+    h2c.stream_manager.removeStream(upgraded.id);
+    const next = try h2c.stream_manager.createStream();
+    const next_headers = try H2Connection.buildRequestHeaders("GET", "/health", "http", "localhost", &.{}, alloc);
+    defer alloc.free(next_headers);
+    try h2c.sendHeaders(&upgrade, next.id, next_headers, true);
+    while (!next.completed) _ = try h2c.processOneFrame(&upgrade, &upgrade);
+    try std.testing.expect(next.stream_error == null);
+    try std.testing.expectEqualStrings("done", next.data_buf.items);
+    state.release.store(true, .release);
+    var buf: [1024]u8 = undefined;
+    while (try first.recv(&buf) != 0) {}
+    task.requestStop();
+    try task.join();
+    try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().active_requests);
+    try std.testing.expectEqual(@as(u32, 1), server.request_permits.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), server.control_request_permits.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), server.recovery_request_permits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), server.runtimeStats().request_permit_rejections_total);
+    try std.testing.expectEqual(@as(u64, 0), server.runtimeStats().request_executor_rejections_total);
+}
+
+test "request task partitions preserve H2 control recovery under general saturation" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var state: DispatchPartitionTest = .{};
+    var server = Server.initWithConfig(alloc, io, .{ .host = "127.0.0.1", .port = 0, .max_connections = 4, .max_request_tasks = 3, .h1_disconnect_cancellation = .disabled });
+    defer server.deinit();
+    try server.configureRequestDispatch(.{ .control_tasks = 1, .recovery_tasks = 1, .classifier = .{ .ctx = null, .classify = DispatchPartitionTest.classify } });
+    try server.any("/work", Handler.bind(&state, DispatchPartitionTest.handler));
+    try server.any("/health", Handler.bind(&state, DispatchPartitionTest.handler));
+    try server.any("/recover", Handler.bind(&state, DispatchPartitionTest.handler));
+    var task = Server.ListenerTask.init(&server);
+    try task.start();
+    defer {
+        state.release.store(true, .release);
+        task.requestStop();
+        task.join() catch {};
+    }
+    while (!server.listen_started.load(.acquire)) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    var socket = try Socket.connect(server.boundAddress().?, io);
+    defer socket.close();
+    try socket.setRecvTimeout(5000);
+    var client = H2Connection.initClient(alloc, io);
+    defer client.deinit();
+    try client.sendClientPreface(&socket);
+    const first = try client.stream_manager.createStream();
+    const first_headers = try H2Connection.buildRequestHeaders("GET", "/work", "http", "localhost", &.{}, alloc);
+    defer alloc.free(first_headers);
+    try client.sendHeaders(&socket, first.id, first_headers, true);
+    while (!state.started.load(.acquire)) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    for ([_][]const u8{ "/recover", "/health", "/recover" }, 0..) |path, i| {
+        const stream = try client.stream_manager.createStream();
+        const extra = [_]hpack.HeaderEntry{.{ .name = "authorization", .value = "test-secret" }};
+        const headers = try H2Connection.buildRequestHeaders("GET", path, "http", "localhost", if (i == 2) &extra else &.{}, alloc);
+        defer alloc.free(headers);
+        try client.sendHeaders(&socket, stream.id, headers, true);
+        while (!stream.completed) _ = try client.processOneFrame(&socket, &socket);
+        if (i == 0) {
+            try std.testing.expect(stream.stream_error != null);
+        } else {
+            try std.testing.expect(stream.stream_error == null);
+            try std.testing.expectEqualStrings("done", stream.data_buf.items);
+        }
+        client.stream_manager.removeStream(stream.id);
+    }
+    state.release.store(true, .release);
+    while (!first.completed) _ = try client.processOneFrame(&socket, &socket);
+    try std.testing.expect(first.stream_error == null);
+    task.requestStop();
+    try task.join();
+    try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().active_requests);
+    try std.testing.expectEqual(@as(u32, 1), server.request_permits.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), server.control_request_permits.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), server.recovery_request_permits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), server.runtimeStats().request_permit_rejections_total);
+    try std.testing.expectEqual(@as(u64, 1), server.runtimeStats().h2_stream_dispatch_rejections_total);
+}
+
+test "request task partitions validate totals and retain lane on dispatch failure" {
+    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{ .max_request_tasks = 3 });
+    defer server.deinit();
+    try std.testing.expectError(error.InvalidRequestDispatchConfiguration, server.configureRequestDispatch(.{ .control_tasks = 1 }));
+    try std.testing.expectError(error.InvalidRequestDispatchConfiguration, server.configureRequestDispatch(.{ .control_tasks = 3, .classifier = .{ .ctx = null, .classify = DispatchPartitionTest.classify } }));
+    try server.configureRequestDispatch(.{ .control_tasks = 1, .recovery_tasks = 1, .classifier = .{ .ctx = null, .classify = DispatchPartitionTest.classify } });
+    try std.testing.expect(server.tryStartRequest());
+    defer server.finishRequest();
+    try std.testing.expect(!server.tryStartRequest());
+    try std.testing.expect(server.tryStartRequestInLane(.control));
+    defer server.finishRequestInLane(.control);
+    try std.testing.expect(!server.tryStartRequestInLane(.control));
+    try std.testing.expect(server.tryStartRequestInLane(.recovery));
+    var h2 = H2Connection.initServer(std.testing.allocator, std.testing.io);
+    defer h2.deinit();
+    const stream = try h2.stream_manager.getOrCreateStream(1);
+    try stream.open();
+    const event = try std.testing.allocator.create(Io.Event);
+    event.* = .unset;
+    stream.data_event = event;
+    const Writer = struct {
+        pub fn writeAll(_: @This(), _: []const u8) !void {}
+    };
+    var writer: Writer = .{};
+    server.rejectH2StreamDispatch(&h2, &writer, 1, event, .recovery);
+    try std.testing.expectEqual(@as(u32, 1), server.recovery_request_permits.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), server.runtimeStats().active_requests);
+    try std.testing.expectEqual(@as(u64, 1), server.runtimeStats().request_executor_rejections_total);
 }

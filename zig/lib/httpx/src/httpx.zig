@@ -212,6 +212,9 @@ pub const PoolStats = pool.PoolStats;
 
 pub const Server = server_mod.Server;
 pub const ListenerTask = server_mod.Server.ListenerTask;
+pub const RequestDispatchView = server_mod.RequestDispatchView;
+pub const RequestTaskLane = server_mod.RequestTaskLane;
+pub const RequestDispatchConfig = server_mod.RequestDispatchConfig;
 pub const ServerConfig = server_mod.ServerConfig;
 pub const H1DisconnectCancellation = server_mod.H1DisconnectCancellation;
 pub const H1DisconnectProbe = server_mod.H1DisconnectProbe;
