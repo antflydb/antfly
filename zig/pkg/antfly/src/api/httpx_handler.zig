@@ -826,6 +826,9 @@ pub const AntflyApiHandler = struct {
         if (!policy.failover_safe_mutations_only) return null;
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
         const mutation = classifyHaMutation(ctx.request.method, path) orelse return null;
+        if (policy.catalog_create_enabled and policy.remote_apply_mutations_enabled and
+            mutation.surface == .table_catalog and ctx.request.method == .POST)
+            return null;
         if (mutation.disposition != .reject and
             (mutation.disposition != .remote_apply or policy.remote_apply_mutations_enabled))
         {

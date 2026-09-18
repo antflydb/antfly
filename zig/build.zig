@@ -7989,6 +7989,7 @@ pub fn build(b: *std.Build) void {
             "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
+            "standalone standby catalog create rejects before contended locks",
             "standalone metadata advertises a linearizable owned snapshot",
             "standalone schema mutation supports atomic merge patch and version CAS",
             "standalone routing watch does not report absence after one probe",
