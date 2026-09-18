@@ -113,7 +113,7 @@ storage selections retain their existing behavior.
 
 ## Validation
 
-The final complete `unit-storage-test` gate succeeded (20/20 build steps):
+The complete `unit-storage-test` gate at `82c46cffb5` succeeded (20/20 build steps):
 4,571 passed, 35 skipped, zero failed tests or leaks. Both the final inventory
 and the execution log contain 4,606 unique tests and zero duplicate executions.
 The prior unique inventory is preserved, with one new HBC routing regression.
@@ -131,6 +131,11 @@ The build reported support at 2m, engine at 5m, and partitioned DB-core at 7m;
 these rounded run-step durations exclude compilation. No new Linux CI run has
 been measured for this branch. Existing diagnostic error-log counts are noted
 below; strict unexpected-error-log mode was not enabled.
+
+The subsequent HLL event-wait fix passed all 12 focused HLL tests, including
+an additional deterministic regression for spurious wakeups, fixed deadline
+expiry, cancellation, and already-set events. Both threaded barriers retry
+against a single absolute deadline rather than treating every Timeout as expiry.
 
 Earlier focused validation for the six-workload part of this branch:
 

@@ -22532,6 +22532,71 @@ test "algebraic HLL cardinality rebuilds after deletes via maintenance lane" {
     try std.testing.expectEqual(@as(?u64, 1), try westEstimate(&idx, &store, west_group, alloc));
 }
 
+// Event.waitTimeout may return Timeout on a spurious futex wake. Keep one
+// absolute deadline across retries so wakeups neither fail early nor extend
+// the test's watchdog indefinitely.
+fn waitForHllTestEvent(event: *std.Io.Event, io: std.Io, duration: std.Io.Clock.Duration) !void {
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, duration);
+    while (!event.isSet()) {
+        if (deadline.durationFromNow(io).raw.toNanoseconds() <= 0) return error.Timeout;
+        event.waitTimeout(io, .{ .deadline = deadline }) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+    }
+}
+
+test "algebraic HLL event waits tolerate spurious wakeups without extending the deadline" {
+    const Mode = enum { signal, signal_at_deadline, timeout, canceled };
+    const Clock = struct {
+        event: std.Io.Event = .unset,
+        now_ns: i96 = 0,
+        waits: usize = 0,
+        mode: Mode,
+
+        fn now(raw: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            std.debug.assert(clock == .awake);
+            return .{ .nanoseconds = self.now_ns };
+        }
+
+        fn wait(raw: ?*anyopaque, _: *const u32, _: u32, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            std.debug.assert(timeout == .deadline);
+            std.debug.assert(timeout.deadline.raw.toNanoseconds() == 3 * std.time.ns_per_s);
+            self.waits += 1;
+            self.now_ns += std.time.ns_per_s;
+            if (self.mode == .canceled and self.waits == 2) return error.Canceled;
+            if ((self.mode == .signal and self.waits == 2) or
+                (self.mode == .signal_at_deadline and self.waits == 3))
+                self.event.set(std.testing.io);
+            // Otherwise return a spurious wake while the event remains unset.
+        }
+    };
+    for (std.enums.values(Mode)) |mode| {
+        var clock: Clock = .{ .mode = mode };
+        var vtable = std.testing.io.vtable.*;
+        vtable.now = Clock.now;
+        vtable.futexWait = Clock.wait;
+        const io: std.Io = .{ .userdata = &clock, .vtable = &vtable };
+        const duration: std.Io.Clock.Duration = .{ .raw = .fromSeconds(3), .clock = .awake };
+        const result = waitForHllTestEvent(&clock.event, io, duration);
+        switch (mode) {
+            .signal, .signal_at_deadline => {
+                try result;
+                try std.testing.expect(clock.event.isSet());
+                const waits = clock.waits;
+                // An already-set event must not wait, even with no time left.
+                try waitForHllTestEvent(&clock.event, io, .{ .raw = .zero, .clock = .awake });
+                try std.testing.expectEqual(waits, clock.waits);
+            },
+            .timeout => try std.testing.expectError(error.Timeout, result),
+            .canceled => try std.testing.expectError(error.Canceled, result),
+        }
+        try std.testing.expectEqual(@as(usize, if (mode == .signal or mode == .canceled) 2 else 3), clock.waits);
+    }
+}
+
 test "algebraic HLL cardinality stays correct under a concurrent threaded maintenance lane" {
     if (builtin.os.tag == .freestanding) return error.SkipZigTest;
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
@@ -22625,14 +22690,14 @@ test "algebraic HLL cardinality stays correct under a concurrent threaded mainte
         idx.test_hll_hooks = null;
     }
     idx.resumeHllMaintenance(&store);
-    try race.locked.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    try waitForHllTestEvent(&race.locked, std.testing.io, .{ .raw = .fromSeconds(10), .clock = .awake });
     const foreground = try std.Thread.spawn(.{}, Race.apply, .{&race});
     var joined = false;
     defer if (!joined) {
         race.release.set(std.testing.io);
         foreground.join();
     };
-    try race.foreground_attempted.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    try waitForHllTestEvent(&race.foreground_attempted, std.testing.io, .{ .raw = .fromSeconds(10), .clock = .awake });
     try std.testing.expect(race.contended);
     race.release.set(std.testing.io);
     foreground.join();
