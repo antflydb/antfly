@@ -1435,27 +1435,19 @@ pub const Backend = struct {
         replay: ?wal_mod.RetentionStats = null,
         replay_ns: u64 = 0,
 
-        fn append(
+        fn appendPrepared(
             self: *@This(),
             storage: storage_io.Storage,
             allocator: Allocator,
-            root_dir: []const u8,
-            state: anytype,
-            sync_on_commit: bool,
-            options: wal_mod.AppendOptions,
+            prepared: *wal_mod.PreparedAppend,
             now_ns: u64,
-        ) !wal_mod.AppendResult {
-            errdefer self.invalidatePrimary();
-            const result = try wal_mod.appendStateWithOptionsResult(
-                storage,
-                allocator,
-                root_dir,
-                state,
-                sync_on_commit,
-                options,
-            );
-            self.noteAppend(result, now_ns);
-            return result;
+        ) !wal_mod.AppendOutcome {
+            const outcome = try prepared.execute(storage, allocator);
+            switch (outcome) {
+                .appended => |result| self.noteAppend(result, now_ns),
+                .uncertain => self.invalidatePrimary(),
+            }
+            return outcome;
         }
 
         fn retireCoveredSegments(
@@ -5942,15 +5934,32 @@ pub const Backend = struct {
         };
         var wal_lock = try self.acquireWalOperationLock(.exclusive);
         defer wal_lock.release();
-        const append_result = try self.wal_retention.append(
-            self.storage.?,
+        // Allocation/encoding errors are provably pre-I/O. Once execution
+        // starts, provider errors cannot prove that no bytes reached the WAL.
+        var append = try wal_mod.PreparedAppend.init(
             self.allocator,
             self.root_dir.?,
             state,
             self.options.wal_sync_on_commit,
             .{ .segment_bytes = self.options.wal_segment_bytes },
+        );
+        defer append.deinit();
+        const outcome = try self.wal_retention.appendPrepared(
+            self.storage.?,
+            self.allocator,
+            &append,
             self.writeStatsNowNs(),
         );
+        const append_result = switch (outcome) {
+            .appended => |result| result,
+            .uncertain => |err| {
+                // Keep admission's unpublished debt and stop all mutation.
+                // In particular, never append another record behind a torn
+                // tail or resend after FileNotFound from an arbitrary provider.
+                self.fenceFailedBulkWal();
+                return err;
+            },
+        };
         self.noteMutableWalSegment(append_result.segment);
         self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_append_records += 1;
@@ -5970,9 +5979,9 @@ pub const Backend = struct {
         if (!self.options.wal_enabled or self.root_dir == null) return;
         const start_ns = self.writeStatsNowNs();
         const before_manifest_writes = self.write_stats.manifest_writes;
-        // Replay may truncate a corrupt primary tail and advances replay
-        // bookkeeping. Treat both derived snapshots as unknown until it has
-        // completed and the primary snapshot is rebuilt below.
+        // Replay ignores an incomplete primary tail; it does not truncate the
+        // file. Treat both derived snapshots as unknown until replay and any
+        // writable recovery checkpoint have completed.
         self.wal_retention.invalidateAll();
         self.recovery_replaying_wal = true;
         errdefer self.recovery_replaying_wal = false;
@@ -6011,6 +6020,16 @@ pub const Backend = struct {
             recovery_session.active_window_bytes = 0;
         }
         self.recovery_replaying_wal = false;
+        if (!self.options.backend.read_only and stats.truncated_tail_bytes > 0) {
+            // A later append would complete the torn record with unrelated
+            // bytes and make even acknowledged writes unreplayable. Publish
+            // every successfully replayed entry in a durable manifest before
+            // resetting the WAL through the ordinary checkpoint machinery.
+            // Open fails if either publication or reset fails; no foreground
+            // writer can observe a partially repaired backend. Read-only opens
+            // leave the WAL untouched.
+            try self.checkpointCommittedStateForWalAdmissionLocked();
+        }
         if (!self.options.backend.read_only and self.write_stats.manifest_writes != before_manifest_writes) {
             try self.maybeCheckpointWalAfterManifestPublish();
         }
@@ -22614,6 +22633,266 @@ fn implementationTests() type {
                 @as(u64, logical_bytes - "one".len + "replacement".len),
                 mutable.estimatedLogicalBytes(),
             );
+        }
+
+        test "lsm WAL uncertainty writable reopen checkpoints torn tail before accepting writes" {
+            const Fixture = struct {
+                var backing: storage_io.Storage = undefined;
+                var fail_append: bool = false;
+                var fail_reset: bool = false;
+                fn writeFile(_: *anyopaque, path: []const u8, bytes: []const u8) !void {
+                    if (fail_reset and bytes.len == 0 and std.mem.endsWith(u8, path, ".log")) return error.InjectedWalResetFailure;
+                    try backing.writeFileAbsolute(path, bytes);
+                }
+                fn append(_: *anyopaque, path: []const u8, bytes: []const u8, sync: bool) !void {
+                    if (fail_append) {
+                        try backing.appendFileAbsolute(std.testing.allocator, path, bytes[0 .. bytes.len / 2], sync);
+                        return error.InjectedWalAppendFailure;
+                    }
+                    try backing.appendFileAbsolute(std.testing.allocator, path, bytes, sync);
+                }
+                fn write(backend: *Backend, key: []const u8) !void {
+                    var txn = try backend.beginWrite();
+                    errdefer txn.abort();
+                    try txn.put(.{}, key, key);
+                    try txn.commit();
+                }
+            };
+            const alloc = std.testing.allocator;
+            var path_buf: [256]u8 = undefined;
+            const path = repository_mod.tmpPath(&path_buf, "backend-wal-uncertainty");
+            const root = std.mem.span(path);
+            defer repository_mod.cleanupTmp(path);
+            var native = try storage_io.NativeStorage.init(alloc, .threaded);
+            defer native.deinit();
+            Fixture.backing = native.storage();
+            Fixture.fail_append = false;
+            Fixture.fail_reset = false;
+            var vtable = Fixture.backing.vtable.*;
+            vtable.append_file_absolute = Fixture.append;
+            vtable.write_file_absolute = Fixture.writeFile;
+            const injected: storage_io.Storage = .{ .ptr = Fixture.backing.ptr, .vtable = &vtable };
+            {
+                var backend = try Backend.open(alloc, root, .{ .storage = injected, .flush_threshold = 1000 });
+                defer backend.abandonAfterCrash();
+                try Fixture.write(&backend, "before");
+                Fixture.fail_append = true;
+                try std.testing.expectError(error.InjectedWalAppendFailure, Fixture.write(&backend, "uncertain"));
+                Fixture.fail_append = false;
+            }
+            const before_read = try wal_mod.snapshotRetention(injected, alloc, root);
+            {
+                var reader = try Backend.open(alloc, root, .{ .storage = injected, .backend = .{ .read_only = true } });
+                defer reader.close();
+                try std.testing.expect(reader.write_stats.wal_replay_truncated_tail_bytes > 0);
+                try std.testing.expectEqualStrings("before", try reader.getMergedWithMutable(&reader.mutable, .{}, "before"));
+                try std.testing.expectError(error.NotFound, reader.getMergedWithMutable(&reader.mutable, .{}, "uncertain"));
+            }
+            const after_read = try wal_mod.snapshotRetention(injected, alloc, root);
+            try std.testing.expectEqual(before_read.bytes, after_read.bytes);
+            Fixture.fail_reset = true;
+            try std.testing.expectError(error.InjectedWalResetFailure, Backend.open(alloc, root, .{ .storage = injected, .flush_threshold = 1000 }));
+            Fixture.fail_reset = false;
+            {
+                var backend = try Backend.open(alloc, root, .{ .storage = injected, .flush_threshold = 1000 });
+                defer backend.abandonAfterCrash();
+                try std.testing.expect(backend.write_stats.wal_replay_truncated_tail_bytes > 0);
+                try std.testing.expectEqual(@as(u64, 0), (try wal_mod.snapshotRetention(injected, alloc, root)).bytes);
+                try std.testing.expectEqualStrings("before", try backend.getMergedWithMutable(&backend.mutable, .{}, "before"));
+                try Fixture.write(&backend, "acknowledged-after-reopen");
+            }
+            {
+                var backend = try Backend.open(alloc, root, .{ .storage = injected, .backend = .{ .read_only = true } });
+                defer backend.close();
+                try std.testing.expectEqualStrings("before", try backend.getMergedWithMutable(&backend.mutable, .{}, "before"));
+                try std.testing.expectEqualStrings("acknowledged-after-reopen", try backend.getMergedWithMutable(&backend.mutable, .{}, "acknowledged-after-reopen"));
+            }
+        }
+
+        test "lsm WAL uncertainty fences later commits and preserves durable unknown outcomes" {
+            const Fixture = struct {
+                const Fault = enum { before, partial, partial_missing, synced };
+                var backing: storage_io.Storage = undefined;
+                var fault: ?Fault = null;
+                var calls: usize = 0;
+                fn append(_: *anyopaque, path: []const u8, bytes: []const u8, sync: bool) !void {
+                    calls += 1;
+                    if (fault) |active| {
+                        if (active == .before) return error.InjectedWalAppendFailure;
+                        try backing.appendFileAbsolute(std.testing.allocator, path, if (active == .synced) bytes else bytes[0 .. bytes.len / 2], sync);
+                        if (active == .partial_missing) return error.FileNotFound;
+                        return error.InjectedWalAppendFailure;
+                    }
+                    try backing.appendFileAbsolute(std.testing.allocator, path, bytes, sync);
+                }
+                fn write(backend: *Backend, key: []const u8) !void {
+                    var txn = try backend.beginWrite();
+                    errdefer txn.abort();
+                    try txn.put(.{}, key, key);
+                    try txn.commit();
+                }
+            };
+            const alloc = std.testing.allocator;
+            for (std.enums.values(Fixture.Fault)) |fault| {
+                var path_buf: [256]u8 = undefined;
+                const path = repository_mod.tmpPath(&path_buf, "backend-wal-fence");
+                const root = std.mem.span(path);
+                defer repository_mod.cleanupTmp(path);
+                var native = try storage_io.NativeStorage.init(alloc, .threaded);
+                defer native.deinit();
+                Fixture.backing = native.storage();
+                Fixture.fault = null;
+                var vtable = Fixture.backing.vtable.*;
+                vtable.append_file_absolute = Fixture.append;
+                const injected: storage_io.Storage = .{ .ptr = Fixture.backing.ptr, .vtable = &vtable };
+                {
+                    var backend = try Backend.open(alloc, root, .{ .storage = injected, .flush_threshold = 1000, .wal_sync_on_commit = true });
+                    defer backend.abandonAfterCrash();
+                    try Fixture.write(&backend, "before");
+                    _ = try backend.cachedWalRetentionLocked();
+                    const previous_debt = backend.manifest_unpublished_wire_bytes;
+                    Fixture.fault = fault;
+                    Fixture.calls = 0;
+                    const expected = if (fault == .partial_missing) error.FileNotFound else error.InjectedWalAppendFailure;
+                    try std.testing.expectError(expected, Fixture.write(&backend, "uncertain"));
+                    try std.testing.expectEqual(@as(usize, 1), Fixture.calls);
+                    try std.testing.expect(backend.manifest_recovery_required);
+                    try std.testing.expect(backend.wal_retention.primary == null);
+                    try std.testing.expect(backend.manifest_unpublished_wire_bytes > previous_debt);
+                    try std.testing.expectEqual(@as(usize, 0), backend.manifest_admitted_commits);
+                    try std.testing.expectEqual(@as(u64, 0), backend.manifest_admitted_bytes);
+                    const debt = backend.manifest_unpublished_wire_bytes;
+                    Fixture.fault = null;
+                    try std.testing.expectError(error.RecoveryRequired, Fixture.write(&backend, "must-not-acknowledge"));
+                    try std.testing.expectEqual(@as(usize, 1), Fixture.calls);
+                    try std.testing.expectEqual(debt, backend.manifest_unpublished_wire_bytes);
+                    try std.testing.expectError(error.RecoveryRequired, backend.checkpointWalAfterDurableBoundary());
+                }
+                {
+                    var backend = try Backend.open(alloc, root, .{ .storage = injected, .flush_threshold = 1000 });
+                    defer backend.abandonAfterCrash();
+                    try std.testing.expectEqualStrings("before", try backend.getMergedWithMutable(&backend.mutable, .{}, "before"));
+                    if (fault == .synced) {
+                        try std.testing.expectEqualStrings("uncertain", try backend.getMergedWithMutable(&backend.mutable, .{}, "uncertain"));
+                    } else try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "uncertain"));
+                    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "must-not-acknowledge"));
+                    try Fixture.write(&backend, "after-recovery");
+                }
+                {
+                    var backend = try Backend.open(alloc, root, .{ .storage = injected, .backend = .{ .read_only = true } });
+                    defer backend.close();
+                    try std.testing.expectEqualStrings("after-recovery", try backend.getMergedWithMutable(&backend.mutable, .{}, "after-recovery"));
+                }
+            }
+        }
+
+        test "lsm WAL uncertainty repairs empty first records and segmented tombstones over existing SSTs" {
+            const Fixture = struct {
+                const replay_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 7);
+                var backing: storage_io.Storage = undefined;
+                var fail_append: bool = false;
+                fn append(_: *anyopaque, path: []const u8, bytes: []const u8, sync: bool) !void {
+                    if (fail_append) {
+                        try backing.appendFileAbsolute(std.testing.allocator, path, bytes[0 .. bytes.len / 2], sync);
+                        return error.InjectedWalAppendFailure;
+                    }
+                    try backing.appendFileAbsolute(std.testing.allocator, path, bytes, sync);
+                }
+                fn write(backend: *Backend, key: []const u8, value: []const u8) !void {
+                    var txn = try backend.beginWrite();
+                    errdefer txn.abort();
+                    try txn.put(.{}, key, value);
+                    try txn.commit();
+                }
+                fn expectState(backend: *Backend, existing_sst: bool) !void {
+                    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "uncertain"));
+                    if (!existing_sst) return;
+                    try std.testing.expectEqualStrings("replacement", try backend.getMergedWithMutable(&backend.mutable, .{}, "survivor"));
+                    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "deleted"));
+                    // Outbox/replay records are ordinary store keys. Their
+                    // retirement needs separate consumer acknowledgment; WAL
+                    // repair must preserve them along with user rows.
+                    try std.testing.expectEqualStrings("pending-outbox", try backend.getMergedWithMutable(&backend.mutable, .{}, "\x00\x00__metadata__:ha_replay_outbox_v1"));
+                    try std.testing.expectEqualStrings("pending-replay", try backend.getMergedWithMutable(&backend.mutable, .{}, &replay_key));
+                }
+            };
+            const alloc = std.testing.allocator;
+            for ([_]bool{ false, true }) |existing_sst| {
+                var path_buf: [256]u8 = undefined;
+                const path = repository_mod.tmpPath(&path_buf, "backend-wal-tail-shapes");
+                const root = std.mem.span(path);
+                defer repository_mod.cleanupTmp(path);
+                var native = try storage_io.NativeStorage.init(alloc, .threaded);
+                defer native.deinit();
+                Fixture.backing = native.storage();
+                Fixture.fail_append = false;
+                var vtable = Fixture.backing.vtable.*;
+                vtable.append_file_absolute = Fixture.append;
+                const injected: storage_io.Storage = .{ .ptr = Fixture.backing.ptr, .vtable = &vtable };
+                const options: Options = .{ .storage = injected, .flush_threshold = 1000, .wal_segment_bytes = 1 };
+                {
+                    var backend = try Backend.open(alloc, root, options);
+                    defer backend.abandonAfterCrash();
+                    if (existing_sst) {
+                        var txn = try backend.beginWrite();
+                        errdefer txn.abort();
+                        try txn.put(.{}, "survivor", "original");
+                        try txn.put(.{}, "deleted", "original");
+                        try txn.put(.{}, "\x00\x00__metadata__:ha_replay_outbox_v1", "pending-outbox");
+                        try txn.commit();
+                        try backend.checkpointWalAfterDurableBoundary();
+                        try std.testing.expect(backend.runs.count() > 0);
+                        try Fixture.write(&backend, "survivor", "replacement");
+                        var deletion = try backend.beginWrite();
+                        errdefer deletion.abort();
+                        try deletion.delete(.{}, "deleted");
+                        try deletion.put(.{}, &Fixture.replay_key, "pending-replay");
+                        try deletion.commit();
+                        try std.testing.expect((try wal_mod.snapshotRetention(injected, alloc, root)).segments >= 2);
+                    }
+                    Fixture.fail_append = true;
+                    try std.testing.expectError(error.InjectedWalAppendFailure, Fixture.write(&backend, "uncertain", "unknown"));
+                    Fixture.fail_append = false;
+                }
+                {
+                    var backend = try Backend.open(alloc, root, options);
+                    defer backend.abandonAfterCrash();
+                    try std.testing.expect(backend.write_stats.wal_replay_truncated_tail_bytes > 0);
+                    if (!existing_sst) try std.testing.expectEqual(@as(u64, 0), backend.write_stats.wal_replay_records);
+                    try std.testing.expectEqual(@as(u64, 0), (try wal_mod.snapshotRetention(injected, alloc, root)).bytes);
+                    try Fixture.expectState(&backend, existing_sst);
+                    try Fixture.write(&backend, "after-repair", "acknowledged");
+                }
+                {
+                    var backend = try Backend.open(alloc, root, .{ .storage = injected, .backend = .{ .read_only = true } });
+                    defer backend.close();
+                    try Fixture.expectState(&backend, existing_sst);
+                    try std.testing.expectEqualStrings("acknowledged", try backend.getMergedWithMutable(&backend.mutable, .{}, "after-repair"));
+                }
+            }
+        }
+
+        test "lsm WAL uncertainty pure preparation allocation failure stays unfenced" {
+            const alloc = std.testing.allocator;
+            var storage = storage_io.MemoryStorage.init(alloc);
+            defer storage.deinit();
+            var failing = std.testing.FailingAllocator.init(alloc, .{});
+            var backend = try Backend.open(failing.allocator(), "/wal-preparation-allocation-failure", .{ .storage = storage.storage(), .flush_threshold = 1000 });
+            defer backend.close();
+            var incoming: State = .{};
+            defer incoming.deinit(alloc);
+            try incoming.upsert(alloc, .{}, "a", "new-a", false);
+            const before = try wal_mod.snapshotRetention(storage.storage(), alloc, backend.root_dir.?);
+            failing.fail_index = failing.alloc_index;
+            const result = backend.appendWalForState(&incoming);
+            failing.fail_index = std.math.maxInt(usize);
+            try std.testing.expectError(error.OutOfMemory, result);
+            try std.testing.expect(!backend.manifest_recovery_required);
+            try std.testing.expectEqual(before.bytes, (try wal_mod.snapshotRetention(storage.storage(), alloc, backend.root_dir.?)).bytes);
+            var txn = try backend.beginWrite();
+            errdefer txn.abort();
+            try txn.put(.{}, "after-preparation-failure", "safe");
+            try txn.commit();
         }
 
         test "lsm publication allocation failure leaves WAL and live keys unchanged" {
