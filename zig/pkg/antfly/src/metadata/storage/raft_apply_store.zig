@@ -20569,4 +20569,18 @@ test "workload admission table record storage extension preserves legacy bytes a
     defer roundtrip.deinit(alloc);
     try std.testing.expectEqualDeep(active.storage, roundtrip.compare_and_replace_table.expected.storage);
     try std.testing.expectEqualDeep(active.storage, roundtrip.compare_and_replace_table.replacement.storage);
+    // The same extension also owns dense placement; exercise it independently
+    // of recovery so an absent policy cannot hide or shift that field.
+    for ([_]bool{ false, true }) |with_recovery| {
+        var vector = if (with_recovery) active else legacy;
+        vector.storage.dense_embeddings = .vector_store;
+        const vector_bytes = try encodeTableRecord(alloc, vector);
+        defer alloc.free(vector_bytes);
+        const vector_decoded = try decodeTableRecord(alloc, vector_bytes);
+        defer metadata_table_manager.freeTable(alloc, vector_decoded);
+        try std.testing.expectEqualDeep(vector.storage, vector_decoded.storage);
+        var vector_identity = try decodeTableIdentity(alloc, vector_bytes);
+        defer vector_identity.deinit(alloc);
+        try std.testing.expectEqual(vector.table_id, vector_identity.table_id);
+    }
 }
