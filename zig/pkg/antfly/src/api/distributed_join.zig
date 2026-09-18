@@ -1012,6 +1012,8 @@ pub const JoinedBaseQueryRewrite = struct {
 
 pub const JoinJobStore = struct {
     alloc: std.mem.Allocator,
+    backing_alloc: std.mem.Allocator,
+    retained_owner: ?*@import("../common/workload_allocator.zig").Owner = null,
     ctx: ?JoinContext = null,
     cfg: JoinJobStoreConfig,
     opened_join_job_store: ?*OpenedJoinJobStore = null,
@@ -1022,8 +1024,20 @@ pub const JoinJobStore = struct {
     pub fn init(alloc: std.mem.Allocator, cfg: JoinJobStoreConfig) JoinJobStore {
         return .{
             .alloc = alloc,
+            .backing_alloc = alloc,
             .cfg = cfg,
         };
+    }
+
+    /// Install once, before publication or the first cached job. The owner is
+    /// process-backed and independent of the request that creates a job.
+    pub fn installRetainedOwner(self: *JoinJobStore, owner: *@import("../common/workload_allocator.zig").Owner) !void {
+        lockAtomic(&self.join_jobs_mutex);
+        defer self.join_jobs_mutex.unlock();
+        if (self.retained_owner != null or self.join_jobs.capacity() != 0) return error.JoinJobAllocatorAlreadyInstalled;
+        owner.retain();
+        self.retained_owner = owner;
+        self.alloc = owner.allocator();
     }
 
     pub fn initWithStore(alloc: std.mem.Allocator, cfg: JoinJobStoreConfig) !JoinJobStore {
@@ -1052,8 +1066,9 @@ pub const JoinJobStore = struct {
         self.join_jobs.deinit(self.alloc);
         if (self.opened_join_job_store) |store| {
             store.deinit();
-            self.alloc.destroy(store);
+            self.backing_alloc.destroy(store);
         }
+        if (self.retained_owner) |owner| owner.release();
         self.* = undefined;
     }
 
@@ -1206,6 +1221,25 @@ pub const JoinJobStore = struct {
         try opened.docstore.put(key, encoded);
     }
 
+    fn cloneRetainedState(self: *JoinJobStore, source: JoinShuffleJobState) !JoinShuffleJobState {
+        var result = source;
+        result.last_error = null;
+        result.partial_response = null;
+        result.cached_response = null;
+        errdefer result.deinit(self.alloc);
+        if (source.last_error) |value| result.last_error = try self.alloc.dupe(u8, value);
+        if (source.partial_response) |value| result.partial_response = try self.alloc.dupe(u8, value);
+        if (source.cached_response) |value| result.cached_response = try self.alloc.dupe(u8, value);
+        return result;
+    }
+
+    fn cachePersistedStateLocked(self: *JoinJobStore, job_id: u64, source: JoinShuffleJobState) !void {
+        if (self.join_jobs.contains(job_id)) return;
+        var copy = try self.cloneRetainedState(source);
+        errdefer copy.deinit(self.alloc);
+        try self.join_jobs.put(self.alloc, job_id, copy);
+    }
+
     fn loadPersistedJoinJobState(self: *JoinJobStore, alloc: std.mem.Allocator, job_id: u64) !?JoinShuffleJobState {
         const opened = self.opened_join_job_store orelse return null;
         const key = try joinJobKey(alloc, job_id);
@@ -1219,9 +1253,10 @@ pub const JoinJobStore = struct {
     }
 
     fn deletePersistedJoinJobState(self: *JoinJobStore, alloc: std.mem.Allocator, job_id: u64) void {
+        _ = alloc;
         const opened = self.opened_join_job_store orelse return;
-        const key = joinJobKey(alloc, job_id) catch return;
-        defer alloc.free(key);
+        var buffer: [64]u8 = undefined;
+        const key = joinJobKeyBuffer(&buffer, job_id) catch return;
         opened.docstore.delete(key) catch {};
     }
 
@@ -1231,14 +1266,13 @@ pub const JoinJobStore = struct {
         const now_ms = self.nowMillis();
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
-        var expired = std.ArrayListUnmanaged(u64).empty;
-        defer expired.deinit(self.alloc);
+        // Removing the current bucket does not resize this unmanaged map, so
+        // the iterator's next bucket remains valid. Cleanup allocates no list
+        // when the very budget it needs to free has been exhausted.
         var it = self.join_jobs.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.expires_at_millis == 0 or entry.value_ptr.expires_at_millis > now_ms) continue;
-            expired.append(self.alloc, entry.key_ptr.*) catch continue;
-        }
-        for (expired.items) |job_id| {
+            const job_id = entry.key_ptr.*;
             if (self.join_jobs.fetchRemove(job_id)) |removed| {
                 var state = removed.value;
                 state.deinit(self.alloc);
@@ -1292,7 +1326,6 @@ pub const JoinJobStore = struct {
         defer self.join_jobs_mutex.unlock();
         const state = self.join_jobs.getPtr(job_id) orelse return;
         const encoded = try self.encodeJoinPartitionResponse(self.alloc, partial_result);
-        errdefer self.alloc.free(encoded);
         if (state.partial_response) |value| self.alloc.free(value);
         state.partial_response = encoded;
         state.completed_partitions = partial_result.completed_partitions;
@@ -1315,6 +1348,7 @@ pub const JoinJobStore = struct {
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
         const state = self.join_jobs.getPtr(job_id) orelse return;
+        const replacement = try self.alloc.dupe(u8, encoded_response);
         if (state.cached_response) |value| self.alloc.free(value);
         if (state.partial_response) |value| {
             self.alloc.free(value);
@@ -1330,7 +1364,7 @@ pub const JoinJobStore = struct {
         state.next_partition_index = state.total_partitions;
         state.finalizer_retries = finalizer_retries;
         state.coordinator_finalized = coordinator_finalized;
-        state.cached_response = try self.alloc.dupe(u8, encoded_response);
+        state.cached_response = replacement;
         state.last_updated_at_millis = self.nowMillis();
         state.expires_at_millis = self.joinJobExpiryForPhase(.succeeded, state.last_updated_at_millis);
         try self.persistJoinJobState(job_id, state.*);
@@ -1340,13 +1374,14 @@ pub const JoinJobStore = struct {
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
         const state = self.join_jobs.getPtr(job_id) orelse return;
+        const replacement = try self.alloc.dupe(u8, @errorName(err));
         if (state.last_error) |value| self.alloc.free(value);
         if (state.partial_response) |value| {
             self.alloc.free(value);
             state.partial_response = null;
         }
         state.phase = .failed;
-        state.last_error = try std.fmt.allocPrint(self.alloc, "{s}", .{@errorName(err)});
+        state.last_error = replacement;
         state.last_updated_at_millis = self.nowMillis();
         state.expires_at_millis = self.joinJobExpiryForPhase(.failed, state.last_updated_at_millis);
         try self.persistJoinJobState(job_id, state.*);
@@ -1374,15 +1409,21 @@ pub const JoinJobStore = struct {
             const phase = state.phase;
             const finalizer_retries = state.finalizer_retries;
             const coordinator_finalized = state.coordinator_finalized;
+            const expiry = state.expires_at_millis;
+            const owned = alloc.dupe(u8, cached) catch |err| {
+                self.join_jobs_mutex.unlock();
+                return err;
+            };
             self.join_jobs_mutex.unlock();
-            var result = try self.parseJoinPartitionResponse(alloc, cached);
+            defer alloc.free(owned);
+            var result = try self.parseJoinPartitionResponse(alloc, owned);
             result.job_id = job_id;
             result.total_partitions = total_partitions;
             result.completed_partitions = completed_partitions;
             result.job_phase = phase;
             result.finalizer_retries = finalizer_retries;
             result.coordinator_finalized = coordinator_finalized;
-            result.expires_at_millis = state.expires_at_millis;
+            result.expires_at_millis = expiry;
             return result;
         }
         self.join_jobs_mutex.unlock();
@@ -1398,21 +1439,7 @@ pub const JoinJobStore = struct {
 
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
-        const entry = try self.join_jobs.getOrPut(self.alloc, job_id);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = .{
-                .owner_group_id = persisted.owner_group_id,
-                .phase = persisted.phase,
-                .total_partitions = persisted.total_partitions,
-                .completed_partitions = persisted.completed_partitions,
-                .worker_retries = persisted.worker_retries,
-                .finalizer_retries = persisted.finalizer_retries,
-                .coordinator_finalized = persisted.coordinator_finalized,
-                .last_updated_at_millis = persisted.last_updated_at_millis,
-                .last_error = if (persisted.last_error) |value| try self.alloc.dupe(u8, value) else null,
-                .cached_response = try self.alloc.dupe(u8, cached),
-            };
-        }
+        try self.cachePersistedStateLocked(job_id, persisted);
         var result = try self.parseJoinPartitionResponse(alloc, cached);
         result.job_id = job_id;
         result.total_partitions = persisted.total_partitions;
@@ -1443,9 +1470,14 @@ pub const JoinJobStore = struct {
                 return null;
             }
             const next_partition_index = state.next_partition_index;
+            const owned = alloc.dupe(u8, partial) catch |err| {
+                self.join_jobs_mutex.unlock();
+                return err;
+            };
             self.join_jobs_mutex.unlock();
+            defer alloc.free(owned);
             return .{
-                .result = try self.parseJoinPartitionResponse(alloc, partial),
+                .result = try self.parseJoinPartitionResponse(alloc, owned),
                 .next_partition_index = next_partition_index,
             };
         }
@@ -1465,24 +1497,7 @@ pub const JoinJobStore = struct {
         errdefer result.deinit(alloc);
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
-        const entry = try self.join_jobs.getOrPut(self.alloc, job_id);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = .{
-                .owner_group_id = persisted.owner_group_id,
-                .phase = persisted.phase,
-                .total_partitions = persisted.total_partitions,
-                .completed_partitions = persisted.completed_partitions,
-                .next_partition_index = persisted.next_partition_index,
-                .worker_retries = persisted.worker_retries,
-                .finalizer_retries = persisted.finalizer_retries,
-                .coordinator_finalized = persisted.coordinator_finalized,
-                .last_updated_at_millis = persisted.last_updated_at_millis,
-                .expires_at_millis = persisted.expires_at_millis,
-                .last_error = if (persisted.last_error) |value| try self.alloc.dupe(u8, value) else null,
-                .partial_response = try self.alloc.dupe(u8, partial),
-                .cached_response = null,
-            };
-        }
+        try self.cachePersistedStateLocked(job_id, persisted);
         return .{
             .result = result,
             .next_partition_index = persisted.next_partition_index,
@@ -1499,9 +1514,8 @@ pub const JoinJobStore = struct {
                 self.cleanupExpiredJoinJobs();
                 return null;
             }
-            const encoded = try encodeJoinJobState(alloc, job_id, state.*);
-            self.join_jobs_mutex.unlock();
-            return encoded;
+            defer self.join_jobs_mutex.unlock();
+            return try encodeJoinJobState(alloc, job_id, state.*);
         }
         self.join_jobs_mutex.unlock();
 
@@ -1517,29 +1531,16 @@ pub const JoinJobStore = struct {
 
     pub fn installJoinJobStateSnapshot(self: *JoinJobStore, alloc: std.mem.Allocator, job_id: u64, body: []const u8) !void {
         var parsed = try parseJoinJobState(alloc, body);
-        errdefer parsed.deinit(alloc);
         defer parsed.deinit(alloc);
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
+        var replacement = try self.cloneRetainedState(parsed);
+        var published = false;
+        defer if (!published) replacement.deinit(self.alloc);
         const entry = try self.join_jobs.getOrPut(self.alloc, job_id);
-        if (entry.found_existing) {
-            entry.value_ptr.deinit(self.alloc);
-        }
-        entry.value_ptr.* = .{
-            .owner_group_id = parsed.owner_group_id,
-            .phase = parsed.phase,
-            .total_partitions = parsed.total_partitions,
-            .completed_partitions = parsed.completed_partitions,
-            .next_partition_index = parsed.next_partition_index,
-            .worker_retries = parsed.worker_retries,
-            .finalizer_retries = parsed.finalizer_retries,
-            .coordinator_finalized = parsed.coordinator_finalized,
-            .last_updated_at_millis = parsed.last_updated_at_millis,
-            .expires_at_millis = parsed.expires_at_millis,
-            .last_error = if (parsed.last_error) |value| try self.alloc.dupe(u8, value) else null,
-            .partial_response = if (parsed.partial_response) |value| try self.alloc.dupe(u8, value) else null,
-            .cached_response = if (parsed.cached_response) |value| try self.alloc.dupe(u8, value) else null,
-        };
+        if (entry.found_existing) entry.value_ptr.deinit(self.alloc);
+        entry.value_ptr.* = replacement;
+        published = true;
         try self.persistJoinJobState(job_id, entry.value_ptr.*);
     }
 
@@ -1551,66 +1552,33 @@ pub const JoinJobStore = struct {
         result: JoinPartitionExecutionResult,
     ) ![]u8 {
         _ = self;
-        var root = std.json.Value{ .object = std.json.ObjectMap.empty };
-        defer deinitJsonValue(alloc, &root);
-
-        var hits_value = std.json.Value{ .array = std.json.Array.init(alloc) };
-        errdefer deinitJsonValue(alloc, &hits_value);
-        for (result.hits) |hit| {
-            try hits_value.array.append(try cloneJsonValue(alloc, hit));
-        }
-        try putOwnedJsonField(alloc, &root.object, "hits", hits_value);
-
-        var stats_value = std.json.Value{ .object = std.json.ObjectMap.empty };
-        errdefer deinitJsonValue(alloc, &stats_value);
-        try putOwnedJsonField(alloc, &stats_value.object, "left_rows_scanned", .{ .integer = result.stats.left_rows_scanned });
-        try putOwnedJsonField(alloc, &stats_value.object, "right_rows_scanned", .{ .integer = result.stats.right_rows_scanned });
-        try putOwnedJsonField(alloc, &stats_value.object, "rows_matched", .{ .integer = result.stats.rows_matched });
-        try putOwnedJsonField(alloc, &stats_value.object, "rows_unmatched_left", .{ .integer = result.stats.rows_unmatched_left });
-        try putOwnedJsonField(alloc, &stats_value.object, "rows_unmatched_right", .{ .integer = result.stats.rows_unmatched_right });
-        try putOwnedJsonField(alloc, &root.object, "stats", stats_value);
-        var matched_right_ids_value = std.json.Value{ .array = std.json.Array.init(alloc) };
-        errdefer deinitJsonValue(alloc, &matched_right_ids_value);
-        for (result.matched_right_ids) |matched_id| {
-            try matched_right_ids_value.array.append(.{ .string = try alloc.dupe(u8, matched_id) });
-        }
-        try putOwnedJsonField(alloc, &root.object, "matched_right_ids", matched_right_ids_value);
-        if (result.job_id) |value| try putOwnedJsonU64Field(alloc, &root.object, "job_id", value);
-        if (result.job_phase) |value| try putOwnedJsonField(alloc, &root.object, "job_phase", .{ .string = try alloc.dupe(u8, phaseString(value)) });
-        try putOwnedJsonField(alloc, &root.object, "total_partitions", .{ .integer = @intCast(result.total_partitions) });
-        try putOwnedJsonField(alloc, &root.object, "completed_partitions", .{ .integer = @intCast(result.completed_partitions) });
-        try putOwnedJsonField(alloc, &root.object, "expires_at_millis", .{ .integer = @intCast(result.expires_at_millis) });
-        try putOwnedJsonField(alloc, &root.object, "worker_retries", .{ .integer = @intCast(result.worker_retries) });
-        try putOwnedJsonField(alloc, &root.object, "finalizer_retries", .{ .integer = @intCast(result.finalizer_retries) });
-        if (result.finalizer_group_id) |group_id| {
-            try putOwnedJsonU64Field(alloc, &root.object, "finalizer_group_id", group_id);
-        }
-        try putOwnedJsonField(alloc, &root.object, "coordinator_finalized", .{ .bool = result.coordinator_finalized });
-        if (result.imported_owner_group_id) |group_id| {
-            try putOwnedJsonU64Field(alloc, &root.object, "imported_owner_group_id", group_id);
-        }
-        try putOwnedJsonField(alloc, &root.object, "imported_partial_state", .{ .bool = result.imported_partial_state });
-        try putOwnedJsonField(alloc, &root.object, "imported_cached_result", .{ .bool = result.imported_cached_result });
-        var attempts_value = std.json.Value{ .array = std.json.Array.init(alloc) };
-        errdefer deinitJsonValue(alloc, &attempts_value);
-        for (result.worker_attempts) |attempt| {
-            var attempt_obj = std.json.ObjectMap.empty;
-            try putOwnedJsonField(alloc, &attempt_obj, "partition_index", .{ .integer = @intCast(attempt.partition_index) });
-            try putOwnedJsonU64Field(alloc, &attempt_obj, "worker_group_id", attempt.worker_group_id);
-            try putOwnedJsonField(alloc, &attempt_obj, "succeeded", .{ .bool = attempt.succeeded });
-            try attempts_value.array.append(.{ .object = attempt_obj });
-        }
-        try putOwnedJsonField(alloc, &root.object, "worker_attempts", attempts_value);
-        var finalizer_attempts_value = std.json.Value{ .array = std.json.Array.init(alloc) };
-        errdefer deinitJsonValue(alloc, &finalizer_attempts_value);
-        for (result.finalizer_attempts) |attempt| {
-            var attempt_obj = std.json.ObjectMap.empty;
-            try putOwnedJsonU64Field(alloc, &attempt_obj, "worker_group_id", attempt.worker_group_id);
-            try putOwnedJsonField(alloc, &attempt_obj, "succeeded", .{ .bool = attempt.succeeded });
-            try finalizer_attempts_value.array.append(.{ .object = attempt_obj });
-        }
-        try putOwnedJsonField(alloc, &root.object, "finalizer_attempts", finalizer_attempts_value);
-        return try stringifyJsonValueAlloc(alloc, root);
+        // Borrow the completed result while encoding. Building an owned JSON
+        // tree here duplicated every hit and introduced partial-transfer cleanup.
+        return std.json.Stringify.valueAlloc(alloc, .{
+            .hits = result.hits,
+            .stats = .{
+                .left_rows_scanned = result.stats.left_rows_scanned,
+                .right_rows_scanned = result.stats.right_rows_scanned,
+                .rows_matched = result.stats.rows_matched,
+                .rows_unmatched_left = result.stats.rows_unmatched_left,
+                .rows_unmatched_right = result.stats.rows_unmatched_right,
+            },
+            .matched_right_ids = result.matched_right_ids,
+            .job_id = result.job_id,
+            .job_phase = if (result.job_phase) |value| phaseString(value) else @as(?[]const u8, null),
+            .total_partitions = result.total_partitions,
+            .completed_partitions = result.completed_partitions,
+            .expires_at_millis = result.expires_at_millis,
+            .worker_retries = result.worker_retries,
+            .finalizer_retries = result.finalizer_retries,
+            .finalizer_group_id = result.finalizer_group_id,
+            .coordinator_finalized = result.coordinator_finalized,
+            .imported_owner_group_id = result.imported_owner_group_id,
+            .imported_partial_state = result.imported_partial_state,
+            .imported_cached_result = result.imported_cached_result,
+            .worker_attempts = result.worker_attempts,
+            .finalizer_attempts = result.finalizer_attempts,
+        }, .{ .emit_null_optional_fields = false });
     }
 
     pub fn parseJoinPartitionResponse(
@@ -1624,22 +1592,33 @@ pub const JoinJobStore = struct {
         });
         defer parsed.deinit();
         const owned_hits = try alloc.alloc(std.json.Value, parsed.value.hits.len);
-        errdefer alloc.free(owned_hits);
+        var hits_initialized: usize = 0;
+        errdefer {
+            for (owned_hits[0..hits_initialized]) |*hit| deinitJsonValue(alloc, hit);
+            alloc.free(owned_hits);
+        }
         for (parsed.value.hits, 0..) |item, i| {
             owned_hits[i] = try cloneJsonValue(alloc, item);
+            hits_initialized += 1;
         }
 
         const matched_right_ids: [][]u8 = if (parsed.value.matched_right_ids) |value| blk: {
             const ids = try alloc.alloc([]u8, value.len);
+            var initialized: usize = 0;
             errdefer {
-                for (ids[0..]) |id| alloc.free(id);
+                for (ids[0..initialized]) |id| alloc.free(id);
                 alloc.free(ids);
             }
             for (value, 0..) |item, i| {
                 ids[i] = try alloc.dupe(u8, item);
+                initialized += 1;
             }
             break :blk ids;
         } else &.{};
+        errdefer {
+            for (matched_right_ids) |id| alloc.free(id);
+            alloc.free(matched_right_ids);
+        }
 
         const worker_attempts: []JoinPartitionExecutionResult.WorkerAttempt = if (parsed.value.worker_attempts) |value| blk: {
             const attempts = try alloc.alloc(JoinPartitionExecutionResult.WorkerAttempt, value.len);
@@ -1736,6 +1715,80 @@ pub const JoinJobStore = struct {
         );
     }
 };
+
+test "workload admission retained join jobs bound replacement overlap and clean up while closed" {
+    const alloc = std.testing.allocator;
+    const admission = @import("../common/request_admission.zig");
+    const Owner = @import("../common/workload_allocator.zig").Owner;
+    var gate = admission.RequestAdmission.initConfigured(0, .{ .max_retained_bytes = 64 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try Owner.create(alloc, &gate);
+    defer owner.release();
+    var store = JoinJobStore.init(alloc, .{});
+    defer store.deinit();
+    try store.installRetainedOwner(owner);
+    try store.recordJoinJobStart(1, null, 1);
+    const metadata_bytes = owner.live.load(.acquire);
+    const original = try alloc.alloc(u8, 32 * 1024);
+    defer alloc.free(original);
+    @memset(original, 'a');
+    const replacement = try alloc.alloc(u8, 40 * 1024);
+    defer alloc.free(replacement);
+    @memset(replacement, 'b');
+    try store.recordJoinJobSucceeded(1, null, 0, true, original);
+    try std.testing.expect(owner.live.load(.acquire) >= metadata_bytes + original.len);
+    try std.testing.expectError(error.OutOfMemory, store.recordJoinJobSucceeded(1, null, 0, true, replacement));
+    try std.testing.expectEqualSlices(u8, original, store.join_jobs.get(1).?.cached_response.?);
+    try store.recordJoinJobStart(1, null, 1);
+    try store.recordJoinJobSucceeded(1, null, 0, true, replacement);
+    try std.testing.expectEqualSlices(u8, replacement, store.join_jobs.get(1).?.cached_response.?);
+    gate.close();
+    store.join_jobs.getPtr(1).?.expires_at_millis = 1;
+    store.cleanupExpiredJoinJobs();
+    try std.testing.expectEqual(@as(usize, 0), store.join_jobs.count());
+    try std.testing.expectEqual(metadata_bytes, owner.live.load(.acquire));
+}
+
+test "workload admission join snapshot replacement unwinds every allocation failure" {
+    const Scope = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var store = JoinJobStore.init(alloc, .{});
+            defer store.deinit();
+            try store.recordJoinJobStart(1, null, 1);
+            try store.recordJoinJobSucceeded(1, null, 0, true, "old");
+            const encoded = try encodeJoinJobState(alloc, 1, .{
+                .last_error = @constCast("error"),
+                .partial_response = @constCast("partial"),
+                .cached_response = @constCast("replacement"),
+            });
+            defer alloc.free(encoded);
+            try store.installJoinJobStateSnapshot(alloc, 1, encoded);
+            const snapshot = (try store.loadJoinJobStateSnapshot(alloc, 1)).?;
+            defer alloc.free(snapshot);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scope.run, .{});
+}
+
+test "workload admission join partition decoding unwinds every allocation failure" {
+    const Scope = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var store = JoinJobStore.init(alloc, .{});
+            defer store.deinit();
+            var result = try store.parseJoinPartitionResponse(alloc,
+                \\{"hits":[{"_id":"left","nested":["value"]},{"_id":"right"}],"stats":{"left_rows_scanned":2,"right_rows_scanned":2,"rows_matched":2,"rows_unmatched_left":0,"rows_unmatched_right":0},"matched_right_ids":["one","two"],"worker_attempts":[{"partition_index":0,"worker_group_id":1,"succeeded":true}],"finalizer_attempts":[{"worker_group_id":2,"succeeded":true}],"job_phase":"succeeded"}
+            );
+            defer result.deinit(alloc);
+            const encoded = try store.encodeJoinPartitionResponse(alloc, result);
+            defer alloc.free(encoded);
+            var roundtrip = try store.parseJoinPartitionResponse(alloc, encoded);
+            defer roundtrip.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), roundtrip.hits.len);
+            try std.testing.expectEqual(@as(usize, 2), roundtrip.matched_right_ids.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scope.run, .{});
+}
 
 // ---------------------------------------------------------------------------
 // Execution functions (top-level pub)
@@ -5193,9 +5246,7 @@ fn parseJoinRowsResponse(
 }
 
 pub fn encodeJoinJobState(alloc: std.mem.Allocator, job_id: u64, state: JoinShuffleJobState) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try std.json.Stringify.value(EncodedJoinJobState{
+    return std.json.Stringify.valueAlloc(alloc, EncodedJoinJobState{
         .job_id = job_id,
         .owner_group_id = state.owner_group_id,
         .phase = phaseString(state.phase),
@@ -5210,8 +5261,7 @@ pub fn encodeJoinJobState(alloc: std.mem.Allocator, job_id: u64, state: JoinShuf
         .last_error = state.last_error,
         .partial_response = state.partial_response,
         .cached_response = state.cached_response,
-    }, .{}, &out.writer);
-    return try out.toOwnedSlice();
+    }, .{});
 }
 
 fn parseJoinJobState(alloc: std.mem.Allocator, body: []const u8) !JoinShuffleJobState {
@@ -7018,6 +7068,10 @@ pub fn phaseFromString(text: []const u8) !JoinShuffleJobPhase {
     if (std.mem.eql(u8, text, "succeeded")) return .succeeded;
     if (std.mem.eql(u8, text, "failed")) return .failed;
     return error.InvalidQueryRequest;
+}
+
+fn joinJobKeyBuffer(buffer: []u8, job_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "__api_join_jobs__:{d}", .{job_id});
 }
 
 fn joinJobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {

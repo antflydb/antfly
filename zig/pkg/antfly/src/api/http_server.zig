@@ -2972,6 +2972,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
     ) !distributed_join.JoinPartitionExecutionResult {
+        try self.ensureJoinJobMemory();
         self.join_job_store.setContext(self.joinContext());
         return distributed_join.executeJoinPartitionWorkerLocal(self.joinContext(), &self.join_job_store, alloc, source, worker_group_id, table_name, body);
     }
@@ -2984,6 +2985,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
     ) !distributed_join.JoinPartitionExecutionResult {
+        try self.ensureJoinJobMemory();
         self.join_job_store.setContext(self.joinContext());
         return distributed_join.executeJoinFinalizeWorkerLocal(self.joinContext(), &self.join_job_store, alloc, source, finalizer_group_id, table_name, body);
     }
@@ -3011,6 +3013,7 @@ pub const ApiHttpServer = struct {
         left_hits: []const std.json.Value,
         plan: PlannedJoinExecution,
     ) !RightJoinQueryResult {
+        try self.ensureJoinJobMemory();
         self.join_job_store.setContext(self.joinContext());
         return distributed_join.executeSupportedRightJoinQuery(self.joinContext(), &self.join_job_store, alloc, source, join, left_hits, plan, .{});
     }
@@ -3025,6 +3028,7 @@ pub const ApiHttpServer = struct {
         appended_left_field: bool,
         plan: PlannedJoinExecution,
     ) !?JoinPartitionExecutionResult {
+        try self.ensureJoinJobMemory();
         self.join_job_store.setContext(self.joinContext());
         return distributed_join.executeSupportedDistributedJoinFinalized(self.joinContext(), &self.join_job_store, alloc, source, join, left_hits, left_fields, appended_left_field, plan);
     }
@@ -3040,16 +3044,19 @@ pub const ApiHttpServer = struct {
         plan: PlannedJoinExecution,
         resume_state: ?distributed_join.JoinShuffleResumeState,
     ) !?JoinPartitionExecutionResult {
+        try self.ensureJoinJobMemory();
         self.join_job_store.setContext(self.joinContext());
         return distributed_join.executeSupportedDistributedJoinPartitions(self.joinContext(), &self.join_job_store, alloc, source, job_id, join, left_hits, appended_left_field, plan, resume_state);
     }
 
     pub fn recordJoinJobStart(self: *ApiHttpServer, job_id: u64, owner_group_id: ?u64, total_partitions: usize) !void {
+        try self.ensureJoinJobMemory();
         self.join_job_store.setContext(self.joinContext());
         return self.join_job_store.recordJoinJobStart(job_id, owner_group_id, total_partitions);
     }
 
     pub fn recordJoinJobProgress(self: *ApiHttpServer, job_id: u64, next_partition_index: usize, partial_result: distributed_join.JoinPartitionExecutionResult) !void {
+        try self.ensureJoinJobMemory();
         self.join_job_store.setContext(self.joinContext());
         return self.join_job_store.recordJoinJobProgress(job_id, next_partition_index, partial_result);
     }
@@ -3095,6 +3102,7 @@ pub const ApiHttpServer = struct {
     ingress_admission: @import("../common/workload_ingress.zig").Runtime,
     session_memory_admission: RequestAdmission,
     txn_session_memory_mutex: std.Io.Mutex = .init,
+    join_job_memory_mutex: std.Io.Mutex = .init,
     txn_session_memory: ?*@import("../common/workload_allocator.zig").Owner = null,
     source: StatusSource,
     metadata_mutation_retry_policy: MetadataMutationRetryPolicy = .{},
@@ -3112,7 +3120,7 @@ pub const ApiHttpServer = struct {
     first_request_started_at_ns: std.atomic.Value(u64) = .init(0),
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     remote_attempt_worker: ?*@import("workload_attempt_worker.zig").Store = null,
-    join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
+    join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .backing_alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     repair_job_store: repair_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     restore_job_store: restore_jobs.Store = .{ .alloc = undefined },
@@ -16567,6 +16575,19 @@ pub const ApiHttpServer = struct {
         errdefer owner.release();
         try self.a2a_tasks.installAllocator(owner.allocator());
         self.a2a_task_memory = owner;
+    }
+
+    /// Join cache and resumable state outlive request envelopes but share the
+    /// finite retained-session ceiling after mandatory completion reservation.
+    pub fn ensureJoinJobMemory(self: *ApiHttpServer) !void {
+        try self.ensureTransactionSessionMemory();
+        const io = configuredApiIo(self.cfg) orelse std.Io.Threaded.global_single_threaded.io();
+        self.join_job_memory_mutex.lockUncancelable(io);
+        defer self.join_job_memory_mutex.unlock(io);
+        if (self.join_job_store.retained_owner != null) return;
+        const owner = try @import("../common/workload_allocator.zig").Owner.create(self.owner_alloc, &self.session_memory_admission);
+        defer owner.release();
+        try self.join_job_store.installRetainedOwner(owner);
     }
 
     pub fn ensureTransactionSessionMemory(self: *ApiHttpServer) !void {

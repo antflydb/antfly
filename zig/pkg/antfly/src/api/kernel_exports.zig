@@ -208,6 +208,10 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         state.server.deinit();
         return fail(err);
     };
+    state.server.ensureJoinJobMemory() catch |err| {
+        state.server.deinit();
+        return fail(err);
+    };
     if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(&state.server.incoming_graph_routes);
     state.request_alloc = state.server.alloc;
     state.request_alloc_abi = .fromStd(&state.request_alloc);

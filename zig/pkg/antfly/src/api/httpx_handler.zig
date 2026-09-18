@@ -2422,7 +2422,8 @@ pub const AntflyApiHandler = struct {
         return ctx.json(result.parsed.value);
     }
 
-    fn internalJoinOperations(self: *AntflyApiHandler) internal_join_operations.Operations {
+    fn internalJoinOperations(self: *AntflyApiHandler) !internal_join_operations.Operations {
+        try self.api_server.ensureJoinJobMemory();
         return .{
             .job_store = &self.api_server.join_job_store,
             .join_context = self.api_server.joinContext(),
@@ -2468,7 +2469,7 @@ pub const AntflyApiHandler = struct {
         var input = @import("distributed_join.zig").parseJoinFinalizeRequest(ctx.allocator, body) catch
             return textResponse(ctx, 400, "invalid join finalize request");
         defer input.deinit(ctx.allocator);
-        var result = self.internalJoinOperations().finalize(
+        var result = (try self.internalJoinOperations()).finalize(
             ctx.allocator,
             operationContext(ctx, null),
             params.group_id,
@@ -2548,7 +2549,7 @@ pub const AntflyApiHandler = struct {
         var input = @import("distributed_join.zig").parseJoinRowsRequest(ctx.allocator, body) catch
             return textResponse(ctx, 400, "invalid join rows request");
         defer input.deinit(ctx.allocator);
-        const hits = self.internalJoinOperations().rows(
+        const hits = (try self.internalJoinOperations()).rows(
             ctx.allocator,
             operationContext(ctx, null),
             params.group_id,
@@ -2571,7 +2572,7 @@ pub const AntflyApiHandler = struct {
         var input = @import("distributed_join.zig").parseJoinUnmatchedRequest(ctx.allocator, body) catch
             return textResponse(ctx, 400, "invalid join unmatched request");
         defer input.deinit(ctx.allocator);
-        const result = self.internalJoinOperations().unmatched(
+        const result = (try self.internalJoinOperations()).unmatched(
             ctx.allocator,
             operationContext(ctx, null),
             params.group_id,
@@ -2594,7 +2595,7 @@ pub const AntflyApiHandler = struct {
         var input = @import("distributed_join.zig").parseJoinPartitionRequest(ctx.allocator, body) catch
             return textResponse(ctx, 400, "invalid join partition request");
         defer input.deinit(ctx.allocator);
-        var result = self.internalJoinOperations().partition(
+        var result = (try self.internalJoinOperations()).partition(
             ctx.allocator,
             operationContext(ctx, null),
             params.group_id,
