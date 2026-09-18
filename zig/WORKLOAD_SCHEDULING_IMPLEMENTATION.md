@@ -208,9 +208,13 @@ Generation closure is persisted before cancellation is signaled, and fence
 evidence waits for local work to unwind and terminal state to persist. Count and
 byte ceilings include outstanding/uncertain attempts, terminal tombstones, and
 fences. Restart retains unknown prior-incarnation work and its reservations;
-capacity reduction cannot erase it. This prerequisite currently uses bounded
-O(N) journal snapshot mutations. Point-key storage/counters, performance
-qualification, and coordinator reconciliation must precede coordinator rollout.
+capacity reduction cannot erase it. The v2 journal stores individual attempts,
+transactional count/byte accounting, and per-coordinator closure keys. Begin,
+finish, duplicate lookup, and usage use a fixed number of point operations;
+only startup reconstruction and generation fencing scan bounded records.
+Startup refuses a legacy v1 snapshot with `WorkerJournalMigrationRequired`;
+an offline migration must fence earlier writers and preserve their obligations.
+Performance qualification and coordinator reconciliation must precede rollout.
 The setting does not enable coordinator dispatch or automatic remote retirement.
 
 The existing distributed join RPCs now emit `budget_version=1` and validate an
@@ -273,7 +277,7 @@ does not raise a transport's independent connection or request-task limit.
 | Dense rerank and helpers | Shared scheduler owns drivers/helpers; exact workspaces and opted-in native read arenas own actual bytes; serial immutable pread suspends only with proven executor affinity | Audit remaining boundaries; remove enclosing thread-affine scopes for portable suspension; add durable ownership for cached HBC scratch |
 | Vector, text, graph, aggregation | Existing cancellation/work budgets and storage resource reservations; no scheduler continuation contract established | Inventory maximum nonyielding intervals, resumable state, and minimum completion resources; remain in the general lane until verified |
 | Scan/stream output | Tracked buffered bodies retain actual allocation charges through transport drain, including API-kernel and serverless handoffs; streaming snapshots remain storage/transport-owned | Complete streaming retained-state ownership and resume only through admission |
-| Remote coordinator/worker tasks | Versioned remaining budgets; authenticated opt-in join-row worker persists deduplication, terminal state, and generation closure; coordinator is still disabled | Wire coordinator ownership, membership/incarnation discovery, destination uncertainty, restart reconciliation, and scalable durable storage |
+| Remote coordinator/worker tasks | Versioned remaining budgets; authenticated opt-in join-row worker persists deduplication, terminal state, and generation closure; coordinator is still disabled | Wire coordinator ownership, membership/incarnation discovery, destination uncertainty, restart reconciliation, and durable-storage qualification |
 | Transaction commits | Stable sessions reserve bounded durable recovery-record capacity before prepare; existing decisions, fencing, and `PendingSessionRecovery` remain authoritative | Extend coverage to stateless writes and decoded mandatory-completion resources |
 | Background/control/recovery | Existing dedicated runtime owners; status/maintenance submission pressure retries without terminating control | Prove process-wide protected count/byte/progress floors and sustained-load fairness across foreground and background work |
 
@@ -324,7 +328,9 @@ executor, preserved wakes, bounded retry timing, permanent-error propagation,
 captured-snapshot failure cleanup, and refresh completion after capacity returns.
 Worker tests exercise real authenticated join-row dispatch, durable duplicates,
 generation closure, failure to persist terminal evidence, reopen, and reduced
-capacity. These tests do not constitute distributed coordinator qualification.
+capacity. Point-journal regressions also verify legacy-format refusal and that
+only actual previous-executor completion can reconcile its retained uncertainty.
+These tests do not constitute distributed coordinator qualification.
 
 Native Debug smoke exposed both a fatal background-capacity escape and a query
 allocator ownership mismatch. The control-capacity regression is fixed and its

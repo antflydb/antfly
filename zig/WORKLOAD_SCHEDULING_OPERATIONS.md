@@ -149,10 +149,14 @@ Restart preserves unknown old-incarnation work and its capacity charges; new
 work remains blocked until uncertainty is reconciled. Lowering limits cannot
 erase existing obligations, and deleting/restoring the journal is not fencing.
 Terminal tombstones remain charged until durable generation closure permits
-retirement. The current journal uses bounded snapshot mutations and still needs
-scalable point-key storage/counters and performance qualification. Enabling
-this worker does not enable coordinator dispatch, cluster-wide uncertainty
-reconciliation, or automatic remote-work retirement.
+retirement. The v2 journal updates point records and accounting atomically;
+only startup and generation fences scan bounded records. Read-only diagnostics
+and duplicate reconciliation do not write the journal. Performance qualification
+remains outstanding. A legacy v1 journal causes `WorkerJournalMigrationRequired`:
+its state must be preserved for an offline migration that fences earlier writers.
+Do not delete the journal to bypass this refusal. Enabling this worker does not
+enable coordinator dispatch, cluster-wide uncertainty reconciliation, or automatic
+remote-work retirement.
 
 ## Qualification
 
