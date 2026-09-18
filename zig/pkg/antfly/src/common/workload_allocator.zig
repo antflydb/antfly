@@ -13,9 +13,39 @@ pub const Owner = struct {
     refs: std.atomic.Value(usize) = .init(1),
     live: std.atomic.Value(usize) = .init(0),
     budget_exhausted: std.atomic.Value(bool) = .init(false),
+    prepaid_capacity: ?usize = null,
+    prepaid_remaining: std.atomic.Value(usize) = .init(0),
 
     pub fn create(backing: std.mem.Allocator, gate: *Controller) !*Owner {
         const account = try gate.memoryAccount(backing);
+        return createWithAccount(backing, account);
+    }
+
+    /// Reserve a verified maximum completion working set before accepting an
+    /// irreversible obligation. The charge stays owned until final retirement;
+    /// freeing a buffer replenishes these private credits, not foreground work.
+    /// Already reserved cleanup may allocate after admission is closed.
+    pub fn createReserved(backing: std.mem.Allocator, gate: *Controller, capacity: usize) !*Owner {
+        const self = try create(backing, gate);
+        errdefer self.release();
+        try self.account.reserve(capacity);
+        self.prepaid_capacity = capacity;
+        self.prepaid_remaining.store(capacity, .release);
+        return self;
+    }
+
+    /// A joined offload or separately retained output can use a different,
+    /// thread-safe backing allocator without escaping its originating budget.
+    /// The new owner retains the shared account, never the request allocator.
+    pub fn fork(self: *Owner, backing: std.mem.Allocator) !*Owner {
+        // A reserved owner's buffers must share its completion working set;
+        // retain that owner instead of silently borrowing foreground bytes.
+        if (self.prepaid_capacity != null) return error.ReservedOwnerCannotFork;
+        self.account.retain();
+        return createWithAccount(backing, self.account);
+    }
+
+    fn createWithAccount(backing: std.mem.Allocator, account: *MemoryAccount) !*Owner {
         errdefer account.release();
         try account.reserve(@sizeOf(Owner));
         errdefer account.free(@sizeOf(Owner));
@@ -34,7 +64,10 @@ pub const Owner = struct {
         std.debug.assert(self.live.load(.acquire) == 0);
         const account = self.account;
         const backing = self.backing;
+        const prepaid = self.prepaid_capacity orelse 0;
+        std.debug.assert(self.prepaid_remaining.load(.acquire) == prepaid);
         backing.destroy(self);
+        account.free(prepaid);
         account.free(@sizeOf(Owner));
         account.release();
     }
@@ -44,17 +77,34 @@ pub const Owner = struct {
     }
 
     fn reserve(self: *Owner, bytes: usize) !void {
+        if (self.prepaid_capacity != null) {
+            var remaining = self.prepaid_remaining.load(.acquire);
+            while (true) {
+                if (bytes > remaining) {
+                    self.budget_exhausted.store(true, .release);
+                    return error.AdmissionBytesExhausted;
+                }
+                remaining = self.prepaid_remaining.cmpxchgWeak(remaining, remaining - bytes, .acq_rel, .acquire) orelse return;
+            }
+        }
         self.account.reserve(bytes) catch |err| {
             self.budget_exhausted.store(true, .release);
             return err;
         };
     }
 
+    fn returnBytes(self: *Owner, bytes: usize) void {
+        if (self.prepaid_capacity) |capacity| {
+            const previous = self.prepaid_remaining.fetchAdd(bytes, .acq_rel);
+            std.debug.assert(previous <= capacity and bytes <= capacity - previous);
+        } else self.account.free(bytes);
+    }
+
     fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *Owner = @ptrCast(@alignCast(raw));
         self.reserve(len) catch return null;
         const result = self.backing.rawAlloc(len, alignment, ret_addr) orelse {
-            self.account.free(len);
+            self.returnBytes(len);
             return null;
         };
         _ = self.live.fetchAdd(len, .monotonic);
@@ -66,7 +116,7 @@ pub const Owner = struct {
         const growth = new_len -| memory.len;
         if (growth > 0) self.reserve(growth) catch return false;
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) {
-            self.account.free(growth);
+            self.returnBytes(growth);
             return false;
         }
         self.resized(memory.len, new_len);
@@ -78,7 +128,7 @@ pub const Owner = struct {
         const growth = new_len -| memory.len;
         if (growth > 0) self.reserve(growth) catch return null;
         const result = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse {
-            self.account.free(growth);
+            self.returnBytes(growth);
             return null;
         };
         self.resized(memory.len, new_len);
@@ -91,7 +141,7 @@ pub const Owner = struct {
         } else {
             const freed = old_len - new_len;
             _ = self.live.fetchSub(freed, .monotonic);
-            self.account.free(freed);
+            self.returnBytes(freed);
         }
     }
 
@@ -99,9 +149,73 @@ pub const Owner = struct {
         const self: *Owner = @ptrCast(@alignCast(raw));
         self.backing.rawFree(memory, alignment, ret_addr);
         _ = self.live.fetchSub(memory.len, .monotonic);
-        self.account.free(memory.len);
+        self.returnBytes(memory.len);
     }
 };
+
+test "workload admission prepaid completion cannot be consumed by foreground or shutdown" {
+    const alloc = std.testing.allocator;
+    var gate = Controller.initConfigured(1, .{ .max_retained_bytes = @sizeOf(Owner) + 128 });
+    defer gate.deinitMemory();
+    const owner = try Owner.createReserved(alloc, &gate, 128);
+    var owner_live = true;
+    defer if (owner_live) owner.release();
+    const account = owner.account;
+    account.retain();
+    defer account.release();
+    try std.testing.expectError(error.AdmissionBytesExhausted, Owner.create(alloc, &gate));
+    try std.testing.expectError(error.ReservedOwnerCannotFork, owner.fork(alloc));
+    const state = try owner.allocator().alloc(u8, 64);
+    try std.testing.expectError(error.OutOfMemory, owner.allocator().alloc(u8, 65));
+    gate.close();
+    gate.deinitMemory();
+    const completion = try owner.allocator().alloc(u8, 64);
+    try std.testing.expectEqual(@sizeOf(Owner) + 128, account.retainedBytes());
+    owner.allocator().free(state);
+    owner.allocator().free(completion);
+    try std.testing.expectEqual(@sizeOf(Owner) + 128, account.retainedBytes());
+    const retry = try owner.allocator().alloc(u8, 128);
+    owner.allocator().free(retry);
+    owner.release();
+    owner_live = false;
+    try std.testing.expectEqual(@as(usize, 0), account.retainedBytes());
+}
+
+test "workload admission prepaid completion backing failures return private credits" {
+    var gate = Controller.initConfigured(1, .{ .max_retained_bytes = @sizeOf(Owner) + 128 });
+    defer gate.deinitMemory();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    const owner = try Owner.createReserved(failing.allocator(), &gate, 128);
+    defer owner.release();
+    try std.testing.expectError(error.OutOfMemory, owner.allocator().alloc(u8, 128));
+    try std.testing.expect(!owner.budget_exhausted.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 128), owner.prepaid_remaining.load(.acquire));
+    try std.testing.expectEqual(@sizeOf(Owner) + 128, gate.stats().retained_bytes);
+}
+
+test "workload admission offload fork shares bytes while outliving request backing" {
+    const alloc = std.testing.allocator;
+    var gate = Controller.initConfigured(1, .{ .max_retained_bytes = 2 * @sizeOf(Owner) + 80 });
+    defer gate.deinitMemory();
+    const request = try Owner.create(alloc, &gate);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, request.fork(failing.allocator()));
+    try std.testing.expectEqual(@sizeOf(Owner), gate.stats().retained_bytes);
+
+    const offload = try request.fork(alloc);
+    defer offload.release();
+    const input = try request.allocator().alloc(u8, 32);
+    const output = try offload.allocator().alloc(u8, 48);
+    try std.testing.expectError(error.OutOfMemory, offload.allocator().alloc(u8, 1));
+    try std.testing.expectEqual(2 * @sizeOf(Owner) + 80, gate.stats().retained_bytes);
+    request.allocator().free(input);
+    request.release();
+    try std.testing.expectEqual(@sizeOf(Owner) + 48, gate.stats().retained_bytes);
+    gate.deinitMemory();
+    try std.testing.expectError(error.OutOfMemory, offload.allocator().alloc(u8, 1));
+    offload.allocator().free(output);
+    try std.testing.expectEqual(@sizeOf(Owner), offload.account.retainedBytes());
+}
 
 test "workload admission allocation ownership outlives execution and rolls back failed growth" {
     var gate = Controller.initConfigured(1, .{ .max_retained_bytes = @sizeOf(Owner) + 128 });

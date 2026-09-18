@@ -80,7 +80,7 @@ pub const MemoryAccount = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
-    fn retain(self: *MemoryAccount) void {
+    pub fn retain(self: *MemoryAccount) void {
         const previous = self.refs.fetchAdd(1, .monotonic);
         std.debug.assert(previous > 0 and previous < std.math.maxInt(usize));
     }
