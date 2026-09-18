@@ -359,6 +359,7 @@ export const generatorProviderCapabilities = {
   gemini: {},
   ollama: {},
   openai: {},
+  openrouter: {},
   vertex: {},
 } as const satisfies Record<GeneratorProvider, object>;
 export const generatorProviders = Object.keys(generatorProviderCapabilities) as GeneratorProvider[];
