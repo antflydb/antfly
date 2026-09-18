@@ -21,6 +21,49 @@ pub fn build(b: *std.Build) void {
     _ = project.create(b);
     _ = b.step("cache-finetune-registry", "Check command compilation coverage without rebuilding commands");
     const tests = b.top_level_steps.get("inference-finetune-test").?;
+    var test_runs: usize = 0;
+    for (tests.step.dependencies.items) |dependency| {
+        const run = dependency.cast(std.Build.Step.Run) orelse continue;
+        for (run.argv.items) |arg| {
+            if (arg != .artifact) continue;
+            const artifact = arg.artifact.artifact;
+            if (artifact.kind != .@"test" or !std.mem.eql(u8, artifact.name, "finetune-tests"))
+                @panic("unexpected finetune test executable");
+            test_runs += 1;
+        }
+    }
+    if (test_runs != 1) @panic("finetune gate must execute one shared test artifact once");
+    const test_root = @embedFile("pkg/inference/src/finetune_test_root.zig");
+    var root_count: usize = 0;
+    for (@import("pkg/inference/build/finetune/tests.zig").specs) |spec| {
+        if (spec.covered_by_inference) continue;
+        const import = b.fmt("@import(\"{s}\")", .{spec.root_source_file["src/".len..]});
+        if (std.mem.count(u8, test_root, import) != 1)
+            std.debug.panic("shared finetune root must import {s} exactly once", .{spec.root_source_file});
+        root_count += 1;
+    }
+    if (std.mem.count(u8, test_root, "@import(") != root_count)
+        @panic("unexpected import in shared finetune root");
+    var inference_owner_found = false;
+    for (b.top_level_steps.get("inference-test").?.step.dependencies.items) |dependency| {
+        const run = dependency.cast(std.Build.Step.Run) orelse continue;
+        for (run.argv.items) |arg| {
+            if (arg != .artifact) continue;
+            const source = arg.artifact.artifact.root_module.root_source_file orelse continue;
+            if (!std.mem.endsWith(u8, source.getPath(b), "/src/inference.zig")) continue;
+            inference_owner_found = true;
+            for (@import("pkg/inference/build/finetune/tests.zig").inference_overlap_filters) |filter| {
+                var excluded = false;
+                for (run.argv.items[1..], 1..) |value, index| {
+                    if (value != .bytes or !std.mem.eql(u8, value.bytes, filter)) continue;
+                    const previous = run.argv.items[index - 1];
+                    if (previous == .bytes and std.mem.eql(u8, previous.bytes, "--skip-test-filter")) excluded = true;
+                }
+                if (!excluded) @panic("inference repeats a finetuning-owned test group");
+            }
+        }
+    }
+    if (!inference_owner_found) @panic("missing inference test owner");
     const specs = @import("pkg/inference/build/finetune/tools.zig").specs ++
         @import("pkg/inference/build/finetune/workflows.zig").specs;
     const checks = b.top_level_steps.get("inference-finetune-command-check") orelse

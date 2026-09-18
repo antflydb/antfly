@@ -145,6 +145,8 @@ pub const TestSpec = struct {
     imports: []const Import = &.{},
     native_link: NativeLink = .none,
     filters: []const []const u8 = &.{},
+    /// Runtime family selection when a focused target includes imported tests.
+    focused_filters: []const []const u8 = &.{},
 };
 
 pub const Command = struct {
@@ -280,6 +282,35 @@ pub fn addCommandChecks(ctx: Context, specs: []const CommandSpec) *std.Build.Ste
         group_index += 1;
     }
     return step;
+}
+
+/// One source boundary and compile artifact for ordinary finetuning tests.
+/// Reuse inference's dependency identities so implementations have one owner.
+pub fn sharedTests(ctx: Context, specs: []const TestSpec) *std.Build.Step.Compile {
+    const b = ctx.b;
+    const root = b.createModule(.{
+        .root_source_file = ctx.path("src/finetune_test_root.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    const exe = b.addTest(.{
+        .name = "finetune-tests",
+        .max_rss = ctx.test_compile_max_rss,
+        .root_module = root,
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    root.addImport("antfly_platform", ctx.antfly_platform_mod);
+    for (specs) |spec| {
+        if (spec.covered_by_inference) continue;
+        std.debug.assert(spec.filters.len == 0);
+        std.debug.assert(spec.native_link != .no_accel);
+        for (spec.imports) |dependency| {
+            if (!root.import_table.contains(@tagName(dependency)))
+                addImports(ctx, root, &.{dependency}, ctx.qualification_pjrt_mod);
+        }
+    }
+    configureNative(ctx, exe, .default, &.{.inference_internal});
+    return exe;
 }
 
 pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {

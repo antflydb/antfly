@@ -1118,6 +1118,61 @@ class RuntimeCacheTest(unittest.TestCase):
         failure = self.build("cache-finetune-registry", succeeds=False)
         self.assertIn("received undeclared import undeclared-test-import", failure)
 
+    def test_finetune_shared_test_ownership(self):
+        shutil.copyfile(
+            ZIG_ROOT / "tools/fixtures/finetune_commands.zig",
+            self.root / "zig/build.zig",
+        )
+        self.build("cache-finetune-registry")
+        tests = self.own("zig/pkg/inference/build/finetune/tests.zig")
+        contents = tests.read_text()
+        attachment = "aggregate.dependOn(&run.step);"
+        self.assertIn(attachment, contents)
+        tests.write_text(
+            contents.replace(
+                attachment,
+                attachment
+                + "\n    aggregate.dependOn(&ctx.b.addRunArtifact(shared).step);",
+            )
+        )
+        failure = self.build("cache-finetune-registry", succeeds=False)
+        self.assertIn(
+            "finetune gate must execute one shared test artifact once", failure
+        )
+        tests.write_text(contents)
+        root = self.own("zig/pkg/inference/src/finetune_test_root.zig")
+        contents = root.read_text()
+        imported = '    _ = @import("finetune/test/test_gliner2_data.zig");'
+        self.assertIn(imported, contents)
+        root.write_text(contents.replace(imported, ""))
+        failure = self.build("cache-finetune-registry", succeeds=False)
+        self.assertIn("shared finetune root must import", failure)
+        root.write_text(contents)
+        inference = self.own("zig/pkg/inference/build/tests.zig")
+        contents = inference.read_text()
+        exclusion = 'run_tests.addArgs(&.{ "--skip-test-filter", filter });'
+        self.assertIn(exclusion, contents)
+        inference.write_text(contents.replace(exclusion, "_ = filter;"))
+        failure = self.build("cache-finetune-registry", succeeds=False)
+        self.assertIn("inference repeats a finetuning-owned test group", failure)
+
+    def test_finetune_standalone_shared_targets(self):
+        self.use_standalone()
+        shutil.copyfile(
+            ZIG_ROOT / "tools/fixtures/finetune_standalone.zig",
+            self.build_directory / "build.zig",
+        )
+        self.build("cache-finetune-standalone")
+        project = self.build_directory / "project_build.zig"
+        contents = project.read_text()
+        attachment = 'default_test_step.dependOn(&b.top_level_steps.get("test-finetune-unit").?.step);'
+        self.assertIn(attachment, contents)
+        project.write_text(contents.replace(attachment, "_ = default_test_step;"))
+        failure = self.build("cache-finetune-standalone", succeeds=False)
+        self.assertIn(
+            "standalone gate must reach shared finetuning owner once", failure
+        )
+
     def test_wasm_profile_cache_contracts(self):
         for source in ("zig/lib/httpx/src/httpx.zig", "zig/lib/json/src/mod.zig"):
             path = self.own(source)

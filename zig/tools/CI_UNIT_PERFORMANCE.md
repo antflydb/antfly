@@ -27,8 +27,8 @@ overlap another CLI's source tree; Zig rejects those files appearing in two
 modules. Their registry entries set `shared_check = false`, including fused
 chunker evaluation, which shares native-compute sources with training. A future
 conflicting entrypoint fails the build instead of silently disappearing from
-coverage. New registry entries are automatically checked. The ordinary
-finetuning test executables and their ownership remain unchanged.
+coverage. New registry entries are automatically checked. Command checks remain
+separate from the single ordinary finetuning test executable described below.
 
 `python3 -m unittest tools.test_finetune_command_checks
 tools.test_runtime_cache.RuntimeCacheTest.test_finetune_command_registry`
@@ -49,6 +49,62 @@ step durations, not exclusive wall time. This follow-up removes 11 command
 compilations (31%) without changing test selection or executing commands. A clean
 Linux CI run is needed to measure elapsed improvement; cached local builds are
 not a cold-build speedup measurement.
+
+## One ordinary finetuning test executable
+
+`inference-finetune-test` and standalone `test-finetune` now run one shared
+`finetune-tests` executable instead of 21. The 24 command-check compilations
+remain distinct compile/link coverage. `inference-finetune-unit-test` (root) and
+`test-finetune-unit` (standalone) run only the shared test executable. Existing
+focused targets such as `test-gliner2-data` reuse that same compile artifact and
+select tests at runtime; `-- --test-filter <substring>` also selects runtime tests.
+
+The shared source root imports all ordinary test roots, and the test registry
+supplies their dependency union. Data/tokenizer test wrappers now reference
+inference's existing implementation owner rather than creating a second module
+for the same files. The runner retains a fresh allocator and I/O lifecycle per
+test. `--reverse-test-order` exercises the same selection in reverse order
+without recompiling or duplicating normal CI execution.
+
+Four inference-owned compatibility targets (graph cache and entity cleanup
+families) remain explicitly callable, but are not dependencies of the finetuning
+gate. Standalone `test` includes both inference and the shared finetuning owner;
+requesting `test` and `test-finetune` together reuses the same run node.
+
+The consolidation exposed 47 existing repeat executions: trainer/evaluator tests
+had different namespace prefixes when compiled as independent roots, so the
+old name-based ownership audit did not recognize the overlap. The default
+inference run now excludes those three test-name prefixes; finetuning owns them.
+Explicitly filtered inference runs retain their historical reachability.
+
+Validation on macOS ARM64, Debug, CPU configuration:
+
+- Before/after executable inventories retain all 136 prior tests exactly once
+  within finetuning, after normalizing the newly shared root's namespace. The
+  only added test is the aggregate import check.
+- Both normal and reverse CPU execution passed: 124 passed, 13 skipped.
+- Reverse execution with the host Metal device passed: 127 passed, 10 skipped
+  (CUDA/optional model fixtures unavailable). All three Metal gradient-parity
+  objectives passed in the shared process.
+- Two focused standalone targets selected the original 43 data and 3 recipe
+  tests while compiling the shared artifact once. The evaluator target also
+  retains all 13 tests, including six imported adapter tests.
+- Replacing the finetuning entries in the previous full local inventory and
+  applying the new inference ownership exclusions gives 16,740 named tests /
+  16,740 executions, down from 16,787 executions. This is a recomposed inventory,
+  not a fresh compilation of every gate; CI runs the full ownership audit.
+- Build-graph regression checks reject omitted test roots, repeated aggregate
+  execution, missing inference ownership exclusions, and a disconnected
+  standalone owner. Every ordinary focused target must reuse the same artifact.
+
+Run the command/ownership checks from `zig/`:
+
+```sh
+python3 -m unittest tools.test_finetune_command_checks \
+  tools.test_runtime_cache.RuntimeCacheTest.test_finetune_command_registry \
+  tools.test_runtime_cache.RuntimeCacheTest.test_finetune_shared_test_ownership \
+  tools.test_runtime_cache.RuntimeCacheTest.test_finetune_standalone_shared_targets
+```
 
 ## Ownership and boundaries
 
