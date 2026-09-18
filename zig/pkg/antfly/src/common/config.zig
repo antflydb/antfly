@@ -213,6 +213,8 @@ pub const Config = struct {
         cleanup_interval_seconds: u64 = 60,
         max_count: usize = 1024,
         max_record_bytes: usize = 16 * 1024 * 1024,
+        max_recovery_count: ?usize = null,
+        max_recovery_bytes: ?u64 = null,
         max_savepoints: usize = 64,
     };
 
@@ -961,6 +963,8 @@ pub const Config = struct {
             .cleanup_interval_seconds = try boundedPositiveInt(u64, cfg.cleanup_interval_seconds, 1, 3600, 60),
             .max_count = try boundedPositiveInt(usize, cfg.max_count, 1, 65536, 1024),
             .max_record_bytes = try boundedPositiveInt(usize, cfg.max_record_bytes, 65536, 67108864, 16 * 1024 * 1024),
+            .max_recovery_count = if (cfg.max_recovery_count != null) try boundedPositiveInt(usize, cfg.max_recovery_count, 1, 65536, 1) else null,
+            .max_recovery_bytes = if (cfg.max_recovery_bytes != null) try boundedPositiveInt(u64, cfg.max_recovery_bytes, 65536, 1099511627776, 65536) else null,
             .max_savepoints = try boundedPositiveInt(usize, cfg.max_savepoints, 1, 1024, 64),
         };
     }
@@ -3658,6 +3662,8 @@ test "common config parses bounded transaction session policy" {
         \\    "cleanup_interval_seconds": 30,
         \\    "max_count": 256,
         \\    "max_record_bytes": 1048576,
+        \\    "max_recovery_count": 8,
+        \\    "max_recovery_bytes": 8388608,
         \\    "max_savepoints": 16
         \\  }
         \\}
@@ -3667,6 +3673,8 @@ test "common config parses bounded transaction session policy" {
     try std.testing.expectEqual(@as(u64, 30), cfg.transaction_sessions.cleanup_interval_seconds);
     try std.testing.expectEqual(@as(usize, 256), cfg.transaction_sessions.max_count);
     try std.testing.expectEqual(@as(usize, 1048576), cfg.transaction_sessions.max_record_bytes);
+    try std.testing.expectEqual(@as(?usize, 8), cfg.transaction_sessions.max_recovery_count);
+    try std.testing.expectEqual(@as(?u64, 8388608), cfg.transaction_sessions.max_recovery_bytes);
     try std.testing.expectEqual(@as(usize, 16), cfg.transaction_sessions.max_savepoints);
 
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,

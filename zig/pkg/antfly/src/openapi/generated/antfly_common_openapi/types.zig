@@ -2142,6 +2142,10 @@ pub const TransactionSessionConfig = struct {
     cleanup_interval_seconds: ?i64 = null,
     max_count: ?i64 = null,
     max_record_bytes: ?i64 = null,
+    /// Optional cap on transaction sessions with unfinished commit or coordinator acknowledgement. New commits reserve capacity before preparation; existing recovery always proceeds.
+    max_recovery_count: ?i64 = null,
+    /// Optional retained recovery reservation cap. Each pending session reserves at least max_record_bytes. Admission scans durable session metadata under the write transaction, bounded by max_count records and max_count times max_record_bytes examined bytes.
+    max_recovery_bytes: ?i64 = null,
     max_savepoints: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -2150,6 +2154,8 @@ pub const TransactionSessionConfig = struct {
         .{ "cleanup_interval_seconds", "cleanup_interval_seconds", true },
         .{ "max_count", "max_count", true },
         .{ "max_record_bytes", "max_record_bytes", true },
+        .{ "max_recovery_count", "max_recovery_count", true },
+        .{ "max_recovery_bytes", "max_recovery_bytes", true },
         .{ "max_savepoints", "max_savepoints", true },
     };
 
@@ -2177,6 +2183,14 @@ pub const TransactionSessionConfig = struct {
         }
         if (self.max_record_bytes) |value| {
             try jw.objectField("max_record_bytes");
+            try jw.write(value);
+        }
+        if (self.max_recovery_count) |value| {
+            try jw.objectField("max_recovery_count");
+            try jw.write(value);
+        }
+        if (self.max_recovery_bytes) |value| {
+            try jw.objectField("max_recovery_bytes");
             try jw.write(value);
         }
         if (self.max_savepoints) |value| {

@@ -4307,6 +4307,16 @@ pub const AntflyApiHandler = struct {
         // maintenance can replay the same transaction ID without duplicating
         // non-idempotent transforms.
         _ = (self.api_server.txn_sessions.markCommitExecutionStarted(alloc, txn_id) catch |err| switch (err) {
+            error.RecoveryCapacityExhausted => {
+                // No participant preparation/commit has started. The durable
+                // session remains sealed and may be retried explicitly.
+                return httpx.Response.fromJson(ctx.allocator, 429, .{
+                    .@"error" = "RecoveryCapacityExhausted",
+                    .reason = "recovery_capacity_exhausted",
+                    .stage = "admission",
+                    .execution_started = false,
+                });
+            },
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");

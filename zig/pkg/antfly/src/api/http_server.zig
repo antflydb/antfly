@@ -1283,6 +1283,8 @@ pub const ApiHttpServerConfig = struct {
     session_savepoint_limit: ?usize = null,
     session_max_count: ?usize = null,
     session_max_record_bytes: ?usize = null,
+    session_max_recovery_count: ?usize = null,
+    session_max_recovery_bytes: ?u64 = null,
     /// Optional node-wide resource owner. The owner must outlive ApiHttpServer.
     /// Cache budgets and concurrency are intentionally not HTTP/API config.
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -3306,6 +3308,8 @@ pub const ApiHttpServer = struct {
                     cfg.session_max_record_bytes,
                 );
                 registry.durable_scope = cfg.session_store_scope;
+                registry.max_recovery_count = cfg.session_max_recovery_count;
+                registry.max_recovery_bytes = cfg.session_max_recovery_bytes;
                 break :blk registry;
             },
             .join_job_store = distributed_join.JoinJobStore.init(owner_alloc, .{
@@ -3719,6 +3723,8 @@ pub const ApiHttpServer = struct {
                 effective_cfg.session_max_record_bytes,
             );
             server.txn_sessions.durable_scope = effective_cfg.session_store_scope;
+            server.txn_sessions.max_recovery_count = effective_cfg.session_max_recovery_count;
+            server.txn_sessions.max_recovery_bytes = effective_cfg.session_max_recovery_bytes;
         }
         if (cfg.join_job_store != null and cfg.join_job_store_path != null)
             return error.InvalidApiServerConfig;

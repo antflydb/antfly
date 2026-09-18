@@ -1268,6 +1268,16 @@ components:
           minimum: 65536
           maximum: 67108864
           default: 16777216
+        max_recovery_count:
+          type: integer
+          minimum: 1
+          maximum: 65536
+          description: "Optional cap on transaction sessions with unfinished commit or coordinator acknowledgement. New commits reserve capacity before preparation; existing recovery always proceeds."
+        max_recovery_bytes:
+          type: integer
+          minimum: 65536
+          maximum: 1099511627776
+          description: "Optional retained recovery reservation cap. Each pending session reserves at least max_record_bytes. Admission scans durable session metadata under the write transaction, bounded by max_count records and max_count times max_record_bytes examined bytes."
         max_savepoints:
           type: integer
           minimum: 1

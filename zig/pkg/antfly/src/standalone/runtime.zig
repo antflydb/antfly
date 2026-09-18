@@ -3644,6 +3644,8 @@ pub fn runFromIterator(
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
             .session_max_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_count else standalone_session_max_count,
             .session_max_record_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_record_bytes else standalone_session_max_record_bytes,
+            .session_max_recovery_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_recovery_count else null,
+            .session_max_recovery_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_recovery_bytes else null,
             .session_savepoint_limit = if (loaded_config) |*cfg| cfg.transaction_sessions.max_savepoints else standalone_session_savepoint_limit,
         },
         .ha = if (ha_primary != null or ha_standby != null or ha_fence_store != null or ha_former_primary_log != null) .{
