@@ -511,3 +511,44 @@ production Debug build exited zero; SHA-256:
 `69c36d8db8835a9a7acacc096aed9d901d612126dccc9388680e8b042ac49d64`.
 Receipt: `/tmp/workload-recovery-read503-production-debug-receipt.json`.
 This frozen binary predates the internal prepaid-memory stage.
+
+
+### Passed native reconciliation and destination isolation
+
+Both following local correctness cells passed against the frozen production
+Debug binary at `39cd8b34b86f6907b64e43d64b8288631519032b`, SHA-256
+`69c36d8db8835a9a7acacc096aed9d901d612126dccc9388680e8b042ac49d64`.
+Build receipt: `/tmp/workload-recovery-read503-production-debug-receipt.json`
+(actual exit zero). This binary predates `013b533924` and subsequent WAL/completion
+work; these runs do not validate those later changes or qualify performance.
+
+The complete reconciliation cell passed all 19 checked requests with no schedule
+violations, unexpected errors or cleanup failures:
+`/tmp/workload-reconciliation-39cd8b34b8-receipts` (21/21 checksums verified).
+Each of three discarded-response phases returned HTTP 503 and retained one
+coordinator record; healing restored the exact document and zero records under
+fresh, stable metrics checks. The worker restart retained its namespace and
+increased its epoch. The API restart preserved worker identity and recovered.
+All owned processes exited zero during final cleanup; intentional fault kills
+are recorded separately.
+
+The independent checker verified 17 request-associated signed proofs with zero
+errors in `/tmp/workload-reconciliation-39cd8b34b8-receipts-proof-check.json`.
+After API restart, a matching fence covered generation 2 and was completely
+forwarded at relay time 130191380750 ns, before the generation 3 request first
+arrived at 130192677750 ns. This is signed identity plus relay-observed ordering,
+not proof of application consumption. Coordinator retirement is separately
+supported by the scenario's fresh record-count checks and successful reads.
+
+The complete two-destination cell also passed:
+`/tmp/workload-destination-39cd8b34b8-receipts` (24/24 checksums verified).
+Actual single-voter groups and advertised routing proved distinct destinations
+4 and 2. After losing a response from destination 4, its lookup returned 503 and
+coordinator records stayed at one. Three exact lookups on destination 2 succeeded
+through its own proxy while that debt remained. Healing destination 4 restored
+its exact lookup and zero records. All four strict metrics gates and 23 semantic
+requests passed; all four processes exited zero, with no cleanup or proxy errors.
+The independent sidecar verified 14 associated signed proofs with zero errors:
+`/tmp/workload-destination-39cd8b34b8-receipts-proof-check.json`.
+These are small local correctness results, not replicated performance or
+whole-process resource-envelope qualification.
