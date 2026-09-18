@@ -55,8 +55,6 @@ datasets/
 *.log
 *.jpg
 *.py
-!zig/tools/run_bounded_zig_build.py
-!zig/tools/patch_zig_0_16_build_runner_maxrss.py
 laion-400m-images/
 data/
 

@@ -4,18 +4,13 @@ This is the release matrix and acceptance policy selected before measuring the
 new scheduling policies. No row is qualified yet. Admission unit tests and the
 HTTP C80 fixture do not substitute for these workloads.
 
-Kubernetes is not a prerequisite. Run scheduler correctness in deterministic
-tests, real-runtime behavior in direct processes, and resource/performance gates
-in Docker containers with explicit CPU, memory, and swap limits matching the
+Run scheduler correctness in deterministic tests, real-runtime behavior in
+direct processes, and resource/performance gates in Docker containers with
+explicit CPU, memory, and swap limits matching the
 packages below. Direct multi-process/container clusters can exercise remote
-accounting and failure schedules without an operator or Kubernetes networking.
-
-The optional [kind environment](WORKLOAD_SCHEDULING_KIND.md) covers deployment
-integration: operator reconciliation, pod lifecycle, PVCs, service routing, and
-deployment-level HA/recovery. It applies package envelopes, checks Docker's
-aggregate capacity, verifies effective cgroup limits, and retains evidence.
-Its local-path storage and shared host are recorded qualification conditions.
-Keep those integration results separate from direct-container scheduling results.
+accounting and failure schedules. Verify effective cgroup limits and record the
+shared host and storage conditions for every container run. Deployment integration
+for the operator, pod lifecycle, volumes, and service routing is separate work.
 
 ## Cloud resource envelopes
 
@@ -38,7 +33,7 @@ Optional hot standby adds a data node; it does not increase primary capacity.
 Gate all three single-node packages. Gate the Starter and Pro replicated
 topologies for coordination, fan-out, cancellation, fencing, recovery, and
 rolling-upgrade behavior. Gate Standard with hot standby for drain/failover and
-irrevocable-write recovery. Record actual pod requests/limits, CPU quota,
+irrevocable-write recovery. Record actual container resource limits, CPU quota,
 architecture, disk class, and resource-manager budgets for each run. A local
 development configuration is not evidence for a paid package. Container CPU
 quota must govern automatic sizing; host CPU count is not its substitute.
@@ -52,8 +47,7 @@ latency isolation from weights alone.
 
 Use Debug for iteration, deterministic/model tests, allocation failure, and
 cancellation/ownership checks. Add ReleaseSafe coverage for optimized execution
-with safety checks. Neither Kubernetes nor ReleaseFast is required for those
-correctness tests. Reserve ReleaseFast for final production smoke tests and
+with safety checks. Reserve ReleaseFast for final production smoke tests and
 performance qualification while it is the shipped optimization mode.
 
 Use the same binary optimization, data, query semantics, and recall setting for

@@ -169,8 +169,9 @@ Network tests need permission to bind local listening sockets.
 
 ## Remaining design phases
 
-- Complete the prerequisite resource ownership model for continuations, remote
-  attempts, mandatory recovery, and demotion; add their deterministic models.
+- Audit the tested ownership foundations against real continuation, remote
+  attempt, mandatory recovery, and demotion paths; extend deterministic coverage
+  for the integration boundaries.
 - Complete Phase 1 ingress/planning/output byte ownership, process-wide protected
   floors, and all SDK/Cloud error contracts. The current byte counter is limited
   to foreground request reservations.
@@ -180,14 +181,15 @@ Network tests need permission to bind local listening sockets.
   and recovery handoff.
 - Implement Phase 3 safe read retries, Cloud diagnostics
   and policy integration, adaptive control behind an explicit mode, and deployment
-  qualification. Select numerical acceptance thresholds before measurements and
-  retain both open-loop and closed-loop results before changing defaults.
+  qualification. Apply the numerical acceptance thresholds already recorded in
+  the qualification matrix and retain both open-loop and closed-loop results
+  before changing defaults.
 
 Passing queue correctness tests does not satisfy the full design's release gates.
 Automatic/adaptive modes and new default waiting policies remain unavailable.
 The [qualification matrix](WORKLOAD_SCHEDULING_QUALIFICATION.md) records actual
 Cloud package sizes and numerical release thresholds selected before measurement.
 Debug is the normal development correctness gate; final performance runs use
-the shipped optimization mode. The optional kind helper is deployment integration
-tooling, with offline rendering/unit coverage so far; scheduler development and
-direct-container qualification do not wait for it.
+the shipped optimization mode. Qualification uses direct processes and containers
+with explicit Cloud resource limits. Deployment integration tooling is separate
+work.
