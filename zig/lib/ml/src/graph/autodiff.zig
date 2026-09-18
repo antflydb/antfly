@@ -973,6 +973,21 @@ fn applyVjp(
                         const grad_b = try dotGeneral2DDirect(b, adj_for_dot, ins[0], 0, 0);
                         try accumulate(b, adjoints, ins[1], grad_b);
                     }
+                } else if (lhs_ax <= 1 and rhs_ax <= 1) {
+                    vjp_geometry_supported = true;
+                    // Retained forward storage must stay in its physical
+                    // layout. Form each derivative directly in that layout
+                    // rather than materializing a transpose.
+                    const grad_a = if (lhs_ax == 1)
+                        try b.matmul2DLayout(adj_for_dot, ins[1], false, rhs_ax == 0)
+                    else
+                        try b.matmul2DLayout(ins[1], adj_for_dot, rhs_ax == 1, true);
+                    const grad_b = if (rhs_ax == 0)
+                        try b.matmul2DLayout(ins[0], adj_for_dot, lhs_ax == 1, false)
+                    else
+                        try b.matmul2DLayout(adj_for_dot, ins[0], true, lhs_ax == 0);
+                    try accumulate(b, adjoints, ins[0], grad_a);
+                    try accumulate(b, adjoints, ins[1], grad_b);
                 } else if (strict) return error.NoVjpRule;
             } else if (attrs.num_contracting == 1 and attrs.num_batch == 1 and a_shape.rank() == 3 and b_shape.rank() == 3) {
                 vjp_geometry_supported = true;
