@@ -362,7 +362,7 @@ pub const Controller = struct {
         // retiring stack storage, including cancellation racing publication.
         while (true) {
             options.check() catch |err| {
-                self.cancelWaiter(&waiter);
+                self.cancelWaiter(&waiter, err);
                 return err;
             };
             self.lock();
@@ -389,7 +389,7 @@ pub const Controller = struct {
             waiter.ready.waitTimeout(options.io, .{ .duration = .{ .raw = .fromNanoseconds(poll_ns), .clock = .awake } }) catch |err| switch (err) {
                 error.Timeout => {},
                 error.Canceled => {
-                    self.cancelWaiter(&waiter);
+                    self.cancelWaiter(&waiter, err);
                     return err;
                 },
             };
@@ -451,15 +451,14 @@ pub const Controller = struct {
         }
     }
 
-    fn cancelWaiter(self: *Controller, waiter: *Waiter) void {
+    fn cancelWaiter(self: *Controller, waiter: *Waiter, cause: anyerror) void {
         self.lock();
         defer self.mutex.unlock();
-        self.cancelled +|= 1;
         if (waiter.finished) {
             if (waiter.outcome == null) {
                 self.active -= 1;
                 self.retained_bytes -= waiter.options.retained_bytes;
-            }
+            } else return; // The grant/close path already recorded retirement.
         } else {
             self.remove(waiter);
             self.queued -= 1;
@@ -467,6 +466,10 @@ pub const Controller = struct {
             self.retained_bytes -= waiter.options.retained_bytes;
             self.recordWait(waiter.options.now() -| waiter.started_ns);
         }
+        if (cause == error.DeadlineExceeded) {
+            self.expired +|= 1;
+            self.recordRejection(.deadline);
+        } else self.cancelled +|= 1;
         self.grant();
     }
 
@@ -636,6 +639,40 @@ test "workload admission cancellation racing grant returns every reservation onc
     try std.testing.expectEqual(@as(usize, 0), stats.queued);
     try std.testing.expectEqual(@as(usize, 0), stats.retained_bytes);
     try std.testing.expectEqual(@as(u64, 1), stats.waited_total);
+}
+
+test "workload admission deadline checkpoints retire as expiry before or after grant" {
+    const Checkpoint = struct {
+        blocker: ?*Controller.Lease,
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == 1) return;
+            if (self.blocker) |lease| lease.release();
+            return error.DeadlineExceeded;
+        }
+    };
+    for ([_]bool{ false, true }) |grant_first| {
+        var controller = Controller.initConfigured(1, .{ .max_wait_ms = 5000, .max_queued_requests = 1, .max_queued_bytes = 64, .max_retained_bytes = 128 });
+        var blocker = try controller.acquire(.{ .io = std.testing.io, .retained_bytes = 64 });
+        defer blocker.release();
+        var checkpoint: Checkpoint = .{ .blocker = if (grant_first) &blocker else null };
+        try std.testing.expectError(error.DeadlineExceeded, controller.acquire(.{
+            .io = std.testing.io,
+            .retained_bytes = 64,
+            .cancellation = .{ .ptr = &checkpoint, .check_fn = Checkpoint.check },
+        }));
+        const stats = controller.stats();
+        try std.testing.expectEqual(@as(u64, 1), stats.expired_total);
+        try std.testing.expectEqual(@as(u64, 0), stats.cancelled_total);
+        try std.testing.expectEqual(@as(u64, 1), stats.rejected_total);
+        try std.testing.expectEqual(@as(u64, 1), stats.rejection_reasons[@intFromEnum(RejectionReason.deadline)]);
+        try std.testing.expectEqual(@as(usize, 0), stats.queued);
+        try std.testing.expectEqual(@as(usize, if (grant_first) 0 else 64), stats.retained_bytes);
+        blocker.release();
+        try std.testing.expectEqual(@as(usize, 0), controller.stats().in_flight);
+    }
 }
 
 test "workload admission byte reductions stop grants without revoking live leases" {
