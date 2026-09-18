@@ -1554,6 +1554,7 @@ pub const AntflyApiHandler = struct {
         }
         const body = (try ctx.body()) orelse "";
         const request = protocol_adapters.McpRequest{
+            .context = operationContext(ctx, authenticated_identity),
             .method = method,
             .endpoint_path = endpoint_path,
             .authorization = ctx.header("authorization"),
@@ -6453,11 +6454,14 @@ pub const AntflyApiHandler = struct {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
-        const alloc = ctx.allocator;
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "lookupKey", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("lookupKey", &admission_lease);
+        const alloc = ctx.response.bodyAllocator();
         const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
-        defer alloc.free(decoded_table_name);
+        defer ctx.allocator.free(decoded_table_name);
         const decoded_key = (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid path parameter");
-        defer alloc.free(decoded_key);
+        defer ctx.allocator.free(decoded_key);
         const source = self.api_server.table_reads orelse {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -6465,6 +6469,10 @@ pub const AntflyApiHandler = struct {
 
         var lookup_opts = try http_route_helpers.parseLookupOptions(alloc, ctx.request.uri.query orelse "");
         defer lookup_opts.deinit(alloc);
+        const request_context = operationContext(ctx, authenticated_identity);
+        lookup_opts.opts.execution_deadline_ns = request_context.deadline_ns;
+        lookup_opts.opts.execution_io = request_context.deadline_io;
+        lookup_opts.opts.cancellation = request_context.cancellation;
         const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch {
             _ = ctx.status(400);
             return ctx.text("invalid read consistency");
@@ -6477,7 +6485,7 @@ pub const AntflyApiHandler = struct {
             decoded_key,
             lookup_opts.opts,
             consistency,
-            operationContext(ctx, authenticated_identity),
+            request_context,
         ) catch |err| switch (err) {
             error.TableNotFound => {
                 _ = ctx.status(404);
@@ -10184,6 +10192,92 @@ test "httpx inference connection preserves upstream retry guidance" {
     try std.testing.expectEqualStrings("{\"error\":\"busy\"}", response.body.?);
 }
 
+test "workload admission document lookups preserve lifetime and retained output across public aliases and MCP" {
+    const alloc = std.testing.allocator;
+    const Reads = struct {
+        mode: enum { normal, cancel, expire } = .normal,
+        signal: std.atomic.Value(bool) = .init(false),
+        deadline_ns: u64 = 0,
+        calls: usize = 0,
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
+        }
+        fn lookup(raw: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, opts: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(self.deadline_ns, opts.execution_deadline_ns.?);
+            try std.testing.expect(opts.cancellation.?.ptr != null);
+            if (self.mode == .cancel) self.signal.store(true, .release);
+            if (self.mode == .expire) {
+                while (@import("antfly_platform").time.monotonicNs() < self.deadline_ns)
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return .{ .json = try a.dupe(u8, "{\"title\":\"alpha\"}"), .version = 7 };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnexpectedTestCall;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedTestCall;
+        }
+    };
+    var reads: Reads = .{};
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{ .query_max_concurrent_requests = 1, .query_admission_waiting = .{ .max_retained_bytes = 65536 } }, source.iface(), reads.source(), null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    for (0..4) |mode| {
+        reads.mode = if (mode < 2) .normal else if (mode == 2) .cancel else .expire;
+        reads.signal.store(false, .release);
+        reads.deadline_ns = @import("antfly_platform").time.monotonicNs() + (if (mode == 3) @as(u64, 20 * std.time.ns_per_ms) else 5 * std.time.ns_per_s);
+        var request = try httpx.Request.init(alloc, .GET, "/db/v1/tables/docs/documents/doc:a");
+        defer request.deinit();
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        var ctx_live = true;
+        defer if (ctx_live) ctx.deinit();
+        ctx.cancellation = &reads.signal;
+        ctx.application_deadline_ns = reads.deadline_ns;
+        var response = if (mode == 1)
+            try handler.lookupNamespaceTableDocument(&ctx, "default", "public", "docs", "doc:a", .{})
+        else
+            try handler.lookupKey(&ctx, "docs", "doc:a", .{});
+        var response_live = true;
+        defer if (response_live) response.deinit();
+        try std.testing.expectEqual(@as(u16, if (mode < 2) 200 else if (mode == 2) 408 else 504), response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
+        ctx.deinit();
+        ctx_live = false;
+        try std.testing.expect(api_server.queryAdmissionStats().retained_bytes > 0);
+        response.deinit();
+        response_live = false;
+        try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().retained_bytes);
+    }
+    reads.mode = .normal;
+    reads.signal.store(false, .release);
+    reads.deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+    var mcp_response = try api_server.executeMcpApplicationOperationWithContext(.{ .get_document = .{ .table_name = "docs", .key = "doc:a" } }, null, .{
+        .deadline_ns = reads.deadline_ns,
+        .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&reads.signal),
+    });
+    try std.testing.expectEqual(@as(u16, 200), mcp_response.status);
+    try std.testing.expect(mcp_response.memory_owner != null);
+    try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
+    try std.testing.expect(api_server.queryAdmissionStats().retained_bytes > 0);
+    mcp_response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().retained_bytes);
+
+    var blocker = api_server.query_admission.tryAcquireLease().?;
+    defer blocker.release();
+    var request = try httpx.Request.init(alloc, .GET, "/db/v1/tables/docs/documents/doc:a");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var rejected = try handler.lookupKey(&ctx, "docs", "doc:a", .{});
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 429), rejected.status.code);
+    try std.testing.expectEqual(@as(usize, 5), reads.calls);
+}
+
 test "httpx query admission releases a cancelled query slot" {
     var admission = RequestAdmission.init(1);
     try std.testing.expect(admission.tryAcquire());
@@ -10229,6 +10323,14 @@ test "httpx query admission treats zero capacity as unlimited" {
 }
 
 test "httpx query admission C80 transport burst waits behind 32 active requests" {
+    try testForegroundReadTransportBurst(false);
+}
+
+test "httpx query admission C80 document lookups share query capacity and bounded waiting" {
+    try testForegroundReadTransportBurst(true);
+}
+
+fn testForegroundReadTransportBurst(comptime lookup: bool) !void {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const Hook = struct {
@@ -10244,7 +10346,7 @@ test "httpx query admission C80 transport burst waits behind 32 active requests"
     var hook: Hook = .{};
     var status_source = AuthStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{
-        .query_admission_waiting = .{ .max_wait_ms = 5000, .max_queued_requests = 64, .max_queued_bytes = 1024 * 1024, .max_retained_bytes = 4 * 1024 * 1024 },
+        .query_admission_waiting = .{ .max_wait_ms = 5000, .max_queued_requests = if (lookup) 16 else 64, .max_queued_bytes = 1024 * 1024, .max_retained_bytes = 4 * 1024 * 1024 },
         .request_lifecycle_hook = .{ .ptr = &hook, .reach_fn = Hook.reach },
     }, status_source.iface(), null, null);
     defer api_server.deinit();
@@ -10257,7 +10359,10 @@ test "httpx query admission C80 transport burst waits behind 32 active requests"
     const address = server.server.boundAddress().?;
     var clients = [_]?httpx.Socket{null} ** 80;
     defer for (&clients) |*slot| if (slot.*) |*client| client.close();
-    const request = "POST /db/v1/tables/docs/query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 11\r\n\r\n{\"limit\":1}";
+    const request = if (lookup)
+        "GET /db/v1/tables/docs/documents/doc:a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    else
+        "POST /db/v1/tables/docs/query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 11\r\n\r\n{\"limit\":1}";
     for (&clients) |*slot| {
         var client = try httpx.Socket.connect(address, std.testing.io);
         errdefer client.close();
@@ -10266,13 +10371,17 @@ test "httpx query admission C80 transport burst waits behind 32 active requests"
         slot.* = client;
     }
     const deadline = @import("antfly_platform").time.monotonicNs() + 3 * std.time.ns_per_s;
-    while (api_server.queryAdmissionStats().queued != 48) {
+    const expected_queued: usize = if (lookup) 16 else 48;
+    const expected_rejected: usize = if (lookup) 32 else 0;
+    while (api_server.queryAdmissionStats().queued != expected_queued or api_server.queryAdmissionStats().rejected_total != expected_rejected) {
         if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
         try std.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expectEqual(@as(usize, 32), api_server.queryAdmissionStats().in_flight);
     try std.testing.expectEqual(@as(u32, 32), hook.started.load(.acquire));
     hook.finish.set(std.testing.io);
+    var completed: usize = 0;
+    var rejected: usize = 0;
     for (&clients) |*slot| {
         var bytes: [256]u8 = undefined;
         var len: usize = 0;
@@ -10282,17 +10391,24 @@ test "httpx query admission C80 transport burst waits behind 32 active requests"
             if (n == 0) return error.TestUnexpectedResult;
             len += n;
         }
-        // The fixture has no table-read backend. Every request reaches that
-        // normal 404 result after admission; none is rejected as overloaded.
-        try std.testing.expect(std.mem.startsWith(u8, bytes[0..len], "HTTP/1.1 404"));
+        // Admitted calls reach the fixture's missing backend; only work above
+        // both execution and queue capacity receives overload rejection.
+        if (std.mem.startsWith(u8, bytes[0..len], "HTTP/1.1 404")) {
+            completed += 1;
+        } else {
+            try std.testing.expect(std.mem.startsWith(u8, bytes[0..len], "HTTP/1.1 429"));
+            rejected += 1;
+        }
         // A received status line does not prove that output ownership retired.
         // Drain this Connection: close response through transport shutdown.
         while (try slot.*.?.recv(&bytes) != 0) {}
     }
-    try std.testing.expectEqual(@as(u32, 80), hook.started.load(.acquire));
+    try std.testing.expectEqual(80 - expected_rejected, completed);
+    try std.testing.expectEqual(expected_rejected, rejected);
+    try std.testing.expectEqual(@as(u32, @intCast(completed)), hook.started.load(.acquire));
     const stats = api_server.queryAdmissionStats();
     try std.testing.expectEqual(@as(usize, 32), stats.peak_in_flight);
-    try std.testing.expectEqual(@as(u64, 0), stats.rejected_total);
+    try std.testing.expectEqual(@as(u64, expected_rejected), stats.rejected_total);
     try std.testing.expectEqual(@as(usize, 0), stats.retained_bytes);
     try std.testing.expectEqual(@as(usize, 0), stats.queued);
 }

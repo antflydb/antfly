@@ -322,6 +322,7 @@ const ExtensionRuntimeBinding = struct {
 };
 
 pub const McpRequest = struct {
+    context: @import("operation.zig").RequestContext = .{},
     method: contextual_operations.Method,
     endpoint_path: []const u8,
     authorization: ?[]const u8 = null,
@@ -343,6 +344,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
     const Server = @TypeOf(server_ptr);
     const ToolContext = struct {
         server: Server,
+        request_context: @import("operation.zig").RequestContext,
         authenticated_identity: @TypeOf(authenticated_identity),
         permissions: ?[]const usermgr.Permission,
         spec: McpToolSpec,
@@ -582,7 +584,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn executeOperation(ctx: *@This(), alloc: std.mem.Allocator, operation: contextual_operations.McpApplicationOperation) !mcp.CallToolResult {
-            var resp = try ctx.server.executeMcpApplicationOperation(operation, ctx.authenticated_identity);
+            var resp = try ctx.server.executeMcpApplicationOperationWithContext(operation, ctx.authenticated_identity, ctx.request_context);
             defer resp.deinit(ctx.server.alloc);
             return try mcpResultFromOwnedResponse(alloc, resp);
         }
@@ -613,6 +615,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
     for (&contexts, mcp_tool_specs) |*ctx, spec| {
         ctx.* = .{
             .server = server_ptr,
+            .request_context = request.context,
             .authenticated_identity = authenticated_identity,
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .spec = spec,

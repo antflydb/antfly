@@ -11627,7 +11627,7 @@ pub const ApiHttpServer = struct {
         });
         while (true) {
             try ensureTableOperationActive(request);
-            return source.lookup(alloc, table_name, key, opts, consistency) catch |err| switch (err) {
+            var result = source.lookup(alloc, table_name, key, opts, consistency) catch |err| switch (err) {
                 error.StorageReadTemporarilyUnavailable => {
                     const now_ns = retryMonotonicNs(retry_io);
                     if (retry_timeout_ns == 0) return err;
@@ -11644,6 +11644,9 @@ pub const ApiHttpServer = struct {
                 },
                 else => return err,
             };
+            errdefer if (result) |*value| value.deinit(alloc);
+            try ensureTableOperationActive(request);
+            return result;
         }
     }
 
@@ -15679,6 +15682,16 @@ pub const ApiHttpServer = struct {
         input: contextual_operations.McpApplicationOperation,
         borrowed_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
+        return self.executeMcpApplicationOperationWithContext(input, borrowed_identity, .{});
+    }
+
+    pub fn executeMcpApplicationOperationWithContext(
+        self: *ApiHttpServer,
+        input: contextual_operations.McpApplicationOperation,
+        borrowed_identity: ?AuthenticatedIdentity,
+        request_context: api_operation.RequestContext,
+    ) !contextual_operations.OwnedResponse {
+        try request_context.ensureActive();
         var operation = input;
         var authenticated_identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (authenticated_identity) |*identity| identity.deinit(self.alloc);
@@ -15691,18 +15704,19 @@ pub const ApiHttpServer = struct {
                 request.table_name = physical_name.?;
             },
             inline else => |*request| {
-                physical_name = self.resolveCatalogKeyAlloc(self.alloc, .{}, request.table_name, &authenticated_identity) catch |err| return contextualJsonErrorResponse(self.alloc, system_catalog.httpStatus(err), @errorName(err));
+                physical_name = self.resolveCatalogKeyAlloc(self.alloc, request_context, request.table_name, &authenticated_identity) catch |err| return contextualJsonErrorResponse(self.alloc, system_catalog.httpStatus(err), @errorName(err));
                 request.table_name = physical_name.?;
             },
         }
         const admission_class = request_admission_policy.mcpOperationClass(operation);
         const body_bytes = switch (operation) {
             .query, .sample_documents, .batch => |value| value.body.len,
+            .get_document => |value| value.table_name.len +| value.key.len +| (if (value.fields) |fields| fields.len else @as(usize, 0)),
             else => 0,
         };
         var admission_lease: ?RequestAdmission.Lease = switch (admission_class) {
             .none, .inference => null,
-            .query => self.acquireQuery(body_bytes, .{}) catch |err| return self.foregroundAdmissionFailure(err),
+            .query => self.acquireQuery(body_bytes, request_context) catch |err| return self.foregroundAdmissionFailure(err),
             .write => self.acquireWrite(body_bytes, .{}) catch |err| {
                 if (err == error.AdmissionFull) return self.writeOverloadedResponse();
                 return self.foregroundAdmissionFailure(err);
@@ -15760,7 +15774,7 @@ pub const ApiHttpServer = struct {
                 defer response.deinit(self.alloc);
                 return try contextualResponseFromPublicTable(self.alloc, response);
             },
-            .get_document => |request| return try self.executeMcpGetDocument(request, authenticated_identity),
+            .get_document => |request| return try self.executeMcpGetDocument(request, authenticated_identity, request_context),
             .sample_documents => |request| return try self.executeMcpSampleDocuments(request, authenticated_identity),
             .query => |request| return self.handleAdmittedPublicTableQueryWithContentTypeCancellation(request.table_name, request.body, null, authenticated_identity, null),
             .backup => |request| {
@@ -16073,24 +16087,49 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         request: contextual_operations.McpApplicationOperation.DocumentRead,
         authenticated_identity: ?AuthenticatedIdentity,
+        request_context: api_operation.RequestContext,
     ) !contextual_operations.OwnedResponse {
-        const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
-        const query = if (request.fields) |fields| try std.fmt.allocPrint(self.alloc, "fields={s}", .{fields}) else try self.alloc.dupe(u8, "");
-        defer self.alloc.free(query);
-        var lookup_options = try http_route_helpers.parseLookupOptions(self.alloc, query);
-        defer lookup_options.deinit(self.alloc);
-        var result = (source.lookup(self.alloc, request.table_name, request.key, lookup_options.opts, .read_index) catch |err| switch (err) {
-            error.TableNotFound => return try contextual_operations.textAlloc(self.alloc, 404, "not found"),
+        const memory = self.queryAllocationOwner() catch |err| return self.foregroundAdmissionFailure(err);
+        defer if (memory) |owner| owner.release();
+        const alloc = if (memory) |owner| owner.allocator() else self.alloc;
+        var response = self.executeMcpGetDocumentAllocated(alloc, request, authenticated_identity, request_context) catch |err| {
+            if (memory) |owner| if (owner.budget_exhausted.load(.acquire)) return self.queryMemoryExhaustedResponse();
+            return err;
+        };
+        if (memory) |owner| {
+            owner.retain();
+            response.memory_owner = owner;
+        }
+        return response;
+    }
+
+    fn executeMcpGetDocumentAllocated(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        request: contextual_operations.McpApplicationOperation.DocumentRead,
+        authenticated_identity: ?AuthenticatedIdentity,
+        request_context: api_operation.RequestContext,
+    ) !contextual_operations.OwnedResponse {
+        const source = self.table_reads orelse return try contextual_operations.textAlloc(alloc, 404, "not found");
+        const query = if (request.fields) |fields| try std.fmt.allocPrint(alloc, "fields={s}", .{fields}) else try alloc.dupe(u8, "");
+        defer alloc.free(query);
+        var lookup_options = try http_route_helpers.parseLookupOptions(alloc, query);
+        defer lookup_options.deinit(alloc);
+        lookup_options.opts.execution_deadline_ns = request_context.deadline_ns;
+        lookup_options.opts.execution_io = request_context.deadline_io;
+        lookup_options.opts.cancellation = request_context.cancellation;
+        var result = (self.lookupWithReadinessRetry(alloc, source, request.table_name, request.key, lookup_options.opts, .read_index, request_context) catch |err| switch (err) {
+            error.TableNotFound => return try contextual_operations.textAlloc(alloc, 404, "not found"),
             else => return err,
-        }) orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
-        defer result.deinit(self.alloc);
-        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, request.table_name);
-        defer if (row_filter_json) |value| self.alloc.free(value);
+        }) orelse return try contextual_operations.textAlloc(alloc, 404, "not found");
+        defer result.deinit(alloc);
+        const row_filter_json = try resolveEffectiveRowFilterJson(alloc, authenticated_identity, request.table_name);
+        defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| {
             if (!(try self.docJsonMatchesRowFilter(request.key, result.json, value)))
-                return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+                return try contextual_operations.textAlloc(alloc, 404, "not found");
         }
-        return contextual_operations.json(try self.alloc.dupe(u8, result.json), false);
+        return contextual_operations.json(try alloc.dupe(u8, result.json), false);
     }
 
     fn executeMcpSampleDocuments(
@@ -36883,6 +36922,11 @@ test "shared application admission covers MCP query and write operations" {
     try std.testing.expectEqualStrings("query capacity exhausted", sample.body);
     try std.testing.expectEqualStrings("1", sample.headers[0].value);
 
+    var document = try server.executeMcpApplicationOperation(.{ .get_document = .{ .table_name = "docs", .key = "doc:a" } }, null);
+    defer document.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), document.status);
+    try std.testing.expectEqualStrings("1", document.headers[0].value);
+
     var query_builder = try server.executeQueryBuilderAgent("{\"intent\":\"find relevant documents\"}", null);
     defer query_builder.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 429), query_builder.status);
@@ -36896,7 +36940,7 @@ test "shared application admission covers MCP query and write operations" {
     defer write.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 429), write.status);
     try std.testing.expectEqualStrings("write capacity exhausted", write.body);
-    try std.testing.expectEqual(@as(u64, 3), server.queryAdmissionStats().rejected_total);
+    try std.testing.expectEqual(@as(u64, 4), server.queryAdmissionStats().rejected_total);
     try std.testing.expectEqual(@as(u64, 1), server.writeAdmissionStats().rejected_total);
 }
 

@@ -64,6 +64,20 @@ executor capabilities, and worker configuration. Incompatible layouts are
 rejected. No inference-provider admission or transaction durability contract
 is replaced by this queue.
 
+Public document lookups (`lookupKey` and its database/namespace alias) and MCP
+`get_document` now share the query gate. They previously bypassed it. This closes
+a data-read admission gap using the existing configured query capacity (32 by
+default), so concurrent lookups can now receive 429 without opting into waiting.
+No separate lookup gate or new default capacity was introduced. HTTP lookup
+projections/results and the MCP application result use the query allocation
+owner. Incoming request cancellation/deadlines reach storage lookup options and
+readiness retries; a late result is freed before returning timeout/cancellation.
+The final MCP protocol envelope retains its existing adapter ownership. The
+serverless route inventory has no document-lookup endpoint; its existing query
+routes already use query admission. Metadata, readiness, metrics, and control
+routes retain their existing bypass policy. This behavior change still requires
+release qualification; it is not evidence that all overload timeouts are fixed.
+
 Query and write classes have independent fixed count/byte budgets. This preserves
 their existing isolation and does not introduce borrowing between them. Configured
 and effective queue bounds, queue residence histograms, active/queued counts,
@@ -272,7 +286,7 @@ does not raise a transport's independent connection or request-task limit.
 
 | Execution path | Current owner and boundaries | Requirement before fine-grained scheduling |
 | --- | --- | --- |
-| Public query and write operations | Admission lease held around the existing synchronous operation, including joins of its helpers | Split runnable, retained state, and request lifetime at verified quiescent boundaries |
+| Public queries, document lookups, and writes | Admission lease held around the existing synchronous operation, including joins of its helpers; lookups share query capacity | Split runnable, retained state, and request lifetime at verified quiescent boundaries |
 | Query decoding/planning | Foreground body reservations plus tracked public single/NDJSON query and serverless query allocations; some catalog/auth/session resolution precedes the grant | Complete all frontend coverage and introduce separately protected planning capacity |
 | Dense rerank and helpers | Shared scheduler owns drivers/helpers; exact workspaces and opted-in native read arenas own actual bytes; serial immutable pread suspends only with proven executor affinity | Audit remaining boundaries; remove enclosing thread-affine scopes for portable suspension; add durable ownership for cached HBC scratch |
 | Vector, text, graph, aggregation | Existing cancellation/work budgets and storage resource reservations; no scheduler continuation contract established | Inventory maximum nonyielding intervals, resumable state, and minimum completion resources; remain in the general lane until verified |
@@ -321,6 +335,10 @@ resume without fresh metadata capacity. Executor archive and compiled-owner
 tests verify that only proven affinity enables this path. The real HTTP C80
 fixture verifies 32 admitted plus 48 queued operations; its missing-table
 responses test transport admission, not database query throughput.
+The C80 lookup variant holds 32 active and 16 queued reads and rejects the
+remaining 32, then verifies all request/output charges retire. Lookup fixtures
+also cover both public aliases, MCP application results, cancellation, original
+deadlines, and output lifetime after execution/context retirement.
 Network tests need permission to bind local listening sockets.
 
 The focused data-runtime gate covers actual exhaustion of an eight-slot durable

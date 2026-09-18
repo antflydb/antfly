@@ -14,6 +14,16 @@ before selecting production policies.
 These coarse operations may wait on storage or other services while admitted;
 they do not measure running CPU threads. Legacy zero disables that count gate.
 
+Migration note: public document GETs (including database/namespace aliases) and
+MCP `get_document` previously bypassed foreground admission. They now share the
+existing query capacity, including its default of 32. Lookup-heavy applications
+may therefore see 429 under pressure and compete with queries for the same
+configured budget. Waiting remains opt-in. Review concurrency and retained-byte
+headroom when upgrading; this fixes policy coverage rather than qualifying a
+new default. Metadata lookups, readiness, metrics, and control routes retain
+their existing bypass behavior. Serverless currently has no document-lookup
+endpoint; its supported query routes already use this gate.
+
 To test throughput above C30 without intentionally testing admission rejection,
 set the baseline and candidate's query capacity explicitly above the offered
 concurrency and record it. Alternatively, deliberately test a smaller execution
@@ -116,6 +126,10 @@ work. A process-local limit must not be presented as an account-wide contract.
 Public query `timeout_ms` starts before admission. NDJSON uses the original
 submission time and the shortest explicit timeout across its lines. Storage
 queues and readiness retries consume that same budget.
+Document lookups preserve the incoming request deadline and cancellation through
+admission, storage options, and readiness retries. They do not gain a new public
+`timeout_ms` parameter from this change. Late lookup results are freed before a
+timeout/cancellation response is returned.
 
 SDK read retries are optional and bounded. A known query route is eligible only
 for an explicit 429 `instance_busy` response with `stage="admission"` and

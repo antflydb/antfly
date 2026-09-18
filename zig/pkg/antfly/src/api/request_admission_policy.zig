@@ -33,7 +33,7 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "dropNamespaceTable", .class = .none },
     .{ .operation_id = "backupNamespaceTable", .class = .none },
     .{ .operation_id = "batchNamespaceTable", .class = .write },
-    .{ .operation_id = "lookupNamespaceTableDocument", .class = .none },
+    .{ .operation_id = "lookupNamespaceTableDocument", .class = .query },
     .{ .operation_id = "listNamespaceTableIndexes", .class = .none },
     .{ .operation_id = "getNamespaceTableIndex", .class = .none },
     .{ .operation_id = "createNamespaceTableIndex", .class = .none },
@@ -110,7 +110,7 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "backupTable", .class = .none },
     .{ .operation_id = "batchWrite", .class = .write },
     .{ .operation_id = "scanKeys", .class = .query },
-    .{ .operation_id = "lookupKey", .class = .none },
+    .{ .operation_id = "lookupKey", .class = .query },
     .{ .operation_id = "listDocumentArtifactManifests", .class = .none },
     .{ .operation_id = "getDocumentArtifactManifest", .class = .none },
     .{ .operation_id = "reprocessDocumentArtifact", .class = .none },
@@ -164,7 +164,7 @@ pub fn publicOperationClass(operation_id: []const u8) ?Class {
 /// classification exhaustive so adding a tool cannot bypass the shared gate.
 pub fn mcpOperationClass(operation: contextual_operations.McpApplicationOperation) Class {
     return switch (operation) {
-        .query, .sample_documents => .query,
+        .query, .sample_documents, .get_document => .query,
         .batch => .write,
         .list_tables,
         .create_table,
@@ -173,7 +173,6 @@ pub fn mcpOperationClass(operation: contextual_operations.McpApplicationOperatio
         .list_indexes,
         .create_index,
         .drop_index,
-        .get_document,
         .backup,
         .restore,
         => .none,
@@ -187,4 +186,13 @@ pub fn extensionHostOperationClass(operation: ExtensionHostOperation) Class {
         .query => .query,
         .batch => .write,
     };
+}
+
+test "workload admission data lookups share query capacity while metadata control bypasses" {
+    try std.testing.expectEqual(Class.query, publicOperationClass("lookupKey").?);
+    try std.testing.expectEqual(Class.query, publicOperationClass("lookupNamespaceTableDocument").?);
+    try std.testing.expectEqual(Class.query, mcpOperationClass(.{ .get_document = .{ .table_name = "docs", .key = "key" } }));
+    try std.testing.expectEqual(Class.none, publicOperationClass("getStatus").?);
+    try std.testing.expectEqual(Class.none, publicOperationClass("getTable").?);
+    try std.testing.expectEqual(Class.none, mcpOperationClass(.{ .describe_table = .{ .table_name = "docs" } }));
 }
