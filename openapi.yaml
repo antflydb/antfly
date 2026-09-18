@@ -21943,7 +21943,7 @@ components:
           description: Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where
             the provider supports it.
         timestamps:
-          x-go-type-skip-optional-pointer: true
+          x-go-type-skip-optional-pointer: false
           type: boolean
           default: true
           description: Request timestamped transcript segments so chunks carry recording offsets. Providers

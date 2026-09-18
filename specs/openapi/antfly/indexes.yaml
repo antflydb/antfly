@@ -720,7 +720,9 @@ components:
           type: string
           description: "Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it."
         timestamps:
-          x-go-type-skip-optional-pointer: true
+          # Pointer, not a bare bool: this defaults to true, so a client that
+          # cannot tell "false" from "unset" can never turn timing off.
+          x-go-type-skip-optional-pointer: false
           type: boolean
           default: true
           description: "Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text."

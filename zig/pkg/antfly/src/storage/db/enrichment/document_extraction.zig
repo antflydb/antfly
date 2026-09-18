@@ -905,10 +905,18 @@ pub fn applyTranscriptTiming(unit: Unit, chunks: anytype) void {
         var last: ?u64 = null;
         var speaker: ?u8 = null;
         var one_speaker = true;
+        // Text this chunk contains that no span accounts for is speech by
+        // somebody: a phrase the provider worded differently is skipped
+        // when spans are built, and crediting the chunk to the speakers on
+        // either side of it would put words in their mouths.
+        var covered_to = start;
         for (unit.transcript_spans) |span| {
             if (span.char_end <= start or span.char_start >= end) continue;
             if (first == null) first = span.start_ms;
             last = span.end_ms;
+            if (span.char_start > covered_to and
+                !isBlankRange(unit.text, covered_to, span.char_start)) one_speaker = false;
+            covered_to = @max(covered_to, span.char_end);
             if (span.speaker_index) |index| {
                 if (speaker) |known| {
                     if (known != index) one_speaker = false;
@@ -919,14 +927,27 @@ pub fn applyTranscriptTiming(unit: Unit, chunks: anytype) void {
                 one_speaker = false;
             }
         }
+        if (covered_to < end and !isBlankRange(unit.text, covered_to, end)) one_speaker = false;
         if (first) |value| chunk.start_time_ms = @floatFromInt(value);
         if (last) |value| chunk.end_time_ms = @floatFromInt(value);
-        // A chunk that straddles a turn belongs to no single speaker, so it
-        // is left unattributed rather than credited to whoever spoke first.
+        // A chunk that straddles a turn, or holds speech no span claims,
+        // belongs to no single speaker: it is left unattributed rather than
+        // credited to whoever spoke around it.
         if (one_speaker) {
             if (speaker) |index| chunk.speaker_index = index;
         }
     }
+}
+
+/// Whether `text[from..to)` holds nothing but whitespace. Offsets past the
+/// end of the text count as blank: there is no speech there to attribute.
+fn isBlankRange(text: []const u8, from: u32, to: u32) bool {
+    if (to <= from or from >= text.len) return true;
+    const limit = @min(@as(usize, to), text.len);
+    for (text[from..limit]) |byte| {
+        if (!std.ascii.isWhitespace(byte)) return false;
+    }
+    return true;
 }
 
 pub const Unit = struct {
@@ -5141,6 +5162,85 @@ test "recordings in video containers take the transcription route" {
     // Documents still are not audio.
     try std.testing.expect(!isAudioContent("application/pdf", "report.pdf", "", "%PDF-1.4"));
     try std.testing.expect(!isAudioContent("text/plain", "notes.txt", "", "hello"));
+}
+
+test "speech no span claims blocks chunk attribution" {
+    const alloc = std.testing.allocator;
+    // The provider worded the middle phrase differently from its own
+    // transcript, so it has no span. A chunk covering the whole transcript
+    // holds that unclaimed speech: attributing it to the speaker on either
+    // side would credit A with what B said.
+    const text = "Hello. $20. Bye.";
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = "Hello.", .start_ms = 0, .end_ms = 500, .speaker = "A" },
+        .{ .text = "twenty dollars.", .start_ms = 500, .end_ms = 1500, .speaker = "B" },
+        .{ .text = "Bye.", .start_ms = 1500, .end_ms = 2000, .speaker = "A" },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+    try std.testing.expectEqual(@as(usize, 2), spans.len);
+
+    const TestChunk = struct {
+        start_offset: ?u32 = null,
+        end_offset: ?u32 = null,
+        start_time_ms: ?f32 = null,
+        end_time_ms: ?f32 = null,
+        speaker_index: ?u8 = null,
+    };
+    const unit = Unit{
+        .unit_id = @constCast("audio:000001"),
+        .unit_type = @constCast("audio"),
+        .text = @constCast(text),
+        .method = @constCast("transcription"),
+        .transcript_spans = spans,
+    };
+    var chunks = [_]TestChunk{
+        // The whole transcript, including the phrase nothing claims.
+        .{ .start_offset = 0, .end_offset = 16 },
+        // Just the opening, which one span covers completely.
+        .{ .start_offset = 0, .end_offset = 6 },
+        // The closing, reached across the unclaimed middle.
+        .{ .start_offset = 12, .end_offset = 16 },
+    };
+    applyTranscriptTiming(unit, &chunks);
+
+    try std.testing.expectEqual(@as(?u8, null), chunks[0].speaker_index);
+    // Timing still brackets what is known, which is a true range.
+    try std.testing.expectEqual(@as(?f32, 0), chunks[0].start_time_ms);
+    try std.testing.expectEqual(@as(?f32, 2000), chunks[0].end_time_ms);
+    try std.testing.expectEqual(@as(?u8, 0), chunks[1].speaker_index);
+    try std.testing.expectEqual(@as(?u8, 0), chunks[2].speaker_index);
+}
+
+test "whitespace between phrases does not block attribution" {
+    const alloc = std.testing.allocator;
+    // Providers join phrases with spaces and punctuation of their own, and
+    // a gap of those is not somebody else talking.
+    const text = "Hello there.   And hello again.";
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = "Hello there.", .start_ms = 0, .end_ms = 500, .speaker = "A" },
+        .{ .text = "And hello again.", .start_ms = 600, .end_ms = 1200, .speaker = "A" },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+
+    const TestChunk = struct {
+        start_offset: ?u32 = null,
+        end_offset: ?u32 = null,
+        start_time_ms: ?f32 = null,
+        end_time_ms: ?f32 = null,
+        speaker_index: ?u8 = null,
+    };
+    const unit = Unit{
+        .unit_id = @constCast("audio:000001"),
+        .unit_type = @constCast("audio"),
+        .text = @constCast(text),
+        .method = @constCast("transcription"),
+        .transcript_spans = spans,
+    };
+    var chunks = [_]TestChunk{.{ .start_offset = 0, .end_offset = @intCast(text.len) }};
+    applyTranscriptTiming(unit, &chunks);
+    try std.testing.expectEqual(@as(?u8, 0), chunks[0].speaker_index);
 }
 
 test "a repeated phrase after a mismatch stays untimed" {
