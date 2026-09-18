@@ -313,6 +313,15 @@ incomplete headers are not emitted. Authorization and cookie headers are
 excluded, and the disposable local signing secret is redacted. Capture also
 observes discarded responses, but is not a parser for persistent/pipelined
 exchanges and does not itself verify signatures or prove terminal retirement.
+Complete single-message captures also retain an independently capped first-request
+prefix with only its method/target, signed attempt header, and exact tiny body.
+Authorization remains excluded. `workload_proxy_evidence.verify_exchange` checks
+request HMAC/digest, expected coordinator/destination, nonce-bound discovery, and
+exact terminal or fence proof. Its `verify_generation_closure` requires matching
+namespace/epoch, a fence covering the old generation, and a later generation.
+Truncation, duplicate headers, chunked framing and pipelined exchanges are rejected
+for proof purposes. Observing a terminal response that the relay discarded proves
+worker termination; it does not prove that the coordinator received or retired it.
 
 Set `proxy_api: true` on a data node to bind a separate owned relay and pass its
 URL as `--api-advertise-url`. Metadata then advertises the relay to coordinators;

@@ -15,6 +15,8 @@ import struct
 import threading
 import time
 
+import workload_proxy_evidence as evidence
+
 
 class FaultProxy:
     def __init__(
@@ -132,6 +134,14 @@ class FaultProxy:
                 self.record(
                     {
                         "event": "proxy_response_capture",
+                        "request_message": evidence.capture_message(
+                            bytes(pair["request_prefix"]),
+                            pair["request_bytes"],
+                            self.redact_values,
+                        ),
+                        "response_message": evidence.capture_message(
+                            captured, pair["response_bytes"], self.redact_values
+                        ),
                         "proxy": self.name,
                         "connection": pair["id"],
                         "status_line": redact(lines[0]) if separator else None,
@@ -268,6 +278,8 @@ class FaultProxy:
                                 "sizes": {client: 0, server: 0},
                                 "prefix": bytearray(),
                                 "path_seen": False,
+                                "request_prefix": bytearray(),
+                                "request_bytes": 0,
                                 "response_prefix": bytearray(),
                                 "response_bytes": 0,
                                 "eof": set(),
@@ -312,6 +324,14 @@ class FaultProxy:
                         ),
                         len(chunk),
                     )
+                    if from_client and self.capture_response_bytes:
+                        pair["request_bytes"] += len(chunk)
+                        pair["request_prefix"].extend(
+                            chunk[
+                                : self.capture_response_bytes
+                                - len(pair["request_prefix"])
+                            ]
+                        )
                     if from_client and not pair["path_seen"]:
                         pair["prefix"].extend(chunk[: 4096 - len(pair["prefix"])])
                         if b"\r\n" in pair["prefix"] or len(pair["prefix"]) >= 4096:

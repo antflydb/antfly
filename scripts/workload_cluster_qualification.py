@@ -1013,6 +1013,7 @@ def run(plan, output):
         q.vectors.__file__,
         q.evidence.__file__,
         proxy_module.__file__,
+        proxy_module.evidence.__file__,
         attempt_evidence.__file__,
     ):
         shutil.copy2(source, output / Path(source).name)
