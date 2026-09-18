@@ -35647,6 +35647,45 @@ pub const DB = struct {
         return try self.searchWithCapturedRequestAndExecutionContext(alloc, req, .{});
     }
 
+    /// Own one primary read generation across a local query's selection and
+    /// aggregation collection. Acquire only after the Raft read barrier; never
+    /// wait for another apply barrier while this lease excludes writers.
+    pub const QueryReadLease = struct {
+        db: *DB,
+
+        pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+            const db = self.db;
+            const snapshot_req = try db.searchRequestAtCurrentIdentityGeneration(req);
+            if (!types.canonicalHierarchyExecutionWithinBudget(snapshot_req)) return error.InvalidQueryRequest;
+            var identity_prefix = try db.searchRequestWithIdentityPrefixFilterAlloc(snapshot_req);
+            defer identity_prefix.deinit();
+            var profile: db_query_search.DenseSearchProfile = .{};
+            const result = try db.searchLockedWithExecutionContextImpl(alloc, identity_prefix.req, .{}, true, if (req.profile) &profile else null);
+            return .{
+                .request = snapshot_req,
+                .result = result,
+                .dense_profile = if (profile.search_route.len > 0) profile else null,
+            };
+        }
+
+        pub fn release(self: *QueryReadLease) void {
+            const db = self.db;
+            db.core.unlockApplyShared();
+            if (db.async_context.resource_manager) |manager| manager.finishForegroundQuery();
+            self.* = undefined;
+        }
+    };
+
+    pub fn beginQueryReadLease(self: *DB) !QueryReadLease {
+        if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
+        errdefer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
+        try self.enforcePortableRuntimeGate();
+        lockApplyShared(self);
+        errdefer self.core.unlockApplyShared();
+        try self.enforcePortableRuntimeGate();
+        return .{ .db = self };
+    }
+
     pub fn searchWithExecutionContext(
         self: *DB,
         alloc: Allocator,
@@ -36564,6 +36603,7 @@ pub const DB = struct {
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
+            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,

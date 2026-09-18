@@ -31,6 +31,8 @@ class SoakTests(unittest.TestCase):
             "Soak public overwrite restore with concurrent readers and status",
             "Soak cross-shard Autograph resolution, promotion, and hydration",
             "Soak three by three cluster backup delete and restore",
+            "Soak large catalog control and diagnostic isolation",
+            "Soak concurrent aggregations and transaction session recovery",
         ):
             with (
                 self.subTest(step=step_name),
@@ -44,6 +46,8 @@ class SoakTests(unittest.TestCase):
                     "scripts/ci/zig-e2e-regression-loop.sh",
                     "scripts/ci/zig-e2e-autograph-soak.sh",
                     "scripts/ci/zig-e2e-cluster-restore-soak.sh",
+                    "scripts/ci/zig-e2e-catalog-soak.sh",
+                    "scripts/ci/zig-e2e-query-transaction-soak.sh",
                 ):
                     stub = root / filename
                     stub.write_text(

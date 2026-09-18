@@ -561,6 +561,7 @@ jobs:
           tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
+          tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
           tools/test_sync_generated.py
@@ -683,6 +684,9 @@ jobs:
               cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
               case "$cmdline" in
                 *"/test "*|*"/test"*|*"-tests "*|*"-tests"|*"zig build"*|*" make "*)
+                  # Ephemeral runner caches disappear with the pod. Keep the
+                  # test bytes even when ptrace cannot supply a stack trace.
+                  python3 zig/tools/retain_test_process.py "$pid" "$ANTFLY_TEST_LOG_DIR/hung" || true
                   echo "::group::proc snapshot pid=$pid cmd=$cmdline"
                   if [ -r "/proc/$pid/status" ]; then
                     grep -E "^(Name|State|Pid|PPid|Threads|VmRSS|VmHWM|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):" "/proc/$pid/status" || true
@@ -816,6 +820,7 @@ jobs:
           path: |
             ${{ runner.temp }}/antfly-zig-unit.log
             ${{ runner.temp }}/antfly-zig-test-logs/*.log
+            ${{ runner.temp }}/antfly-zig-test-logs/hung/
           if-no-files-found: ignore
           retention-days: 14
 
@@ -908,6 +913,7 @@ jobs:
           tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
+          tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
           tools/test_sync_generated.py

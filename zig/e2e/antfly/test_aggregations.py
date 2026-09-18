@@ -63,9 +63,15 @@ def test_aggregations_remain_exact_during_concurrent_inserts(stateful_api):
                 session.cookies.update(stateful_api.s.cookies)
                 barrier.wait(timeout=15)
                 deadline = time.monotonic() + 5
+                minimum_completed = 2 if index < 10 else 1
                 completed = 0
                 try:
-                    while time.monotonic() < deadline and not stop.is_set():
+                    # Exercise each reader twice even on a busy runner. The
+                    # per-request deadline bounds hangs; the five-second phase
+                    # controls extra contention, not a throughput requirement.
+                    while (
+                        completed < minimum_completed or time.monotonic() < deadline
+                    ) and not stop.is_set():
                         if index < 10:
                             kind = "terms" if (index + completed) % 2 == 0 else "stats"
                             aggregation = {"type": kind, "field": "age"}
@@ -105,7 +111,7 @@ def test_aggregations_remain_exact_during_concurrent_inserts(stateful_api):
                         else:
                             assert payload["inserted"] == 1, payload
                         completed += 1
-                    assert completed >= (2 if index < 10 else 1), (
+                    assert completed >= minimum_completed, (
                         trial,
                         index,
                         completed,
@@ -131,6 +137,36 @@ def test_aggregations_remain_exact_during_concurrent_inserts(stateful_api):
     phase("read-only", 0)
     for trial in range(3):
         phase(trial, 2)
+
+
+@pytest.mark.e2e_resource("antfly_process")
+@pytest.mark.parametrize("num_shards", [1, 3])
+def test_aggregation_pages_cover_all_matches(stateful_api, num_shards):
+    name = f"aggregation_pages_{num_shards}_{time.time_ns()}"
+    stateful_api.create_table(name, num_shards=num_shards)
+    stateful_api.batch_write(
+        name,
+        inserts={f"doc-{age}": {"age": age} for age in (18, 20, 22, 24)},
+        sync_level="full_index",
+    )
+    for limit in (0, 1):
+        for kind in ("stats", "terms"):
+            response = stateful_api.query_table(
+                name,
+                {
+                    "limit": limit,
+                    "aggregations": {"age": {"type": kind, "field": "age"}},
+                },
+            )["responses"][0]
+            assert response["status"] == 200, response
+            assert len(response["hits"]["hits"]) == limit, response
+            age = response["aggregations"]["age"]
+            if kind == "stats":
+                assert age["count"] == 4 and age["sum"] == 84, response
+            else:
+                assert {int(b["key"]): b["doc_count"] for b in age["buckets"]} == {
+                    value: 1 for value in (18, 20, 22, 24)
+                }, response
 
 
 @pytest.mark.e2e_resource("antfly_process")

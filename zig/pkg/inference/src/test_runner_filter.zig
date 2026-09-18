@@ -79,6 +79,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     const runtime_offset = getenvUsize("ANTFLY_INFERENCE_TEST_RUNTIME_OFFSET") orelse 0;
     const runtime_limit = getenvUsize("ANTFLY_INFERENCE_TEST_RUNTIME_LIMIT") orelse std.math.maxInt(usize);
+    var progress_io = std.Io.Threaded.init(allocator, .{});
+    defer progress_io.deinit();
+    const progress = RuntimeProgress.open(allocator, progress_io.io(), args);
+    defer if (progress) |p| p.file.close(p.io);
 
     var matched_count: usize = 0;
     var selected_count: usize = 0;
@@ -94,6 +98,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (selected_count >= runtime_limit) break;
         selected_count += 1;
 
+        if (progress) |p| p.record("START", test_fn.name);
         std.testing.allocator_instance = .{};
         std.testing.io_instance = .init(std.testing.allocator, .{
             .argv0 = .init(init.args),
@@ -120,8 +125,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             },
         }
 
+        if (progress) |p| p.record("IO_DEINIT", test_fn.name);
         std.testing.io_instance.deinit();
+        if (progress) |p| p.record("ALLOCATOR_DEINIT", test_fn.name);
         if (std.testing.allocator_instance.deinit() == .leak) leak_count += 1;
+        if (progress) |p| p.record("DONE", test_fn.name);
         if (log_err_count != 0) fail_count += 1;
     }
 
@@ -142,6 +150,33 @@ pub fn main(init: std.process.Init.Minimal) !void {
     });
     std.process.exit(1);
 }
+
+// Share CI's progress directory with Antfly's runner. Each process owns a log,
+// and its diagnostic I/O outlives per-test I/O, including blocked teardown.
+const RuntimeProgress = struct {
+    io: std.Io,
+    file: std.Io.File,
+
+    fn open(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) ?RuntimeProgress {
+        const directory = getenvSpan("ANTFLY_TEST_LOG_DIR") orelse return null;
+        const pid = platform.process.currentId() orelse return null;
+        const path = std.fmt.allocPrint(alloc, "{s}/inference-test-{d}.log", .{ directory, pid }) catch
+            @panic("cannot allocate test progress path");
+        defer alloc.free(path);
+        const file = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err|
+            std.debug.panic("cannot create test progress log {s}: {t}", .{ path, err });
+        const result: RuntimeProgress = .{ .io = io, .file = file };
+        for (args) |arg| result.record("ARG", arg);
+        return result;
+    }
+
+    fn record(self: RuntimeProgress, phase: []const u8, name: []const u8) void {
+        for ([_][]const u8{ phase, "\t", name, "\n" }) |bytes| {
+            self.file.writeStreamingAll(self.io, bytes) catch |err|
+                std.debug.panic("cannot write test progress log: {t}", .{err});
+        }
+    }
+};
 
 fn matchesAnyFilter(name: []const u8, filters: []const []const u8) bool {
     for (filters) |filter| {

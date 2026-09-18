@@ -4,6 +4,49 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+The later [Antfly E2E failures](e2e/FLAKES.md#2026-09-18-concurrent-aggregations-stalled-hydration-and-raced-primary-generations)
+add full-text hydration contention, aggregation generation races, and overlapping transaction session recovery;
+their deterministic regressions and native soak evidence are recorded there.
+
+## 2026-09-17: unit watchdog lost attribution outside the DB partitions
+
+[Run 35298670343's x86 unit job](https://github.com/antflydb/antfly/actions/runs/35298670343/job/105456824907)
+hit the 1,801-second idle watchdog. Both retained DB partition logs ended normally:
+138 passed/3 skipped and 1,177 passed/5 skipped, without failures or leaks. The
+remaining anonymous executable was `f26151a39b6115e67510f0853223991c/test`, PID 16100,
+blocked in `futex_wait_queue` with 11 threads. Both ordinary and elevated debugger
+attachments failed with `ptrace: Inappropriate ioctl for device`; no OOM kill was
+recorded. The ephemeral runner cache is gone. These artifacts do not identify
+the stalled test or establish a runtime deadlock's cause.
+
+Only the DB partition wrapper streamed progress to retained files. Other checked
+build runs buffered stderr until exit, including CPU inference's separate simple
+runner. Both simple runners now write a separate PID-named log under the existing
+`ANTFLY_TEST_LOG_DIR`, recording arguments, test entry, I/O teardown, allocator
+teardown, and completion. Diagnostic I/O is independent of the per-test I/O owner.
+The existing idle watchdog watches these files, so advancing tests no longer
+appear idle solely because their console output is buffered until process exit.
+Inventories retain their existing output and do not execute tests. The watchdog
+also copies live test executables with their arguments, working directory, and
+SHA-256 before termination, so a ptrace denial cannot erase the executable too.
+Watchdog limits and test selection are unchanged.
+
+The compiled runner regressions verify that an in-flight test is visible while
+stdout/stderr remain captured, then verify both teardown phases and completion.
+The retention helper checks exact binary bytes, arguments containing spaces,
+digest, and exclusion of compilers. This closes the diagnostic gap; it does not
+by itself resolve or reproduce the original hang.
+
+Local CPU-inference runs completed 4,319 selected tests on native macOS (4,261
+passed, 58 skipped) and 4,305 on Linux x86 under emulation (3,909 passed, 396
+skipped). The emulated run required a 64 MiB stack after the emulator hit its
+8 MiB default stack boundary; this is not a native ARC qualification result.
+The newer run `35304355356` also passed its x86 base-unit job. These passes do not
+identify or resolve the original stalled executable.
+
+The same run's E2E failure was a large-catalog database-create HTTP 503, not a
+restore timeout. See the [catalog E2E record](e2e/FLAKES.md#2026-09-17-large-catalog-mutation-failed-during-fast-native-elections).
+
 ## 2026-09-17: standby drain stalled behind status-protocol probing
 
 Both standby-scaling shards in [run 35247508165](https://github.com/antflydb/antfly/actions/runs/35247508165)
