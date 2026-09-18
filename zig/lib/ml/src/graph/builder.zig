@@ -304,48 +304,48 @@ pub const Builder = struct {
 
     // ── Primitive Contraction ──────────────────────────────────────────
 
-    /// Standard 2D matmul: [M, K] x [K, N] -> [M, N]
+    /// Standard 2D matmul: [M, K] x [K, N] -> [M, N].
     pub fn matmul(self: *Builder, a: NodeId, b: NodeId) !NodeId {
-        const a_shape = self.graph.node(a).output_shape;
-        const b_shape = self.graph.node(b).output_shape;
-        const out_shape = Shape.init(a_shape.dtype, &.{
-            a_shape.dim(0),
-            b_shape.dim(1),
-        });
-        return self.graph.addNode(.{
-            .op = .{ .dot_general = .{
-                .lhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
-                .rhs_contracting = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-                .num_contracting = 1,
-            } },
-            .output_shape = out_shape,
-            .inputs = .{ a, b, null_node, null_node },
-            .num_inputs = 2,
-        });
+        return self.matmul2DLayout(a, b, false, false);
     }
 
-    /// Batched matmul with a single leading batch dimension:
-    ///   [B, M, K] x [B, K, N] -> [B, M, N].
-    /// Both inputs must be 3-D and share the same batch dim. Used by
-    /// decomposed multi-head attention (Q @ K^T, probs @ V).
+    /// Dense contraction retaining either operand's physical storage.
+    pub fn matmul2DLayout(self: *Builder, a: NodeId, b: NodeId, lhs_transposed: bool, rhs_transposed: bool) !NodeId {
+        return self.matmulLayout(a, b, 2, lhs_transposed, rhs_transposed);
+    }
+
+    /// [B, M, K] x [B, K, N] -> [B, M, N], with a shared leading batch.
     pub fn matmul3D(self: *Builder, a: NodeId, b: NodeId) !NodeId {
+        return self.matmul3DLayout(a, b, false, false);
+    }
+
+    /// [B, M, K] x [B, N, K]^T -> [B, M, N], retaining RHS storage.
+    pub fn matmul3DTransB(self: *Builder, a: NodeId, b: NodeId) !NodeId {
+        return self.matmul3DLayout(a, b, false, true);
+    }
+
+    /// Batched contraction retaining either operand's physical storage.
+    pub fn matmul3DLayout(self: *Builder, a: NodeId, b: NodeId, lhs_transposed: bool, rhs_transposed: bool) !NodeId {
+        return self.matmulLayout(a, b, 3, lhs_transposed, rhs_transposed);
+    }
+
+    fn matmulLayout(self: *Builder, a: NodeId, b: NodeId, comptime rank: u8, lhs_transposed: bool, rhs_transposed: bool) !NodeId {
         const a_shape = self.graph.node(a).output_shape;
         const b_shape = self.graph.node(b).output_shape;
-        const out_shape = Shape.init(a_shape.dtype, &.{
-            a_shape.dim(0),
-            a_shape.dim(1),
-            b_shape.dim(2),
-        });
+        const lc: u8 = if (lhs_transposed) rank - 2 else rank - 1;
+        const rc: u8 = if (rhs_transposed) rank - 1 else rank - 2;
+        var dimensions: [rank]i64 = undefined;
+        if (rank == 3) dimensions[0] = a_shape.dim(0);
+        dimensions[rank - 2] = a_shape.dim(if (lhs_transposed) rank - 1 else rank - 2);
+        dimensions[rank - 1] = b_shape.dim(if (rhs_transposed) rank - 2 else rank - 1);
         return self.graph.addNode(.{
             .op = .{ .dot_general = .{
-                .lhs_contracting = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
-                .rhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
-                .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-                .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+                .lhs_contracting = .{ lc, 0, 0, 0, 0, 0, 0, 0 },
+                .rhs_contracting = .{ rc, 0, 0, 0, 0, 0, 0, 0 },
                 .num_contracting = 1,
-                .num_batch = 1,
+                .num_batch = if (rank == 3) 1 else 0,
             } },
-            .output_shape = out_shape,
+            .output_shape = Shape.init(a_shape.dtype, &dimensions),
             .inputs = .{ a, b, null_node, null_node },
             .num_inputs = 2,
         });
@@ -559,6 +559,22 @@ pub const Builder = struct {
         return fused;
     }
 
+    /// Inclusive scan retaining the reference physical layout.
+    pub fn prefixScanV1(self: *Builder, input: NodeId, attrs: node_mod.PrefixScanAttrs) !NodeId {
+        const shape = try attrs.shape();
+        if (input >= self.graph.nodeCount() or !self.graph.node(input).output_shape.eq(shape)) return error.InvalidPrefixScanShape;
+        return self.graph.addNode(.{ .op = .{ .fused_prefix_scan_v1 = attrs }, .output_shape = shape, .inputs = .{ input, null_node, null_node, null_node }, .num_inputs = 1 });
+    }
+
+    /// CUDA reference features for externally selected, frozen span geometry.
+    /// Both inputs are metadata: their derivatives are intentionally zero.
+    pub fn frozenSpanFeaturesV1(self: *Builder, lengths: NodeId, counts: NodeId, attrs: node_mod.FrozenSpanFeaturesAttrs) !NodeId {
+        if (lengths >= self.graph.nodeCount() or counts >= self.graph.nodeCount()) return error.InvalidFrozenSpanFeaturesShape;
+        const shape = try attrs.shape();
+        try attrs.validate(shape, self.graph.node(lengths).output_shape, self.graph.node(counts).output_shape);
+        return self.graph.addNode(.{ .op = .{ .frozen_span_features_v1 = attrs }, .output_shape = shape, .inputs = .{ lengths, counts, null_node, null_node }, .num_inputs = 2 });
+    }
+
     /// Fused SiLU/Swish activation: x * sigmoid(x).
     pub fn silu(self: *Builder, input: NodeId) !NodeId {
         // Decomposed: x / (1 + exp(-x))
@@ -762,6 +778,17 @@ pub const Builder = struct {
             .num_inputs = 3,
             .vjp_alternate = null_node,
         });
+    }
+
+    /// Saved forward state remains a normal graph value; consumers slice its
+    /// attended prefix and the strict VJP reuses the normalization suffix.
+    pub fn boundaryTrainingAttentionV1(self: *Builder, qkv: NodeId, mask: NodeId, attrs: node_mod.BoundaryTrainingAttentionAttrs) !NodeId {
+        const layout = try attrs.layout();
+        for ([_]NodeId{ qkv, mask }) |id|
+            if (id == null_node or id >= self.graph.nodes.items.len) return error.InvalidGraphDependency;
+        if (!self.graph.node(qkv).output_shape.eq(layout.qkvShape()) or !self.graph.node(mask).output_shape.eq(attrs.maskShape()))
+            return error.InvalidBoundaryTrainingAttentionShape;
+        return self.graph.addNode(.{ .op = .{ .fused_boundary_training_attention_v1 = attrs }, .output_shape = layout.savedShape(), .inputs = .{ qkv, mask, null_node, null_node }, .num_inputs = 2 });
     }
 
     /// Training-only tiled/replay attention. Integer control is immutable and
@@ -1072,8 +1099,7 @@ pub const Builder = struct {
     // ── Sigmoid (composed) ─────────────────────────────────────────────
     //
     // Same pattern silu uses internally: sigmoid(x) = 1 / (1 + exp(-x)).
-    // No fused IR node, so we just emit the decomposition; CSE in the
-    // pipeline can fuse later if it's worth it.
+    // Keep the default decomposition for existing backend profiles.
 
     pub fn sigmoid(self: *Builder, x: NodeId) !NodeId {
         const dtype = self.graph.node(x).output_shape.dtype;
@@ -1082,6 +1108,20 @@ pub const Builder = struct {
         const exp_neg = try self.expOp(neg_x);
         const denom = try self.add(one, exp_neg);
         return self.div(one, denom);
+    }
+
+    /// Explicit FP32 sigmoid with a saved-output VJP. Requires backend support
+    /// for fused_sigmoid_backward; default sigmoid graphs remain decomposed.
+    pub fn sigmoidRetained(self: *Builder, x: NodeId) !NodeId {
+        if (x >= self.graph.nodeCount()) return error.InvalidSigmoidShape;
+        const shape = self.graph.node(x).output_shape;
+        if (shape.dtype != .f32) return error.InvalidSigmoidShape;
+        return self.graph.addNode(.{
+            .op = .{ .fused_sigmoid = {} },
+            .output_shape = shape,
+            .inputs = .{ x, null_node, null_node, null_node },
+            .num_inputs = 1,
+        });
     }
 
     // ── Scatter-add ────────────────────────────────────────────────────

@@ -508,6 +508,12 @@ fn applyVjp(
     switch (n.op) {
         // ── No gradient ──────────────────────────────────────────────
         .parameter, .constant, .stop_gradient => {},
+        .frozen_span_features_v1 => |attrs| {
+            if (n.num_inputs != 2) return error.InvalidFrozenSpanFeaturesShape;
+            try attrs.validate(n.output_shape, b.graph.node(ins[0]).output_shape, b.graph.node(ins[1]).output_shape);
+            // Selected integer span geometry and mask counts are detached by
+            // contract, even when a caller asks for their gradients explicitly.
+        },
 
         // ── Elementwise unary ────────────────────────────────────────
 
@@ -594,20 +600,71 @@ fn applyVjp(
             try accumulate(b, adjoints, ins[0], grad);
         },
 
-        .fused_softmax => {
+        .fused_prefix_scan_v1 => |attrs| {
+            const shape = try attrs.shape();
+            if (n.num_inputs != 1 or !n.output_shape.eq(shape) or
+                !b.graph.node(ins[0]).output_shape.eq(shape) or !b.graph.node(adj).output_shape.eq(shape)) return error.InvalidPrefixScanShape;
+            var reverse = attrs;
+            reverse.reverse = !attrs.reverse;
+            const grad = if (attrs.width == 1) adj else try b.prefixScanV1(adj, reverse);
+            try accumulate(b, adjoints, ins[0], grad);
+        },
+
+        .fused_silu => {
+            // Only explicitly retained SiLU reaches this rule. Ordinary
+            // builder graphs still lower through their primitive alternate.
+            if (n.num_inputs != 1 or n.output_shape.dtype != .f32 or
+                !b.graph.node(ins[0]).output_shape.eq(n.output_shape) or
+                !b.graph.node(adj).output_shape.eq(n.output_shape)) return error.InvalidSiluShape;
+            const grad = try b.graph.addNode(.{
+                .op = .{ .fused_silu_backward = {} },
+                .output_shape = n.output_shape,
+                .inputs = .{ ins[0], adj, null_node, null_node },
+                .num_inputs = 2,
+            });
+            try accumulate(b, adjoints, ins[0], grad);
+        },
+
+        .fused_sigmoid => {
+            if (n.num_inputs != 1 or n.output_shape.dtype != .f32 or
+                !b.graph.node(ins[0]).output_shape.eq(n.output_shape) or
+                !b.graph.node(adj).output_shape.eq(n.output_shape)) return error.InvalidSigmoidShape;
+            const grad = try b.graph.addNode(.{
+                .op = .{ .fused_sigmoid_backward = {} },
+                .output_shape = n.output_shape,
+                .inputs = .{ node_id, adj, null_node, null_node },
+                .num_inputs = 2,
+            });
+            try accumulate(b, adjoints, ins[0], grad);
+        },
+
+        .fused_softmax => |attrs| {
             // For y = softmax(x), dL/dx = y * (dL/dy - sum(dL/dy * y)).
             // Keeping this fused avoids routing attention gradients through
             // the reduce_max stabilization subgraph used by the forward
             // decomposition.
             const y = node_id;
             const rank = n.output_shape.rank();
+            if (attrs.fuse_backward and (n.num_inputs != 1 or rank == 0 or attrs.dim == 0 or
+                attrs.dim != n.output_shape.dim(rank - 1) or n.output_shape.dtype != .f32 or
+                !b.graph.node(ins[0]).output_shape.eq(n.output_shape))) return error.InvalidSoftmaxShape;
             const last_axis: u8 = @intCast(rank - 1);
             const adj_times_y = try b.mul(adj, y);
-            const dot = try b.reduceSum(adj_times_y, &.{last_axis});
-            const dot_shape = b.graph.node(dot).output_shape;
-            const dot_bc = try broadcastToShape(b, dot, dot_shape, n.output_shape, &.{last_axis});
-            const centered = try b.sub(adj, dot_bc);
-            try accumulate(b, adjoints, ins[0], try b.mul(y, centered));
+            if (attrs.fuse_backward) {
+                const grad = try b.graph.addNode(.{
+                    .op = .{ .fused_softmax_backward = attrs },
+                    .output_shape = n.output_shape,
+                    .inputs = .{ adj_times_y, y, null_node, null_node },
+                    .num_inputs = 2,
+                });
+                try accumulate(b, adjoints, ins[0], grad);
+            } else {
+                const dot = try b.reduceSum(adj_times_y, &.{last_axis});
+                const dot_shape = b.graph.node(dot).output_shape;
+                const dot_bc = try broadcastToShape(b, dot, dot_shape, n.output_shape, &.{last_axis});
+                const centered = try b.sub(adj, dot_bc);
+                try accumulate(b, adjoints, ins[0], try b.mul(y, centered));
+            }
         },
 
         .abs => {
@@ -893,7 +950,7 @@ fn applyVjp(
             if (attrs.num_contracting == 1 and attrs.num_batch == 0 and a_shape.rank() == 2 and b_shape.rank() == 2) {
                 const lhs_ax = attrs.lhs_contracting[0];
                 const rhs_ax = attrs.rhs_contracting[0];
-                if (lhs_ax == 1 and rhs_ax == 0) {
+                if (lhs_ax == 1 and rhs_ax == 0 and !attrs.retain_backward_storage) {
                     vjp_geometry_supported = true;
                     // Y = A @ B → dA = dY @ B^T, dB = A^T @ dY
                     const bt = try b.transpose(ins[1], &.{ 1, 0 });
@@ -926,30 +983,42 @@ fn applyVjp(
                 const rc = attrs.rhs_contracting[0];
                 const lb = attrs.lhs_batch[0];
                 const rb = attrs.rhs_batch[0];
-                if (strict and (lb != 0 or rb != 0 or lc != 2 or rc != 1)) return error.NoVjpRule;
+                if (lb != 0 or rb != 0 or (lc != 1 and lc != 2) or (rc != 1 and rc != 2)) return error.NoVjpRule;
 
-                // Find free dims (the one that's not batch and not contracting).
-                const a_free: u8 = for ([_]u8{ 0, 1, 2 }) |d| {
-                    if (d != lb and d != lc) break d;
-                } else 1;
-                const b_free: u8 = for ([_]u8{ 0, 1, 2 }) |d| {
-                    if (d != rb and d != rc) break d;
-                } else 1;
-                _ = a_free;
-                _ = b_free;
+                if (attrs.retain_backward_storage) {
+                    // Retain both contraction operands. Match the reference's
+                    // dA product before restoring a transposed A layout:
+                    // reversing the product to avoid that output copy changes
+                    // FP32 reduction order even with the same BLAS library.
+                    const grad_a_raw = try b.matmul3DLayout(adj_for_dot, ins[1], false, rc == 1);
+                    const grad_a = if (lc == 1) try b.transpose(grad_a_raw, &.{ 0, 2, 1 }) else grad_a_raw;
+                    const grad_b = if (rc == 1)
+                        try b.matmul3DLayout(ins[0], adj_for_dot, lc == 2, false)
+                    else
+                        try b.matmul3DLayout(adj_for_dot, ins[0], true, lc == 1);
+                    try accumulate(b, adjoints, ins[0], grad_a);
+                    try accumulate(b, adjoints, ins[1], grad_b);
+                    return;
+                }
 
                 // dA = adj @ B^T (contract adj's last dim with B's free dim)
-                const bt = try b.transpose(ins[1], &.{ 0, 2, 1 });
-                const grad_a_raw = try batchedDotGeneral3D(b, adj, bt);
+                const bt = if (rc == 1) try b.transpose(ins[1], &.{ 0, 2, 1 }) else ins[1];
+                const grad_a_raw = try batchedDotGeneral3D(b, adj_for_dot, bt);
                 // If A's layout isn't [batch, free, contract], transpose back.
                 const grad_a = if (lc == 1) try b.transpose(grad_a_raw, &.{ 0, 2, 1 }) else grad_a_raw;
                 try accumulate(b, adjoints, ins[0], grad_a);
 
                 // dB = A^T @ adj (contract A's free dim with adj's first non-batch dim)
-                const at = try b.transpose(ins[0], &.{ 0, 2, 1 });
-                const grad_b_raw = try batchedDotGeneral3D(b, at, adj);
-                // If B's layout isn't [batch, free, contract], transpose back.
-                const grad_b = if (rc == 1) grad_b_raw else try b.transpose(grad_b_raw, &.{ 0, 2, 1 });
+                // For a retained transposed RHS, form dB = adj^T @ A
+                // directly in its storage layout.
+                const grad_b = if (rc == 1) blk: {
+                    const at = if (lc == 2) try b.transpose(ins[0], &.{ 0, 2, 1 }) else ins[0];
+                    break :blk try batchedDotGeneral3D(b, at, adj_for_dot);
+                } else blk: {
+                    const a = if (lc == 2) ins[0] else try b.transpose(ins[0], &.{ 0, 2, 1 });
+                    const adj_t = try b.transpose(adj_for_dot, &.{ 0, 2, 1 });
+                    break :blk try batchedDotGeneral3D(b, adj_t, a);
+                };
                 try accumulate(b, adjoints, ins[1], grad_b);
             } else if (attrs.num_contracting == 1 and attrs.num_batch == 2 and a_shape.rank() == 4 and b_shape.rank() == 4 and
                 attrs.lhs_batch[0] == 0 and attrs.lhs_batch[1] == 1 and
@@ -990,12 +1059,12 @@ fn applyVjp(
 
         // ── Data movement ────────────────────────────────────────────
 
-        .gather => {
+        .gather => |attrs| {
             if (strict and n.op.gather.axis != 0) return error.NoVjpRule;
             // d/d(table)(gather(table, indices)) = scatter_add(adj, indices)
             const table_shape = g.node(ins[0]).output_shape;
             const grad = try b.graph.addNode(.{
-                .op = .{ .scatter_add = .{ .axis = 0 } },
+                .op = .{ .scatter_add = .{ .axis = 0, .reduction = attrs.backward_reduction, .padding_index = attrs.backward_padding_index } },
                 .output_shape = table_shape,
                 .inputs = .{ adj, ins[1], null_node, null_node },
                 .num_inputs = 2,
@@ -1098,6 +1167,21 @@ fn applyVjp(
             // attn_bias (ins[2]) is a frozen padding mask — no gradient.
         },
 
+        .fused_boundary_training_attention_v1 => |attrs| {
+            const layout = try attrs.layout();
+            if (ins.len != 2 or !g.node(ins[0]).output_shape.eq(layout.qkvShape()) or
+                !g.node(ins[1]).output_shape.eq(attrs.maskShape()) or !n.output_shape.eq(layout.savedShape()) or
+                !g.node(adj).output_shape.eq(layout.savedShape())) return error.InvalidBoundaryTrainingAttentionShape;
+            const grad_qkv = try b.graph.addNode(.{
+                .op = .{ .fused_boundary_training_attention_backward_v1 = attrs },
+                .output_shape = layout.qkvShape(),
+                .inputs = .{ ins[0], ins[1], node_id, adj },
+                .num_inputs = 4,
+            });
+            try accumulate(b, adjoints, ins[0], grad_qkv);
+            // Binary routing mask and saved normalization have no cotangent.
+        },
+
         .fused_deberta_training_attention_v1 => |attrs| {
             const layout = try attrs.layout();
             if (ins.len != 3) return error.InvalidDebertaTrainingAttentionShape;
@@ -1119,6 +1203,34 @@ fn applyVjp(
             try accumulate(b, adjoints, ins[0], d_qkv);
             try accumulate(b, adjoints, ins[1], d_relative);
             // Token validity, bucket indices and RNG counters have no VJP.
+        },
+
+        .fused_linear => |attrs| {
+            // Preserve fused forward rounding while reusing the ordinary
+            // matrix and reduction VJPs. Only explicitly retained FP32
+            // linear nodes reach this rule; normal lowering is unchanged.
+            if (ins.len != 3 or attrs.rows == 0 or attrs.in_dim == 0 or attrs.out_dim == 0)
+                return error.InvalidLinearShape;
+            const input_shape = g.node(ins[0]).output_shape;
+            const weight_shape = Shape.init(.f32, &.{ attrs.out_dim, attrs.in_dim });
+            const bias_shape = Shape.init(.f32, &.{attrs.out_dim});
+            const input_elements = std.math.mul(i64, attrs.rows, attrs.in_dim) catch return error.InvalidLinearShape;
+            if (input_shape.dtype != .f32 or input_shape.numElements() != input_elements or
+                !g.node(ins[1]).output_shape.eq(weight_shape) or !g.node(ins[2]).output_shape.eq(bias_shape) or
+                !n.output_shape.eq(Shape.init(.f32, &.{ attrs.rows, attrs.out_dim })))
+                return error.InvalidLinearShape;
+            const matrix_shape = Shape.init(.f32, &.{ attrs.rows, attrs.in_dim });
+            const input_matrix = if (input_shape.eq(matrix_shape)) ins[0] else try b.reshape(ins[0], matrix_shape);
+            const dx_matrix = try b.matmul(adj, ins[1]);
+            const dx = if (input_shape.eq(matrix_shape)) dx_matrix else try b.reshape(dx_matrix, input_shape);
+            const dw = if (attrs.retain_backward_storage)
+                try b.matmul2DLayout(adj, input_matrix, true, false)
+            else
+                try b.matmul(try b.transpose(adj, &.{ 1, 0 }), input_matrix);
+            const db = try b.reshape(try b.reduceSum(adj, &.{0}), bias_shape);
+            try accumulate(b, adjoints, ins[0], dx);
+            try accumulate(b, adjoints, ins[1], dw);
+            try accumulate(b, adjoints, ins[2], db);
         },
 
         .fused_layer_norm => |attrs| {
@@ -1293,25 +1405,7 @@ fn sliceRows(b: *Builder, input: NodeId, start: i64, end: i64, cols: i64, dtype:
 /// Emit a 3D batched matmul: C[b] = A[b] @ B[b] with batch dim 0,
 /// contracting A's dim 2 with B's dim 1 (standard layout).
 fn batchedDotGeneral3D(b: *Builder, lhs: NodeId, rhs: NodeId) !NodeId {
-    const a_shape = b.graph.node(lhs).output_shape;
-    const b_shape = b.graph.node(rhs).output_shape;
-    const batch_dim = a_shape.dim(0);
-    const m = a_shape.dim(1);
-    const n_dim = b_shape.dim(2);
-    const out_shape = Shape.init(a_shape.dtype, &.{ batch_dim, m, n_dim });
-    return b.graph.addNode(.{
-        .op = .{ .dot_general = .{
-            .lhs_contracting = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
-            .rhs_contracting = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
-            .lhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-            .rhs_batch = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-            .num_contracting = 1,
-            .num_batch = 1,
-        } },
-        .output_shape = out_shape,
-        .inputs = .{ lhs, rhs, null_node, null_node },
-        .num_inputs = 2,
-    });
+    return b.matmul3D(lhs, rhs);
 }
 
 /// Reduce a gradient to match a smaller (broadcast source) shape.
@@ -1864,6 +1958,33 @@ test "gradient through selected tied head emits d_hidden only" {
     );
 }
 
+test "retained FP32 fused linear has strict VJPs for matrix and flattened inputs" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |retain| {
+        for ([_]Shape{ Shape.init(.f32, &.{ 2, 3 }), Shape.init(.f32, &.{6}) }) |input_shape| {
+            var graph = Graph.init(a);
+            defer graph.deinit();
+            var builder = Builder.init(&graph);
+            const x = try builder.parameter("x", input_shape);
+            const w = try builder.parameter("w", Shape.init(.f32, &.{ 4, 3 }));
+            const bias = try builder.parameter("bias", Shape.init(.f32, &.{4}));
+            const seed = try builder.parameter("seed", Shape.init(.f32, &.{ 2, 4 }));
+            const y = try builder.linear(x, w, bias, 2, 3, 4);
+            graph.nodeMut(y).vjp_alternate = null_node;
+            graph.nodeMut(y).op.fused_linear.retain_backward_storage = retain;
+            var result = try gradientWithSeeds(a, &graph, &.{.{ .output = y, .cotangent = seed }}, &.{ x, w, bias }, .{});
+            defer result.deinit();
+            try std.testing.expect(result.graph.node(result.id_map[y]).op == .fused_linear);
+            for ([_]NodeId{ x, w, bias }, result.param_grads) |id, grad| {
+                try std.testing.expect(grad != null_node);
+                try std.testing.expect(graph.node(id).output_shape.eq(result.graph.node(grad).output_shape));
+            }
+            graph.nodeMut(y).op.fused_linear.rows = 3;
+            try std.testing.expectError(error.InvalidLinearShape, gradientWithSeeds(a, &graph, &.{.{ .output = y, .cotangent = seed }}, &.{ x, w, bias }, .{}));
+        }
+    }
+}
+
 test "gradient through fused linear (lowered)" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -1929,4 +2050,177 @@ test "gradient chain: linear -> gelu -> loss" {
     // Gradients should flow through gelu → linear → params
     try std.testing.expect(result.param_grads[0] != null_node); // dL/dw
     try std.testing.expect(result.param_grads[1] != null_node); // dL/dbias
+}
+
+test "softmax backward fusion is explicit and preserves seeded gradient shape" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |fused| {
+        var graph = Graph.init(a);
+        defer graph.deinit();
+        var builder = Builder.init(&graph);
+        const shape = Shape.init(.f32, &.{ 2, 7 });
+        const x = try builder.parameter("x", shape);
+        const seed = try builder.parameter("seed", shape);
+        const y = try builder.softmax(x);
+        graph.nodeMut(y).op.fused_softmax.fuse_backward = fused;
+        var result = try gradientWithSeeds(a, &graph, &.{.{ .output = y, .cotangent = seed }}, &.{x}, .{});
+        defer result.deinit();
+        const grad = result.graph.node(result.param_grads[0]);
+        try std.testing.expect(grad.output_shape.eq(shape));
+        try std.testing.expectEqual(fused, grad.op == .fused_softmax_backward);
+        if (fused) {
+            try std.testing.expectEqual(@as(u8, 2), grad.num_inputs);
+            try std.testing.expect(result.graph.node(grad.inputs[0]).op == .mul);
+            try std.testing.expectEqual(result.id_map[y], grad.inputs[1]);
+        }
+        if (fused) {
+            graph.nodeMut(y).op.fused_softmax.dim = 8;
+            try std.testing.expectError(error.InvalidSoftmaxShape, gradientWithSeeds(a, &graph, &.{.{ .output = y, .cotangent = seed }}, &.{x}, .{}));
+        }
+    }
+}
+
+test "boundary attention strict VJP retains forward state and freezes mask" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = Builder.init(&graph);
+    const attrs = node_mod.BoundaryTrainingAttentionAttrs{ .batch = 2, .seq_len = 65, .num_heads = 4, .window = 3 };
+    const layout = try attrs.layout();
+    const qkv = try b.parameter("qkv", layout.qkvShape());
+    const mask = try b.parameter("mask", attrs.maskShape());
+    const seed = try b.parameter("seed", layout.attendedShape());
+    const saved = try b.boundaryTrainingAttentionV1(qkv, mask, attrs);
+    const output = try b.reshape(try b.sliceLastDim(saved, 0, layout.output_elements), layout.attendedShape());
+    var ad = try gradientWithSeeds(a, &graph, &.{.{ .output = output, .cotangent = seed }}, &.{ qkv, mask }, .{});
+    defer ad.deinit();
+    try std.testing.expectEqual(null_node, ad.param_grads[1]);
+    const grad = ad.graph.node(ad.param_grads[0]);
+    try std.testing.expectEqual(.fused_boundary_training_attention_backward_v1, std.meta.activeTag(grad.op));
+    try std.testing.expectEqualDeep(attrs, grad.op.fused_boundary_training_attention_backward_v1);
+    try std.testing.expectEqual(ad.id_map[saved], grad.inputs[2]);
+    try std.testing.expect(grad.output_shape.eq(layout.qkvShape()));
+    try std.testing.expect(ad.graph.node(grad.inputs[3]).output_shape.eq(layout.savedShape()));
+    var forwards: usize = 0;
+    for (ad.graph.nodes.items) |node| if (node.op == .fused_boundary_training_attention_v1) {
+        forwards += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), forwards);
+    try std.testing.expectError(error.InvalidBoundaryTrainingAttentionShape, b.boundaryTrainingAttentionV1(qkv, seed, attrs));
+}
+
+test "retained sigmoid strict VJP uses saved output and seed" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const shape = Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const seed = try b.parameter("seed", shape);
+    const y = try b.sigmoidRetained(x);
+    var ad = try gradientWithSeeds(a, &g, &.{.{ .output = y, .cotangent = seed }}, &.{x}, .{});
+    defer ad.deinit();
+    const grad = ad.graph.node(ad.param_grads[0]);
+    try std.testing.expect(grad.op == .fused_sigmoid_backward);
+    try std.testing.expect(grad.output_shape.eq(shape));
+    try std.testing.expectEqualSlices(NodeId, &.{ ad.id_map[y], ad.id_map[seed] }, grad.getInputs());
+    try std.testing.expect(ad.graph.node(grad.inputs[0]).op == .fused_sigmoid);
+    try std.testing.expectError(error.InvalidSigmoidShape, b.sigmoidRetained(null_node));
+    const integer = try b.parameter("integer", Shape.init(.i32, &.{ 2, 3 }));
+    try std.testing.expectError(error.InvalidSigmoidShape, b.sigmoidRetained(integer));
+    g.nodeMut(y).num_inputs = 2;
+    g.nodeMut(y).inputs[1] = x;
+    try std.testing.expectError(error.InvalidSigmoidShape, gradientWithSeeds(a, &g, &.{.{ .output = y, .cotangent = seed }}, &.{x}, .{}));
+}
+
+test "retained SiLU strict VJP uses original input and seed while default decomposes" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const shape = Shape.init(.f32, &.{ 2, 3 });
+    const x = try b.parameter("x", shape);
+    const seed = try b.parameter("seed", shape);
+    const y = try b.silu(x);
+    var materialized = try gradientWithSeeds(a, &g, &.{.{ .output = y, .cotangent = seed }}, &.{x}, .{});
+    defer materialized.deinit();
+    for (materialized.graph.nodes.items) |n| {
+        try std.testing.expect(n.op != .fused_silu and n.op != .fused_silu_backward);
+    }
+    g.nodeMut(y).vjp_alternate = null_node;
+    var retained = try gradientWithSeeds(a, &g, &.{.{ .output = y, .cotangent = seed }}, &.{x}, .{});
+    defer retained.deinit();
+    const grad = retained.graph.node(retained.param_grads[0]);
+    try std.testing.expect(grad.op == .fused_silu_backward);
+    try std.testing.expectEqualSlices(NodeId, &.{ retained.id_map[x], retained.id_map[seed] }, grad.getInputs());
+    g.nodeMut(y).num_inputs = 2;
+    g.nodeMut(y).inputs[1] = x;
+    try std.testing.expectError(error.InvalidSiluShape, gradientWithSeeds(a, &g, &.{.{ .output = y, .cotangent = seed }}, &.{x}, .{}));
+}
+
+test "prefix scan strict VJP reverses direction without retaining values" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const attrs = node_mod.PrefixScanAttrs{ .batch = 3, .width = 65, .channels = 1, .reference = .inner };
+    const shape = try attrs.shape();
+    const x = try b.parameter("x", shape);
+    const seed = try b.parameter("seed", shape);
+    const y = try b.prefixScanV1(x, attrs);
+    var ad = try gradientWithSeeds(a, &g, &.{.{ .output = y, .cotangent = seed }}, &.{x}, .{});
+    defer ad.deinit();
+    const grad = ad.graph.node(ad.param_grads[0]);
+    var reverse = attrs;
+    reverse.reverse = true;
+    try std.testing.expectEqualDeep(reverse, grad.op.fused_prefix_scan_v1);
+    try std.testing.expectEqualSlices(NodeId, &.{ad.id_map[seed]}, grad.getInputs());
+    g.nodeMut(y).op.fused_prefix_scan_v1.channels = 2;
+    try std.testing.expectError(error.InvalidPrefixScanShape, gradientWithSeeds(a, &g, &.{.{ .output = y, .cotangent = seed }}, &.{x}, .{}));
+}
+
+test "frozen span features validate geometry and detach both metadata inputs" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const attrs = node_mod.FrozenSpanFeaturesAttrs{ .batch = 2, .capacity = 3 };
+    const lengths = try b.parameter("lengths", Shape.init(.f32, &.{ 6, 1 }));
+    const counts = try b.parameter("counts", Shape.init(.f32, &.{ 2, 1 }));
+    const seed = try b.parameter("seed", try attrs.shape());
+    const y = try b.frozenSpanFeaturesV1(lengths, counts, attrs);
+    var ad = try gradientWithSeeds(a, &g, &.{.{ .output = y, .cotangent = seed }}, &.{ lengths, counts }, .{});
+    defer ad.deinit();
+    try std.testing.expectEqualSlices(NodeId, &.{ null_node, null_node }, ad.param_grads);
+    try std.testing.expect(ad.graph.node(ad.id_map[y]).op == .frozen_span_features_v1);
+    try std.testing.expectError(error.InvalidFrozenSpanFeaturesShape, b.frozenSpanFeaturesV1(counts, lengths, attrs));
+    try std.testing.expectError(error.InvalidFrozenSpanFeaturesShape, b.frozenSpanFeaturesV1(null_node, counts, attrs));
+    try std.testing.expectError(error.InvalidFrozenSpanFeaturesShape, b.frozenSpanFeaturesV1(lengths, counts, .{ .batch = 0, .capacity = 3 }));
+    try std.testing.expectError(error.InvalidFrozenSpanFeaturesShape, b.frozenSpanFeaturesV1(lengths, counts, .{ .batch = 65536, .capacity = 65536 }));
+    g.nodeMut(y).op.frozen_span_features_v1.capacity = 4;
+    try std.testing.expectError(error.InvalidFrozenSpanFeaturesShape, gradientWithSeeds(a, &g, &.{.{ .output = y, .cotangent = seed }}, &.{lengths}, .{}));
+}
+
+test "gather strict VJP preserves explicit scatter reduction profile" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const table = try b.parameter("table", Shape.init(.f32, &.{ 3, 7 }));
+    const index = try b.parameter("index", Shape.init(.i32, &.{65}));
+    const shape = Shape.init(.f32, &.{ 65, 7 });
+    const seed = try b.parameter("seed", shape);
+    const output = try b.gather(table, index, shape);
+    for ([_]node_mod.ScatterReduction{ .serial_v1, .pytorch_gather_v1, .pytorch_embedding_v1 }) |reference| {
+        g.nodeMut(output).op.gather.backward_reduction = reference;
+        g.nodeMut(output).op.gather.backward_padding_index = if (reference == .pytorch_embedding_v1) 2 else null;
+        var ad = try gradientWithSeeds(a, &g, &.{.{ .output = output, .cotangent = seed }}, &.{table}, .{});
+        defer ad.deinit();
+        const grad = ad.graph.node(ad.param_grads[0]);
+        try std.testing.expect(grad.op == .scatter_add);
+        try std.testing.expectEqual(reference, grad.op.scatter_add.reduction);
+        try std.testing.expectEqual(g.node(output).op.gather.backward_padding_index, grad.op.scatter_add.padding_index);
+        try std.testing.expectEqualSlices(NodeId, &.{ ad.id_map[seed], ad.id_map[index] }, grad.getInputs());
+        try std.testing.expect(grad.output_shape.eq(g.node(table).output_shape));
+    }
 }

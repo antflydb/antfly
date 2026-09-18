@@ -7569,7 +7569,7 @@ pub fn prepareGlinerBoundaryResident(session: Session, control: ?InferenceExecut
         try cb.glinerBoundaryResidentPreparation(true);
         var preparation_access = true;
         defer if (preparation_access) cb.glinerBoundaryResidentPreparation(false) catch {};
-        try @import("gliner_boundary_engine_device.zig").prepareResidentConstants(&cb, self.allocator, &self.arch_config.gliner_boundary, control);
+        try @import("gliner/boundary_engine_device.zig").prepareResidentConstants(&cb, self.allocator, &self.arch_config.gliner_boundary, control);
         try cb.glinerBoundaryResidentPreparation(false);
         preparation_access = false;
     }

@@ -37,6 +37,10 @@ const ml = @import("ml");
 pub const CT = backend_contracts.CT;
 pub const gliner_boundary_device = @import("gliner_boundary_device_ops.zig");
 pub const resident_training = @import("resident_training_ops.zig");
+pub const record_loss_math = @import("record_loss_math.zig");
+pub const elementwise_loss_math = @import("elementwise_loss_math.zig");
+pub const consistency_loss_math = @import("consistency_loss_math.zig");
+pub const listwise_loss_math = @import("listwise_loss_math.zig");
 pub const deberta_training_attention = @import("deberta_training_attention.zig");
 
 pub const UnaryConsumeOp = enum {
@@ -178,6 +182,7 @@ pub const TrainingAdamWBatchInput = struct {
     elem_count: usize,
     bias_correction1: f32,
     bias_correction2: f32,
+    adam_step: u32 = 0,
 };
 
 pub const TrainingAdamWBatchOptions = struct {
@@ -187,6 +192,7 @@ pub const TrainingAdamWBatchOptions = struct {
     eps: f32,
     weight_decay: f32,
     grad_scale: f32 = 1.0,
+    pytorch_fused: ?struct { lr: f64, optimizer: @import("ml").graph.optimizers.AdamWConfig64 } = null,
 };
 
 pub const TrainingSumSquaresInput = resident_training.NormInput;
@@ -1650,6 +1656,10 @@ pub const ComputeBackend = struct {
         glinerBoundaryDevice: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.Request) anyerror!CT = null,
         glinerBoundaryScope: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.ScopeRequest) anyerror!gliner_boundary_device.ScopeStats = null,
         glinerBoundaryResidentPreparation: ?*const fn (ctx: *anyopaque, enabled: bool) anyerror!void = null,
+        recordLossGradient: ?*const fn (ctx: *anyopaque, request: *const record_loss_math.Request) anyerror!void = null,
+        listwiseLossGradient: ?*const fn (ctx: *anyopaque, request: *const listwise_loss_math.Request) anyerror!void = null,
+        consistencyLossGradient: ?*const fn (ctx: *anyopaque, request: *const consistency_loss_math.Request) anyerror!void = null,
+        elementwiseLossGradient: ?*const fn (ctx: *anyopaque, request: *const elementwise_loss_math.Request) anyerror!void = null,
         glinerBoundaryDownload: ?*const fn (ctx: *anyopaque, tensor: CT, output: []f32) anyerror!void = null,
 
         debugCudaGraphCaptureBegin: ?*const fn (ctx: *anyopaque, label: []const u8) anyerror!bool = null,
@@ -2393,6 +2403,7 @@ pub const ComputeBackend = struct {
         /// sufficient because a later graph operation may donate its input.
         snapshotTensorShape: ?*const fn (ctx: *anyopaque, tensor: CT, shape: []const i32) anyerror!CT = null,
         residentTrainingNorm: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.NormInput, limits: resident_training.NormLimits, control: ?InferenceExecutionControl) anyerror!resident_training.NormSummary = null,
+        residentTrainingValidate: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.ValidationInput, limits: resident_training.ValidationLimits, control: ?InferenceExecutionControl) anyerror!resident_training.ValidationSummary = null,
         residentTrainingInstruction: ?*const fn (ctx: *anyopaque, instruction: *const resident_program.Instruction, inputs: []const CT, limits: resident_program.Limits, control: ?InferenceExecutionControl) anyerror!CT = null,
 
         /// Copy a tensor from another backend instance into this backend
@@ -4318,6 +4329,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn trainingAdamWManyF32(self: *const ComputeBackend, inputs: []const TrainingAdamWBatchInput, opts: TrainingAdamWBatchOptions) !void {
+        if (opts.pytorch_fused != null and self.kind() != .cuda) return error.DeviceTrainingUnavailable;
         const op = self.vtable.trainingAdamWManyF32 orelse return error.DeviceTrainingUnavailable;
         return op(self.ptr, inputs, opts);
     }
@@ -4384,14 +4396,34 @@ pub const ComputeBackend = struct {
         return result;
     }
 
-    /// Reads back only three bounded scalars per tensor. No gradient values
+    /// Reads back bounded norm scalars (one total for pytorch_f32). No gradient values
     /// are copied to the host, and no implicit uploads are permitted.
     pub fn residentTrainingNorm(self: *const ComputeBackend, inputs: []const resident_training.NormInput, limits: resident_training.NormLimits) !resident_training.NormSummary {
         try self.checkExecutionControl();
+        if (limits.profile == .pytorch_f32 and self.kind() != .cuda) return error.UnsupportedResidentTrainingPrimitive;
         const op = self.vtable.residentTrainingNorm orelse return error.UnsupportedResidentTrainingPrimitive;
         const result = try op(self.ptr, inputs, limits, self.execution_control);
         try self.checkExecutionControl();
         return result;
+    }
+
+    /// Retains the scaled-norm validation on backends without a boolean-only
+    /// primitive. This fallback reads only norm scalars, never tensor payloads.
+    pub fn residentTrainingValidate(self: *const ComputeBackend, inputs: []const resident_training.ValidationInput, limits: resident_training.ValidationLimits) !resident_training.ValidationSummary {
+        try self.checkExecutionControl();
+        if (self.vtable.residentTrainingValidate) |op| {
+            const result = try op(self.ptr, inputs, limits, self.execution_control);
+            try self.checkExecutionControl();
+            return result;
+        }
+        const summary = try self.residentTrainingNorm(inputs, .{
+            .primitive = limits.primitive,
+            .max_tensors = limits.max_tensors,
+            .max_total_elements = limits.max_total_elements,
+            .max_partial_bytes = limits.max_partial_bytes,
+        });
+        const finite = summary.finite and std.math.isFinite(summary.sum_squares) and summary.sum_squares >= 0;
+        return .{ .finite = finite, .all_zero = finite and summary.sum_squares == 0, .tensor_count = summary.tensor_count, .partial_bytes = summary.partial_bytes, .download_bytes = summary.download_bytes };
     }
 
     pub fn residentTrainingInstruction(self: *const ComputeBackend, instruction: *const resident_program.Instruction, inputs: []const CT, limits: resident_program.Limits) !CT {

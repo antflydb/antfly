@@ -1895,14 +1895,6 @@ extern "C" __global__ void termite_add_layer_norm_f32(
     }
 }
 
-__device__ __forceinline__ float termite_erf_approx_f32(float x) {
-    float sign = x < 0.0f ? -1.0f : 1.0f;
-    float ax = fabsf(x);
-    float t = 1.0f / (1.0f + 0.3275911f * ax);
-    float poly = (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;
-    return sign * (1.0f - poly * expf(-(ax * ax)));
-}
-
 extern "C" __global__ void termite_elementwise_f32(
     float* dst,
     const float* a,
@@ -1956,12 +1948,12 @@ extern "C" __global__ void termite_elementwise_f32(
     } else if (op == 19u) {
         out = x < y ? 1.0f : 0.0f;
     } else if (op == 20u) {
-        out = isfinite(x) ? 0.5f * x * (1.0f + termite_erf_approx_f32(x * 0.7071067811865476f)) : 0.0f;
+        out = isfinite(x) ? 0.5f * x * (1.0f + erff(x * 0.7071067811865476f)) : 0.0f;
     } else if (op == 21u) {
         if (!isfinite(x)) {
             out = 0.0f;
         } else {
-            float cdf = 0.5f * (1.0f + termite_erf_approx_f32(x * 0.7071067811865476f));
+            float cdf = 0.5f * (1.0f + erff(x * 0.7071067811865476f));
             float pdf = expf(-0.5f * x * x) * 0.3989422804014327f;
             float derivative = cdf + x * pdf;
             out = isfinite(derivative) ? y * derivative : 0.0f;
@@ -20476,6 +20468,32 @@ extern "C" __global__ void termite_primitive_reduce_f32(
     if (out_idx >= output_count) return;
     unsigned int dims[8] = {dim0, dim1, dim2, dim3, dim4, dim5, dim6, dim7};
     float acc = mode == 1u ? -3.402823466e+38f : 0.0f;
+    // A contiguous set of reduced axes is a logical [outer, reduce, inner]
+    // tensor. Decode the output coordinate once, rather than doing rank-many
+    // integer divisions for every input value. Preserve the serial FP32 sum
+    // order so this indexing optimization does not change training numerics.
+    unsigned int first = rank, last = 0u;
+    for (unsigned int d = 0; d < rank; ++d) {
+        if ((reduce_mask & (1u << d)) != 0u) {
+            first = min(first, d);
+            last = d;
+        }
+    }
+    bool contiguous = first < rank;
+    for (unsigned int d = first; d <= last && d < rank; ++d)
+        contiguous = contiguous && ((reduce_mask & (1u << d)) != 0u);
+    if (contiguous) {
+        unsigned int inner = 1u;
+        for (unsigned int d = last + 1u; d < rank; ++d) inner *= dims[d];
+        unsigned int base = (out_idx / inner) * reduce_count * inner + out_idx % inner;
+        for (unsigned int r = 0; r < reduce_count; ++r) {
+            float value = input[base + r * inner];
+            acc = mode == 1u ? fmaxf(acc, value) : acc + value;
+        }
+        if (mode == 2u && reduce_count != 0u) acc /= (float)reduce_count;
+        output[out_idx] = acc;
+        return;
+    }
     for (unsigned int reduced_idx = 0; reduced_idx < reduce_count; ++reduced_idx) {
         unsigned int output_remaining = out_idx;
         unsigned int reduced_remaining = reduced_idx;
@@ -23769,3 +23787,9 @@ extern "C" __global__ void antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1(
     partial_indices[global_tile] = best_index;
 }
 // quant-kernel-codegen:end generated CUDA runtime-wired dev matmul candidates
+
+#include "../kernels/gliner25_boundary.cuh"
+#include "../kernels/training_validation.cuh"
+#include "../kernels/gliner25_layer_norm.cuh"
+#include "../kernels/gliner25_softmax.cuh"
+#include "../kernels/gliner25_attention.cuh"

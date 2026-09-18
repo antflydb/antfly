@@ -338,16 +338,20 @@ fn evalNode(
                 @memset(out, 0);
                 return out;
             }
-            const M: usize = @intCast(a_shape.dim(0));
-            const K: usize = @intCast(a_shape.dim(1));
-            const N: usize = @intCast(b_shape.dim(1));
+            if (a_shape.rank() != 2 or b_shape.rank() != 2 or attrs.num_contracting != 1 or attrs.num_batch != 0 or
+                attrs.lhs_contracting[0] > 1 or attrs.rhs_contracting[0] > 1) return error.UnsupportedDotGeneral;
+            const lc = attrs.lhs_contracting[0];
+            const rc = attrs.rhs_contracting[0];
+            const M: usize = @intCast(a_shape.dim(1 - lc));
+            const K: usize = @intCast(a_shape.dim(lc));
+            const N: usize = @intCast(b_shape.dim(1 - rc));
             const out = try allocator.alloc(f32, M * N);
             @memset(out, 0);
             for (0..M) |m| {
                 for (0..N) |nn| {
                     var sum: f32 = 0;
                     for (0..K) |k| {
-                        sum += a[m * K + k] * b[k * N + nn];
+                        sum += a[if (lc == 1) m * K + k else k * M + m] * b[if (rc == 0) k * N + nn else nn * K + k];
                     }
                     out[m * N + nn] = sum;
                 }
@@ -1698,6 +1702,127 @@ test "grad_check fused_rope half-swap rotation" {
                 .{ i, a, n, diff, allow },
             );
             return error.GradientMismatch;
+        }
+    }
+}
+
+test "grad_check transposed RHS batched matmul preserves both input gradients" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = Builder.init(&graph);
+    const q = try b.parameter("q", Shape.init(.f32, &.{ 2, 3, 2 }));
+    const k = try b.parameter("k", Shape.init(.f32, &.{ 2, 4, 2 }));
+    const score = try b.matmul3DTransB(q, k);
+    try std.testing.expect(graph.node(score).output_shape.eq(Shape.init(.f32, &.{ 2, 3, 4 })));
+    const loss = try b.reduceSum(try b.mul(score, score), &.{ 0, 1, 2 });
+    try graph.markOutput(loss);
+    const q_values = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, -0.1, -0.2, -0.3, -0.4, -0.5, -0.6 };
+    const k_values = [_]f32{ 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, -0.11, -0.12, -0.13, -0.14, -0.15, -0.16, -0.17, -0.18 };
+    const max_error = try checkGradients(a, &graph, loss, &.{ q, k }, &.{ &q_values, &k_values }, 1e-3);
+    try std.testing.expect(max_error < tolerance);
+}
+
+test "grad_check batched dot storage layouts have strict seeded gradients" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |retain| {
+        for ([_]u8{ 1, 2 }) |lc| {
+            for ([_]u8{ 1, 2 }) |rc| {
+                var graph = Graph.init(a);
+                defer graph.deinit();
+                var b = Builder.init(&graph);
+                const q_shape = Shape.init(.f32, if (lc == 2) &.{ 2, 3, 2 } else &.{ 2, 2, 3 });
+                const k_shape = Shape.init(.f32, if (rc == 2) &.{ 2, 4, 2 } else &.{ 2, 2, 4 });
+                const q = try b.parameter("q", q_shape);
+                const k = try b.parameter("k", k_shape);
+                const score = try b.matmul3DLayout(q, k, lc == 1, rc == 2);
+                graph.nodeMut(score).op.dot_general.retain_backward_storage = retain;
+                const loss = try b.reduceSum(try b.mul(score, score), &.{ 0, 1, 2 });
+                try graph.markOutput(loss);
+                const q_values = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, -0.1, -0.2, -0.3, -0.4, -0.5, -0.6 };
+                const k_values = [_]f32{ 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, -0.11, -0.12, -0.13, -0.14, -0.15, -0.16, -0.17, -0.18 };
+                const max_error = try checkGradients(a, &graph, loss, &.{ q, k }, &.{ &q_values, &k_values }, 1e-3);
+                try std.testing.expect(max_error < tolerance);
+
+                const seed = try b.parameter("seed", Shape.init(.f32, &.{ 2, 3, 4 }));
+                const seed_values = [_]f32{ 1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, -1, 2, -3, 4, -5, 6, -7, 8, -9, 10, -11, 12 };
+                var ad = try autodiff_mod.gradientWithSeeds(a, &graph, &.{.{ .output = score, .cotangent = seed }}, &.{ q, k }, .{});
+                defer ad.deinit();
+                ad.graph.outputs.clearRetainingCapacity();
+                for (ad.param_grads, [_]Shape{ q_shape, k_shape }) |grad, shape| {
+                    try std.testing.expect(grad != null_node);
+                    try std.testing.expect(ad.graph.node(grad).output_shape.eq(shape));
+                    try ad.graph.markOutput(grad);
+                }
+                var result = try eval(a, &ad.graph, &.{ &q_values, &k_values, &seed_values });
+                defer result.deinit();
+                var expected_q = [_]f64{0} ** 12;
+                var expected_k = [_]f64{0} ** 16;
+                for (0..2) |batch| {
+                    for (0..3) |m| {
+                        for (0..4) |n| {
+                            const dy: f64 = seed_values[batch * 12 + m * 4 + n];
+                            for (0..2) |contract| {
+                                const qi = batch * 6 + (if (lc == 2) m * 2 + contract else contract * 3 + m);
+                                const ki = batch * 8 + (if (rc == 2) n * 2 + contract else contract * 4 + n);
+                                expected_q[qi] += dy * @as(f64, k_values[ki]);
+                                expected_k[ki] += dy * @as(f64, q_values[qi]);
+                            }
+                        }
+                    }
+                }
+                for (result.values[0], expected_q) |actual, expected| try std.testing.expectApproxEqAbs(expected, @as(f64, actual), 1e-6);
+                for (result.values[1], expected_k) |actual, expected| try std.testing.expectApproxEqAbs(expected, @as(f64, actual), 1e-6);
+            }
+        }
+    }
+}
+
+test "grad_check dense retained storage has strict seeded gradients" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |retain| {
+        for ([_]bool{ false, true }) |lt| {
+            for ([_]bool{ false, true }) |rt| {
+                var graph = Graph.init(a);
+                defer graph.deinit();
+                var b = Builder.init(&graph);
+                const xs = Shape.init(.f32, if (lt) &.{ 2, 3 } else &.{ 3, 2 });
+                const ws = Shape.init(.f32, if (rt) &.{ 4, 2 } else &.{ 2, 4 });
+                const x = try b.parameter("x", xs);
+                const w = try b.parameter("w", ws);
+                const y = try b.matmul2DLayout(x, w, lt, rt);
+                graph.nodeMut(y).op.dot_general.retain_backward_storage = retain;
+                const loss = try b.reduceSum(try b.mul(y, y), &.{ 0, 1 });
+                try graph.markOutput(loss);
+                const xv = [_]f32{ 0.1, -0.2, 0.3, 0.4, -0.5, 0.6 };
+                const wv = [_]f32{ 0.11, 0.12, -0.13, 0.14, 0.15, -0.16, 0.17, 0.18 };
+                try std.testing.expect(try checkGradients(a, &graph, loss, &.{ x, w }, &.{ &xv, &wv }, 1e-3) < tolerance);
+                const seed = try b.parameter("seed", Shape.init(.f32, &.{ 3, 4 }));
+                const sv = [_]f32{ 1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12 };
+                var ad = try autodiff_mod.gradientWithSeeds(a, &graph, &.{.{ .output = y, .cotangent = seed }}, &.{ x, w }, .{});
+                defer ad.deinit();
+                ad.graph.outputs.clearRetainingCapacity();
+                for (ad.param_grads, [_]Shape{ xs, ws }) |grad, shape| {
+                    try std.testing.expect(ad.graph.node(grad).output_shape.eq(shape));
+                    try ad.graph.markOutput(grad);
+                }
+                var result = try eval(a, &ad.graph, &.{ &xv, &wv, &sv });
+                defer result.deinit();
+                var dx = [_]f64{0} ** 6;
+                var dw = [_]f64{0} ** 8;
+                for (0..3) |m| {
+                    for (0..4) |n| {
+                        for (0..2) |k| {
+                            const xi = if (lt) k * 3 + m else m * 2 + k;
+                            const wi = if (rt) n * 2 + k else k * 4 + n;
+                            dx[xi] += @as(f64, sv[m * 4 + n]) * wv[wi];
+                            dw[wi] += @as(f64, sv[m * 4 + n]) * xv[xi];
+                        }
+                    }
+                }
+                for (result.values[0], dx) |actual, expected| try std.testing.expectApproxEqAbs(expected, @as(f64, actual), 1e-6);
+                for (result.values[1], dw) |actual, expected| try std.testing.expectApproxEqAbs(expected, @as(f64, actual), 1e-6);
+            }
         }
     }
 }

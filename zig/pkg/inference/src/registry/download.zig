@@ -216,6 +216,7 @@ const always_files = [_][]const u8{
     "1_LogitScore/config.json",
     "added_tokens.json",
     "gliner_config.json",
+    "encoder_config/config.json", // GLiNER2.5 boundary encoder config
     "termite_bundle.json",
     "antfly_inference_bundle.json",
     "spm.model",
