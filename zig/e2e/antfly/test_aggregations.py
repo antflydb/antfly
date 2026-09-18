@@ -53,7 +53,6 @@ def test_aggregations_remain_exact_during_concurrent_inserts(stateful_api):
 
     def phase(trial, writers):
         barrier = threading.Barrier(10 + writers)
-        stop = threading.Event()
 
         def worker(index):
             # The fixture serializes its shared session. Each worker needs its
@@ -62,11 +61,14 @@ def test_aggregations_remain_exact_during_concurrent_inserts(stateful_api):
                 session.headers.update(stateful_api.s.headers)
                 session.auth = stateful_api.s.auth
                 session.cookies.update(stateful_api.s.cookies)
-                barrier.wait(timeout=15)
-                deadline = time.monotonic() + 5
                 completed = 0
                 try:
-                    while time.monotonic() < deadline and not stop.is_set():
+                    # Exercise both aggregation kinds per reader in every
+                    # phase. A five-second loop made correctness depend on
+                    # shared-runner throughput and could execute only one kind.
+                    # Release readers and writers together in each round.
+                    for _ in range(2):
+                        barrier.wait(timeout=45)
                         if index < 10:
                             kind = "terms" if (index + completed) % 2 == 0 else "stats"
                             aggregation = {"type": kind, "field": "age"}
@@ -90,7 +92,9 @@ def test_aggregations_remain_exact_during_concurrent_inserts(stateful_api):
                         response = session.post(
                             f"{stateful_api.url}/tables/{name}/{route}",
                             json=body,
-                            timeout=15,
+                            # Match PublicApi's ordinary request timeout;
+                            # this is a deadlock bound, not a latency assertion.
+                            timeout=30,
                         )
                         expected_statuses = (200,) if index < 10 else (200, 201)
                         assert response.status_code in expected_statuses, (
@@ -106,14 +110,9 @@ def test_aggregations_remain_exact_during_concurrent_inserts(stateful_api):
                         else:
                             assert payload["inserted"] == 1, payload
                         completed += 1
-                    assert completed >= (2 if index < 10 else 1), (
-                        trial,
-                        index,
-                        completed,
-                    )
                     return completed
                 except BaseException:
-                    stop.set()
+                    barrier.abort()
                     raise
 
         with ThreadPoolExecutor(max_workers=10 + writers) as pool:

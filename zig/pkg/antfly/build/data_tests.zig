@@ -163,6 +163,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime split apply store seeding reuses cached source writer",
         "data runtime local merge fallback uses its durable table contract",
         "data runtime resolves extension package store env before local default",
+        "data runtime secret store follows projected symlink rotation",
         "data runtime parses optional split store registration flags",
         "data runtime cli accepts ARD identity flags",
         "data runtime parses experimental flag",

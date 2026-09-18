@@ -645,9 +645,25 @@ jobs:
             "$patched_runner"
           echo "build_runner=$patched_runner" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare bounded correctness-fixture workspace
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: |
+          workspace=$(mktemp -d "${RUNNER_TEMP}/antfly-fixtures.XXXXXX")
+          # This is fixture data only, not the compiler cache. Bound its charge
+          # within the pod's 2 GiB headroom above the compiler reservation.
+          if sudo mount -t tmpfs -o "size=512m,mode=0700,uid=$(id -u),gid=$(id -g)" tmpfs "$workspace"; then
+            echo "ANTFLY_TEST_WORKSPACE=$workspace" >> "$GITHUB_ENV"
+          else
+            # Restricted ARC pods may not grant mount capability. Preserve the
+            # complete gate on disk and make the missing acceleration visible.
+            rmdir "$workspace"
+            echo "::warning::Runner cannot mount fixture tmpfs; using disk-backed fixtures"
+          fi
+
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
         env:
+          ANTFLY_TEST_WORK_PROFILE: "1"
           ANTFLY_TEST_CLEANUP_TRACE: "1"
           ANTFLY_TEST_TIMINGS: "1"
         run: |
@@ -822,6 +838,13 @@ jobs:
             echo "::endgroup::"
           fi
           exit "$status"
+
+      - name: Release correctness-fixture workspace
+        if: always() && env.ANTFLY_TEST_WORKSPACE != ''
+        run: |
+          df -h "$ANTFLY_TEST_WORKSPACE"
+          sudo umount "$ANTFLY_TEST_WORKSPACE"
+          rmdir "$ANTFLY_TEST_WORKSPACE"
 
       - name: Retain unit test progress
         if: always()

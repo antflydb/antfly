@@ -4434,6 +4434,10 @@ const TestCompute = struct {
     fn backendKind(_: *anyopaque) contracts.BackendKind {
         return .native;
     }
+    // TestBuf stores only f32 values, including the legacy index fixtures.
+    fn tensorDType(_: *anyopaque, _: CT) anyerror!@import("../backends/tensor.zig").DType {
+        return .f32;
+    }
     fn deinitBackend(_: *anyopaque) void {}
     fn prefetchHint(_: *anyopaque, _: []const u8, _: u32) void {}
     fn drainPrefetch(_: *anyopaque, _: usize) void {}
@@ -4753,13 +4757,7 @@ const TestCompute = struct {
     }
 
     const test_vtable = ComputeBackend.VTable{
-        // TestBuf stores f32 even when a graph declares integer index inputs.
-        // Report the physical dtype so scatter-add exercises its host fallback.
-        .tensorDType = struct {
-            fn dtype(_: *anyopaque, _: CT) !@import("../backends/tensor.zig").DType {
-                return .f32;
-            }
-        }.dtype,
+        .tensorDType = &tensorDType,
         .backendKind = &backendKind,
         .deinitBackend = &deinitBackend,
         .freeTensor = &freeTensor,
