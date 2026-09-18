@@ -8,9 +8,9 @@
 const std = @import("std");
 const compute = @import("../ops/ops.zig");
 const model = @import("../models/gliner_boundary.zig");
-const head = @import("../architectures/gliner_boundary_head.zig");
-const tasks = @import("../architectures/gliner_boundary_tasks.zig");
-const ops = @import("../architectures/gliner_boundary_ops.zig");
+const head = @import("../architectures/gliner/boundary_head.zig");
+const tasks = @import("../architectures/gliner/boundary_tasks.zig");
+const ops = @import("../architectures/gliner/boundary_ops.zig");
 const processor = @import("gliner_boundary_processor.zig");
 const schema_mod = @import("extraction_schema.zig");
 const boundary = @import("gliner_boundary_decode.zig");
@@ -1334,10 +1334,10 @@ fn readPinnedFile(a: Allocator, directory: []const u8, name: []const u8, expecte
 }
 fn publishedCheckpointParity(comptime variant: []const u8, comptime environment: [:0]const u8, comptime fixture_name: []const u8) !void {
     const directory = @import("antfly_platform").env.getenv(environment) orelse return error.SkipZigTest;
-    const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const safetensors = @import("../models/safetensors.zig");
     const native = @import("../ops/native_compute.zig");
-    const engine = @import("../architectures/gliner_boundary_engine.zig");
+    const engine = @import("../architectures/gliner/boundary_engine.zig");
     const a = std.testing.allocator;
     const bytes = try fixtures.fixtureBytes(a, fixture_name);
     defer a.free(bytes);
@@ -1459,7 +1459,7 @@ fn classificationTestBatch(a: Allocator, schemas: []const *const schema_mod.Comp
 test "gliner boundary pipeline enum validators cover source free fallback required fields and literal override" {
     const a = std.testing.allocator;
     const regex = @import("extraction_regex.zig");
-    const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const config_bytes = try fixtures.fixtureBytes(a, "models/base/config.json");
     defer a.free(config_bytes);
     const encoder_bytes = try fixtures.fixtureBytes(a, "models/base/encoder_config.json");
@@ -1683,7 +1683,7 @@ test "gliner boundary classification top_k preserves ordinary and structured pre
 
 test "gliner boundary pipeline attribute labels consume the shared value budget" {
     const a = std.testing.allocator;
-    const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const config_bytes = try fixtures.fixtureBytes(a, "models/base/config.json");
     defer a.free(config_bytes);
     const encoder_bytes = try fixtures.fixtureBytes(a, "models/base/encoder_config.json");

@@ -547,6 +547,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "capability lease HTTP fields own storage",
             "provider quotas",
             "vertex provider",
+            "vertex request",
+            "gemini provider",
+            "agent tools",
+            "agent conversation",
         },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);

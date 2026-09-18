@@ -12,7 +12,7 @@ const ops = @import("../ops/ops.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const metal_tensor = @import("../backends/metal_tensor.zig");
 const device_fixture = @import("../graph/resident_training_fixture.zig");
-const parity = @import("../architectures/gliner_boundary_parity_test.zig");
+const parity = @import("../architectures/gliner/boundary_parity_test.zig");
 const Allocator = std.mem.Allocator;
 const mib = 1024 * 1024;
 const run_identity: [32]u8 = @splat(17);
@@ -51,7 +51,7 @@ fn create(a: Allocator, cb: *const ops.ComputeBackend, fixture: Fixture) !contro
         group.* = .{ .optimizer = .{ .beta1 = fixture.optimizer.betas[0], .beta2 = fixture.optimizer.betas[1], .eps = fixture.optimizer.eps, .weight_decay = source.weight_decay }, .schedule = .{ .constant = source.lr } };
     }
     return controller.Trainer.init(a, cb, parameters, .{
-        .execution = .resident_metal,
+        .execution = if (cb.kind() == .cuda) .resident_cuda else .resident_metal,
         .groups = groups,
         .grad_accum_steps = fixture.optimizer.gradient_accumulation_steps,
         .max_grad_norm = fixture.optimizer.max_grad_norm,
@@ -108,7 +108,10 @@ fn expectScalarTransfers(trainer: *const controller.Trainer, before: metal_tenso
     const receipt = trainer.last_device_receipt orelse return error.MissingDeviceOptimizerReceipt;
     try std.testing.expect(receipt.selected_slots > 0);
     try std.testing.expectEqual(@as(usize, 0), receipt.scalar_upload_bytes % 4);
-    try std.testing.expectEqual(@as(usize, 0), receipt.scalar_download_bytes % 12);
+    // CUDA validation returns one four-byte flags word per batch. Metal keeps
+    // its three-float norm summary; neither path reads tensor payloads here.
+    const scalar_alignment: usize = if (trainer.execution == .resident_cuda) 4 else 12;
+    try std.testing.expectEqual(@as(usize, 0), receipt.scalar_download_bytes % scalar_alignment);
     try std.testing.expect(receipt.scalar_upload_bytes + receipt.scalar_download_bytes <= receipt.selected_slots * 144 + 64);
     try std.testing.expect(!trainer.host_mirrors_current);
 }
@@ -329,4 +332,74 @@ test "seeded gradient trainer resident Metal failures preserve authoritative epo
     try expectFlush(&trainer, fixture.value.flushes[0], first_step, 0);
     try trainer.restoreValidated(path, run_identity, null, .{ .context = null, .validate = Accept.apply, .expected_state_sha256 = saved });
     try std.testing.expectEqualSlices(u8, &saved, &try trainer.stateFingerprint(run_identity, null));
+}
+
+test "seeded gradient trainer CUDA matches pinned Torch AdamW and exact durable partial resume" {
+    const a = std.testing.allocator;
+    var device = try device_fixture.CudaDevice.init(a);
+    defer device.deinit();
+    const cb = device.backend.computeBackend();
+    var fixture = try load(a);
+    defer fixture.deinit();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cuda.safetensors", .{temporary.sub_path});
+    defer a.free(path);
+    const uninterrupted = try replay(a, &cb, fixture.value, false, path);
+    const resumed = try replay(a, &cb, fixture.value, true, path);
+    try std.testing.expectEqualSlices(u8, &uninterrupted, &resumed);
+}
+
+test "seeded gradient trainer CUDA clipping preserves partial resume absent gradients and order identity" {
+    const a = std.testing.allocator;
+    var device = try device_fixture.CudaDevice.init(a);
+    defer device.deinit();
+    try device.backend.enableResidentTrainingMath();
+    const cb = device.backend.computeBackend();
+    const parameters = [_]controller.Parameter{
+        .{ .name = "a", .values = &.{ 1, 1 }, .dimensions = &.{2}, .group = 0 },
+        .{ .name = "b", .values = &.{1}, .dimensions = &.{1}, .group = 0 },
+        .{ .name = "zero", .values = &.{1}, .dimensions = &.{1}, .group = 0 },
+        .{ .name = "absent", .values = &.{1}, .dimensions = &.{1}, .group = 0 },
+    };
+    var order = [_]usize{ 2, 0, 3, 1 };
+    var config = controller.Config{ .execution = .resident_cuda, .groups = &.{.{ .optimizer = .{ .weight_decay = 0.1 }, .schedule = .{ .constant = 0.01 } }}, .grad_accum_steps = 2, .max_grad_norm = 3.7, .pytorch_clip_order = &order };
+    var trainer = try controller.Trainer.init(a, &cb, &parameters, config);
+    defer trainer.deinit();
+    order[0] = 1;
+    try std.testing.expectEqualSlices(usize, &.{ 2, 0, 3, 1 }, trainer.pytorch_clip_order.?);
+    order[0] = 2;
+    const g1 = try cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = &.{ 6, 8 }, .shape = &.{2} } }, .{});
+    defer cb.free(g1);
+    const first = try trainer.submitResident(trainer.identity(), 1, &.{ .{ .name = "a", .value = .{ .tensor = g1 } }, .{ .name = "zero", .value = .zero } }, null);
+    try std.testing.expectEqual(@as(f64, 5), first.grad_norm);
+    try std.testing.expect(!first.optimizer_stepped);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/clipping.safetensors", .{temporary.sub_path});
+    defer a.free(path);
+    try trainer.save(path, run_identity, null);
+    var resumed = try controller.Trainer.init(a, &cb, &parameters, config);
+    defer resumed.deinit();
+    try resumed.restore(path, run_identity, null);
+    try std.testing.expectEqualSlices(usize, trainer.pytorch_clip_order.?, resumed.pytorch_clip_order.?);
+    config.pytorch_clip_order = &.{ 0, 1, 2, 3 };
+    var wrong = try controller.Trainer.init(a, &cb, &parameters, config);
+    defer wrong.deinit();
+    try std.testing.expectError(error.TrainingStateFingerprintMismatch, wrong.restore(path, run_identity, null));
+    const g2 = try cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = &.{24}, .shape = &.{1} } }, .{});
+    defer cb.free(g2);
+    for ([_]*controller.Trainer{ &trainer, &resumed }) |t| {
+        const result = try t.submitResident(t.identity(), 1, &.{.{ .name = "b", .value = .{ .tensor = g2 } }}, null);
+        try std.testing.expectEqual(@as(f64, 13), result.grad_norm);
+        try std.testing.expect(result.optimizer_stepped);
+        try t.ensureHostState(null);
+        try std.testing.expectEqual(@as(u32, 0), t.owner.regular_params.items[3].adam_step_count);
+        try std.testing.expectEqual(@as(f32, 1), t.owner.regular_params.items[3].weights[0]);
+        try std.testing.expectEqual(@as(u32, 1), t.owner.regular_params.items[2].adam_step_count);
+        try std.testing.expect(t.owner.regular_params.items[2].weights[0] < 1);
+    }
+    const lhs = try trainer.stateFingerprint(run_identity, null);
+    const rhs = try resumed.stateFingerprint(run_identity, null);
+    try std.testing.expectEqualSlices(u8, &lhs, &rhs);
 }

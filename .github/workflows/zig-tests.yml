@@ -594,6 +594,8 @@ jobs:
             scripts.gemma4.test_gemma4_qat_llamacpp_pair_benchmark \
             scripts.test_paired_benchmark \
             scripts.test_regen_cuda_artifacts \
+            scripts.test_regen_cuda_training_math \
+            scripts.test_regen_cuda_boundary_attention \
             scripts.test_summarize_cuda_flash_prefill_v2 \
             scripts.gemma4.test_validate_gemma4_cuda_candidate \
             scripts.gemma4.test_validate_gemma4_cuda_quality_candidate
@@ -607,6 +609,19 @@ jobs:
 
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
+
+      - name: Release completed pre-unit test artifacts
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: |
+          # The checks above compile and run several standalone test binaries
+          # into the same job-local cache. Remove their completed outputs
+          # before the aggregate unit suite so late test partitions do not
+          # fail with NoSpaceLeft while retaining compiler/dependency objects.
+          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          du -sh "$cache"
+          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          df -h "$cache"
+          df -i "$cache"
 
       # ARC may expose the shared node's memory total when the runner cgroup is
       # unlimited. Cap the aggregate scheduler budget at 22 GiB so concurrent
