@@ -36,6 +36,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
+        "workload admission cache metrics emit unique sample identities",
         "data ownership fallback requires a single store across all roles",
         "data runtime background worker capacity is reserved and closes with its owner",
         "data runtime status refresh retries bounded executor pressure without losing wakes",
