@@ -1530,6 +1530,22 @@ pub fn create(b: *std.Build) ?Artifacts {
         6 * 1024 * 1024 * 1024,
     );
 
+    // The VOPR workflow also selects focused and build-only roots that need
+    // not be reachable from `test`. Account for every compile/run before the
+    // cgroup-aware wrapper admits parallel work; preserve measured claims.
+    for ([_][]const u8{
+        "antfly-raft-transport-test",  "standby-vopr-test",                "vopr-runtime-test",
+        "restore-admission-vopr-test", "vopr-determinism-audit",           "vopr-build",
+        "antfly",                      "antfly-storage-owner-source-test",
+    }) |name| {
+        assignDefaultAggregateMaxRss(
+            b,
+            &b.top_level_steps.get(name).?.step,
+            @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
+            6 * 1024 * 1024 * 1024,
+        );
+    }
+
     const hbc_trace_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/tools/hbc_trace.zig"),
         .target = target,
