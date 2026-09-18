@@ -3516,7 +3516,7 @@ test "opaque metadata listener boundary preserves incarnation commit ordering" {
 test "storage kernel status registry is unique and lossless" {
     try error_identity.validateForTest();
     const runtime_error = @import("../runtime_error_abi.zig");
-    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable }) |expected| {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable, error.TableTopologyProtocolUpgradeRequired, error.StorageReadTemporarilyUnavailable }) |expected| {
         const failure = error_identity.failureFromError(
             expected,
             .local_query,
@@ -3531,7 +3531,8 @@ test "storage kernel status registry is unique and lossless" {
         };
         try std.testing.expectEqual(expected, received);
         const public_status = runtime_error.statusFromError(received);
-        try std.testing.expectEqual(@intFromEnum(runtime_error.Code.retryable), public_status.code);
+        const expected_code: runtime_error.Code = if (expected == error.TableTopologyProtocolUpgradeRequired) .unavailable else .retryable;
+        try std.testing.expectEqual(@intFromEnum(expected_code), public_status.code);
         try std.testing.expectEqual(expected, runtime_error.errorFromStatus(public_status));
     }
 }

@@ -159,6 +159,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         generation: u64,
         initial_range: ?db_types.ByteRange = null,
         identity: descriptor_contract.Identity,
+        restore: ?@import("../storage/restore_identity.zig").Identity = null,
 
         pub fn view(self: *const LoadedDescriptor) descriptor_contract.Descriptor {
             return .{
@@ -168,6 +169,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .indexes_json = self.indexes_json,
                 .table_storage = self.table_storage,
                 .initial_range = self.initial_range,
+                .restore = self.restore,
             };
         }
 
@@ -176,6 +178,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             alloc.free(self.schema_json);
             alloc.free(self.indexes_json);
             descriptor_contract.freeInitialRange(alloc, self.initial_range);
+            if (self.restore) |*identity| identity.deinit(alloc);
             self.* = undefined;
         }
     };
@@ -194,6 +197,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         restore_cancel_recovery: bool = false,
         restore_ha_replay: bool = false,
         table_storage: ?@import("../common/table_storage.zig").Settings = null,
+        restore: ?@import("../storage/restore_identity.zig").Identity = null,
         owner: client.Owner,
         // Exact descriptor/target proof, owned by this physical generation.
         // Shared repair steps may reuse it until a structural follow-up is due.
@@ -1917,6 +1921,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.alloc.free(entry.indexes_json);
         self.alloc.free(entry.restore_bootstrap_json);
         descriptor_contract.freeInitialRange(self.alloc, entry.initial_range);
+        if (entry.restore) |*identity| identity.deinit(self.alloc);
         if (entry.repair_target) |target| self.alloc.free(target);
         self.alloc.destroy(entry);
     }
@@ -2183,6 +2188,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .indexes_json = projection.indexes_json,
             .table_storage = projection.table_storage,
             .initial_range = projection.initial_range,
+            .restore = projection.restore,
             .generation = self.visibleRootGeneration(group_id),
             .identity = .{
                 .table_id = projection.table_id,
@@ -2889,7 +2895,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         for (self.entries.items, 0..) |entry, index| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.closing) return error.StorageKernelOwnerTransitionRequired;
-            if (entry.retired or entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity)) {
+            // A cached owner opened before restore intent must drain as well.
+            // Compare the admitted binding in memory; warm hits need no marker I/O.
+            const restore_matches = if (descriptor.restore) |expected|
+                if (entry.restore) |admitted| admitted.eql(expected) else false
+            else
+                true;
+            if (entry.retired or entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity) or !restore_matches) {
                 entry.retired = true;
                 if (entry.active_users == 0) {
                     stale_index = index;
@@ -2943,6 +2955,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer self.alloc.free(owned_restore_bootstrap_json);
         const owned_initial_range = try descriptor_contract.cloneInitialRange(self.alloc, descriptor.initial_range);
         errdefer descriptor_contract.freeInitialRange(self.alloc, owned_initial_range);
+        var owned_restore = if (descriptor.restore) |identity| try identity.clone(self.alloc) else null;
+        errdefer if (owned_restore) |*identity| identity.deinit(self.alloc);
         const entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(entry);
         try self.ensureContextConfigured();
@@ -2987,6 +3001,15 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .cancellation_ctx = &cancellation,
                 .cancellation_fn = cancellationTokenRequested,
             },
+            .restore = if (descriptor.restore) |identity| .{
+                .required = 1,
+                .backup_id = .fromSlice(identity.backup_id),
+                .location = .fromSlice(identity.location),
+                .snapshot_path = .fromSlice(identity.snapshot_path),
+                .artifact_sha256 = .fromSlice(identity.artifact_sha256),
+                .native_manifest_size_bytes = identity.native_manifest_size_bytes,
+                .native_manifest_sha256 = .fromSlice(identity.native_manifest_sha256),
+            } else .{},
         });
         errdefer owner.deinit();
         entry.* = .{
@@ -3001,6 +3024,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .restore_cancel_recovery = descriptor.restore_cancel_recovery,
             .restore_ha_replay = descriptor.restore_ha_replay,
             .table_storage = descriptor.table_storage,
+            .restore = owned_restore,
             .owner = owner,
             .active_users = 1,
             .resident = residency == .resident,

@@ -191,7 +191,7 @@ def test_fk_cascade_recovers_claims_references_and_rows(
                 cluster, session, table, {"num_shards": 3, "schema": schema}
             )
             assert wait_until(
-                lambda table=table: cluster.table_is_fully_replicated(table),
+                lambda table=table: cluster.fully_replicated_topology(table),
                 timeout_s=90,
             ), cluster.debug_logs()
 
@@ -363,7 +363,7 @@ def test_schema_rewrite_recovers_dependency_cohort(
                 cluster, session, table, {"num_shards": 3, "schema": schema}
             )
             assert wait_until(
-                lambda table=table: cluster.table_is_fully_replicated(table),
+                lambda table=table: cluster.fully_replicated_topology(table),
                 timeout_s=90,
             ), cluster.debug_logs()
 

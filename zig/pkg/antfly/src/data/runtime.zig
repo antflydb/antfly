@@ -5171,6 +5171,9 @@ pub const DataServer = struct {
     telemetry_active: bool = false,
     telemetry_rotation: usize = 0,
     store_report_update_retry_at_ms: u64 = 0,
+    // Capability discovery must not pause publication through a supported
+    // older protocol during a rolling upgrade.
+    store_report_protocol_retry_at_ms: u64 = 0,
     metadata_bootstrap_retry_mutex: std.atomic.Mutex = .unlocked,
     metadata_bootstrap_retry_attempts: u32 = 0,
     next_metadata_bootstrap_retry_at_ms: u64 = 0,
@@ -16569,12 +16572,7 @@ pub const DataServer = struct {
         const reporter_incarnation = input.reporter_incarnation;
         const report_generation = input.report_generation;
         const claimed_activity = input.claimed_activity;
-        const budget: antfly.metadata_http_client.RequestBudget = .{
-            .deadline_ns = std.math.maxInt(u64),
-            .cancellation = &self.store_report_cancellation,
-            .io = remote_metadata.io,
-        };
-        try RemoteMetadataSource.ensureBudgetActive(budget);
+        if (self.store_report_cancellation.isCancelled()) return error.Cancelled;
         var local_group_ids = try collectLocalGroupIds(self.alloc, snapshot.placement_intents, registration.node_id);
         if (local_group_ids.len == 0 and hasSingleRoleStore(snapshot.stores, registration.role, registration.store_id)) {
             const fallback_group_ids = try collectAllRangeGroupIds(self.alloc, snapshot.ranges);
@@ -16688,11 +16686,24 @@ pub const DataServer = struct {
         if (self.local_group_status_generation.load(.acquire) != report_generation) {
             return error.StaleLocalGroupStatusGeneration;
         }
+        // Collection can outlive a transport quantum on a large inventory.
+        // Start the bounded network deadline only once that snapshot is ready;
+        // an unreachable metadata peer must not pin this worker indefinitely.
+        const budget: antfly.metadata_http_client.RequestBudget = .{
+            .deadline_ns = remote_metadata.awakeNs() +| 2 * std.time.ns_per_s,
+            .cancellation = &self.store_report_cancellation,
+            .io = remote_metadata.io,
+        };
         if (!try self.publishStoreReportUpdateWithBudget(report, false, budget)) try remote_metadata.reportNodeStatusWithBudget(report, budget);
         try self.storeStatusHeartbeatCacheReplaceAtGeneration(report, report_generation);
         self.last_store_status_report_at_ms.store(self.backgroundMonotonicMs(), .release);
         if (claimed_activity) self.last_embedding_activity_report_at_ms.store(self.last_store_status_report_at_ms.load(.acquire), .release);
         self.clearMetadataBootstrapRetry();
+        // Schema progress already has its own bounded quantum. Preserve it
+        // after a slow successful report instead of starving every schema
+        // checkpoint with the publication deadline's exhausted remainder.
+        var progress_budget = budget;
+        progress_budget.deadline_ns = remote_metadata.awakeNs() +| 2 * std.time.ns_per_s;
         try self.reportRuntimeSchemaProgress(
             remote_metadata,
             registration.store_id,
@@ -16702,7 +16713,7 @@ pub const DataServer = struct {
             snapshot.tables,
             snapshot.ranges,
             snapshot.schema_progresses,
-            budget,
+            progress_budget,
         );
     }
 
@@ -17616,6 +17627,7 @@ pub const DataServer = struct {
             return false;
         }
         if (self.store_report_baseline != null) return error.StoreReportBaselinePending;
+        if (self.backgroundMonotonicMs() < self.store_report_protocol_retry_at_ms) return false;
         if (retain_runtime and self.store_report_publisher.cursor == null) return false;
         for (0..2) |attempt| {
             var prepared = try self.store_report_publisher.prepare(self.alloc, report, attempt != 0, retain_runtime);
@@ -17641,7 +17653,7 @@ pub const DataServer = struct {
                 error.StoreReportBaseMismatch => if (attempt == 0) continue else return err,
                 error.UnsupportedOperation => {
                     self.store_report_publisher.cursor = null;
-                    self.store_report_update_retry_at_ms = self.backgroundMonotonicMs() + 60 * std.time.ms_per_s;
+                    self.store_report_protocol_retry_at_ms = self.backgroundMonotonicMs() + 60 * std.time.ms_per_s;
                     return false;
                 },
                 else => return err,
@@ -22890,7 +22902,12 @@ const RemoteMetadataSource = struct {
         comptime callFn: anytype,
         ctx: anytype,
     ) !T {
-        return self.withMetadataApiClientBudget(T, callFn, ctx, null);
+        const Adapter = struct {
+            fn call(source: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, uri: []const u8, context: @TypeOf(ctx), _: ?antfly.metadata_http_client.RequestBudget) !T {
+                return callFn(source, client, uri, context);
+            }
+        };
+        return self.withMetadataApiClientBudget(T, Adapter.call, ctx, null);
     }
 
     fn withMetadataApiClientBudget(self: *RemoteMetadataSource, comptime T: type, comptime callFn: anytype, ctx: anytype, budget: ?antfly.metadata_http_client.RequestBudget) !T {
@@ -22899,11 +22916,19 @@ const RemoteMetadataSource = struct {
         for (0..self.base_uris.len) |attempt| {
             try ensureBudgetActive(budget);
             const index = (start + attempt) % self.base_uris.len;
+            // Reserve a share for every remaining peer. Both discovery and
+            // publication consume this same endpoint budget, so one stalled
+            // route cannot starve a reachable leader on every worker turn.
+            const attempt_budget: ?antfly.metadata_http_client.RequestBudget = if (budget) |outer| blk: {
+                var bounded = outer;
+                bounded.deadline_ns = catalogRoutingAttemptDeadline(outer.nowNs(), outer.deadline_ns, self.base_uris.len - attempt);
+                break :blk bounded;
+            } else null;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
             var metadata_client = self.metadataClient(scratch);
-            const head = metadata_client.fetchHeadWithBudget(self.base_uris[index], budget) catch |err| {
+            const head = metadata_client.fetchHeadWithBudget(self.base_uris[index], attempt_budget) catch |err| {
                 last_err = err;
                 continue;
             };
@@ -22911,7 +22936,7 @@ const RemoteMetadataSource = struct {
                 last_err = err;
                 continue;
             };
-            const result = callFn(self, &metadata_client, self.base_uris[index], ctx) catch |err| {
+            const result = callFn(self, &metadata_client, self.base_uris[index], ctx, attempt_budget) catch |err| {
                 // These are authoritative report rejections, including the
                 // instruction to repair an obsolete delta base. A follower's
                 // later NotLeader must never hide that recovery signal.
@@ -23853,7 +23878,9 @@ const RemoteMetadataSource = struct {
                 if (deadline_ns) |deadline| {
                     if (self.awakeNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
                 }
-                ranges[initialized] = try antfly.metadata.table_manager.cloneRoutingRange(self.alloc, range);
+                // Point reads feed storage-owner admission and must retain the
+                // immutable restore binding; only catalog-wide routes are compact.
+                ranges[initialized] = try antfly.metadata.table_manager.cloneRange(self.alloc, range);
                 initialized += 1;
             }
         }
@@ -24802,34 +24829,34 @@ const RemoteMetadataSource = struct {
         defer arena.deinit();
         const scratch = arena.allocator();
         const body = try stringifyJsonAlloc(scratch, report);
-        const Request = struct { body: []const u8, budget: ?antfly.metadata_http_client.RequestBudget };
+        const Request = struct { body: []const u8 };
         const supported = try self.withMetadataApiClientBudget(bool, struct {
-            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: Request) !bool {
-                return try client.reportNodeStatusWithReferenceSupportAndBudget(base_uri, ctx.body, ctx.budget);
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: Request, attempt_budget: ?antfly.metadata_http_client.RequestBudget) !bool {
+                return try client.reportNodeStatusWithReferenceSupportAndBudget(base_uri, ctx.body, attempt_budget);
             }
-        }.call, Request{ .body = body, .budget = budget }, budget);
+        }.call, Request{ .body = body }, budget);
         self.supports_runtime_reference.store(supported, .release);
     }
 
     fn reportNodeBaseline(self: *RemoteMetadataSource, store_id: u64, body: []const u8, budget: antfly.metadata_http_client.RequestBudget) !store_report_baseline.Progress {
-        const Request = struct { store_id: u64, body: []const u8, budget: antfly.metadata_http_client.RequestBudget };
+        const Request = struct { store_id: u64, body: []const u8 };
         return self.withMetadataApiClientBudget(store_report_baseline.Progress, struct {
-            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, req: Request) !store_report_baseline.Progress {
-                return client.reportNodeBaselineWithBudget(base_uri, req.store_id, req.body, req.budget);
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, req: Request, attempt_budget: ?antfly.metadata_http_client.RequestBudget) !store_report_baseline.Progress {
+                return client.reportNodeBaselineWithBudget(base_uri, req.store_id, req.body, attempt_budget.?);
             }
-        }.call, Request{ .store_id = store_id, .body = body, .budget = budget }, budget);
+        }.call, Request{ .store_id = store_id, .body = body }, budget);
     }
     fn reportNodeUpdate(self: *RemoteMetadataSource, store_id: u64, body: []const u8) !store_report_update.Cursor {
         return self.reportNodeUpdateWithBudget(store_id, body, null);
     }
 
     fn reportNodeUpdateWithBudget(self: *RemoteMetadataSource, store_id: u64, body: []const u8, budget: ?antfly.metadata_http_client.RequestBudget) !store_report_update.Cursor {
-        const Request = struct { store_id: u64, body: []const u8, budget: ?antfly.metadata_http_client.RequestBudget };
+        const Request = struct { store_id: u64, body: []const u8 };
         return self.withMetadataApiClientBudget(store_report_update.Cursor, struct {
-            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, req: Request) !store_report_update.Cursor {
-                return client.reportNodeUpdateWithBudget(base_uri, req.store_id, req.body, req.budget);
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, req: Request, attempt_budget: ?antfly.metadata_http_client.RequestBudget) !store_report_update.Cursor {
+                return client.reportNodeUpdateWithBudget(base_uri, req.store_id, req.body, attempt_budget);
             }
-        }.call, Request{ .store_id = store_id, .body = body, .budget = budget }, budget);
+        }.call, Request{ .store_id = store_id, .body = body }, budget);
     }
 
     fn reportNodeHeartbeat(self: *RemoteMetadataSource, report: antfly.metadata.table_manager.StoreStatusReport) !void {
@@ -24839,12 +24866,12 @@ const RemoteMetadataSource = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const body = try stringifyJsonAlloc(arena.allocator(), report);
-        const Request = struct { body: []const u8, budget: ?antfly.metadata_http_client.RequestBudget };
+        const Request = struct { body: []const u8 };
         self.withMetadataApiClientBudget(void, struct {
-            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, request: Request) !void {
-                try client.reportNodeHeartbeatWithBudget(base_uri, request.body, request.budget);
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, request: Request, attempt_budget: ?antfly.metadata_http_client.RequestBudget) !void {
+                try client.reportNodeHeartbeatWithBudget(base_uri, request.body, attempt_budget);
             }
-        }.call, Request{ .body = body, .budget = budget }, budget) catch |err| {
+        }.call, Request{ .body = body }, budget) catch |err| {
             if (err == error.UnsupportedOperation or err == error.StoreReportBaseMismatch) self.supports_runtime_reference.store(false, .release);
             return err;
         };
@@ -24855,12 +24882,12 @@ const RemoteMetadataSource = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const body = try stringifyJsonAlloc(arena.allocator(), records);
-        const Request = struct { body: []const u8, budget: ?antfly.metadata_http_client.RequestBudget };
+        const Request = struct { body: []const u8 };
         try self.withMetadataApiClientBudget(void, struct {
-            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, request: Request) !void {
-                try client.upsertSchemaProgressBatch(base_uri, request.body, request.budget);
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, request: Request, attempt_budget: ?antfly.metadata_http_client.RequestBudget) !void {
+                try client.upsertSchemaProgressBatch(base_uri, request.body, attempt_budget);
             }
-        }.call, Request{ .body = body, .budget = budget }, budget);
+        }.call, Request{ .body = body }, budget);
     }
 
     fn upsertSchemaProgress(self: *RemoteMetadataSource, record: antfly.metadata.table_manager.SchemaProgressRecord) !void {
@@ -24872,12 +24899,12 @@ const RemoteMetadataSource = struct {
         defer arena.deinit();
         const scratch = arena.allocator();
         const body = try stringifyJsonAlloc(scratch, record);
-        const Request = struct { body: []const u8, budget: ?antfly.metadata_http_client.RequestBudget };
+        const Request = struct { body: []const u8 };
         try self.withMetadataApiClientBudget(void, struct {
-            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: Request) !void {
-                try client.upsertSchemaProgressWithBudget(base_uri, ctx.body, ctx.budget);
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: Request, attempt_budget: ?antfly.metadata_http_client.RequestBudget) !void {
+                try client.upsertSchemaProgressWithBudget(base_uri, ctx.body, attempt_budget);
             }
-        }.call, Request{ .body = body, .budget = budget }, budget);
+        }.call, Request{ .body = body }, budget);
     }
 
     fn upsertRestoreProgress(self: *RemoteMetadataSource, record: antfly.metadata.table_manager.RestoreProgressRecord) !void {
@@ -42829,7 +42856,7 @@ fn implementationTests() type {
             }
         }
 
-        test "DataServer store status retries leadership changes on borrowed VoprIo" {
+        test "DataServer store status retries leadership and socket failures on borrowed VoprIo" {
             const alloc = std.testing.allocator;
             const RuntimeRound = struct {
                 // Publication now runs on its own worker. Await it from a
@@ -42884,6 +42911,12 @@ fn implementationTests() type {
                 reports: usize = 0,
                 delayed_error: ?anyerror = null,
                 dirty_on_report: ?*DataServer = null,
+                updates_supported: bool = true,
+                update_probes: usize = 0,
+                fallback_reports: usize = 0,
+                stall_report: bool = false,
+                stall_uri: ?[]const u8 = null,
+                stall_head: bool = true,
 
                 fn executor(self: *@This()) antfly.common.http.RequestExecutor {
                     return .{ .ptr = self, .vtable = &.{ .execute = execute } };
@@ -42892,6 +42925,13 @@ fn implementationTests() type {
                 fn execute(ptr: *anyopaque, response_alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.requests += 1;
+                    if (self.stall_uri) |uri| {
+                        if (std.mem.startsWith(u8, request.uri, uri) and (self.stall_head or request.method == .POST)) {
+                            const timeout_ms = request.timeout_ms orelse return error.UnboundedStoreReport;
+                            self.vopr_io.monotonic_ns += @as(i96, timeout_ms) * std.time.ns_per_ms;
+                            return error.Timeout;
+                        }
+                    }
                     if (self.delayed_error) |err| {
                         self.vopr_io.monotonic_ns += 2 * std.time.ns_per_s;
                         return err;
@@ -42908,7 +42948,21 @@ fn implementationTests() type {
                         };
                     }
                     try std.testing.expectEqual(antfly.common.http.Method.POST, request.method);
+                    const timeout_ms = request.timeout_ms orelse return error.UnboundedStoreReport;
+                    try std.testing.expect(timeout_ms <= 2000);
+                    if (self.stall_report) {
+                        self.vopr_io.monotonic_ns += @as(i96, timeout_ms) * std.time.ns_per_ms;
+                        return error.Timeout;
+                    }
+                    if (std.mem.endsWith(u8, request.uri, "/status")) {
+                        var report = try std.json.parseFromSlice(antfly.metadata.table_manager.StoreStatusReport, response_alloc, request.body, .{});
+                        defer report.deinit();
+                        self.fallback_reports += 1;
+                        return .{ .status = 200, .body = try response_alloc.dupe(u8, "{}") };
+                    }
                     try std.testing.expect(std.mem.endsWith(u8, request.uri, "/status/update"));
+                    self.update_probes += 1;
+                    if (!self.updates_supported) return .{ .status = 404, .body = try response_alloc.dupe(u8, "unsupported") };
                     var update = try std.json.parseFromSlice(store_report_update.Update, response_alloc, request.body, .{});
                     defer update.deinit();
                     self.reports += 1;
@@ -43035,35 +43089,88 @@ fn implementationTests() type {
             // would already have elapsed, for both publication and registration.
             server.setRemoteMetadataFetchErrorForTest(null);
             for ([_]bool{ true, false }) |registered| {
-                server.clearMetadataBootstrapRetry();
-                server.store_registration_confirmed = registered;
-                server.store_status_dirty.store(true, .release);
-                remote_metadata.cached_snapshot_at_ms = remote_metadata.awakeMs();
-                metadata_transport.delayed_error = error.NotLeader;
-                const started_at_ms = server.backgroundMonotonicMs();
-                const requests_before = metadata_transport.requests;
-                try RuntimeRound.run(&server, &vopr_io);
-                const failed_at_ms = server.backgroundMonotonicMs();
-                try std.testing.expectEqual(started_at_ms + 2000, failed_at_ms);
-                try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
-                try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
-                const delayed_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
-                try std.testing.expect(delayed_retry_at_ms >= failed_at_ms + metadata_bootstrap_retry_base_ms);
-                try std.testing.expect(delayed_retry_at_ms <= failed_at_ms + metadata_bootstrap_retry_base_ms + metadata_bootstrap_retry_jitter_ms);
-                try std.testing.expect(server.store_status_dirty.load(.acquire));
+                for ([_]anyerror{ error.NotLeader, error.ConnectionResetByPeer }) |transport_error| {
+                    server.clearMetadataBootstrapRetry();
+                    server.store_registration_confirmed = registered;
+                    server.store_status_dirty.store(true, .release);
+                    remote_metadata.cached_snapshot_at_ms = remote_metadata.awakeMs();
+                    metadata_transport.delayed_error = transport_error;
+                    // The metadata client owns one bounded retry for replay-safe
+                    // control requests after a socket reset. Backoff begins only
+                    // after that whole attempt finishes, not after its first send.
+                    const attempt_count: usize = if (!registered and transport_error == error.ConnectionResetByPeer) 2 else 1;
+                    const started_at_ms = server.backgroundMonotonicMs();
+                    const requests_before = metadata_transport.requests;
+                    try RuntimeRound.run(&server, &vopr_io);
+                    const failed_at_ms = server.backgroundMonotonicMs();
+                    try std.testing.expectEqual(started_at_ms + 2000 * attempt_count, failed_at_ms);
+                    try std.testing.expectEqual(requests_before + attempt_count, metadata_transport.requests);
+                    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+                    const delayed_retry_at_ms = server.nextMetadataBootstrapRetryAtMsForTest();
+                    try std.testing.expect(delayed_retry_at_ms >= failed_at_ms + metadata_bootstrap_retry_base_ms);
+                    try std.testing.expect(delayed_retry_at_ms <= failed_at_ms + metadata_bootstrap_retry_base_ms + metadata_bootstrap_retry_jitter_ms);
+                    try std.testing.expect(server.store_status_dirty.load(.acquire));
 
-                // No new transport call may start until the delay after completion
-                // expires. A permanent failure at that boundary must still escape.
-                metadata_transport.delayed_error = error.MetadataIncarnationMismatch;
+                    // No new transport call may start until the delay after completion
+                    // expires. A permanent failure at that boundary must still escape.
+                    metadata_transport.delayed_error = error.MetadataIncarnationMismatch;
+                    try RuntimeRound.run(&server, &vopr_io);
+                    vopr_io.monotonic_ns = @as(i96, delayed_retry_at_ms - 1) * std.time.ns_per_ms;
+                    try RuntimeRound.run(&server, &vopr_io);
+                    try std.testing.expectEqual(requests_before + attempt_count, metadata_transport.requests);
+                    vopr_io.monotonic_ns += std.time.ns_per_ms;
+                    try std.testing.expectError(error.MetadataIncarnationMismatch, RuntimeRound.run(&server, &vopr_io));
+                    try std.testing.expectEqual(requests_before + attempt_count + 1, metadata_transport.requests);
+                    try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+                    try std.testing.expectEqual(delayed_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
+                }
+            }
+            // Capability-probe backoff must not block fresh full reports via
+            // an older peer. The worker and protocol probe have separate clocks.
+            metadata_transport.delayed_error = null;
+            metadata_transport.updates_supported = false;
+            server.store_registration_confirmed = true;
+            server.clearMetadataBootstrapRetry();
+            server.store_report_update_retry_at_ms = 0;
+            const probes_before = metadata_transport.update_probes;
+            for (0..3) |_| {
+                remote_metadata.cached_snapshot_at_ms = remote_metadata.awakeMs();
                 try RuntimeRound.run(&server, &vopr_io);
-                vopr_io.monotonic_ns = @as(i96, delayed_retry_at_ms - 1) * std.time.ns_per_ms;
-                try RuntimeRound.run(&server, &vopr_io);
-                try std.testing.expectEqual(requests_before + 1, metadata_transport.requests);
                 vopr_io.monotonic_ns += std.time.ns_per_ms;
-                try std.testing.expectError(error.MetadataIncarnationMismatch, RuntimeRound.run(&server, &vopr_io));
-                try std.testing.expectEqual(requests_before + 2, metadata_transport.requests);
-                try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
-                try std.testing.expectEqual(delayed_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
+            }
+            try std.testing.expectEqual(@as(usize, 3), metadata_transport.fallback_reports);
+            try std.testing.expectEqual(probes_before + 1, metadata_transport.update_probes);
+            try std.testing.expectEqual(@as(u64, 0), server.store_report_update_retry_at_ms);
+            // Once the peer upgrades, resume the current protocol at the
+            // probe deadline rather than permanently latching compatibility.
+            metadata_transport.updates_supported = true;
+            vopr_io.monotonic_ns = @as(i96, server.store_report_protocol_retry_at_ms) * std.time.ns_per_ms;
+            remote_metadata.cached_snapshot_at_ms = remote_metadata.awakeMs();
+            try RuntimeRound.run(&server, &vopr_io);
+            try std.testing.expectEqual(probes_before + 2, metadata_transport.update_probes);
+            try std.testing.expect(server.store_report_publisher.cursor != null);
+            // A stalled publication consumes one transport quantum and then
+            // yields to backoff, retaining a dirty observation for recovery.
+            metadata_transport.stall_report = true;
+            const stalled_at_ns = vopr_io.monotonic_ns;
+            try RuntimeRound.run(&server, &vopr_io);
+            try std.testing.expectEqual(stalled_at_ns + 2 * std.time.ns_per_s, vopr_io.monotonic_ns);
+            try std.testing.expect(server.store_status_dirty.load(.acquire));
+            try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
+            metadata_transport.stall_report = false;
+            metadata_transport.stall_uri = "http://stalled.test";
+            for ([_]bool{ true, false }) |stall_head| {
+                metadata_transport.stall_head = stall_head;
+                var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{ "http://stalled.test", "http://healthy.test" }, &.{metadata_transport.executor()}, vopr_io.io());
+                defer source.deinit();
+                const started_ns = source.awakeNs();
+                const delivered_before = metadata_transport.fallback_reports;
+                try source.reportNodeStatusWithBudget(.{ .store_id = 19 }, .{
+                    .deadline_ns = started_ns + 2 * std.time.ns_per_s,
+                    .io = vopr_io.io(),
+                });
+                try std.testing.expectEqual(started_ns + std.time.ns_per_s, source.awakeNs());
+                try std.testing.expectEqual(delivered_before + 1, metadata_transport.fallback_reports);
             }
             try vopr_io.ensureNoCapabilityViolation();
         }
@@ -50421,11 +50528,19 @@ fn implementationTests() type {
             try std.testing.expect(server.lsm_maintenance_future == null);
         }
 
-        test "remote routing capture cache and session share a virtual deadline clock" {
+        test "remote routing point reads retain restore identity and share a virtual deadline clock" {
             const alloc = std.testing.allocator;
             var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{});
             defer vopr_io.deinit();
             const Stub = struct {
+                const identity: @import("../storage/restore_identity.zig").Identity = .{
+                    .backup_id = "backup",
+                    .location = "file:///backup",
+                    .snapshot_path = "groups/71.afb",
+                    .artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    .native_manifest_size_bytes = 123,
+                    .native_manifest_sha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                };
                 calls: usize = 0,
                 fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -50439,7 +50554,18 @@ fn implementationTests() type {
                             .metadata_incarnation = .{'1'} ** 32,
                             .catalog_revision = 9,
                             .tables = @constCast(&[_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }}),
-                            .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{ .table_id = 7, .group_id = 71, .range_id = 71, .start_key = "" }}),
+                            .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{
+                                .table_id = 7,
+                                .group_id = 71,
+                                .range_id = 71,
+                                .start_key = "",
+                                .restore_backup_id = identity.backup_id,
+                                .restore_location = identity.location,
+                                .restore_snapshot_path = identity.snapshot_path,
+                                .restore_artifact_sha256 = identity.artifact_sha256,
+                                .restore_native_manifest_size_bytes = identity.native_manifest_size_bytes,
+                                .restore_native_manifest_sha256 = identity.native_manifest_sha256,
+                            }}),
                         }, .{});
                     };
                     return .{ .status = 200, .body = body };
@@ -50452,6 +50578,7 @@ fn implementationTests() type {
             var captured = try source.remoteRoutingSnapshotWithMode(deadline, false);
             defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &captured);
             try std.testing.expectEqual(@as(u64, 9), captured.catalog_revision);
+            try std.testing.expectEqualStrings("", captured.ranges[0].restore_backup_id);
             const calls_after_capture = stub.calls;
             var cached = try source.remoteRoutingSnapshotWithMode(deadline, false);
             defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &cached);
@@ -50477,7 +50604,22 @@ fn implementationTests() type {
                 defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &table);
                 try std.testing.expectEqualStrings("docs", table.tables[0].name);
                 try std.testing.expectEqual(@as(usize, 1), table.ranges.len);
+                const range = table.ranges[0];
+                try std.testing.expect(Stub.identity.eql(.{
+                    .backup_id = range.restore_backup_id,
+                    .location = range.restore_location,
+                    .snapshot_path = range.restore_snapshot_path,
+                    .artifact_sha256 = range.restore_artifact_sha256,
+                    .native_manifest_size_bytes = range.restore_native_manifest_size_bytes,
+                    .native_manifest_sha256 = range.restore_native_manifest_sha256,
+                }));
             }
+            // The real storage-owner consumer must receive the complete binding,
+            // even after this source has populated its compact routing cache.
+            var descriptor = (try antfly.public_api.table_catalog.tableGroupDescriptorProjection(alloc, source.catalogSource(), "docs", 71, deadline)).?;
+            defer descriptor.deinit(alloc);
+            try std.testing.expect(descriptor.restore != null);
+            try std.testing.expect(Stub.identity.eql(descriptor.restore.?));
             vopr_io.monotonic_ns = deadline;
             try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, session.catalog().budget(deadline).checkpoint());
             try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.remoteRoutingSnapshotWithMode(deadline, false));

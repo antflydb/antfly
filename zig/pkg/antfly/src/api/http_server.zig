@@ -20318,6 +20318,9 @@ fn restoreJobErrorIsFenced(err: anyerror) bool {
     return err == error.RestoreJobFenced or
         err == error.RestoreJobPersistenceUnavailable or
         err == error.ArtifactIndexSourcesTemporarilyUnavailable or
+        err == error.MetadataProposalSuperseded or
+        err == error.MetadataProposalApplyTimeout or
+        err == error.MetadataMutationOutcomeUnknown or
         metadata_authority.isRetryableError(err);
 }
 
@@ -20335,6 +20338,9 @@ test "restore job ownership failures remain retryable" {
     try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobFenced));
     try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobPersistenceUnavailable));
     try std.testing.expect(restoreJobErrorIsFenced(error.NotLeader));
+    try std.testing.expect(restoreJobErrorIsFenced(error.MetadataProposalSuperseded));
+    try std.testing.expect(restoreJobErrorIsFenced(error.MetadataProposalApplyTimeout));
+    try std.testing.expect(restoreJobErrorIsFenced(error.MetadataMutationOutcomeUnknown));
     try std.testing.expect(restoreJobErrorIsFenced(error.ArtifactIndexSourcesTemporarilyUnavailable));
     try std.testing.expect(!restoreJobErrorIsFenced(error.InvalidArguments));
     try std.testing.expect(restoreJobFailureRequiresRecovery(false, error.OutOfMemory));

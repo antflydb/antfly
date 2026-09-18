@@ -1999,11 +1999,13 @@ pub const TableGroupDescriptorProjection = struct {
     indexes_json: []u8,
     table_storage: ?@import("../common/table_storage.zig").Settings,
     initial_range: ?@import("../storage/byte_range.zig").ByteRange = null,
+    restore: ?@import("../storage/restore_identity.zig").Identity = null,
 
     pub fn deinit(self: *TableGroupDescriptorProjection, alloc: std.mem.Allocator) void {
         alloc.free(self.schema_json);
         alloc.free(self.indexes_json);
         @import("../storage/kernel_owner_descriptor.zig").freeInitialRange(alloc, self.initial_range);
+        if (self.restore) |*identity| identity.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -2071,6 +2073,7 @@ pub fn tableGroupDescriptorProjection(
                 table.indexes_json,
                 table.storage,
                 .{ .start = range.start_key, .end = range.end_key orelse "" },
+                restoreIdentityFromRange(range),
             );
         }
     }
@@ -2091,6 +2094,7 @@ pub fn tableGroupDescriptorProjection(
             transition.table_contract.indexes_json,
             null,
             null, // The replicated split bootstrap owns its initial range.
+            null,
         );
     }
     for (admin.merge_transitions) |transition| {
@@ -2110,6 +2114,7 @@ pub fn tableGroupDescriptorProjection(
             transition.table_contract.indexes_json,
             null,
             null, // The replicated merge bootstrap owns its initial range.
+            null,
         );
     }
     return null;
@@ -2133,6 +2138,7 @@ fn descriptorProjectionFromRoutingSnapshot(
             table.indexes_json,
             table.storage,
             .{ .start = range.start_key, .end = range.end_key orelse "" },
+            restoreIdentityFromRange(range),
         );
     }
     return null;
@@ -2147,11 +2153,14 @@ fn descriptorProjectionFromValues(
     indexes_json: []const u8,
     table_storage: ?@import("../common/table_storage.zig").Settings,
     initial_range: ?@import("../storage/byte_range.zig").ByteRange,
+    restore: ?@import("../storage/restore_identity.zig").Identity,
 ) !TableGroupDescriptorProjection {
     const owned_schema_json = try alloc.dupe(u8, schema_json);
     errdefer alloc.free(owned_schema_json);
     const owned_initial_range = try @import("../storage/kernel_owner_descriptor.zig").cloneInitialRange(alloc, initial_range);
     errdefer @import("../storage/kernel_owner_descriptor.zig").freeInitialRange(alloc, owned_initial_range);
+    const owned_indexes_json = try alloc.dupe(u8, indexes_json);
+    errdefer alloc.free(owned_indexes_json);
     return .{
         .table_id = table_id,
         .table_storage = table_storage,
@@ -2159,7 +2168,20 @@ fn descriptorProjectionFromValues(
         .doc_identity_shard_id = doc_identity_shard_id,
         .doc_identity_range_id = doc_identity_range_id,
         .schema_json = owned_schema_json,
-        .indexes_json = try alloc.dupe(u8, indexes_json),
+        .indexes_json = owned_indexes_json,
+        .restore = if (restore) |identity| try identity.clone(alloc) else null,
+    };
+}
+
+fn restoreIdentityFromRange(range: metadata_table_manager.RangeRecord) ?@import("../storage/restore_identity.zig").Identity {
+    if (range.restore_backup_id.len == 0) return null;
+    return .{
+        .backup_id = range.restore_backup_id,
+        .location = range.restore_location,
+        .snapshot_path = range.restore_snapshot_path,
+        .artifact_sha256 = range.restore_artifact_sha256,
+        .native_manifest_size_bytes = range.restore_native_manifest_size_bytes,
+        .native_manifest_sha256 = range.restore_native_manifest_sha256,
     };
 }
 

@@ -238,6 +238,14 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
             return error.DistributedQueryUnavailable;
         }
 
+        fn storageReadUnavailable(_: *u32) anyerror!void {
+            return error.StorageReadTemporarilyUnavailable;
+        }
+
+        fn topologyUpgradeRequired(_: *u32) anyerror!void {
+            return error.TableTopologyProtocolUpgradeRequired;
+        }
+
         fn indexGenerationMismatch(_: *u32) anyerror!void {
             return error.IndexGenerationMismatch;
         }
@@ -304,6 +312,14 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     try std.testing.expectError(
         error.DistributedQueryUnavailable,
         TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.distributedQueryUnavailable, .{&base}),
+    );
+    try std.testing.expectError(
+        error.StorageReadTemporarilyUnavailable,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.storageReadUnavailable, .{&base}),
+    );
+    try std.testing.expectError(
+        error.TableTopologyProtocolUpgradeRequired,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.topologyUpgradeRequired, .{&base}),
     );
     try std.testing.expectError(
         error.IndexGenerationMismatch,

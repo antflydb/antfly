@@ -41,6 +41,7 @@ pub const Descriptor = struct {
     restore_cancel_recovery: bool = false,
     restore_ha_replay: bool = false,
     table_storage: ?@import("../common/table_storage.zig").Settings = null,
+    restore: ?@import("restore_identity.zig").Identity = null,
 };
 
 pub fn cloneInitialRange(alloc: @import("std").mem.Allocator, range: ?@import("byte_range.zig").ByteRange) !?@import("byte_range.zig").ByteRange {

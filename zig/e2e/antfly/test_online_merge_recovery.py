@@ -528,7 +528,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
         backups._create_cluster_table_when_admitted(
             owner, session, child, {"num_shards": 3, "schema": child_schema}
         )
-        assert wait_until(lambda: owner.table_is_fully_replicated(child), timeout_s=90)
+        assert wait_until(lambda: owner.fully_replicated_topology(child), timeout_s=90)
 
         def ready():
             response = session.get(
@@ -624,7 +624,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
                 cluster, session, parent, {"num_shards": 3, "schema": schema}
             )
             assert wait_until(
-                lambda: cluster.table_is_fully_replicated(parent), timeout_s=90
+                lambda: cluster.fully_replicated_topology(parent), timeout_s=90
             )
 
             def ready_parent():

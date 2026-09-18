@@ -67,7 +67,7 @@ def _ready(cluster, session, table):
         assert response.status_code in (409, 503, 504), response.text
         return False
 
-    assert wait_until(lambda: cluster.table_is_fully_replicated(table), timeout_s=90), (
+    assert wait_until(lambda: cluster.fully_replicated_topology(table), timeout_s=90), (
         cluster.debug_logs()
     )
     assert wait_until(enforced, timeout_s=90), cluster.debug_logs()

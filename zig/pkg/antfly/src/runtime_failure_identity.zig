@@ -229,6 +229,7 @@ const mappings = [_]Mapping{
     .{ .status = .index_rebuilding, .err = error.IndexRebuilding },
     .{ .status = .incomplete_published_snapshot, .err = error.IncompletePublishedSnapshot },
     .{ .status = .distributed_query_unavailable, .err = error.DistributedQueryUnavailable },
+    .{ .status = .storage_read_temporarily_unavailable, .err = error.StorageReadTemporarilyUnavailable },
     .{ .status = .identity_read_generation_changed, .err = error.IdentityReadGenerationChanged },
     .{ .status = .timeout, .err = error.Timeout },
     .{ .status = .read_index_timeout, .err = error.ReadIndexTimeout },

@@ -435,6 +435,8 @@ pub const Detail = enum(c_int) {
     metadata_incarnation_unavailable,
     invalid_metadata_incarnation,
     metadata_incarnation_mismatch,
+    metadata_proposal_superseded,
+    metadata_proposal_apply_timeout,
     // Unpublished relational/restore identities follow every released main ID.
     backup_cohort_already_committed,
     backup_cohort_cancelled,
@@ -1022,6 +1024,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.LeaderTransferInProgress => status(.retryable, .leader_transfer_in_progress),
         error.MetadataLinearizableReadTimeout => status(.timeout, .metadata_linearizable_read_timeout),
         error.ReconcileLeaseNotHeld => status(.retryable, .reconcile_lease_not_held),
+        error.MetadataProposalSuperseded => status(.conflict, .metadata_proposal_superseded),
+        error.MetadataProposalApplyTimeout => status(.timeout, .metadata_proposal_apply_timeout),
         error.MetadataMutationOutcomeUnknown => status(.conflict, .metadata_mutation_outcome_unknown),
         error.MissingEmbeddingArtifactProducer => status(.invalid_argument, .missing_embedding_artifact_producer),
         error.InvalidEmbeddingArtifactProducer => status(.invalid_argument, .invalid_embedding_artifact_producer),
@@ -1788,6 +1792,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .graph_min_weight_domain_violation => "GraphMinWeightDomainViolation",
         .graph_max_weight_domain_violation => "GraphMaxWeightDomainViolation",
         .graph_path_weight_overflow => "GraphPathWeightOverflow",
+        .metadata_proposal_superseded => "MetadataProposalSuperseded",
+        .metadata_proposal_apply_timeout => "MetadataProposalApplyTimeout",
         .metadata_mutation_outcome_unknown => "MetadataMutationOutcomeUnknown",
         .missing_embedding_artifact_producer => "MissingEmbeddingArtifactProducer",
         .invalid_embedding_artifact_producer => "InvalidEmbeddingArtifactProducer",
@@ -2009,7 +2015,7 @@ test "released main Detail identifiers retain their exact names and numeric valu
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
     inline for (@typeInfo(Detail).@"enum".fields) |field| {
-        if (field.value <= 341) {
+        if (field.value <= 370) {
             for (field.name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             var encoded: [4]u8 = undefined;
             std_test.mem.writeInt(u32, &encoded, @intCast(field.value), .little);
@@ -2017,6 +2023,13 @@ test "released main Detail identifiers retain their exact names and numeric valu
             count += 1;
         }
     }
-    try std_test.testing.expectEqual(@as(usize, 342), count);
-    try std_test.testing.expectEqual(@as(u64, 0x5f6899626d4ae845), fingerprint);
+    try std_test.testing.expectEqual(@as(usize, 371), count);
+    try std_test.testing.expectEqual(@as(u64, 0xa07c5018c0739e78), fingerprint);
+}
+
+test "metadata proposal recovery errors preserve identity across runtime archives" {
+    for ([_]anyerror{ error.MetadataProposalSuperseded, error.MetadataProposalApplyTimeout, error.MetadataMutationOutcomeUnknown }) |err| {
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(statusFromErrorWithFallback(err, error.RestoreJobPersistenceUnavailable)));
+    }
 }
