@@ -854,14 +854,23 @@ const ResolvedMetadataApiUrls = struct {
     }
 };
 
-fn publicApiListenerConfig(bind_host: []const u8, bind_port: u16) antfly.raft.transport.StdHttpListenerConfig {
+fn publicApiListenerConfig(
+    bind_host: []const u8,
+    bind_port: u16,
+    ingress: @import("../common/workload_ingress.zig").Config,
+) antfly.raft.transport.StdHttpListenerConfig {
+    // The application ingress envelope must be reachable through the transport.
+    // Preserve the legacy limits when ingress scheduling is disabled. Additional
+    // connection slots let overload requests reach parsing and rejection; they
+    // are not additional application execution capacity or protected lanes.
+    const request_capacity = @max(public_api_max_active_requests, ingress.max_requests);
     return .{
         .bind_host = bind_host,
         .bind_port = bind_port,
         .max_request_bytes = antfly.public_api.http_server.public_api_max_request_body_bytes,
         .serve_in_connection_threads = true,
-        .max_connection_threads = public_api_max_connection_threads,
-        .max_active_requests = public_api_max_active_requests,
+        .max_connection_threads = @max(public_api_max_connection_threads, request_capacity + (public_api_max_connection_threads - public_api_max_active_requests)),
+        .max_active_requests = request_capacity,
     };
 }
 
@@ -877,6 +886,9 @@ fn publicApiHttpxConfig(
         @min(max_connections, public_api_max_active_requests)
     else
         cfg.max_active_requests;
+    // Request-task capacity also covers bodyless reads and queued admission.
+    // Increasing it must not multiply the maximum upload buffering envelope.
+    const max_h1_bodies = @min(max_request_tasks, public_api_max_active_requests);
     return (httpx.ServerConfig{
         .host = cfg.bind_host,
         .port = cfg.bind_port,
@@ -884,8 +896,8 @@ fn publicApiHttpxConfig(
         .header_read_timeout_ms = cfg.header_read_timeout_ms,
         .body_read_timeout_ms = cfg.body_read_timeout_ms,
         .response_write_timeout_ms = cfg.header_read_timeout_ms,
-        .request_body_buffer_budget_bytes = cfg.max_request_bytes * @as(usize, max_request_tasks),
-        .max_h1_inflight_bodies = max_request_tasks,
+        .request_body_buffer_budget_bytes = cfg.max_request_bytes * @as(usize, max_h1_bodies),
+        .max_h1_inflight_bodies = max_h1_bodies,
         .max_connections = max_connections,
         .max_request_tasks = max_request_tasks,
         .accept_error_backoff_initial_ms = cfg.accept_error_backoff_initial_ms,
@@ -5551,7 +5563,7 @@ pub const DataServer = struct {
             .work_cost_port = cfg.work_cost_port,
             .backend_runtime = cfg.backend_runtime,
             .borrowed_storage_kernel_context = cfg.storage_kernel_context_handle,
-            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.ingress_admission),
         };
     }
 
@@ -5595,7 +5607,7 @@ pub const DataServer = struct {
             .query_async_limit = cfg.query_async_limit,
             .work_cost_port = cfg.work_cost_port,
             .backend_runtime = cfg.backend_runtime,
-            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.ingress_admission),
         };
     }
 
@@ -5639,7 +5651,7 @@ pub const DataServer = struct {
             .query_async_limit = cfg.query_async_limit,
             .work_cost_port = cfg.work_cost_port,
             .backend_runtime = cfg.backend_runtime,
-            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.ingress_admission),
         };
     }
 
@@ -20016,7 +20028,7 @@ pub const DataServer = struct {
             .work_cost_port = cfg.work_cost_port,
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
-            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
+            .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port, cfg.api_server_cfg.ingress_admission),
         };
         owned_backend_runtime = null;
         storage_kernel_context = null;
@@ -29761,7 +29773,7 @@ fn consumerTests() type {
         }
 
         test "data public API listener uses public API request body limit" {
-            const cfg = publicApiListenerConfig("127.0.0.1", 8080);
+            const cfg = publicApiListenerConfig("127.0.0.1", 8080, .{});
             try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
             try std.testing.expect(cfg.serve_in_connection_threads);
             try std.testing.expectEqual(public_api_max_connection_threads, cfg.max_connection_threads);
@@ -29771,6 +29783,26 @@ fn consumerTests() type {
             try std.testing.expectEqual(public_api_max_connection_threads, server_config.max_connections);
             try std.testing.expectEqual(public_api_max_active_requests, server_config.max_request_tasks);
             try std.testing.expectEqual(public_api_max_active_requests, server_config.max_h1_inflight_bodies);
+        }
+
+        test "data public API listener carries configured ingress capacity without increasing upload buffers" {
+            const legacy = publicApiHttpxConfig(publicApiListenerConfig("127.0.0.1", 8080, .{}), null);
+            const configured = publicApiHttpxConfig(publicApiListenerConfig("127.0.0.1", 8080, .{
+                .max_requests = 128,
+                .max_retained_bytes = 16 * 1024 * 1024,
+            }), null);
+            try std.testing.expectEqual(@as(u32, 128), configured.max_request_tasks);
+            try std.testing.expectEqual(@as(u32, 160), configured.max_connections);
+            try std.testing.expectEqual(legacy.max_h1_inflight_bodies, configured.max_h1_inflight_bodies);
+            try std.testing.expectEqual(legacy.request_body_buffer_budget_bytes, configured.request_body_buffer_budget_bytes);
+            // Even the maximum valid configured envelope keeps arithmetic finite.
+            const largest = publicApiHttpxConfig(publicApiListenerConfig("127.0.0.1", 8080, .{
+                .max_requests = 65_536,
+                .max_retained_bytes = 16 * 1024 * 1024,
+            }), null);
+            try std.testing.expectEqual(@as(u32, 65_536), largest.max_request_tasks);
+            try std.testing.expectEqual(@as(u32, 65_568), largest.max_connections);
+            try std.testing.expectEqual(legacy.request_body_buffer_budget_bytes, largest.request_body_buffer_budget_bytes);
         }
 
         test "data descriptor factory separates bootstrap voters from transport peers" {

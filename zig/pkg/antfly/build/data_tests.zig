@@ -169,6 +169,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime cli accepts ARD identity flags",
         "data runtime parses experimental flag",
         "data public API listener uses public API request body limit",
+        "data public API listener carries configured ingress capacity without increasing upload buffers",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
         "data raft read safety deadline and cancellation cover owner lock admission",

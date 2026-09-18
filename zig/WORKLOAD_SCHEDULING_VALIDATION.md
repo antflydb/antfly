@@ -552,3 +552,41 @@ The independent sidecar verified 14 associated signed proofs with zero errors:
 `/tmp/workload-destination-39cd8b34b8-receipts-proof-check.json`.
 These are small local correctness results, not replicated performance or
 whole-process resource-envelope qualification.
+
+
+### Prepared WAL and native I/O prerequisites
+
+The prepared WAL append stage (`7e4f72005e`) passed all 22 focused WAL tests
+in the scheduling worktree (`/tmp/workload-wal-integrated.log`, actual exit zero).
+The native WAL completion I/O scope (`f967ded772`) then passed the combined
+storage-I/O and WAL gate: 60/60 tests, no leaks, actual exit zero
+(`/tmp/workload-native-wal-integrated.log`). Its native tests exhaust allocation
+and ordinary descriptor capacity after preparation, close the original native
+owner, append through the retained scope, and reopen the resulting records.
+The scope owns two descriptor permits and uses sequential, preallocated path
+and atomic-writer state. Provider failures still produce uncertain outcomes.
+These are internal prerequisites; no persistent completion ticket or public
+mandatory-completion guarantee is enabled by these results.
+
+### Frontend overload failure retained
+
+The strict frontend C40 cell on frozen `39cd8b34b8` failed with 12 exact successful
+reads, 20 structured admission rejections, and eight unexpected generic HTTP
+503 responses. `antfly_http_request_dispatch_rejections_total` was exactly eight.
+The data/API listener still had a fixed 32 request-task limit despite configured
+ingress capacity 128. Query active=4 and queued=8 were observed; the API health
+and readiness probes succeeded. All owned processes were cleaned up and all
+21 receipt checksums verified:
+`/tmp/workload-frontend-39cd8b34b8-receipts2`. C80 was not reached.
+The generic transport responses remain failures under the qualification contract.
+A larger task capacity alone does not establish protected request-task or
+connection capacity for control and authenticated recovery traffic.
+
+The data/API transport now derives request-task capacity from enabled ingress
+capacity (with the legacy 32-task floor), retaining 32 additional connection
+slots for parsing and overload rejection. Disabled ingress retains 32 tasks
+and 64 connections. Upload body slots and buffered-byte limits remain at their
+previous ceilings. The actual data-runtime owning target passed both listener
+configuration tests with no leaks and actual exit zero
+(`/tmp/workload-ingress-transport-capacity.log`). This wiring change does not
+yet qualify native C40/C80 or protect lanes at transport dispatch.
