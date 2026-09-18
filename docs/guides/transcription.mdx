@@ -150,6 +150,8 @@ antfly inference pull csukuangfj/speaker-embedding-models:3dspeaker_speech_campp
 
 Without it, a diarization request fails with `SPEAKER_MODEL_UNAVAILABLE` rather than silently returning an unlabelled transcript. Diarization adds roughly a tenth of a second per phrase on CPU. A transcript produced as text (rather than JSON) keeps the turns as `SPEAKER_00: ...` lines; the JSON form carries `speaker` on each segment and a `speakers` list. Labels are per recording: `SPEAKER_00` in one file is not the same person as `SPEAKER_00` in another.
 
+As an enrichment, the labels are durable. Each transcript phrase keeps the speaker who said it, and every chunk cut from a phrase carries `_speaker` alongside `_start_time_ms` and `_end_time_ms`, so a search hit says who was talking. A chunk that straddles a turn carries no label rather than crediting the wrong person. Providers that name speakers their own way, such as Vertex, are renumbered into the same `SPEAKER_NN` order.
+
 ## Tradeoffs
 
 The decision is how the transcript is chunked, because a chunk is what search returns and what an embedding represents. `chunk_size` counts characters of transcript for the default chunker; 256 is about fifteen seconds of speech and gives one idea per hit with a tight time range, while 1024 keeps a whole topic together for an answer agent at the cost of a range that spans a minute or more. Chunks are cut on text boundaries, not silence, so a chunk can straddle a topic change; the timing on each chunk spans from the first sentence it overlaps to the last, which is what a player needs even when the cut is imperfect.

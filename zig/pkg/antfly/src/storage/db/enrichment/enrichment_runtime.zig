@@ -16556,7 +16556,13 @@ fn runtimeGeneratedTextSpansAlloc(alloc: Allocator, object: std.json.ObjectMap, 
                 words = words[0..word_count];
             }
         }
-        inputs[count] = .{ .text = segment_text, .start_ms = @intFromFloat(start_ms), .end_ms = @intFromFloat(end_ms), .words = words };
+        inputs[count] = .{
+            .text = segment_text,
+            .start_ms = @intFromFloat(start_ms),
+            .end_ms = @intFromFloat(end_ms),
+            .words = words,
+            .speaker = runtimeGeneratedTextJsonStringField(item.object, "speaker"),
+        };
         count += 1;
     }
     return try document_extraction_mod.transcriptSpansFromSegmentsAlloc(alloc, text, inputs[0..count]);

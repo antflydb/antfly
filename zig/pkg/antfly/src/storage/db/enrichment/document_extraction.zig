@@ -694,7 +694,29 @@ pub const TranscriptSpan = struct {
     char_end: u32,
     start_ms: u64,
     end_ms: u64,
+    /// Which speaker said this, when the provider diarized the recording:
+    /// an index into the speakers of this transcript, numbered in order of
+    /// first appearance. Providers label speakers differently (`SPEAKER_00`
+    /// locally, a bare number from Vertex), so the index is what is stored
+    /// and `speakerLabel` renders it; keeping the span free of owned text
+    /// also keeps every caller that copies or frees spans unchanged.
+    speaker_index: ?u8 = null,
 };
+
+/// The stable label for a speaker index: `SPEAKER_00`, `SPEAKER_01`, ...
+/// The buffer must hold at least 11 bytes.
+pub fn speakerLabel(buf: []u8, index: u8) []const u8 {
+    return std.fmt.bufPrint(buf, "SPEAKER_{d:0>2}", .{index}) catch unreachable;
+}
+
+/// Speakers named in `spans`, as a count: indexes run 0..count-1.
+pub fn transcriptSpeakerCount(spans: []const TranscriptSpan) u8 {
+    var count: u8 = 0;
+    for (spans) |span| {
+        if (span.speaker_index) |index| count = @max(count, index +| 1);
+    }
+    return count;
+}
 
 /// A word as a provider reports it inside a phrase, with its offsets.
 pub const TranscriptWordInput = struct {
@@ -710,6 +732,8 @@ pub const TranscriptSegmentInput = struct {
     start_ms: u64,
     end_ms: u64,
     words: []const TranscriptWordInput = &.{},
+    /// The provider's speaker label for this phrase, if it diarized.
+    speaker: ?[]const u8 = null,
 };
 
 /// Locates each phrase inside the transcript text, in order, and returns the
@@ -725,6 +749,7 @@ pub const TranscriptSegmentInput = struct {
 pub fn transcriptSpansFromSegmentsAlloc(alloc: Allocator, text: []const u8, segments: []const TranscriptSegmentInput) ![]TranscriptSpan {
     var spans = std.ArrayListUnmanaged(TranscriptSpan).empty;
     errdefer spans.deinit(alloc);
+    var speakers = SpeakerIndexer{};
     var cursor: usize = 0;
     for (segments) |segment| {
         const phrase = std.mem.trim(u8, segment.text, " \t\r\n");
@@ -732,18 +757,46 @@ pub fn transcriptSpansFromSegmentsAlloc(alloc: Allocator, text: []const u8, segm
         const start = std.mem.indexOfPos(u8, text, cursor, phrase) orelse break;
         const end = start + phrase.len;
         const segment_end_ms = @max(segment.end_ms, segment.start_ms);
-        if (!try appendWordSentenceSpans(alloc, &spans, text[0..end], start, segment, segment_end_ms)) {
+        const speaker_index = speakers.indexOf(segment.speaker);
+        if (!try appendWordSentenceSpans(alloc, &spans, text[0..end], start, segment, segment_end_ms, speaker_index)) {
             try spans.append(alloc, .{
                 .char_start = std.math.cast(u32, start) orelse break,
                 .char_end = std.math.cast(u32, end) orelse break,
                 .start_ms = segment.start_ms,
                 .end_ms = segment_end_ms,
+                .speaker_index = speaker_index,
             });
         }
         cursor = end;
     }
     return try spans.toOwnedSlice(alloc);
 }
+
+/// Numbers speaker labels in order of first appearance. The labels
+/// themselves are borrowed from the provider's response, which outlives the
+/// call, and only the resulting index is stored.
+const SpeakerIndexer = struct {
+    labels: [max_speakers][]const u8 = undefined,
+    count: u8 = 0,
+
+    /// A transcript with more distinct speakers than this is a provider
+    /// fault, not a meeting; the rest go unlabelled rather than growing the
+    /// table without bound.
+    const max_speakers: u8 = 64;
+
+    fn indexOf(self: *SpeakerIndexer, label: ?[]const u8) ?u8 {
+        const raw = label orelse return null;
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        for (self.labels[0..self.count], 0..) |known, i| {
+            if (std.mem.eql(u8, known, trimmed)) return @intCast(i);
+        }
+        if (self.count == max_speakers) return null;
+        self.labels[self.count] = trimmed;
+        self.count += 1;
+        return self.count - 1;
+    }
+};
 
 /// Splits one phrase into sentence spans using its timed words. Returns
 /// false, appending nothing, when the phrase has no usable words, so the
@@ -755,6 +808,7 @@ fn appendWordSentenceSpans(
     phrase_start: usize,
     segment: TranscriptSegmentInput,
     segment_end_ms: u64,
+    speaker_index: ?u8,
 ) !bool {
     if (segment.words.len == 0) return false;
     const first_len = spans.items.len;
@@ -785,6 +839,7 @@ fn appendWordSentenceSpans(
                 .char_end = std.math.cast(u32, group_end) orelse return error.Overflow,
                 .start_ms = group_start_ms,
                 .end_ms = group_end_ms,
+                .speaker_index = speaker_index,
             });
             group_start = null;
         }
@@ -795,6 +850,7 @@ fn appendWordSentenceSpans(
             .char_end = std.math.cast(u32, group_end) orelse return error.Overflow,
             .start_ms = group_start_ms,
             .end_ms = group_end_ms,
+            .speaker_index = speaker_index,
         });
     }
     if (located == 0) {
@@ -828,13 +884,29 @@ pub fn applyTranscriptTiming(unit: Unit, chunks: anytype) void {
         if (end <= start) continue;
         var first: ?u64 = null;
         var last: ?u64 = null;
+        var speaker: ?u8 = null;
+        var one_speaker = true;
         for (unit.transcript_spans) |span| {
             if (span.char_end <= start or span.char_start >= end) continue;
             if (first == null) first = span.start_ms;
             last = span.end_ms;
+            if (span.speaker_index) |index| {
+                if (speaker) |known| {
+                    if (known != index) one_speaker = false;
+                } else {
+                    speaker = index;
+                }
+            } else {
+                one_speaker = false;
+            }
         }
         if (first) |value| chunk.start_time_ms = @floatFromInt(value);
         if (last) |value| chunk.end_time_ms = @floatFromInt(value);
+        // A chunk that straddles a turn belongs to no single speaker, so it
+        // is left unattributed rather than credited to whoever spoke first.
+        if (one_speaker) {
+            if (speaker) |index| chunk.speaker_index = index;
+        }
     }
 }
 
@@ -5052,12 +5124,69 @@ test "recordings in video containers take the transcription route" {
     try std.testing.expect(!isAudioContent("text/plain", "notes.txt", "", "hello"));
 }
 
+test "diarized phrases carry their speaker into spans and chunks" {
+    const alloc = std.testing.allocator;
+    const text = "alpha alpha alpha. beta beta beta. alpha again.";
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = "alpha alpha alpha.", .start_ms = 0, .end_ms = 1000, .speaker = "SPEAKER_00" },
+        .{ .text = "beta beta beta.", .start_ms = 1000, .end_ms = 2000, .speaker = "SPEAKER_01" },
+        // A provider that labels speakers its own way is numbered the same
+        // way: in order of first appearance.
+        .{ .text = "alpha again.", .start_ms = 2000, .end_ms = 3000, .speaker = "SPEAKER_00" },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+    try std.testing.expectEqual(@as(usize, 3), spans.len);
+    try std.testing.expectEqual(@as(?u8, 0), spans[0].speaker_index);
+    try std.testing.expectEqual(@as(?u8, 1), spans[1].speaker_index);
+    try std.testing.expectEqual(@as(?u8, 0), spans[2].speaker_index);
+    try std.testing.expectEqual(@as(u8, 2), transcriptSpeakerCount(spans));
+
+    var label_buf: [11]u8 = undefined;
+    try std.testing.expectEqualStrings("SPEAKER_01", speakerLabel(&label_buf, 1));
+
+    const TestChunk = struct {
+        start_offset: ?u32 = null,
+        end_offset: ?u32 = null,
+        start_time_ms: ?f32 = null,
+        end_time_ms: ?f32 = null,
+        speaker_index: ?u8 = null,
+    };
+    const unit = Unit{
+        .unit_id = @constCast("audio:000001"),
+        .unit_type = @constCast("audio"),
+        .text = @constCast(text),
+        .method = @constCast("transcription"),
+        .transcript_spans = spans,
+    };
+    var chunks = [_]TestChunk{
+        .{ .start_offset = 0, .end_offset = 18 },
+        .{ .start_offset = 19, .end_offset = 33 },
+        // Straddles the turn, so it belongs to neither speaker.
+        .{ .start_offset = 0, .end_offset = 33 },
+    };
+    applyTranscriptTiming(unit, &chunks);
+    try std.testing.expectEqual(@as(?u8, 0), chunks[0].speaker_index);
+    try std.testing.expectEqual(@as(?u8, 1), chunks[1].speaker_index);
+    try std.testing.expectEqual(@as(?u8, null), chunks[2].speaker_index);
+
+    // An undiarized transcript leaves every chunk unattributed.
+    const plain_segments = [_]TranscriptSegmentInput{
+        .{ .text = "alpha alpha alpha.", .start_ms = 0, .end_ms = 1000 },
+    };
+    const plain_spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &plain_segments);
+    defer alloc.free(plain_spans);
+    try std.testing.expectEqual(@as(?u8, null), plain_spans[0].speaker_index);
+    try std.testing.expectEqual(@as(u8, 0), transcriptSpeakerCount(plain_spans));
+}
+
 test "transcript timing stamps chunks with the phrases they overlap" {
     const TestChunk = struct {
         start_offset: ?u32 = null,
         end_offset: ?u32 = null,
         start_time_ms: ?f32 = null,
         end_time_ms: ?f32 = null,
+        speaker_index: ?u8 = null,
     };
     var spans = [_]TranscriptSpan{
         .{ .char_start = 0, .char_end = 12, .start_ms = 0, .end_ms = 900 },

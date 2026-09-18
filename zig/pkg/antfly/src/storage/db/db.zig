@@ -83808,6 +83808,103 @@ test "db document extraction transcript segments time chunk artifacts" {
     try std.testing.expectEqual(@as(f64, 2500), last_end_ms);
 }
 
+test "db document extraction keeps diarized speakers through reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{
+        .transcriber_output = "{\"text\":\"alpha alpha alpha alpha alpha. beta beta beta beta beta.\",\"confidence\":0.9,\"duration_ms\":6000,\"speakers\":[\"SPEAKER_00\",\"SPEAKER_01\"],\"segments\":[{\"text\":\"alpha alpha alpha alpha alpha.\",\"start_ms\":0,\"end_ms\":3000,\"speaker\":\"SPEAKER_00\"},{\"text\":\"beta beta beta beta beta.\",\"start_ms\":3100,\"end_ms\":6000,\"speaker\":\"SPEAKER_01\"}]}",
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .ttl_cleanup = .{ .enabled = false },
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .asset_producer = fake.producer(),
+            },
+        });
+        defer db.close();
+
+        try db.addEnrichment(.{
+            .name = "document_units_v1",
+            .kind = .asset,
+            .field = "url",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"mock-transcriber\",\"diarization\":true}}}}",
+        });
+        try db.addEnrichment(.{
+            .name = "document_chunks_v1",
+            .kind = .chunk,
+            .field = "text",
+            .source_artifact_name = "document_units_v1",
+            .chunk_size = 20,
+        });
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:diarized-audio",
+                .value = "{\"filename\":\"call.webm\",\"mime_type\":\"video/webm\",\"url\":\"data:video/webm;base64,SUQzYXVkaW8gYnl0ZXM=\"}",
+            }},
+            .sync_level = .full_index,
+        });
+        try std.testing.expectEqual(@as(usize, 1), fake.transcriber_calls);
+    }
+
+    // Reopen: the speaker attribution has to survive as durable artifact
+    // state, not just as something the enrichment pass held in memory.
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{ .enabled = false },
+        .start_index_workers = false,
+    });
+    defer reopened.close();
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:diarized-audio", "document_units_v1", "audio:000001");
+    defer alloc.free(unit_key);
+    const unit_payload = try reopened.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    var parsed_unit = try std.json.parseFromSlice(std.json.Value, alloc, unit_payload, .{});
+    defer parsed_unit.deinit();
+
+    // Every phrase kept the speaker who said it, numbered in the order they
+    // first spoke.
+    const spans = parsed_unit.value.object.get("provenance").?.object.get("transcript_spans").?.array;
+    try std.testing.expect(spans.items.len >= 2);
+    try std.testing.expectEqual(@as(i64, 0), spans.items[0].object.get("speaker_index").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), spans.items[spans.items.len - 1].object.get("speaker_index").?.integer);
+
+    // Chunks cut from the transcript carry the speaker's label, and a chunk
+    // that straddles the turn carries none.
+    var chunk_index: u32 = 0;
+    var first_speaker_chunks: usize = 0;
+    var second_speaker_chunks: usize = 0;
+    while (true) : (chunk_index += 1) {
+        const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:diarized-audio", "document_chunks_v1", "audio:000001", chunk_index);
+        defer alloc.free(chunk_key);
+        const chunk_payload = reopened.core.store.get(alloc, chunk_key) catch |err| switch (err) {
+            error.NotFound => break,
+            else => return err,
+        };
+        defer alloc.free(chunk_payload);
+        var parsed_chunk = try std.json.parseFromSlice(std.json.Value, alloc, chunk_payload, .{});
+        defer parsed_chunk.deinit();
+        const speaker = parsed_chunk.value.object.get("_speaker") orelse continue;
+        if (std.mem.eql(u8, speaker.string, "SPEAKER_00")) {
+            first_speaker_chunks += 1;
+        } else if (std.mem.eql(u8, speaker.string, "SPEAKER_01")) {
+            second_speaker_chunks += 1;
+        } else {
+            return error.UnexpectedSpeakerLabel;
+        }
+    }
+    try std.testing.expect(first_speaker_chunks >= 1);
+    try std.testing.expect(second_speaker_chunks >= 1);
+}
+
 test "db document extraction stores rfc822 email units" {
     const alloc = std.testing.allocator;
 

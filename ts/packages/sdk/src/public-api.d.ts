@@ -11115,7 +11115,7 @@ export interface components {
             producer_json?: string;
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
-            /** @description Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. content_type defaults to application/json. */
+            /** @description Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json. */
             transcriber?: components["schemas"]["TranscriberEnrichmentConfig"];
         };
         /** @description Textual artifact stream consumed by a full-text index, with an optional source-local projection. */

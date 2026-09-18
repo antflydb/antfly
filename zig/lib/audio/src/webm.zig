@@ -428,7 +428,16 @@ fn decodeVorbisTrack(allocator: std.mem.Allocator, demuxed: DemuxedAudio) !Decod
             .allocator = allocator,
         },
         .access_unit_frames = frames,
-        .timeline_delay_frames = nsToFrames(demuxed.codec_delay_ns, decoded.sample_rate),
+        // A Vorbis stream's first packet only primes the overlap: decoding
+        // emits nothing until the second, and the audio that then comes out
+        // starts half a block late. That half block is priming exactly as
+        // Opus's pre-skip is, and muxers stamp blocks with the audio they
+        // complete, so it has to come off the timeline the same way or a
+        // remuxed file gains half a block of silence at its head.
+        .timeline_delay_frames = @max(
+            nsToFrames(demuxed.codec_delay_ns, decoded.sample_rate),
+            if (vorbis_demuxed.audio_packets.len > 0) vorbis_demuxed.audio_packets[0].decoded_sample_count else 0,
+        ),
     };
 }
 
@@ -1563,6 +1572,87 @@ test "webm decoding leaves uninterrupted opus alone" {
 
     try std.testing.expectEqual(laced_pcm.samples.len, timed_pcm.samples.len);
     try std.testing.expectEqualSlices(f32, laced_pcm.samples, timed_pcm.samples);
+}
+
+test "webm decoding leaves a remuxed vorbis recording alone" {
+    const allocator = std.testing.allocator;
+
+    var ogg_packets = try ogg.parsePacketsAlloc(allocator, tone_ogg_bytes);
+    defer ogg_packets.deinit();
+    const codec_private = try vorbisCodecPrivateAlloc(allocator, ogg_packets.packets[0..3]);
+    defer allocator.free(codec_private);
+    const audio_packets = ogg_packets.packets[3..];
+
+    const entry = try buildAudioTrackEntry(allocator, 1, "A_VORBIS", codec_private, 2, null);
+    defer allocator.free(entry);
+    const tracks = try buildTracks(allocator, &.{entry});
+    defer allocator.free(tracks);
+
+    // The same packets as one block, which carries a single timestamp and
+    // so cannot be placed, and as a block per packet stamped the way a
+    // remux stamps them: each packet advances the clock by its own
+    // duration, the first included. Decoding emits nothing for that first
+    // packet -- a Vorbis packet only yields audio once its successor
+    // overlaps it -- so its duration is priming, and counting it as a gap
+    // would prepend half a block of silence and shift every timestamp.
+    var frames_list = std.ArrayList([]const u8).empty;
+    defer frames_list.deinit(allocator);
+    for (audio_packets) |packet| try frames_list.append(allocator, packet.bytes);
+    const laced = try buildSimpleBlockLaced(allocator, 1, frames_list.items, .xiph);
+    defer allocator.free(laced);
+    const laced_cluster = try buildCluster(allocator, 0, &.{laced});
+    defer allocator.free(laced_cluster);
+    const laced_file = try buildWebmFile(allocator, tracks, &.{laced_cluster});
+    defer allocator.free(laced_file);
+
+    var demuxed_vorbis = try vorbis.demuxOggAlloc(allocator, tone_ogg_bytes);
+    defer demuxed_vorbis.deinit();
+    try std.testing.expectEqual(audio_packets.len, demuxed_vorbis.audio_packets.len);
+    const rate = demuxed_vorbis.headers.identification.sample_rate;
+
+    var blocks = std.ArrayList([]u8).empty;
+    defer {
+        for (blocks.items) |block| allocator.free(block);
+        blocks.deinit(allocator);
+    }
+    var elapsed_samples: u64 = 0;
+    for (audio_packets, demuxed_vorbis.audio_packets) |packet, timing| {
+        const relative_ms: i16 = @intCast(elapsed_samples * 1000 / rate);
+        try blocks.append(allocator, try buildSimpleBlockAt(allocator, 1, packet.bytes, relative_ms));
+        elapsed_samples += timing.decoded_sample_count;
+    }
+    const timed_cluster = try buildCluster(allocator, 0, @ptrCast(blocks.items));
+    defer allocator.free(timed_cluster);
+    const timed_file = try buildWebmFile(allocator, tracks, &.{timed_cluster});
+    defer allocator.free(timed_file);
+
+    var laced_pcm = try decodeInterleaved(allocator, laced_file);
+    defer laced_pcm.deinit();
+    var timed_pcm = try decodeInterleaved(allocator, timed_file);
+    defer timed_pcm.deinit();
+
+    try std.testing.expectEqual(laced_pcm.samples.len, timed_pcm.samples.len);
+    try std.testing.expectEqualSlices(f32, laced_pcm.samples, timed_pcm.samples);
+
+    // And the audio itself is still the recording, not a shifted copy.
+    var reference = try vorbis.decodeInterleavedOggAlloc(allocator, tone_ogg_bytes);
+    defer reference.deinit();
+    try std.testing.expect(timed_pcm.samples.len >= reference.samples.len);
+    try expectPcmClose(reference.samples, timed_pcm.samples[0..reference.samples.len]);
+}
+
+/// The three Vorbis setup packets Xiph-laced into a CodecPrivate blob.
+fn vorbisCodecPrivateAlloc(allocator: std.mem.Allocator, headers: []const ogg.Packet) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, 2); // three packets, minus one
+    for (headers[0..2]) |header_packet| {
+        var remaining = header_packet.bytes.len;
+        while (remaining >= 255) : (remaining -= 255) try out.append(allocator, 0xFF);
+        try out.append(allocator, @intCast(remaining));
+    }
+    for (headers[0..3]) |header_packet| try out.appendSlice(allocator, header_packet.bytes);
+    return out.toOwnedSlice(allocator);
 }
 
 test "webm decoding keeps a paused recording's gap on the timeline" {

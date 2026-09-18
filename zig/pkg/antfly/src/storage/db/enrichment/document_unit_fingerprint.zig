@@ -471,6 +471,9 @@ fn hashTaggedTranscriptSpans(hasher: *Sha256, spans: []const document_extraction
         hashU64(hasher, span.char_end);
         hashU64(hasher, span.start_ms);
         hashU64(hasher, span.end_ms);
+        // Turning diarization on changes what the artifact says, so it has
+        // to change the fingerprint too or the unit is never re-enriched.
+        hashU64(hasher, if (span.speaker_index) |index| @as(u64, index) + 1 else 0);
     }
 }
 
