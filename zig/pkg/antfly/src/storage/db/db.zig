@@ -27969,7 +27969,7 @@ pub const DB = struct {
         if (sequence == 0) return;
         const runtime = self.enrichment_runtime orelse return;
         runtime.notifySequence(sequence);
-        try runtime.catchUpUntil(sequence);
+        try runtime.catchUpUntilForDrain(sequence);
     }
 
     fn runEnrichmentUntilForDrain(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
@@ -92625,6 +92625,8 @@ test "db foreign inference provider failure releases enrichment waiter as termin
         error.EnrichmentWorkerFailed,
         db.enrichment_runtime.?.waitForApplied(sequence),
     );
+
+    try std.testing.expectError(error.EnrichmentWorkerFailed, db.runUntilIdle());
 
     const stats = db.enrichment_runtime.?.stats();
     try std.testing.expectEqual(sequence, stats.applied_sequence);
