@@ -136,10 +136,10 @@ pub const Stream = struct {
     }
 
     pub fn deinit(self: *Self, allocator: Allocator) void {
+        self.data_buf.deinit(allocator);
         if (self.data_budget) |budget| budget.release(self.data_budget_reserved);
         self.data_budget = null;
         self.data_budget_reserved = 0;
-        self.data_buf.deinit(allocator);
         freeDecodedHeaders(allocator, self.request_headers);
         freeDecodedHeaders(allocator, self.trailer_headers);
     }

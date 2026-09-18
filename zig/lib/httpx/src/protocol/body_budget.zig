@@ -4,10 +4,9 @@ const std = @import("std");
 
 /// Process-wide byte budget shared by every inbound HTTP connection.
 ///
-/// Fixed-length HTTP/1 requests reserve once before allocating their body
-/// buffer. Chunked HTTP/1 and HTTP/2 DATA reserve incrementally. Reservations
-/// remain owned by the parser/stream until request teardown so bytes copied
-/// into application request storage cannot escape the process-wide bound.
+/// Charges allocation capacity, including cached buffers and overlapping
+/// allocations during growth or materialization. Each parser, stream, or
+/// request releases its reservation only after freeing its retained storage.
 pub const SharedBodyBudget = struct {
     capacity: usize,
     in_use: std.atomic.Value(usize) = .init(0),
@@ -74,4 +73,132 @@ test "SharedBodyBudget bounds aggregate reservations and records pressure" {
     try std.testing.expectEqual(@as(u64, 1), budget.stats().rejected_total);
     budget.release(4);
     try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+}
+
+/// Grow a retained body buffer while charging its allocation capacity. The
+/// temporary allocator exists only during growth; the owning parser/reader
+/// frees the final buffer before releasing `reserved` at retirement.
+///
+/// ArrayList may fall back from remap to allocate-copy-free. Charging both
+/// allocations in that case bounds the transient peak as well as steady state.
+pub fn ensureBufferCapacity(
+    budget: ?*SharedBodyBudget,
+    backing: std.mem.Allocator,
+    buffer: *std.ArrayListUnmanaged(u8),
+    minimum: usize,
+    reserved: *usize,
+) !void {
+    if (minimum <= buffer.capacity) return;
+    const shared = budget orelse return buffer.ensureTotalCapacity(backing, minimum);
+    std.debug.assert(reserved.* == buffer.capacity);
+    const available = shared.capacity -| shared.stats().in_use;
+    const geometric = if (buffer.capacity == 0) minimum else buffer.capacity +| @max(buffer.capacity / 2, 8);
+    const target = @max(minimum, @min(geometric, buffer.capacity +| available));
+    var tracker = CapacityAllocator{ .backing = backing, .budget = shared, .reserved = reserved };
+    buffer.ensureTotalCapacityPrecise(tracker.allocator(), target) catch |err| {
+        if (tracker.denied) return error.BodyCapacityExceeded;
+        return err;
+    };
+    std.debug.assert(reserved.* == buffer.capacity);
+}
+
+const CapacityAllocator = struct {
+    backing: std.mem.Allocator,
+    budget: *SharedBodyBudget,
+    reserved: *usize,
+    denied: bool = false,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn reserve(self: *@This(), bytes: usize) bool {
+        if (!self.budget.tryReserve(bytes)) {
+            self.denied = true;
+            return false;
+        }
+        self.reserved.* += bytes;
+        return true;
+    }
+    fn release(self: *@This(), bytes: usize) void {
+        self.budget.release(bytes);
+        self.reserved.* -= bytes;
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.reserve(len)) return null;
+        return self.backing.rawAlloc(len, alignment, ra) orelse {
+            self.release(len);
+            return null;
+        };
+    }
+    fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const growth = len -| memory.len;
+        if (!self.reserve(growth)) return false;
+        if (!self.backing.rawResize(memory, alignment, len, ra)) {
+            self.release(growth);
+            return false;
+        }
+        self.release(memory.len -| len);
+        return true;
+    }
+    fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const growth = len -| memory.len;
+        if (!self.reserve(growth)) return null;
+        const result = self.backing.rawRemap(memory, alignment, len, ra) orelse {
+            self.release(growth);
+            return null;
+        };
+        self.release(memory.len -| len);
+        return result;
+    }
+    fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.backing.rawFree(memory, alignment, ra);
+        self.release(memory.len);
+    }
+};
+
+test "ingress capacity accounts spare capacity and simultaneous reallocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    const alloc = failing.allocator();
+    var budget = SharedBodyBudget.init(32);
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    var reserved: usize = 0;
+    defer {
+        buffer.deinit(alloc);
+        budget.release(reserved);
+    }
+    try ensureBufferCapacity(&budget, alloc, &buffer, 4, &reserved);
+    buffer.appendSliceAssumeCapacity("abcd");
+    try ensureBufferCapacity(&budget, alloc, &buffer, 5, &reserved);
+    try std.testing.expectEqual(@as(usize, 12), buffer.capacity);
+    try std.testing.expectEqual(buffer.capacity, reserved);
+    try std.testing.expectEqual(reserved, budget.stats().in_use);
+    try std.testing.expectEqual(@as(usize, 16), budget.stats().peak_in_use);
+    try std.testing.expectEqualStrings("abcd", buffer.items);
+    // Final capacity would fit, but both old+new storage would not.
+    try std.testing.expectError(error.BodyCapacityExceeded, ensureBufferCapacity(&budget, alloc, &buffer, 25, &reserved));
+    try std.testing.expectEqual(@as(usize, 12), reserved);
+    try std.testing.expectEqualStrings("abcd", buffer.items);
+}
+
+test "ingress capacity rolls back backing OOM without misclassifying pressure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1, .resize_fail_index = 0 });
+    const alloc = failing.allocator();
+    var budget = SharedBodyBudget.init(128);
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    var reserved: usize = 0;
+    defer {
+        buffer.deinit(alloc);
+        budget.release(reserved);
+    }
+    try ensureBufferCapacity(&budget, alloc, &buffer, 4, &reserved);
+    buffer.appendSliceAssumeCapacity("abcd");
+    try std.testing.expectError(error.OutOfMemory, ensureBufferCapacity(&budget, alloc, &buffer, 5, &reserved));
+    try std.testing.expectEqual(@as(usize, 4), reserved);
+    try std.testing.expectEqual(reserved, budget.stats().in_use);
+    try std.testing.expectEqual(@as(u64, 0), budget.stats().rejected_total);
+    try std.testing.expectEqualStrings("abcd", buffer.items);
 }

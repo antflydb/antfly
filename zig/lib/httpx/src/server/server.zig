@@ -709,12 +709,18 @@ pub const Context = struct {
         chunk_remaining: u64 = 0,
         line_buf: [256]u8 = undefined,
         owned_body: ?[]u8 = null,
+        owned_allocation: ?[]u8 = null,
+        body_budget: ?*SharedBodyBudget = null,
+        body_budget_reserved: usize = 0,
 
         pub const ChunkState = enum { size, data, crlf, trailer, done };
 
         pub fn deinit(self: *H1StreamReader) void {
-            if (self.owned_body) |body_bytes| self.allocator.free(body_bytes);
+            if (self.owned_allocation) |allocation| self.allocator.free(allocation);
+            if (self.body_budget) |budget| budget.release(self.body_budget_reserved);
             self.owned_body = null;
+            self.owned_allocation = null;
+            self.body_budget_reserved = 0;
         }
 
         /// True once the whole body has been consumed, so the connection can
@@ -821,30 +827,55 @@ pub const Context = struct {
         fn readAllErased(ptr: ?*anyopaque) anyerror!?[]const u8 {
             const self: *H1StreamReader = @ptrCast(@alignCast(ptr orelse return error.EndOfStream));
             if (self.owned_body != null) return self.owned_body.?;
+            var collected = RetainedBody{ .allocator = self.allocator, .budget = self.body_budget };
+            errdefer collected.deinit();
             if (self.chunked) {
-                var collected = std.ArrayListUnmanaged(u8).empty;
-                errdefer collected.deinit(self.allocator);
                 var chunk: [8192]u8 = undefined;
                 while (true) {
                     const n = try self.read(&chunk);
                     if (n == 0) break;
-                    if (collected.items.len + n > self.max_body) return error.BodyTooLarge;
-                    try collected.appendSlice(self.allocator, chunk[0..n]);
+                    if (n > self.max_body -| collected.buffer.items.len) return error.BodyTooLarge;
+                    try collected.append(chunk[0..n]);
                 }
-                self.owned_body = try collected.toOwnedSlice(self.allocator);
-                return self.owned_body.?;
+            } else {
+                const len = std.math.cast(usize, self.remaining) orelse return error.BodyTooLarge;
+                if (len > self.max_body) return error.BodyTooLarge;
+                try collected.ensureCapacity(len);
+                collected.buffer.items.len = len;
+                var offset: usize = 0;
+                while (offset < len) {
+                    const n = try self.read(collected.buffer.items[offset..]);
+                    if (n == 0) return error.EndOfStream;
+                    offset += n;
+                }
             }
-            const len = std.math.cast(usize, self.remaining) orelse return error.BodyTooLarge;
-            const body_bytes = try self.allocator.alloc(u8, len);
-            errdefer self.allocator.free(body_bytes);
-            var offset: usize = 0;
-            while (offset < body_bytes.len) {
-                const n = try self.read(body_bytes[offset..]);
-                if (n == 0) return error.EndOfStream;
-                offset += n;
-            }
-            self.owned_body = body_bytes;
-            return body_bytes;
+            self.owned_body = collected.buffer.items;
+            self.owned_allocation = collected.buffer.allocatedSlice();
+            self.body_budget_reserved = collected.reserved;
+            return self.owned_body.?;
+        }
+    };
+
+    /// Capacity-bearing materialization owner. Its allocation can move into a
+    /// Request without shrinking/copying, together with the existing charge.
+    const RetainedBody = struct {
+        allocator: Allocator,
+        budget: ?*SharedBodyBudget,
+        buffer: std.ArrayListUnmanaged(u8) = .empty,
+        reserved: usize = 0,
+
+        fn deinit(self: *@This()) void {
+            self.buffer.deinit(self.allocator);
+            if (self.budget) |budget| budget.release(self.reserved);
+        }
+
+        fn ensureCapacity(self: *@This(), minimum: usize) !void {
+            try @import("../protocol/body_budget.zig").ensureBufferCapacity(self.budget, self.allocator, &self.buffer, minimum, &self.reserved);
+        }
+
+        fn append(self: *@This(), data: []const u8) !void {
+            try self.ensureCapacity(try std.math.add(usize, self.buffer.items.len, data.len));
+            self.buffer.appendSliceAssumeCapacity(data);
         }
     };
 
@@ -901,17 +932,25 @@ pub const Context = struct {
             }
         }
 
-        /// Reads all remaining body data into a single owned slice.
-        pub fn readAll(self: *H2StreamReader, allocator: Allocator) ![]u8 {
-            var result = std.ArrayListUnmanaged(u8).empty;
-            errdefer result.deinit(allocator);
+        fn readAllRetained(self: *H2StreamReader, allocator: Allocator, budget: ?*SharedBodyBudget) !RetainedBody {
+            var result = RetainedBody{ .allocator = allocator, .budget = budget };
+            errdefer result.deinit();
             var buf: [8192]u8 = undefined;
             while (true) {
                 const n = try self.read(&buf);
                 if (n == 0) break;
-                try result.appendSlice(allocator, buf[0..n]);
+                try result.append(buf[0..n]);
             }
-            return result.toOwnedSlice(allocator);
+            return result;
+        }
+
+        /// Reads all remaining data into caller-owned storage for unbudgeted
+        /// embeddings. Server dispatch uses Context.body to transfer both the
+        /// materialized capacity and its reservation into the owning Request.
+        pub fn readAll(self: *H2StreamReader, allocator: Allocator) ![]u8 {
+            var result = try self.readAllRetained(allocator, null);
+            errdefer result.deinit();
+            return result.buffer.toOwnedSlice(allocator);
         }
     };
 
@@ -928,7 +967,7 @@ pub const Context = struct {
             return data;
         }
         if (self.h2_body_reader) |reader| {
-            const data = reader.readAll(self.allocator) catch |err| switch (err) {
+            const data = reader.readAllRetained(self.request.allocator, self.request.body_budget) catch |err| switch (err) {
                 error.EndOfStream => {
                     if (self.bodyFramingRequiresEndStream()) return err;
                     self.h2_body_reader = null;
@@ -936,8 +975,10 @@ pub const Context = struct {
                 },
                 else => return err,
             };
-            self.request.body = data;
+            self.request.body = data.buffer.items;
+            self.request.body_allocation = data.buffer.allocatedSlice();
             self.request.body_owned = true;
+            self.request.body_budget_reserved += data.reserved;
             self.h2_body_reader = null;
             return self.request.body;
         }
@@ -2430,6 +2471,7 @@ pub const Server = struct {
                 .remaining = if (parser.chunked) 0 else parser.content_length.?,
                 .chunked = parser.chunked,
                 .max_body = ctx.max_request_body_size,
+                .body_budget = &self.body_budget,
                 .deadline_ms = deadlineAfter(self.io, self.config.body_read_timeout_ms),
             } else null;
             defer if (h1_stream_reader) |*reader| reader.deinit();
@@ -6677,4 +6719,98 @@ test "stream output cancellation and deadline stop producers before more bytes" 
     try std.testing.expectError(error.Timeout, writer.write("expired"));
     try std.testing.expectError(error.Timeout, writer.close());
     try std.testing.expectEqual(@as(usize, 1), capture.writes);
+}
+
+test "ingress capacity H1 lazy materialization retains actual allocation until reader retirement" {
+    for ([_]bool{ false, true }) |chunked| {
+        var budget = SharedBodyBudget.init(128);
+        var buffer: [8192]u8 = undefined;
+        const wire = if (chunked) "4\r\nabcd\r\n1\r\ne\r\n0\r\n\r\n" else "abcde";
+        @memcpy(buffer[0..wire.len], wire);
+        var leftover = wire.len;
+        var reader = Context.H1StreamReader{
+            .allocator = std.testing.allocator,
+            .io = std.testing.io,
+            .sock = undefined, // Entire framed body is already buffered.
+            .buffer = &buffer,
+            .leftover = &leftover,
+            .remaining = 5,
+            .deadline_ms = 0,
+            .chunked = chunked,
+            .body_budget = &budget,
+        };
+        errdefer reader.deinit();
+        const data = (try Context.H1StreamReader.readAllErased(&reader)).?;
+        try std.testing.expectEqualStrings("abcde", data);
+        try std.testing.expect(reader.finished());
+        try std.testing.expectEqual(reader.owned_allocation.?.len, budget.stats().in_use);
+        if (chunked) try std.testing.expect(reader.owned_allocation.?.len > data.len);
+        try std.testing.expectEqual(data.ptr, (try Context.H1StreamReader.readAllErased(&reader)).?.ptr);
+        reader.deinit();
+        try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+    }
+}
+
+test "ingress capacity H1 lazy rejection leaves no materialization charge" {
+    for ([_]bool{ false, true }) |chunked| {
+        var budget = SharedBodyBudget.init(3);
+        var buffer: [8192]u8 = undefined;
+        const wire = if (chunked) "4\r\nabcd\r\n0\r\n\r\n" else "abcd";
+        @memcpy(buffer[0..wire.len], wire);
+        var leftover = wire.len;
+        var reader = Context.H1StreamReader{
+            .allocator = std.testing.allocator,
+            .io = std.testing.io,
+            .sock = undefined,
+            .buffer = &buffer,
+            .leftover = &leftover,
+            .remaining = 4,
+            .deadline_ms = 0,
+            .chunked = chunked,
+            .body_budget = &budget,
+        };
+        defer reader.deinit();
+        try std.testing.expectError(error.BodyCapacityExceeded, Context.H1StreamReader.readAllErased(&reader));
+        try std.testing.expect(reader.owned_body == null);
+        try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+    }
+}
+
+test "ingress capacity H2 materialization transfers charge to request while mailbox remains charged" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 7, 32 }) |capacity| {
+        var budget = SharedBodyBudget.init(capacity);
+        var stream = Stream.init(1);
+        stream.data_budget = &budget;
+        try @import("../protocol/body_budget.zig").ensureBufferCapacity(&budget, alloc, &stream.data_buf, 4, &stream.data_budget_reserved);
+        stream.data_buf.appendSliceAssumeCapacity("body");
+        stream.completed = true;
+        var stream_live = true;
+        defer if (stream_live) stream.deinit(alloc);
+        var event = Io.Event.unset;
+        var reader = Context.H2StreamReader{ .h2_stream = &stream, .io = std.testing.io, .data_event = &event };
+        var request = try Request.init(alloc, .POST, "/");
+        request.body_budget = &budget;
+        var request_live = true;
+        defer if (request_live) request.deinit();
+        var ctx = Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.h2_body_reader = &reader;
+        if (capacity == 7) {
+            try std.testing.expectError(error.BodyCapacityExceeded, ctx.body());
+            try std.testing.expectEqual(@as(usize, 0), request.body_budget_reserved);
+        } else {
+            try std.testing.expectEqualStrings("body", (try ctx.body()).?);
+            try std.testing.expectEqual(request.body_allocation.?.len, request.body_budget_reserved);
+            try std.testing.expectEqual(@as(usize, 8), budget.stats().in_use);
+        }
+        request.deinit();
+        request_live = false;
+        try std.testing.expectEqual(@as(usize, 4), budget.stats().in_use);
+        stream.compactDataBuf();
+        try std.testing.expectEqual(@as(usize, 4), budget.stats().in_use);
+        stream.deinit(alloc);
+        stream_live = false;
+        try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
+    }
 }

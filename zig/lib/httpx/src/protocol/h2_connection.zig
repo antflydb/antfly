@@ -1005,24 +1005,24 @@ pub const H2Connection = struct {
                         return;
                     }
                 }
-                const budget = self.recv_data_budget;
-                if (budget) |shared| {
-                    if (!shared.tryReserve(data_payload.len)) {
-                        stream.stream_error = error.BodyCapacityExceeded;
+                stream.data_budget = self.recv_data_budget;
+                @import("body_budget.zig").ensureBufferCapacity(
+                    stream.data_budget,
+                    self.allocator,
+                    &stream.data_buf,
+                    try std.math.add(usize, stream.data_buf.items.len, data_payload.len),
+                    &stream.data_budget_reserved,
+                ) catch |err| {
+                    if (err == error.BodyCapacityExceeded) {
+                        stream.stream_error = err;
                         stream.completed = true;
                         if (stream.data_event) |ev| ev.set(self.io);
                         stream.completion_event.set(self.io);
                         return;
                     }
-                }
-                stream.data_buf.appendSlice(self.allocator, data_payload) catch |err| {
-                    if (budget) |shared| shared.release(data_payload.len);
                     return err;
                 };
-                if (budget) |shared| {
-                    stream.data_budget = shared;
-                    stream.data_budget_reserved += data_payload.len;
-                }
+                stream.data_buf.appendSliceAssumeCapacity(data_payload);
                 stream.total_data_received = new_size;
                 if (stream.data_event) |ev| ev.set(self.io);
                 if (frame.header.flags & FLAG_END_STREAM != 0) {
