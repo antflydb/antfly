@@ -384,6 +384,39 @@ fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
 
+test "lite native repeated WAL reset does not publish unchanged control records" {
+    const wal = @import("../lsm_backend/wal.zig");
+    const State = @import("../lsm_backend/state.zig").State;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-wal-reset.aflite");
+    defer allocator.free(path);
+    var docs = try docstore.Store.create(allocator, path, true);
+    defer docs.close();
+    var indexes = Store.init(allocator, &docs);
+    const storage = indexes.storage();
+    const root = "/indexes/test";
+    try wal.reset(storage, allocator, root);
+    const empty = docs.file.activeCheckpoint();
+    for (0..3) |_| try wal.reset(storage, allocator, root);
+    try std.testing.expectEqualDeep(empty, docs.file.activeCheckpoint());
+
+    var state: State = .{};
+    defer state.deinit(allocator);
+    try state.upsert(allocator, .{ .name = "docs" }, "a", "A", false);
+    _ = try wal.appendStateWithOptions(storage, allocator, root, &state, false, .{ .segment_bytes = 32 });
+    const retained = try wal.snapshotRetention(storage, allocator, root);
+    try std.testing.expect(retained.bytes > 0);
+    try wal.reset(storage, allocator, root);
+    const after = try wal.snapshotRetention(storage, allocator, root);
+    try std.testing.expectEqual(@as(u64, 0), after.bytes);
+    const reset = docs.file.activeCheckpoint();
+    try std.testing.expect(reset.commit_sequence > empty.commit_sequence);
+    try wal.reset(storage, allocator, root);
+    try std.testing.expectEqualDeep(reset, docs.file.activeCheckpoint());
+}
+
 test "lite native index storage persists logical files across reopen" {
     const allocator = std.testing.allocator;
 

@@ -15,8 +15,8 @@ if TYPE_CHECKING:
     from ..models.chat_tools_config import ChatToolsConfig
     from ..models.filter_spec import FilterSpec
     from ..models.generator_config import GeneratorConfig
+    from ..models.query_request import QueryRequest
     from ..models.retrieval_agent_steps import RetrievalAgentSteps
-    from ..models.retrieval_query_request import RetrievalQueryRequest
 
 
 T = TypeVar("T", bound="RetrievalAgentRequest")
@@ -25,7 +25,8 @@ T = TypeVar("T", bound="RetrievalAgentRequest")
 @_attrs_define
 class RetrievalAgentRequest:
     """Request for the retrieval agent. Queries define which tables and indexes
-    to search, each as a QueryRequest with optional tree search configuration.
+    to search, each as an ordinary QueryRequest. Optional tree or graph exploration
+    is configured by steps.retrieval.navigation, targeting one query by index.
 
     **Pipeline mode** (default, max_internal_iterations=0): Queries are executed
     directly without an LLM tool-calling loop.
@@ -42,7 +43,7 @@ class RetrievalAgentRequest:
 
         Attributes:
             query (str): User's natural language query Example: How do I configure OAuth?.
-            queries (list[RetrievalQueryRequest]): Queries to execute. Each query carries its own table via the
+            queries (list[QueryRequest]): Queries to execute. Each query carries its own table via the
                 QueryRequest table field.
 
                 In pipeline mode (max_internal_iterations=0), these are executed directly.
@@ -110,7 +111,7 @@ class RetrievalAgentRequest:
     """
 
     query: str
-    queries: list[RetrievalQueryRequest]
+    queries: list[QueryRequest]
     messages: list[ChatMessage] | Unset = UNSET
     agent_knowledge: str | Unset = UNSET
     accumulated_filters: list[FilterSpec] | Unset = UNSET
@@ -251,8 +252,8 @@ class RetrievalAgentRequest:
         from ..models.chat_tools_config import ChatToolsConfig
         from ..models.filter_spec import FilterSpec
         from ..models.generator_config import GeneratorConfig
+        from ..models.query_request import QueryRequest
         from ..models.retrieval_agent_steps import RetrievalAgentSteps
-        from ..models.retrieval_query_request import RetrievalQueryRequest
 
         d = dict(src_dict)
         query = d.pop("query")
@@ -260,7 +261,7 @@ class RetrievalAgentRequest:
         queries = []
         _queries = d.pop("queries")
         for queries_item_data in _queries:
-            queries_item = RetrievalQueryRequest.from_dict(queries_item_data)
+            queries_item = QueryRequest.from_dict(queries_item_data)
 
             queries.append(queries_item)
 

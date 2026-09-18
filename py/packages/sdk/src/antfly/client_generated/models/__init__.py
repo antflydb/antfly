@@ -934,6 +934,7 @@ from .open_ai_embedder_config import OpenAIEmbedderConfig
 from .open_ai_embedder_config_provider import OpenAIEmbedderConfigProvider
 from .open_ai_generator_config import OpenAIGeneratorConfig
 from .open_ai_generator_config_provider import OpenAIGeneratorConfigProvider
+from .open_ai_reasoning_effort import OpenAIReasoningEffort
 from .open_aistt_config import OpenAISTTConfig
 from .open_router_embedder_config import OpenRouterEmbedderConfig
 from .open_router_embedder_config_provider import OpenRouterEmbedderConfigProvider
@@ -1042,7 +1043,9 @@ from .retrieval_agent_request import RetrievalAgentRequest
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
 from .retrieval_agent_usage import RetrievalAgentUsage
-from .retrieval_query_request import RetrievalQueryRequest
+from .retrieval_navigation_config import RetrievalNavigationConfig
+from .retrieval_navigation_selection import RetrievalNavigationSelection
+from .retrieval_navigation_strategy import RetrievalNavigationStrategy
 from .retrieval_step_config import RetrievalStepConfig
 from .retrieval_strategy import RetrievalStrategy
 from .retry_config import RetryConfig
@@ -1188,7 +1191,6 @@ from .traversal_result import TraversalResult
 from .traversal_result_document import TraversalResultDocument
 from .traversal_rules import TraversalRules
 from .traverse_response import TraverseResponse
-from .tree_search_config import TreeSearchConfig
 from .ttl_config import TtlConfig
 from .unsupported_hierarchy_grouping_error import UnsupportedHierarchyGroupingError
 from .unsupported_hierarchy_grouping_error_action import UnsupportedHierarchyGroupingErrorAction
@@ -2147,6 +2149,7 @@ __all__ = (
     "OpenAIEmbedderConfigProvider",
     "OpenAIGeneratorConfig",
     "OpenAIGeneratorConfigProvider",
+    "OpenAIReasoningEffort",
     "OpenAISTTConfig",
     "OpenRouterEmbedderConfig",
     "OpenRouterEmbedderConfigProvider",
@@ -2255,7 +2258,9 @@ __all__ = (
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
     "RetrievalAgentUsage",
-    "RetrievalQueryRequest",
+    "RetrievalNavigationConfig",
+    "RetrievalNavigationSelection",
+    "RetrievalNavigationStrategy",
     "RetrievalStepConfig",
     "RetrievalStrategy",
     "RetryConfig",
@@ -2401,7 +2406,6 @@ __all__ = (
     "TraversalResultDocument",
     "TraversalRules",
     "TraverseResponse",
-    "TreeSearchConfig",
     "TtlConfig",
     "UnsupportedHierarchyGroupingError",
     "UnsupportedHierarchyGroupingErrorAction",

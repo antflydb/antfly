@@ -156,7 +156,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     defer if (pruner_value) |*parsed| parsed.deinit();
     if (pruner_json) |raw| pruner_value = parseJsonArg(antfly_client.types.Pruner, allocator, "--pruner", raw);
 
-    const retrieval_query = antfly_client.types.RetrievalQueryRequest{
+    const retrieval_query = antfly_client.types.QueryRequest{
         .table = table,
         .full_text_search = if (full_text_value) |*parsed| parsed.value else null,
         .semantic_search = semantic_search,
@@ -166,7 +166,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
         .reranker = if (reranker_value) |*parsed| parsed.value else null,
         .pruner = if (pruner_value) |*parsed| parsed.value else null,
     };
-    const queries = [_]antfly_client.types.RetrievalQueryRequest{retrieval_query};
+    const queries = [_]antfly_client.types.QueryRequest{retrieval_query};
 
     const steps = antfly_client.types.RetrievalAgentSteps{
         .classification = .{

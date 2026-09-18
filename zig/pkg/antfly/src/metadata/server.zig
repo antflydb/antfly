@@ -729,7 +729,7 @@ const MetadataAdminHttpRuntime = struct {
     ) anyerror!httpx.Response {
         if (!MetadataAdminMux.isRestoreApiRequest(ctx.request.uri.raw)) return next.call(ctx);
         const local_leader = self.mux.ensureRestoreLeadershipIfLocalLeader() catch |err| {
-            if (!metadata_authority.isRetryableError(err)) return err;
+            if (!metadata_authority.isRetryableLeadershipPreparationError(err)) return err;
             return self.metadataNotLeader(ctx);
         };
         // A present follower row can be arbitrarily stale after leadership

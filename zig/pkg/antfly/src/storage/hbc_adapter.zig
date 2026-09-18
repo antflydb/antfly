@@ -16032,8 +16032,19 @@ pub const HBCIndex = struct {
         values_storage: []?[]const u8,
         scratch: []f32,
     ) !bool {
-        if (self.bulk_split_vector_workspace.active) {
-            return try self.loadExternalVectorsTransformedIntoMatrixWithBulkSplitWorkspace(
+        const loaded = if (self.bulk_split_vector_workspace.active)
+            try self.loadExternalVectorsTransformedIntoMatrixWithBulkSplitWorkspace(
+                txn,
+                vector_ids,
+                matrix_positions,
+                matrix,
+                lookup_storage,
+                key_views_storage,
+                values_storage,
+                scratch,
+            )
+        else
+            try self.loadExternalVectorsTransformedIntoMatrixUncached(
                 txn,
                 vector_ids,
                 matrix_positions,
@@ -16043,17 +16054,21 @@ pub const HBCIndex = struct {
                 values_storage,
                 scratch,
             );
+        if (loaded) return true;
+        // Point loaders cannot fill a batch view directly. Transform each
+        // point while its one-vector scratch is hot, instead of staging a
+        // second leaf-sized matrix of raw vectors before transforming it.
+        // Keep the existing batch-loader fallback and current/previous-vector
+        // selection intact; no source data survives this call.
+        if (!self.hasExternalVectorLoader() or self.external_vector_batch_scratch_loader != null) return false;
+        if (vector_ids.len != matrix_positions.len or scratch.len < self.config.dims) return error.InvalidArgument;
+        for (vector_ids, matrix_positions) |vector_id, position| {
+            const offset = std.math.mul(usize, position, self.config.dims) catch return error.BufferTooSmall;
+            if (offset > matrix.len or matrix.len - offset < self.config.dims) return error.BufferTooSmall;
+            const original = try self.getVectorInto(txn, vector_id, scratch);
+            _ = self.transformVector(original, matrix[offset..][0..self.config.dims]);
         }
-        return try self.loadExternalVectorsTransformedIntoMatrixUncached(
-            txn,
-            vector_ids,
-            matrix_positions,
-            matrix,
-            lookup_storage,
-            key_views_storage,
-            values_storage,
-            scratch,
-        );
+        return true;
     }
 
     /// The replay/split path already owns one bounded, transaction-scoped
@@ -26755,7 +26770,9 @@ test "wide native external update query results survive reopening unchanged" {
 fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
     const vector_count = if (dims == 1536) 4096 else 512;
     const query_k = if (dims == 1536) 100 else 10;
-    const alloc = std.testing.allocator;
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27827,10 +27844,15 @@ test "flat traversal does not treat a full candidate heap as a pruning proof" {
     });
     defer idx.close();
 
-    for (0..128) |i| {
-        const value: f32 = @floatFromInt(i + 1);
-        try idx.insert(@intCast(i + 1), &.{ value, 1 });
+    // Traversal needs a published directory with more than two leaves. A
+    // balanced build isolates that contract from adversarial binary insertion.
+    var vectors: [128][2]f32 = undefined;
+    var items: [128]BatchInsertItem = undefined;
+    for (&vectors, &items, 0..) |*vector, *item, i| {
+        vector.* = .{ @floatFromInt(i + 1), 1 };
+        item.* = .{ .vector_id = @intCast(i + 1), .vector = vector };
     }
+    try idx.bulkBuildWithMetadata(&items);
 
     var profiled = try idx.searchProfiledRequest(.{
         .query = &.{ 1, 0 },
@@ -27843,6 +27865,55 @@ test "flat traversal does not treat a full candidate heap as a pruning proof" {
     try std.testing.expectEqual(@as(u64, 2), profiled.profile.traversal_initial_wave_leaves);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
     try std.testing.expect(profiled.profile.leaves_explored > 2);
+}
+
+test "hbc monotone insertion has bounded split and save work" {
+    try testMonotoneInsertionWork(128, 16);
+}
+
+test "hbc binary monotone insertion production scale" {
+    try testMonotoneInsertionWork(128, 2);
+}
+
+fn testMonotoneInsertionWork(count: usize, fanout: u32) !void {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .metric = .inner_product,
+        .leaf_size = 8,
+        .branching_factor = fanout,
+        .search_width = 8,
+        .use_quantization = true,
+        .rerank_policy = .boundary,
+        .centroid_directory_mode = .flat_exact,
+        .flat_centroid_block_size = 4,
+        .flat_centroid_probe_count = 2,
+    });
+    defer idx.close();
+    for (0..count) |i| try idx.insert(@intCast(i + 1), &.{ @floatFromInt(i + 1), 1 });
+    const profile = idx.write_profile;
+    // Binary fanout permits unary internal nodes and quadratic split cascades.
+    // Keep its original adversarial fixture in the scale suite; ordinary
+    // fanout must stay within a linear work budget on the same ordered input.
+    const split_budget = if (fanout == 2) count * count / 16 else count;
+    const save_budget = if (fanout == 2) count * count / 4 else 8 * count;
+    try std.testing.expect(profile.split_leaf_calls <= count / 2);
+    try std.testing.expect(profile.split_internal_calls <= split_budget);
+    try std.testing.expect(profile.save_node_calls <= save_budget);
+    if (fanout != 2) try std.testing.expect(profile.range_nodes_examined <= 64 * count);
+    var result = try idx.searchProfiledRequest(.{
+        .query = &.{ 1, 0 },
+        .k = 1,
+        .search_width = 8,
+        .load_metadata = false,
+    });
+    defer result.results.deinit();
+    try std.testing.expectEqual(@as(u64, @intCast(count)), result.results.getHits()[0].vector_id);
+    if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+        std.debug.print("\nWORK insertion fanout={d} count={d} leaf_splits={d} internal_splits={d} saves={d} range_nodes={d}\n", .{ fanout, count, profile.split_leaf_calls, profile.split_internal_calls, profile.save_node_calls, profile.range_nodes_examined });
 }
 
 test "flat rabitq full effort exhausts an underfilled published directory" {
@@ -28477,6 +28548,58 @@ test "batch insert options can defer quantized rebuild until finish" {
     switch (quantized.ptr().*) {
         .nonquant, .rabit => {},
     }
+}
+
+test "deferred quantized relocation publishes payloads only at batch finish" {
+    const alloc = std.testing.allocator;
+    var path: TestPath = .{};
+    const tmp_path = path.init();
+    defer path.cleanup();
+    var idx = try HBCIndex.open(alloc, tmp_path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = true,
+    });
+    defer idx.close();
+    const vectors = [_][2]f32{
+        .{ 0.0, 0.0 },   .{ 0.1, 0.0 }, .{ 0.2, 0.0 }, .{ 0.3, 0.0 },
+        .{ 8.0, 8.0 },   .{ 8.1, 8.0 }, .{ 8.2, 8.0 }, .{ 8.3, 8.0 },
+        .{ 16.0, 16.0 },
+    };
+    var items: [vectors.len]BatchInsertItem = undefined;
+    for (&items, 0..) |*item, i| item.* = .{ .vector_id = i + 1, .vector = &vectors[i], .metadata = "doc" };
+    try idx.bulkBuildWithMetadata(&items);
+    const update = [_]BatchInsertItem{.{ .vector_id = 1, .vector = &.{ 16.05, 16.0 }, .metadata = "updated" }};
+    const options: BatchInsertOptions = .{
+        .defer_quantized_rebuild = true,
+        .suppress_quantized_payload_persist = true,
+        .centroid_only_routing = true,
+    };
+    var txn = try idx.beginWriteTxn();
+    var active = true;
+    errdefer if (active) txn.abort();
+    const source = try idx.getVecLeaf(&txn, 1);
+    const target = try idx.getVecLeaf(&txn, 9);
+    try std.testing.expect(source != target);
+    idx.resetWriteProfile();
+    try idx.batchInsertWithMetadataTxnOptions(&txn, &update, options);
+    try std.testing.expectEqual(target, try idx.getVecLeaf(&txn, 1));
+    // Both the removed-from and inserted-into leaves must honor the batch's
+    // publication boundary, rather than rebuilding per relocated vector.
+    try std.testing.expectEqual(@as(u64, 0), idx.getWriteProfile().ns_quant_put_calls);
+    try std.testing.expect(idx.deferred_quantized_nodes.contains(source));
+    try std.testing.expect(idx.deferred_quantized_nodes.contains(target));
+    try idx.finishWriteTxnOptions(&txn, options);
+    active = false;
+    try std.testing.expect(idx.getWriteProfile().ns_quant_put_calls > 0);
+    try std.testing.expect(idx.getWriteProfile().ns_quant_put_calls <= idx.metadata.node_count);
+    try std.testing.expectEqual(@as(u32, 0), idx.deferred_quantized_nodes.count());
+    var result = try idx.search(update[0].vector, 1);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.getHits().len);
+    try std.testing.expectEqual(@as(u64, 1), result.getHits()[0].vector_id);
 }
 
 test "deferred quantized rebuild refreshes touched nodes only" {
@@ -33177,6 +33300,58 @@ test "bulk ingest does not persist deferred oversized leaf quantized payloads" {
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 1), results.getHits().len);
     try std.testing.expectEqual(@as(u64, 10), results.getHits()[0].vector_id);
+}
+
+test "point-loaded centroid matrices avoid raw batch staging and observe invalidation" {
+    const alloc = std.testing.allocator;
+    const Source = struct {
+        vectors: [3][2]f32 = .{ .{ 1, 2 }, .{ 3, -4 }, .{ -5, 6 } },
+        fn load(ctx: *anyopaque, allocator: Allocator, id: u64, _: []const u8) ![]f32 {
+            const source: *@This() = @ptrCast(@alignCast(ctx));
+            if (id == 0 or id > source.vectors.len) return error.NotFound;
+            return allocator.dupe(f32, &source.vectors[id - 1]);
+        }
+    };
+    inline for (.{ .l2_squared, .cosine, .inner_product }) |metric| {
+        var tp: TestPath = .{};
+        const path = tp.init();
+        defer tp.cleanup();
+        var resources = resource_manager_mod.ResourceManager.init(.{});
+        defer resources.deinit(alloc);
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 4,
+            .branching_factor = 4,
+            .metric = metric,
+            .use_quantization = false,
+            .storage_backend = .lsm,
+        });
+        defer idx.close();
+        idx.attachResourceManager(&resources);
+        var source = Source{};
+        idx.setExternalVectorLoader(&source, Source.load);
+        var txn = try idx.beginWriteTxn();
+        defer txn.abort();
+        for (1..4) |id| try idx.putMetadata(&txn, id, "embedding");
+        const ids = [_]u64{ 3, 1, 2 };
+        var matrix: [6]f32 = undefined;
+        const baseline = resources.sliceStats(.dense_apply_working_set).peak_bytes;
+        for (0..2) |iteration| {
+            if (iteration == 1) {
+                source.vectors[1] = .{ -7, 8 };
+                idx.invalidateVectorCache(2);
+            }
+            try idx.loadPostingVectorsTransformed(&txn, &ids, &matrix);
+            for (ids, 0..) |id, row| {
+                var expected: [2]f32 = undefined;
+                _ = idx.transformVector(&source.vectors[id - 1], &expected);
+                try std.testing.expectEqualSlices(f32, &expected, matrix[row * 2 ..][0..2]);
+            }
+            // The caller's transformed matrix is sufficient: no additional
+            // member-count × dimensions raw-vector apply workspace is needed.
+            try std.testing.expectEqual(baseline, resources.sliceStats(.dense_apply_working_set).peak_bytes);
+        }
+    }
 }
 
 test "bulk split workspace reuses transformed external vectors and reports apply memory" {

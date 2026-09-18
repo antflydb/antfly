@@ -11,7 +11,14 @@ SCRIPT = Path(__file__).with_name("zig-e2e-regression-loop.sh").resolve()
 
 class RegressionEvidenceTests(unittest.TestCase):
     def run_loop(
-        self, *, mode="pass", workers=1, repeats=1, stale=False, autograph=False
+        self,
+        *,
+        mode="pass",
+        workers=1,
+        repeats=1,
+        stale=False,
+        autograph=False,
+        cluster_restore=False,
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -33,7 +40,9 @@ class RegressionEvidenceTests(unittest.TestCase):
             if stale:
                 (reports / "worker-1-case-1.xml").write_text("previous run")
             result = subprocess.run(
-                [str(SCRIPT.with_name("zig-e2e-autograph-soak.sh"))]
+                [str(SCRIPT.with_name("zig-e2e-cluster-restore-soak.sh"))]
+                if cluster_restore
+                else [str(SCRIPT.with_name("zig-e2e-autograph-soak.sh"))]
                 if autograph
                 else [str(SCRIPT), "example.py::test_restore"],
                 env={
@@ -85,6 +94,20 @@ class RegressionEvidenceTests(unittest.TestCase):
 
     def test_autograph_runs_both_profiles_but_keeps_first_failure(self):
         result, reports = self.run_loop(autograph=True, mode="normal-skip")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(len(reports), 4)
+
+    def test_cluster_restore_profiles_retain_every_case_and_constrain_descriptors(self):
+        result, reports = self.run_loop(cluster_restore=True, workers=2, repeats=2)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(reports), 16)
+        self.assertEqual(sum(path.startswith("normal/") for path in reports), 8)
+        for path, body in reports.items():
+            if path.startswith("constrained/"):
+                self.assertIn('nofile="256"', body)
+
+    def test_cluster_restore_runs_both_profiles_but_keeps_first_failure(self):
+        result, reports = self.run_loop(cluster_restore=True, mode="normal-skip")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(len(reports), 4)
 

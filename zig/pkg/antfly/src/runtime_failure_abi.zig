@@ -487,6 +487,7 @@ pub const Status = enum(u32) {
     tablespace_not_found = 529,
     ha_seed_snapshot_runtime_busy = 530,
     ha_seed_capture_already_in_progress = 531,
+    storage_read_temporarily_unavailable = 532,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
