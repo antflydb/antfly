@@ -719,7 +719,7 @@ pub fn encodeSingleTableStatusWithDefinitions(
 // Clone only the final wire projection into its owning arena. Generated JSON
 // parsers and capability aggregation allocate intermediate trees and indexes;
 // retaining those would make cache capacity depend on parser implementation.
-fn cloneSchemaProjection(comptime T: type, alloc: std.mem.Allocator, value: T) !T {
+fn cloneSchemaProjection(comptime T: type, alloc: std.mem.Allocator, value: T) std.mem.Allocator.Error!T {
     if (T == std.json.Value) return cloneJsonValueAlloc(alloc, value);
     return switch (@typeInfo(T)) {
         .optional => |info| if (value) |item| try cloneSchemaProjection(info.child, alloc, item) else null,
@@ -1122,7 +1122,7 @@ pub fn encodeStoredCreateTableRequestAlloc(alloc: std.mem.Allocator, req: Create
         try root.object.put(arena, "description", .{ .string = description });
     }
     if (req.schema_json) |schema_json| {
-        try root.object.put(arena, "schema", try std.json.parseFromSliceLeaky(std.json.Value, arena, schema_json, .{}));
+        try root.object.put(arena, "schema", try std.json.parseFromSliceLeaky(std.json.Value, arena, schema_json, .{ .parse_numbers = false }));
     }
     if (req.indexes_json) |indexes_json| {
         try root.object.put(arena, "indexes", try std.json.parseFromSliceLeaky(std.json.Value, arena, indexes_json, .{}));
@@ -1152,6 +1152,10 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     if (body.len == 0) return .{};
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
+    // Keep typed expression operands exact without changing the numeric value
+    // representation expected by storage settings and artifact index parsers.
+    var exact_schema = try std.json.parseFromSlice(struct { schema: ?std.json.Value = null }, alloc, body, .{ .ignore_unknown_fields = true, .parse_numbers = false });
+    defer exact_schema.deinit();
 
     const root = switch (parsed.value) {
         .object => |object| object,
@@ -1194,7 +1198,7 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     } else {
         req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, default_indexes_json);
     }
-    if (root.get("schema")) |value| {
+    if (exact_schema.value.schema) |value| {
         if (value != .null) {
             const encoded_schema = try stringifyJsonValue(alloc, value);
             defer alloc.free(encoded_schema);
@@ -1203,7 +1207,7 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
                 else => return err,
             };
             defer alloc.free(validated_schema);
-            try validateCreateSchemaVersion(value, allow_private_index_fields);
+            try validateCreateSchemaVersion(root.get("schema").?, allow_private_index_fields);
             const normalized_schema = normalizeSchemaVersion(alloc, validated_schema, 0) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
                 else => return err,
@@ -1663,9 +1667,9 @@ pub fn mergeSchemaPatchRequest(
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
-    var current = std.json.parseFromSliceLeaky(std.json.Value, arena, current_schema_json, .{}) catch
+    var current = std.json.parseFromSliceLeaky(std.json.Value, arena, current_schema_json, .{ .parse_numbers = false }) catch
         return error.InvalidSchemaUpdateRequest;
-    const patch = std.json.parseFromSliceLeaky(std.json.Value, arena, patch_json, .{}) catch
+    const patch = std.json.parseFromSliceLeaky(std.json.Value, arena, patch_json, .{ .parse_numbers = false }) catch
         return error.InvalidSchemaUpdateRequest;
     if (current != .object or patch != .object) return error.InvalidSchemaUpdateRequest;
     if (patch.object.get("version")) |version| {
@@ -1747,8 +1751,20 @@ pub fn applySchemaUpdateRecord(
     table: *const metadata_table_manager.TableRecord,
     schema_json: []const u8,
 ) !metadata_table_manager.TableRecord {
+    return applySchemaRecord(alloc, table, schema_json, false);
+}
+
+/// Only the fresh-generation rewrite reservation may use this constructor.
+/// It does not publish the schema or permit changing existing stored rows.
+pub fn prepareSchemaRewriteRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8) !metadata_table_manager.TableRecord {
+    return applySchemaRecord(alloc, table, schema_json, true);
+}
+
+fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool) !metadata_table_manager.TableRecord {
+    try @import("../schema/relational_index_namespace.zig").validate(alloc, schema_json, table.indexes_json);
     const current_version = try schemaVersion(table.schema_json);
     const schema_changed = !try schemasSemanticallyEqual(alloc, table.schema_json, schema_json);
+    if (schema_changed and !rewrite) try @import("../schema/relational_expression.zig").validateSchemaUpdate(alloc, table.schema_json, schema_json);
     const next_version = if (schema_changed)
         std.math.add(u32, current_version, 1) catch return error.SchemaVersionExhausted
     else
@@ -2379,10 +2395,13 @@ fn parseOptionalTableSchema(alloc: std.mem.Allocator, schema_json: []const u8) !
 }
 
 fn parseTableSchema(alloc: std.mem.Allocator, schema_json: []const u8) !schema_openapi.TableSchema {
-    return try std.json.parseFromSliceLeaky(schema_openapi.TableSchema, alloc, schema_json, .{
+    var schema = try std.json.parseFromSliceLeaky(schema_openapi.TableSchema, alloc, schema_json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
+        .parse_numbers = false,
     });
+    try @import("relational_expression_contract.zig").canonicalizeOwnedSchema(alloc, &schema);
+    return schema;
 }
 
 fn parseTableIndexes(
@@ -3799,8 +3818,9 @@ fn appendCanonicalSchemaJson(
 
 pub fn normalizeSchemaVersion(alloc: std.mem.Allocator, schema_json: []const u8, version: u32) ![]u8 {
     const source = if (schema_json.len > 0) schema_json else "{}";
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{ .parse_numbers = false });
     defer parsed.deinit();
+    try @import("relational_expression_contract.zig").canonicalizeSchemaValue(parsed.arena.allocator(), &parsed.value);
 
     const root = switch (parsed.value) {
         .object => |object| object,
@@ -4064,6 +4084,161 @@ test "metadata.table status encoder emits antfly-style shard map" {
     const replication_sources = root.get("replication_sources").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), replication_sources.len);
     try std.testing.expectEqualStrings("postgres", replication_sources[0].object.get("type").?.string);
+}
+
+test "metadata.table relational storage mode survives create and status round trips" {
+    const alloc = std.testing.allocator;
+    var request = try parseCreateTableRequest(alloc,
+        \\{"schema":{"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"tenant_id","keys":[{"column":"tenant","collation":"ci"},{"column":"id","direction":"desc","nulls":"last"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"keyword"},"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}}}}}
+    );
+    defer request.deinit(alloc);
+    const schema_json = request.schema_json.?;
+    var schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer schema.deinit(alloc);
+    try std.testing.expect(schema.storage_mode == .relational);
+    try std.testing.expect(schema.enforce_types);
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "rows",
+            .schema_json = schema_json,
+            .read_schema_json = schema_json,
+            .indexes_json = "{}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const detail = (try encodeSingleTableStatus(alloc, &snapshot, "rows")).?;
+    defer alloc.free(detail);
+    const list = try encodeTableList(alloc, &snapshot, null);
+    defer alloc.free(list);
+    for ([_][]const u8{ detail, list }) |encoded| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+        defer parsed.deinit();
+        const table = if (parsed.value == .array) parsed.value.array.items[0].object else parsed.value.object;
+        try std.testing.expectEqualStrings("relational", table.get("schema").?.object.get("storage_mode").?.string);
+        const migration_schema = table.get("migration").?.object.get("read_schema").?.object;
+        try std.testing.expectEqualStrings("relational", migration_schema.get("storage_mode").?.string);
+        for ([_]std.json.ObjectMap{ table.get("schema").?.object, migration_schema }) |public_schema| {
+            const indexes = public_schema.get("relational_indexes").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), indexes.len);
+            const keys = indexes[0].object.get("keys").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            try std.testing.expectEqualStrings("ci", keys[0].object.get("collation").?.string);
+            try std.testing.expectEqualStrings("desc", keys[1].object.get("direction").?.string);
+            try std.testing.expectEqualStrings("last", keys[1].object.get("nulls").?.string);
+        }
+    }
+}
+
+test "relational declarations public schema preserves unsafe typed literals and semantic identities" {
+    const alloc = std.testing.allocator;
+    const source =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"n","expression":{"op":"literal","type":"integer","value":9007199254740993}}],"generated_columns":[{"column":"g","expression":{"op":"literal","type":"integer","value":-9007199254740993}}],"checks":[{"name":"exact","expression":{"op":"eq","args":[{"op":"column","column":"n"},{"op":"literal","type":"integer","value":9007199254740993}]}}],"relational_indexes":[{"name":"clock","keys":[{"expression":{"op":"literal","type":"datetime","value":18446744073709551615},"result_type":"datetime"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"g":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "exact", .schema_json = source, .read_schema_json = source, .indexes_json = "{}", .placement_role = "data" }})[0..]),
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const encoded = (try encodeSingleTableStatus(alloc, &snapshot, "exact")).?;
+    defer alloc.free(encoded);
+    // Use the lossy default JSON decoder deliberately: unsafe literals must
+    // already be strings before a Go/JavaScript client sees the response.
+    const response = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer response.deinit();
+    const active = response.value.object.get("schema").?;
+    const historical = response.value.object.get("migration").?.object.get("read_schema").?;
+    for ([_]std.json.Value{ active, historical }) |public| {
+        try std.testing.expectEqualStrings("9007199254740993", public.object.get("column_defaults").?.array.items[0].object.get("expression").?.object.get("value").?.string);
+        try std.testing.expectEqualStrings("-9007199254740993", public.object.get("generated_columns").?.array.items[0].object.get("expression").?.object.get("value").?.string);
+        try std.testing.expectEqualStrings("9007199254740993", public.object.get("checks").?.array.items[0].object.get("expression").?.object.get("args").?.array.items[1].object.get("value").?.string);
+        try std.testing.expectEqualStrings("18446744073709551615", public.object.get("relational_indexes").?.array.items[0].object.get("keys").?.array.items[0].object.get("expression").?.object.get("value").?.string);
+    }
+    const roundtrip = try std.json.Stringify.valueAlloc(alloc, active, .{});
+    defer alloc.free(roundtrip);
+    try @import("../schema/relational_expression.zig").validateSchemaUpdate(alloc, source, roundtrip);
+    var old = try schema_mod.CompiledTableValidator.init(alloc, source);
+    defer old.deinit(alloc);
+    var next = try schema_mod.CompiledTableValidator.init(alloc, roundtrip);
+    defer next.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &old.execution.checks.?.fingerprint(), &next.execution.checks.?.fingerprint());
+}
+
+test "relational declarations bound predicate responses preserve integer datetime references and numeric semantics" {
+    const alloc = std.testing.allocator;
+    const source =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"id","column":"n","op":"gte","value":9007199254740993},{"name":"clock","column":"t","op":"gte","value":18446744073709551615},{"name":"float","column":"f","op":"gte","value":9007199254740992}],"relational_indexes":[{"name":"partial","keys":[{"column":"n"}],"where":[{"column":"n","op":"gte","value":9007199254740993},{"column":"t","op":"gte","value":18446744073709551615},{"column":"f","op":"gte","value":9007199254740992}]}],"document_schemas":{"row":{"schema":{"type":"object","$defs":{"identifier":{"type":"integer"},"clock":{"type":"datetime"}},"properties":{"n":{"$ref":"#/$defs/identifier"},"t":{"$ref":"#/$defs/clock"},"f":{"type":"number"}},"additionalProperties":false}}}}
+    ;
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "exact", .schema_json = source, .read_schema_json = source, .indexes_json = "{}", .placement_role = "data" };
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{table})[0..]),
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    const encoded = (try encodeSingleTableStatus(alloc, &snapshot, "exact")).?;
+    defer alloc.free(encoded);
+    const response = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer response.deinit();
+    const active = response.value.object.get("schema").?;
+    const historical = response.value.object.get("migration").?.object.get("read_schema").?;
+    for ([_]std.json.Value{ active, historical }) |public| {
+        const checks = public.object.get("checks").?.array.items;
+        const where = public.object.get("relational_indexes").?.array.items[0].object.get("where").?.array.items;
+        for ([_][]std.json.Value{ checks, where }) |predicates| {
+            try std.testing.expect(predicates[0].object.get("value").? == .string);
+            try std.testing.expect(predicates[1].object.get("value").? == .string);
+            try std.testing.expect(predicates[2].object.get("value").? == .integer);
+            try std.testing.expectEqualStrings("9007199254740993", predicates[0].object.get("value").?.string);
+            try std.testing.expectEqualStrings("18446744073709551615", predicates[1].object.get("value").?.string);
+            try std.testing.expectEqual(@as(i64, 9007199254740992), predicates[2].object.get("value").?.integer);
+        }
+    }
+    const roundtrip = try std.json.Stringify.valueAlloc(alloc, active, .{});
+    defer alloc.free(roundtrip);
+    try std.testing.expect(try schemasSemanticallyEqual(alloc, source, roundtrip));
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc, source);
+    defer parsed.deinit(alloc);
+    var columns: @import("relational_expression_contract.zig").ColumnTypes = .{ .alloc = alloc, .source = .{ .parsed = &parsed } };
+    defer columns.deinit();
+    const definition = parsed.relational_indexes.?.value[0];
+    const config = try @import("relational_index_mutation.zig").configForDefinition(alloc, definition, &columns);
+    defer alloc.free(config);
+    try std.testing.expectEqual(@as(u32, 3), columns.cache.count());
+    try std.testing.expectEqualStrings("9007199254740993", definition.where.?[0].value.?.number_string);
+    const updated = try @import("relational_index_mutation.zig").create(alloc, table, "partial", config);
+    defer metadata_table_manager.freeTable(alloc, updated);
+    try std.testing.expectEqual(@as(u32, 1), try schemaVersion(updated.schema_json));
+}
+
+test "metadata.table document storage mode remains optional in public schemas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for ([_][]const u8{ "{}", "{\"storage_mode\":\"document\"}" }, 0..) |schema_json, i| {
+        const schema = try parseTableSchema(alloc, schema_json);
+        const encoded = try std.json.Stringify.valueAlloc(alloc, schema, .{ .emit_null_optional_fields = false });
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, encoded, .{});
+        if (i == 0) {
+            try std.testing.expect(parsed.object.get("storage_mode") == null);
+        } else {
+            try std.testing.expectEqualStrings("document", parsed.object.get("storage_mode").?.string);
+        }
+    }
 }
 
 test "metadata.table detail encoder includes replication source status and action hint" {

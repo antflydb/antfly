@@ -621,6 +621,138 @@ func (c *AntflyClient) LookupKeyWithFields(ctx context.Context, tableName, key, 
 	return document, nil
 }
 
+// QueryRelationalRows reads one bounded primary-key-ordered page. Integer row
+// values decode as json.Number, preserving int64 precision. Resume using the
+// final row's Id as From; pagination opens a new snapshot on each request.
+func (c *AntflyClient) QueryRelationalRows(ctx context.Context, tableName string, request RelationalRowQueryRequest) ([]RelationalRow, error) {
+	resp, err := c.client.QueryRelationalRows(ctx, tableName, request)
+	if err != nil {
+		return nil, fmt.Errorf("querying relational rows: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("querying relational rows: %w", readErrorResponse(resp))
+	}
+	body, truncated, err := readLimitedBody(resp.Body, 16<<20)
+	if err != nil {
+		return nil, fmt.Errorf("reading relational rows: %w", err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("relational row response exceeds 16 MiB")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	rows := make([]RelationalRow, 0)
+	for {
+		var row RelationalRow
+		if err := decoder.Decode(&row); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return nil, fmt.Errorf("decoding relational row: %w", err)
+		}
+		if len(rows) == 4096 {
+			return nil, fmt.Errorf("relational row response exceeds 4096 rows")
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+// MutateRelationalRows atomically replaces/deletes rows with exact row-version
+// and schema-epoch preconditions. It never retries an ambiguous commit.
+func (c *AntflyClient) MutateRelationalRows(ctx context.Context, tableName string, request RelationalRowMutationRequest) (*BatchResult, error) {
+	return c.mutateRelationalRows(ctx, tableName, request, false)
+}
+
+// RepairRelationalConstraints repairs failed activation rows without bypassing
+// new-value integrity checks. It requires administrator permission.
+func (c *AntflyClient) RepairRelationalConstraints(ctx context.Context, tableName string, request RelationalRowMutationRequest) (*BatchResult, error) {
+	return c.mutateRelationalRows(ctx, tableName, request, true)
+}
+
+func (c *AntflyClient) mutateRelationalRows(ctx context.Context, tableName string, request RelationalRowMutationRequest, repair bool) (*BatchResult, error) {
+	body, err := boundedJSONBody(request, DefaultWriteMaxRequestBytes)
+	if err != nil {
+		return nil, fmt.Errorf("encoding relational mutations: %w", err)
+	}
+	var resp *http.Response
+	if repair {
+		resp, err = c.client.RepairRelationalConstraintsWithBody(ctx, tableName, "application/json", body)
+	} else {
+		resp, err = c.client.MutateRelationalRowsWithBody(ctx, tableName, "application/json", body)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("mutating relational rows: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("mutating relational rows: %w", readErrorResponse(resp))
+	}
+	response, truncated, err := readLimitedBody(resp.Body, DefaultWriteMaxResponseBytes)
+	if err != nil {
+		return nil, fmt.Errorf("reading relational mutation outcome: %w", err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("relational mutation outcome exceeded response limit")
+	}
+	var result BatchResult
+	if err := json.Unmarshal(response, &result); err != nil {
+		return nil, fmt.Errorf("decoding relational mutation outcome: %w", err)
+	}
+	if result.Status == "" {
+		if resp.StatusCode == http.StatusAccepted {
+			result.Status = "committed_pending"
+		} else {
+			result.Status = "committed"
+		}
+	}
+	return &result, nil
+}
+
+// RetryRelationalConstraints idempotently restarts failed owner validation.
+// Acceptance is not completion; inspect the constraint status endpoint afterward.
+func (c *AntflyClient) RetryRelationalConstraints(ctx context.Context, tableName string, request RelationalConstraintRetryRequest) (*RelationalConstraintRetryResponse, error) {
+	return c.relationalConstraintLifecycle(ctx, tableName, request, false)
+}
+
+// RetireRelationalConstraints starts a durable constraint drain. With Drop,
+// the table remains intact until explicitly deleted after ready_to_drop.
+func (c *AntflyClient) RetireRelationalConstraints(ctx context.Context, tableName string, request RelationalConstraintRetirementRequest) (*RelationalConstraintRetryResponse, error) {
+	return c.relationalConstraintLifecycle(ctx, tableName, request, true)
+}
+
+func (c *AntflyClient) relationalConstraintLifecycle(ctx context.Context, tableName string, request any, retire bool) (*RelationalConstraintRetryResponse, error) {
+	body, err := boundedJSONBody(request, DefaultWriteMaxRequestBytes)
+	if err != nil {
+		return nil, fmt.Errorf("encoding constraint retry: %w", err)
+	}
+	var resp *http.Response
+	if retire {
+		resp, err = c.client.RetireRelationalConstraintsWithBody(ctx, tableName, "application/json", body)
+	} else {
+		resp, err = c.client.RetryRelationalConstraintsWithBody(ctx, tableName, "application/json", body)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("retrying constraints: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		return nil, fmt.Errorf("retrying constraints: %w", readErrorResponse(resp))
+	}
+	encoded, truncated, err := readLimitedBody(resp.Body, DefaultWriteMaxResponseBytes)
+	if err != nil || truncated {
+		return nil, fmt.Errorf("reading constraint retry response (truncated=%t): %v", truncated, err)
+	}
+	var result RelationalConstraintRetryResponse
+	if err := json.Unmarshal(encoded, &result); err != nil {
+		return nil, fmt.Errorf("decoding constraint retry: %w", err)
+	}
+	if result.Status != "accepted" {
+		return nil, fmt.Errorf("unexpected constraint retry status %q", result.Status)
+	}
+	return &result, nil
+}
+
 // ScanKeys scans keys in a table within an optional key range.
 // Returns keys and optionally document data based on the request parameters.
 func (c *AntflyClient) ScanKeys(ctx context.Context, tableName string, request ScanKeysRequest) ([]map[string]any, error) {

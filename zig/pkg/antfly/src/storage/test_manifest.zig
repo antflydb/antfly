@@ -21,7 +21,32 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("relational_index.zig");
+    _ = @import("db/relational_index_keys.zig");
+    _ = @import("db/relational_index_plan.zig");
+    _ = @import("db/relational_index_catalog.zig");
+    _ = @import("db/relational_index_records.zig");
+    _ = @import("db/relational_index_jobs.zig");
+    _ = @import("db/relational_index_maintenance_sweep.zig");
+    _ = @import("rewrite_program_cache.zig");
+    _ = @import("rewrite_tail_spool.zig");
+    _ = @import("db/relational_constraint_jobs.zig");
+    _ = @import("db/relational_integrity.zig");
+    _ = @import("db/relational_integrity_contract.zig");
+    _ = @import("db/relational_transition_contract.zig");
+    _ = @import("db/relational_integrity_catalog.zig");
+    _ = @import("db/relational_integrity_integration_test.zig");
+    _ = @import("db/relational_integrity_range.zig");
+    _ = @import("db/relational_integrity_activation.zig");
+    _ = @import("db/relational_integrity_retirement.zig");
+    _ = @import("db/relational_integrity_topology.zig");
+    _ = @import("db/restore_staging.zig");
+    _ = @import("db/relational_index_gc.zig");
+    _ = @import("db/relational_row_cursor.zig");
+    _ = @import("db/relational_predicate.zig");
     _ = @import("admission_waiter.zig");
+    _ = @import("coordinated_ttl.zig");
+    _ = @import("restore_owner.zig");
     _ = @import("artifact_payload.zig");
     _ = @import("dense_work_admission.zig");
     _ = @import("maintenance_signal.zig");
@@ -123,6 +148,25 @@ comptime {
     _ = @import("db/maintenance/transaction_runtime.zig");
     _ = @import("db/maintenance/ttl_runtime.zig");
     _ = @import("db/merge_contract.zig");
+    _ = @import("db/merge_page_system_test.zig");
+    _ = @import("db/merge_page_wire.zig");
+    _ = @import("db/native_raft_snapshot.zig");
+    _ = @import("db/online_merge_io.zig");
+    _ = @import("db/online_integrity_shadow.zig");
+    _ = @import("db/online_merge_io_contract.zig");
+    _ = @import("db/online_merge_receiver.zig");
+    _ = @import("db/online_merge_snapshot.zig");
+    _ = @import("db/online_source.zig");
+    _ = @import("db/relational_expression_system_test.zig");
+    _ = @import("db/relational_index_cover_system_test.zig");
+    _ = @import("db/relational_index_maintenance_contract.zig");
+    _ = @import("db/relational_predicate_implication.zig");
+    _ = @import("db/relational_rewrite_staging_test.zig");
+    _ = @import("db/relational_rewrite_program.zig");
+    _ = @import("db/relational_row_transform_test.zig");
+    _ = @import("db/source_pin.zig");
+    _ = @import("db/source_pin_gc.zig");
+    _ = @import("db/source_publication_job.zig");
     _ = @import("db/mod.zig");
     _ = @import("db/native_backup.zig");
     _ = @import("db/ownership.zig");
@@ -141,6 +185,7 @@ comptime {
     _ = @import("db/range_state.zig");
     _ = @import("db/relational_columns.zig");
     _ = @import("db/relational_store.zig");
+    _ = @import("db/relational_index_system_test.zig");
     _ = @import("db/schema_cache_admission.zig");
     _ = @import("db/schema_registry.zig");
     _ = @import("db/table_catalog.zig");
@@ -178,6 +223,9 @@ comptime {
     _ = @import("hot_standby/layout.zig");
     _ = @import("hot_standby/lifecycle_receipt_inventory_test.zig");
     _ = @import("hot_standby/local_generation_gc.zig");
+    _ = @import("hot_standby/metadata_effect_chunks.zig");
+    _ = @import("hot_standby/replay_floor.zig");
+    _ = @import("hot_standby/restore_terminal_ledger.zig");
     _ = @import("hot_standby/metrics.zig");
     _ = @import("hot_standby/mod.zig");
     _ = @import("hot_standby/mutation_barrier.zig");
@@ -272,6 +320,9 @@ comptime {
     _ = @import("persistent_vopr.zig");
     _ = @import("portable_backup.zig");
     _ = @import("resource_manager.zig");
+    _ = @import("retained_effects.zig");
+    _ = @import("source_pin_state.zig");
+    _ = @import("source_snapshot.zig");
     _ = @import("rowsource/external.zig");
     _ = @import("rowsource/local.zig");
     _ = @import("rowsource/mod.zig");

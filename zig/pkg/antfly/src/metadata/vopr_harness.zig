@@ -11384,7 +11384,7 @@ test "metadata VOPR http cluster serves public lifecycle from a non-host node af
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 2), query_result.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 0), query_result.hits.?.hits.?.len);
     try std.testing.expect(query_result.profile != null);
     try std.testing.expectEqual(@as(i64, 1), query_result.profile.?.object.get("shards").?.object.get("total").?.integer);

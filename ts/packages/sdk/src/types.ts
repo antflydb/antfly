@@ -158,6 +158,32 @@ export type Table = components["schemas"]["Table"];
 export type CommittedMutationOutcome = components["schemas"]["CommittedMutationOutcome"];
 export type CreateTableRequest = components["schemas"]["CreateTableRequest"];
 export type TableSchema = components["schemas"]["TableSchema"];
+export type RelationalUniqueConstraint = components["schemas"]["RelationalUniqueConstraint"];
+export type RelationalForeignKeyConstraint =
+  components["schemas"]["RelationalForeignKeyConstraint"];
+export type RelationalRow = components["schemas"]["RelationalRow"];
+export type RelationalIndexPredicate = components["schemas"]["RelationalIndexPredicate"];
+export type RelationalScalarExpression = components["schemas"]["RelationalScalarExpression"];
+export type RelationalColumnExpression = components["schemas"]["RelationalColumnExpression"];
+export type RelationalExpressionOp = components["schemas"]["RelationalExpressionOp"];
+export type RelationalExpressionType = components["schemas"]["RelationalExpressionType"];
+export type RelationalRowCondition = components["schemas"]["RelationalRowCondition"];
+export type RelationalRowQueryRequest = components["schemas"]["RelationalRowQueryRequest"];
+export type RelationalRowMutation = components["schemas"]["RelationalRowMutation"];
+export type RelationalRowMutationRequest = components["schemas"]["RelationalRowMutationRequest"];
+export type RelationalConstraintStatus = components["schemas"]["RelationalConstraintStatus"];
+export type RelationalConstraintRetryRequest =
+  components["schemas"]["RelationalConstraintRetryRequest"];
+export type RelationalConstraintRetirementRequest =
+  components["schemas"]["RelationalConstraintRetirementRequest"];
+export type RelationalConstraintRetirementStatus =
+  components["schemas"]["RelationalConstraintRetirementStatus"];
+export type RelationalConstraintRetryResponse =
+  components["schemas"]["RelationalConstraintRetryResponse"];
+export type RelationalConstraintRangeStatus =
+  components["schemas"]["RelationalConstraintRangeStatus"];
+export type RelationalConstraintConflictReason =
+  components["schemas"]["RelationalConstraintConflictReason"];
 export type TableMigration = components["schemas"]["TableMigration"];
 export type TableStatus = components["schemas"]["TableStatus"];
 
@@ -191,6 +217,18 @@ export type CreateFullTextIndexRequest = components["schemas"]["CreateFullTextIn
 export type CreateEmbeddingsIndexRequest = components["schemas"]["CreateEmbeddingsIndexRequest"];
 export type CreateGraphIndexRequest = components["schemas"]["CreateGraphIndexRequest"];
 export type CreateAlgebraicIndexRequest = components["schemas"]["CreateAlgebraicIndexRequest"];
+export type CreateRelationalIndexRequest = components["schemas"]["CreateRelationalIndexRequest"];
+export type CreatedRelationalIndex = components["schemas"]["CreatedRelationalIndex"];
+export type RelationalIndexConfig = components["schemas"]["RelationalIndexConfig"];
+export type RelationalIndexStats = components["schemas"]["RelationalIndexStats"];
+export type RelationalIndexStatus = components["schemas"]["RelationalIndexStatus"];
+export type RelationalIndexRangeStatus = components["schemas"]["RelationalIndexRangeStatus"];
+export type RelationalIndexBuildState = components["schemas"]["RelationalIndexBuildState"];
+export type RelationalIndexBuildFailure = components["schemas"]["RelationalIndexBuildFailure"];
+export type IndexMaintenanceRequest = components["schemas"]["IndexMaintenanceRequest"];
+export type IndexMaintenanceResponse = components["schemas"]["IndexMaintenanceResponse"];
+export type IndexMaintenanceOwnerProof = components["schemas"]["IndexMaintenanceOwnerProof"];
+export type RelationalRowIndexBound = components["schemas"]["RelationalRowIndexBound"];
 export type CreatedIndex = components["schemas"]["CreatedIndex"];
 export type IndexType = components["schemas"]["IndexType"];
 export type IndexStatus = components["schemas"]["IndexStatus"];

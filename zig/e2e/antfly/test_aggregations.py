@@ -17,6 +17,7 @@ def _check_age_aggregation(payload, kind):
     assert len(responses) == 1, payload
     response = responses[0]
     assert response.get("status", 200) == 200, payload
+    assert response["hits"]["hits"] == [], payload
     age = response["aggregations"]["age"]
     if kind == "terms":
         buckets = age["buckets"]

@@ -41,6 +41,19 @@ pub fn loadFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
     return try decode(raw);
 }
 
+/// Read the range-local result after appendIdentityTransitionAlloc, without
+/// confusing retained namespace-wide identities with owned primary rows. This
+/// is the authoritative empty/non-empty input for transactional table metadata.
+pub fn afterIdentityTransition(alloc: Allocator, store: *docstore_mod.DocStore, writes: []const docstore_mod.KVPair) !u64 {
+    var i = writes.len;
+    while (i != 0) {
+        i -= 1;
+        if (std.mem.eql(u8, writes[i].key, &internal_keys.range_document_count_key))
+            return try decode(writes[i].value);
+    }
+    return (try load(alloc, store)) orelse error.InvalidRangeDocumentCount;
+}
+
 /// A new empty store has no range counter until its first primary mutation.
 /// Prove that case with a single bounded user-key probe. Any user record keeps
 /// a missing counter unknown, including legacy documents without identity

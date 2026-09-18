@@ -228,7 +228,7 @@ pub const AntflyRootImports = struct {
             "logging_openapi", "metadata_openapi",   "objectstore",       "openai_api",
             "pdf",             "query_openapi",      "reader_config",     "readers",
             "regex",           "reranking",          "scraping",          "synthesizing",
-            "transcribing",    "vector",             "vellum",
+            "transcribing",    "vector",             "vellum",            "schema_openapi",
         }) |field| self.addImport(mod, field);
     }
 
@@ -239,8 +239,8 @@ pub const AntflyRootImports = struct {
         "vectorindex",
     };
     const api_imports = .{
-        "a2a", "casbin",      "eval_openapi",   "generating_api_openapi", "generating_openapi",
-        "mcp", "raft_engine", "schema_openapi", "usermgr_openapi",
+        "a2a", "casbin",      "eval_openapi",    "generating_api_openapi", "generating_openapi",
+        "mcp", "raft_engine", "usermgr_openapi",
     };
 
     pub fn configureStorage(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {

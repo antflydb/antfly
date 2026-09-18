@@ -24,6 +24,8 @@ pub const replay_all_kind: u8 = 0xfe;
 pub const primary_kind: u8 = 0x10;
 pub const ttl_kind: u8 = 0x11;
 pub const relational_row_kind: u8 = 0x12;
+/// One reverse ownership record per document/physical relational index.
+pub const relational_index_reverse_kind: u8 = 0x13;
 pub const relational_columnar_manifest_key = "\x00\x00__columnar__:manifest";
 pub const relational_columnar_prefix = "\x00\x00__columnar__:";
 pub const relational_columnar_dirty_prefix = relational_columnar_prefix ++ "dirty:";
@@ -248,6 +250,19 @@ pub fn findComponentTerminator(key: []const u8, start: usize) ?usize {
         return null;
     }
     return null;
+}
+
+/// Exclusive cut after one document's complete physical key family. The
+/// terminator ends in zero, so incrementing its final byte cannot overflow or
+/// skip a logical key extending this one (including embedded NUL/0xff bytes).
+/// `key` must not alias `out`; callers can reuse the buffer across cursor seeks.
+pub fn documentPrefixSuccessor(alloc: Allocator, out: *std.ArrayList(u8), key: []const u8) ![]const u8 {
+    if (key.len == 0 or key[0] != user_namespace) return error.InvalidInternalUserKey;
+    const end = (findComponentTerminator(key, 1) orelse return error.InvalidInternalUserKey) + 2;
+    try out.resize(alloc, end);
+    @memcpy(out.items, key[0..end]);
+    out.items[end - 1] = 1;
+    return out.items;
 }
 
 pub fn decodeBodyAlloc(alloc: Allocator, body: []const u8) ![]u8 {
@@ -1473,6 +1488,14 @@ pub fn isRelationalRowKey(key: []const u8) bool {
 
 pub fn isStoredDocumentRowKey(key: []const u8) bool {
     return isPrimaryDocumentKey(key) or isRelationalRowKey(key);
+}
+
+pub fn isRelationalIndexReverseKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    const start = term + 3;
+    if (start > key.len or key.len - start != 12 or key[term + 2] != relational_index_reverse_kind) return false;
+    return std.mem.readInt(u64, key[start..][0..8], .big) != 0;
 }
 
 pub fn isTtlKey(key: []const u8) bool {

@@ -631,7 +631,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
     else
         indexed;
     const readiness = if (@hasField(Stats, "readiness")) stats.readiness else null;
-    const milestones = if (@hasField(Stats, "milestones")) stats.milestones else null;
+    const milestones: ?antfly_client.types.IndexMilestones = if (@hasField(Stats, "milestones")) stats.milestones else null;
     const activity = if (@hasField(Stats, "activity")) stats.activity.valueOrNull() else null;
     const publication = if (@hasField(Stats, "publication")) stats.publication else null;
     const repair = if (@hasField(Stats, "repair")) stats.repair else null;
@@ -644,7 +644,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
         !readiness_pending and !coverage_incomplete and (std.mem.eql(u8, state, "ready") or
             (reported_state == null and rebuilding == false and error_text == null and !config_mismatch));
     const queryable = if (milestones) |value| value.queryable.reached else if (readiness) |value| value.queryable else complete;
-    const failed = if (milestones) |value|
+    const failed = (if (@hasField(Stats, "relational_index")) stats.relational_index.state == .failed else false) or if (milestones) |value|
         containsBlocker(value.queryable.blockers, "failure") or containsBlocker(value.complete.blockers, "failure")
     else if (readiness) |value|
         value.state == .failed
@@ -2093,6 +2093,26 @@ test "index summary prefers typed embedding milestones coverage and activity" {
     try std.testing.expect(reporter.observeEmbeddingRate(advanced, 5 * std.time.ns_per_s) == null);
     advanced.embeddings_computed = 12;
     try std.testing.expectApproxEqAbs(@as(f64, 10.0), reporter.observeEmbeddingRate(advanced, 6 * std.time.ns_per_s).?, 0.0001);
+}
+
+test "index summary uses relational milestones for ready pending and failed indexes" {
+    var stats: antfly_client.types.RelationalIndexStats = .{
+        .index_type = .relational,
+        .milestones = .{
+            .queryable = .{ .reached = false, .blockers = &.{"index_build_coverage"} },
+            .complete = .{ .reached = false, .blockers = &.{"index_build_coverage"} },
+        },
+        .relational_index = .{ .table_id = "1", .schema_version = 1, .index_name = "by_tenant", .state = .building, .ranges = &.{} },
+    };
+    try std.testing.expectEqualStrings("pending", summarizeStats(stats).state);
+    stats.milestones.queryable = .{ .reached = true, .blockers = &.{} };
+    stats.milestones.complete = .{ .reached = true, .blockers = &.{} };
+    stats.relational_index.state = .ready;
+    try std.testing.expectEqualStrings("ready", summarizeStats(stats).state);
+    stats.milestones.queryable = .{ .reached = false, .blockers = &.{"index_build_failed"} };
+    stats.milestones.complete = .{ .reached = false, .blockers = &.{"index_build_failed"} };
+    stats.relational_index.state = .failed;
+    try std.testing.expectEqualStrings("failed", summarizeStats(stats).state);
 }
 
 test "index status distinguishes absent and explicitly unavailable embedding activity" {

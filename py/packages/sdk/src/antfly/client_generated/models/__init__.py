@@ -144,6 +144,8 @@ from .create_full_text_index_request_type import CreateFullTextIndexRequestType
 from .create_graph_index_request import CreateGraphIndexRequest
 from .create_graph_index_request_type import CreateGraphIndexRequestType
 from .create_index_common import CreateIndexCommon
+from .create_relational_index_request import CreateRelationalIndexRequest
+from .create_relational_index_request_type import CreateRelationalIndexRequestType
 from .create_table_request import CreateTableRequest
 from .create_table_request_indexes import CreateTableRequestIndexes
 from .create_table_storage_migration_body import CreateTableStorageMigrationBody
@@ -172,6 +174,8 @@ from .created_graph_index_config_metrics import CreatedGraphIndexConfigMetrics
 from .created_graph_index_type import CreatedGraphIndexType
 from .created_index_common import CreatedIndexCommon
 from .created_provider_config import CreatedProviderConfig
+from .created_relational_index import CreatedRelationalIndex
+from .created_relational_index_type import CreatedRelationalIndexType
 from .credentials import Credentials
 from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
@@ -420,6 +424,9 @@ from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
 from .followup_step_config import FollowupStepConfig
 from .foreign_column import ForeignColumn
+from .foreign_key_action import ForeignKeyAction
+from .foreign_key_match import ForeignKeyMatch
+from .foreign_key_timing import ForeignKeyTiming
 from .foreign_source import ForeignSource
 from .foreign_source_type import ForeignSourceType
 from .full_text_artifact_index_source import FullTextArtifactIndexSource
@@ -654,6 +661,9 @@ from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
 from .index_execution_config import IndexExecutionConfig
+from .index_maintenance_owner_proof import IndexMaintenanceOwnerProof
+from .index_maintenance_request import IndexMaintenanceRequest
+from .index_maintenance_response import IndexMaintenanceResponse
 from .index_milestone_status import IndexMilestoneStatus
 from .index_milestones import IndexMilestones
 from .index_mutation_conflict_error import IndexMutationConflictError
@@ -1008,6 +1018,46 @@ from .rate_limit_config import RateLimitConfig
 from .reauthorize_table_destinations_response_200 import ReauthorizeTableDestinationsResponse200
 from .reauthorize_table_destinations_response_200_status import ReauthorizeTableDestinationsResponse200Status
 from .regexp_query import RegexpQuery
+from .relational_check_constraint import RelationalCheckConstraint
+from .relational_column_expression import RelationalColumnExpression
+from .relational_comparison_op import RelationalComparisonOp
+from .relational_constraint_activation_phase import RelationalConstraintActivationPhase
+from .relational_constraint_conflict_reason import RelationalConstraintConflictReason
+from .relational_constraint_range_status import RelationalConstraintRangeStatus
+from .relational_constraint_retirement_request import RelationalConstraintRetirementRequest
+from .relational_constraint_retirement_status import RelationalConstraintRetirementStatus
+from .relational_constraint_retirement_status_phase import RelationalConstraintRetirementStatusPhase
+from .relational_constraint_retry_request import RelationalConstraintRetryRequest
+from .relational_constraint_retry_response import RelationalConstraintRetryResponse
+from .relational_constraint_retry_response_status import RelationalConstraintRetryResponseStatus
+from .relational_constraint_status import RelationalConstraintStatus
+from .relational_constraint_status_coverage_kind import RelationalConstraintStatusCoverageKind
+from .relational_constraint_validation_state import RelationalConstraintValidationState
+from .relational_expression_op import RelationalExpressionOp
+from .relational_expression_type import RelationalExpressionType
+from .relational_foreign_key_constraint import RelationalForeignKeyConstraint
+from .relational_index_build_failure import RelationalIndexBuildFailure
+from .relational_index_build_state import RelationalIndexBuildState
+from .relational_index_config import RelationalIndexConfig
+from .relational_index_definition import RelationalIndexDefinition
+from .relational_index_key import RelationalIndexKey
+from .relational_index_key_direction import RelationalIndexKeyDirection
+from .relational_index_key_nulls import RelationalIndexKeyNulls
+from .relational_index_predicate import RelationalIndexPredicate
+from .relational_index_range_status import RelationalIndexRangeStatus
+from .relational_index_stats import RelationalIndexStats
+from .relational_index_stats_index_type import RelationalIndexStatsIndexType
+from .relational_index_status import RelationalIndexStatus
+from .relational_row import RelationalRow
+from .relational_row_condition import RelationalRowCondition
+from .relational_row_index_bound import RelationalRowIndexBound
+from .relational_row_mutation import RelationalRowMutation
+from .relational_row_mutation_request import RelationalRowMutationRequest
+from .relational_row_mutation_row import RelationalRowMutationRow
+from .relational_row_query_request import RelationalRowQueryRequest
+from .relational_row_row import RelationalRowRow
+from .relational_scalar_expression import RelationalScalarExpression
+from .relational_unique_constraint import RelationalUniqueConstraint
 from .rename_catalog_resource_request import RenameCatalogResourceRequest
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
@@ -1130,6 +1180,7 @@ from .table_shards import TableShards
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
 from .table_status import TableStatus
+from .table_storage_mode import TableStorageMode
 from .table_storage_settings import TableStorageSettings
 from .table_storage_settings_dense_embeddings import TableStorageSettingsDenseEmbeddings
 from .table_storage_unreadable_error import TableStorageUnreadableError
@@ -1377,6 +1428,8 @@ __all__ = (
     "CreatedGraphIndexType",
     "CreatedIndexCommon",
     "CreatedProviderConfig",
+    "CreatedRelationalIndex",
+    "CreatedRelationalIndexType",
     "CreateEmbeddingsIndexRequest",
     "CreateEmbeddingsIndexRequestType",
     "CreateFullTextIndexRequest",
@@ -1384,6 +1437,8 @@ __all__ = (
     "CreateGraphIndexRequest",
     "CreateGraphIndexRequestType",
     "CreateIndexCommon",
+    "CreateRelationalIndexRequest",
+    "CreateRelationalIndexRequestType",
     "CreateTableRequest",
     "CreateTableRequestIndexes",
     "CreateTablespaceRequest",
@@ -1633,6 +1688,9 @@ __all__ = (
     "FilterSpecOperator",
     "FollowupStepConfig",
     "ForeignColumn",
+    "ForeignKeyAction",
+    "ForeignKeyMatch",
+    "ForeignKeyTiming",
     "ForeignSource",
     "ForeignSourceType",
     "FullTextArtifactIndexSource",
@@ -1867,6 +1925,9 @@ __all__ = (
     "IncompleteDetails",
     "IncompleteDetailsReason",
     "IndexExecutionConfig",
+    "IndexMaintenanceOwnerProof",
+    "IndexMaintenanceRequest",
+    "IndexMaintenanceResponse",
     "IndexMilestones",
     "IndexMilestoneStatus",
     "IndexMutationConflictError",
@@ -2217,6 +2278,46 @@ __all__ = (
     "ReauthorizeTableDestinationsResponse200",
     "ReauthorizeTableDestinationsResponse200Status",
     "RegexpQuery",
+    "RelationalCheckConstraint",
+    "RelationalColumnExpression",
+    "RelationalComparisonOp",
+    "RelationalConstraintActivationPhase",
+    "RelationalConstraintConflictReason",
+    "RelationalConstraintRangeStatus",
+    "RelationalConstraintRetirementRequest",
+    "RelationalConstraintRetirementStatus",
+    "RelationalConstraintRetirementStatusPhase",
+    "RelationalConstraintRetryRequest",
+    "RelationalConstraintRetryResponse",
+    "RelationalConstraintRetryResponseStatus",
+    "RelationalConstraintStatus",
+    "RelationalConstraintStatusCoverageKind",
+    "RelationalConstraintValidationState",
+    "RelationalExpressionOp",
+    "RelationalExpressionType",
+    "RelationalForeignKeyConstraint",
+    "RelationalIndexBuildFailure",
+    "RelationalIndexBuildState",
+    "RelationalIndexConfig",
+    "RelationalIndexDefinition",
+    "RelationalIndexKey",
+    "RelationalIndexKeyDirection",
+    "RelationalIndexKeyNulls",
+    "RelationalIndexPredicate",
+    "RelationalIndexRangeStatus",
+    "RelationalIndexStats",
+    "RelationalIndexStatsIndexType",
+    "RelationalIndexStatus",
+    "RelationalRow",
+    "RelationalRowCondition",
+    "RelationalRowIndexBound",
+    "RelationalRowMutation",
+    "RelationalRowMutationRequest",
+    "RelationalRowMutationRow",
+    "RelationalRowQueryRequest",
+    "RelationalRowRow",
+    "RelationalScalarExpression",
+    "RelationalUniqueConstraint",
     "RenameCatalogResourceRequest",
     "RepairIssueListRequest",
     "RepairRunRequest",
@@ -2340,6 +2441,7 @@ __all__ = (
     "TableStatistics",
     "TableStatisticsFieldStats",
     "TableStatus",
+    "TableStorageMode",
     "TableStorageSettings",
     "TableStorageSettingsDenseEmbeddings",
     "TableStorageUnreadableError",

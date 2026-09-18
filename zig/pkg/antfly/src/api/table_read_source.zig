@@ -32,6 +32,7 @@ const CancellationToken = @import("../common/cancellation.zig").CancellationToke
 pub const LookupResponse = struct {
     json: []u8,
     version: u64,
+    expected_content_digest: ?[32]u8 = null,
 
     pub fn deinit(self: *LookupResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.json);
@@ -118,9 +119,40 @@ pub const JoinReadView = struct {
 };
 
 pub const TableReadSource = struct {
+    pub const integrity_catalog_lookup_key = "\x00relational_integrity_catalog";
+
+    /// Read authoritative generations through the same routed ownership/read
+    /// barrier as point reads. Empty is the exact first-range logical key;
+    /// transport substitutes a path placeholder only after selecting its owner.
+    pub fn integrityCatalog(self: TableReadSource, alloc: std.mem.Allocator, table_name: []const u8) !?LookupResponse {
+        return self.lookup(alloc, table_name, "", .{ .relational_integrity_catalog = true }, .read_index);
+    }
+
+    pub fn integrityActionPage(self: TableReadSource, alloc: std.mem.Allocator, table_name: []const u8, routing_key: []const u8) !?LookupResponse {
+        if (routing_key.len != 32) return error.InvalidArgument;
+        return self.lookup(alloc, table_name, routing_key, .{ .relational_integrity_action = true }, .read_index);
+    }
+
+    pub fn integrityJobs(self: TableReadSource, alloc: std.mem.Allocator, table_name: []const u8, range_key: []const u8, request_json: []const u8) !?LookupResponse {
+        if (request_json.len == 0 or request_json.len > 4096) return error.InvalidArgument;
+        return self.lookup(alloc, table_name, range_key, .{ .relational_integrity_jobs_json = request_json }, .read_index);
+    }
+
+    pub fn integrityActivation(self: TableReadSource, alloc: std.mem.Allocator, table_name: []const u8, range_key: []const u8, request_json: []const u8) !?LookupResponse {
+        if (request_json.len == 0 or request_json.len > 4096) return error.InvalidArgument;
+        return self.lookup(alloc, table_name, range_key, .{ .relational_activation_json = request_json }, .read_index);
+    }
+
+    pub fn topologyStatus(self: TableReadSource, alloc: std.mem.Allocator, table_name: []const u8, range_key: []const u8, request_json: []const u8) !?LookupResponse {
+        return self.lookup(alloc, table_name, range_key, .{ .relational_topology_json = request_json }, .read_index);
+    }
+
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    /// Provider guarantees read_index never downgrades to a stale read. Only
+    /// such a successful lookup may certify absence to another replica.
+    strict_read_index_absence: bool = false,
     /// Set only by authenticated group-local ingress. When present, dispatch
     /// must use a routed callback; silently falling back would reintroduce an
     /// admin-snapshot identity race.
@@ -1040,6 +1072,33 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "relational row query integrity controls preserve the empty first range routing key" {
+            const Recorder = struct {
+                calls: usize = 0,
+                fn lookup(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, key: []const u8, opts: db_types.LookupOptions, consistency: read_gate.ReadConsistency) !?LookupResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqualStrings("", key);
+                    try std.testing.expectEqual(read_gate.ReadConsistency.read_index, consistency);
+                    switch (self.calls) {
+                        0 => try std.testing.expect(opts.relational_integrity_catalog),
+                        1 => try std.testing.expectEqualStrings("{}", opts.relational_integrity_jobs_json),
+                        2 => try std.testing.expectEqualStrings("{\"mode\":\"status\"}", opts.relational_activation_json),
+                        3 => try std.testing.expectEqualStrings("{\"mode\":\"identity\"}", opts.relational_topology_json),
+                        else => return error.TestUnexpectedResult,
+                    }
+                    self.calls += 1;
+                    return null;
+                }
+            };
+            var recorder: Recorder = .{};
+            const source = TableReadSource{ .ptr = &recorder, .vtable = &.{ .lookup = Recorder.lookup, .scan = undefined, .query = undefined } };
+            _ = try source.integrityCatalog(std.testing.allocator, "rows");
+            _ = try source.integrityJobs(std.testing.allocator, "rows", "", "{}");
+            _ = try source.integrityActivation(std.testing.allocator, "rows", "", "{\"mode\":\"status\"}");
+            _ = try source.topologyStatus(std.testing.allocator, "rows", "", "{\"mode\":\"identity\"}");
+            try std.testing.expectEqual(@as(usize, 4), recorder.calls);
+        }
+
         test "table read source distinguishes unavailable physical capability observation" {
             const Observer = struct {
                 fn lookup(

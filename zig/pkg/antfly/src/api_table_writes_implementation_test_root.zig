@@ -3,6 +3,9 @@
 
 pub const antfly_sources = @import("source_owner_physical.zig");
 pub const implementation_tests_only = true;
+test {
+    _ = @import("api/backup_cohort_physical_test.zig");
+}
 comptime {
     _ = @import("api/table_reads.zig").implementation_tests;
     _ = @import("metadata/table_provisioner.zig").implementation_tests;

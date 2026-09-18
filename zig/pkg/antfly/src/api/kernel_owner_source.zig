@@ -17,6 +17,7 @@
 //! and lifecycle; this source owns only coarse physical operations.
 
 const std = @import("std");
+const request_operation = @import("operation.zig");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 const abi = @import("kernel_owner_abi");
@@ -35,6 +36,7 @@ const ha_effects = @import("../storage/hot_standby/effects.zig");
 const ha_replication_record = @import("../storage/hot_standby/replication_record.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
+const metadata_domain = @import("../metadata/domain.zig");
 const backup_contract = @import("backup_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const query_response = @import("query_response.zig");
@@ -53,15 +55,73 @@ const transaction_recovery_source = @import("transaction_recovery_source.zig");
 const common_config = @import("../common/config.zig");
 const scraping = @import("antfly_scraping");
 
+/// Native owner controls use the platform monotonic clock. In particular on
+/// Darwin that clock is not std.Io's awake clock. Translate the remaining
+/// budget once, before both cold owner acquisition and the compiled boundary.
+fn platformDeadlineContext(context: request_operation.RequestContext) !request_operation.RequestContext {
+    return context.platformDeadline();
+}
+
+test "distributed txn native lookup read-index rejects leader loss before storage execution" {
+    const Barrier = struct {
+        calls: usize = 0,
+        fn wait(ptr: *anyopaque, _: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.NotLeader;
+        }
+    };
+    var barrier: Barrier = .{};
+    // The gate must fail before touching any owner/catalog/storage fields.
+    var source: ProvisionedKernelOwnerSource = undefined;
+    source.read_safety_barrier = .{ .ptr = &barrier, .vtable = &.{ .wait_read_safe = Barrier.wait } };
+    const reader = source.readSource();
+    try std.testing.expect(reader.strict_read_index_absence);
+    try std.testing.expectError(error.NotLeader, reader.lookupGroupLocal(std.testing.allocator, 7, "rows", "missing", .{}, .read_index));
+    try std.testing.expectEqual(@as(usize, 1), barrier.calls);
+    try source.prepareLookupRead(7, "missing", .{}, .stale);
+    try std.testing.expectEqual(@as(usize, 1), barrier.calls);
+}
+
+test "source owner deadlines normalize executor clock epochs without extending budgets" {
+    const FakeClock = struct {
+        fn now(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const value: *const u64 = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = value.* };
+        }
+    };
+    var clock_now: u64 = 10;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = FakeClock.now;
+    const io: std.Io = .{ .userdata = &clock_now, .vtable = &vtable };
+    const context: request_operation.RequestContext = .{ .deadline_ns = 10 + std.time.ns_per_s, .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&io) };
+    const before = platform_time.monotonicNs();
+    const normalized = try platformDeadlineContext(context);
+    const after = platform_time.monotonicNs();
+    try std.testing.expect(normalized.deadline_io == null);
+    try std.testing.expect(normalized.deadline_ns.? >= before + std.time.ns_per_s);
+    try std.testing.expect(normalized.deadline_ns.? <= after + std.time.ns_per_s);
+    try normalized.ensureActive();
+    clock_now = context.deadline_ns.?;
+    try std.testing.expectError(error.DeadlineExceeded, platformDeadlineContext(context));
+    try std.testing.expect((try platformDeadlineContext(.{})).deadline_ns == null);
+    const native_context: request_operation.RequestContext = .{ .deadline_ns = after + std.time.ns_per_s };
+    try std.testing.expectEqual(native_context.deadline_ns, (try platformDeadlineContext(native_context)).deadline_ns);
+}
+
 pub const ProvisionedKernelOwnerSource = struct {
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     read_safety_barrier: read_gate.ReadSafetyBarrier,
+    /// Selected once by the hosting runtime before any owner is opened.
+    online_source_authority: @import("../storage/db/online_source_contract.zig").Authority = .raft,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     transaction_recovery_source: ?transaction_recovery_source.Source = null,
+    restore_descriptor_recovery: ?RestoreDescriptorRecovery = null,
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
     resolution_candidate_source: ?runtime_callbacks.CandidateSource = null,
+    coordinated_ttl: ?@import("../storage/coordinated_ttl.zig").Port = null,
     entity_sink: ?runtime_callbacks.EntitySink = null,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     native_migration_policy: ?runtime_callbacks.DenseNativeMigrationPolicySource = null,
@@ -97,6 +157,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         indexes_json: []u8,
         table_storage: ?@import("../common/table_storage.zig").Settings = null,
         generation: u64,
+        initial_range: ?db_types.ByteRange = null,
         identity: descriptor_contract.Identity,
         restore: ?@import("../storage/restore_identity.zig").Identity = null,
 
@@ -107,6 +168,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .schema_json = self.schema_json,
                 .indexes_json = self.indexes_json,
                 .table_storage = self.table_storage,
+                .initial_range = self.initial_range,
                 .restore = self.restore,
             };
         }
@@ -115,6 +177,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             alloc.free(self.path);
             alloc.free(self.schema_json);
             alloc.free(self.indexes_json);
+            descriptor_contract.freeInitialRange(alloc, self.initial_range);
             if (self.restore) |*identity| identity.deinit(alloc);
             self.* = undefined;
         }
@@ -129,6 +192,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         identity: Identity,
         schema_json: []u8,
         indexes_json: []u8,
+        restore_bootstrap_json: []u8,
+        initial_range: ?db_types.ByteRange = null,
+        restore_cancel_recovery: bool = false,
+        restore_ha_replay: bool = false,
         table_storage: ?@import("../common/table_storage.zig").Settings = null,
         restore: ?@import("../storage/restore_identity.zig").Identity = null,
         owner: client.Owner,
@@ -348,6 +415,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn readSource(self: *ProvisionedKernelOwnerSource) table_read_source.TableReadSource {
         return .{
             .ptr = self,
+            .strict_read_index_absence = true,
             .vtable = &.{
                 .lookup = unsupportedTopLevelLookup,
                 .scan = unsupportedTopLevelScan,
@@ -391,10 +459,13 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .batch_group_local = batchGroupLocal,
                 .replicated_batch_group_local = replicatedBatchGroupLocal,
                 .backup_table_group_local = backupTableGroupLocal,
+                .backup_pin_control = backupPinControl,
                 .txn_begin_group_local = txnBeginGroupLocal,
+                .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .begin_bulk_ingest_group_local = beginBulkIngestGroupLocal,
                 .finish_bulk_ingest_group_local = finishBulkIngestGroupLocal,
@@ -422,6 +493,34 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .local_runtime_status_group_local = localRuntimeStatusGroupLocal,
             },
         };
+    }
+
+    pub fn captureNativeRaftSnapshot(self: *ProvisionedKernelOwnerSource, group_id: u64, applied_index: u64) !*anyopaque {
+        // Keep the owner and its runtime alive across deferred materialization.
+        // The compiled capture destroys its pin before releasing this lease.
+        var catalog = try self.catalog.adminSnapshot();
+        const table_name = blk: {
+            defer self.catalog.freeAdminSnapshot(&catalog);
+            const range = metadata_domain.findAdminRange(&catalog, group_id) orelse return error.UnknownGroup;
+            const table = metadata_domain.findAdminTable(&catalog, range.table_id) orelse return error.TableNotFound;
+            break :blk try self.alloc.dupe(u8, table.name);
+        };
+        defer self.alloc.free(table_name);
+        const lease = try self.alloc.create(Lease);
+        errdefer self.alloc.destroy(lease);
+        lease.* = try self.acquire(group_id, table_name);
+        errdefer lease.deinit();
+        var capture = try lease.owner().captureNativeRaftSnapshot(group_id, applied_index);
+        errdefer capture.deinit();
+        try capture.bindLease(lease, struct {
+            fn release(ptr: ?*anyopaque) callconv(.c) void {
+                const held: *Lease = @ptrCast(@alignCast(ptr.?));
+                const alloc = held.source.alloc;
+                held.deinit();
+                alloc.destroy(held);
+            }
+        }.release);
+        return capture.handle orelse unreachable;
     }
 
     pub fn snapshotSource(self: *ProvisionedKernelOwnerSource) storage_snapshot_source.Source {
@@ -531,6 +630,53 @@ pub const ProvisionedKernelOwnerSource = struct {
             for (page.entries, 0..) |entry, i| rows[i] = .{ .key = entry.key, .value = entry.value };
             alloc.free(page.entries);
             return rows;
+        }
+
+        fn relationalRead(self: *TransitionLease, comptime T: type, alloc: std.mem.Allocator, request: @import("../storage/db/relational_transition_contract.zig").Request) !T {
+            var encoded: std.Io.Writer.Allocating = .init(alloc);
+            defer encoded.deinit();
+            var json: std.json.Stringify = .{ .writer = &encoded.writer };
+            try @import("../storage/db/relational_integrity_json.zig").write(request, &json);
+            var response: abi.OwnedBytes = .{};
+            try kernel_error_identity.statusToError(abi.antfly_storage_owner_relational_transition_read(self.lease.owner().handle, &.{
+                .table_name = .fromSlice(self.lease.entry.table_name),
+                .request_json = .fromSlice(encoded.written()),
+            }, &response));
+            defer abi.antfly_storage_owner_buffer_destroy(&response);
+            // Handoff pages/manifests borrow the caller's bounded request
+            // arena, exactly like their native counterparts. Never retain ABI
+            // response bytes after the owner releases its output buffer.
+            return std.json.parseFromSliceLeaky(T, alloc, response.slice(), .{ .allocate = .alloc_always });
+        }
+
+        /// Read bounded lifecycle metadata from this exact transition owner.
+        /// The caller establishes its Raft read barrier before acquiring the
+        /// lease. In particular, an unpublished split destination must not be
+        /// re-resolved through the public table catalog here.
+        pub fn readRelationalTopologyJson(self: *TransitionLease, alloc: std.mem.Allocator, mode: []const u8) ![]u8 {
+            const Mode = @FieldType(@import("../raft/shard_ops.zig").TopologyReadRequest, "mode");
+            _ = std.meta.stringToEnum(Mode, mode) orelse return error.InvalidArgument;
+            const control = try std.json.Stringify.valueAlloc(alloc, .{ .mode = mode }, .{});
+            defer alloc.free(control);
+            const request = try table_reads.encodeStorageKernelLookupRequest(alloc, "", .{ .relational_topology_json = control });
+            defer alloc.free(request);
+            var response = try self.lease.owner().lookupJson(self.lease.entry.table_name, request);
+            defer response.deinit();
+            return alloc.dupe(u8, response.bytes());
+        }
+
+        pub fn relationalTopologyStatus(self: *TransitionLease) !@import("../storage/db/relational_integrity_topology_contract.zig").Status {
+            var arena = std.heap.ArenaAllocator.init(self.lease.source.alloc);
+            defer arena.deinit();
+            return self.relationalRead(@import("../storage/db/relational_integrity_topology_contract.zig").Status, arena.allocator(), .{ .status = {} });
+        }
+
+        pub fn relationalHandoffManifest(self: *TransitionLease, alloc: std.mem.Allocator, source: @import("../storage/db/relational_integrity_topology_contract.zig").Fence, destination: @import("../storage/db/relational_integrity_topology_contract.zig").Fence, lower: []const u8, upper: []const u8, primary_sequence: u64) !@import("../storage/db/relational_integrity_handoff_contract.zig").Manifest {
+            return self.relationalRead(@import("../storage/db/relational_integrity_handoff_contract.zig").Manifest, alloc, .{ .manifest = .{ .source = source, .destination = destination, .lower = lower, .upper = upper, .primary_sequence = primary_sequence } });
+        }
+
+        pub fn relationalHandoffPage(self: *TransitionLease, alloc: std.mem.Allocator, manifest: @import("../storage/db/relational_integrity_handoff_contract.zig").Manifest, progress: @import("../storage/db/relational_integrity_handoff_contract.zig").Progress) !@import("../storage/db/relational_integrity_handoff_contract.zig").Page {
+            return self.relationalRead(@import("../storage/db/relational_integrity_handoff_contract.zig").Page, alloc, .{ .page = .{ .manifest = manifest, .progress = progress } });
         }
     };
 
@@ -801,21 +947,23 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !void {
+        if (group_id == 0) return error.InvalidArgument;
         var wait_io_impl = std.Io.Threaded.init(self.alloc, .{});
         defer wait_io_impl.deinit();
         const wait_io = wait_io_impl.io();
         const deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+        const name_filter: ?[]const u8 = if (table_name.len == 0) null else table_name;
         while (true) {
             var active = false;
             {
                 lock(&self.mutex);
                 defer self.mutex.unlock();
                 for (self.entries.items) |entry| {
-                    if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name)) entry.retired = true;
+                    if (entry.group_id == group_id and (name_filter == null or std.mem.eql(u8, entry.table_name, name_filter.?))) entry.retired = true;
                 }
-                self.drainRetiredLocked(group_id, table_name);
+                self.drainRetiredLocked(group_id, name_filter);
                 for (self.entries.items) |entry| {
-                    if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name)) active = true;
+                    if (entry.group_id == group_id and (name_filter == null or std.mem.eql(u8, entry.table_name, name_filter.?))) active = true;
                 }
             }
             if (!active) return;
@@ -840,6 +988,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             .schema_json = .fromSlice(request.schema_json),
             .indexes_json = .fromSlice(request.indexes_json),
             .encoded_snapshot = .fromSlice(request.encoded_snapshot),
+            .projection_store = request.projection_store,
+            .expected_applied_index = request.expected_applied_index,
         });
         return snapshot.handle orelse error.StorageKernelFailure;
     }
@@ -1023,7 +1173,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // checkpoint. Yield admission conflicts to it immediately: waiting for
         // another owner lease here stalls unrelated groups and can deadlock a
         // maintenance callback waiting for this same progress driver.
-        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident) catch |err| switch (err) {
+        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{}) catch |err| switch (err) {
             error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
             else => return err,
         };
@@ -1095,6 +1245,75 @@ pub const ProvisionedKernelOwnerSource = struct {
         });
     }
 
+    /// Read the persisted private bootstrap without asking the public catalog
+    /// to invent a route for an unpublished owner. Warm reads pin the exact
+    /// current generation; cold reads stay inside the compiled storage owner.
+    pub fn readHAHiddenOwnerBootstrap(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) {
+        const generation = self.visibleRootGeneration(group_id);
+        var resident: ?Lease = blk: {
+            lock(&self.mutex);
+            defer self.mutex.unlock();
+            for (self.entries.items) |entry| {
+                if (entry.group_id != group_id or entry.generation != generation or entry.retired or entry.closing) continue;
+                if (!tryReserveEntryLeaseLocked(entry, .shared)) return error.StorageReadTemporarilyUnavailable;
+                break :blk .{ .source = self, .entry = entry };
+            }
+            break :blk null;
+        };
+        defer if (resident) |*lease| lease.deinit();
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        defer alloc.free(path);
+        var output: abi.OwnedBytes = .{};
+        try kernel_error_identity.statusToError(abi.antfly_storage_owner_hidden_restore_json(if (resident) |*lease| lease.owner().handle else null, &.{ .operation = .read_bootstrap, .context = self.context.handle, .path = .fromSlice(path), .table_id = table_id }, &output));
+        defer abi.antfly_storage_owner_buffer_destroy(&output);
+        if (output.len == 0) return null;
+        if (generation != self.visibleRootGeneration(group_id)) return error.RestoreStagingScopeChanged;
+        return try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, output.slice(), .{ .allocate = .alloc_always });
+    }
+
+    pub fn captureHASeedHiddenReplicaSnapshot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, scope: [32]u8, snapshot_token: []const u8, destination_root: []const u8) !void {
+        var descriptor = (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
+        defer descriptor.deinit(alloc);
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        defer alloc.free(path);
+        var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor.view());
+        defer lease.deinit();
+        var output: abi.OwnedBytes = .{};
+        try kernel_error_identity.statusToError(abi.antfly_storage_owner_hidden_restore_json(lease.owner().handle, &.{ .operation = .capture_snapshot, .table_name = .fromSlice(table_name), .table_id = descriptor.descriptor.identity.table_id, .scope = scope, .snapshot_token = .fromSlice(snapshot_token), .destination_root = .fromSlice(destination_root) }, &output));
+        defer abi.antfly_storage_owner_buffer_destroy(&output);
+    }
+
+    pub fn captureHASeedReplicaSnapshot(self: *ProvisionedKernelOwnerSource, table_name: []const u8, group_id: u64, snapshot_token: []const u8, destination_root: []const u8) !void {
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var output: abi.OwnedBytes = .{};
+        try kernel_error_identity.statusToError(abi.antfly_storage_owner_hidden_restore_json(lease.owner().handle, &.{ .operation = .capture_public_snapshot, .table_name = .fromSlice(table_name), .table_id = lease.entry.identity.table_id, .snapshot_token = .fromSlice(snapshot_token), .destination_root = .fromSlice(destination_root) }, &output));
+        defer abi.antfly_storage_owner_buffer_destroy(&output);
+    }
+
+    pub fn applyHAHiddenOwnerRecord(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, record: ha_replication_record.RecordView) !void {
+        var descriptor = (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
+        defer descriptor.deinit(alloc);
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        defer alloc.free(path);
+        var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor.view());
+        defer lease.deinit();
+        try lease.owner().applyHAReplicationRecord(table_name, .{
+            .record_kind = @intFromEnum(record.kind),
+            .payload_codec = @intFromEnum(record.payload_codec),
+            .flags = record.flags,
+            .cluster_id = record.cluster_id,
+            .shard_id = record.shard_id,
+            .table_id = record.table_id,
+            .timeline_id = record.timeline_id,
+            .epoch = record.epoch,
+            .lsn = record.lsn,
+            .previous_lsn = record.previous_lsn,
+            .commit_timestamp_ns = record.commit_timestamp_ns,
+            .payload = record.payload,
+        });
+    }
+
     const BackupShardWire = struct {
         group_id: u64,
         range_id: u64 = 0,
@@ -1118,17 +1337,30 @@ pub const ProvisionedKernelOwnerSource = struct {
         plan: backup_contract.TableBackupPlan,
     ) !?[]backup_contract.ShardSnapshot {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try plan.ensureActive();
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
-        var response = try lease.owner().backupJson(
-            table_name,
-            plan.backup_root,
-            plan.backup_id,
-            switch (plan.format) {
-                .native => .native,
-                .portable => .portable,
-            },
-        );
+        const cohort_json = if (plan.relational_cohort_fence) |fence| try std.json.Stringify.valueAlloc(alloc, fence, .{}) else null;
+        defer if (cohort_json) |json| alloc.free(json);
+        const handle = try backup_contract.sealedHandleForGroup(plan.sealed_handles, group_id);
+        const handle_json = if (handle) |sealed| try std.json.Stringify.valueAlloc(alloc, sealed.handle, .{}) else null;
+        defer if (handle_json) |json| alloc.free(json);
+        var cancellation = plan.cancellation;
+        var response = try lease.owner().backupWithControl(.{
+            .table_name = .fromSlice(table_name),
+            .backup_root = .fromSlice(plan.backup_root),
+            .backup_id = .fromSlice(plan.backup_id),
+            .format = @intFromEnum(switch (plan.format) {
+                .native => abi.BackupFormat.native,
+                .portable => abi.BackupFormat.portable,
+            }),
+            .cohort_json = .fromSlice(cohort_json orelse ""),
+            .sealed_handle_json = .fromSlice(handle_json orelse ""),
+            .execution_deadline_ns = plan.deadline_ns orelse 0,
+            .has_execution_deadline = @intFromBool(plan.deadline_ns != null),
+            .cancellation_ctx = &cancellation,
+            .cancellation_fn = cancellationTokenRequested,
+        });
         defer response.deinit();
         var parsed = try std.json.parseFromSlice(
             []BackupShardWire,
@@ -1179,6 +1411,100 @@ pub const ProvisionedKernelOwnerSource = struct {
             initialized += 1;
         }
         return shards;
+    }
+
+    fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, input: @import("../storage/db/native_backup_seal_contract.zig").Request, control: backup_contract.BackupOperationControl) !?[]u8 {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try control.ensureActive();
+        const json = try std.json.Stringify.valueAlloc(alloc, input, .{});
+        defer alloc.free(json);
+        var cancellation = control.cancellation;
+        const native_control: abi.ControlledJsonOperationRequest = .{
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(json),
+            .execution_deadline_ns = control.deadline_ns,
+            .has_execution_deadline = 1,
+            .cancellation_ctx = &cancellation,
+            .cancellation_fn = cancellationTokenRequested,
+        };
+        if (input != .seal) {
+            try self.ensureContextConfigured();
+            var response = try self.context.reclaimBackupPinJson(.{ .control = native_control, .replica_root = .fromSlice(self.replica_root_dir), .group_id = group_id });
+            defer response.deinit();
+            return try alloc.dupe(u8, response.bytes());
+        }
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = control.deadline_ns, .cancellation = control.cancellation });
+        defer lease.deinit();
+        var response = try lease.owner().backupPinControlJson(native_control);
+        defer response.deinit();
+        return try alloc.dupe(u8, response.bytes());
+    }
+
+    /// Private lifecycle bridge: materialize from the admitted durable pin,
+    /// then return its certificate for a separate replicated publication CAS.
+    pub fn prepareOnlineSourcePublication(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: @import("../storage/db/online_source_contract.zig").Scope, context: @import("operation.zig").RequestContext) !@import("../storage/source_snapshot.zig").Certificate {
+        try context.ensureActive();
+        try scope.validate();
+        if (scope.fence.owner_group_id != group_id) return error.OnlineSourceScopeChanged;
+        const json = try std.json.Stringify.valueAlloc(alloc, scope, .{});
+        defer alloc.free(json);
+        const native_context = try platformDeadlineContext(context);
+        var cancellation = context.cancellation;
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation = cancellation });
+        defer lease.deinit();
+        try context.ensureActive();
+        var response = try lease.owner().prepareSourcePinPublicationJson(.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json), .execution_deadline_ns = native_context.deadline_ns orelse 0, .has_execution_deadline = @intFromBool(native_context.deadline_ns != null), .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(@import("../storage/source_snapshot.zig").Certificate, alloc, response.bytes(), .{});
+        defer parsed.deinit();
+        _ = try parsed.value.encode();
+        if (!parsed.value.cut.namespace.eql(scope.fence.namespace)) return error.SourceSnapshotCutMismatch;
+        try context.ensureActive();
+        return parsed.value;
+    }
+
+    pub fn onlineSourceArtifact(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("../storage/db/source_artifact_transfer.zig").Request, context: @import("operation.zig").RequestContext) ![]u8 {
+        try context.ensureActive();
+        try request.scope().validate();
+        if (request.scope().fence.owner_group_id != group_id) return error.OnlineSourceScopeChanged;
+        const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(json);
+        if (json.len > 2 * 1024 * 1024) return error.InvalidSourceSnapshot;
+        const native_context = try platformDeadlineContext(context);
+        var cancellation = context.cancellation;
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation = cancellation });
+        defer lease.deinit();
+        try context.ensureActive();
+        var response = try lease.owner().sourceArtifactJson(.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json), .execution_deadline_ns = native_context.deadline_ns orelse 0, .has_execution_deadline = @intFromBool(native_context.deadline_ns != null), .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        defer response.deinit();
+        try context.ensureActive();
+        return alloc.dupe(u8, response.bytes());
+    }
+
+    pub fn onlineMergeIo(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("../storage/db/online_merge_io_contract.zig").Request, context: @import("operation.zig").RequestContext) ![]u8 {
+        try context.ensureActive();
+        try request.validate();
+        if (request.ownerGroup() != group_id) return error.OnlineSourceScopeChanged;
+        // An immutable artifact may be served by another donor replica. Its
+        // inner published-ledger scope/certificate is the authority, not a
+        // new current read cut. All row/status operations require read-index.
+        if (request.operation != .artifact) try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareLookupWithConsistency(group_id, "", .{
+            .execution_deadline_ns = context.deadline_ns,
+            .execution_io = context.deadline_io,
+            .cancellation = context.cancellation,
+        }, .read_index);
+        const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(json);
+        if (json.len > @import("online_merge_io.zig").contract.max_request_bytes) return error.InvalidMergePage;
+        const native_context = try platformDeadlineContext(context);
+        var cancellation = context.cancellation;
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation = cancellation });
+        defer lease.deinit();
+        try context.ensureActive();
+        var response = try lease.owner().onlineMergeIoJson(.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json), .execution_deadline_ns = native_context.deadline_ns orelse 0, .has_execution_deadline = @intFromBool(native_context.deadline_ns != null), .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        defer response.deinit();
+        try context.ensureActive();
+        return alloc.dupe(u8, response.bytes());
     }
 
     pub fn ownerCountForTest(self: *ProvisionedKernelOwnerSource) usize {
@@ -1593,8 +1919,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.alloc.free(entry.table_name);
         self.alloc.free(entry.schema_json);
         self.alloc.free(entry.indexes_json);
+        self.alloc.free(entry.restore_bootstrap_json);
+        descriptor_contract.freeInitialRange(self.alloc, entry.initial_range);
         if (entry.restore) |*identity| identity.deinit(self.alloc);
-
         if (entry.repair_target) |target| self.alloc.free(target);
         self.alloc.destroy(entry);
     }
@@ -1860,6 +2187,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .schema_json = projection.schema_json,
             .indexes_json = projection.indexes_json,
             .table_storage = projection.table_storage,
+            .initial_range = projection.initial_range,
             .restore = projection.restore,
             .generation = self.visibleRootGeneration(group_id),
             .identity = .{
@@ -1872,17 +2200,24 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     const ReadControls = struct {
         execution_deadline_ns: ?u64 = null,
+        execution_io: ?@import("../runtime_io_abi.zig").Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
 
         fn from(req: anytype) ReadControls {
-            return .{ .execution_deadline_ns = req.execution_deadline_ns, .cancellation = req.cancellation };
+            return .{ .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
         }
 
         fn check(self: ReadControls) !void {
-            try table_reads.checkQueryDeadline(.{
-                .execution_deadline_ns = self.execution_deadline_ns,
-                .cancellation = self.cancellation,
-            });
+            const context: request_operation.RequestContext = .{
+                .deadline_ns = self.execution_deadline_ns,
+                .deadline_io = self.execution_io,
+                .cancellation = self.cancellation orelse .none,
+            };
+            context.ensureActive() catch |err| return switch (err) {
+                error.Canceled => error.Cancelled,
+                error.DeadlineExceeded => error.Timeout,
+                else => err,
+            };
         }
     };
 
@@ -2054,6 +2389,8 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn runtimeHooksConfig(self: *ProvisionedKernelOwnerSource) abi.RuntimeHooksConfig {
         return .{
+            .coordinated_ttl_ctx = if (self.coordinated_ttl != null) self else null,
+            .coordinated_ttl_enqueue_fn = if (self.coordinated_ttl != null) enqueueCoordinatedTtl else null,
             .native_authority_ctx = if (self.native_migration_policy != null) self else null,
             .native_authority_fn = if (self.native_migration_policy != null) nativeAuthorityPermitted else null,
             .resolution_candidates = if (self.resolution_candidate_source != null) .{
@@ -2070,6 +2407,28 @@ pub const ProvisionedKernelOwnerSource = struct {
             .promotion_owner_ctx = if (self.promotion_leadership_source != null) self else null,
             .promotion_owner_fn = if (self.promotion_leadership_source != null) promotionOwner else null,
         };
+    }
+
+    pub fn withCoordinatedTtl(self: *ProvisionedKernelOwnerSource, port: @import("../storage/coordinated_ttl.zig").Port) *ProvisionedKernelOwnerSource {
+        std.debug.assert(self.entries.items.len == 0);
+        self.coordinated_ttl = port;
+        return self;
+    }
+
+    fn enqueueCoordinatedTtl(ptr: ?*anyopaque, request: *const abi.CoordinatedTtlRequest) callconv(.c) u8 {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return 1));
+        const port = self.coordinated_ttl orelse return 1;
+        if (request.candidate_count > abi.coordinated_ttl_page_capacity or
+            (request.candidate_count != 0 and request.candidates == null)) return 1;
+        var candidates: [abi.coordinated_ttl_page_capacity]@import("../storage/coordinated_ttl.zig").Candidate = undefined;
+        for (candidates[0..request.candidate_count], 0..) |*dest, index| {
+            const source = request.candidates.?[index];
+            if (source.key.len != 0 and source.key.ptr == null) return 1;
+            dest.* = .{ .key = source.key.slice(), .row_version = source.row_version, .ttl_timestamp_ns = source.ttl_timestamp_ns, .expected_content_digest = source.expected_content_digest };
+        }
+        if (request.ttl_field.len != 0 and request.ttl_field.ptr == null) return 1;
+        _ = port.expire(.{ .table_id = request.table_id, .group_id = request.group_id, .schema_version = request.schema_version, .ttl_duration_ns = request.ttl_duration_ns, .ttl_field = request.ttl_field.slice(), .observed_at_unix_ns = request.observed_at_unix_ns, .grace_period_ns = request.grace_period_ns, .candidates = candidates[0..request.candidate_count] }) catch return 1;
+        return 0;
     }
 
     fn transactionRecoveryResolve(
@@ -2166,6 +2525,196 @@ pub const ProvisionedKernelOwnerSource = struct {
         return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false, .resident, .{});
     }
 
+    pub const RestoreOwnerOptions = struct {
+        secret_store: ?*anyopaque = null,
+        node_config: ?*const anyopaque = null,
+        source_byte_budget: u64 = 1024 * 1024,
+    };
+
+    pub const OwnedRestoreDescriptor = struct {
+        descriptor: descriptor_contract.Descriptor,
+
+        pub fn view(self: *const OwnedRestoreDescriptor) descriptor_contract.Descriptor {
+            return self.descriptor;
+        }
+
+        pub fn deinit(self: *OwnedRestoreDescriptor, alloc: std.mem.Allocator) void {
+            alloc.free(self.descriptor.schema_json);
+            alloc.free(self.descriptor.indexes_json);
+            alloc.free(self.descriptor.restore_bootstrap_json);
+            descriptor_contract.freeInitialRange(alloc, self.descriptor.initial_range);
+            self.* = undefined;
+        }
+    };
+
+    pub const RestoreDescriptorUse = enum { read, mutate, resolve };
+    pub const RestoreDescriptorRecovery = struct {
+        const VTable = struct { recover: @FieldType(RestoreDescriptorRecovery, "recover_fn") };
+        const Boundary = @import("../runtime_callback_abi.zig").Boundary(VTable);
+        ptr: *anyopaque,
+        recover_fn: *const fn (*anyopaque, std.mem.Allocator, u64, []const u8, [32]u8, [16]u8, RestoreDescriptorUse, @import("operation.zig").RequestContext) anyerror!OwnedRestoreDescriptor,
+        boundary_dispatch: Boundary.Dispatch = Boundary.local_dispatch,
+
+        fn recover(self: @This(), alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: [16]u8, use: RestoreDescriptorUse, context: @import("operation.zig").RequestContext) !OwnedRestoreDescriptor {
+            return Boundary.call("recover", self.boundary_dispatch, self.recover_fn, .{ self.ptr, alloc, group_id, table_name, scope, plan_id, use, context });
+        }
+    };
+
+    pub fn withRestoreDescriptorRecovery(self: *ProvisionedKernelOwnerSource, recovery: RestoreDescriptorRecovery) *ProvisionedKernelOwnerSource {
+        self.restore_descriptor_recovery = recovery;
+        return self;
+    }
+
+    /// Cold hidden-owner recovery is bounded by its explicit plan identity.
+    /// Only the host's authoritative restore-plan callback can supply a missing
+    /// descriptor; ordinary named-table discovery is never an alternative.
+    pub fn resolveRestoreDescriptor(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: ?[16]u8, use: RestoreDescriptorUse, context: @import("operation.zig").RequestContext) !OwnedRestoreDescriptor {
+        try context.ensureActive();
+        var descriptor = if (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) |cached| cached else blk: {
+            const plan = plan_id orelse return error.RestoreStagingScopeChanged;
+            if (std.mem.allEqual(u8, &plan, 0)) return error.RestoreStagingScopeChanged;
+            const recovery = self.restore_descriptor_recovery orelse return error.RestoreStagingScopeChanged;
+            break :blk try recovery.recover(alloc, group_id, table_name, scope, plan, use, context);
+        };
+        errdefer descriptor.deinit(alloc);
+        var parsed = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, descriptor.descriptor.restore_bootstrap_json, .{});
+        defer parsed.deinit();
+        try parsed.value.validate();
+        const namespace = parsed.value.scope.target_namespace;
+        if (!std.mem.eql(u8, &scope, &parsed.value.scope.digest()) or
+            !std.mem.eql(u8, table_name, parsed.value.table_name) or namespace.shard_id != group_id or
+            namespace.table_id != descriptor.descriptor.identity.table_id or namespace.range_id != descriptor.descriptor.identity.range_id or
+            descriptor.descriptor.identity.shard_id != group_id or descriptor.descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.RestoreStagingScopeChanged;
+        if (plan_id) |plan| if (!std.mem.eql(u8, &plan, &parsed.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
+        try context.ensureActive();
+        return descriptor;
+    }
+
+    pub fn cachedRestoreDescriptor(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8) !?OwnedRestoreDescriptor {
+        const generation = self.visibleRootGeneration(group_id);
+        var pinned: Lease = blk: {
+            lock(&self.mutex);
+            defer self.mutex.unlock();
+            for (self.entries.items) |entry| {
+                if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name) or entry.retired or entry.closing or entry.generation != generation or entry.restore_bootstrap_json.len == 0) continue;
+                if (!tryReserveEntryLeaseLocked(entry, .shared)) return error.StorageReadTemporarilyUnavailable;
+                break :blk .{ .source = self, .entry = entry };
+            }
+            return null;
+        };
+        defer pinned.deinit();
+        const entry = pinned.entry;
+        {
+            var bootstrap = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, entry.restore_bootstrap_json, .{});
+            defer bootstrap.deinit();
+            if (!std.mem.eql(u8, &scope, &bootstrap.value.scope.digest())) return error.RestoreStagingScopeChanged;
+            const schema_json = try alloc.dupe(u8, entry.schema_json);
+            errdefer alloc.free(schema_json);
+            const indexes_json = try alloc.dupe(u8, entry.indexes_json);
+            errdefer alloc.free(indexes_json);
+            const restore_bootstrap_json = try alloc.dupe(u8, entry.restore_bootstrap_json);
+            errdefer alloc.free(restore_bootstrap_json);
+            const initial_range = try descriptor_contract.cloneInitialRange(alloc, entry.initial_range);
+            return .{ .descriptor = .{
+                .lsm_root_generation = entry.generation,
+                .identity = entry.identity,
+                .schema_json = schema_json,
+                .indexes_json = indexes_json,
+                .restore_bootstrap_json = restore_bootstrap_json,
+                .restore_cancel_recovery = entry.restore_cancel_recovery,
+                .restore_ha_replay = entry.restore_ha_replay,
+                .table_storage = entry.table_storage,
+                .initial_range = initial_range,
+            } };
+        }
+    }
+
+    /// The caller supplies an authoritative private descriptor, never a public
+    /// name lookup. Opening and all physical work remain in the compiled owner.
+    pub fn primeRestoreOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor) !void {
+        if (descriptor.restore_bootstrap_json.len == 0) return error.RestoreStagingScopeChanged;
+        if (descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.RestoreStagingScopeChanged;
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        defer self.alloc.free(path);
+        var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor);
+        defer lease.deinit();
+    }
+
+    pub fn restoreOwnerControl(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        input: @import("restore_owner.zig").Request,
+        proposer: ?@import("restore_owner.zig").Proposer,
+        options: RestoreOwnerOptions,
+        request: @import("operation.zig").RequestContext,
+    ) !@import("restore_owner.zig").Response {
+        try request.ensureActive();
+        try input.validate(group_id);
+        if (descriptor.restore_bootstrap_json.len == 0) return error.RestoreStagingScopeChanged;
+        if (descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.RestoreStagingScopeChanged;
+        var bootstrap = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, descriptor.restore_bootstrap_json, .{});
+        defer bootstrap.deinit();
+        if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &input.scope.digest())) return error.RestoreStagingScopeChanged;
+        var prepared = try self.prepareRestoreOwnerControl(alloc, group_id, table_name, descriptor, input, options, request);
+        defer prepared.deinit();
+        const encoded = prepared.value.batch_json orelse return prepared.value.response;
+        var batch = try @import("batch.zig").parseInternalBatchRequest(alloc, encoded);
+        defer batch.deinit(alloc);
+        const scope = batch.req.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
+        if (!std.mem.eql(u8, &scope, &input.scope.digest()) or batch.req.restore_staging == null) return error.RestoreStagingScopeChanged;
+        // No owner lease crosses the proposal callback: Raft apply must acquire
+        // this same owner, and the returned receipt must reflect that commit.
+        if (proposer) |replicated| {
+            try replicated.submit(batch.req, request);
+        } else {
+            _ = try self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, batch.req, descriptor);
+        }
+        const followup = if (input.action == .publish or input.action == .cancel) input else input.statusRead();
+        var committed = try self.prepareRestoreOwnerControl(alloc, group_id, table_name, descriptor, followup, options, request);
+        defer committed.deinit();
+        if (committed.value.batch_json != null) return error.RestoreStagingScopeChanged;
+        committed.value.response.source_next_offset = prepared.value.response.source_next_offset;
+        return committed.value.response;
+    }
+
+    fn prepareRestoreOwnerControl(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        input: @import("restore_owner.zig").Request,
+        options: RestoreOwnerOptions,
+        request: @import("operation.zig").RequestContext,
+    ) !std.json.Parsed(@import("restore_owner.zig").Prepared) {
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        defer alloc.free(path);
+        const json = try std.json.Stringify.valueAlloc(alloc, input, .{});
+        defer alloc.free(json);
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false, .resident, .{ .execution_deadline_ns = request.deadline_ns, .execution_io = request.deadline_io, .cancellation = request.cancellation });
+        defer lease.deinit();
+        var cancellation = request.cancellation;
+        const native_context = try platformDeadlineContext(request);
+        var result = try lease.owner().restoreControlJson(.{
+            .control = .{
+                .table_name = .fromSlice(table_name),
+                .request_json = .fromSlice(json),
+                .execution_deadline_ns = native_context.deadline_ns orelse 0,
+                .has_execution_deadline = @intFromBool(native_context.deadline_ns != null),
+                .cancellation_ctx = &cancellation,
+                .cancellation_fn = cancellationTokenRequested,
+            },
+            .source_byte_budget = options.source_byte_budget,
+            .secret_store = options.secret_store,
+            .node_config = options.node_config,
+        });
+        defer result.deinit();
+        return std.json.parseFromSlice(@import("restore_owner.zig").Prepared, alloc, result.bytes(), .{ .allocate = .alloc_always });
+    }
+
     /// Lease only an already-resident owner whose complete catalog descriptor
     /// still matches. Observability uses this path so a cold status read never
     /// opens storage or discards query-warmed physical coverage.
@@ -2185,6 +2734,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 !entry.identity.eql(descriptor.identity) or
                 !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
                 !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
+                !descriptor_contract.initialRangesEqual(entry.initial_range, descriptor.initial_range) or
                 !std.meta.eql(entry.table_storage, descriptor.table_storage))
             {
                 return null;
@@ -2232,7 +2782,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // Return busy without installing that gate; the startup scheduler
         // retains the inspection debt and retries. Explicit structural changes
         // and admitted repair work keep their writer-preference contract.
-        return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .exclusive_if_idle, residency) catch |err| switch (err) {
+        return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .exclusive_if_idle, residency, .{}) catch |err| switch (err) {
             error.StorageKernelOwnerTransitionRequired => null,
             else => return err,
         };
@@ -2249,7 +2799,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         controls: ReadControls,
     ) !Lease {
         try controls.check();
-        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency) catch |err| switch (err) {
+        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency, controls) catch |err| switch (err) {
             error.StorageKernelOwnerTransitionRequired => try self.acquireDescriptorAfterTransition(
                 group_id,
                 table_name,
@@ -2285,7 +2835,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             try controls.check();
             try wait_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
             try controls.check();
-            return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency) catch |err| switch (err) {
+            return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency, controls) catch |err| switch (err) {
                 error.StorageKernelOwnerTransitionRequired => {
                     try controls.check();
                     if (platform_time.monotonicNs() >= deadline_ns) return error.StorageBusy;
@@ -2332,6 +2882,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: descriptor_contract.Descriptor,
         admission: LeaseAdmission,
         residency: Residency,
+        controls: ReadControls,
     ) !Lease {
         const exclusive = admission != .shared;
         if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
@@ -2360,6 +2911,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             }
             if (!std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
                 !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
+                !std.mem.eql(u8, entry.restore_bootstrap_json, descriptor.restore_bootstrap_json) or
+                !descriptor_contract.initialRangesEqual(entry.initial_range, descriptor.initial_range) or
+                entry.restore_cancel_recovery != descriptor.restore_cancel_recovery or
+                entry.restore_ha_replay != descriptor.restore_ha_replay or
                 !std.meta.eql(entry.table_storage, descriptor.table_storage))
             {
                 // Catalog definition changes do not necessarily publish a new
@@ -2396,11 +2951,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer self.alloc.free(owned_schema_json);
         const owned_indexes_json = try self.alloc.dupe(u8, descriptor.indexes_json);
         errdefer self.alloc.free(owned_indexes_json);
+        const owned_restore_bootstrap_json = try self.alloc.dupe(u8, descriptor.restore_bootstrap_json);
+        errdefer self.alloc.free(owned_restore_bootstrap_json);
+        const owned_initial_range = try descriptor_contract.cloneInitialRange(self.alloc, descriptor.initial_range);
+        errdefer descriptor_contract.freeInitialRange(self.alloc, owned_initial_range);
         var owned_restore = if (descriptor.restore) |identity| try identity.clone(self.alloc) else null;
         errdefer if (owned_restore) |*identity| identity.deinit(self.alloc);
         const entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(entry);
         try self.ensureContextConfigured();
+        var cancellation = controls.cancellation orelse db_types.CancellationToken.none;
+        const native_context = try platformDeadlineContext(.{
+            .deadline_ns = controls.execution_deadline_ns,
+            .deadline_io = controls.execution_io,
+            .cancellation = cancellation,
+        });
         var owner = try client.Owner.open(.{
             .context = self.context.handle,
             .path = abi.BorrowedBytes.fromSlice(path),
@@ -2413,6 +2978,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .identity_range_id = descriptor.identity.range_id,
             .schema_json = .fromSlice(descriptor.schema_json),
             .indexes_json = .fromSlice(descriptor.indexes_json),
+            .restore_bootstrap_json = .fromSlice(descriptor.restore_bootstrap_json),
+            .restore_cancel_recovery = @intFromBool(descriptor.restore_cancel_recovery),
+            .restore_ha_replay = @intFromBool(descriptor.restore_ha_replay),
+            .online_source_authority = @intFromEnum(self.online_source_authority),
             .dense_embedding_storage = if (descriptor.table_storage) |settings| switch (settings.dense_embeddings) {
                 .primary_lsm => .primary_lsm,
                 .vector_store => .vector_store,
@@ -2423,6 +2992,15 @@ pub const ProvisionedKernelOwnerSource = struct {
             } else .{},
             .transaction_recovery = self.transactionRecoveryConfig(),
             .runtime_hooks = self.runtimeHooksConfig(),
+            .has_initial_range = @intFromBool(descriptor.initial_range != null),
+            .initial_range_start = .fromSlice(if (descriptor.initial_range) |range| range.start else ""),
+            .initial_range_end = .fromSlice(if (descriptor.initial_range) |range| range.end else ""),
+            .initial_range_control = .{
+                .execution_deadline_ns = native_context.deadline_ns orelse 0,
+                .has_execution_deadline = @intFromBool(native_context.deadline_ns != null),
+                .cancellation_ctx = &cancellation,
+                .cancellation_fn = cancellationTokenRequested,
+            },
             .restore = if (descriptor.restore) |identity| .{
                 .required = 1,
                 .backup_id = .fromSlice(identity.backup_id),
@@ -2441,6 +3019,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .identity = descriptor.identity,
             .schema_json = owned_schema_json,
             .indexes_json = owned_indexes_json,
+            .restore_bootstrap_json = owned_restore_bootstrap_json,
+            .initial_range = owned_initial_range,
+            .restore_cancel_recovery = descriptor.restore_cancel_recovery,
+            .restore_ha_replay = descriptor.restore_ha_replay,
             .table_storage = descriptor.table_storage,
             .restore = owned_restore,
             .owner = owner,
@@ -2479,7 +3061,9 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !void {
         const reads = feature_reads.FeatureReads.init(self.read_safety_barrier);
         reads.prepareLookupWithConsistency(group_id, key, opts, consistency) catch |err| switch (err) {
-            error.NotLeader => if (consistency == .stale)
+            // Read-index null is an authoritative absence proof. Never
+            // manufacture one by downgrading a failed leader read to stale.
+            error.NotLeader => if (consistency != .leader_lease)
                 return err
             else
                 return try reads.prepareLookupWithConsistency(group_id, key, opts, .stale),
@@ -2619,6 +3203,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?table_read_source.LookupResponse {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        if (opts.restore_staging_scope != null) return self.lookupRestoreStaging(alloc, group_id, table_name, key, opts, fence);
         try self.validateRoutedRead(alloc, fence, group_id, table_name);
         return try lookupGroupLocal(ptr, alloc, group_id, table_name, key, opts, consistency);
     }
@@ -2806,6 +3391,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?table_read_source.LookupResponse {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        if (opts.restore_staging_scope != null) return self.lookupRestoreStaging(alloc, group_id, table_name, key, opts, null);
         try self.prepareLookupRead(group_id, key, opts, consistency);
         const request_json = try table_reads.encodeStorageKernelLookupRequest(alloc, key, opts);
         defer alloc.free(request_json);
@@ -2816,10 +3402,42 @@ pub const ProvisionedKernelOwnerSource = struct {
             else => return err,
         };
         defer response.deinit();
+        if (opts.include_primary_digest and !table_reads.integrityLookupMode(opts) and response.expectedContentDigest() == null) return error.InvalidResponse;
         return .{
             .json = try alloc.dupe(u8, response.bytes()),
             .version = response.version(),
+            .expected_content_digest = response.expectedContentDigest(),
         };
+    }
+
+    fn lookupRestoreStaging(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8, opts: db_types.LookupOptions, fence: ?metadata_api.CatalogRouteFence) !?table_read_source.LookupResponse {
+        const scope = opts.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
+        var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, opts.restore_staging_plan_id, .read, .{ .deadline_ns = opts.execution_deadline_ns, .deadline_io = opts.execution_io, .cancellation = opts.cancellation orelse .none });
+        defer descriptor.deinit(alloc);
+        const identity = descriptor.view().identity;
+        if (identity.shard_id != group_id) return error.RestoreStagingScopeChanged;
+        if (fence) |expected| {
+            try expected.validate();
+            try expected.admission_cancellation.check();
+            if (expected.table_id != identity.table_id or expected.route.group_id != group_id or expected.route.range_id != identity.range_id or
+                expected.route.identity_namespace.table_id != identity.table_id or expected.route.identity_namespace.shard_id != identity.shard_id or expected.route.identity_namespace.range_id != identity.range_id) return error.RestoreStagingScopeChanged;
+        }
+        // Hidden reads certify UNIQUE/FK activation. Never use the ordinary
+        // observational NotLeader -> stale fallback for those proofs.
+        try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareLookupWithConsistency(group_id, key, opts, .read_index);
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        defer alloc.free(path);
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, ReadControls.from(opts));
+        defer lease.deinit();
+        const encoded = try table_reads.encodeStorageKernelLookupRequest(alloc, key, opts);
+        defer alloc.free(encoded);
+        var response = lease.owner().lookupJson(table_name, encoded) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer response.deinit();
+        if (opts.include_primary_digest and !table_reads.integrityLookupMode(opts) and response.expectedContentDigest() == null) return error.InvalidResponse;
+        return .{ .json = try alloc.dupe(u8, response.bytes()), .version = response.version(), .expected_content_digest = response.expectedContentDigest() };
     }
 
     fn scanGroupLocalStream(
@@ -2837,9 +3455,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.prepareScanRead(group_id, from_key, to_key, opts, consistency);
         const request_json = try table_reads.encodeStorageKernelScanRequest(alloc, from_key, to_key, opts);
         defer alloc.free(request_json);
-        var lease = try self.acquire(group_id, table_name);
+        var lease = try self.acquireWithControls(group_id, table_name, .from(opts));
         defer lease.deinit();
-        try lease.owner().scanStream(table_name, request_json, sink);
+        var cancellation = opts.cancellation;
+        try lease.owner().scanStreamWithOptions(table_name, request_json, sink, .{
+            .execution_deadline_ns = opts.execution_deadline_ns,
+            .cancellation_ctx = if (cancellation != null) @ptrCast(&cancellation.?) else null,
+            .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
+        });
         return true;
     }
 
@@ -2857,9 +3480,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.prepareScanRead(group_id, from_key, to_key, opts, consistency);
         const request_json = try table_reads.encodeStorageKernelScanRequest(alloc, from_key, to_key, opts);
         defer alloc.free(request_json);
-        var lease = try self.acquire(group_id, table_name);
+        var lease = try self.acquireWithControls(group_id, table_name, .from(opts));
         defer lease.deinit();
-        var response = try lease.owner().scanNdjson(table_name, request_json);
+        var cancellation = opts.cancellation;
+        var response = try lease.owner().scanNdjsonWithOptions(table_name, request_json, .{
+            .execution_deadline_ns = opts.execution_deadline_ns,
+            .cancellation_ctx = if (cancellation != null) @ptrCast(&cancellation.?) else null,
+            .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
+        });
         defer response.deinit();
         return .{ .ndjson = try alloc.dupe(u8, response.bytes()) };
     }
@@ -2995,6 +3623,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         req: db_types.BatchRequest,
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        if (req.restore_staging_scope) |scope| {
+            var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, req.restore_staging_plan_id, restoreDescriptorUseForBatch(req), .{});
+            defer descriptor.deinit(alloc);
+            return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, descriptor.view());
+        }
+        return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, null);
+    }
+
+    fn batchGroupLocalWithDescriptor(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.BatchRequest,
+        descriptor: ?descriptor_contract.Descriptor,
+    ) !?void {
         if (self.ha_write_gate) |gate| try gate.check();
         var ha_mutation = if (self.ha_async_mirror) |mirror|
             if (mirror.mutation_barrier) |barrier| barrier.acquireShared() else null
@@ -3004,7 +3648,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.preflightHAMirrorSyncCommit();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
-        var lease = try self.acquire(group_id, table_name);
+        const private_path = if (descriptor != null) try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id }) else null;
+        defer if (private_path) |path| alloc.free(path);
+        var lease = if (descriptor) |owned| try self.acquireDescriptor(group_id, table_name, private_path.?, owned) else try self.acquire(group_id, table_name);
         defer lease.deinit();
         var callback_error_relay: kernel_error_identity.CallbackErrorRelay = .{};
         var committed_effects_context = CommittedBatchEffectsContext{
@@ -3511,12 +4157,60 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.BatchRequest,
     ) !void {
+        return self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, req, .{});
+    }
+
+    fn applyTransactionGroupLocalWithContext(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.BatchRequest,
+        context: request_operation.RequestContext,
+    ) !void {
+        try context.ensureActive();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
-        var lease = try self.acquire(group_id, table_name);
+        var lease = try self.acquireTransactionOwner(alloc, group_id, table_name, req, context);
         defer lease.deinit();
+        try context.ensureActive();
         var response = try lease.owner().replicatedBatchJson(table_name, request_json);
         defer response.deinit();
+    }
+
+    fn acquireHiddenTransactionOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !?Lease {
+        const generation = self.visibleRootGeneration(group_id);
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name) or entry.restore_bootstrap_json.len == 0) continue;
+            if (entry.retired or entry.closing or entry.generation != generation or !tryReserveEntryLeaseLocked(entry, .shared)) return error.RaftApplyWriterUnavailable;
+            return .{ .source = self, .entry = entry };
+        }
+        return null;
+    }
+
+    fn restoreDescriptorUseForBatch(req: db_types.BatchRequest) RestoreDescriptorUse {
+        if (req.transaction) |txn| switch (txn) {
+            .resolve, .acknowledge, .cleanup => return .resolve,
+            else => {},
+        };
+        return .mutate;
+    }
+
+    fn acquireTransactionOwner(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, context: request_operation.RequestContext) !Lease {
+        if (req.restore_staging_scope) |scope| {
+            var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, req.restore_staging_plan_id, restoreDescriptorUseForBatch(req), context);
+            defer descriptor.deinit(alloc);
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            return self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation });
+        }
+        if (req.transaction) |txn| switch (txn) {
+            .resolve, .acknowledge => if (try self.acquireHiddenTransactionOwner(group_id, table_name)) |lease| return lease,
+            else => {},
+        };
+        return self.acquire(group_id, table_name);
     }
 
     fn txnBeginGroupLocal(
@@ -3544,6 +4238,37 @@ pub const ProvisionedKernelOwnerSource = struct {
         return {};
     }
 
+    fn txnBeginGroupLocalWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+        begin_timestamp: u64,
+        topology_epoch: u64,
+        retain_terminal: bool,
+        participants: []const []const u8,
+        context: @import("distributed_txn_contract.zig").PreDecisionContext,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
+        try active.ensureActive();
+        if (context.restore_staging_scope == null and context.restore_staging_plan_id != null) return error.RestoreStagingScopeChanged;
+        try self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, .{
+            .restore_staging_scope = context.restore_staging_scope,
+            .restore_staging_plan_id = context.restore_staging_plan_id,
+            .transaction = .{ .begin = .{
+                .txn_id = txn_id,
+                .begin_timestamp = begin_timestamp,
+                .created_at_ns = platform_time.realtimeNs(),
+                .topology_epoch = topology_epoch,
+                .retain_terminal = retain_terminal,
+                .participants = participants,
+            } },
+        }, active);
+        return {};
+    }
+
     fn txnPrepareGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -3555,6 +4280,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         comptime std.debug.assert(@sizeOf(db_types.TransactionWrite) == @sizeOf(db_types.BatchWrite));
+        if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
         comptime std.debug.assert(@alignOf(db_types.TransactionWrite) == @alignOf(db_types.BatchWrite));
         const writes: []const db_types.BatchWrite = @ptrCast(req.writes);
         try self.applyTransactionGroupLocal(alloc, group_id, table_name, .{
@@ -3562,6 +4288,16 @@ pub const ProvisionedKernelOwnerSource = struct {
             .deletes = req.deletes,
             .transforms = req.transforms,
             .predicates = req.predicates,
+            .integrity = req.integrity,
+            .integrity_commands = req.integrity_commands,
+            .relational_schema_version = req.relational_schema_version,
+            .relational_integrity_generation_set = req.relational_integrity_generation_set,
+            .relational_repair = req.relational_repair,
+            .relational_activation = req.relational_activation,
+            .relational_retirement = req.relational_retirement,
+            .relational_index_maintenance = req.relational_index_maintenance,
+            .restore_staging_scope = req.restore_staging_scope,
+            .restore_staging_plan_id = req.restore_staging_plan_id,
             .transaction = .{ .prepare = .{
                 .txn_id = txn_id,
                 .topology_epoch = topology_epoch,
@@ -3601,9 +4337,40 @@ pub const ProvisionedKernelOwnerSource = struct {
         txn_id: db_types.TxnId,
     ) !?db_types.TxnStatus {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var lease = try self.acquire(group_id, table_name);
+        var lease = (try self.acquireHiddenTransactionOwner(group_id, table_name)) orelse try self.acquire(group_id, table_name);
         defer lease.deinit();
         return switch (try lease.owner().transactionStatus(table_name, txn_id)) {
+            .pending => .pending,
+            .committed => .committed,
+            .aborted => .aborted,
+        };
+    }
+
+    fn txnStatusGroupLocalWithRequest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: @import("distributed_txn_contract.zig").TxnStatusRequest,
+        context: request_operation.RequestContext,
+    ) !?db_types.TxnStatus {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const scope = req.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
+        var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, req.restore_staging_plan_id, .resolve, context);
+        defer descriptor.deinit(alloc);
+        // A coordinator may recover a durable decision after publication or
+        // cancellation, but it must never turn an uncertain read into an abort.
+        try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareLookupWithConsistency(group_id, "", .{
+            .execution_deadline_ns = context.deadline_ns,
+            .execution_io = context.deadline_io,
+            .cancellation = context.cancellation,
+        }, .read_index);
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+        defer alloc.free(path);
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation });
+        defer lease.deinit();
+        try context.ensureActive();
+        return switch (try lease.owner().transactionStatus(table_name, req.txn_id)) {
             .pending => .pending,
             .committed => .committed,
             .aborted => .aborted,
@@ -4100,6 +4867,44 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 };
 
+test "compiled owner coordinated ttl admission preserves exact observations and pressure" {
+    const ttl = @import("../storage/coordinated_ttl.zig");
+    const Fake = struct {
+        calls: usize = 0,
+        pressure: bool = false,
+        fn enqueue(ptr: *anyopaque, request: ttl.Request) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.pressure) return error.CoordinatedTtlBackpressure;
+            try std.testing.expectEqual(@as(u64, 17), request.table_id);
+            try std.testing.expectEqual(@as(u64, 23), request.group_id);
+            try std.testing.expectEqual(@as(u32, 3), request.schema_version);
+            try std.testing.expectEqualStrings("expires", request.ttl_field);
+            try std.testing.expectEqual(@as(usize, 1), request.candidates.len);
+            try std.testing.expectEqualStrings("\x00\xffkey", request.candidates[0].key);
+            try std.testing.expectEqual(@as(u64, 99), request.candidates[0].row_version);
+            try std.testing.expectEqual(@as(u64, 44), request.candidates[0].ttl_timestamp_ns);
+            try std.testing.expectEqual([_]u8{0xa7} ** 32, request.candidates[0].expected_content_digest);
+            self.calls += 1;
+            return 0;
+        }
+    };
+    var fake = Fake{};
+    var source: ProvisionedKernelOwnerSource = undefined;
+    source.coordinated_ttl = .{ .ptr = &fake, .expire_fn = Fake.enqueue };
+    const candidates = [_]abi.CoordinatedTtlCandidate{.{ .key = .fromSlice("\x00\xffkey"), .row_version = 99, .ttl_timestamp_ns = 44, .expected_content_digest = @splat(0xa7) }};
+    var request = abi.CoordinatedTtlRequest{ .table_id = 17, .group_id = 23, .schema_version = 3, .ttl_duration_ns = 100, .ttl_field = .fromSlice("expires"), .observed_at_unix_ns = 200, .grace_period_ns = 1, .candidates = &candidates, .candidate_count = 1 };
+    try std.testing.expectEqual(@as(u8, 0), ProvisionedKernelOwnerSource.enqueueCoordinatedTtl(&source, &request));
+    fake.pressure = true;
+    try std.testing.expectEqual(@as(u8, 1), ProvisionedKernelOwnerSource.enqueueCoordinatedTtl(&source, &request));
+    fake.pressure = false;
+    request.candidate_count = abi.coordinated_ttl_page_capacity + 1;
+    try std.testing.expectEqual(@as(u8, 1), ProvisionedKernelOwnerSource.enqueueCoordinatedTtl(&source, &request));
+    request.candidate_count = 1;
+    request.candidates = null;
+    try std.testing.expectEqual(@as(u8, 1), ProvisionedKernelOwnerSource.enqueueCoordinatedTtl(&source, &request));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
 test "storage owner quiesce drains leases and promotion callbacks before context destruction" {
     const alloc = std.testing.allocator;
     var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-quiesce");
@@ -4410,6 +5215,7 @@ test "scheduled repair admission yields to readers and reuses exact configured g
         .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
         .schema_json = @constCast("schema"),
         .indexes_json = @constCast("indexes"),
+        .restore_bootstrap_json = @constCast(""),
         .owner = undefined,
         .active_users = 1,
         .resident = true,

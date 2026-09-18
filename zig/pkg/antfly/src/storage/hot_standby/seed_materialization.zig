@@ -19,10 +19,13 @@ const generation_lifecycle = @import("../db/generation_lifecycle.zig");
 const backend_types = @import("../backend_types.zig");
 const lsm_backend = @import("../lsm_backend.zig");
 const validation = @import("validation.zig");
+const topology_records = @import("../../common/topology_records.zig");
 const seed_topology = @import("seed_topology.zig");
 
 pub const topology_format_version = seed_topology.topology_format_version;
 pub const topology_name = seed_topology.topology_name;
+pub const private_provisioning_name = seed_topology.private_provisioning_name;
+pub const standalone_metadata_name = seed_topology.standalone_metadata_name;
 pub const materialized_receipt_name = ".antfly-ha-materialized.json";
 pub const max_topology_bytes = seed_topology.max_topology_bytes;
 pub const max_materialized_receipt_bytes: usize = 64 * 1024 * 1024;
@@ -142,6 +145,40 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
     const local_catalog_json = try std.json.Stringify.valueAlloc(alloc, parsed.value.catalog, .{ .emit_null_optional_fields = false });
     defer alloc.free(local_catalog_json);
     try writeNewFileDurably(io, local_catalog_path, local_catalog_json);
+    if (parsed.value.standalone_metadata) |artifact| {
+        const source_path = try std.fs.path.join(alloc, &.{ request.raw_generation_root, artifact.path });
+        defer alloc.free(source_path);
+        const metadata_store_root = try std.fs.path.join(alloc, &.{ metadata_root, "local-state" });
+        defer alloc.free(metadata_store_root);
+        var metadata_store = try @import("../../metadata/storage/raft_apply_store.zig").RaftApplyStore.init(alloc, .{ .root_dir = metadata_store_root });
+        defer metadata_store.deinit();
+        try metadata_store.importHACheckpoint(io, source_path, artifact.size_bytes);
+        try verifyStandaloneMetadataTopology(alloc, &metadata_store, parsed.value);
+    }
+    if (parsed.value.private_provisioning) |projection| {
+        const private_path = try std.fs.path.join(alloc, &.{ metadata_root, private_provisioning_name });
+        defer alloc.free(private_path);
+        const private_json = try std.json.Stringify.valueAlloc(alloc, projection, .{});
+        defer alloc.free(private_json);
+        try writeNewFileDurably(io, private_path, private_json);
+    }
+    const native_owners = try @import("restore_owner_registry.zig").expand(alloc, parsed.value.native_restore_tables, parsed.value.native_restore_owners);
+    defer alloc.free(native_owners);
+    for (native_owners) |owner| try @import("restore_owner_registry.zig").record(alloc, io, metadata_root, owner);
+    if (parsed.value.restore_terminals) |artifact| {
+        const terminal_path = try std.fs.path.join(alloc, &.{ request.raw_generation_root, artifact.path });
+        defer alloc.free(terminal_path);
+        var ledger = try @import("restore_terminal_ledger.zig").Ledger.open(alloc, io, metadata_root);
+        defer ledger.deinit();
+        try ledger.importFile(io, terminal_path, artifact.size_bytes);
+        var terminals = try ledger.snapshot();
+        defer terminals.deinit();
+        for (native_owners) |owner| if (try terminals.get(owner.scope.target_namespace.shard_id) != null) return error.NonCanonicalSeedTopology;
+        for (parsed.value.catalog.ranges) |range| if (try terminals.get(range.group_id) != null) return error.NonCanonicalSeedTopology;
+        if (parsed.value.private_provisioning) |projection| for (projection.ranges) |range| {
+            if (try terminals.get(range.group_id) != null) return error.NonCanonicalSeedTopology;
+        };
+    }
 
     const replica_catalog_path = try std.fs.path.join(alloc, &.{ data_root, "catalog.txt" });
     defer alloc.free(replica_catalog_path);
@@ -160,7 +197,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
         defer transition.deinit();
         var staged = try transition.beginStaging();
         defer staged.deinit();
-        try db_mod.DB.restoreSnapshotToStagedGeneration(&staged, alloc, snapshot_root, staged.path(), .{
+        try db_mod.DB.restoreCoherentHASeedReplicaToStagedGeneration(&staged, alloc, snapshot_root, staged.path(), .{
             .identity_namespace = .{
                 .table_id = replica.identity_table_id,
                 .shard_id = replica.identity_shard_id,
@@ -168,8 +205,32 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
             },
             .start_index_workers = false,
             .start_optional_runtimes = false,
+        }, .{
+            .table_id = replica.identity_table_id,
+            .shard_id = replica.identity_shard_id,
+            .range_id = replica.identity_range_id,
         });
+        var native_ha_owner = false;
+        for (native_owners) |owner| {
+            if (owner.scope.target_namespace.shard_id != replica.group_id) continue;
+            native_ha_owner = true;
+            var verified = try db_mod.DB.open(alloc, staged.path(), .{ .open_mode = .query_readonly, .primary_only_readonly = true, .identity_namespace = owner.scope.target_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+            defer verified.close();
+            var bootstrap = (try verified.readRestoreStagingBootstrap(alloc)) orelse return error.SeedReplicaIdentityMismatch;
+            defer bootstrap.deinit();
+            const actual = try bootstrap.value.encode(alloc);
+            defer alloc.free(actual);
+            const expected = try owner.encode(alloc);
+            defer alloc.free(expected);
+            if (!std.mem.eql(u8, actual, expected)) return error.SeedReplicaIdentityMismatch;
+            var progress = (try verified.restoreStagingStatus(alloc)) orelse return error.SeedReplicaIdentityMismatch;
+            defer progress.deinit();
+            if (!std.mem.eql(u8, &progress.value.scope.digest(), &owner.scope.digest())) return error.SeedReplicaIdentityMismatch;
+        }
         if (try staged.publish() != .durable) return error.LiveDBPublicationConflict;
+        // Stream authority reconstructs an owner, not Raft membership. The
+        // independent registry keeps it discoverable for replay and reseeding.
+        if (native_ha_owner) continue;
         try catalog.catalog().upsertReplica(.{
             .group_id = replica.group_id,
             .replica_id = request.target_replica_id,
@@ -353,6 +414,68 @@ pub fn validateRuntimeIdentity(
     }
 }
 
+fn verifyStandaloneMetadataTopology(alloc: Allocator, store: *@import("../../metadata/storage/raft_apply_store.zig").RaftApplyStore, topology: Topology) !void {
+    const manager = @import("../../metadata/table_manager.zig");
+    const group_id = @import("../../common/group_ids.zig").main_metadata_group_id;
+    if (try store.standaloneRevision() != topology.catalog.epoch) return error.SeedMetadataTopologyMismatch;
+    var projection = try store.captureProvisioningCatalog(alloc, group_id);
+    defer projection.deinit(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const catalog = @import("../../system_catalog/domain.zig");
+    var actual_catalog = try store.systemCatalogSnapshot(alloc, group_id);
+    defer actual_catalog.deinit();
+    const expected_catalog = topology.catalog.system_catalog orelse catalog.State{};
+    if (actual_catalog.value.revision != expected_catalog.revision or actual_catalog.value.next_id != expected_catalog.next_id) return error.SeedMetadataTopologyMismatch;
+    var expected_state = try catalog.MutableState.clone(scratch, expected_catalog);
+    defer expected_state.deinit();
+    var actual_state = try catalog.MutableState.clone(scratch, actual_catalog.value);
+    defer actual_state.deinit();
+    if (actual_state.value.resources.len != expected_state.value.resources.len) return error.SeedMetadataTopologyMismatch;
+    for (actual_state.value.resources) |resource| {
+        const expected = expected_state.index.byId(resource.kind, resource.id) orelse return error.SeedMetadataTopologyMismatch;
+        const left = try std.json.Stringify.valueAlloc(scratch, resource, .{});
+        const right = try std.json.Stringify.valueAlloc(scratch, expected, .{});
+        if (!std.mem.eql(u8, left, right)) return error.SeedMetadataTopologyMismatch;
+    }
+    const expected_tables = if (topology.private_provisioning) |private| try std.mem.concat(scratch, topology_records.TableRecord, &.{ topology.catalog.tables, private.tables }) else topology.catalog.tables;
+    const expected_ranges = if (topology.private_provisioning) |private| try std.mem.concat(scratch, topology_records.RangeRecord, &.{ topology.catalog.ranges, private.ranges }) else topology.catalog.ranges;
+    if (projection.tables.len != expected_tables.len or projection.ranges.len != expected_ranges.len) return error.SeedMetadataTopologyMismatch;
+    var table_indices: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    var range_indices: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    for (expected_tables, 0..) |table, index| {
+        const entry = try table_indices.getOrPut(scratch, table.table_id);
+        if (entry.found_existing) return error.SeedMetadataTopologyMismatch;
+        entry.value_ptr.* = index;
+    }
+    for (projection.tables) |table| {
+        const index = table_indices.get(table.table_id) orelse return error.SeedMetadataTopologyMismatch;
+        if (!manager.tableDefinitionsEqual(table, expected_tables[index])) return error.SeedMetadataTopologyMismatch;
+    }
+    for (expected_ranges, 0..) |range, index| {
+        const entry = try range_indices.getOrPut(scratch, range.group_id);
+        if (entry.found_existing) return error.SeedMetadataTopologyMismatch;
+        entry.value_ptr.* = index;
+    }
+    for (projection.ranges) |range| {
+        const index = range_indices.get(range.group_id) orelse return error.SeedMetadataTopologyMismatch;
+        var actual = range;
+        var expected = expected_ranges[index];
+        // Seed descriptors make the released implicit identity explicit.
+        actual.doc_identity_shard_id = manager.rangeDocIdentityShardId(actual);
+        actual.doc_identity_range_id = manager.rangeDocIdentityRangeId(actual);
+        expected.doc_identity_shard_id = manager.rangeDocIdentityShardId(expected);
+        expected.doc_identity_range_id = manager.rangeDocIdentityRangeId(expected);
+        if (!manager.rangeRecordsEqual(actual, expected)) return error.SeedMetadataTopologyMismatch;
+    }
+    const expected_jobs = if (topology.private_provisioning) |private| private.jobs_json else &.{};
+    if (projection.jobs_json.len != expected_jobs.len) return error.SeedMetadataTopologyMismatch;
+    var jobs: std.StringHashMapUnmanaged(void) = .empty;
+    for (expected_jobs) |job| try jobs.put(scratch, job, {});
+    for (projection.jobs_json) |job| if (!jobs.remove(job)) return error.SeedMetadataTopologyMismatch;
+}
+
 const validateTableIdentityName = seed_topology.validateTableIdentityName;
 
 const validateLogicalCatalog = seed_topology.validateLogicalCatalog;
@@ -364,6 +487,11 @@ pub fn validateTopology(
     expected_generation: []const u8,
     topology: Topology,
 ) !void {
+    var proof_arena = std.heap.ArenaAllocator.init(alloc);
+    defer proof_arena.deinit();
+    const proof_alloc = proof_arena.allocator();
+    const private = topology.private_provisioning;
+    if (private) |projection| _ = try @import("../../data/private_provisioning.zig").validate(proof_alloc, topology.catalog.tables, topology.catalog.ranges, projection);
     return seed_topology.validate(alloc, io, raw_root, expected_generation, topology);
 }
 

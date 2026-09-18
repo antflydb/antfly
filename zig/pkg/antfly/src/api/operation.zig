@@ -103,6 +103,10 @@ pub const RequestDiagnostics = struct {
 };
 
 pub const RequestContext = struct {
+    /// Set only by the administrator-authorized relational recovery routes.
+    relational_recovery: enum { none, repair, retry, retire } = .none,
+    relational_retirement_target: ?[]const u8 = null,
+    relational_retirement_drop: bool = false,
     cancellation: CancellationToken = .none,
     /// Absolute monotonic deadline. This deliberately does not use a wall
     /// clock or a transport timeout duration.
@@ -112,6 +116,10 @@ pub const RequestContext = struct {
     /// the caller did not supply one; adapters may generate one in middleware.
     request_id: []const u8 = "",
     principal: ?Principal = null,
+    /// Request-lifetime capability for writes discovered after initial route
+    /// admission (for example FK cascades). Adapters retain the admitted
+    /// credential scopes; a username alone cannot reconstruct API-key rights.
+    table_write_authorization: ?TableWriteAuthorization = null,
     admission: ?*AdmissionReservation = null,
     /// Borrowed for the duration of the operation. This is deliberately
     /// request-scoped: std.Io tasks may resume on a different worker thread.
@@ -137,6 +145,27 @@ pub const RequestContext = struct {
             if (now_ns >= deadline) return error.DeadlineExceeded;
         }
     }
+
+    /// Preserve remaining time when entering native owners or HTTP timeout
+    /// APIs, whose absolute clock is platform monotonic rather than Io awake.
+    pub fn platformDeadline(self: RequestContext) !RequestContext {
+        try self.ensureActive();
+        const deadline = self.deadline_ns orelse return self;
+        const borrow = self.deadline_io orelse return self;
+        const platform_now = platform_time.monotonicNs();
+        var receiver = try borrow.receive();
+        const source_now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
+        if (source_now >= deadline) return error.DeadlineExceeded;
+        var normalized = self;
+        normalized.deadline_ns = platform_now +| (deadline - source_now);
+        normalized.deadline_io = null;
+        return normalized;
+    }
+};
+
+pub const TableWriteAuthorization = struct {
+    ptr: *const anyopaque,
+    allows: *const fn (*const anyopaque, []const u8) bool,
 };
 
 /// A synchronous sink applies backpressure by not returning from `writeAll`
