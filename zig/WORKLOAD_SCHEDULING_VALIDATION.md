@@ -407,3 +407,44 @@ The combined admission gate also exited zero: metadata 123/123 and
 request/runtime 213 passed, one optional Wasmtime skip, zero failures/leaks,
 six expected and zero unexpected error logs. These artifacts overlap; counts
 are not additive. Log: `/tmp/workload-recovery-coordination-checkpoint15.log`.
+
+
+### Native reads and backup repair checkpoint
+
+The frozen `04c5f3da89` Debug binary passed the three-process
+`local-correctness.json` scenario: exact document lookup, advertised-proxy
+partition/heal, API kill/restart on its original root, and correct reads afterward.
+All seven checked requests passed, with zero unknown writes; all three cleanup
+exits were zero. All 21 receipt checksums verified in
+`/tmp/workload-local-correctness-04c-receipts`. This is local correctness only.
+
+The subsequent reconciliation scenario passed its initial exact lookup and
+verified signed discovery, initial generation fence and request-bound terminal
+HTTP 200. Its strict metrics gate then rejected duplicate
+`antfly_lsm_cache_kind_used_bytes` series before any injected fault. Evidence:
+`/tmp/workload-reconciliation-04c5f3da89-receipts`, all 20 checksums verified;
+independent signed proof check:
+`/tmp/workload-reconciliation-04c5f3da89-proof-check.json`. This run does not
+establish lost-response reconciliation or restart closure.
+
+Commit `b5f32967be` closes the earlier storage-owner fixture failure. A deliberate
+partial index reconciliation had left the sibling full-text repair journal in
+`detected` state; document-artifact repair did not resolve that separate debt.
+The fixture now proves backup rejects pending repair, explicitly completes
+index repair, then verifies backup success. The specific guard error also
+survives the status-only compiled boundary (failure ABI 54, storage ABI 68;
+API ABI 29 unchanged). The full storage-owner gate passed **33/33**, zero leaks,
+one expected and zero unexpected error logs, actual exit zero. Log:
+`/tmp/workload-storage-owner-backup-final.log`. The backup guard is unchanged.
+
+
+Commit `186bd1b0da` removes the duplicate cache metric family. The renderer
+uniqueness regression passed 1/1 through its owning `antfly-data-runtime-test`
+target, with zero leaks and actual exit zero
+(`/tmp/workload-cache-metrics-focused.log`). The combined admission gate also
+passed 123 metadata and 213 request/runtime tests with one optional skip; that
+separate gate does not import the renderer fixture.
+
+The allocator-provenance prerequisite is integrated as `05bd7c5b0e`; its
+[scope and measured structure overhead](WORKLOAD_LSM_COMPLETION.md) remain
+explicit. It does not activate backend completion credits or durable tickets.
