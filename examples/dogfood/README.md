@@ -39,8 +39,17 @@ work-log entries reads sensibly end to end.
 2. Inference runs in-process by default. `libantfly` links the standalone
    inference runtime (the same one the `antfly` executable embeds), so a Lite
    handle opened with `LocalRuntimeConfigured` runs the chunker, embedder, and
-   extractor locally; `dogfood status` shows `inference: mode=local_embedded`.
-   Metal is enabled by default on macOS builds.
+   extractor locally; `dogfood status` shows `inference: mode=local_embedded`
+   and both models select the Metal backend on macOS.
+
+   Model execution lives in a sandboxed worker process (Metal, CUDA, and PJRT
+   calls need crash containment), which the library resolves in this order:
+   `ANTFLY_INFERENCE_WORKER`, an `antfly` binary next to the loaded
+   `libantfly`, then `antfly` on `PATH`. From a source tree:
+
+   ```sh
+   export ANTFLY_INFERENCE_WORKER=$PWD/../../zig/zig-out/bin/antfly
+   ```
 
    To use an external server instead, start one and pass `-inference-url`:
 
@@ -51,9 +60,6 @@ work-log entries reads sensibly end to end.
 
    That is Lite's "remote inference provider" mode (`zig/LITE.md`): the
    producer configs carry `api_url` and Lite calls the server over HTTP.
-   `--max-loaded-models 0` matters: ingest alternates embed and extract
-   requests per document, and the server's default eviction policy otherwise
-   reloads the two models on nearly every request.
 
 3. Pull the models this example uses:
 
@@ -177,26 +183,27 @@ deduplicating and traversing the graph -- no separate merge step is needed.
 
 ## Known limitations
 
-Status as of this example's first commit (2026-09-17), measured against the
-1196-section corpus in this repository:
+Measured on an Apple Silicon laptop against this repository's corpus
+(1196 markdown sections), in-process on Metal, 2026-09-17:
 
-- **Remote-provider mode works end to end.** Chunking, Qwen3 embedding,
-  GLiNER2 extraction, and `semantic_search` all run against a local
-  `antfly inference run` (Metal). It is slow: 35–70 minutes for the whole
-  corpus depending on server flags, versus a ~5 minute baseline for the same
-  work called directly (Qwen3 ~23 chunks/s in batches of 32–64, GLiNER2
-  ~13 sections/s batched 8). Use `--max-loaded-models 0` on the server; the
-  remaining gap is per-document interleaving and lease retries inside Lite's
-  enrichment runtime.
-- **In-process mode does not run inference yet.** The handle opens as
-  `local_embedded` and the embedded provider is invoked, but the inference
-  worker sandbox re-execs `argv[0]` as `antfly inference _worker`, which
-  assumes the host binary is `antfly`; from a Go program that fails. Until
-  the worker host is generalized, use `-inference-url`.
-- **Graph edge retrieval crashes once real edges exist**:
-  `antfly_db_get_edges_json` aborts on an ingested graph, so `entity` and the
-  traversal half of `query` currently crash rather than print edges. This was
-  latent; it surfaced only once extraction produced edges in Lite.
+| Step | Result |
+|---|---|
+| Ingest wall time | 9.4 min (drain 562 s) |
+| Chunks embedded | 4,978 in 173 batches, 13.3 chunks/s |
+| Sections extracted | 1,196 in 150 batches, 7.9 sections/s |
+| `query "how does VOPR fence strong reads"` | 8 RRF-merged hits, 2 entities, 2 `tested_by` edges |
+
+What remains:
+
+- **Throughput is below the direct baseline.** Called directly through the
+  inference server the same models do ~23 chunks/s and ~13 sections/s, so the
+  corpus would take ~5 minutes. Lite's enrichment runtime runs the extract
+  stream and the embed stream strictly one after the other per ~64-item
+  window (`flushDeferredGeneratedWork` in
+  `zig/pkg/antfly/src/storage/db/enrichment/enrichment_runtime.zig`), which
+  both serializes the two models and lowers per-item throughput. Running the
+  two streams concurrently needs care around crash-idempotent replay and
+  belongs in a change with VOPR coverage.
 - `fastino/gliner2.5-base-v1` is gated off for serving pending a
   qualification row (see Prerequisites).
 - Artifact-sourced dense-vector indexes (`sources: [{artifact: ...}]`, the
@@ -208,6 +215,9 @@ Status as of this example's first commit (2026-09-17), measured against the
 - `antfly lite init` still does not provision `full_text_index_v0` (only the
   C ABI and embedded facade do), and `antfly lite query` cannot open a
   binding-created file (`IdentityNamespaceMismatch`).
+- Entity node names are the extractor's surface strings (for example
+  `Full-cluster v42`), so `dogfood entity` needs the exact extracted text;
+  there is no entity resolution step in this example yet.
 
 ## Files
 
