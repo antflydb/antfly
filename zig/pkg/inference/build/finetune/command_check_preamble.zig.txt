@@ -1,0 +1,7 @@
+// Generated compile/link check. Runtime dispatch keeps every main reachable.
+const std = @import("std");
+pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.gpa);
+    defer init.gpa.free(args);
+    if (args.len == 0) return error.CompileCheckOnly;
+    const name = std.fs.path.basename(args[0]);

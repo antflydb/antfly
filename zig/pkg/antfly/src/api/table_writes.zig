@@ -31451,21 +31451,6 @@ fn catchUpManagedDb(
         try db.core.index_manager.syncAll(true);
     }
 
-    if (runs_broad_debt and db.nativeVectorProjectionMaintenanceNeeded()) {
-        progress_ctx.phase = .artifact_rebuild;
-        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
-        const publication: db_mod.types.NativePublicationResult = if (owner == .live_writer)
-            try db.publishVectorBlockBasesOnlineReported(.{
-                .cancel_check = index_repair_options.cancel_check,
-            })
-        else
-            .{ .published = try db.publishVectorBlockBasesAtStableTip() };
-        native_publication_busy = publication.busy or publication.deferred;
-        repaired_native_vector_projection = publication.published != 0;
-        made_progress = made_progress or repaired_native_vector_projection;
-        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
-    }
-
     if (mode == .all_debt and !initial_repair_debt) {
         try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .idle, db));
         return .{};
@@ -31508,6 +31493,24 @@ fn catchUpManagedDb(
             };
             try db.core.index_manager.syncAll(true);
         }
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+    }
+
+    // Restore missing membership from authoritative artifacts before building
+    // the native vector projection. Its publication validates vector counts
+    // against HBC, so publishing against a known membership gap cannot succeed.
+    if (runs_broad_debt and db.nativeVectorProjectionMaintenanceNeeded()) {
+        progress_ctx.phase = .artifact_rebuild;
+        try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+        const publication: db_mod.types.NativePublicationResult = if (owner == .live_writer)
+            try db.publishVectorBlockBasesOnlineReported(.{
+                .cancel_check = index_repair_options.cancel_check,
+            })
+        else
+            .{ .published = try db.publishVectorBlockBasesAtStableTip() };
+        native_publication_busy = publication.busy or publication.deferred;
+        repaired_native_vector_projection = publication.published != 0;
+        made_progress = made_progress or repaired_native_vector_projection;
         try finishManagedMaintenanceStatusPublication(source, table_name, publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
     }
 
@@ -38392,8 +38395,8 @@ fn consumerTests() type {
             var write_source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
             _ = try write_source.source().batch(alloc, "docs", .{
                 .writes = &.{
-                    .{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" },
-                    .{ .key = "doc:b", .value = "{\"_embeddings\":{\"semantic_idx\":[2,1]}}" },
+                    .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"semantic_idx\":[1,2]}}" },
+                    .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"semantic_idx\":[2,1]}}" },
                 },
                 .sync_level = .write,
             });
@@ -38406,6 +38409,11 @@ fn consumerTests() type {
                 FakeRouter.iface(),
                 executor_state.iface(),
             );
+
+            // Embedding-only writes are artifact updates, not document inserts.
+            var lookup = (try hosted.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)) orelse
+                return error.TestExpectedStoredDocument;
+            defer lookup.deinit(alloc);
 
             var owned = try query_api.parseQueryRequest(alloc, null, "docs",
                 \\{"embeddings":{"semantic_idx":[1.0,2.0]},"indexes":["semantic_idx"],"limit":2,"profile":true}
@@ -42265,26 +42273,42 @@ fn implementationTests() type {
             defer alloc.free(path);
             const indexes_json = "{\"indexes\":[]}";
 
-            var obsolete_path: []u8 = undefined;
-            {
+            const primary_root = blk: {
                 var seeded = try openManagedDbWithIndexesJsonAndCacheMode(alloc, path, indexes_json, null, null, table_reads.backend_current_root_generation, null, .default);
                 defer seeded.close();
-
                 const primary_backend = seeded.core.primary_store_owner.lsmBackend() orelse return error.SkipZigTest;
-                const primary_root = primary_backend.root_dir orelse return error.TestUnexpectedResult;
-                obsolete_path = try lsm_backend.repository.runPath(alloc, primary_root, 777_777);
-                errdefer alloc.free(obsolete_path);
-                try lsm_backend.repository.writeFileAbsoluteWithStorage(primary_backend.storage.?, obsolete_path, "obsolete");
-                {
-                    const locked = lsm_backend.runtime.lockBackend(lsm_backend.Backend, primary_backend);
-                    defer lsm_backend.runtime.unlockBackend(lsm_backend.Backend, primary_backend, locked);
-                    try primary_backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
-                    try primary_backend.persistManifest();
-                }
-            }
+                break :blk try alloc.dupe(u8, primary_backend.root_dir orelse return error.TestUnexpectedResult);
+            };
+            defer alloc.free(primary_root);
+            const obsolete_path = try lsm_backend.repository.runPath(alloc, primary_root, 777_777);
             defer alloc.free(obsolete_path);
-
+            {
+                // Model a crash after publication but before reclamation. Persist
+                // an already-due entry through the native journal, without the
+                // normal persist/close maintenance that would reclaim it here.
+                // No elapsed-time assumption is needed during fixture setup.
+                var backend = try lsm_backend.Backend.open(alloc, primary_root, .{});
+                defer backend.abandonAfterCrash();
+                try lsm_backend.repository.writeFileAbsoluteWithStorage(backend.storage.?, obsolete_path, "obsolete");
+                const locked = lsm_backend.runtime.lockBackend(lsm_backend.Backend, &backend);
+                defer lsm_backend.runtime.unlockBackend(lsm_backend.Backend, &backend, locked);
+                try backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+                backend.obsolete_paths.setDeadlinePrepared(obsolete_path, 0);
+                var turn = try backend.beginManifestTurn();
+                defer turn.deinit();
+                const runs = try alloc.alloc(lsm_backend.repository.Run, backend.runs.count());
+                defer alloc.free(runs);
+                var cursor = backend.runs.cursor();
+                for (runs) |*run| run.* = cursor.next().?.*;
+                _ = try backend.manifest_journal.persist(&backend, primary_root, runs);
+            }
             try std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{});
+            {
+                var persisted = try lsm_backend.Backend.open(alloc, primary_root, .{ .backend = .{ .read_only = true } });
+                defer persisted.close();
+                const obsolete = persisted.obsolete_paths.get(obsolete_path) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(u64, 0), obsolete.delete_after_ns);
+            }
 
             var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
             defer snapshot_cache.deinit();
@@ -42298,7 +42322,15 @@ fn implementationTests() type {
             var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
             defer statuses.deinit(alloc);
             try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-            try std.testing.expectEqual(@as(u64, 0), statuses.items[0].lsm_storage_stats.?.maintenance.obsolete_paths_reclaimable);
+            // The transient startup writer has retired; its cached status need
+            // not include optional live-owner storage metrics. Verify the
+            // persisted reclamation state through a read-only reopen instead.
+            var reopened = try db_mod.DB.open(alloc, path, .{
+                .open_mode = .query_readonly,
+                .lsm_root_generation = table_reads.backend_current_root_generation,
+            });
+            defer reopened.close();
+            try std.testing.expectEqual(@as(u64, 0), reopened.snapshotLsmMaintenanceStats().obsolete_paths_reclaimable);
         }
 
         test "provisioned Raft snapshot install publishes a fenced group generation" {
@@ -54534,7 +54566,9 @@ fn implementationTests() type {
         }
 
         test "provisioned table read source survives many external write-sync batches before first profiled dense query" {
-            const alloc = std.testing.allocator;
+            var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+            defer std.debug.assert(allocator_state.deinit() == .ok);
+            const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
             const total_docs: usize = 50_000;
             const batch_size: usize = 250;
             const dims: usize = 384;
@@ -54626,7 +54660,7 @@ fn implementationTests() type {
             const dense_doc_json = blk: {
                 var out: std.Io.Writer.Allocating = .init(alloc);
                 defer out.deinit();
-                try out.writer.writeAll("{\"_embeddings\":{\"semantic_idx\":[");
+                try out.writer.writeAll("{\"title\":\"document\",\"_embeddings\":{\"semantic_idx\":[");
                 for (0..dims) |i| {
                     if (i != 0) try out.writer.writeByte(',');
                     try out.writer.writeAll("1");
@@ -54648,6 +54682,15 @@ fn implementationTests() type {
                 break :blk try out.toOwnedSlice();
             };
             defer alloc.free(query_json);
+
+            // Readers cannot create metadata-defined indexes. Provision the
+            // empty table through its writer before opening the cold reader.
+            {
+                const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+                defer alloc.free(db_path);
+                var provisioned = try write_cache.getOrOpenLocked(db_path, Catalog.iface(), 7001, 0, "docs");
+                defer provisioned.deinit(alloc);
+            }
 
             {
                 var cold_read_source = table_reads.ProvisionedTableReadSource.init(
@@ -54711,33 +54754,33 @@ fn implementationTests() type {
                 } = null,
             };
 
-            var ready = false;
-            for (0..200) |_| {
-                var detail = try public_table_http.handleTableGetIndex(
-                    alloc,
-                    "docs",
-                    "semantic_idx",
-                    server.tableApi(.{}),
-                );
-                defer detail.deinit(alloc);
-                try std.testing.expectEqual(@as(u16, 200), detail.status);
-                var parsed_detail = try std.json.parseFromSlice(IndexDetail, alloc, detail.body, .{ .ignore_unknown_fields = true });
-                defer parsed_detail.deinit();
-                if (parsed_detail.value.status) |idx| {
-                    if ((idx.doc_count orelse 0) == total_docs and
-                        (idx.total_indexed orelse 0) == total_docs and
-                        (idx.replay_applied_sequence orelse 0) == (idx.replay_target_sequence orelse 0) and
-                        !(idx.replay_catch_up_required orelse false) and
-                        !(idx.backfill_active orelse false) and
-                        !(idx.rebuilding orelse false))
-                    {
-                        ready = true;
-                        break;
-                    }
-                }
-                sleepNs(10 * std.time.ns_per_ms);
+            // Write synchronization deliberately leaves indexing asynchronous.
+            // This standalone fixture has no runtime status publisher; drain
+            // the writer and publish its completed snapshot before asserting
+            // readiness through the public API.
+            {
+                const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+                defer alloc.free(db_path);
+                var cached = try write_cache.getOrOpenLocked(db_path, Catalog.iface(), 7001, 0, "docs");
+                defer cached.deinit(alloc);
+                try cached.db.runUntilIdle();
+                const live = try cached.db.runtimeStatusStatsConsistent(alloc);
+                defer db_mod.types.freeDBStats(alloc, live);
+                try std.testing.expect(!live.indexes[0].backfill_active);
+                try std.testing.expect(write_source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
             }
-            try std.testing.expect(ready);
+            var detail = try public_table_http.handleTableGetIndex(alloc, "docs", "semantic_idx", server.tableApi(.{}));
+            defer detail.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 200), detail.status);
+            var parsed_detail = try std.json.parseFromSlice(IndexDetail, alloc, detail.body, .{ .ignore_unknown_fields = true });
+            defer parsed_detail.deinit();
+            const idx = parsed_detail.value.status orelse return error.TestExpectedIndexStatus;
+            try std.testing.expectEqual(@as(?u64, total_docs), idx.doc_count);
+            try std.testing.expectEqual(@as(?u64, total_docs), idx.total_indexed);
+            try std.testing.expectEqual(idx.replay_target_sequence, idx.replay_applied_sequence);
+            try std.testing.expect(!(idx.replay_catch_up_required orelse true));
+            try std.testing.expect(!(idx.backfill_active orelse true));
+            try std.testing.expect(!(idx.rebuilding orelse true));
 
             var response = try server.handlePublicTableQuery("docs", query_json, null);
             defer response.deinit(alloc);
@@ -59140,7 +59183,7 @@ fn implementationTests() type {
                             .table_id = 7,
                             .name = "docs",
                             .placement_role = "data",
-                            .indexes_json = "{\"indexes\":[{\"name\":\"dense_idx\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}},{\"name\":\"ft_v1\",\"type\":\"full_text\",\"config\":{}}]}",
+                            .indexes_json = "{\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3,\"metric\":\"l2_squared\",\"external\":true},\"ft_v1\":{\"type\":\"full_text\"}}",
                         }})[0..]),
                         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
                             .group_id = 7001,
@@ -59158,24 +59201,13 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
+            var active_relative_path: ?[]u8 = null;
+            defer if (active_relative_path) |value| alloc.free(value);
+            var vector_ids: [3]u64 = undefined;
             {
-                var db = try db_mod.DB.open(alloc, path, .{
-                    .identity_namespace = identity_namespace,
-                    .prefer_existing_identity_namespace = true,
-                });
+                var db = try openManagedDbForTableGroupWithRuntime(alloc, path, Catalog.iface(), "docs", 7001, null);
                 defer db.close();
                 try doc_identity.writeNamespaceToStore(db.core.store, identity_namespace);
-
-                try db.addIndex(.{
-                    .name = "dense_idx",
-                    .kind = .dense_vector,
-                    .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-                });
-                try db.addIndex(.{
-                    .name = "ft_v1",
-                    .kind = .full_text,
-                    .config_json = "{}",
-                });
                 try db.batch(.{
                     .writes = &.{
                         .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
@@ -59184,13 +59216,65 @@ fn implementationTests() type {
                     },
                     .sync_level = .full_index,
                 });
+                for ([_][]const u8{ "doc:a", "doc:b", "doc:c" }, 0..) |key, i| {
+                    vector_ids[i] = (try db.core.index_manager.lookupDenseVectorId(db.core.store, "dense_idx", key)) orelse
+                        return error.TestExpectedDenseVector;
+                }
+                active_relative_path = (try db.core.index_manager.captureActiveIndexRootPointer("dense_idx")) orelse
+                    return error.TestExpectedDenseIndex;
             }
 
-            const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{path});
-            defer alloc.free(dense_index_path);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
-            try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+            // Damage only the published index after DB shutdown, preserving
+            // primary documents, artifact counters, replay and status watermarks.
+            // Native indexes live under the selected generation root.
+            const dense_path = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ path, active_relative_path.? }, 0);
+            defer alloc.free(dense_path);
+            {
+                var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path, .{
+                    .dims = 3,
+                    .storage_backend = .lsm,
+                }, .{});
+                defer hbc.close();
+                const Vectors = struct {
+                    fn load(ctx: *anyopaque, vector_alloc: std.mem.Allocator, id: u64, _: []const u8) ![]f32 {
+                        const ids: *const [3]u64 = @ptrCast(@alignCast(ctx));
+                        const values = [3][3]f32{ .{ 1, 0, 0 }, .{ 0, 1, 0 }, .{ 0.9, 0.1, 0 } };
+                        for (ids.*, 0..) |candidate, i| {
+                            if (candidate == id) return vector_alloc.dupe(f32, &values[i]);
+                        }
+                        return error.TestUnexpectedVector;
+                    }
+                };
+                hbc.setExternalVectorLoader(&vector_ids, Vectors.load);
+                _ = try hbc.activateExperimentalPostingReadsAtOrAfter(0);
+                try hbc.enableNativePostingMutationStore();
+                try std.testing.expectEqual(@as(u64, 3), hbc.publishedActiveCount());
+                try hbc.beginExperimentalPostingMutationCapture();
+                errdefer hbc.cancelExperimentalPostingMutationCapture();
+                const coverage = hbc.experimentalPostingMutationCaptureBaseSourceSequence().?;
+                try hbc.batchDelete(&vector_ids);
+                try hbc.persistExperimentalPostingSidecarAtAppliedSequence(coverage, .{});
+                try std.testing.expectEqual(@as(u64, 0), hbc.publishedActiveCount());
+            }
+
+            {
+                var gap = try db_mod.DB.open(alloc, path, .{
+                    .open_mode = .query_readonly,
+                    .identity_namespace = identity_namespace,
+                    .prefer_existing_identity_namespace = true,
+                });
+                defer gap.close();
+                const entry = gap.core.index_manager.denseIndex("dense_idx") orelse return error.TestExpectedDenseIndex;
+                try std.testing.expectEqual(@as(u64, 0), entry.index.publishedActiveCount());
+                const stats = try gap.stats(alloc);
+                defer db_mod.types.freeDBStats(alloc, stats);
+                try std.testing.expectEqual(@as(u64, 3), stats.doc_count);
+                for (stats.indexes) |index| {
+                    if (!std.mem.eql(u8, index.name, "dense_idx")) continue;
+                    try std.testing.expectEqual(index.replay_target_sequence, index.replay_applied_sequence);
+                    try std.testing.expect(!index.replay_catch_up_required);
+                }
+            }
 
             var write_cache = ProvisionedTableWriteCache.init(alloc);
             defer write_cache.deinit();

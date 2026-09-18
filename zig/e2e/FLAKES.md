@@ -1,5 +1,77 @@
 # Zig E2E flakes
 
+## 2026-09-17: stalled-discovery restore poll and production-soak leadership churn
+
+[PR #781's E2E job](https://github.com/antflydb/antfly/actions/runs/35247545305/job/105310030026)
+failed `test_backup_restore_discovers_leader_past_stalled_status` while polling
+restore job `7733568408289635401`: HTTP 500 with `INTERNAL_ERROR`. Its artifact
+pattern omitted metadata-backup fixture roots, and that ephemeral runner's logs
+are no longer available. The exact handler error for this request is unproven.
+The unchanged CI executable passed 10 serial and 50 two-worker Linux repetitions;
+20 local macOS repetitions also passed. Passing repeats do not establish a cause.
+
+The concurrently running [production soak](https://github.com/antflydb/antfly/actions/runs/35247508165/job/105291344795)
+provided retained evidence of proposal supersession/apply timeout, metadata
+leadership churn, and incomplete restores. See [the runtime record](../FLAKES.md#2026-09-17-restore-leadership-recovery-lost-proposal-error-identity)
+for the stable error-transport and scoped recovery fixes. The native fixture now
+uses production clock settings; its former 5 ms ticks gave real disk syncs longer
+than the election budget. Completion deadlines, exact restored-content checks,
+and failure-on-500 behavior remain unchanged.
+
+Both backup/restore variants now run in the scheduled normal and 256-descriptor
+profiles: 50 repetitions per variant per profile, 200 cases total. Evidence checks
+require all four cohorts and reject failed, missing, or skipped cases. Standard
+E2E CI uploads metadata-backup server logs and failure diagnostics. A failed job
+poll also includes fresh metadata observations and server log tails in its JUnit
+failure, so a future error remains diagnosable even if artifact collection fails.
+
+A bounded Linux check using the unchanged CI executable and corrected native
+cadence passed 40/40 cases: ten per variant per profile. That isolates the fixture
+change; it does not validate the new production recovery code. An additional
+20-case concurrent-poll probe passed, with no reproduction of the original 500.
+The rebuilt macOS ARM64 executable containing the production restore-recovery
+changes passed another 20/20 serial cases (five per variant per profile), with
+no failures, errors, or skips. This precedes the later status-publication deadline
+change. Both variants also pass a final two-case smoke on the executable containing
+the publication and separate schema-progress budgets. Final Linux CI and the
+complete scheduled soak remain required.
+
+## 2026-09-16: 3x3 backup/delete/restore admission stall
+
+`test_three_by_three_cluster_backup_restore_through_metadata_public_api` timed out
+waiting for restore job `3531487279743073036` in
+[PR #771's E2E job](https://github.com/antflydb/antfly/actions/runs/35163796459/job/105028671150).
+A local two-worker, 20-case baseline reproduced the stall: an owner opened before
+import pinned an empty generation and indefinitely blocked Raft restore bootstrap.
+See [the runtime flake record](../FLAKES.md#2026-09-16-3x3-restore-owner-admission-blocked-its-own-bootstrap)
+for evidence, the compiled-owner regression, and production admission fix.
+
+Scheduled VOPR qualification now runs the seeded admission histories; the production
+soak runs this E2E and its stalled-discovery variant 50 times each with normal
+limits and 50 times each with 256 descriptors.
+The test preserves one restore idempotency key across uncertain admission, accepts
+documented committed or uncertain delete outcomes only after observing catalog
+absence, and retains the original 120-second completion assertion. An uncertain
+seed batch is never replayed and must converge to every expected document's exact
+payload within its existing budget. Unresolved or partial outcomes still fail. Timeout diagnostics include fresh metadata and observed jobs.
+Run profiles sequentially at the scheduled two-cluster limit: a four-cluster local
+experiment exhausted TCP ports. Its fatal generic HTTP write error also led to a
+deterministic socket-reset regression and transport-identity fix; see the runtime
+record for the failed experiment and its limits.
+The merged executable also exposed a redundant topology-probe failure after a
+successful restore and replication check. The check now returns the same agreed
+table/group identities it validated across all metadata nodes, removing the second
+optional read while retaining the incarnation and per-data-node content checks.
+A later two-worker macOS run also exhausted local TCP ports (51,921 `TIME_WAIT`
+sockets and explicit `EADDRNOTAVAIL` before restore). For the current 200-case
+local run on macOS (both variants and profiles), set `ANTFLY_E2E_REGRESSION_WORKERS=1` and
+`ANTFLY_E2E_REGRESSION_REPEATS=50`; the scheduled Linux job keeps two workers.
+Neither uncertain mutation failures nor host resource exhaustion count as passes.
+Final macOS ARM64 ReleaseSafe validation passed 100/100 serial cases (50 normal,
+50 constrained), with complete JUnit evidence and an unchanged executable hash.
+The deterministic admission histories and all 110 harness/script checks also pass.
+Linux parallel qualification remains separate from this local result.
+
 ## 2026-09-16: constrained Autograph restart exited during teardown
 
 The [second PR #704 production soak](https://github.com/antflydb/antfly/actions/runs/35126679231/job/104951437450)

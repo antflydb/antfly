@@ -23,6 +23,7 @@ class TestRunnerSelection(unittest.TestCase):
             'std.log.info("quiet info", .{}); std.log.warn("visible warning", .{}); }\n'
             'test "verbose logging" { std.testing.log_level = .debug; '
             'std.log.debug("visible debug", .{}); }\n'
+            'test "timed body" { try std.testing.io.sleep(.fromMilliseconds(20), .awake); }\n'
             'test "error logging" { std.log.err("visible error", .{}); }\n'
         )
         cls.binary = root / "tests"
@@ -54,6 +55,34 @@ class TestRunnerSelection(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    def test_timings_measure_body_and_cleanup(self):
+        result = subprocess.run(
+            [str(self.binary), "--test-filter", "timed body"],
+            text=True,
+            capture_output=True,
+            env={**os.environ, "ANTFLY_TEST_TIMINGS": "1"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = [
+            line.split("\t")
+            for line in result.stderr.splitlines()
+            if line.startswith("TIMING\t")
+        ]
+        self.assertEqual(len(records), 1, result.stderr)
+        _, setup, body, io_cleanup, allocator_cleanup, name = records[0]
+        self.assertIn("timed body", name)
+        self.assertGreaterEqual(int(body), 20_000_000)
+        for value in (setup, io_cleanup, allocator_cleanup):
+            self.assertGreaterEqual(int(value), 0)
+        disabled = subprocess.run(
+            [str(self.binary), "--test-filter", "timed body"],
+            text=True,
+            capture_output=True,
+            env={**os.environ, "ANTFLY_TEST_TIMINGS": "0"},
+        )
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertNotIn("TIMING\t", disabled.stderr)
 
     def test_default_and_narrowed_inventory(self):
         result = self.run_selection("--list-tests")

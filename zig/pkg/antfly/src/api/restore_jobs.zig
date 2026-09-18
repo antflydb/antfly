@@ -2474,6 +2474,7 @@ const TestReplicatedPersistence = struct {
     get_gate: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     fail_load_private: bool = false,
     fail_put_private: bool = false,
+    put_error: ?anyerror = null,
     timeout_after_create: bool = false,
     timeout_after_new_create: bool = false,
     fail_delete: bool = false,
@@ -2555,6 +2556,7 @@ const TestReplicatedPersistence = struct {
         if (self.required_leadership_term) |required| {
             if (leadership_term != required) return error.NotLeader;
         }
+        if (self.put_error) |err| return err;
         if (self.fail_put_private) return error.TestRestoreJobPutPrivateFailure;
         const owned_value = try self.alloc.dupe(u8, value);
         errdefer self.alloc.free(owned_value);
@@ -3754,6 +3756,15 @@ test "replicated restore leadership rebuild preserves FIFO and recovers running 
     defer std.testing.allocator.free(expired);
     try TestReplicatedPersistence.put(&persistence, expired_key, expired, 0);
 
+    // A leadership change can supersede the requeue write, and an apply
+    // timeout can leave its result unknown. Preserve those identities through
+    // the persistence ABI and rebuild from durable rows on the next attempt.
+    for ([_]anyerror{ error.MetadataProposalSuperseded, error.MetadataProposalApplyTimeout, error.MetadataMutationOutcomeUnknown }) |err| {
+        persistence.put_error = err;
+        try std.testing.expectError(err, store.prepareReplicatedLeadership(std.testing.allocator, 7));
+        try std.testing.expectEqual(@as(usize, 0), persistence.private_failure_count);
+    }
+    persistence.put_error = null;
     try store.prepareReplicatedLeadership(std.testing.allocator, 7);
     try std.testing.expect(!persistence.rows.contains(expired_key));
     const recovered = try store.takePendingIds(std.testing.allocator, 3);

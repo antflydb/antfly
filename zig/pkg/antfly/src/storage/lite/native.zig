@@ -528,6 +528,8 @@ const PageLinkInfo = struct {
     external_value_len: usize = 0,
     /// value pages only.
     chunk_len: usize = 0,
+    is_delete: bool = false,
+    value_len: usize = 0,
     /// catalog pages only; owned by the cache.
     key: []u8 = &.{},
 };
@@ -556,7 +558,7 @@ const PageLinkCopy = struct {
 const PageCache = struct {
     const default_limit_bytes: usize = 64 * 1024 * 1024;
     const default_link_limit_bytes: usize = 16 * 1024 * 1024;
-    const link_entry_overhead: usize = 64;
+    const link_entry_overhead: usize = @sizeOf(PageLinkInfo) + @sizeOf(u64);
 
     mutex: std.atomic.Mutex = .unlocked,
     pages: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
@@ -580,6 +582,28 @@ const PageCache = struct {
         defer self.mutex.unlock();
         const cached = self.pages.get(page_id) orelse return null;
         return try allocator.dupe(u8, cached);
+    }
+
+    const CatalogProbe = struct {
+        previous_page: u64,
+        matches: bool,
+        is_delete: bool,
+        value_len: usize,
+    };
+
+    // Compare under the cache lock: callers never borrow cache-owned keys or
+    // allocate a copy merely to skip an unrelated historical record.
+    fn probeCatalog(self: *PageCache, page_id: u64, key: []const u8) !?CatalogProbe {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const entry = self.links.get(page_id) orelse return null;
+        if (entry.kind != .catalog) return error.UnexpectedNativePageKind;
+        return .{
+            .previous_page = entry.link_page,
+            .matches = std.mem.eql(u8, entry.key, key),
+            .is_delete = entry.is_delete,
+            .value_len = entry.value_len,
+        };
     }
 
     fn attachResourceManager(self: *PageCache, manager: *resource_manager_mod.ResourceManager) void {
@@ -790,6 +814,9 @@ pub const NativeFile = struct {
     header: Header,
     read_only: bool = false,
     no_sync: bool = false,
+    // An error after slot publication may leave disk ahead of header. Do not
+    // elide a subsequent write based on the old in-memory checkpoint then.
+    checkpoint_publication_uncertain: bool = false,
     page_cache_enabled: std.atomic.Value(bool) = .init(true),
     page_cache: PageCache = .{},
     namespace_directory_cache: NamespaceDirectory = .empty,
@@ -1185,6 +1212,23 @@ pub const NativeFile = struct {
         if (mutations.len == 0) return;
         for (mutations) |mutation| try self.validateCatalogMutation(mutation);
 
+        // Small index files include WAL control records, which are frequently
+        // reset to the same contents. Avoid growing catalog history for those
+        // writes. Bound comparison work to one inline record; bulk mutations
+        // and spilled values retain the normal publication path.
+        if (root == .index and mutations.len == 1 and !self.checkpoint_publication_uncertain) {
+            const mutation = mutations[0];
+            const size = try self.getCatalogRecordSizeFromRoot(root, mutation.key);
+            if (mutation.is_delete and size == null) return self.syncIfRequired();
+            if (!mutation.is_delete and size != null and size.? == mutation.value.len and self.catalogEntryFitsInline(mutation.key, mutation.value)) {
+                const existing = try self.getCatalogRecordFromRootAlloc(self.allocator, root, mutation.key);
+                defer if (existing) |bytes| self.allocator.free(bytes);
+                if (existing) |bytes| {
+                    if (std.mem.eql(u8, bytes, mutation.value)) return self.syncIfRequired();
+                }
+            }
+        }
+
         const previous = self.activeCheckpoint();
         var next_root_page = catalogRootPage(previous, root);
         var page_allocator = try self.pageAllocatorFromFreeMap(previous);
@@ -1231,6 +1275,11 @@ pub const NativeFile = struct {
 
         var page_id = catalogRootPage(previous, root);
         while (page_id != 0) {
+            const probe = try self.probeCatalogForCheckpoint(page_id, key, previous);
+            if (!probe.matches) {
+                page_id = probe.previous_page;
+                continue;
+            }
             const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog);
             const entry = decodeCatalogEntry(payload) catch |err| {
                 self.allocator.free(payload);
@@ -1314,6 +1363,11 @@ pub const NativeFile = struct {
 
         var page_id = catalogRootPage(previous, root);
         while (page_id != 0) {
+            const probe = try self.probeCatalogForCheckpoint(page_id, old_key, previous);
+            if (!probe.matches) {
+                page_id = probe.previous_page;
+                continue;
+            }
             const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog);
             const entry = decodeCatalogEntry(payload) catch |err| {
                 self.allocator.free(payload);
@@ -1434,6 +1488,24 @@ pub const NativeFile = struct {
         return try self.getCatalogRecordFromRootAtCheckpointAlloc(allocator, root, key, self.activeCheckpoint());
     }
 
+    fn probeCatalogForCheckpoint(self: *NativeFile, page_id: u64, key: []const u8, checkpoint: CheckpointSlot) !PageCache.CatalogProbe {
+        if (page_id == 0 or page_id >= checkpoint.page_count) return error.InvalidPageId;
+        const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
+        if (use_cache) {
+            if (try self.page_cache.probeCatalog(page_id, key)) |probe| return probe;
+        }
+        const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .catalog, checkpoint);
+        defer self.allocator.free(payload);
+        const entry = try decodeCatalogEntry(payload);
+        if (use_cache) self.cachePageLinks(page_id, .catalog, payload);
+        return .{
+            .previous_page = entry.previous_page,
+            .matches = std.mem.eql(u8, entry.key, key),
+            .is_delete = entry.is_delete,
+            .value_len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len,
+        };
+    }
+
     fn getCatalogRecordFromRootAtCheckpointAlloc(
         self: *NativeFile,
         allocator: Allocator,
@@ -1443,6 +1515,12 @@ pub const NativeFile = struct {
     ) !?[]u8 {
         var page_id = catalogRootPage(checkpoint, root);
         while (page_id != 0) {
+            const probe = try self.probeCatalogForCheckpoint(page_id, key, checkpoint);
+            if (!probe.matches) {
+                page_id = probe.previous_page;
+                continue;
+            }
+            if (probe.is_delete) return null;
             const payload = try self.readPagePayloadByKindAllocForCheckpoint(allocator, page_id, .catalog, checkpoint);
             defer allocator.free(payload);
             const entry = try decodeCatalogEntry(payload);
@@ -1471,14 +1549,13 @@ pub const NativeFile = struct {
     ) !?usize {
         var page_id = catalogRootPage(checkpoint, root);
         while (page_id != 0) {
-            const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .catalog, checkpoint);
-            defer self.allocator.free(payload);
-            const entry = try decodeCatalogEntry(payload);
-            if (std.mem.eql(u8, entry.key, key)) {
-                if (entry.is_delete) return null;
-                return if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+            const probe = try self.probeCatalogForCheckpoint(page_id, key, checkpoint);
+            if (!probe.matches) {
+                page_id = probe.previous_page;
+                continue;
             }
-            page_id = entry.previous_page;
+            if (probe.is_delete) return null;
+            return probe.value_len;
         }
         return null;
     }
@@ -1505,6 +1582,12 @@ pub const NativeFile = struct {
     ) !?[]u8 {
         var page_id = catalogRootPage(checkpoint, root);
         while (page_id != 0) {
+            const probe = try self.probeCatalogForCheckpoint(page_id, key, checkpoint);
+            if (!probe.matches) {
+                page_id = probe.previous_page;
+                continue;
+            }
+            if (probe.is_delete) return null;
             const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .catalog, checkpoint);
             defer self.allocator.free(payload);
             const entry = try decodeCatalogEntry(payload);
@@ -3329,6 +3412,10 @@ pub const NativeFile = struct {
     }
 
     fn validateFreePagesSafeForCheckpointSlots(self: *NativeFile, free_pages: []const u64) !void {
+        // Append-only writes have nothing to reclaim. Walking both checkpoint
+        // graphs here makes each small catalog write proportional to history.
+        // Nonempty free maps still require the full protected-page proof.
+        if (free_pages.len == 0) return;
         var protected_pages = std.AutoHashMapUnmanaged(u64, void){};
         defer protected_pages.deinit(self.allocator);
 
@@ -3615,6 +3702,8 @@ pub const NativeFile = struct {
                     .external_value_root_page = entry.external_value_root_page,
                     .external_value_len = entry.external_value_len,
                     .key = @constCast(entry.key),
+                    .is_delete = entry.is_delete,
+                    .value_len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len,
                 });
             },
             .value => {
@@ -3642,6 +3731,7 @@ pub const NativeFile = struct {
         encodeCheckpointSlot(&encoded_slot, checkpoint);
 
         const io = self.runtimeIo();
+        self.checkpoint_publication_uncertain = true;
         try self.file.writePositionalAll(io, &encoded_slot, checkpointOffset(next_slot));
         try self.syncIfRequired();
         const active_checkpoint: [1]u8 = .{next_slot};
@@ -3650,6 +3740,7 @@ pub const NativeFile = struct {
 
         self.header.checkpoints[next_slot] = checkpoint;
         self.header.active_checkpoint = next_slot;
+        self.checkpoint_publication_uncertain = false;
     }
 
     fn syncIfRequired(self: *NativeFile) !void {
@@ -6409,6 +6500,107 @@ test "lite native free map reads are bounded by supplied checkpoint" {
     var reachable_pages = std.AutoHashMapUnmanaged(u64, void){};
     defer reachable_pages.deinit(allocator);
     try std.testing.expectError(error.InvalidPageId, file.validateReachableFreeMap(checkpoint, &reachable_pages));
+}
+
+test "lite native unchanged small index records do not publish checkpoints" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "catalog-noop.aflite");
+    defer allocator.free(path);
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+    try file.putIndexCatalogRecord("control", "state");
+    const before = file.activeCheckpoint();
+    for (0..8) |_| {
+        try file.putIndexCatalogRecord("control", "state");
+        try file.deleteIndexCatalogRecord("absent");
+    }
+    try std.testing.expectEqualDeep(before, file.activeCheckpoint());
+    // Equal length is insufficient: changed bytes must still be published.
+    try file.putIndexCatalogRecord("control", "other");
+    try std.testing.expectEqual(before.commit_sequence + 1, file.activeCheckpoint().commit_sequence);
+    try file.deleteIndexCatalogRecord("control");
+    const deleted = file.activeCheckpoint();
+    try file.deleteIndexCatalogRecord("control");
+    try std.testing.expectEqualDeep(deleted, file.activeCheckpoint());
+    try file.putIndexCatalogRecord("control", "other");
+    const restored = file.activeCheckpoint();
+    // An ambiguous publication cannot use the old header as a no-op proof.
+    file.checkpoint_publication_uncertain = true;
+    try file.putIndexCatalogRecord("control", "other");
+    try std.testing.expectEqual(restored.commit_sequence + 1, file.activeCheckpoint().commit_sequence);
+    try std.testing.expect(!file.checkpoint_publication_uncertain);
+    file.page_cache.clear(allocator);
+    const cold = file.activeCheckpoint();
+    try file.putIndexCatalogRecord("control", "other");
+    try std.testing.expectEqualDeep(cold, file.activeCheckpoint());
+    var reader = try NativeFile.open(allocator, path, true);
+    defer reader.close();
+    const value = (try reader.getIndexCatalogRecordAlloc(allocator, "control")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("other", value);
+    try std.testing.expectError(error.ReadOnly, reader.putIndexCatalogRecord("control", "other"));
+}
+
+test "lite native catalog point lookups skip history without allocating" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "catalog-probes.aflite");
+    defer allocator.free(path);
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+    try file.putIndexCatalogRecord("target", "original");
+    const pinned = file.activeCheckpoint();
+    for (0..32) |i| try file.putIndexCatalogRecord("noise", std.mem.asBytes(&i));
+    try file.putIndexCatalogRecord("deleted", "value");
+    try file.deleteIndexCatalogRecord("deleted");
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    file.allocator = failing.allocator();
+    {
+        defer file.allocator = allocator;
+        try std.testing.expectEqual(@as(?usize, 8), try file.getCatalogRecordSizeFromRootAtCheckpoint(.index, "target", file.activeCheckpoint()));
+        try std.testing.expectEqual(@as(?usize, null), try file.getCatalogRecordSizeFromRootAtCheckpoint(.index, "missing", file.activeCheckpoint()));
+        try std.testing.expectEqual(@as(?usize, null), try file.getCatalogRecordSizeFromRootAtCheckpoint(.index, "deleted", file.activeCheckpoint()));
+        const value = (try file.getCatalogRecordFromRootAtCheckpointAlloc(allocator, .index, "target", pinned)).?;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("original", value);
+        try std.testing.expect(!failing.has_induced_failure);
+        file.allocator = allocator;
+        const range = (try file.getCatalogRecordRangeFromRootAtCheckpointAlloc(allocator, .index, "target", 1, 3, file.activeCheckpoint())).?;
+        defer allocator.free(range);
+        try std.testing.expectEqualStrings("rig", range);
+        try std.testing.expect(!failing.has_induced_failure);
+    }
+    try file.putIndexCatalogRecord("target", "new");
+    try std.testing.expectEqual(@as(?usize, 3), try file.getCatalogRecordSizeFromRootAtCheckpoint(.index, "target", file.activeCheckpoint()));
+    try std.testing.expectEqual(@as(?usize, 8), try file.getCatalogRecordSizeFromRootAtCheckpoint(.index, "target", pinned));
+    file.page_cache.clear(allocator);
+    try std.testing.expectEqual(@as(?usize, 3), try file.getCatalogRecordSizeFromRootAtCheckpoint(.index, "target", file.activeCheckpoint()));
+    file.page_cache_enabled.store(false, .monotonic);
+    try std.testing.expectEqual(@as(?usize, 8), try file.getCatalogRecordSizeFromRootAtCheckpoint(.index, "target", pinned));
+}
+
+test "lite native empty free map validation does not allocate or walk checkpoints" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-empty-free-map.aflite");
+    defer allocator.free(path);
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+    try file.putDocument("doc:1", "v1");
+    try file.putDocument("doc:1", "v2");
+
+    // Any reachability walk requires scratch allocation, even with warm pages.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    file.allocator = failing.allocator();
+    defer file.allocator = allocator;
+    try file.validateFreePagesSafeForCheckpointSlots(&.{});
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
 }
 
 test "lite native free map cannot reclaim previous checkpoint pages" {

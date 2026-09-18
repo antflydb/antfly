@@ -64,7 +64,10 @@ fn exercise(a: std.mem.Allocator, execution: controller.Execution) !void {
         errdefer if (!enrolled) a.free(name);
         const shape = node.output_shape;
         const values = try scratch.alloc(f32, @intCast(shape.numElements().?));
-        for (values, 0..) |*value, index| value.* = if (std.mem.endsWith(u8, name, ".bias")) 0 else if (std.mem.indexOf(u8, name, "norm") != null or std.mem.indexOf(u8, name, "LayerNorm") != null) 1 else 0.025 * @sin(@as(f32, @floatFromInt(index + @as(usize, id) * 11 + 1)));
+        // Classification depends on the tensor name, not on each weight.
+        const is_bias = std.mem.endsWith(u8, name, ".bias");
+        const is_norm = std.mem.indexOf(u8, name, "norm") != null or std.mem.indexOf(u8, name, "LayerNorm") != null;
+        for (values, 0..) |*value, index| value.* = if (is_bias) 0 else if (is_norm) 1 else 0.025 * @sin(@as(f32, @floatFromInt(index + @as(usize, id) * 11 + 1)));
         var tensor = try Tensor.initFloat32(a, name, shape.dims[0..shape.rank_], values);
         errdefer if (!enrolled) tensor.deinit();
         try store.resident_weights.put(a, name, .{ .tensor = tensor });
@@ -152,7 +155,11 @@ fn exercise(a: std.mem.Allocator, execution: controller.Execution) !void {
 }
 
 test "boundary inactive adapter CPU classifier LoRA DoRA mixed accumulation zero objective and durable partial resume" {
-    try exercise(std.testing.allocator, .native);
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const test_allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    try exercise(test_allocator, .native);
 }
 
 test "boundary inactive adapter Metal classifier LoRA DoRA mixed accumulation zero objective and durable partial resume" {

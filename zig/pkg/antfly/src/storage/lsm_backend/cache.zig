@@ -1365,25 +1365,21 @@ test "cache pending load waiter survives finish removal" {
     };
 
     var waiter = Waiter{};
-    var thread = try std.testing.io.concurrent(Waiter.run, .{ &waiter, &cache });
     {
-        defer {
-            cache.finishLoad("run-1", 1, 1, .run_table_index);
-            thread.await(std.testing.io);
-        }
-        // Observe the waiter before removing the pending load. A fixed sleep
-        // can expire before the concurrent task starts on a busy CI runner.
-        // beginLoad increments waits under the same lock used by finishLoad,
-        // so removal cannot overtake the wait registration after this point.
-        var attempts: usize = 0;
-        while (cache.snapshotStats().run_table_index.waits == 0 and attempts < 10_000) : (attempts += 1) {
-            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
-        }
-        try std.testing.expect(cache.snapshotStats().run_table_index.waits > 0);
+        var thread = try std.testing.io.concurrent(Waiter.run, .{ &waiter, &cache });
+        defer thread.await(std.testing.io);
+        defer cache.finishLoad("run-1", 1, 1, .run_table_index);
+        // beginLoad increments waits under pending_sync before releasing the
+        // mutex in wait(). finishLoad takes that same mutex, so observing the
+        // counter guarantees removal follows waiter enrollment, even if the
+        // worker starts late. A scheduling delay cannot prove that ordering.
+        while (cache.snapshotStats().run_table_index.waits == 0)
+            platform.time.yieldBriefly();
     }
 
     if (waiter.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), cache.pendingLoadCountForTests());
+    try std.testing.expect(cache.snapshotStats().run_table_index.waits > 0);
 }
 
 test "cache accounts table index prefix bloom filters" {

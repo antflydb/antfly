@@ -7123,6 +7123,8 @@ fn consumerTests() type {
                 .doc_count = 1,
                 .node_count = 1,
                 .coverage_produced_count = 1,
+                .publication_target_count = 1,
+                .publication_target_ready = true,
                 .coverage_generation = 7,
                 .coverage_config_hash = 41,
                 .coverage_identity_ready = true,

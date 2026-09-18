@@ -49,6 +49,7 @@ const replayable_sources = [_]Source{
     .{ .path = "vopr/parquet_cache.zig", .bytes = @embedFile("parquet_cache.zig") },
     .{ .path = "vopr/provider_boundaries.zig", .bytes = @embedFile("provider_boundaries.zig") },
     .{ .path = "vopr/provisioning_startup.zig", .bytes = @embedFile("provisioning_startup.zig") },
+    .{ .path = "vopr/restore_admission.zig", .bytes = @embedFile("restore_admission.zig") },
     .{ .path = "vopr/production_cluster.zig", .bytes = @embedFile("production_cluster.zig") },
     .{ .path = "vopr/production_standby.zig", .bytes = @embedFile("production_standby.zig") },
     .{ .path = "vopr/query_embedding_cache.zig", .bytes = @embedFile("query_embedding_cache.zig") },
