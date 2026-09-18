@@ -769,6 +769,9 @@ const BatchReservationIdentity = struct {
 
 const ObserverIdentity = struct {
     current: u64,
+    completion_pins: usize = 0,
+    completion_reservation_identity: u64 = 0,
+    completion_published: bool = false,
 };
 
 const ObserverKey = struct {
@@ -2724,6 +2727,12 @@ pub const ResourceManager = struct {
             self.memory.accounting_errors +|= 1;
             return error.ResourceAccountingMismatch;
         }
+        // A completion ticket owns both its unused reservation and this
+        // observer. Generic observation cannot discard or mint that credit.
+        if (owned.completion_pins != 0 and previous != next) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
 
         const state = &self.slices[sliceIndex(slice)];
         if (previous > state.used_bytes or previous > self.memory.used_bytes) {
@@ -2762,7 +2771,7 @@ pub const ResourceManager = struct {
             self.memory.soft_limit_events +|= 1;
         if (!enforce_limits and self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)
             self.memory.hard_limit_rejections +|= 1;
-        if (next == 0) _ = self.observer_identities.remove(key);
+        if (next == 0 and owned.completion_pins == 0) _ = self.observer_identities.remove(key);
         self.pressure_change.advance();
     }
 
@@ -2864,6 +2873,7 @@ pub const ResourceManager = struct {
                 self.memory.accounting_errors +|= 1;
                 return error.ResourceAccountingMismatch;
             }
+            if (owned.completion_pins != 0) return error.ResourceAccountingMismatch;
             break :blk owned.current;
         } else blk: {
             if (destination.* != 0) {
@@ -2872,6 +2882,7 @@ pub const ResourceManager = struct {
             }
             break :blk 0;
         };
+        if (source_owned.completion_pins != 0) return error.ResourceAccountingMismatch;
 
         var inserted_destination = false;
         if (destination_previous == 0 and destination_next != 0 and
@@ -3401,6 +3412,268 @@ pub const CapacityReservation = struct {
 fn hbcClockEntries(budget_bytes: u64, estimated_entry_bytes: u64) usize {
     const entries = @min(hbc_max_clock_entries, @max(@as(u64, 1), budget_bytes / estimated_entry_bytes));
     return @intCast(entries);
+}
+
+/// Prepaid ownership for one completion allocation/publication lifetime.
+/// The manager and tracked counter must remain at stable addresses, and the
+/// caller serializes this move-only ticket with its publication/reclamation.
+/// While the ticket is live, the counter is exclusively updated through it.
+/// This is an accounting primitive, not evidence that physical buffers were
+/// freed, a durable transaction ticket, or permission to bypass backend limits.
+pub const CompletionCredit = struct {
+    reservation: Reservation,
+    tracked: *u64,
+    staged: u64 = 0,
+    closed: bool = false,
+
+    pub fn init(manager: *ResourceManager, slice: Slice, capacity: u64, tracked: *u64) !CompletionCredit {
+        var reservation = try manager.reserveWithoutReclaim(slice, capacity);
+        errdefer reservation.release();
+        lockAtomic(&manager.mutex);
+        defer manager.mutex.unlock();
+        if (tracked.* != 0) return error.ResourceAccountingMismatch;
+        const key = ObserverKey{ .slice = slice, .identity = @intFromPtr(tracked) };
+        if (manager.observer_identities.contains(key)) return error.ResourceAccountingMismatch;
+        _ = try manager.reservationIdentityLocked(&reservation);
+        // Register before allocation/publication. All subsequent ownership
+        // transfers are allocation-free, including at an aggregate hard cap.
+        try manager.observer_identities.put(manager.identity_allocator, key, .{
+            .current = 0,
+            .completion_pins = 1,
+            .completion_reservation_identity = reservation.identity,
+        });
+        return .{ .reservation = reservation, .tracked = tracked };
+    }
+
+    /// Call before allocating bytes. Allocation failure must rollback only
+    /// after the allocator has freed every partial allocation in that charge.
+    pub fn stage(self: *CompletionCredit, bytes: u64) !void {
+        if (self.closed) return error.ReservationReleased;
+        try self.move(bytes, true, false);
+    }
+
+    pub fn rollback(self: *CompletionCredit, bytes: u64) !void {
+        if (self.closed) return error.ReservationReleased;
+        try self.move(bytes, false, false);
+    }
+
+    /// No allocation or accounting mutation occurs at the irreversible boundary.
+    pub fn markPublished(self: *CompletionCredit) !void {
+        if (self.closed) return error.ReservationReleased;
+        const manager = self.reservation.manager;
+        lockAtomic(&manager.mutex);
+        defer manager.mutex.unlock();
+        const key = ObserverKey{ .slice = self.reservation.slice, .identity = @intFromPtr(self.tracked) };
+        const observer = manager.observer_identities.getPtr(key) orelse return error.ResourceAccountingMismatch;
+        if (observer.completion_reservation_identity != self.reservation.identity or
+            observer.completion_pins != 1 or observer.current != self.staged or observer.current != self.tracked.*)
+            return error.ResourceAccountingMismatch;
+        if (observer.completion_published) return error.CompletionAlreadyPublished;
+        // Canonical state lives with the pinned observer, not in a copyable
+        // ticket value. A stale pre-publication alias cannot restore credit.
+        observer.completion_published = true;
+    }
+
+    /// Call only after physical reclamation, including the final reader pin.
+    /// Request return, cancellation, WAL append, and flush alone are not proof.
+    pub fn reclaim(self: *CompletionCredit, bytes: u64) !void {
+        if (self.closed) return error.ReservationReleased;
+        try self.move(bytes, false, true);
+    }
+
+    /// Release unused credit while retaining every live allocation charge.
+    pub fn releaseUnused(self: *CompletionCredit) void {
+        if (self.closed) return;
+        self.reservation.shrink(self.reservation.bytes);
+    }
+
+    pub fn deinit(self: *CompletionCredit) !void {
+        if (self.closed) return;
+        if (self.staged != 0) return error.CompletionOwnershipLive;
+        const manager = self.reservation.manager;
+        {
+            lockAtomic(&manager.mutex);
+            defer manager.mutex.unlock();
+            const key = ObserverKey{ .slice = self.reservation.slice, .identity = @intFromPtr(self.tracked) };
+            const observer = manager.observer_identities.get(key) orelse return error.ResourceAccountingMismatch;
+            if (observer.completion_reservation_identity != self.reservation.identity) return error.ResourceAccountingMismatch;
+            const reservation = manager.reservation_identities.get(self.reservation.identity) orelse return error.ReservationReleased;
+            if (observer.current != 0 or observer.completion_pins != 1 or self.tracked.* != 0 or
+                reservation.bytes != self.reservation.bytes or reservation.slice != self.reservation.slice)
+                return error.ResourceAccountingMismatch;
+            _ = manager.observer_identities.remove(key);
+        }
+        self.reservation.release();
+        self.closed = true;
+    }
+
+    fn move(self: *CompletionCredit, bytes: u64, into_observer: bool, reclamation: bool) !void {
+        const manager = self.reservation.manager;
+        lockAtomic(&manager.mutex);
+        defer manager.mutex.unlock();
+        const reservation = manager.reservation_identities.getPtr(self.reservation.identity) orelse return error.ReservationReleased;
+        const key = ObserverKey{ .slice = self.reservation.slice, .identity = @intFromPtr(self.tracked) };
+        const observer = manager.observer_identities.getPtr(key) orelse return error.ResourceAccountingMismatch;
+        if (observer.completion_reservation_identity != self.reservation.identity) return error.ResourceAccountingMismatch;
+        if (observer.completion_published and !reclamation) return error.CompletionAlreadyPublished;
+        if (reservation.slice != self.reservation.slice or reservation.bytes != self.reservation.bytes or
+            observer.current != self.tracked.* or observer.current != self.staged or observer.completion_pins != 1)
+            return error.ResourceAccountingMismatch;
+        if (into_observer) {
+            if (bytes > reservation.bytes) return error.ResourceBudgetExceeded;
+            const next = std.math.add(u64, observer.current, bytes) catch return error.ResourceAccountingMismatch;
+            reservation.bytes -= bytes;
+            observer.current = next;
+        } else {
+            if (bytes > observer.current) return error.ResourceAccountingMismatch;
+            const next = std.math.add(u64, reservation.bytes, bytes) catch return error.ResourceAccountingMismatch;
+            observer.current -= bytes;
+            reservation.bytes = next;
+        }
+        self.reservation.bytes = reservation.bytes;
+        self.tracked.* = observer.current;
+        self.staged = observer.current;
+        // Ownership changes under the same accounting lock. Slice and host
+        // totals (and peaks) never change, even with subsequently reduced caps.
+    }
+};
+
+test "workload admission completion credit never exposes capacity during concurrent handoff" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator, .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(std.testing.allocator);
+    var tracked: u64 = 0;
+    var credit = try CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked);
+    defer credit.deinit() catch unreachable;
+    const Probe = struct {
+        fn run(rm: *ResourceManager, bad: *std.atomic.Value(bool)) void {
+            for (0..2000) |_| {
+                if (rm.reserveWithoutReclaim(.lsm_in_memory_state, 1)) |held| {
+                    var owned = held;
+                    owned.release();
+                    bad.store(true, .release);
+                } else |err| {
+                    if (err != error.ResourceBudgetExceeded) bad.store(true, .release);
+                }
+                if (rm.snapshot().memory.used_bytes != 100) bad.store(true, .release);
+            }
+        }
+    };
+    var bad = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{ &manager, &bad });
+    for (0..2000) |_| {
+        try credit.stage(64);
+        try credit.rollback(64);
+    }
+    thread.join();
+    try std.testing.expect(!bad.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.peak_bytes);
+}
+
+test "workload admission completion credit preserves published pinned ownership" {
+    const alloc = std.testing.allocator;
+    var manager = ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(alloc);
+    var tracked: u64 = 0;
+    var credit = try CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked);
+    try credit.stage(64);
+    const retained = try alloc.alloc(u8, 64);
+    try credit.markPublished();
+    credit.releaseUnused();
+    try std.testing.expectEqual(@as(u64, 64), manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.CompletionAlreadyPublished, credit.rollback(64));
+    try std.testing.expectError(error.CompletionOwnershipLive, credit.deinit());
+    try std.testing.expect(!manager.tryObserveUsage(.lsm_in_memory_state, &tracked, 0));
+    try std.testing.expectEqual(@as(u64, 64), tracked);
+    try std.testing.expectEqual(@as(u64, 64), manager.snapshot().memory.used_bytes);
+    // A surviving reader still owns the allocation after the submitting
+    // request releases unused credit. Only its final free permits retirement.
+    @memset(retained, 7);
+    try std.testing.expectEqual(@as(u8, 7), retained[63]);
+    alloc.free(retained);
+    try credit.reclaim(64);
+    try std.testing.expectEqual(@as(u64, 64), manager.snapshot().memory.used_bytes);
+    try credit.deinit();
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "workload admission completion credit transfers survive reduced limits without allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator(), .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(std.testing.allocator);
+    var tracked: u64 = 0;
+    var credit = try CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked);
+    defer credit.deinit() catch unreachable;
+    failing.fail_index = failing.alloc_index;
+    manager.memory.budget.hard_limit_bytes = 1;
+    manager.slices[sliceIndex(.lsm_in_memory_state)].budget.hard_limit_bytes = 1;
+    try credit.stage(100);
+    try std.testing.expectError(error.ResourceBudgetExceeded, credit.stage(1));
+    try credit.rollback(100);
+    try credit.stage(100);
+    try credit.markPublished();
+    try credit.reclaim(100);
+    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.used_bytes);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "workload admission completion credit stale alias cannot roll back published ownership" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator, .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(std.testing.allocator);
+    var tracked: u64 = 0;
+    var credit = try CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked);
+    var before_stage = credit;
+    try credit.stage(64);
+    var before_publish = credit;
+    try credit.markPublished();
+    try std.testing.expectError(error.CompletionAlreadyPublished, before_publish.rollback(64));
+    try std.testing.expectError(error.CompletionAlreadyPublished, before_publish.stage(1));
+    try std.testing.expectError(error.CompletionAlreadyPublished, before_publish.markPublished());
+    try std.testing.expectError(error.CompletionAlreadyPublished, before_stage.rollback(0));
+    try std.testing.expectError(error.ResourceAccountingMismatch, before_stage.deinit());
+    try std.testing.expectEqual(@as(u64, 64), tracked);
+    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.used_bytes);
+    try credit.reclaim(64);
+    try credit.deinit();
+    // Reusing the same counter address must not authorize an older ticket.
+    var next = try CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked);
+    defer next.deinit() catch unreachable;
+    try std.testing.expectError(error.ResourceAccountingMismatch, before_stage.markPublished());
+    try std.testing.expectError(error.ResourceAccountingMismatch, before_stage.deinit());
+    try next.stage(1);
+    try next.rollback(1);
+}
+
+test "workload admission completion credit rolls back actual backing allocation failure" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator, .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(std.testing.allocator);
+    var tracked: u64 = 0;
+    var credit = try CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked);
+    defer credit.deinit() catch unreachable;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try credit.stage(64);
+    try std.testing.expectError(error.OutOfMemory, failing.allocator().alloc(u8, 64));
+    try credit.rollback(64);
+    try std.testing.expectEqual(@as(u64, 0), tracked);
+    try std.testing.expectEqual(@as(u64, 100), credit.reservation.reservedBytes());
+    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.used_bytes);
+}
+
+test "workload admission completion credit initialization failure leaves no charge" {
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var manager = ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 100 } });
+            defer manager.deinit(alloc);
+            var tracked: u64 = 0;
+            var credit = CompletionCredit.init(&manager, .lsm_in_memory_state, 100, &tracked) catch |err| {
+                try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+                return err;
+            };
+            try credit.stage(100);
+            try credit.rollback(100);
+            try credit.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 pub const Reservation = struct {
