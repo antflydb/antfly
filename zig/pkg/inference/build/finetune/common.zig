@@ -204,14 +204,16 @@ fn configureCommand(ctx: Context, spec: CommandSpec, exe: *std.Build.Step.Compil
 }
 
 fn sameCommandConfiguration(a: CommandSpec, b: CommandSpec) bool {
+    // inference_internal owns the Metal translation unit when imported; otherwise
+    // configureNative supplies it at the executable root. Keep that ownership.
     return a.shared_check and b.shared_check and a.assets == b.assets and a.native_link == b.native_link and
         a.link_libc == b.link_libc and a.release_metadata == b.release_metadata and
-        std.mem.eql(Import, a.imports, b.imports);
+        containsImport(a.imports, .inference_internal) == containsImport(b.imports, .inference_internal);
 }
 
 /// Check every registered entrypoint without recompiling its shared inference
-/// implementation for every CLI. Only identical import/link profiles share a
-/// compilation, so the check cannot supply another command's dependencies.
+/// implementation for every CLI. Compatible link profiles share a compilation;
+/// each command module still receives only its declared imports.
 /// Individual command artifacts and run targets remain independently buildable.
 pub fn addCommandChecks(ctx: Context, specs: []const CommandSpec) *std.Build.Step {
     const b = ctx.b;
@@ -222,12 +224,12 @@ pub fn addCommandChecks(ctx: Context, specs: []const CommandSpec) *std.Build.Ste
     for (specs, 0..) |spec, first| {
         if (assigned[first]) continue;
         var names: std.ArrayList([]const u8) = .empty;
-        var paths: std.ArrayList([]const u8) = .empty;
+        var commands: std.ArrayList(CommandSpec) = .empty;
         for (specs, 0..) |candidate, index| {
             if (assigned[index] or (index != first and !sameCommandConfiguration(spec, candidate))) continue;
             std.debug.assert(std.mem.startsWith(u8, candidate.root_source_file, "src/"));
             names.append(b.allocator, candidate.name) catch @panic("OOM");
-            paths.append(b.allocator, candidate.root_source_file) catch @panic("OOM");
+            commands.append(b.allocator, candidate) catch @panic("OOM");
             assigned[index] = true;
         }
         const generated = b.addWriteFiles();
@@ -249,17 +251,28 @@ pub fn addCommandChecks(ctx: Context, specs: []const CommandSpec) *std.Build.Ste
         configureCommand(ctx, spec, check);
         // Share each named dependency within the group, while retaining the
         // original source boundary for each command module.
-        for (paths.items, 0..) |path, index| {
+        for (commands.items, 0..) |command, index| {
             const module = b.createModule(.{
-                .root_source_file = ctx.path(path),
+                .root_source_file = ctx.path(command.root_source_file),
                 .target = ctx.target,
                 .optimize = ctx.optimize,
             });
-            var imports = check.root_module.import_table.iterator();
-            while (imports.next()) |entry| {
-                if (!std.mem.startsWith(u8, entry.key_ptr.*, "command_"))
-                    module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+            // Commands keep their declared imports even when their link-compatible
+            // checks share an executable. A union of imports would mask missing
+            // dependency declarations in standalone commands.
+            for (command.imports) |dependency| {
+                const name = @tagName(dependency);
+                if (!check.root_module.import_table.contains(name))
+                    addImports(ctx, check.root_module, &.{dependency}, ctx.qualification_pjrt_mod);
+                if (check.root_module.import_table.get(name)) |shared|
+                    module.addImport(name, shared);
+                if (dependency == .onnx_graph) module.addImport("onnx_data", ctx.onnx.data);
             }
+            if (command.native_link != .none) ctx.identities.addImports(module);
+            if (command.assets != null)
+                module.addImport("inference_finetune_assets", check.root_module.import_table.get("inference_finetune_assets").?);
+            if (command.release_metadata)
+                module.addImport("build_info", ctx.build_info_mod);
             check.root_module.addImport(b.fmt("command_{d}", .{index}), module);
         }
         _ = check.getEmittedBin();

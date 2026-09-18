@@ -1096,13 +1096,27 @@ class RuntimeCacheTest(unittest.TestCase):
         # compiling the missing command or maintaining another test inventory.
         integration = self.own("zig/pkg/inference/build/integration.zig")
         contents = integration.read_text()
-        registration = (
-            "for (commands) |command| finetune_step.dependOn(&command.executable.step);"
-        )
+        registration = 'finetune_step.dependOn(finetune.addCommandChecks(finetune_ctx, &(@import("finetune/tools.zig").specs ++ @import("finetune/workflows.zig").specs)));'
         self.assertIn(registration, contents)
-        integration.write_text(contents.replace(registration, "_ = commands;"))
+        integration.write_text(contents.replace(registration, ""))
         failure = self.build("cache-finetune-registry", succeeds=False)
         self.assertIn("finetune aggregate does not compile", failure)
+        integration.write_text(contents)
+        common = self.own("zig/pkg/inference/build/finetune/common.zig")
+        contents = common.read_text()
+        attachment = (
+            'check.root_module.addImport(b.fmt("command_{d}", .{index}), module);'
+        )
+        self.assertIn(attachment, contents)
+        common.write_text(
+            contents.replace(
+                attachment,
+                'module.addImport("undeclared-test-import", ctx.jinja_mod);\n'
+                + attachment,
+            )
+        )
+        failure = self.build("cache-finetune-registry", succeeds=False)
+        self.assertIn("received undeclared import undeclared-test-import", failure)
 
     def test_wasm_profile_cache_contracts(self):
         for source in ("zig/lib/httpx/src/httpx.zig", "zig/lib/json/src/mod.zig"):

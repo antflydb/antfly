@@ -12,28 +12,43 @@ compiled each as a separate executable; the measured compile steps summed to
 1,077 seconds, excluding the actual test executables and auxiliary tools.
 Summed compile durations are not elapsed gate time.
 
-The root `inference-finetune-test` and standalone `test-finetune` gate now use
-35 compile/link groups for 68 entrypoints after merging the two new GLiNER2.5
-commands from main (the measured change initially used 34 groups for 66). Groups must have identical named imports, asset owner,
-native linkage, libc setting, and release metadata. The generated dispatcher
+The root `inference-finetune-test` and standalone `test-finetune` gates now use
+24 compile/link groups for 68 entrypoints, down from 35 at `addc7fa2ca`. Groups
+share asset owner, native linkage, libc setting, release metadata, and ownership
+of the Metal translation unit. Different named import lists no longer force
+another compilation: each command gets only its declared imports, referencing
+shared dependency module identities within its group. The generated dispatcher
 selects a CLI at runtime, keeping every registered `main` reachable for semantic
 analysis, code generation, and linking. The checks are not installed or executed.
 Individual CLI targets retain their original modules and run behavior.
 
-Five entrypoints require isolated checks because they import another CLI through
-relative paths; Zig rejects those files appearing in two modules. Their registry
-entries set `shared_check = false`. A future conflicting entrypoint fails the
-build instead of silently disappearing from coverage. New registry entries are
-automatically checked. The ordinary finetuning test executables remain in the gate.
+Six entrypoints require isolated checks because their relative source imports
+overlap another CLI's source tree; Zig rejects those files appearing in two
+modules. Their registry entries set `shared_check = false`, including fused
+chunker evaluation, which shares native-compute sources with training. A future
+conflicting entrypoint fails the build instead of silently disappearing from
+coverage. New registry entries are automatically checked. The ordinary
+finetuning test executables and their ownership remain unchanged.
 
-`python3 -m unittest tools/test_finetune_command_checks.py` checks that runtime
-dispatch rejects semantic and linker failures in an unexecuted second entrypoint.
+`python3 -m unittest tools.test_finetune_command_checks
+tools.test_runtime_cache.RuntimeCacheTest.test_finetune_command_registry`
+checks runtime dispatch rejects semantic and linker failures in an unexecuted
+second entrypoint. It also inspects the actual build graph for every registered
+command exactly once and for each command's declared imports. Negative mutations
+prove it detects a disconnected compile-check gate and an undeclared import.
+The registry check previously assumed individually compiled commands and is now
+updated for the grouped gate.
+
 `zig build inference-finetune-command-check -Dmetal=false -Dcuda=false` runs only
 the command checks. The standalone name is `test-finetune-command-check`.
 
-This change halves the number of command compilations. A clean Linux CI run is
-still needed to establish the resulting gate wall-time reduction; local follow-up
-builds reuse caches and should not be presented as cold-build speedups.
+In Linux CI run 35372508595, the prior finetuning gate compiled 35 command groups
+and 21 test executables. Their rounded compile durations summed to about 644
+seconds while test runs summed to about seven seconds. These are overlapping
+step durations, not exclusive wall time. This follow-up removes 11 command
+compilations (31%) without changing test selection or executing commands. A clean
+Linux CI run is needed to measure elapsed improvement; cached local builds are
+not a cold-build speedup measurement.
 
 ## Ownership and boundaries
 
