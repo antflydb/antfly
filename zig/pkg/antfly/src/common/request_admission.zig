@@ -66,12 +66,12 @@ pub fn appendPrometheusMetrics(
     const prefix = "antfly_admission_" ++ @tagName(class);
     try prometheus.appendPromMetric(writer, prefix ++ "_queue_capacity_requests", "gauge", "Configured maximum queued requests", stats.max_queued_requests);
     try prometheus.appendPromMetric(writer, prefix ++ "_queue_capacity_bytes", "gauge", "Configured maximum queued request bytes", stats.max_queued_bytes);
-    try prometheus.appendPromMetric(writer, prefix ++ "_retained_capacity_bytes", "gauge", "Configured request reservation byte ceiling; zero is unlimited", stats.max_retained_bytes);
+    try prometheus.appendPromMetric(writer, prefix ++ "_retained_capacity_bytes", "gauge", "Configured request and tracked allocation byte ceiling; zero is unlimited", stats.max_retained_bytes);
     try prometheus.appendPromMetric(writer, prefix ++ "_wait_ceiling_milliseconds", "gauge", "Configured admission wait ceiling; zero is fail fast", stats.max_wait_ms);
     try prometheus.appendPromMetric(writer, prefix ++ "_draining", "gauge", "Whether this admission owner is closed to new work", @intFromBool(stats.draining));
     try prometheus.appendPromMetric(writer, prefix ++ "_queued_requests", "gauge", "Requests waiting for admission", stats.queued);
     try prometheus.appendPromMetric(writer, prefix ++ "_queued_bytes", "gauge", "Retained bytes owned by admission waiters", stats.queued_bytes);
-    try prometheus.appendPromMetric(writer, prefix ++ "_retained_bytes", "gauge", "Request bytes reserved by queued and active leases", stats.retained_bytes);
+    try prometheus.appendPromMetric(writer, prefix ++ "_retained_bytes", "gauge", "Request reservations and tracked query or output allocations still owned", stats.retained_bytes);
     try prometheus.appendPromMetric(writer, prefix ++ "_waited_requests_total", "counter", "Requests entering admission waiting", stats.waited_total);
     try prometheus.appendPromMetric(writer, prefix ++ "_wait_nanoseconds_total", "counter", "Cumulative admission waiting time", stats.wait_ns_total);
     try prometheus.appendPromMetric(writer, prefix ++ "_expired_requests_total", "counter", "Waiters retired on admission or request deadline", stats.expired_total);

@@ -20,6 +20,50 @@ const serverless_http_types = @import("serverless/api/http_types.zig");
 
 pub const ServerlessHttpServerConfig = struct {};
 
+test "workload admission serverless adapters retain body ownership through output drain" {
+    const Owner = @import("common/workload_allocator.zig").Owner;
+    const Controller = @import("common/workload_admission.zig").Controller;
+    const Producer = struct {
+        gate: Controller = Controller.initConfigured(1, .{ .max_retained_bytes = 4096 }),
+
+        pub fn handle(self: *@This(), _: serverless_http_types.HttpRequest) !serverless_http_types.HttpResponse {
+            const owner = try Owner.create(std.testing.allocator, &self.gate);
+            errdefer owner.release();
+            const alloc = owner.allocator();
+            const content_type = try alloc.dupe(u8, "application/json");
+            errdefer alloc.free(content_type);
+            return .{
+                .status = 200,
+                .content_type = content_type,
+                .body = try alloc.dupe(u8, "{\"ok\":true}"),
+                .memory_owner = owner,
+            };
+        }
+    };
+    var producer: Producer = .{};
+    var producer_live = true;
+    defer if (producer_live) producer.gate.deinitMemory();
+    var server = ServerlessHttpServer.init(std.testing.allocator, .{}, &producer);
+    var buffered = try server.handle(.{ .method = .POST, .uri = "/db/v1/tables/docs/query", .body = "{}" });
+    defer buffered.deinit(std.testing.allocator);
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/db/v1/tables/docs/query");
+    defer request.deinit();
+    request.body = "{}";
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    var ctx_live = true;
+    defer if (ctx_live) ctx.deinit();
+    var native = try server.handleHttpx(&ctx);
+    defer native.deinit();
+    ctx.deinit();
+    ctx_live = false;
+    try std.testing.expect(producer.gate.stats().retained_bytes >= buffered.body.len + native.body.?.len);
+    producer.gate.deinitMemory();
+    producer_live = false;
+    producer = undefined;
+    try std.testing.expectEqualStrings("{\"ok\":true}", buffered.body);
+    try std.testing.expectEqualStrings("{\"ok\":true}", native.body.?);
+}
+
 pub const Handler = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -107,21 +151,28 @@ pub const ServerlessHttpServer = struct {
         });
         defer resp.deinit(self.alloc);
 
-        var response = http_common.HttpResponse{
+        const alloc = if (resp.memory_owner) |owner| owner.allocator() else self.alloc;
+        var response: http_common.HttpResponse = .{
             .status = resp.status,
-            .owner_allocator = self.alloc,
-            .content_type = try self.alloc.dupe(u8, resp.content_type),
-            .body = try self.alloc.dupe(u8, resp.body),
+            .owner_allocator = alloc,
+            .content_type = resp.content_type,
+            .body = resp.body,
         };
-        errdefer response.deinit(self.alloc);
+        if (resp.memory_owner) |owner|
+            response.allocation_owner = .{ .ptr = owner, .release = releaseResponseMemory };
+        // Move the allocation owner and buffers together across the adapter.
+        resp.content_type = &.{};
+        resp.body = &.{};
+        resp.memory_owner = null;
+        errdefer response.deinit(alloc);
         if (resp.retry_after_seconds) |seconds| {
-            const value = try std.fmt.allocPrint(self.alloc, "{d}", .{seconds});
-            defer self.alloc.free(value);
-            const name_owned = try self.alloc.dupe(u8, "Retry-After");
-            errdefer self.alloc.free(name_owned);
-            const value_owned = try self.alloc.dupe(u8, value);
-            errdefer self.alloc.free(value_owned);
-            const headers = try self.alloc.alloc(http_common.Header, 1);
+            const value = try std.fmt.allocPrint(alloc, "{d}", .{seconds});
+            defer alloc.free(value);
+            const name_owned = try alloc.dupe(u8, "Retry-After");
+            errdefer alloc.free(name_owned);
+            const value_owned = try alloc.dupe(u8, value);
+            errdefer alloc.free(value_owned);
+            const headers = try alloc.alloc(http_common.Header, 1);
             headers[0] = .{
                 .name = name_owned,
                 .value = value_owned,
@@ -129,6 +180,16 @@ pub const ServerlessHttpServer = struct {
             response.headers = headers;
         }
         return response;
+    }
+
+    fn releaseResponseMemory(raw: *anyopaque) void {
+        const owner: *@import("common/workload_allocator.zig").Owner = @ptrCast(@alignCast(raw));
+        owner.release();
+    }
+
+    fn retainResponseMemory(raw: *anyopaque) void {
+        const owner: *@import("common/workload_allocator.zig").Owner = @ptrCast(@alignCast(raw));
+        owner.retain();
     }
 
     /// Native httpx adapter. Request decoding and response encoding remain at
@@ -162,6 +223,16 @@ pub const ServerlessHttpServer = struct {
         });
         defer response.deinit(self.alloc);
 
+        if (response.memory_owner) |owner| {
+            std.debug.assert(ctx.response.body_memory == null and !ctx.response.body_owned);
+            owner.retain();
+            ctx.response.body_memory = .{
+                .allocator = owner.allocator(),
+                .ptr = owner,
+                .retain = retainResponseMemory,
+                .release = releaseResponseMemory,
+            };
+        }
         _ = ctx.status(response.status);
         try ctx.setHeader("Content-Type", response.content_type);
         if (response.retry_after_seconds) |seconds| {
@@ -170,6 +241,11 @@ pub const ServerlessHttpServer = struct {
             try ctx.setHeader("Retry-After", value);
         }
         _ = ctx.response.body(response.body);
+        if (response.memory_owner != null) {
+            // The installed body allocator owns this exact allocation.
+            ctx.response.body_owned = true;
+            response.body = &.{};
+        }
         return try ctx.response.build();
     }
 

@@ -601,20 +601,25 @@ pub const Context = struct {
             return self.status(413).text("File Too Large");
         }
 
-        const content = try self.allocator.alloc(u8, @intCast(stat.size));
-        errdefer self.allocator.free(content);
+        const alloc = self.response.bodyAllocator();
+        const content = try alloc.alloc(u8, @intCast(stat.size));
+        var content_owned = true;
+        defer if (content_owned) alloc.free(content);
         _ = f.readPositionalAll(self.io, content, 0) catch return self.status(500).text("Read Error");
 
         _ = try self.response.header(HeaderName.CONTENT_TYPE, common.mimeTypeFromPath(path));
-        self.response.body_data = content;
+        _ = self.response.body(content);
         self.response.body_owned = true;
+        content_owned = false;
         return self.response.build();
     }
 
     /// Sends chunked transfer-encoded payload with optional trailers.
     pub fn chunked(self: *Self, data: []const u8, trailers: ?*const Headers) !Response {
-        const encoded = try http.encodeChunkedBody(data, trailers, self.allocator);
-        errdefer self.allocator.free(encoded);
+        const alloc = self.response.bodyAllocator();
+        const encoded = try http.encodeChunkedBody(data, trailers, alloc);
+        var encoded_owned = true;
+        defer if (encoded_owned) alloc.free(encoded);
 
         _ = try self.response.header(HeaderName.TRANSFER_ENCODING, "chunked");
         if (trailers) |trailer_headers| {
@@ -623,16 +628,18 @@ pub const Context = struct {
             _ = try self.response.header(HeaderName.TRAILER, trailer_names);
         }
         // Transfer ownership to the builder to avoid a second allocation in build().
-        self.response.body_data = encoded;
+        _ = self.response.body(encoded);
         self.response.body_owned = true;
+        encoded_owned = false;
         return self.response.build();
     }
 
     /// Sends one-shot Server-Sent Events payload.
     pub fn sse(self: *Self, events: []const SseEvent) !Response {
         var payload = std.ArrayListUnmanaged(u8).empty;
-        defer payload.deinit(self.allocator);
-        const writer = arrayListWriter(&payload, self.allocator);
+        const alloc = self.response.bodyAllocator();
+        defer payload.deinit(alloc);
+        const writer = arrayListWriter(&payload, alloc);
 
         for (events) |evt| {
             if (evt.id) |id| {
@@ -2489,7 +2496,7 @@ pub const Server = struct {
 
             if (suppress_body) {
                 if (response.body_owned) {
-                    if (response.body) |body| self.allocator.free(body);
+                    if (response.body) |body| (response.body_allocator orelse response.allocator).free(body);
                     response.body_owned = false;
                 }
                 response.body = null;
@@ -3246,7 +3253,7 @@ pub const Server = struct {
 
         if (suppress_body) {
             if (response.body_owned) {
-                if (response.body) |b| self.allocator.free(b);
+                if (response.body) |b| (response.body_allocator orelse response.allocator).free(b);
                 response.body_owned = false;
             }
             response.body = null;
@@ -3434,12 +3441,21 @@ pub const Server = struct {
         try sendBuffered(self.allocator, socket, &resp);
     }
 
-    /// Serializes a response to memory, then sends in a single writeAll call
-    /// to avoid per-header syscalls through the unbuffered SocketWriter.
+    /// Small responses retain a single write without a heap allocation. Large
+    /// bodies are sent from their retained owner, avoiding a second unbudgeted
+    /// body copy while a slow consumer drains the socket.
     fn sendBuffered(allocator: Allocator, socket: *Socket, resp: *Response) !void {
-        const bytes = try serializeToSlice(allocator, resp);
+        var small: [4096]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&small);
+        if (resp.serialize(&writer)) |_| {
+            return socket.sendAll(writer.buffered());
+        } else |_| {}
+        var headers_only = resp.*;
+        headers_only.body = null;
+        const bytes = try serializeToSlice(allocator, &headers_only);
         defer allocator.free(bytes);
         try socket.sendAll(bytes);
+        if (resp.body) |body| try socket.sendAll(body);
     }
 
     /// RFC 7231 §7.1.1.2: Origin servers MUST send a Date header field

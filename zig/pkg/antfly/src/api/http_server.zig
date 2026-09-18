@@ -3806,6 +3806,9 @@ pub const ApiHttpServer = struct {
 
     pub fn deinit(self: *ApiHttpServer) void {
         self.closeForegroundAdmission();
+        self.query_admission.deinitMemory();
+        self.write_admission.deinitMemory();
+        self.inference_admission.deinitMemory();
         self.restore_jobs_closing.store(true, .release);
         self.signalRestoreRetryWakeup();
         self.signalRestoreBackoffWaiters();
@@ -16134,17 +16137,38 @@ pub const ApiHttpServer = struct {
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
         if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithCancellation(table_name, body, borrowed_identity, cancellation, null, null);
-        var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
-        defer if (identity) |*owned| owned.deinit(self.alloc);
+        const memory = self.queryAllocationOwner() catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
+        defer if (memory) |owner| owner.release();
+        const alloc = if (memory) |owner| owner.allocator() else self.alloc;
+        var identity = cloneCatalogIdentity(alloc, borrowed_identity) catch |err|
+            return self.queryPlanningErrorResponse(memory, table_name, body, err);
+        defer if (identity) |*owned| owned.deinit(alloc);
         const deadline = query_contract.publicQueryDeadline(self.alloc, body, false, if (cancellation) |signal| signal.query_deadline_ns else null) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
         var scoped = http_common.RequestCancellation.fromToken(if (cancellation) |signal| signal.token() else .none);
         scoped.query_deadline_ns = deadline;
-        var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
+        var catalog_arena = std.heap.ArenaAllocator.init(alloc);
         defer catalog_arena.deinit();
         var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
-        var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
+        var binding = self.bindCatalogQuery(alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.queryPlanningErrorResponse(memory, table_name, body, err);
         defer binding.deinit();
         return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, &scoped, binding.label, if (binding.join) |*value| value else null, &resolver);
+    }
+
+    fn queryAllocationOwner(self: *ApiHttpServer) !?*@import("../common/workload_allocator.zig").Owner {
+        if (self.query_admission.stats().max_retained_bytes == 0) return null;
+        return try @import("../common/workload_allocator.zig").Owner.create(self.alloc, &self.query_admission);
+    }
+
+    fn queryPlanningErrorResponse(self: *ApiHttpServer, memory: ?*@import("../common/workload_allocator.zig").Owner, table_name: []const u8, body: []const u8, err: anyerror) !contextual_operations.OwnedResponse {
+        if (memory) |owner| if (owner.budget_exhausted.load(.acquire)) {
+            return contextualJsonResponse(self.alloc, 429, .{
+                .@"error" = "QueryMemoryExhausted",
+                .reason = "resource_exhausted",
+                .stage = "planning",
+                .execution_started = false,
+            });
+        };
+        return self.publicQueryOperationErrorResponse(table_name, body, err);
     }
 
     pub fn handleAdmittedResolvedTableQueryWithContentTypeCancellation(
@@ -16202,6 +16226,18 @@ pub const ApiHttpServer = struct {
         err: anyerror,
     ) !contextual_operations.OwnedResponse {
         return switch (err) {
+            error.AdmissionFull,
+            error.AdmissionQueueFull,
+            error.AdmissionBytesExhausted,
+            error.AdmissionRequestTooLarge,
+            error.AdmissionWaitTimeout,
+            error.AdmissionClosed,
+            => try contextualJsonResponse(self.alloc, if (err == error.AdmissionClosed) 503 else 429, .{
+                .@"error" = @errorName(err),
+                .reason = if (err == error.AdmissionClosed) "draining" else if (err == error.AdmissionRequestTooLarge) "resource_exhausted" else "instance_busy",
+                .stage = "execution",
+                .execution_started = true,
+            }),
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
             error.CatalogGenerationChanged => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
             error.InvalidCatalogName => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid table target"),
@@ -16336,23 +16372,59 @@ pub const ApiHttpServer = struct {
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
         catalog_resolver: ?*CatalogQueryResolver,
     ) !contextual_operations.OwnedResponse {
+        const memory = self.queryAllocationOwner() catch |err|
+            return self.publicQueryOperationErrorResponse(table_name, body, err);
+        defer if (memory) |owner| owner.release();
+        var response = self.handlePublicTableQueryAllocated(table_name, body, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver, memory) catch |err| {
+            if (memory) |owner| if (owner.budget_exhausted.load(.acquire))
+                return self.queryMemoryExhaustedResponse();
+            return err;
+        };
+        if (memory) |owner| if (response.status >= 400 and owner.budget_exhausted.load(.acquire)) {
+            response.deinit(self.alloc);
+            return self.queryMemoryExhaustedResponse();
+        };
+        return response;
+    }
+
+    fn queryMemoryExhaustedResponse(self: *ApiHttpServer) !contextual_operations.OwnedResponse {
+        return contextualJsonResponse(self.alloc, 429, .{
+            .@"error" = "QueryMemoryExhausted",
+            .reason = "resource_exhausted",
+            .stage = "execution",
+            .execution_started = true,
+        });
+    }
+
+    fn handlePublicTableQueryAllocated(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+        response_label: ?[]const u8,
+        bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
+        catalog_resolver: ?*CatalogQueryResolver,
+        memory: ?*@import("../common/workload_allocator.zig").Owner,
+    ) !contextual_operations.OwnedResponse {
         var diagnostic_context: query_request_diagnostics.Context = .{};
         const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
+        const alloc = if (memory) |owner| owner.allocator() else self.alloc;
 
         // `/query` selects its table from the body, so path middleware cannot
         // establish this authorization boundary. Keep the check in the query
         // service so every transport and direct caller is covered.
         if (!admittedTablePermissionAllowed(authenticated_identity, table_name, .read))
             return try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
-        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
-        defer if (row_filter_json) |value| self.alloc.free(value);
+        const row_filter_json = try resolveEffectiveRowFilterJson(alloc, authenticated_identity, table_name);
+        defer if (row_filter_json) |value| alloc.free(value);
 
         const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
         db_mod.resetLastSortRejectionDiagnostic();
         query_request_diagnostics.reset();
         var query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
-            self.alloc,
+            alloc,
             source,
             table_name,
             body,
@@ -16365,10 +16437,15 @@ pub const ApiHttpServer = struct {
             if (cancellation) |signal| signal.query_deadline_ns else null,
         ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
         self.reachQueryResultLifecycle("public.table.query", table_name, query_response.json.len) catch |err| {
-            query_response.deinit(self.alloc);
+            query_response.deinit(alloc);
             return err;
         };
-        return try publicQuerySuccessResponse(self.alloc, query_response);
+        var response = try publicQuerySuccessResponse(alloc, query_response);
+        if (memory) |owner| {
+            owner.retain();
+            response.memory_owner = owner;
+        }
+        return response;
     }
 
     fn handlePublicTableMultiQuery(
@@ -16389,19 +16466,45 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
     ) !contextual_operations.OwnedResponse {
+        const memory = self.queryAllocationOwner() catch |err|
+            return self.publicQueryOperationErrorResponse(route_table_name orelse "", body, err);
+        defer if (memory) |owner| owner.release();
+        var response = self.handlePublicTableMultiQueryAllocated(route_table_name, body, authenticated_identity, cancellation, response_label, bound_join, memory) catch |err| {
+            if (memory) |owner| if (owner.budget_exhausted.load(.acquire))
+                return self.queryMemoryExhaustedResponse();
+            return err;
+        };
+        if (memory) |owner| if (response.status >= 400 and owner.budget_exhausted.load(.acquire)) {
+            response.deinit(self.alloc);
+            return self.queryMemoryExhaustedResponse();
+        };
+        return response;
+    }
+
+    fn handlePublicTableMultiQueryAllocated(
+        self: *ApiHttpServer,
+        route_table_name: ?[]const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+        response_label: ?[]const u8,
+        bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
+        memory: ?*@import("../common/workload_allocator.zig").Owner,
+    ) !contextual_operations.OwnedResponse {
         var diagnostic_context: query_request_diagnostics.Context = .{};
         const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
+        const alloc = if (memory) |owner| owner.allocator() else self.alloc;
 
         const batch_deadline = query_contract.publicQueryDeadline(self.alloc, body, true, if (cancellation) |signal| signal.query_deadline_ns else null) catch
             return self.publicQueryOperationErrorResponse(route_table_name orelse "", body, error.InvalidQueryRequest);
 
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
         var catalog_resolver = CatalogQueryResolver{ .arena = arena };
 
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
         try out.writer.writeAll("{\"responses\":[");
         var emitted: usize = 0;
@@ -16432,10 +16535,10 @@ pub const ApiHttpServer = struct {
                 break :blk try arena.dupe(u8, parsed_table.table_name);
             };
 
-            var line_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
-            defer if (line_identity) |*identity| identity.deinit(self.alloc);
+            var line_identity = try cloneCatalogIdentity(alloc, authenticated_identity);
+            defer if (line_identity) |*identity| identity.deinit(alloc);
             const deadline = batch_deadline;
-            var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, logical_table_name, line, &line_identity, &catalog_resolver) catch |err| return self.publicQueryOperationErrorResponse(logical_table_name, line, err);
+            var binding = self.bindCatalogQuery(alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, logical_table_name, line, &line_identity, &catalog_resolver) catch |err| return self.publicQueryOperationErrorResponse(logical_table_name, line, err);
             defer binding.deinit();
             const table_name = binding.physical;
 
@@ -16444,15 +16547,15 @@ pub const ApiHttpServer = struct {
             if (!try tablePermissionCurrentlyAllowed(line_identity, table_name, .read))
                 return try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
 
-            const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, line_identity, table_name);
-            defer if (row_filter_json) |value| self.alloc.free(value);
+            const row_filter_json = try resolveEffectiveRowFilterJson(alloc, line_identity, table_name);
+            defer if (row_filter_json) |value| alloc.free(value);
 
             const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
             db_mod.resetLastSortRejectionDiagnostic();
             query_request_diagnostics.reset();
             const line_label = response_label orelse binding.label;
             var query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
-                self.alloc,
+                alloc,
                 source,
                 table_name,
                 line,
@@ -16464,7 +16567,7 @@ pub const ApiHttpServer = struct {
                 &catalog_resolver,
                 deadline,
             ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
-            defer query_response.deinit(self.alloc);
+            defer query_response.deinit(alloc);
             try self.reachQueryResultLifecycle(
                 if (route_table_name == null) "public.global.multi_query" else "public.table.multi_query",
                 table_name,
@@ -16495,10 +16598,14 @@ pub const ApiHttpServer = struct {
 
         if (emitted == 0) return try contextual_operations.textAlloc(self.alloc, 400, "invalid query request");
         try out.writer.writeAll("]}");
-        var response = contextual_operations.json(try self.alloc.dupe(u8, out.written()), false);
-        errdefer response.deinit(self.alloc);
+        var response = contextual_operations.json(try alloc.dupe(u8, out.written()), false);
+        errdefer response.deinit(alloc);
         if (accepted_legacy_graph_search) {
-            try markLegacyGraphSearchResponse(self.alloc, &response);
+            try markLegacyGraphSearchResponse(alloc, &response);
+        }
+        if (memory) |owner| {
+            owner.retain();
+            response.memory_owner = owner;
         }
         return response;
     }
@@ -25583,6 +25690,7 @@ test "api http plain public query preserves outer absolute request deadline thro
 
     const FakeReads = struct {
         expected_deadline_ns: u64,
+        oversized: bool = false,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -25629,6 +25737,10 @@ test "api http plain public query preserves outer absolute request deadline thro
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
             try std.testing.expectEqual(self.expected_deadline_ns, req.execution_deadline_ns.?);
+            if (self.oversized) {
+                const excessive = try inner_alloc.alloc(u8, 2 * 1024 * 1024);
+                defer inner_alloc.free(excessive);
+            }
             return .{ .json = try inner_alloc.dupe(u8, "{\"hits\":[],\"total\":0}") };
         }
     };
@@ -25673,6 +25785,27 @@ test "api http plain public query preserves outer absolute request deadline thro
     defer rejected.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 504), rejected.status);
     try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+
+    try server.query_admission.configure(.{ .max_retained_bytes = 1024 * 1024 });
+    var valid: http_common.RequestCancellation = .{ .query_deadline_ns = outer_deadline_ns };
+    var owned = try server.handlePublicTableQueryWithContentTypeCancellation("docs", body, null, null, &valid);
+    var owned_live = true;
+    defer if (owned_live) owned.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), owned.status);
+    try std.testing.expect(owned.memory_owner != null);
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+    try std.testing.expect(server.queryAdmissionStats().retained_bytes >= owned.body.len);
+    owned.deinit(alloc);
+    owned_live = false;
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().retained_bytes);
+
+    reads.oversized = true;
+    @import("../test_error_logs.zig").expectErrorLogs(2);
+    var excessive = try server.handlePublicTableQueryWithContentTypeCancellation("docs", body, null, null, &valid);
+    defer excessive.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), excessive.status);
+    try std.testing.expect(std.mem.indexOf(u8, excessive.body, "resource_exhausted") != null);
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().retained_bytes);
 }
 
 test "api http hierarchy traversal preserves policy and cursor across remote hydration seam" {

@@ -42,10 +42,14 @@ pub const HttpResponse = struct {
     content_type: []u8,
     body: []u8,
     retry_after_seconds: ?u32 = null,
+    memory_owner: ?*@import("../../common/workload_allocator.zig").Owner = null,
 
-    pub fn deinit(self: *HttpResponse, alloc: Allocator) void {
+    pub fn deinit(self: *HttpResponse, fallback_alloc: Allocator) void {
+        const owner = self.memory_owner;
+        const alloc = if (owner) |memory| memory.allocator() else fallback_alloc;
         alloc.free(self.content_type);
         alloc.free(self.body);
+        if (owner) |memory| memory.release();
         self.* = undefined;
     }
 };

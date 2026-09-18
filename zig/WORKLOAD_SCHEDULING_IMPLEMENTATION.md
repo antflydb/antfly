@@ -4,13 +4,14 @@ Design: [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md).
 
 The design was committed first as `74820f0ec2`. Implementation is in progress.
 The current implementation provides fixed foreground admission with opt-in
-bounded waiting. It does not yet implement the full execution scheduler or
+bounded waiting, shared dense driver/helper scheduling, and bounded SDK read
+retries. It does not yet implement the full operator scheduling design or
 qualify new defaults.
 
 ## Implemented admission contract
 
 `common/workload_admission.zig` owns an allocation-free intrusive FIFO, active
-operation count, queued count/bytes, and retained request reservations. A grant
+operation count, queued count/bytes, and retained request/allocation reservations. A grant
 removes queue accounting while preserving the request's byte reservation until
 its lease releases. Cancellation rejoins the queue lock before retiring waiter
 storage; a concurrent grant returns its execution and byte reservations exactly
@@ -21,9 +22,28 @@ leases remain owned by their callers.
 
 All operations admitted here retain coarse operation leases. There is no claim
 that these counts measure busy CPU threads. Payload reservations cover request
-bodies and a conservative metadata allowance; they are not a measurement or
-ceiling for all decoded allocations, output buffers, or execution working memory.
-Existing transport and storage resource limits still govern those resources.
+bodies and a conservative metadata allowance. When a retained-byte ceiling is
+configured, tracked query decoding/planning and output allocations additionally
+reserve their actual size before allocating. Other execution allocations still
+depend on their storage resource limits; this is not a process-wide memory cap.
+
+`common/workload_allocator.zig` supplies heap-stable reference-counted allocation
+owners. Request completion releases execution capacity while buffered output
+retains its allocation charge through response drain. A detached memory account
+allows outstanding responses to retire after server destruction without touching
+the former admission controller. The compiled API bridge retains both the
+foreign response and its allocator descriptors instead of copying the body.
+Serverless adapters transfer the buffers and their owner together. Large HTTP/1
+responses send directly from their retained body instead of building a second
+full response buffer. Transport/header metadata and unconverted streaming paths
+remain outside this allocation owner.
+
+Tracked allocation exhaustion unwinds without waiting while holding a partial
+bundle. Output or execution failures report `execution_started=true`, preserving
+write ambiguity and preventing automatic retries. Small structured error
+responses use the underlying allocator so an exhausted query budget does not
+prevent rejection. Actual backing-allocation failure remains distinct from a
+configured resource ceiling.
 
 The REST/httpx, alternate-listener API-kernel paths, MCP, query builder, A2A,
 extension-host query/write calls, and serverless query/write handlers share this
@@ -47,8 +67,17 @@ write retries. TypeScript shares pools across database/inference clients; Python
 shares a FIFO across synchronous threads and generated asyncio calls. Python's
 canceled stream cleanup retains a slot until its separately owned cleanup task
 finishes. Rust's `PooledClient` constructs the request future after admission and
-retains capacity in an `Admitted<T>` wrapper through stream ownership. Safe read
-retries remain outstanding.
+retains capacity in an `Admitted<T>` wrapper through stream ownership.
+
+Go, TypeScript, Python, and Rust provide opt-in bounded read retries. Only known
+query POST routes with replayable request bodies and an explicit HTTP 429
+`instance_busy` / `admission` / `execution_started=false` response qualify.
+Transport failures, writes, ambiguous outcomes, and delivered successful streams
+do not retry. Attempts release pool capacity before bounded backoff, respect
+Retry-After or decline the retry, and preserve cancellation and the original
+deadline. Rust exposes a query-request wrapper; arbitrary generated operation
+closures are not automatically retried. Python synchronous transport timeouts
+remain per-I/O limits, and streaming callers must bound subsequent consumption.
 
 Public query timeouts are captured before admission and retained through catalog
 binding, execution, and readiness retries. Native and runtime clock domains are
@@ -59,7 +88,7 @@ allocating a full vector/document tree before admission.
 Serverless execution carries the captured deadline through a scoped cancellation
 token. HTTP token adapters preserve fallible checkpoints and their timeout cause.
 
-## Execution ownership core (not enabled for operators)
+## Execution ownership core and dense integration
 
 `common/workload_resources.zig` implements typed, generation-checked leases over
 a fixed metadata pool. Atomic count/byte/working-set grants preserve protected
@@ -77,17 +106,34 @@ Grant/cancel races restore retained state to its caller, and resume cannot reduc
 the charge below the state still owned. Transfers reject active execution or
 queued ownership so scheduling identity cannot change underneath a waiter.
 
-These modules are tested foundations. Their credit ledger is not a replacement
+These modules provide tested foundations. Their credit ledger is not a replacement
 for resource-manager allocation reservations, worker fencing, or durable write
-recovery. Production operators do not use this scheduler yet. Their integration
-must supply audited completion bundles and separately charged actual allocations.
+recovery. The opt-in dense binding uses the scheduler for HBC drivers and vector
+read helpers. Broader operator integration must supply audited completion bundles
+and separately charged actual allocations.
+
+`admission.dense_execution` activates a heap-stable ledger and scheduler in the
+actual storage ResourceManager, including the compiled storage-owner boundary.
+Its explicit runnable/outstanding/queue/wait limits preserve the legacy path when
+omitted. Drivers and helpers each hold owned leases; helpers never wait and
+release their permits at worker completion. Original query deadlines reach dense
+queues and work through a scoped cancellation adapter. A driver retains its coarse
+permit through scan/rerank waits and helper joins. This does not claim CPU-only
+accounting, cooperative suspension, or protected-lane latency isolation.
+`antfly_dense_execution_*` metrics expose configured limits and current ownership
+from the actual storage owner. Optional `max_working_bytes` bounds tracked exact
+dense working memory through storage ABI 62.
 
 `storage/workload_memory.zig` connects an allocation owner to both the class
 ledger and `ResourceManager`. It reserves both without waiting or invoking
 reclaimers while holding a partial bundle, rolls back failed grants/allocations,
 and preserves pinned minimum completion memory across suspend/resume. Actual
-freeing precedes returning byte credits. This adapter is tested but not yet
-installed on an operator path.
+freeing precedes returning byte credits. Exact dense scoring installs a scoped
+owner for candidate sets, metadata, vector scratch, and batch buffers, with
+allocation failures mapped back to structured resource rejection. Escaping search
+results retain their existing allocator owner. Cached HBC scratch needs a durable
+pool owner before it can be charged here; it is not attributed to a temporary
+request owner.
 
 `common/workload_attempts.zig` models bounded coordinator attempt ownership,
 pre-reserved reconciliation capacity, deadline-preserving retransmission, and
@@ -98,6 +144,22 @@ acknowledges the previous generation is fenced and quiescent. Wire encoding,
 worker deduplication/expiry, membership evidence, and shutdown/restart integration
 remain necessary before enabling it. The module does not claim that an ordinary
 HTTP error proves remote retirement.
+
+The existing distributed join RPCs now emit `budget_version=1` and validate an
+explicit version on workers. Workers capture their receive deadline before JSON
+decoding and keep the earlier caller deadline through typed dispatch. Legacy
+requests without a version remain accepted. This fixes deadline renewal; it does
+not enable the remote-attempt ownership model.
+
+Stable transaction sessions support optional `transaction_sessions.max_recovery_count`
+and `max_recovery_bytes`. Before marking commit execution started, the durable
+store scans authoritative session records inside its serialized write transaction.
+It reserves record capacity for each pending recovery obligation, including
+records predating the recovery index. A full budget rejects before participant
+preparation; an already pending transaction may complete under reduced limits.
+Restart derives ownership from durable records, and terminal acknowledgement
+retires the obligation. These bounds cover durable session records, not all
+decoded 2PC memory or stateless-write recovery.
 
 ## Configuration
 
@@ -128,12 +190,12 @@ does not raise a transport's independent connection or request-task limit.
 | Execution path | Current owner and boundaries | Requirement before fine-grained scheduling |
 | --- | --- | --- |
 | Public query and write operations | Admission lease held around the existing synchronous operation, including joins of its helpers | Split runnable, retained state, and request lifetime at verified quiescent boundaries |
-| Query decoding/planning | Body admission precedes buffering; query decode follows foreground grant; some catalog/auth/session resolution precedes it | Account actual allocation expansion and introduce a separately bounded planning owner |
-| Dense rerank and helpers | `storage/dense_work_admission.zig` has whole-caller FIFO admission and nonwaiting helper leases | Charge helpers against the same node execution envelope and avoid duplicate waiting |
+| Query decoding/planning | Foreground body reservations plus tracked public single/NDJSON query and serverless query allocations; some catalog/auth/session resolution precedes the grant | Complete all frontend coverage and introduce separately protected planning capacity |
+| Dense rerank and helpers | Opt-in shared storage scheduler owns drivers/helpers; exact scoring additionally owns scoped working memory | Split runnable ownership only at audited quiescent boundaries; add durable ownership for cached HBC scratch |
 | Vector, text, graph, aggregation | Existing cancellation/work budgets and storage resource reservations; no scheduler continuation contract established | Inventory maximum nonyielding intervals, resumable state, and minimum completion resources; remain in the general lane until verified |
-| Scan/stream output | Handler retains its operation lease through the stream producer; snapshot/result lifetime remains storage/transport-owned | Transfer retained state before releasing runnable capacity; account slow consumers and resume only through admission |
+| Scan/stream output | Tracked buffered bodies retain actual allocation charges through transport drain, including API-kernel and serverless handoffs; streaming snapshots remain storage/transport-owned | Complete streaming retained-state ownership and resume only through admission |
 | Remote coordinator/worker tasks | Existing request deadlines, route fencing, transport cancellation, and independent storage work limits | Add attempt identities, worker expiry, destination uncertainty accounting, generation fencing, and restart reconciliation |
-| Transaction commits | Existing durable decisions, session identity, owner fencing, and `PendingSessionRecovery` | Reserve bounded mandatory-completion capacity before irrevocable decisions and transfer resource ownership to recovery |
+| Transaction commits | Stable sessions reserve bounded durable recovery-record capacity before prepare; existing decisions, fencing, and `PendingSessionRecovery` remain authoritative | Extend coverage to stateless writes and decoded mandatory-completion resources |
 | Background/control/recovery | Existing dedicated runtime owners and cancellation protocols | Prove process-wide protected count/byte/progress floors across foreground and background work |
 
 No operator is admitted to a new protected bounded-plan execution lane by this
@@ -163,7 +225,11 @@ The dedicated Zig target covers FIFO pressure, count/byte bounds, deadline/grant
 races with VOPR time, cancellation/grant races, policy reductions, draining,
 compiled API ownership, legacy MCP responses, and serverless behavior. Controller
 burst tests cover C1/5/10/20/30/40/60/80 with a fixed execution capacity of 32.
-The real HTTP C80 fixture verifies 32 admitted plus 48 queued operations; its
+Allocation regressions cover failed growth, policy reductions, response lifetime
+beyond execution/context/server destruction, concurrent teardown, both sides of
+the API allocator boundary, and serverless adapters. Real exact-scoring tests
+observe memory and runnable ownership during execution and verify complete
+retirement. The real HTTP C80 fixture verifies 32 admitted plus 48 queued operations; its
 missing-table responses test transport admission, not database query throughput.
 Network tests need permission to bind local listening sockets.
 
@@ -173,13 +239,14 @@ Network tests need permission to bind local listening sockets.
   attempt, mandatory recovery, and demotion paths; extend deterministic coverage
   for the integration boundaries.
 - Complete Phase 1 ingress/planning/output byte ownership, process-wide protected
-  floors, and all SDK/Cloud error contracts. The current byte counter is limited
-  to foreground request reservations.
+  floors, and all SDK/Cloud error contracts. Byte accounting now covers foreground
+  request reservations and the tracked query/output paths above; remaining
+  allocations must acquire an appropriate durable or scoped owner.
 - Implement Phase 2 operator suspend/resume, execution working-set bundles,
   resource-fit backfill, bounded/general lane isolation, measured service debt,
   demotion transfers, helper/fan-out accounting, remote uncertainty fencing,
   and recovery handoff.
-- Implement Phase 3 safe read retries, Cloud diagnostics
+- Complete Phase 3 Cloud diagnostics
   and policy integration, adaptive control behind an explicit mode, and deployment
   qualification. Apply the numerical acceptance thresholds already recorded in
   the qualification matrix and retain both open-loop and closed-loop results

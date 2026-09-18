@@ -39,8 +39,22 @@ pub const HandlerCreateContext = abi.HandlerCreateContext;
 const ServerState = struct {
     owner_alloc: std.mem.Allocator,
     server: server_mod.ApiHttpServer,
+    refs: std.atomic.Value(usize) = .init(1),
+    // Exported allocator descriptors may outlive server resources. Never point
+    // them at a field overwritten by ApiHttpServer.deinit().
+    request_alloc: std.mem.Allocator,
     request_alloc_abi: abi.memory_abi.Allocator,
     runtime_io: RuntimeIoReceivers = .{},
+
+    fn retain(self: *ServerState) void {
+        const previous = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
+    }
+
+    fn release(self: *ServerState) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.owner_alloc.destroy(self);
+    }
 };
 
 const RuntimeIoReceivers = struct {
@@ -67,6 +81,7 @@ const RuntimeIoReceivers = struct {
 };
 
 const HandlerState = struct {
+    server_owner: ?*ServerState = null,
     alloc: std.mem.Allocator,
     handler: handler_mod.AntflyApiHandler,
     routes: std.ArrayListUnmanaged(*RouteState) = .empty,
@@ -82,6 +97,7 @@ const RouteState = struct {
 };
 
 const HttpResponseState = struct {
+    server_owner: ?*ServerState = null,
     alloc: std.mem.Allocator,
     response: httpx.Response,
     header_views: []abi.HeaderView,
@@ -169,6 +185,7 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
     defer if (!published) owner_alloc.destroy(state);
 
     state.owner_alloc = owner_alloc;
+    state.refs = .init(1);
     state.runtime_io = .{};
     var imported_cfg = cfg.*;
     imported_cfg.imported_runtime_io = null;
@@ -184,7 +201,8 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
     else
         server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, imported_cfg, source.*, reads.*, writes.*);
     if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(&state.server.incoming_graph_routes);
-    state.request_alloc_abi = .fromStd(&state.server.alloc);
+    state.request_alloc = state.server.alloc;
+    state.request_alloc_abi = .fromStd(&state.request_alloc);
     context.out_handle.* = state;
     context.out_request_alloc.* = &state.request_alloc_abi;
     published = true;
@@ -193,9 +211,8 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
 
 pub fn destroy(opaque_handle: *anyopaque) callconv(.c) void {
     const state: *ServerState = @ptrCast(@alignCast(opaque_handle));
-    const owner_alloc = state.owner_alloc;
     state.server.deinit();
-    owner_alloc.destroy(state);
+    state.release();
 }
 
 pub fn requestStats(context: *const CallContext) callconv(.c) abi.Status {
@@ -313,10 +330,12 @@ pub fn handlerCreate(context: *const HandlerCreateContext) callconv(.c) abi.Stat
     const api_state: *ServerState = @ptrCast(@alignCast(context.api_server_handle));
     const state = api_state.owner_alloc.create(HandlerState) catch |err| return fail(err);
     state.* = .{
+        .server_owner = api_state,
         .alloc = api_state.owner_alloc,
         .handler = .{ .api_server = &api_state.server },
         .route_validator = httpx.Router.init(api_state.owner_alloc),
     };
+    api_state.retain();
     context.out_handle.* = state;
     return .ok;
 }
@@ -388,6 +407,7 @@ pub fn handlerRouteManifest(context: *const abi.RouteManifestContext) callconv(.
 }
 
 fn exportHttpResponse(
+    server_owner: ?*ServerState,
     alloc: std.mem.Allocator,
     response: httpx.Response,
     out_handle: *?*anyopaque,
@@ -405,10 +425,12 @@ fn exportHttpResponse(
         };
     }
     response_state.* = .{
+        .server_owner = server_owner,
         .alloc = alloc,
         .response = response,
         .header_views = header_views,
     };
+    if (server_owner) |owner| owner.retain();
     out_handle.* = response_state;
     out_view.* = .{
         .status = response.status.code,
@@ -454,7 +476,7 @@ pub fn handlerAuthorizeInternalService(context: *const abi.InternalServiceAuthCo
     if (state.handler.authorizeHostInternalServiceRoute(&http_context, &legacy_accepted) catch |err| return fail(err)) |response| {
         var owned_response = response;
         errdefer owned_response.deinit();
-        exportHttpResponse(alloc, owned_response, context.out_response_handle, context.out_response) catch |err| return fail(err);
+        exportHttpResponse(state.server_owner, alloc, owned_response, context.out_response_handle, context.out_response) catch |err| return fail(err);
     } else if (legacy_accepted) {
         context.out_legacy_accepted.* = 1;
     }
@@ -504,20 +526,23 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
     var response = state.handler.dispatchLinkedRoute(&http_context, route.handler) catch |err| return fail(err);
     errdefer response.deinit();
 
-    exportHttpResponse(alloc, response, context.out_response_handle, context.out_response) catch |err| return fail(err);
+    exportHttpResponse(state.server_owner, alloc, response, context.out_response_handle, context.out_response) catch |err| return fail(err);
     return .ok;
 }
 
 pub fn handlerDestroyHttpResponse(response_handle: *anyopaque) callconv(.c) void {
     const state: *HttpResponseState = @ptrCast(@alignCast(response_handle));
+    const server_owner = state.server_owner;
     const alloc = state.alloc;
     state.response.deinit();
     alloc.free(state.header_views);
     alloc.destroy(state);
+    if (server_owner) |owner| owner.release();
 }
 
 pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
     const state: *HandlerState = @ptrCast(@alignCast(opaque_handle));
+    const server_owner = state.server_owner;
     const alloc = state.alloc;
     for (state.routes.items) |route| alloc.destroy(route);
     state.routes.deinit(alloc);
@@ -525,6 +550,7 @@ pub fn handlerDestroy(opaque_handle: *anyopaque) callconv(.c) void {
     state.route_validator.deinit();
     state.handler.deinitRuntime();
     alloc.destroy(state);
+    if (server_owner) |owner| owner.release();
 }
 
 const function_table: abi.FunctionTable = .{
@@ -723,6 +749,44 @@ fn responseHeader(response: abi.HttpResponseView, name: []const u8) ?[]const u8 
         if (std.ascii.eqlIgnoreCase(header.name.slice(), name)) return header.value.slice();
     }
     return null;
+}
+
+test "workload admission exported kernel response survives server teardown" {
+    const alloc = std.testing.allocator;
+    var status = KernelIngressTestStatus{};
+    const state = try alloc.create(ServerState);
+    state.* = .{
+        .owner_alloc = alloc,
+        .server = server_mod.ApiHttpServer.init(alloc, .{
+            .query_admission_waiting = .{ .max_retained_bytes = 4096 },
+        }, status.source(), null, null),
+        .request_alloc = alloc,
+        .request_alloc_abi = undefined,
+    };
+    state.request_alloc_abi = .fromStd(&state.request_alloc);
+    const Owner = @import("../common/workload_allocator.zig").Owner;
+    const owner = try Owner.create(state.request_alloc, &state.server.query_admission);
+    var response = httpx.Response.init(state.request_alloc, 200);
+    response.body = try owner.allocator().dupe(u8, "kernel-owned output");
+    response.body_owned = true;
+    response.body_allocator = owner.allocator();
+    response.retirement = .{ .ptr = owner, .release = struct {
+        fn release(raw: *anyopaque) void {
+            const value: *Owner = @ptrCast(@alignCast(raw));
+            value.release();
+        }
+    }.release };
+    var handle: ?*anyopaque = null;
+    var view: abi.HttpResponseView = undefined;
+    try exportHttpResponse(state, state.request_alloc, response, &handle, &view);
+    const exported_allocator = state.request_alloc_abi.asStd();
+    const before = owner.account.retainedBytes();
+    destroy(state); // closes resources, but exported allocation state survives
+    try std.testing.expectEqual(before, owner.account.retainedBytes());
+    try std.testing.expectEqualStrings("kernel-owned output", view.body.slice());
+    const probe = try exported_allocator.alloc(u8, 16);
+    exported_allocator.free(probe);
+    handlerDestroyHttpResponse(handle.?);
 }
 
 test "linked API route manifest preserves internal scan response streaming" {

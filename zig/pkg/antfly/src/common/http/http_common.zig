@@ -206,6 +206,9 @@ pub const HttpResponse = struct {
     content_type: ?[]u8 = null,
     headers: []Header = &.{},
     body: []u8 = &.{},
+    /// Optional lifetime for the allocator itself, released after its buffers.
+    /// Transport adapters retain this when a response outlives its producer.
+    allocation_owner: ?struct { ptr: *anyopaque, release: *const fn (*anyopaque) void } = null,
 
     pub fn header(self: HttpResponse, name: []const u8) ?[]const u8 {
         for (self.headers) |entry| {
@@ -220,6 +223,7 @@ pub const HttpResponse = struct {
         for (self.headers) |*entry| entry.deinit(alloc);
         if (self.headers.len > 0) alloc.free(self.headers);
         if (self.body.len > 0) alloc.free(self.body);
+        if (self.allocation_owner) |owner| owner.release(owner.ptr);
         self.* = undefined;
     }
 };

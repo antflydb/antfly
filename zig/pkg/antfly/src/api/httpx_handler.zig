@@ -665,7 +665,8 @@ pub const AntflyApiHandler = struct {
         establishInternalTxnStatusDeadline(ctx);
         establishInternalBackupDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
-        const response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
+        var response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
+        errdefer response.deinit();
         try self.api_server.reachRequestLifecycle(.response_ready, null);
         return response;
     }
@@ -845,7 +846,8 @@ pub const AntflyApiHandler = struct {
             try self.api_server.reachRequestLifecycle(.response_ready, null);
             return response;
         }
-        const response = route_handler.invoke(ctx) catch |err| try mapIngressError(ctx, err);
+        var response = route_handler.invoke(ctx) catch |err| try mapIngressError(ctx, err);
+        errdefer response.deinit();
         try self.api_server.reachRequestLifecycle(.response_ready, null);
         return response;
     }
@@ -948,6 +950,21 @@ pub const AntflyApiHandler = struct {
     }
 
     fn mapIngressError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.OutOfMemory) {
+            if (ctx.getData("antfly.workload-body-memory")) |raw| {
+                const owner: *@import("../common/workload_allocator.zig").Owner = @ptrCast(@alignCast(raw));
+                if (owner.budget_exhausted.load(.acquire)) {
+                    // Output may follow a committed write. Do not claim that
+                    // execution never began or attach automatic retry advice.
+                    return httpx.Response.fromJson(ctx.allocator, 429, .{
+                        .@"error" = "ResponseMemoryExhausted",
+                        .reason = "resource_exhausted",
+                        .stage = "output",
+                        .execution_started = true,
+                    });
+                }
+            }
+        }
         if (metadata_authority.isRetryableError(err)) return metadataNotLeaderResponse(ctx);
         return err;
     }
@@ -3242,6 +3259,54 @@ pub const AntflyApiHandler = struct {
             .write => try writeOverloadedResponse(ctx),
             .inference => try inferenceOverloadedResponse(ctx),
         };
+        if (lease.*) |owned| {
+            const gate = owned.owner.?;
+            if (gate.stats().max_retained_bytes != 0 and ctx.response.body_memory == null) {
+                const Owner = @import("../common/workload_allocator.zig").Owner;
+                const memory = Owner.create(ctx.allocator, gate) catch |err| {
+                    self.releasePublicOperation(operation_id, lease);
+                    return switch (err) {
+                        error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge => try httpx.Response.fromJson(ctx.allocator, 429, .{
+                            .@"error" = @errorName(err),
+                            .reason = "resource_exhausted",
+                            .stage = "admission",
+                            .execution_started = false,
+                        }),
+                        error.AdmissionClosed => try httpx.Response.fromJson(ctx.allocator, 503, .{
+                            .@"error" = "AdmissionClosed",
+                            .reason = "draining",
+                            .stage = "admission",
+                            .execution_started = false,
+                        }),
+                        else => return err,
+                    };
+                };
+                ctx.setData("antfly.workload-body-memory", memory, null) catch |err| {
+                    memory.release();
+                    self.releasePublicOperation(operation_id, lease);
+                    return err;
+                };
+                // Header/authentication allocations predate this owner. Only
+                // body allocations use it; errors retain the base allocator.
+                std.debug.assert(!ctx.response.body_owned);
+                ctx.response.body_memory = .{
+                    .allocator = memory.allocator(),
+                    .ptr = memory,
+                    .retain = struct {
+                        fn retain(raw: *anyopaque) void {
+                            const owner: *Owner = @ptrCast(@alignCast(raw));
+                            owner.retain();
+                        }
+                    }.retain,
+                    .release = struct {
+                        fn release(raw: *anyopaque) void {
+                            const owner: *Owner = @ptrCast(@alignCast(raw));
+                            owner.release();
+                        }
+                    }.release,
+                };
+            }
+        }
         self.api_server.reachRequestLifecycle(.admission_acquired, operation_id) catch |err| {
             self.releasePublicOperation(operation_id, lease);
             return err;
@@ -4717,7 +4782,18 @@ pub const AntflyApiHandler = struct {
             );
             return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
         }
-        var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data) catch {
+        var parsed_table = parseGlobalQueryTable(ctx.response.bodyAllocator(), body_data) catch {
+            if (ctx.getData("antfly.workload-body-memory")) |raw| {
+                const memory: *@import("../common/workload_allocator.zig").Owner = @ptrCast(@alignCast(raw));
+                if (memory.budget_exhausted.load(.acquire)) {
+                    return httpx.Response.fromJson(ctx.allocator, 429, .{
+                        .@"error" = "QueryMemoryExhausted",
+                        .reason = "resource_exhausted",
+                        .stage = "planning",
+                        .execution_started = false,
+                    });
+                }
+            }
             _ = ctx.status(400);
             return ctx.text("invalid query request");
         };
@@ -9287,6 +9363,96 @@ test "httpx request lifecycle hook suspends after admission without leaking capa
     try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
 }
 
+test "workload admission output bytes survive context and retire with response" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .query_max_concurrent_requests = 1,
+        .query_admission_waiting = .{ .max_retained_bytes = 64 * 1024 },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "/db/v1/tables/docs/query");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    var ctx_live = true;
+    defer if (ctx_live) ctx.deinit();
+    var lease: ?RequestAdmission.Lease = null;
+    defer if (lease) |*owned| owned.release();
+    try std.testing.expect((try handler.acquirePublicOperation(&ctx, "queryTable", &lease)) == null);
+    var response = try ctx.text("retained result");
+    var response_live = true;
+    defer if (response_live) response.deinit();
+    var chunked = try ctx.chunked("chunked result", null);
+    var chunked_live = true;
+    defer if (chunked_live) chunked.deinit();
+    handler.releasePublicOperation("queryTable", &lease);
+    ctx.deinit();
+    ctx_live = false;
+    try std.testing.expectEqualStrings("retained result", response.body.?);
+    try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
+    try std.testing.expectEqual(@sizeOf(@import("../common/workload_allocator.zig").Owner) + response.body.?.len + chunked.body.?.len, api_server.queryAdmissionStats().retained_bytes);
+    response.deinit();
+    response_live = false;
+    try std.testing.expect(api_server.queryAdmissionStats().retained_bytes > 0);
+    chunked.deinit();
+    chunked_live = false;
+    try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().retained_bytes);
+}
+
+test "workload admission output owner allocation failure returns structured overload" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .query_max_concurrent_requests = 1,
+        // The request fits, but leaves no room for the output owner metadata.
+        .query_admission_waiting = .{ .max_retained_bytes = @sizeOf(httpx.Context) + 4096 },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "/db/v1/tables/docs/query");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var lease: ?RequestAdmission.Lease = null;
+    var response = (try handler.acquirePublicOperation(&ctx, "queryTable", &lease)).?;
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 429), response.status.code);
+    try std.testing.expect(lease == null);
+    try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"execution_started\":false") != null);
+}
+
+test "workload admission oversized output preserves execution ambiguity and cleanup" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .query_max_concurrent_requests = 1,
+        .query_admission_waiting = .{ .max_retained_bytes = 64 * 1024 },
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    var request = try httpx.Request.init(alloc, .POST, "/db/v1/tables/docs/query");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var lease: ?RequestAdmission.Lease = null;
+    try std.testing.expect((try handler.acquirePublicOperation(&ctx, "queryTable", &lease)) == null);
+    defer handler.releasePublicOperation("queryTable", &lease);
+    const before = api_server.queryAdmissionStats().retained_bytes;
+    const huge = try alloc.alloc(u8, 64 * 1024);
+    defer alloc.free(huge);
+    @memset(huge, 'x');
+    try std.testing.expectError(error.OutOfMemory, ctx.text(huge));
+    try std.testing.expectEqual(before, api_server.queryAdmissionStats().retained_bytes);
+    var response = try AntflyApiHandler.mapIngressError(&ctx, error.OutOfMemory);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 429), response.status.code);
+    try std.testing.expect(response.headers.get("Retry-After") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"execution_started\":true") != null);
+}
+
 test "httpx query admission bounded waiting transfers bytes and honors original deadline" {
     const alloc = std.testing.allocator;
     var runtime = std.Io.Threaded.init(alloc, .{});
@@ -9334,10 +9500,11 @@ test "httpx query admission bounded waiting transfers bytes and honors original 
     blocker.release();
     try group.await(io);
     try std.testing.expect(worker.err == null and worker.response == null and worker.lease != null);
-    try std.testing.expectEqual(queued_bytes, api_server.queryAdmissionStats().retained_bytes);
+    const output_owner_bytes = @sizeOf(@import("../common/workload_allocator.zig").Owner);
+    try std.testing.expectEqual(queued_bytes + output_owner_bytes, api_server.queryAdmissionStats().retained_bytes);
     try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().queued_bytes);
     worker.lease.?.release();
-    try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().retained_bytes);
+    try std.testing.expectEqual(output_owner_bytes, api_server.queryAdmissionStats().retained_bytes);
 
     ctx.application_deadline_ns = 0;
     var lease: ?RequestAdmission.Lease = null;
@@ -9851,6 +10018,9 @@ test "httpx query admission C80 transport burst waits behind 32 active requests"
         // The fixture has no table-read backend. Every request reaches that
         // normal 404 result after admission; none is rejected as overloaded.
         try std.testing.expect(std.mem.startsWith(u8, bytes[0..len], "HTTP/1.1 404"));
+        // A received status line does not prove that output ownership retired.
+        // Drain this Connection: close response through transport shutdown.
+        while (try slot.*.?.recv(&bytes) != 0) {}
     }
     try std.testing.expectEqual(@as(u32, 80), hook.started.load(.acquire));
     const stats = api_server.queryAdmissionStats();

@@ -708,8 +708,8 @@ pub const OwnedStack = struct {
     }
 
     pub fn deinit(self: *OwnedStack) void {
-        self.handler.query_admission.close();
-        self.handler.write_admission.close();
+        self.handler.query_admission.deinitMemory();
+        self.handler.write_admission.deinitMemory();
         self.runtime.deinit();
         if (self.managed_query_embedder) |*query_embedder| query_embedder.deinit();
         self.embedding_provider_runtime.deinit();

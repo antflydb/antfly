@@ -2998,30 +2998,52 @@ pub const HttpHandler = struct {
     }
 
     fn handleTableQueryRequest(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
+        const memory = if (self.query_admission.stats().max_retained_bytes != 0)
+            try @import("../../common/workload_allocator.zig").Owner.create(self.alloc, &self.query_admission)
+        else
+            null;
+        defer if (memory) |owner| owner.release();
+        const alloc = if (memory) |owner| owner.allocator() else self.alloc;
+        var response = self.handleTableQueryRequestAllocated(alloc, table_name, body, cancellation) catch |err| {
+            if (memory) |owner| if (owner.budget_exhausted.load(.acquire)) return error.QueryMemoryExhausted;
+            return err;
+        };
+        if (memory) |owner| {
+            if (response.status >= 400 and owner.budget_exhausted.load(.acquire)) {
+                response.deinit(alloc);
+                return error.QueryMemoryExhausted;
+            }
+            owner.retain();
+            response.memory_owner = owner;
+        }
+        return response;
+    }
+
+    fn handleTableQueryRequestAllocated(self: *HttpHandler, alloc: Allocator, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
         try cancellation.check();
         var diagnostics = api_operation.RequestDiagnostics{};
         var resp = try public_table_http.handleTableQueryRequest(
-            self.alloc,
+            alloc,
             table_name,
             body,
             null,
             self.tableApiWithDiagnostics(cancellation, &diagnostics),
         );
-        defer resp.deinit(self.alloc);
+        defer resp.deinit(alloc);
         try cancellation.check();
         if (resp.status == 422) {
             if (diagnostics.graph_metric_rejection) |*diagnostic| {
                 const rejection_body = try public_table_http.graphMetricMaterializationRejectedBodyWithContext(
-                    self.alloc,
+                    alloc,
                     diagnostic.graphIndexName(),
                     diagnostic.metricName(),
                     diagnostic.materializer_fingerprint,
                 );
-                defer self.alloc.free(rejection_body);
-                return try jsonSliceResponse(self.alloc, 422, rejection_body);
+                defer alloc.free(rejection_body);
+                return try jsonSliceResponse(alloc, 422, rejection_body);
             }
         }
-        return try adaptPublicTableQueryResponse(self.alloc, resp);
+        return try adaptPublicTableQueryResponse(alloc, resp);
     }
 
     fn handleTablePublicGraphQueryRequest(
@@ -10024,35 +10046,83 @@ fn admissionFailureResponse(alloc: Allocator, err: anyerror) !HttpResponse {
 }
 
 fn executionFailureResponse(alloc: Allocator, err: anyerror) !HttpResponse {
-    if (err != error.DeadlineExceeded) return err;
-    return jsonResponse(alloc, 504, .{
+    const status: u16 = switch (err) {
+        error.QueryMemoryExhausted,
+        error.AdmissionBytesExhausted,
+        error.AdmissionRequestTooLarge,
+        error.AdmissionFull,
+        error.AdmissionQueueFull,
+        error.AdmissionWaitTimeout,
+        => 429,
+        error.AdmissionClosed => 503,
+        error.DeadlineExceeded => 504,
+        else => return err,
+    };
+    const reason = switch (err) {
+        error.QueryMemoryExhausted, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge => "resource_exhausted",
+        error.AdmissionClosed => "draining",
+        error.DeadlineExceeded => "deadline_exceeded",
+        else => "instance_busy",
+    };
+    // Storage admission can fail after foreground execution began. Never turn
+    // that into a pre-execution response eligible for automatic SDK retries.
+    return jsonResponse(alloc, status, .{
         .@"error" = @errorName(err),
-        .reason = "deadline_exceeded",
+        .reason = reason,
         .stage = "execution",
         .execution_started = true,
     });
 }
 
+test "workload admission serverless execution rejection preserves started outcome" {
+    const cases = .{
+        .{ error.QueryMemoryExhausted, 429, "resource_exhausted" },
+        .{ error.AdmissionBytesExhausted, 429, "resource_exhausted" },
+        .{ error.AdmissionRequestTooLarge, 429, "resource_exhausted" },
+        .{ error.AdmissionFull, 429, "instance_busy" },
+        .{ error.AdmissionQueueFull, 429, "instance_busy" },
+        .{ error.AdmissionWaitTimeout, 429, "instance_busy" },
+        .{ error.AdmissionClosed, 503, "draining" },
+        .{ error.DeadlineExceeded, 504, "deadline_exceeded" },
+    };
+    inline for (cases) |case| {
+        var response = try executionFailureResponse(std.testing.allocator, case[0]);
+        defer response.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, case[1]), response.status);
+        try std.testing.expectEqual(@as(?u32, null), response.retry_after_seconds);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case[2], parsed.value.object.get("reason").?.string);
+        try std.testing.expectEqualStrings("execution", parsed.value.object.get("stage").?.string);
+        try std.testing.expect(parsed.value.object.get("execution_started").?.bool);
+    }
+    try std.testing.expectError(error.OutOfMemory, executionFailureResponse(std.testing.allocator, error.OutOfMemory));
+}
+
 fn jsonResponse(alloc: Allocator, status: u16, value: anytype) !HttpResponse {
+    const content_type = try alloc.dupe(u8, "application/json");
+    errdefer alloc.free(content_type);
     return .{
         .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
+        .content_type = content_type,
         .body = try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
 }
 
 fn jsonSliceResponse(alloc: Allocator, status: u16, body: []const u8) !HttpResponse {
+    const content_type = try alloc.dupe(u8, "application/json");
+    errdefer alloc.free(content_type);
     return .{
         .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
+        .content_type = content_type,
         .body = try alloc.dupe(u8, body),
     };
 }
 
 fn parseJsonResponseBody(comptime T: type, alloc: Allocator, body: []const u8) !T {
-    var parsed = try std.json.parseFromSlice(T, alloc, body, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-    return parsed.value;
+    // Callers supply their response arena. The parsed strings must remain live
+    // through serialization; destroying an inner Parsed arena here frees them.
+    return try std.json.parseFromSliceLeaky(T, alloc, body, .{ .allocate = .alloc_always });
 }
 
 fn typedJsonResponse(comptime T: type, alloc: Allocator, status: u16, body: []const u8) !HttpResponse {
@@ -10274,9 +10344,11 @@ const TestQueryAggregationsResponse = struct {
 };
 
 fn textResponse(alloc: Allocator, status: u16, body: []const u8) !HttpResponse {
+    const content_type = try alloc.dupe(u8, "text/plain");
+    errdefer alloc.free(content_type);
     return .{
         .status = status,
-        .content_type = try alloc.dupe(u8, "text/plain"),
+        .content_type = content_type,
         .body = try alloc.dupe(u8, body),
     };
 }

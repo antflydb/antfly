@@ -49,6 +49,54 @@ pub const Failure = error{ AdmissionFull, AdmissionQueueFull, AdmissionBytesExha
 pub const wait_bucket_ms = [_]u64{ 1, 5, 10, 25, 50, 100, 250, 1000, 5000, 60000 };
 pub const wait_bucket_seconds = [_][]const u8{ "0.001", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "1", "5", "60", "+Inf" };
 
+/// Stable allocation accounting can outlive the embedded admission controller.
+/// Its fixed metadata is controller overhead; retained_bytes tracks every
+/// allocation charged through it, including allocation-owner metadata.
+pub const MemoryAccount = struct {
+    allocator: std.mem.Allocator,
+    refs: std.atomic.Value(usize) = .init(2), // controller and first owner
+    mutex: std.atomic.Mutex = .unlocked,
+    controller: ?*Controller,
+    retained_bytes: usize = 0,
+
+    fn lock(self: *MemoryAccount) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn retain(self: *MemoryAccount) void {
+        const previous = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0 and previous < std.math.maxInt(usize));
+    }
+
+    pub fn release(self: *MemoryAccount) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        std.debug.assert(self.controller == null and self.retained_bytes == 0);
+        self.allocator.destroy(self);
+    }
+
+    pub fn reserve(self: *MemoryAccount, bytes: usize) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        const controller = self.controller orelse return error.AdmissionClosed;
+        try controller.reserveMemory(bytes);
+        self.retained_bytes += bytes;
+    }
+
+    pub fn free(self: *MemoryAccount, bytes: usize) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(bytes <= self.retained_bytes);
+        self.retained_bytes -= bytes;
+        if (self.controller) |controller| controller.releaseMemory(bytes);
+    }
+
+    pub fn retainedBytes(self: *MemoryAccount) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        return self.retained_bytes;
+    }
+};
+
 pub const Controller = struct {
     capacity: usize,
     config: Config = .{},
@@ -68,6 +116,7 @@ pub const Controller = struct {
     closed: bool = false,
     head: ?*Waiter = null,
     tail: ?*Waiter = null,
+    memory_account: ?*MemoryAccount = null,
 
     const Waiter = struct {
         previous: ?*Waiter = null,
@@ -130,7 +179,7 @@ pub const Controller = struct {
         try config.validate();
         self.lock();
         defer self.mutex.unlock();
-        if (self.active != 0 or self.queued != 0) return error.AdmissionBusy;
+        if (self.active != 0 or self.queued != 0 or self.retained_bytes != 0) return error.AdmissionBusy;
         self.config = config;
     }
 
@@ -141,6 +190,73 @@ pub const Controller = struct {
     fn fitsBytes(self: *const Controller, bytes: usize) bool {
         return bytes <= std.math.maxInt(usize) - self.retained_bytes and
             (self.config.max_retained_bytes == 0 or (self.retained_bytes <= self.config.max_retained_bytes and bytes <= self.config.max_retained_bytes - self.retained_bytes));
+    }
+
+    /// Allocation ownership is independent of runnable/request count. A response
+    /// may still own bytes after its handler returns. Growth never queues while
+    /// holding partially allocated state; callers unwind on failure.
+    pub fn reserveMemory(self: *Controller, bytes: usize) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return error.AdmissionClosed;
+        if (self.config.max_retained_bytes != 0 and bytes > self.config.max_retained_bytes)
+            return error.AdmissionRequestTooLarge;
+        if (!self.fitsBytes(bytes)) return error.AdmissionBytesExhausted;
+        self.retained_bytes += bytes;
+    }
+
+    pub fn releaseMemory(self: *Controller, bytes: usize) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(bytes <= self.retained_bytes);
+        self.retained_bytes -= bytes;
+        self.grant();
+    }
+
+    pub fn memoryAccount(self: *Controller, allocator: std.mem.Allocator) !*MemoryAccount {
+        self.lock();
+        if (self.closed) {
+            self.mutex.unlock();
+            return error.AdmissionClosed;
+        }
+        if (self.memory_account) |account| {
+            account.retain();
+            self.mutex.unlock();
+            return account;
+        }
+        self.mutex.unlock();
+        const candidate = try allocator.create(MemoryAccount);
+        var published = false;
+        defer if (!published) allocator.destroy(candidate);
+        candidate.* = .{ .allocator = allocator, .controller = self };
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return error.AdmissionClosed;
+        if (self.memory_account) |account| {
+            account.retain();
+            return account;
+        }
+        self.memory_account = candidate;
+        published = true;
+        return candidate;
+    }
+
+    /// Call after request execution has drained, before destroying controller
+    /// storage. Exported output buffers remain charged and may be freed later.
+    /// Never hold the controller lock while taking the account lock: allocation
+    /// releases take these locks in the opposite order to wake queued work.
+    pub fn deinitMemory(self: *Controller) void {
+        self.close();
+        self.lock();
+        const account = self.memory_account;
+        self.memory_account = null;
+        self.mutex.unlock();
+        if (account) |value| {
+            value.lock();
+            value.controller = null;
+            value.mutex.unlock();
+            value.release();
+        }
     }
 
     fn activate(self: *Controller) void {

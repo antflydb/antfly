@@ -39,6 +39,17 @@ const direct_codegen = builtin.is_test;
 const BoundaryAllocator = struct {
     allocator: std.mem.Allocator,
     abi_allocator: abi.memory_abi.Allocator,
+    refs: std.atomic.Value(usize) = .init(1),
+
+    fn retain(self: *BoundaryAllocator) void {
+        const previous = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
+    }
+
+    fn release(self: *BoundaryAllocator) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.allocator.destroy(self);
+    }
 };
 
 extern fn antfly_api_kernel_get_function_table() callconv(.c) *const abi.FunctionTable;
@@ -94,9 +105,8 @@ const OpaqueApiHttpServer = struct {
 
     pub fn deinit(self: *OpaqueApiHttpServer) void {
         const boundary_allocator = self.boundary_allocator;
-        const allocator = boundary_allocator.allocator;
         self.functions.destroy(self.opaque_handle);
-        allocator.destroy(boundary_allocator);
+        boundary_allocator.release();
         self.* = undefined;
     }
 
@@ -232,6 +242,7 @@ fn createOpaqueServer(
     const boundary_allocator = try owner_alloc.create(BoundaryAllocator);
     errdefer owner_alloc.destroy(boundary_allocator);
     boundary_allocator.allocator = owner_alloc;
+    boundary_allocator.refs = .init(1);
     boundary_allocator.abi_allocator = .fromStd(&boundary_allocator.allocator);
     const status = functions.create(&.{
         .abi_version = abi.abi_version,
@@ -306,6 +317,7 @@ const OpaqueHttpxHandler = struct {
     functions: *const abi.FunctionTable,
     alloc: ?std.mem.Allocator = null,
     runtime_routes: std.ArrayListUnmanaged(*RuntimeRoute) = .empty,
+    boundary_allocator: ?*BoundaryAllocator = null,
 
     pub fn initRuntime(self: *OpaqueHttpxHandler, alloc: std.mem.Allocator) !void {
         try callFallible(void, void, self.functions.handler_init, self.handle, null, null);
@@ -383,7 +395,7 @@ const OpaqueHttpxHandler = struct {
             .out_legacy_accepted = &legacy_accepted,
         }));
         if (response_handle) |owned_handle|
-            return copyKernelResponse(context, self.functions, owned_handle, response_view);
+            return copyKernelResponse(context, self.functions, owned_handle, response_view, self.boundary_allocator);
 
         var response = try next.call(context);
         errdefer response.deinit();
@@ -420,6 +432,7 @@ const OpaqueHttpxHandler = struct {
             const route = try alloc.create(RuntimeRoute);
             errdefer alloc.destroy(route);
             route.* = .{
+                .boundary_allocator = self.boundary_allocator,
                 .functions = self.functions,
                 .kernel_route_handle = entry.route_handle,
                 .request_body = entry.request_body,
@@ -443,6 +456,7 @@ const OpaqueHttpxHandler = struct {
             self.runtime_routes.deinit(alloc);
         }
         self.functions.handler_destroy(self.handle);
+        if (self.boundary_allocator) |owner| owner.release();
         self.* = undefined;
     }
 };
@@ -458,6 +472,7 @@ fn requiresHostInternalServicePrincipal(path: []const u8) bool {
 }
 
 const RuntimeRoute = struct {
+    boundary_allocator: ?*BoundaryAllocator = null,
     functions: *const abi.FunctionTable,
     kernel_route_handle: *anyopaque,
     request_body: abi.RequestBodyMode,
@@ -518,6 +533,7 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         route.functions,
         response_handle orelse return error.RuntimeBoundaryFailure,
         response_view,
+        route.boundary_allocator,
     );
 }
 
@@ -526,8 +542,9 @@ fn copyKernelResponse(
     functions: *const abi.FunctionTable,
     owned_response_handle: *anyopaque,
     response_view: abi.HttpResponseView,
+    boundary_allocator: ?*BoundaryAllocator,
 ) !httpx.Response {
-    defer functions.handler_destroy_http_response(owned_response_handle);
+    errdefer functions.handler_destroy_http_response(owned_response_handle);
     var response = httpx.Response.init(context.allocator, response_view.status);
     errdefer response.deinit();
     if (response_view.content_type.slice()) |content_type|
@@ -538,9 +555,31 @@ fn copyKernelResponse(
             std.ascii.eqlIgnoreCase(header.name.slice(), "Content-Type")) continue;
         try response.headers.append(header.name.slice(), header.value.slice());
     }
-    const body = try context.allocator.dupe(u8, response_view.body.slice());
-    response.body = body;
-    response.body_owned = true;
+    const Retirement = struct {
+        allocator: std.mem.Allocator,
+        boundary_allocator: ?*BoundaryAllocator,
+        functions: *const abi.FunctionTable,
+        handle: *anyopaque,
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.functions.handler_destroy_http_response(self.handle);
+            const allocator = self.allocator;
+            const boundary = self.boundary_allocator;
+            allocator.destroy(self);
+            if (boundary) |owner| owner.release();
+        }
+    };
+    // Retirement itself must not use the kernel allocator descriptor which
+    // destroying the final opaque response can retire.
+    const retirement_alloc = if (boundary_allocator) |owner| owner.allocator else context.allocator;
+    const retirement = try retirement_alloc.create(Retirement);
+    if (boundary_allocator) |owner| owner.retain();
+    retirement.* = .{ .allocator = retirement_alloc, .boundary_allocator = boundary_allocator, .functions = functions, .handle = owned_response_handle };
+    // Keep the kernel allocation and its admission charge through output drain.
+    // The opaque handle owns the body; no uncharged host-side copy is needed.
+    response.body = response_view.body.slice();
+    response.retirement = .{ .ptr = retirement, .release = Retirement.release };
     return response;
 }
 
@@ -561,9 +600,12 @@ pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
         .out_handle = &handle,
     });
     try callError(status);
+    const owned_handle = handle orelse return error.ApiKernelOperationFailed;
+    server.boundary_allocator.retain();
     return .{
-        .handle = handle orelse return error.ApiKernelOperationFailed,
+        .handle = owned_handle,
         .functions = server.functions,
+        .boundary_allocator = server.boundary_allocator,
     };
 }
 
@@ -604,6 +646,39 @@ pub fn setAntflyProvider(server: *ApiHttpServer, provider: ?managed_embedder.Ant
         server.antfly_provider = provider
     else
         server.setAntflyProvider(provider);
+}
+
+test "workload admission host response retains ABI allocator after producer teardown" {
+    const alloc = std.testing.allocator;
+    const boundary = try alloc.create(BoundaryAllocator);
+    boundary.* = .{ .allocator = alloc, .abi_allocator = undefined };
+    boundary.abi_allocator = .fromStd(&boundary.allocator);
+    const foreign = boundary.abi_allocator.asStd();
+    const Payload = struct {
+        allocator: std.mem.Allocator,
+        body: []u8,
+        fn destroy(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const backing = self.allocator;
+            backing.free(self.body);
+            backing.destroy(self);
+        }
+    };
+    const payload = try foreign.create(Payload);
+    payload.* = .{ .allocator = foreign, .body = try foreign.dupe(u8, "opaque body") };
+    var functions: abi.FunctionTable = undefined;
+    functions.handler_destroy_http_response = Payload.destroy;
+    var request = try httpx.Request.init(alloc, .GET, "/");
+    defer request.deinit();
+    var context = httpx.Context.init(foreign, std.testing.io, &request);
+    var response = try copyKernelResponse(&context, &functions, payload, .{
+        .status = 200,
+        .body = abi.Bytes.init(payload.body),
+    }, boundary);
+    context.deinit();
+    boundary.release(); // producer/server releases its reference
+    try std.testing.expectEqualStrings("opaque body", response.body.?);
+    response.deinit(); // headers, foreign payload, then allocator descriptor
 }
 
 test "opaque host middleware protects direct internal routes across the kernel ABI" {

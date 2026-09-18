@@ -53,11 +53,17 @@ pub const OwnedResponse = struct {
     body: []u8,
     public_cors: bool = false,
     headers: []Header = &.{},
+    /// When present, every owned buffer uses this allocator. The response owns
+    /// a reference independently of its producer's stack or admission lease.
+    memory_owner: ?*@import("../common/workload_allocator.zig").Owner = null,
 
-    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), fallback_alloc: std.mem.Allocator) void {
+        const memory = self.memory_owner;
+        const alloc = if (memory) |owner| owner.allocator() else fallback_alloc;
         for (self.headers) |*header| header.deinit(alloc);
         if (self.headers.len > 0) alloc.free(self.headers);
         alloc.free(self.body);
+        if (memory) |owner| owner.release();
         self.* = undefined;
     }
 };
