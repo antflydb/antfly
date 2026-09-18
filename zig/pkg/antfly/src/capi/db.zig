@@ -1229,8 +1229,12 @@ fn parseEnrichmentKind(kind: []const u8) ?db_mod.types.EnrichmentKind {
 }
 
 fn graphFreeEdges(alloc: Allocator, edges: []graph_mod.Edge) void {
+    // GraphIndex.freeEdges already frees both each edge's owned fields and
+    // the slice itself. Freeing `edges` again here double-frees it: harmless
+    // for the len==0 case (many allocators no-op an empty-slice free), but a
+    // real heap corruption once a query returns actual edges -- see
+    // antfly_db_get_edges_json below, the only caller.
     graph_mod.GraphIndex.freeEdges(alloc, edges);
-    alloc.free(edges);
 }
 
 fn traversalFreeResults(alloc: Allocator, results: []traversal_mod.TraversalResult) void {
@@ -11932,6 +11936,65 @@ pub export fn antfly_db_get_edges_json(
     }
     out_buf.* = stringifyJson(payload) catch return .internal;
     return .ok;
+}
+
+test "capi get edges json does not double free a non-empty edge slice" {
+    // Regression test for graphFreeEdges double-freeing the edges slice
+    // GraphIndex.freeEdges already frees (antfly_db_get_edges_json's only
+    // caller). std.testing.allocator (a GeneralPurposeAllocator) detects a
+    // double free immediately, so this test would have failed loudly before
+    // the fix -- the bug otherwise only corrupted the libc heap used by
+    // production builds, manifesting later as an unrelated SIGABRT with no
+    // panic message. An empty-result query (before any edges exist) freed a
+    // zero-length slice, which many allocators no-op, so it never caught this.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-get-edges-double-free");
+    defer alloc.free(path);
+    var handle_ptr: ?*anyopaque = null;
+    cleanupTestDir(path);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
+    defer cleanupTestDir(path);
+    defer antfly_db_close(handle_ptr);
+
+    const index_config = "{\"name\":\"gr_edges_v1\",\"kind\":\"graph\",\"config_json\":\"{}\"}";
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle_ptr, .{
+        .ptr = index_config.ptr,
+        .len = index_config.len,
+    }));
+
+    // Before any edges exist, getEdges returns an empty slice: freeing it
+    // twice never crashed, which is exactly why this bug went unnoticed.
+    var empty_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_edges_json(handle_ptr, .{
+        .ptr = "gr_edges_v1",
+        .len = "gr_edges_v1".len,
+    }, .{ .ptr = "doc:edge-source", .len = "doc:edge-source".len }, .{}, 2, &empty_out));
+    antfly_db_buffer_free(empty_out.ptr, empty_out.len);
+
+    const source_doc =
+        \\{"title":"source","_edges":{"gr_edges_v1":{"links":[{"target":"doc:edge-target","weight":1.0}]}}}
+    ;
+    const batch_json = "{\"inserts\":{\"doc:edge-source\":" ++ source_doc ++ ",\"doc:edge-target\":{\"title\":\"target\"}},\"sync_level\":\"write\"}";
+    var batch_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle_ptr, .{
+        .ptr = batch_json.ptr,
+        .len = batch_json.len,
+    }, &batch_out));
+    defer antfly_db_buffer_free(batch_out.ptr, batch_out.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle_ptr));
+
+    // Now getEdges returns one real edge. Freeing that non-empty slice twice
+    // is a real heap corruption that std.testing.allocator catches.
+    var out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_edges_json(handle_ptr, .{
+        .ptr = "gr_edges_v1",
+        .len = "gr_edges_v1".len,
+    }, .{ .ptr = "doc:edge-source", .len = "doc:edge-source".len }, .{}, 2, &out));
+    defer antfly_db_buffer_free(out.ptr, out.len);
+    try std.testing.expect(out.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "edge_type") != null);
 }
 
 pub export fn antfly_db_traverse_edges_json(

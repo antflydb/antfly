@@ -18,6 +18,7 @@ package antflylite
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -1513,4 +1514,232 @@ func TestLiteNativeRemoteProviderSemanticSearchMatchesDogfoodRequestShape(t *tes
 	if !bytes.Contains(result, []byte("doc:a")) {
 		t.Fatalf("dogfood-shape hybrid search result %q did not contain doc:a", result)
 	}
+}
+
+// newFakeAntflyExtractServer starts an httptest server implementing the
+// minimal antfly inference extraction endpoint (POST .../extract, see
+// zig/EXTRACT.md's request/response envelope) that the graph index's
+// extractor asset producer calls for a `relations_v1` artifact whose
+// producer config carries its own api_url. Every input is answered with the
+// same fixed two-entity, one-relation payload so the relation's rendered
+// graph target ("antfly-core", from entity_index 1) is not itself a document
+// key -- the shape dogfood's `knowledge` graph index (see
+// examples/dogfood/index_config.go's knowledgeGraphIndexJSON) produces
+// against real GLiNER2.5 output. It also answers unrelated paths (the
+// GET capability probe) with 404, which the client tolerates.
+func newFakeAntflyExtractServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/extract") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var req struct {
+			Model  string `json:"model"`
+			Inputs []struct {
+				ID      string `json:"id"`
+				Content string `json:"content"`
+			} `json:"inputs"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		data := make([]map[string]any, len(req.Inputs))
+		for i, in := range req.Inputs {
+			item := map[string]any{
+				"entities": []map[string]any{
+					{"text": "VOPR", "label": "component", "start": 0, "end": 4, "score": 0.95},
+					{"text": "antfly-core", "label": "component", "start": 10, "end": 21, "score": 0.9},
+				},
+				"relations": []map[string]any{
+					{
+						"type":   "depends_on",
+						"source": map[string]any{"entity_index": 0},
+						"target": map[string]any{"entity_index": 1},
+						"score":  0.88,
+					},
+				},
+			}
+			if in.ID != "" {
+				item["id"] = in.ID
+			}
+			data[i] = item
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": "extraction", "model": req.Model, "data": data})
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// knowledgeGraphIndexJSONForTest mirrors examples/dogfood/index_config.go's
+// knowledgeGraphIndexJSON: a graph index fed by an extractor asset producer
+// (the "autograph" pattern) whose relation targets render arbitrary entity
+// text rather than existing document keys.
+func knowledgeGraphIndexJSONForTest(indexName, artifactName, apiURL string) ([]byte, error) {
+	config := map[string]any{
+		"source": map[string]any{
+			"artifact": artifactName,
+			"path":     "$.relations[*]",
+			"format":   "extraction_relation",
+			"nodes": map[string]any{
+				"model":  "document",
+				"target": "{{ _item.target.text }}",
+			},
+			"edge": map[string]any{
+				"weight": "{{ _item.score }}",
+				"metadata": map[string]any{
+					"type":          "{{ _item.type }}",
+					"source_entity": "{{ _item.source.text }}",
+					"target_entity": "{{ _item.target.text }}",
+					"score":         "{{ _item.score }}",
+				},
+			},
+		},
+		"artifact": map[string]any{
+			"name": artifactName,
+			"kind": "asset",
+			"source": map[string]any{
+				"type":  "field",
+				"value": "body",
+			},
+			"content_type": "application/json",
+			"producer_json": map[string]any{
+				"type": "extractor",
+				"config": map[string]any{
+					"provider": "antfly",
+					"model":    "fake-extractor",
+					"api_url":  apiURL,
+					"schema": map[string]any{
+						"entities":  []string{"component"},
+						"relations": []map[string]any{{"type": "depends_on"}},
+					},
+					"options": map[string]any{
+						"include_confidence": true,
+						"include_spans":      true,
+					},
+				},
+			},
+		},
+		"algebraic_planning": map[string]any{
+			"bounded_traversal": map[string]any{
+				"law": "provenance_semiring",
+			},
+		},
+	}
+	inner, err := json.Marshal(config)
+	if err != nil {
+		return nil, fmt.Errorf("marshal graph config: %w", err)
+	}
+	envelope := struct {
+		Name       string `json:"name"`
+		Kind       string `json:"kind"`
+		ConfigJSON string `json:"config_json"`
+	}{Name: indexName, Kind: "graph", ConfigJSON: string(inner)}
+	return json.Marshal(envelope)
+}
+
+// TestLiteNativeGraphEdgesFromExtractionArtifact reproduces the Lite/native
+// SIGABRT reported against antfly_db_get_edges_json once a graph index fed by
+// an extraction asset producer has real edges: the extractor's relation
+// targets are entity text ("antfly-core") rather than existing document
+// keys, and the previous agent found that once such edges exist,
+// handle.db.getEdges aborts the process with no panic message. This test
+// reproduces that setup without any real model, using a fake `/ai/v1/extract`
+// server standing in for GLiNER2.5, mirroring dogfood's `knowledge` graph
+// index (examples/dogfood/index_config.go's knowledgeGraphIndexJSON).
+func TestLiteNativeGraphEdgesFromExtractionArtifact(t *testing.T) {
+	server := newFakeAntflyExtractServer(t)
+
+	path := filepath.Join(t.TempDir(), "graph-extraction-edges.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:                     OpenModeWriter,
+		Profile:                  ProfileNative,
+		RemoteProviderConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("create native remote-provider Lite database: %v", err)
+	}
+	defer db.Close()
+
+	const indexName = "knowledge"
+	const artifactName = "relations_v1"
+	graphIndex, err := knowledgeGraphIndexJSONForTest(indexName, artifactName, server.URL)
+	if err != nil {
+		t.Fatalf("build knowledge graph index config: %v", err)
+	}
+	if err := db.AddIndexJSON(graphIndex); err != nil {
+		t.Fatalf("add knowledge graph index: %v", err)
+	}
+
+	if err := db.Batch([]WriteIntent{
+		{Key: "doc:vopr-design", Value: []byte(`{"title":"VOPR design","body":"VOPR depends on antfly-core for storage."}`)},
+		{Key: "doc:vopr-tests", Value: []byte(`{"title":"VOPR tests","body":"VOPR test harness also depends on antfly-core."}`)},
+	}, 2); err != nil {
+		t.Fatalf("batch write documents: %v", err)
+	}
+
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatalf("run until idle: %v", err)
+	}
+
+	edges, err := db.EdgesJSON(indexName, "doc:vopr-design", "", 2 /* both */)
+	if err != nil {
+		t.Fatalf("edges json: %v", err)
+	}
+	if !bytes.Contains(edges, []byte("depends_on")) {
+		t.Fatalf("edges JSON %q did not contain the extracted depends_on edge", edges)
+	}
+
+	neighbors, err := db.NeighborsJSON(indexName, "doc:vopr-design", "", 2 /* both */)
+	if err != nil {
+		t.Fatalf("neighbors json: %v", err)
+	}
+	t.Logf("neighbors: %s", neighbors)
+
+	traverseRequest, err := json.Marshal(map[string]any{
+		"index_name":    indexName,
+		"start_key_b64": base64.StdEncoding.EncodeToString([]byte("doc:vopr-design")),
+		"direction":     2,
+		"max_depth":     2,
+		"max_results":   10,
+	})
+	if err != nil {
+		t.Fatalf("marshal traverse request: %v", err)
+	}
+	traversal, err := db.TraverseEdgesJSON(traverseRequest)
+	if err != nil {
+		t.Fatalf("traverse edges json: %v", err)
+	}
+	t.Logf("traversal: %s", traversal)
+
+	graphQueriesRequest, err := json.Marshal(map[string]any{
+		"graph_queries": []map[string]any{
+			{
+				"name":       "neighbors",
+				"type":       "neighbors",
+				"index_name": indexName,
+				"start_nodes": map[string]any{
+					"keys": []string{base64.StdEncoding.EncodeToString([]byte("doc:vopr-design"))},
+				},
+				"direction": "both",
+			},
+		},
+		"named_sets": []map[string]any{},
+		"limit":      10,
+	})
+	if err != nil {
+		t.Fatalf("marshal graph queries request: %v", err)
+	}
+	graphQueries, err := db.ExecuteGraphQueriesJSON(graphQueriesRequest)
+	if err != nil {
+		t.Fatalf("execute graph queries json: %v", err)
+	}
+	t.Logf("graph queries: %s", graphQueries)
 }

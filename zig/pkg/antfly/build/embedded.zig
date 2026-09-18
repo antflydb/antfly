@@ -417,6 +417,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi aggregate hits rejects stale identity generation before aggregation materialization",
         "capi lite local-runtime-configured flag reports local_embedded only when the build links inference",
         "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
+        "capi get edges json does not double free a non-empty edge slice",
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_mod,
