@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any
 
 import workload_vector_qualification as vectors
+import workload_scenarios as scenarios
+import workload_evidence as evidence
 
 TIERS = {
     "starter": (1, 4 << 30, 50 << 30),
@@ -264,6 +266,9 @@ def validate(plan: dict[str, Any]) -> None:
         ):
             raise ValueError("workload names must be unique safe filenames")
         names.add(workload["name"])
+        if workload.get("kind") == "scenario":
+            scenarios.validate(workload)
+            continue
         if workload.get("kind") == "vector":
             if "vector" not in plan:
                 raise ValueError(
@@ -273,6 +278,8 @@ def validate(plan: dict[str, Any]) -> None:
         for field in ("read_percent", "query_percent_of_reads"):
             if type(workload.get(field)) is not int or not 0 <= workload[field] <= 100:
                 raise ValueError(f"{field} must be an integer percentage")
+    if "telemetry" in plan:
+        evidence.validate(plan["telemetry"])
     if "vector" in plan:
         vectors.validate(
             plan["vector"], qualification=plan["purpose"] == "qualification"
@@ -382,6 +389,9 @@ def operation(
     # Independent permutations give exact long-run offered mixes, independent of
     # completion rates. Updates rewrite identical values so expected reads stay fixed.
     index = sequence % documents
+    if workload.get("kind") == "scenario":
+        index, item = scenarios.select(workload, sequence)
+        return item["class"], item["method"], item["path"], item.get("body"), index
     if workload.get("kind") == "vector":
         fixture = workload["_fixture"]
         query_id = (
@@ -449,11 +459,11 @@ def classify(kind: str, index: int, status: int, data: bytes, documents: int) ->
 def percentiles(values: list[float]) -> dict[str, float | None]:
     ordered = sorted(values)
     return {
-        f"p{p}_ms": ordered[
-            min(len(ordered) - 1, math.ceil(len(ordered) * p / 100) - 1)
-        ]
-        if ordered
-        else None
+        f"p{p}_ms": (
+            ordered[min(len(ordered) - 1, math.ceil(len(ordered) * p / 100) - 1)]
+            if ordered
+            else None
+        )
         for p in (50, 95, 99)
     }
 
@@ -521,7 +531,7 @@ def run_load(
                 counts[outcome] += 1
                 class_counts[kind][outcome] += 1
                 if outcome == "completed":
-                    if kind == "vector":
+                    if workload.get("kind") == "vector":
                         vector_matches += sample["matched_neighbors"]
                         vector_completed += 1
                     latencies[kind].append(sample["latency_ms"])
@@ -535,6 +545,11 @@ def run_load(
             nonlocal outstanding
             kind, method, route, body, index = operation(
                 sequence, workload, plan["documents"]
+            )
+            scenario = (
+                workload["operations"][index]
+                if workload.get("kind") == "scenario"
+                else None
             )
             dispatched = time.monotonic()
             sample: dict[str, Any] = {
@@ -551,56 +566,77 @@ def run_load(
                 if remaining <= 0:
                     sample["outcome"] = "client_deadline_before_dispatch"
                 else:
-                    if not hasattr(local, "client"):
-                        local.client = HTTP(port, remaining)
-                        with lock:
-                            clients.append(local.client)
-                    connection = local.client.connection
-                    connection.timeout = remaining
-                    if connection.sock:
-                        connection.sock.settimeout(remaining)
-                    status, data, headers = local.client.request(method, route, body)
-                    if kind == "vector" and status == 200:
-                        sample["status"] = status
-                        try:
-                            result = workload["_fixture"].result(index, status, data)
-                            sample.update(
-                                outcome="completed",
-                                query_id=index,
-                                ids=result["ids"],
-                                recall=result["recall"],
-                                matched_neighbors=result["matched_neighbors"],
-                                search_effort=workload["_effort"],
-                            )
-                        except (ValueError, TypeError, KeyError, IndexError):
-                            sample["outcome"] = "invalid_result"
-                    elif kind == "vector":
+                    if scenario is not None and scenario.get("stream"):
                         sample.update(
-                            status=status,
-                            outcome="rejected"
-                            if status == 429
-                            else "unexpected_http_error",
+                            scenarios.stream_request(
+                                port, scenario, submitted + plan["request_timeout"]
+                            )
                         )
                     else:
-                        sample.update(
-                            status=status,
-                            outcome=classify(
-                                kind, index, status, data, plan["documents"]
-                            ),
+                        if not hasattr(local, "client"):
+                            local.client = HTTP(port, remaining)
+                            with lock:
+                                clients.append(local.client)
+                        connection = local.client.connection
+                        connection.timeout = remaining
+                        if connection.sock:
+                            connection.sock.settimeout(remaining)
+                        status, data, headers = local.client.request(
+                            method, route, body
                         )
-                    if sample["outcome"] != "completed":
-                        sample.update(
-                            error_body=data[:16384].decode(errors="replace"),
-                            retry_after=headers.get("Retry-After"),
-                        )
+                        if workload.get("kind") == "vector" and status == 200:
+                            sample["status"] = status
+                            try:
+                                result = workload["_fixture"].result(
+                                    index, status, data
+                                )
+                                sample.update(
+                                    outcome="completed",
+                                    query_id=index,
+                                    ids=result["ids"],
+                                    recall=result["recall"],
+                                    matched_neighbors=result["matched_neighbors"],
+                                    search_effort=workload["_effort"],
+                                )
+                            except (ValueError, TypeError, KeyError, IndexError):
+                                sample["outcome"] = "invalid_result"
+                        elif workload.get("kind") == "vector":
+                            sample.update(
+                                status=status,
+                                outcome=(
+                                    "rejected"
+                                    if status == 429
+                                    else "unexpected_http_error"
+                                ),
+                            )
+                        elif scenario is not None:
+                            sample.update(
+                                status=status,
+                                outcome=scenarios.classify(scenario, status, data),
+                            )
+                        else:
+                            sample.update(
+                                status=status,
+                                outcome=classify(
+                                    kind, index, status, data, plan["documents"]
+                                ),
+                            )
+                        if sample["outcome"] != "completed":
+                            sample.update(
+                                error_body=data[:16384].decode(errors="replace"),
+                                retry_after=headers.get("Retry-After"),
+                            )
                     if time.monotonic() > submitted + plan["request_timeout"]:
                         sample["deadline_exceeded"] = True
                         sample["outcome"] = "late_response"
             except (OSError, http.client.HTTPException, ValueError) as error:
                 sample.update(
-                    outcome="unknown_write_outcome"
-                    if kind == "write"
-                    else "transport_error",
+                    outcome=(
+                        "unknown_write_outcome"
+                        if kind == "write"
+                        or (scenario is not None and scenario["is_write"])
+                        else "transport_error"
+                    ),
                     error=f"{type(error).__name__}: {error}",
                 )
             finally:
@@ -675,22 +711,27 @@ def run_load(
             client.close()
     all_latencies = [value for values in latencies.values() for value in values]
     return {
-        "vector": {
-            "search_effort": workload["_effort"],
-            "completed_queries": vector_completed,
-            "recall": vector_matches
-            / (vector_completed * workload["_fixture"].spec["k"])
-            if vector_completed
-            else None,
-            "recall_floor_pass": bool(
-                vector_completed
-                and vector_matches / (vector_completed * workload["_fixture"].spec["k"])
-                >= 0.95
-            ),
-        }
-        if workload.get("kind") == "vector"
-        else None,
+        "vector": (
+            {
+                "search_effort": workload["_effort"],
+                "completed_queries": vector_completed,
+                "recall": (
+                    vector_matches / (vector_completed * workload["_fixture"].spec["k"])
+                    if vector_completed
+                    else None
+                ),
+                "recall_floor_pass": bool(
+                    vector_completed
+                    and vector_matches
+                    / (vector_completed * workload["_fixture"].spec["k"])
+                    >= 0.95
+                ),
+            }
+            if workload.get("kind") == "vector"
+            else None
+        ),
         "seconds": seconds,
+        "monotonic_origin": started,
         "elapsed_including_drain": time.monotonic() - started,
         "offered": sum(counts.values()),
         "offered_qps": sum(counts.values()) / seconds,
@@ -799,7 +840,8 @@ def prometheus_error(status: int, body: bytes, headers: dict[str, str]) -> str |
     if status != 200:
         return f"metrics HTTP status {status}"
     content_type = (
-        {key.lower(): value for key, value in headers.items()}.get("content-type", "")
+        {key.lower(): value for key, value in headers.items()}
+        .get("content-type", "")
         .split(";", 1)[0]
         .strip()
         .lower()
@@ -1114,6 +1156,55 @@ def compare(
     return output
 
 
+def compare_open_low_load(points, expected_runs):
+    results = []
+    for workload in sorted({point["workload"] for point in points}):
+        arms = {
+            arm: [
+                point
+                for point in points
+                if point["workload"] == workload
+                and point["arm"] == arm
+                and point["phase"] == "open"
+                and point.get("factor") == 0.5
+            ]
+            for arm in ("baseline", "candidate")
+        }
+        complete = all(
+            len(rows) == expected_runs
+            and all(successful_baseline(point) for point in rows)
+            for rows in arms.values()
+        )
+        worst = {
+            arm: max(
+                (
+                    point["success_latency"]["p99_ms"]
+                    for point in rows
+                    if point["success_latency"]["p99_ms"] is not None
+                ),
+                default=None,
+            )
+            for arm, rows in arms.items()
+        }
+        available = complete and all(value is not None for value in worst.values())
+        passed = (
+            available
+            and worst["candidate"]
+            <= worst["baseline"] * GATES["low_load_p99_ratio"]
+            + GATES["low_load_p99_add_ms"]
+        )
+        results.append(
+            {
+                "workload": workload,
+                "worst_half_rate_p99_ms": worst,
+                "status": (
+                    "passed" if passed else "failed" if available else "unavailable"
+                ),
+            }
+        )
+    return results
+
+
 def freeze_artifacts(plan: dict[str, Any], output: Path) -> dict[str, Any]:
     # Freeze binaries once per arm before either lifecycle. Concurrent builds
     # cannot replace a later arm's executable underneath its recorded checksum.
@@ -1151,7 +1242,14 @@ def outcome_summary(
         unexpected = {
             kind: count
             for kind, count in counts.items()
-            if count and kind not in {"completed", "rejected", *generator_outcomes}
+            if count
+            and kind
+            not in {
+                "completed",
+                "rejected",
+                "intentional_disconnect",
+                *generator_outcomes,
+            }
         }
         vector_failed = (
             point.get("vector") is not None and not point["vector"]["recall_floor_pass"]
@@ -1199,11 +1297,11 @@ def outcome_summary(
     status = (
         "experiment_failed"
         if not correctness_passed
-        else "generator_invalid"
-        if not generator_valid
-        else "smoke_evidence"
-        if purpose == "smoke"
-        else "partial_matrix_evidence"
+        else (
+            "generator_invalid"
+            if not generator_valid
+            else "smoke_evidence" if purpose == "smoke" else "partial_matrix_evidence"
+        )
     )
     return {
         "status": status,
@@ -1222,6 +1320,8 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
     save(output / "plan.json", plan)
     shutil.copy2(__file__, output / "workload_qualification.py")
     shutil.copy2(vectors.__file__, output / "workload_vector_qualification.py")
+    shutil.copy2(scenarios.__file__, output / "workload_scenarios.py")
+    shutil.copy2(evidence.__file__, output / "workload_evidence.py")
     save(
         output / "host.json",
         {
@@ -1264,10 +1364,13 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                     lifecycles.append(runtime)
                     port = runtime["port"]
                     if any(
-                        workload.get("kind") != "vector"
+                        workload.get("kind") not in {"vector", "scenario"}
                         for workload in plan["workloads"]
                     ):
                         seed(port, plan["documents"], directory)
+                    for workload in plan["workloads"]:
+                        if workload.get("kind") == "scenario":
+                            scenarios.seed(HTTP, port, workload, directory)
                     vector_effort = None
                     if vector_fixture is not None:
                         vectors.seed(HTTP, port, vector_fixture, directory)
@@ -1278,6 +1381,64 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                             directory,
                             plan["request_timeout"],
                         )
+
+                    def observed_load(*args, **kwargs):
+                        if "telemetry" not in plan:
+                            return run_load(*args, **kwargs)
+                        raw_path = args[3]
+                        with evidence.observe(
+                            HTTP,
+                            command,
+                            runtime,
+                            raw_path.with_suffix(".telemetry.jsonl"),
+                            plan["telemetry"],
+                        ) as observations:
+                            measured = run_load(*args, **kwargs)
+                        for observation in observations:
+                            observation["started_s"] = (
+                                observation["started_monotonic"]
+                                - measured["monotonic_origin"]
+                            )
+                            observation["finished_s"] = (
+                                observation["finished_monotonic"]
+                                - measured["monotonic_origin"]
+                            )
+                        measured["periodic_telemetry"] = evidence.periodic_gates(
+                            observations, plan["telemetry"], kwargs["seconds"]
+                        )
+
+                        def samples():
+                            with raw_path.open() as stream:
+                                for line in stream:
+                                    yield json.loads(line)
+
+                        operations = args[1].get(
+                            "operations",
+                            [{"class": name} for name in measured["classes"]],
+                        )
+                        measured["class_progress"] = evidence.progress_gates(
+                            samples(), operations, kwargs["seconds"]
+                        )
+                        if kwargs.get("rate_schedule"):
+                            prior = [
+                                point["success_latency"]["p99_ms"]
+                                for point in points
+                                if point["arm"] == "baseline"
+                                and point["workload"] == args[1]["name"]
+                                and point["phase"] == "open"
+                                and point["factor"] == 0.5
+                                and successful_baseline(point)
+                            ]
+                            measured["overload_recovery_gate"] = evidence.recovery_gate(
+                                samples(),
+                                observations,
+                                plan["telemetry"],
+                                plan["overload_seconds"],
+                                kwargs["seconds"],
+                                max(prior) if prior else None,
+                            )
+                        return measured
+
                     for configured_workload in plan["workloads"]:
                         workload = configured_workload.copy()
                         if workload.get("kind") == "vector":
@@ -1287,7 +1448,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                         name = workload["name"]
                         for concurrency in plan["concurrency"]:
                             prefix = f"{name}-closed-{concurrency}"
-                            warmup = run_load(
+                            warmup = observed_load(
                                 port,
                                 workload,
                                 plan,
@@ -1304,7 +1465,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                             warmups.append(warmup)
                             save(output / "warmups.json", warmups)
                             snapshot(runtime, port, directory, prefix + "-before")
-                            point = run_load(
+                            point = observed_load(
                                 port,
                                 workload,
                                 plan,
@@ -1346,7 +1507,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                         rate = baseline_rates[name]
                         for factor in plan["open_factors"]:
                             prefix = f"{name}-open-{factor}"
-                            warmup = run_load(
+                            warmup = observed_load(
                                 port,
                                 workload,
                                 plan,
@@ -1362,7 +1523,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                             )
                             warmups.append(warmup)
                             save(output / "warmups.json", warmups)
-                            point = run_load(
+                            point = observed_load(
                                 port,
                                 workload,
                                 plan,
@@ -1382,7 +1543,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                             )
                             points.append(point)
                             save(output / "points.json", points)
-                        point = run_load(
+                        point = observed_load(
                             port,
                             workload,
                             plan,
@@ -1417,16 +1578,27 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
             **outcome_summary(plan["purpose"], points + warmups, lifecycles, error),
             "release_qualified": False,
             "error": error,
-            "comparisons": compare(points, plan["runs"])
-            if plan["purpose"] == "qualification"
-            else [],
+            "comparisons": (
+                compare(points, plan["runs"])
+                if plan["purpose"] == "qualification"
+                else []
+            ),
+            "open_low_load_comparisons": (
+                compare_open_low_load(points, plan["runs"])
+                if plan["purpose"] == "qualification"
+                else []
+            ),
             "lifecycles": lifecycles,
             "unmeasured_gates": [
-                "vector recall/calibration"
-                if vector_fixture is None
-                else "retained vector datasets and cold storage"
-                if vector_fixture.spec["source"] == "deterministic_cosine"
-                else "cold vector storage",
+                (
+                    "vector recall/calibration"
+                    if vector_fixture is None
+                    else (
+                        "retained vector datasets and cold storage"
+                        if vector_fixture.spec["source"] == "deterministic_cosine"
+                        else "cold vector storage"
+                    )
+                ),
                 "graph/aggregation/scan isolation",
                 "slow output and inference",
                 "per-stage ownership ceilings",
@@ -1446,6 +1618,38 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
             summary["unmeasured_gates"].append("Prometheus telemetry snapshots")
             if summary["exit_code"] == 0:
                 summary.update(status="telemetry_unavailable", exit_code=3)
+        summary["periodic_gate_results"] = [
+            {
+                "arm": point.get("arm"),
+                "trial": point.get("trial"),
+                "workload": point.get("workload"),
+                "phase": point.get("phase"),
+                **{
+                    key: point[key]
+                    for key in (
+                        "periodic_telemetry",
+                        "class_progress",
+                        "overload_recovery_gate",
+                    )
+                    if key in point
+                },
+            }
+            for point in points
+            if "periodic_telemetry" in point
+        ]
+        statuses = [
+            gate["status"]
+            for point in points
+            for name in ("periodic_telemetry", "overload_recovery_gate")
+            if (gate := point.get(name)) is not None
+        ]
+        statuses.extend(row["status"] for row in summary["open_low_load_comparisons"])
+        if any(not row["measured_gate_pass"] for row in summary["comparisons"]):
+            statuses.append("failed")
+        if summary["exit_code"] == 0 and "failed" in statuses:
+            summary.update(status="measured_gate_failed", exit_code=4)
+        elif summary["exit_code"] == 0 and "unavailable" in statuses:
+            summary.update(status="gate_evidence_unavailable", exit_code=3)
         save(output / "summary.json", summary)
         files = sorted(
             path

@@ -170,3 +170,76 @@ Run the offline harness checks with:
 ```sh
 python3 -B -m unittest discover -s scripts -p 'test_workload*qualification.py'
 ```
+
+## Explicit operator and output scenarios
+
+A workload with `kind: "scenario"` provides `setup` requests and an `operations`
+list. Each operation declares a unique class, integer weight, `is_write`, method,
+local `/db/v1/` path, body, and an exact successful HTTP status plus JSON checks.
+Checks use a list of object keys/array indices in `path` and one of `equals`,
+`length`, or `sorted_equals`. Query error payloads fail even when HTTP is 200.
+Setup writes run once; failed or ambiguous writes are never replayed. Operation
+weights determine offered mix independently of completion. Unknown outcomes from
+custom write class names retain `unknown_write_outcome`.
+
+`workload_scenarios.mixed_fixture(rows=4096, read_percent=90, graph_depth=32)`
+generates a separate deterministic fixture with selective text, graph-chain
+traversal, sum aggregation, document lookup, and identical-value indexed writes.
+Use `read_percent=50` for the other declared mix. The request shapes come from
+repository integration tests; exact preflight assertions verify the installed
+fixture before measurements. This fixture is not the retained vector/graph
+benchmark and its graph operation is not certified long-running by its name.
+Choose and freeze row count/depth before qualification, retain observed operator
+latency, and pair identical fixture plans. Generated setup and request assertions
+are part of the checksummed plan. The generic scenario schema also accepts
+explicit checked operations over externally prepared workload-specific fixtures.
+
+A scan operation can declare `stream` with `mode: "drain"` or `"disconnect"`,
+`chunk_bytes`, `pause_seconds`, and `max_bytes`. Drain additionally requires the
+predeclared exact `sha256` of the expected complete response. Only the keys scan
+endpoint accepts this transport mode. Connect, body reads, and pauses consume
+the original submission deadline. A deliberate disconnect is recorded separately
+and never counts as completed useful work. It does not itself prove server-side
+retirement; inspect the retained ownership metrics or deterministic fault tests.
+Dedicated disconnect-only scenarios are correctness probes, not a source of a
+sustainable throughput baseline.
+
+## Periodic resource and recovery evidence
+
+Opt into periodic evidence with a plan `telemetry` object:
+
+```json
+{
+  "interval_seconds": 1,
+  "ceilings": {"EXACT_EXPORTED_SERIES_WITH_LABELS": 32},
+  "queue_metrics": ["EXACT_EXPORTED_QUEUE_SERIES_WITH_LABELS"],
+  "recovery_queue_bound": 0
+}
+```
+
+Replace the names and limits using the frozen resource policy and actual exported
+series; missing names fail closed. Queue bounds must be chosen before the run
+from the declared pre-burst policy, not fitted to observed overload results.
+Every point retains `.telemetry.jsonl` with raw Prometheus text, raw cgroup data,
+monotonic polling timestamps, and failures. A separate sampler polls the dedicated
+health listener and Docker cgroup `memory.current`, kernel `memory.peak`, enforced
+`memory.max`, and `memory.events` at intervals no longer than one second. The
+kernel peak catches memory spikes between polls. Process runs remain useful for
+correctness, but have no claimed cgroup qualification coverage. Missing samples
+or coverage gaps over two seconds produce unavailable evidence. A peak above
+90% of the enforced memory limit or any OOM event fails the memory gate. Declared
+series ceilings apply to observed samples; invisible gauge excursions still need
+runtime invariants/counters and cannot be disproved by sampling.
+
+The recovery evaluator attributes latency to original submission and requires
+every one-second window from ten seconds after pressure removal through the end
+of recovery to meet baseline 50%-load p99 × 1.10 + 1 ms and the declared summed
+queue bound. Rejections do not improve the verdict; missing completions or queue
+samples are unavailable. Class progress reports continuously backlogged client
+windows separately from server eligibility, which requires runtime evidence.
+These results are per-point evidence, never a full-matrix qualification verdict.
+Missing periodic gate evidence uses exit 3; measured numerical gate failure uses
+exit 4. Request correctness failures (exit 1) and invalid generators (exit 2)
+retain precedence. Fault schedules and remote/durable reconciliation evidence
+belong to the separate cluster correctness runner; no Cloud-sized machine is
+required to execute those correctness schedules.
