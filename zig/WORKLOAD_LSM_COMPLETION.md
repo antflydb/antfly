@@ -1,4 +1,6 @@
-# LSM completion allocation ownership prerequisite
+# Internal LSM completion allocation ownership
+
+## Allocator provenance prerequisite
 
 This stage preserves allocator provenance when an in-memory publication uses
 an allocator different from the backend allocator. Persistent AVL nodes free
@@ -8,7 +10,7 @@ its allocator separately. Switching its allocation domain first retires the
 old unused pool; a transferred spare vector therefore cannot contain nodes
 from another allocator domain.
 
-The existing shared memory `Account` remains unchanged and stays alive through
+The prerequisite kept the existing shared memory `Account` unchanged and alive through
 the same generation and allocation references. Mixed publication allocators do
 not create new accounts or exclude any allocations from ordinary accounting.
 The allocator contexts themselves must outlive every allocation made through
@@ -28,11 +30,65 @@ exercise incremental reclamation, shared-account conservation, and allocator
 domain changes in a spare pool. Final focused results: 25 state/backend-type
 tests and two actual LSM backend tests in each of Debug and ReleaseSafe.
 
-This is not prepaid backend completion integration. `CompletionCredit` remains
-disconnected from LSM publication. There is no new public transaction policy,
-WAL or manifest admission bypass, or mandatory-completion guarantee. The next
-step needs a stable retained allocator owner and an exact accounted subset
-inside the existing shared account before credit can move into backend
-ownership without being counted twice. Durable pre-prepare physical-plan
-certificates, restart reservations, replay/backlog capacity, and protected
-WAL/manifest/flush resources remain separate requirements.
+## Sealed memory-only point batches
+
+`Backend.prepareCompletionPointBatch(namespace, operations, limits)` is an
+internal, callable backend path. It copies bounded point puts/tombstones and
+prepares the complete COW successor before returning a heap-stable ticket.
+The caller supplies operation, encoded-input and physical-allocation ceilings.
+The physical ceiling includes the owner, ticket, copied input, nodes, spare
+vectors, shared entry headers and preparation overlap. An insufficient ceiling
+or backing allocation failure aborts preparation without publishing anything;
+it is not an estimate promising that arbitrary input will fit. Range/bulk
+operations are absent from the API. Persistent roots and storage-backed modes
+are rejected before reservation. There is no public configuration or transaction
+policy activation.
+
+The allocator stages exact requested buffer bytes from `CompletionCredit`
+before calling its backing allocator. Resizing uses allocate-copy-free, so the
+overlap is reserved as well. The owner metadata is itself reserved before
+allocation. Each physical buffer retains the owner, including buffers retained
+by readers after the submitting ticket is destroyed. The manager and backing
+allocator must outlive those buffers. Allocator-private overhead, resource
+manager identity-ledger storage and whole-process RSS are outside this byte
+accounting contract.
+
+The same shared `Account` follows old and new roots. Its single atomic
+`ordinary_bytes` counter contains only buffers charged by the ordinary backend
+observer. The trusted prepaid allocator's buffers retain the account but are
+charged solely by their separate credit observer. This preserves old ordinary
+nodes without counting the prepaid subset twice, and avoids subtracting two
+independently changing counters. This change adds no `Account` size overhead.
+The backend has one additional pending-ticket list pointer.
+
+Outstanding tickets participate in the backend's ordinary accounting walk,
+including their pinned original root. A competing write or mutable rotation
+makes publication fail as stale; the original root remains charged until
+ticket destruction. Successful publication checks the pinned root identity,
+marks credit published, and swaps the prepared root without allocation. It
+can use already-owned capacity after aggregate or slice limits are reduced.
+Ticket destruction releases unused credit; subsequent physical frees release
+their exact charges. Destruction retains immutable account handles on the
+backend list while destructive tree cursors run outside the writer lock in
+64-node slices. This matters when a tiny stale batch is the final pin of a
+large prior generation. Close waits for outstanding tickets just as for readers;
+callers must destroy tickets before synchronously closing their backend.
+
+Actual backend tests cover saturation and reduced limits, failed backing
+allocation at publication, retained old/new readers across ordinary writes,
+mutable rotation, stale and persistent-path rejection, insufficient physical
+capacity, 64 preparation-allocation failure positions, off-lock retirement of
+a 2,001-key stale generation, and close waiting for both ticket and reader.
+They validate
+resource-manager byte ownership, not process memory or throughput.
+
+The final focused suites passed 27 tests each in Debug and ReleaseSafe, with
+zero leaks: seven actual backend tests and twenty existing state regressions.
+Run from `zig/` with `zig build lsm-backend-test -j1` (add
+`-Doptimize=ReleaseSafe` for that mode), followed by
+`-- --test-filter 'workload admission lsm' --test-filter 'storage.lsm_backend.state.test'`.
+
+This is not durable transaction completion. No WAL or manifest admission is
+bypassed. Durable pre-prepare physical-plan certificates, restart reservations,
+replay/backlog capacity, and protected WAL/manifest/flush resources remain
+requirements before public transaction policy can claim mandatory completion.

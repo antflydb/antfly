@@ -13,19 +13,22 @@
 // limitations.
 
 const std = @import("std");
+const prepaid = @import("completion_allocator.zig");
 
 /// Allocation ownership, independent of how many immutable roots reference it.
 /// Each charged allocation and each generation handle keeps the account alive.
 pub const Account = struct {
     backing: std.mem.Allocator,
     refs: std.atomic.Value(usize) = .init(1),
-    bytes: std.atomic.Value(u64) = .init(0),
+    /// Exact subset owned by the ordinary aggregate observer. Prepaid buffers
+    /// retain this account but remain charged solely to their credit owner.
+    ordinary_bytes: std.atomic.Value(u64) = .init(0),
     last_pass: u64 = 0,
 
     pub fn create(backing: std.mem.Allocator) !*Account {
         const self = try backing.create(Account);
         self.* = .{ .backing = backing };
-        self.bytes.store(@sizeOf(Account), .monotonic);
+        if (!prepaid.isPrepaid(backing)) self.ordinary_bytes.store(@sizeOf(Account), .monotonic);
         return self;
     }
     pub fn retain(self: *Account) *Account {
@@ -37,17 +40,25 @@ pub const Account = struct {
     }
     pub fn charge(self: *Account, bytes: usize) void {
         _ = self.retain();
-        _ = self.bytes.fetchAdd(bytes, .monotonic);
+        _ = self.ordinary_bytes.fetchAdd(bytes, .monotonic);
     }
     pub fn discharge(self: *Account, bytes: usize) void {
-        _ = self.bytes.fetchSub(bytes, .monotonic);
+        _ = self.ordinary_bytes.fetchSub(bytes, .monotonic);
         self.release();
+    }
+    pub fn chargeAllocated(self: *Account, bytes: usize, allocator: std.mem.Allocator) void {
+        if (prepaid.isPrepaid(allocator)) {
+            _ = self.retain();
+        } else self.charge(bytes);
+    }
+    pub fn dischargeAllocated(self: *Account, bytes: usize, allocator: std.mem.Allocator) void {
+        if (prepaid.isPrepaid(allocator)) self.release() else self.discharge(bytes);
     }
     /// The owning backend serializes accounting passes and generation changes.
     pub fn chargeOnce(self: *Account, pass: u64) u64 {
         if (self.last_pass == pass) return 0;
         self.last_pass = pass;
-        return self.bytes.load(.acquire);
+        return self.ordinary_bytes.load(.acquire);
     }
 };
 

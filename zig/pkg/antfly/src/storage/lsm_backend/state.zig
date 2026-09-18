@@ -163,7 +163,7 @@ const SharedEntry = struct {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         const allocator = self.allocator;
         const bytes: [*]align(@alignOf(SharedEntry)) u8 = @ptrCast(self);
-        if (self.account) |account| account.discharge(self.allocation_len);
+        if (self.account) |account| account.dischargeAllocated(self.allocation_len, allocator);
         allocator.free(bytes[0..self.allocation_len]);
     }
 };
@@ -684,7 +684,7 @@ pub const ActiveMemTable = struct {
     }
 
     pub fn accountedMemoryBytes(self: *const ActiveMemTable, pass: u64) u64 {
-        if (self.ordered_enabled) return (if (self.ordered.account) |account| account.chargeOnce(pass) else 0) + self.ordered.spare.capacity * @sizeOf(*OrderedIndex.Node);
+        if (self.ordered_enabled) return (if (self.ordered.account) |account| account.chargeOnce(pass) else 0) + (if (self.ordered.spare_allocator != null and @import("completion_allocator.zig").isPrepaid(self.ordered.spare_allocator.?)) @as(u64, 0) else self.ordered.spare.capacity * @sizeOf(*OrderedIndex.Node));
         return self.estimatedMemoryBytes();
     }
 
@@ -768,7 +768,7 @@ pub const ActiveMemTable = struct {
             }
             if (owned.shared.?.account == null) {
                 owned.shared.?.account = account;
-                account.charge(owned.shared.?.allocation_len);
+                account.chargeAllocated(owned.shared.?.allocation_len, owned.shared.?.allocator);
             }
             self.ordered.putPrepared(allocator, owned);
             const root = self.ordered.root.?;

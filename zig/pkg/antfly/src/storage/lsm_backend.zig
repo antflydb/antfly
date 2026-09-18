@@ -24,6 +24,7 @@ const backend_types = @import("backend_types.zig");
 const lsm_manifest = @import("lsm/manifest.zig");
 const lsm_table_file = @import("lsm/table_file.zig");
 const state_mod = @import("lsm_backend/state.zig");
+const completion_allocator = @import("lsm_backend/completion_allocator.zig");
 const repository_mod = @import("lsm_backend/repository.zig");
 const runtime_mod = @import("lsm_backend/runtime.zig");
 const run_directory_mod = @import("lsm_backend/run_directory.zig");
@@ -1603,6 +1604,7 @@ pub const Backend = struct {
     current_manifest_bytes: u64 = 0,
     next_run_id: u64 = 1,
     active_readers: usize = 0,
+    completion_batches: ?*CompletionPointBatch = null,
     active_readers_by_kind: [reader_pin_kind_count]usize = [_]usize{0} ** reader_pin_kind_count,
     manifest_dirty: bool = false,
     obsolete_paths: repository_mod.ObsoleteLedger = .empty,
@@ -1905,7 +1907,7 @@ pub const Backend = struct {
     fn waitForGenerationReadersToDrain(self: *Backend) void {
         while (true) {
             const locked = runtime_mod.lockBackend(Backend, self);
-            const active_readers = self.active_readers;
+            const active_readers = self.active_readers + @as(usize, @intFromBool(self.completion_batches != null));
             runtime_mod.unlockBackend(Backend, self, locked);
             if (active_readers == 0) return;
             platform.time.yieldBriefly();
@@ -3008,6 +3010,11 @@ pub const Backend = struct {
     fn estimateInMemoryStateBytesWithCandidateLocked(self: *const Backend, candidate: ?*const ActiveMemTable) u64 {
         const pass = state_mod.memory_account.nextPass();
         var bytes = self.mutable.accountedMemoryBytes(pass);
+        var completion = self.completion_batches;
+        while (completion) |batch| : (completion = batch.next) {
+            bytes +|= batch.base.accountedMemoryBytes(pass);
+            bytes +|= batch.candidate.accountedMemoryBytes(pass);
+        }
         // Tickets already own builder-slice reservations. Only the queue
         // header belongs to this observer; charging tickets here duplicates
         // their contribution to the resource manager's aggregate budget.
@@ -4260,6 +4267,137 @@ pub const Backend = struct {
     pub fn beginWrite(self: *Backend) !NamespaceWriteTxn {
         if (self.options.backend.read_only) return error.ReadOnly;
         return try NamespaceWriteTxn.open(self);
+    }
+
+    pub const CompletionPointOperation = struct {
+        key: []const u8,
+        /// null is a point tombstone. Range deletes and bulk ingest are absent.
+        value: ?[]const u8,
+    };
+
+    pub const CompletionPointLimits = struct {
+        max_operations: usize,
+        max_encoded_bytes: usize,
+        /// Physical allocation peak, including owner/ticket, input buffers,
+        /// spare vectors, nodes and COW workspace; exhausted before publication.
+        physical_capacity: u64,
+    };
+
+    /// Internal memory-only physical ticket. The backend/manager must remain
+    /// alive until deinit; close waits for outstanding tickets as for readers.
+    /// No public BatchOptions or transaction policy enables this API.
+    pub const CompletionPointBatch = struct {
+        backend: *Backend,
+        owner: *completion_allocator.Owner,
+        base: State,
+        candidate: ActiveMemTable,
+        next: ?*CompletionPointBatch = null,
+        published: bool = false,
+        retiring: bool = false,
+
+        pub var test_reclaim_hook: ?*const fn (*Backend) void = null;
+
+        pub fn publish(self: *CompletionPointBatch) !void {
+            const backend = self.backend;
+            const locked = runtime_mod.lockBackend(Backend, backend);
+            defer runtime_mod.unlockBackend(Backend, backend, locked);
+            if (self.retiring) return error.CompletionBatchRetiring;
+            if (self.published) return error.CompletionAlreadyPublished;
+            if (backend.closing.load(.acquire)) return error.LsmBackendClosed;
+            if (backend.root_dir != null) return error.UnsupportedCompletionBackend;
+            // Retaining base prevents pointer ABA. A later writer/rotation
+            // invalidates the ticket instead of overwriting its newer work.
+            if (backend.mutable.ordered.root != self.base.ordered_root or
+                backend.mutable.ordered.account != self.base.account)
+                return error.StaleCompletionBatch;
+            try self.owner.markPublished();
+            backend.invalidateMutableReadSnapshot();
+            backend.mutable.publishPrepared(&self.candidate);
+            self.published = true;
+            backend.syncTrackedInMemoryStateUsageCurrentLocked();
+        }
+
+        pub fn deinit(self: *CompletionPointBatch) void {
+            const backend = self.backend;
+            const owner = self.owner;
+            const initial_lock = runtime_mod.lockBackend(Backend, backend);
+            std.debug.assert(!self.retiring);
+            self.retiring = true;
+            // A stale base may be the final pin of a large old generation.
+            // Keep immutable accounting handles on the backend list while
+            // the destructive cursors reclaim outside the writer mutex.
+            const base_account = if (self.base.account) |account| account.retain() else null;
+            const candidate_account = if (self.candidate.ordered.account) |account| account.retain() else null;
+            std.debug.assert(self.candidate.ordered_enabled and self.candidate.entries.capacity == 0 and self.candidate.arena_owner == null);
+            var base_reclaimer = State.Reclaimer.init(self.base);
+            var candidate_reclaimer = @TypeOf(self.candidate.ordered).Reclaimer.init(self.candidate.ordered);
+            // The ticket buffer itself retains owner until final teardown.
+            // Return unused credit now, then each slice returns only bytes
+            // whose physical buffers it actually freed.
+            owner.retire();
+            runtime_mod.unlockBackend(Backend, backend, initial_lock);
+            var base_done = false;
+            var candidate_done = false;
+            while (!base_done or !candidate_done) {
+                var credits: usize = 64;
+                if (!base_done) base_done = base_reclaimer.step(backend.allocator, &credits);
+                if (!candidate_done) candidate_done = candidate_reclaimer.step(owner.allocator(), &credits);
+                if (builtin.is_test) if (test_reclaim_hook) |hook| hook(backend);
+                const locked = runtime_mod.lockBackend(Backend, backend);
+                if (candidate_done) self.candidate.ordered.spare = .empty;
+                backend.syncTrackedInMemoryStateUsageCurrentLocked();
+                runtime_mod.unlockBackend(Backend, backend, locked);
+                if (!base_done or !candidate_done) platform.time.yieldBriefly();
+            }
+            const final_lock = runtime_mod.lockBackend(Backend, backend);
+            defer runtime_mod.unlockBackend(Backend, backend, final_lock);
+            var link = &backend.completion_batches;
+            while (link.* != self) link = &link.*.?.next;
+            link.* = self.next;
+            if (base_account) |account| account.release();
+            if (candidate_account) |account| account.release();
+            owner.allocator().destroy(self);
+            backend.syncTrackedInMemoryStateUsageCurrentLocked();
+        }
+    };
+
+    /// Seal the actual successor under the writer lock. Every fallible input
+    /// copy and COW allocation happens against reserved credit. The returned
+    /// ticket publishes allocation-free even after hard limits are reduced.
+    /// Persistent WAL/manifest paths fail closed, before reserving any credit.
+    pub fn prepareCompletionPointBatch(self: *Backend, namespace: backend_types.Namespace, operations: []const CompletionPointOperation, limits: CompletionPointLimits) !*CompletionPointBatch {
+        if (self.root_dir != null or self.storage != null) return error.UnsupportedCompletionBackend;
+        if (self.options.backend.read_only) return error.ReadOnly;
+        const manager = self.options.resource_manager orelse return error.CompletionResourceManagerRequired;
+        if (operations.len == 0 or operations.len > limits.max_operations) return error.CompletionBatchTooLarge;
+        var encoded: usize = 0;
+        for (operations) |op| {
+            // Include length/tombstone metadata and repeated namespace bytes.
+            for ([_]usize{ 25, if (namespace.name) |name| name.len else 0, op.key.len, if (op.value) |value| value.len else 0 }) |part| {
+                encoded = std.math.add(usize, encoded, part) catch return error.CompletionBatchTooLarge;
+                if (encoded > limits.max_encoded_bytes) return error.CompletionBatchTooLarge;
+            }
+        }
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        if (self.closing.load(.acquire)) return error.LsmBackendClosed;
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+        const owner = try completion_allocator.Owner.create(self.allocator, manager, limits.physical_capacity);
+        errdefer owner.retire();
+        const alloc = owner.allocator();
+        const batch = try alloc.create(CompletionPointBatch);
+        errdefer alloc.destroy(batch);
+        var incoming = ActiveMemTable{ .ordered_enabled = false };
+        defer incoming.deinit(alloc);
+        for (operations) |op| try incoming.upsert(alloc, namespace, op.key, op.value orelse "", op.value == null);
+        var base = try self.mutable.snapshot(alloc);
+        errdefer base.deinit(alloc);
+        var candidate = try self.mutable.preparePublication(alloc, &incoming);
+        errdefer candidate.deinit(alloc);
+        batch.* = .{ .backend = self, .owner = owner, .base = base, .candidate = candidate, .next = self.completion_batches };
+        self.completion_batches = batch;
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
+        return batch;
     }
 
     pub fn beginBatch(self: *Backend) !NamespaceWriteTxn {
@@ -22512,6 +22650,218 @@ fn implementationTests() type {
             defer reopened.close();
             try std.testing.expectEqualStrings("old-a", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "a"));
             try std.testing.expectEqualStrings("old-b", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "b"));
+        }
+
+        test "workload admission lsm prepaid sealed publication preserves shared old charges and reader ownership" {
+            const alloc = std.testing.allocator;
+            const capacity = 128 * 1024;
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 } });
+            defer manager.deinit(alloc);
+            var failing = std.testing.FailingAllocator.init(alloc, .{});
+            var backend = Backend.init(failing.allocator(), .{ .flush_threshold = 1000, .resource_manager = &manager });
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, "a", "old-a");
+                try write.put(.{}, "untouched", "shared-old");
+                try write.commit();
+            }
+            var old = try backend.beginRead();
+            const before = manager.snapshot().memory.used_bytes;
+            const ordinary = backend.tracked_in_memory_state_bytes;
+            const batch = try backend.prepareCompletionPointBatch(.{}, &.{ .{ .key = "a", .value = "prepaid-a" }, .{ .key = "b", .value = "prepaid-b" } }, .{ .max_operations = 2, .max_encoded_bytes = 256, .physical_capacity = capacity });
+            const owner = batch.owner;
+            try std.testing.expectEqual(before + capacity, manager.snapshot().memory.used_bytes);
+            try std.testing.expectEqual(ordinary, backend.tracked_in_memory_state_bytes);
+            var competitor = try manager.reserveWithoutReclaim(.lsm_in_memory_state, 1024 * 1024 - manager.snapshot().memory.used_bytes);
+            try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserveWithoutReclaim(.lsm_in_memory_state, 1));
+            manager.memory.budget.hard_limit_bytes = 1;
+            manager.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)].budget.hard_limit_bytes = 1;
+            failing.fail_index = failing.alloc_index;
+            try batch.publish();
+            try std.testing.expect(!failing.has_induced_failure);
+            failing.fail_index = std.math.maxInt(usize);
+            try std.testing.expectError(error.CompletionAlreadyPublished, batch.publish());
+            batch.deinit();
+            try std.testing.expect(owner.retired and owner.tracked > 0);
+            try std.testing.expectError(error.OutOfMemory, owner.allocator().alloc(u8, 1));
+            try std.testing.expectEqualStrings("old-a", try old.get(.{}, "a"));
+            competitor.release();
+            manager.memory.budget.hard_limit_bytes = 1024 * 1024;
+            manager.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)].budget.hard_limit_bytes = 0;
+            var pin = try backend.beginRead();
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, "a", "ordinary-a");
+                try write.delete(.{}, "b");
+                try write.commit();
+            }
+            try std.testing.expectEqualStrings("prepaid-a", try pin.get(.{}, "a"));
+            try std.testing.expectEqualStrings("shared-old", try pin.get(.{}, "untouched"));
+            try std.testing.expect(owner.tracked > 0);
+            old.abort();
+            pin.abort();
+            backend.close();
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        }
+
+        test "workload admission lsm prepaid stale and unsupported batches fail before publication" {
+            const alloc = std.testing.allocator;
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+            defer manager.deinit(alloc);
+            var backend = Backend.init(alloc, .{ .flush_threshold = 1000, .resource_manager = &manager });
+            defer backend.close();
+            const limits: Backend.CompletionPointLimits = .{ .max_operations = 1, .max_encoded_bytes = 128, .physical_capacity = 64 * 1024 };
+            const operations = [_]Backend.CompletionPointOperation{.{ .key = "a", .value = "sealed" }};
+            const before_rejection = manager.snapshot().memory.used_bytes;
+            try std.testing.expectError(error.ResourceBudgetExceeded, backend.prepareCompletionPointBatch(.{}, &operations, .{ .max_operations = 1, .max_encoded_bytes = 128, .physical_capacity = 1 }));
+            try std.testing.expectError(error.OutOfMemory, backend.prepareCompletionPointBatch(.{}, &operations, .{ .max_operations = 1, .max_encoded_bytes = 128, .physical_capacity = @sizeOf(completion_allocator.Owner) + @sizeOf(Backend.CompletionPointBatch) }));
+            try std.testing.expectEqual(before_rejection, manager.snapshot().memory.used_bytes);
+            try std.testing.expectError(error.CompletionBatchTooLarge, backend.prepareCompletionPointBatch(.{}, &operations, .{ .max_operations = 0, .max_encoded_bytes = 128, .physical_capacity = 64 * 1024 }));
+            try std.testing.expectError(error.CompletionBatchTooLarge, backend.prepareCompletionPointBatch(.{}, &operations, .{ .max_operations = 1, .max_encoded_bytes = 1, .physical_capacity = 64 * 1024 }));
+            const batch = try backend.prepareCompletionPointBatch(.{}, &operations, limits);
+            var batch_live = true;
+            defer if (batch_live) batch.deinit();
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, "a", "newer");
+                try write.commit();
+            }
+            try std.testing.expectError(error.StaleCompletionBatch, batch.publish());
+            batch.deinit();
+            batch_live = false;
+            try std.testing.expectEqualStrings("newer", try backend.mutable.get(.{}, "a"));
+            var storage = storage_io.MemoryStorage.init(alloc);
+            defer storage.deinit();
+            var persistent = try Backend.open(alloc, "/prepaid-unsupported", .{ .storage = storage.storage(), .resource_manager = &manager });
+            defer persistent.close();
+            const used = manager.snapshot().memory.used_bytes;
+            try std.testing.expectError(error.UnsupportedCompletionBackend, persistent.prepareCompletionPointBatch(.{}, &operations, limits));
+            try std.testing.expectEqual(used, manager.snapshot().memory.used_bytes);
+        }
+
+        test "workload admission lsm prepaid mutable rotation retains sealed base accounting" {
+            const alloc = std.testing.allocator;
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+            defer manager.deinit(alloc);
+            var backend = Backend.init(alloc, .{ .flush_threshold = 10000, .resource_manager = &manager });
+            defer backend.close();
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, "a", "original");
+                for (0..2000) |i| {
+                    var key: [32]u8 = undefined;
+                    try write.put(.{}, try std.fmt.bufPrint(&key, "old-{d:0>8}", .{i}), "original");
+                }
+                try write.commit();
+            }
+            const batch = try backend.prepareCompletionPointBatch(.{}, &.{.{ .key = "a", .value = "sealed" }}, .{ .max_operations = 1, .max_encoded_bytes = 128, .physical_capacity = 64 * 1024 });
+            var batch_live = true;
+            defer if (batch_live) batch.deinit();
+            {
+                const locked = runtime_mod.lockBackend(Backend, &backend);
+                defer runtime_mod.unlockBackend(Backend, &backend, locked);
+                try backend.flushMutable();
+                backend.syncTrackedInMemoryStateUsageCurrentLocked();
+                try std.testing.expect(backend.mutable.ordered.root != batch.base.ordered_root);
+                try std.testing.expect(backend.tracked_in_memory_state_bytes >= batch.base.account.?.ordinary_bytes.load(.acquire));
+            }
+            try std.testing.expectError(error.StaleCompletionBatch, batch.publish());
+            const Progress = struct {
+                var calls: usize = 0;
+                var blocked: bool = false;
+                fn check(b: *Backend) void {
+                    calls += 1;
+                    if (!b.mu.tryLock()) {
+                        blocked = true;
+                        return;
+                    }
+                    // A concurrent observer may visit the immutable account
+                    // handles while the actual roots are being destroyed.
+                    b.syncTrackedInMemoryStateUsageCurrentLocked();
+                    b.mu.unlock();
+                }
+            };
+            Progress.calls = 0;
+            Progress.blocked = false;
+            Backend.CompletionPointBatch.test_reclaim_hook = Progress.check;
+            defer Backend.CompletionPointBatch.test_reclaim_hook = null;
+            batch.deinit();
+            batch_live = false;
+            try std.testing.expect(Progress.calls > 1 and !Progress.blocked);
+            var reader = try backend.beginRead();
+            defer reader.abort();
+            try std.testing.expectEqualStrings("original", try reader.get(.{}, "a"));
+        }
+
+        test "workload admission lsm prepaid close waits for ticket and reader ownership" {
+            const alloc = std.testing.allocator;
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+            defer manager.deinit(alloc);
+            var backend = Backend.init(alloc, .{ .flush_threshold = 1000, .resource_manager = &manager });
+            const batch = try backend.prepareCompletionPointBatch(.{}, &.{.{ .key = "a", .value = "sealed" }}, .{ .max_operations = 1, .max_encoded_bytes = 128, .physical_capacity = 64 * 1024 });
+            var batch_live = true;
+            defer if (batch_live) batch.deinit();
+            try batch.publish();
+            var reader = try backend.beginRead();
+            var done = std.atomic.Value(bool).init(false);
+            const Closer = struct {
+                fn run(b: *Backend, completed: *std.atomic.Value(bool)) void {
+                    b.close();
+                    completed.store(true, .release);
+                }
+            };
+            const thread = try std.Thread.spawn(.{}, Closer.run, .{ &backend, &done });
+            while (!backend.closing.load(.acquire)) platform.time.yieldBriefly();
+            const waited_for_ticket = !done.load(.acquire);
+            batch.deinit();
+            batch_live = false;
+            const waited_for_reader = !done.load(.acquire);
+            const retained_ok = std.mem.eql(u8, try reader.get(.{}, "a"), "sealed");
+            reader.abort();
+            thread.join();
+            try std.testing.expect(waited_for_ticket and waited_for_reader and retained_ok and done.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        }
+
+        test "workload admission lsm prepaid preparation allocation failure unwinds exact ownership" {
+            const alloc = std.testing.allocator;
+            var failures: usize = 0;
+            var successes: usize = 0;
+            for (0..64) |offset| {
+                var failing = std.testing.FailingAllocator.init(alloc, .{});
+                var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+                defer manager.deinit(alloc);
+                var backend = Backend.init(failing.allocator(), .{ .flush_threshold = 1000, .resource_manager = &manager });
+                {
+                    var write = try backend.beginWrite();
+                    errdefer write.abort();
+                    try write.put(.{}, "a", "old");
+                    try write.commit();
+                }
+                var reader = try backend.beginRead();
+                const before = manager.snapshot().memory.used_bytes;
+                failing.fail_index = failing.alloc_index + offset;
+                if (backend.prepareCompletionPointBatch(.{}, &.{ .{ .key = "a", .value = "new" }, .{ .key = "b", .value = "new-b" } }, .{ .max_operations = 2, .max_encoded_bytes = 256, .physical_capacity = 128 * 1024 })) |batch| {
+                    batch.deinit();
+                    successes += 1;
+                } else |err| {
+                    try std.testing.expectEqual(error.OutOfMemory, err);
+                    failures += 1;
+                }
+                failing.fail_index = std.math.maxInt(usize);
+                try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+                try std.testing.expectEqualStrings("old", try reader.get(.{}, "a"));
+                try std.testing.expectEqualStrings("old", try backend.mutable.get(.{}, "a"));
+                reader.abort();
+                backend.close();
+                try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            }
+            try std.testing.expect(failures > 5 and successes > 0);
         }
 
         test "workload admission lsm alternate publication allocator survives reader retirement" {

@@ -55,7 +55,7 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                 if (self.left) |node| node.release(allocator);
                 if (self.right) |node| node.release(allocator);
                 self.entry.deinit(allocator);
-                if (self.account) |account| account.discharge(@sizeOf(Node));
+                if (self.account) |account| account.dischargeAllocated(@sizeOf(Node), owned_allocator);
                 owned_allocator.destroy(self);
             }
 
@@ -160,7 +160,7 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             if (self.root) |root| root.release(allocator);
             for (self.spare.items) |node| {
                 const owned_allocator = node.allocation_allocator;
-                if (self.account) |account| account.discharge(@sizeOf(Node));
+                if (self.account) |account| account.dischargeAllocated(@sizeOf(Node), owned_allocator);
                 owned_allocator.destroy(node);
             }
             self.spare.deinit(self.spare_allocator orelse allocator);
@@ -204,7 +204,7 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                         self.len += 1;
                     }
                     node.entry.deinit(allocator);
-                    if (node.account) |account| account.discharge(@sizeOf(Node));
+                    if (node.account) |account| account.dischargeAllocated(@sizeOf(Node), owned_allocator);
                     owned_allocator.destroy(node);
                 }
                 if (self.len != 0) return false;
@@ -212,7 +212,7 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                     const node = self.owned.spare.pop() orelse break;
                     credits.* -= 1;
                     const owned_allocator = node.allocation_allocator;
-                    if (self.owned.account) |account| account.discharge(@sizeOf(Node));
+                    if (self.owned.account) |account| account.dischargeAllocated(@sizeOf(Node), owned_allocator);
                     owned_allocator.destroy(node);
                 }
                 if (self.owned.spare.items.len != 0) return false;
@@ -263,7 +263,7 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
                     // retained live nodes keep their individual provenance.
                     for (self.spare.items) |node| {
                         const owned_allocator = node.allocation_allocator;
-                        self.account.?.discharge(@sizeOf(Node));
+                        self.account.?.dischargeAllocated(@sizeOf(Node), owned_allocator);
                         owned_allocator.destroy(node);
                     }
                     self.spare.deinit(previous);
@@ -276,7 +276,7 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             while (self.spare.items.len < needed) {
                 const node = try allocator.create(Node);
                 node.allocation_allocator = allocator;
-                self.account.?.charge(@sizeOf(Node));
+                self.account.?.chargeAllocated(@sizeOf(Node), allocator);
                 self.spare.appendAssumeCapacity(node);
             }
         }
