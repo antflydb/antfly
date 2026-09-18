@@ -86,9 +86,10 @@ def _deadline(timeout: float) -> float:
 
 
 class _ProcessTree:
-    def __init__(self, parent: subprocess.Popen, psutil):
+    def __init__(self, parent: subprocess.Popen, psutil, max_processes=MAX_PROCESSES):
         self.parent = parent
         self.psutil = psutil
+        self.max_processes = max_processes
         self.known: dict[tuple[int, float], dict[str, Any]] = {}
         self.groups: dict[int, tuple[int, float]] = {}
         self.actions: list[dict[str, Any]] = []
@@ -107,7 +108,7 @@ class _ProcessTree:
             key = (process.pid, process.create_time())
             if key in self.known:
                 return
-            if len(self.known) >= MAX_PROCESSES:
+            if len(self.known) >= self.max_processes:
                 raise BenchmarkError("owned process identity ceiling exceeded")
             self.known[key] = {
                 "process": process,
@@ -258,10 +259,16 @@ class _ProcessTree:
 
 class ResourceGuard:
     def __init__(
-        self, max_rss_bytes: int = 8 * 1024**3, max_log_bytes: int = MAX_LOG_BYTES
+        self,
+        max_rss_bytes: int = 8 * 1024**3,
+        max_log_bytes: int = MAX_LOG_BYTES,
+        *,
+        max_processes: int = MAX_PROCESSES,
     ):
         if type(max_rss_bytes) is not int or max_rss_bytes <= 0:
             raise BenchmarkError("RSS ceiling must be a positive integer")
+        if type(max_processes) is not int or not 1 <= max_processes <= 4096:
+            raise BenchmarkError("process identity ceiling must be between 1 and 4096")
         if type(max_log_bytes) is not int or not 0 < max_log_bytes <= MAX_LOG_BYTES:
             raise BenchmarkError(
                 "log ceiling must be a positive integer at most 64 MiB"
@@ -276,6 +283,7 @@ class ResourceGuard:
         own.children()
         self.psutil = psutil
         self.max_rss_bytes = max_rss_bytes
+        self.max_processes = max_processes
         self.max_log_bytes = max_log_bytes
         self.workers: list[Worker] = []
         self.peak_rss_bytes = 0
@@ -388,7 +396,9 @@ class Worker:
             )
             # Register the owner before any fallible selector/stream setup.
             self.guard._register(self)
-            self._tree = _ProcessTree(self.process, self.guard.psutil)
+            self._tree = _ProcessTree(
+                self.process, self.guard.psutil, self.guard.max_processes
+            )
             for stream in (
                 self.process.stdin,
                 self.process.stdout,
@@ -623,7 +633,9 @@ class Worker:
             if self.process is not None:
                 if self._tree is None:
                     try:
-                        self._tree = _ProcessTree(self.process, self.guard.psutil)
+                        self._tree = _ProcessTree(
+                            self.process, self.guard.psutil, self.guard.max_processes
+                        )
                     except Exception as error:
                         errors.append(
                             f"process registration: {type(error).__name__}: {error}"
