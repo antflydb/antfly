@@ -310,7 +310,9 @@ test "reconstruct checked-in ogg flac stream" {
     const info = try flac.parseStreamInfo(native_flac);
     try std.testing.expectEqual(@as(u32, 16000), info.sample_rate);
     try std.testing.expectEqual(@as(u8, 2), info.channels);
-    try std.testing.expectEqual(@as(u64, 16000), info.total_samples);
+    // ffmpeg's Ogg FLAC muxer leaves the STREAMINFO sample count at 0
+    // (unknown); the reconstructed stream carries it through unchanged.
+    try std.testing.expectEqual(@as(u64, 0), info.total_samples);
 }
 
 test "decode checked-in ogg flac fixture to interleaved pcm" {
