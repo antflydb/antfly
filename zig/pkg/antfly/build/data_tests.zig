@@ -122,6 +122,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft apply records transaction conflicts without stopping replica progress",
         "db raced replicated transaction completion persists receipt and participant acknowledgement",
         "data runtime structural changes preserve writer-published runtime status",
+        "data runtime admission metrics preserve configured policy and live ownership",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime startup catch-up clears dirty bit for terminal degraded index load",
         "data runtime startup catch-up retains deferred inspection despite clean cached status",

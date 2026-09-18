@@ -910,14 +910,8 @@ const DataPublicHttpRuntime = struct {
         max_connection_threads: u32,
         active_connection_threads: usize,
         peak_connection_threads: usize,
-        max_active_requests: usize,
-        active_requests: usize,
-        peak_active_requests: usize,
-        rejected_requests_total: u64,
-        max_active_writes: usize,
-        active_writes: usize,
-        peak_active_writes: usize,
-        rejected_writes_total: u64,
+        query: antfly.common.request_admission.RequestAdmission.Stats,
+        write: antfly.common.request_admission.RequestAdmission.Stats,
         accept_errors_total: u64,
         connection_dispatch_rejections_total: u64,
         request_dispatch_rejections_total: u64,
@@ -936,6 +930,11 @@ const DataPublicHttpRuntime = struct {
         peer_disconnects_total: u64,
         active_peer_observers: usize,
         active_deadline_observers: usize,
+
+        fn appendAdmissionMetrics(self: RuntimeStats, writer: *std.Io.Writer) !void {
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, self.query);
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, self.write);
+        }
     };
 
     fn start(
@@ -1021,14 +1020,8 @@ const DataPublicHttpRuntime = struct {
             .max_connection_threads = transport.max_connections,
             .active_connection_threads = transport.active_connections,
             .peak_connection_threads = transport.peak_active_connections,
-            .max_active_requests = application.query.capacity,
-            .active_requests = application.query.in_flight,
-            .peak_active_requests = application.query.peak_in_flight,
-            .rejected_requests_total = application.query.rejected_total,
-            .max_active_writes = application.write.capacity,
-            .active_writes = application.write.in_flight,
-            .peak_active_writes = application.write.peak_in_flight,
-            .rejected_writes_total = application.write.rejected_total,
+            .query = application.query,
+            .write = application.write,
             .accept_errors_total = transport.accept_errors_total,
             .connection_dispatch_rejections_total = transport.connection_dispatch_rejections_total,
             .request_dispatch_rejections_total = transport.request_dispatch_rejections_total,
@@ -2070,18 +2063,7 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_http_connection_thread_limit", "gauge", "Maximum public HTTP connection handoff threads", http.max_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_connection_threads", "gauge", "Currently active public HTTP connection handoff threads", http.active_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_peak_connection_threads", "gauge", "Peak public HTTP connection handoff threads since process start", http.peak_connection_threads);
-            try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, .{
-                .capacity = http.max_active_requests,
-                .in_flight = http.active_requests,
-                .peak_in_flight = http.peak_active_requests,
-                .rejected_total = http.rejected_requests_total,
-            });
-            try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, .{
-                .capacity = http.max_active_writes,
-                .in_flight = http.active_writes,
-                .peak_in_flight = http.peak_active_writes,
-                .rejected_total = http.rejected_writes_total,
-            });
+            try http.appendAdmissionMetrics(writer);
             if (inference_admission_stats) |inference| {
                 try antfly.common.request_admission.appendPrometheusMetrics(writer, .inference, inference);
             }
@@ -45114,6 +45096,74 @@ fn implementationTests() type {
             try std.testing.expect(report.replay_caught_up);
             try std.testing.expect(report.cutover_ready);
             try std.testing.expect(report.reads_ready_after_cutover);
+        }
+
+        test "data runtime admission metrics preserve configured policy and live ownership" {
+            const alloc = std.testing.allocator;
+            const admission = antfly.common.request_admission;
+            const policy: admission.workload.Config = .{
+                .max_queued_requests = 2,
+                .max_queued_bytes = 128,
+                .max_retained_bytes = 512,
+                .max_wait_ms = 100,
+            };
+            const Source = struct {
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return .{ .metadata_group_id = 1, .metrics = .{} };
+                }
+            };
+            var server = antfly.public_api.http_server.ApiHttpServer.init(alloc, .{
+                .query_max_concurrent_requests = 1,
+                .query_admission_waiting = policy,
+                .write_max_concurrent_requests = 3,
+                .write_admission_waiting = .{ .max_retained_bytes = 1024 },
+            }, .{ .ptr = undefined, .vtable = &.{ .status = Source.status } }, null, null);
+            defer server.deinit();
+            var runtime: DataPublicHttpRuntime = .{
+                .alloc = alloc,
+                .api_server = &server,
+                .handler = try antfly.public_api.kernel_bridge.createHandler(&server),
+                .server = httpx.Server.init(alloc, std.testing.io),
+                // This fixture collects admission/transport statistics without
+                // starting a listener or acquiring a backend execution lane.
+                .listener_task = undefined,
+                .api_lane_lease = undefined,
+            };
+            defer runtime.server.deinit();
+            defer antfly.public_api.kernel_bridge.deinitHandler(&runtime.handler);
+            var query = try server.query_admission.acquire(.{ .io = std.testing.io, .retained_bytes = 64 });
+            defer query.release();
+            var write = try server.write_admission.acquire(.{ .io = std.testing.io, .retained_bytes = 32 });
+            defer write.release();
+            try std.testing.expect(!server.query_admission.tryAcquire());
+            try std.testing.expectError(error.AdmissionRequestTooLarge, server.query_admission.reserveMemory(1024));
+            try server.query_admission.reconfigure(1, policy);
+            const live = runtime.runtimeStats();
+            try std.testing.expectEqualDeep(server.queryAdmissionStats(), live.query);
+            try std.testing.expectEqualDeep(server.writeAdmissionStats(), live.write);
+            var output: std.Io.Writer.Allocating = .init(alloc);
+            defer output.deinit();
+            try live.appendAdmissionMetrics(&output.writer);
+            for ([_][]const u8{
+                "antfly_admission_query_queue_capacity_requests 2\n",
+                "antfly_admission_query_queue_capacity_bytes 128\n",
+                "antfly_admission_query_retained_capacity_bytes 512\n",
+                "antfly_admission_query_wait_ceiling_milliseconds 100\n",
+                "antfly_admission_query_in_flight_requests 1\n",
+                "antfly_admission_query_retained_bytes 64\n",
+                "antfly_admission_query_policy_generation 2\n",
+                "antfly_admission_query_rejections_by_reason_total{reason=\"execution_capacity\"} 1\n",
+                "antfly_admission_query_allocation_denials_total{reason=\"allocation_bytes\"} 1\n",
+                "antfly_admission_write_retained_capacity_bytes 1024\n",
+                "antfly_admission_write_retained_bytes 32\n",
+            }) |line| try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), line) != null);
+            query.release();
+            write.release();
+            const retired = runtime.runtimeStats();
+            try std.testing.expectEqual(@as(usize, 0), retired.query.in_flight);
+            try std.testing.expectEqual(@as(usize, 0), retired.query.retained_bytes);
+            try std.testing.expectEqual(@as(usize, 0), retired.write.in_flight);
+            try std.testing.expectEqual(@as(usize, 0), retired.write.retained_bytes);
         }
 
         test "data runtime metrics use prometheus labels for resource and cache dimensions" {
