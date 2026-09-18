@@ -828,6 +828,17 @@ pub const NativeFile = struct {
     page_cache_bypass: std.atomic.Value(u32) = .init(0),
     test_fail_vacuum_after_adoption: bool = false,
     test_fail_generation_directory_sync: bool = false,
+    /// Set once the on-disk free map has been cross-checked against every
+    /// valid checkpoint slot (including the crash-safety fallback slot) for
+    /// this open file handle. That full-database reachability scan is only
+    /// needed to catch corruption present when the file was opened (or
+    /// written to out of band); this process's own commits can only ever
+    /// consume pages that a prior, already-verified free map declared free,
+    /// so re-running the scan on every single mutation is unnecessary and,
+    /// for large stores, quadratic in the number of commits. `check()` (via
+    /// `validateReachableFreeMap`) always re-verifies regardless of this
+    /// flag, for explicit integrity audits.
+    free_pages_verified: bool = false,
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
         return try openWithOptions(allocator, path, .{ .read_only = read_only });
@@ -3207,7 +3218,10 @@ pub const NativeFile = struct {
     fn pageAllocatorFromFreeMap(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
         var free_pages = try self.readFreePagesAlloc(checkpoint);
         errdefer self.allocator.free(free_pages);
-        try self.validateFreePagesSafeForCheckpointSlots(free_pages);
+        if (!self.free_pages_verified) {
+            try self.validateFreePagesSafeForCheckpointSlots(free_pages);
+            self.free_pages_verified = true;
+        }
         var data_lock_file: ?std.Io.File = null;
         if (free_pages.len > 0) {
             const data_lock = acquireDataRewriteLock(self.runtimeIo(), self.path) catch |err| switch (err) {
@@ -6612,29 +6626,41 @@ test "lite native free map cannot reclaim previous checkpoint pages" {
     const path = try testPath(allocator, tmp, "native-free-map-previous-protected.aflite");
     defer allocator.free(path);
 
-    var file = try NativeFile.create(allocator, path);
-    defer file.close();
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
 
-    try file.putDocument("doc:1", "v1");
-    try file.putDocument("doc:1", "v2");
+        try file.putDocument("doc:1", "v1");
+        try file.putDocument("doc:1", "v2");
 
-    const active = file.activeCheckpoint();
-    const previous = file.header.checkpoints[if (file.header.active_checkpoint == 0) 1 else 0];
-    try std.testing.expect(active.free_map_root_page != 0);
-    try std.testing.expect(previous.free_map_root_page != 0);
-    try std.testing.expect(active.free_map_root_page != previous.free_map_root_page);
+        const active = file.activeCheckpoint();
+        const previous = file.header.checkpoints[if (file.header.active_checkpoint == 0) 1 else 0];
+        try std.testing.expect(active.free_map_root_page != 0);
+        try std.testing.expect(previous.free_map_root_page != 0);
+        try std.testing.expect(active.free_map_root_page != previous.free_map_root_page);
 
-    const payload = try encodeFreeMapAlloc(allocator, default_page_size, active.page_count, &.{previous.free_map_root_page});
-    defer allocator.free(payload);
-    var page: [default_page_size]u8 = undefined;
-    encodePage(&page, .free_map, payload);
-    try file.file.writePositionalAll(file.io_impl.io(), &page, active.free_map_root_page * default_page_size);
-    try file.file.sync(file.io_impl.io());
+        const payload = try encodeFreeMapAlloc(allocator, default_page_size, active.page_count, &.{previous.free_map_root_page});
+        defer allocator.free(payload);
+        var page: [default_page_size]u8 = undefined;
+        encodePage(&page, .free_map, payload);
+        try file.file.writePositionalAll(file.io_impl.io(), &page, active.free_map_root_page * default_page_size);
+        try file.file.sync(file.io_impl.io());
 
-    const report = try file.check();
-    try std.testing.expect(!report.valid);
-    try std.testing.expectEqualStrings("invalid_free_map", report.issue.?);
-    try std.testing.expectError(error.InvalidNativeFreeMap, file.putDocument("doc:1", "v3"));
+        const report = try file.check();
+        try std.testing.expect(!report.valid);
+        try std.testing.expectEqualStrings("invalid_free_map", report.issue.?);
+    }
+
+    // The free-map-vs-fallback-checkpoint cross-check only needs to run once
+    // per open handle: this process's own commits can only ever reuse pages
+    // that a previously verified free map already declared free, so
+    // re-scanning every checkpoint slot's full reachable set on every single
+    // mutation would make ingest quadratic in the number of commits.
+    // Corruption written out of band (as above) is instead caught the next
+    // time the file is opened and its free map is trusted again.
+    var reopened = try NativeFile.open(allocator, path, false);
+    defer reopened.close();
+    try std.testing.expectError(error.InvalidNativeFreeMap, reopened.putDocument("doc:1", "v3"));
 }
 
 test "lite native check reports corrupted committed document page" {
