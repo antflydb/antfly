@@ -1003,6 +1003,19 @@ pub const AntflyApiHandler = struct {
         return ctx.text("table mutation outcome is unknown; observe table state before retrying");
     }
 
+    fn queryMemoryFailureResponse(ctx: *httpx.Context, err: anyerror, stage: []const u8, execution_started: bool) !?httpx.Response {
+        if (err != error.OutOfMemory) return null;
+        const raw = ctx.getData("antfly.workload-body-memory") orelse return null;
+        const owner: *@import("../common/workload_allocator.zig").Owner = @ptrCast(@alignCast(raw));
+        if (!owner.budget_exhausted.load(.acquire)) return null;
+        return try httpx.Response.fromJson(ctx.allocator, 429, .{
+            .@"error" = "QueryMemoryExhausted",
+            .reason = "resource_exhausted",
+            .stage = stage,
+            .execution_started = execution_started,
+        });
+    }
+
     fn mapIngressError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (err == error.OutOfMemory) {
             if (ctx.getData("antfly.workload-body-memory")) |raw| {
@@ -6467,7 +6480,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("not found");
         };
 
-        var lookup_opts = try http_route_helpers.parseLookupOptions(alloc, ctx.request.uri.query orelse "");
+        var lookup_opts = http_route_helpers.parseLookupOptions(alloc, ctx.request.uri.query orelse "") catch |err| {
+            if (try queryMemoryFailureResponse(ctx, err, "planning", false)) |response| return response;
+            return err;
+        };
         defer lookup_opts.deinit(alloc);
         const request_context = operationContext(ctx, authenticated_identity);
         lookup_opts.opts.execution_deadline_ns = request_context.deadline_ns;
@@ -6487,6 +6503,10 @@ pub const AntflyApiHandler = struct {
             consistency,
             request_context,
         ) catch |err| switch (err) {
+            error.OutOfMemory => {
+                if (try queryMemoryFailureResponse(ctx, err, "execution", true)) |response| return response;
+                return err;
+            },
             error.TableNotFound => {
                 _ = ctx.status(404);
                 return ctx.text("not found");
@@ -10195,7 +10215,7 @@ test "httpx inference connection preserves upstream retry guidance" {
 test "workload admission document lookups preserve lifetime and retained output across public aliases and MCP" {
     const alloc = std.testing.allocator;
     const Reads = struct {
-        mode: enum { normal, cancel, expire } = .normal,
+        mode: enum { normal, cancel, expire, budget, backing_oom } = .normal,
         signal: std.atomic.Value(bool) = .init(false),
         deadline_ns: u64 = 0,
         calls: usize = 0,
@@ -10207,6 +10227,12 @@ test "workload admission document lookups preserve lifetime and retained output 
             self.calls += 1;
             try std.testing.expectEqual(self.deadline_ns, opts.execution_deadline_ns.?);
             try std.testing.expect(opts.cancellation.?.ptr != null);
+            if (self.mode == .backing_oom) return error.OutOfMemory;
+            if (self.mode == .budget) {
+                const scratch = try a.alloc(u8, 128 * 1024);
+                defer a.free(scratch);
+                return error.ExpectedBudgetRejection;
+            }
             if (self.mode == .cancel) self.signal.store(true, .release);
             if (self.mode == .expire) {
                 while (@import("antfly_platform").time.monotonicNs() < self.deadline_ns)
@@ -10266,6 +10292,39 @@ test "workload admission document lookups preserve lifetime and retained output 
     mcp_response.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().retained_bytes);
 
+    for (0..3) |failure_mode| {
+        reads.mode = if (failure_mode == 0) .budget else if (failure_mode == 1) .backing_oom else .normal;
+        const large_field = try alloc.alloc(u8, 128 * 1024);
+        defer alloc.free(large_field);
+        @memset(large_field, 'x');
+        const uri = try std.fmt.allocPrint(alloc, "/db/v1/tables/docs/documents/doc:a?fields={s}", .{if (failure_mode == 2) large_field else "title"});
+        defer alloc.free(uri);
+        var pressure_request = try httpx.Request.init(alloc, .GET, uri);
+        defer pressure_request.deinit();
+        var pressure_ctx = httpx.Context.init(alloc, std.testing.io, &pressure_request);
+        pressure_ctx.cancellation = &reads.signal;
+        pressure_ctx.application_deadline_ns = reads.deadline_ns;
+        var pressure_ctx_live = true;
+        defer if (pressure_ctx_live) pressure_ctx.deinit();
+        if (failure_mode == 1) {
+            try std.testing.expectError(error.OutOfMemory, handler.lookupKey(&pressure_ctx, "docs", "doc:a", .{}));
+        } else {
+            var pressure_response = try handler.lookupKey(&pressure_ctx, "docs", "doc:a", .{});
+            defer pressure_response.deinit();
+            try std.testing.expectEqual(@as(u16, 429), pressure_response.status.code);
+            var diagnostic = try std.json.parseFromSlice(std.json.Value, alloc, pressure_response.body.?, .{});
+            defer diagnostic.deinit();
+            try std.testing.expectEqualStrings("resource_exhausted", diagnostic.value.object.get("reason").?.string);
+            try std.testing.expectEqualStrings(if (failure_mode == 0) "execution" else "planning", diagnostic.value.object.get("stage").?.string);
+            try std.testing.expectEqual(failure_mode == 0, diagnostic.value.object.get("execution_started").?.bool);
+            try std.testing.expect(pressure_response.headers.get("Retry-After") == null);
+        }
+        try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
+        pressure_ctx.deinit();
+        pressure_ctx_live = false;
+        try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().retained_bytes);
+    }
+
     var blocker = api_server.query_admission.tryAcquireLease().?;
     defer blocker.release();
     var request = try httpx.Request.init(alloc, .GET, "/db/v1/tables/docs/documents/doc:a");
@@ -10275,7 +10334,7 @@ test "workload admission document lookups preserve lifetime and retained output 
     var rejected = try handler.lookupKey(&ctx, "docs", "doc:a", .{});
     defer rejected.deinit();
     try std.testing.expectEqual(@as(u16, 429), rejected.status.code);
-    try std.testing.expectEqual(@as(usize, 5), reads.calls);
+    try std.testing.expectEqual(@as(usize, 7), reads.calls);
 }
 
 test "httpx query admission releases a cancelled query slot" {
