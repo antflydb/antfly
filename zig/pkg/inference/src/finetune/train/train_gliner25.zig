@@ -133,7 +133,7 @@ fn help() void {
     std.debug.print(
         \\usage: antfly-inference finetune train gliner25 <job.json> [--stop-after-microbatches N] [--shutdown-grace-seconds N]
         \\The version-1 job specifies absolute source/data/output paths and FP32 training settings.
-        \\execution defaults to native; resident_metal requires a Metal-enabled build and admitted device budgets.
+        \\execution defaults to native; resident_metal and resident_cuda require the respective GPU build and admitted device budgets.
         \\The output directory must be new. To resume, set resume_from to latest.safetensors and choose a new output directory.
         \\A cooperative stop preserves unfinished accumulation; a completed run exports a portable model or PEFT adapter.
         \\SIGINT/SIGTERM requests a checkpoint at the next safe boundary; a second signal forces termination.

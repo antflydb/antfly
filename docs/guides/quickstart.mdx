@@ -99,7 +99,9 @@ role. The Q8_0 bundle runs on native CPU on Linux and macOS, and uses Metal
 automatically when it is available.
 
 <Callout type="info">
-If Antfly doesn't detect the new model, restart `antfly standalone`.
+The running process picks up the new model on its next model-list or inference
+request. The Antfarm dashboard refreshes its model list about every 30 seconds,
+so allow up to a minute for it to appear there.
 </Callout>
 
 ## Download Sample Data
@@ -492,7 +494,9 @@ antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --task
 ```
 
 <Callout type="info">
-If Antfly doesn't detect the new model, restart `antfly standalone`.
+The running process picks up the new model on its next model-list or inference
+request. The Antfarm dashboard refreshes its model list about every 30 seconds,
+so allow up to a minute for it to appear there.
 </Callout>
 
 The Q8 model is about 610 MiB and runs on native CPU or Metal. The first query
@@ -623,7 +627,9 @@ antfly inference pull antflydb/clipclap:gguf:Q4_K
 ```
 
 <Callout type="info">
-If Antfly doesn't detect the new model, restart `antfly standalone`.
+The running process picks up the new model on its next model-list or inference
+request. The Antfarm dashboard refreshes its model list about every 30 seconds,
+so allow up to a minute for it to appear there.
 </Callout>
 
 ### Add an image index to your table

@@ -1593,10 +1593,7 @@ fn executeScatterAdd(
     axis: u8,
 ) !CT {
     if (axis != 0) return error.UnsupportedPrimitiveOp;
-    const index_dtype = cb.tensorDType(indices) catch |err| switch (err) {
-        error.UnsupportedTensorType => .f32,
-        else => return err,
-    };
+    const index_dtype = try cb.tensorDType(indices);
     if (index_dtype == .i32 or index_dtype == .i64) {
         // The compatibility host path below represents legacy indices as f32.
         // Typed training indices must reach the backend without that cast.
@@ -2584,6 +2581,7 @@ pub fn executeNode(
             return cb.relu(V.get(ins[0]));
         },
 
+        .fused_silu_backward, .fused_sigmoid_backward, .fused_prefix_scan_v1, .frozen_span_features_v1 => return error.UnsupportedPrimitiveOp,
         .fused_silu => {
             if (state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
                 if (try cb.unaryConsume(.silu, V.get(ins[0]))) |consumed| return consumed;
@@ -3104,6 +3102,11 @@ pub fn executeNode(
             try cb.evalTensor(V.get(ins[0]));
             return V.get(ins[0]);
         },
+
+        // This opt-in backward profile requires the resident executor's
+        // admitted FP32 reduction kernel. CPU/Metal default VJPs remain
+        // decomposed; do not silently replace requested fused arithmetic.
+        .fused_softmax_backward, .fused_boundary_training_attention_v1, .fused_boundary_training_attention_backward_v1 => return error.UnsupportedResidentProgramInstruction,
 
         .fused_softmax => |attrs| {
             const input_ct = V.get(ins[0]);
@@ -3764,6 +3767,7 @@ pub fn executeNode(
             return result;
         },
         .scatter_add => |attrs| {
+            if (attrs.padding_index != null or attrs.reduction == .pytorch_embedding_v1) return error.UnsupportedOperation;
             var dest_buf: [8]i64 = undefined;
             var values_buf: [8]i64 = undefined;
             var indices_buf: [8]i64 = undefined;
@@ -4430,6 +4434,10 @@ const TestCompute = struct {
     fn backendKind(_: *anyopaque) contracts.BackendKind {
         return .native;
     }
+    // TestBuf stores only f32 values, including the legacy index fixtures.
+    fn tensorDType(_: *anyopaque, _: CT) anyerror!@import("../backends/tensor.zig").DType {
+        return .f32;
+    }
     fn deinitBackend(_: *anyopaque) void {}
     fn prefetchHint(_: *anyopaque, _: []const u8, _: u32) void {}
     fn drainPrefetch(_: *anyopaque, _: usize) void {}
@@ -4749,6 +4757,7 @@ const TestCompute = struct {
     }
 
     const test_vtable = ComputeBackend.VTable{
+        .tensorDType = &tensorDType,
         .backendKind = &backendKind,
         .deinitBackend = &deinitBackend,
         .freeTensor = &freeTensor,

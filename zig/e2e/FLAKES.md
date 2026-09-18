@@ -96,6 +96,13 @@ the unchanged request deadline. Its SHA-256 is
 `72c5cd8eacc4ca783741ff62af869ca6e4db3a226e84470d63bf16a4b3547b22`.
 This is additional architecture coverage, not native ARC qualification.
 
+Before publishing, merge `origin/main` at `addc7fa2ca` (#790). Its concurrent
+aggregation fixture independently switched to two barrier-synchronized rounds
+and the ordinary 30-second public request timeout. Preserve that upstream fixture
+behavior alongside the new page-limit regression. The results above precede this
+merge and used the original 15-second request deadline; the production fixes do
+not depend on the upstream timeout increase.
+
 ## 2026-09-18: stable transaction recovery overlapped foreground execution
 
 The same job failed `test_session_transform_savepoint_rollback` with HTTP 503,

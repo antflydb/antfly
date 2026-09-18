@@ -13,9 +13,9 @@ const schema = @import("../pipelines/extraction_schema.zig");
 const regex = @import("../pipelines/extraction_regex.zig");
 const model = @import("../models/gliner_boundary.zig");
 const scoring = pipeline.scoring;
-const ops = @import("../architectures/gliner_boundary_ops.zig");
-const head = @import("../architectures/gliner_boundary_head.zig");
-const tasks = @import("../architectures/gliner_boundary_tasks.zig");
+const ops = @import("../architectures/gliner/boundary_ops.zig");
+const head = @import("../architectures/gliner/boundary_head.zig");
+const tasks = @import("../architectures/gliner/boundary_tasks.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const Fixture = struct {

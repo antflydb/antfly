@@ -277,7 +277,7 @@ fn compileRegion(a: Allocator, source: *const ml.Graph, spec: RegionSpec, checkp
     var local_metadata = initial.admission.host_metadata_upper_bound_bytes;
     var compilation = initial.admission.compile_upper_bound_bytes;
     var work = initial.admission.total_work;
-    var instruction_control_bytes = if (options.session.execution == .resident_metal) initial.admission.instruction_control_readback_upper_bound_bytes else 0;
+    var instruction_control_bytes = if (options.session.execution != .native) initial.admission.instruction_control_readback_upper_bound_bytes else 0;
     var control_bytes = instruction_control_bytes;
     if (wrt.items.len != 0) {
         const seeds = try a.alloc(ml.autodiff.Seed, output_slots.len);
@@ -713,7 +713,7 @@ pub const Tape = struct {
         errdefer a.free(fixed);
         @memset(fixed, null);
         var owned = false;
-        errdefer if (owned and plan.options.session.execution == .resident_metal) for (fixed) |value| {
+        errdefer if (owned and plan.options.session.execution != .native) for (fixed) |value| {
             if (value) |tensor| backend.free(tensor);
         };
         var required: usize = 0;
@@ -736,7 +736,7 @@ pub const Tape = struct {
         }
         // Stage resident reference leases independently. No partial failure
         // may free one of the caller's original handles.
-        if (plan.options.session.execution == .resident_metal) {
+        if (plan.options.session.execution != .native) {
             for (fixed) |*value| value.* = null;
             owned = true;
             var cb = backend.*;
@@ -765,7 +765,7 @@ pub const Tape = struct {
             try combined.check();
             var bindings = try result.bindRegion(region, &cb, combined);
             defer bindings.deinit(&cb);
-            const captured = if (plan.options.session.execution == .resident_metal) resident_capture: {
+            const captured = if (plan.options.session.execution != .native) resident_capture: {
                 const mapped = try a.alloc(program.Binding, bindings.values.len);
                 defer a.free(mapped);
                 for (bindings.values, mapped) |input, *out| out.* = .{ .node_id = input.node_id, .value = input.value };
@@ -844,7 +844,7 @@ pub const Tape = struct {
         if (self.consumed) return;
         self.consumed = true;
         for (self.checkpoints) |value| if (value) |tensor| self.backend.free(tensor);
-        if (self.plan.options.session.execution == .resident_metal) for (self.fixed) |value| {
+        if (self.plan.options.session.execution != .native) for (self.fixed) |value| {
             if (value) |tensor| self.backend.free(tensor);
         };
         self.plan.allocator.free(self.checkpoints);
@@ -967,7 +967,7 @@ pub const Tape = struct {
 fn validateBackend(plan: *const Plan, cb: *const ops.ComputeBackend) !void {
     switch (plan.options.session.execution) {
         .native => if (cb.kind() != .native) return error.UnsupportedSeededTrainingBackend,
-        .resident_metal => if (cb.kind() != .metal or cb.vtable.residentTrainingInstruction == null or cb.vtable.residentTrainingPrimitive == null or cb.vtable.residentTrainingNorm == null or cb.vtable.snapshotTensorShape == null) return error.UnsupportedSeededTrainingBackend,
+        .resident_metal, .resident_cuda => if (cb.kind() != plan.options.session.execution.backendKind() or cb.vtable.residentTrainingInstruction == null or cb.vtable.residentTrainingPrimitive == null or cb.vtable.residentTrainingNorm == null or cb.vtable.snapshotTensorShape == null) return error.UnsupportedSeededTrainingBackend,
     }
 }
 
@@ -993,7 +993,7 @@ fn emptyGradients(a: Allocator, loss: f32) !seeded.BackwardResult {
 fn zeroTensor(plan: *const Plan, cb: *const ops.ComputeBackend, shape: ml.Shape) !ops.CT {
     var dimensions: [8]i32 = undefined;
     const dims = shape32(shape, &dimensions);
-    if (plan.options.session.execution == .resident_metal) {
+    if (plan.options.session.execution != .native) {
         const scalar = try cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = &.{0}, .shape = &.{} } }, plan.options.session.resident.program.instruction.primitive);
         defer cb.free(scalar);
         const instruction = ops.resident_program.Instruction{ .op = .{ .broadcast_in_dim = .{ .target_shape = shape, .num_axes = 0 } }, .output = shape, .inputs = .{ ml.Shape.init(.f32, &.{}), .{}, .{}, .{} }, .num_inputs = 1 };
@@ -1021,7 +1021,7 @@ fn ownGradientOutputs(plan: *const Plan, region: *const Region, cb: *const ops.C
     for (result.gradients.outputs, region.duplicate_gradients, outputs, 0..) |tensor, duplicate, *output, index| {
         if (duplicate) |_| {
             const shape = region.cut.graph.node(region.gradients[index].local).output_shape;
-            if (plan.options.session.execution == .resident_metal) {
+            if (plan.options.session.execution != .native) {
                 output.* = try resident.lease(cb, tensor, shape, plan.options.session.resident);
             } else {
                 const data = try cb.toFloat32(tensor, a);
@@ -1057,7 +1057,7 @@ fn accumulate(plan: *const Plan, cb: *const ops.ComputeBackend, destination: *?o
         destination.* = incoming;
         return;
     };
-    const sum = if (plan.options.session.execution == .resident_metal) resident_sum: {
+    const sum = if (plan.options.session.execution != .native) resident_sum: {
         const instruction = ops.resident_program.Instruction{ .op = .add, .output = shape, .inputs = .{ shape, shape, .{}, .{} }, .num_inputs = 2 };
         break :resident_sum try cb.residentTrainingInstruction(&instruction, &.{ old, incoming }, plan.options.session.resident.program.instruction);
     } else try cb.add(old, incoming);

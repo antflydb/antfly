@@ -56,7 +56,8 @@ pub const CreateMetalRuntimeTestsResult = struct {
 pub fn createMetalRuntimeTests(ctx: Context) CreateMetalRuntimeTestsResult {
     const b = ctx.b;
     const quant_kernel_metal_runtime_check_tests = b.addTest(.{
-        .max_rss = 1024 * 1024 * 1024,
+        // ReleaseFast reaches 1.15 GB on Linux; reserve compiler headroom.
+        .max_rss = 2 * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/quant_kernel_metal_runtime_check.zig"),
             .target = ctx.target,

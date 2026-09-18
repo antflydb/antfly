@@ -62,6 +62,12 @@ pub fn build(a: std.mem.Allocator, indices: []const i32, output_rows: usize, lim
     try check(control);
     const admission = try plan(indices.len, output_rows, limits);
     try (try IndexBounds.of(indices)).validate(output_rows);
+    // Attention routing has many repeats over a dense destination range. Its
+    // stable counting sort needs <=8N scratch bytes and <=6N visits here, both
+    // within the already-admitted heap-sort bounds (N>=4). Sparse, high integer
+    // destinations keep the original O(N log N), O(N) allocation path.
+    if (indices.len >= 4 and output_rows <= indices.len * 2)
+        return buildCounted(a, indices, output_rows, admission, control);
     const entries = try a.alloc(Entry, indices.len);
     defer a.free(entries);
     const count: i64 = @intCast(output_rows);
@@ -103,6 +109,75 @@ pub fn build(a: std.mem.Allocator, indices: []const i32, output_rows: usize, lim
         .maximum_group_size = maximum_group,
         .admission = admission,
     };
+}
+
+fn buildCounted(a: std.mem.Allocator, indices: []const i32, output_rows: usize, admission: Admission, control: ?Control) !Grouped {
+    const cursors = try a.alloc(u32, output_rows);
+    defer a.free(cursors);
+    @memset(cursors, 0);
+    const count: i64 = @intCast(output_rows);
+    for (indices, 0..) |raw, ordinal| {
+        if (ordinal % 4096 == 0) try check(control);
+        const row: usize = @intCast(if (raw < 0) @as(i64, raw) + count else raw);
+        cursors[row] += 1;
+    }
+    const storage = try a.alloc(i32, admission.persistent_bytes / 4);
+    errdefer a.free(storage);
+    const order = storage[0..indices.len];
+    const rows = storage[indices.len..][0..indices.len];
+    const offsets = storage[2 * indices.len ..];
+    var groups: usize = 0;
+    var total: u32 = 0;
+    var maximum_group: usize = 0;
+    for (cursors, 0..) |*cursor, row| {
+        if (row % 4096 == 0) try check(control);
+        const size = cursor.*;
+        if (size != 0) {
+            rows[groups] = @intCast(row);
+            offsets[groups] = @intCast(total);
+            groups += 1;
+            maximum_group = @max(maximum_group, size);
+        }
+        cursor.* = total;
+        total += size;
+    }
+    offsets[groups] = @intCast(total);
+    // Visiting original ordinals in ascending order reproduces the heap
+    // comparator's ordinal tie-break exactly, including negative aliases.
+    for (indices, 0..) |raw, ordinal| {
+        if (ordinal % 4096 == 0) try check(control);
+        const row: usize = @intCast(if (raw < 0) @as(i64, raw) + count else raw);
+        order[cursors[row]] = @intCast(ordinal);
+        cursors[row] += 1;
+    }
+    try check(control);
+    return .{ .allocator = a, .storage = storage, .rows = rows[0..groups], .offsets = offsets[0 .. groups + 1], .order = order, .output_rows = output_rows, .maximum_group_size = maximum_group, .admission = admission };
+}
+
+test "CUDA boundary dense routing matches sparse heap order including negative aliases" {
+    const a = std.testing.allocator;
+    var indices: [64]i32 = undefined;
+    for ([_]usize{ 1, 4, 63, 128, 129 }) |rows| {
+        var expected: [indices.len]Entry = undefined;
+        for (&indices, &expected, 0..) |*index, *entry, i| {
+            const row: i32 = @intCast((i * 37 + i / 3) % rows);
+            index.* = row - if (i % 2 == 0) @as(i32, @intCast(rows)) else 0;
+            entry.* = .{ .row = row, .ordinal = @intCast(i) };
+        }
+        std.sort.heap(Entry, &expected, {}, Entry.lessThan);
+        var grouped = try build(a, &indices, rows, .{}, null);
+        defer grouped.deinit();
+        for (expected, grouped.order) |entry, ordinal| try std.testing.expectEqual(entry.ordinal, ordinal);
+        var largest: usize = 0;
+        for (grouped.rows, 0..) |row, g| {
+            const begin: usize = @intCast(grouped.offsets[g]);
+            const end: usize = @intCast(grouped.offsets[g + 1]);
+            largest = @max(largest, end - begin);
+            for (expected[begin..end]) |entry| try std.testing.expectEqual(row, entry.row);
+        }
+        try std.testing.expectEqual(largest, grouped.maximum_group_size);
+    }
+    try std.testing.checkAllAllocationFailures(a, allocationCheck, .{});
 }
 
 test "resident training sparse groups preserve repeated negative and high integer routing order" {
