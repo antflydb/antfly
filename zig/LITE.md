@@ -703,6 +703,37 @@ the standard `libantfly` -- no separate library or extra link flags.
 Models are still auto-discovered the same way as `antfly inference pull`,
 under `~/.antfly/inference/models/`.
 
+**Worker process.** GPU-hosted and driver-backed backends (Metal, CUDA, ONNX,
+PJRT) run model construction and, for Metal/CUDA/PJRT, execution itself in a
+separate, replaceable child process (`<worker executable> inference
+_worker`), not in the host process -- see
+`BackendRuntime.requiresProcessIsolation` in
+`zig/pkg/inference/src/backends/backends.zig`. This is crash containment, not
+an implementation accident: an unabortable driver call or a model load that
+corrupts GPU state can only be recovered by killing and respawning the
+process that made it, and that must never be the process embedding
+`libantfly`. Native-only backends (CPU) never need this and run in-process.
+
+The `antfly` CLI resolves the worker by re-executing itself (`argv[0]` names
+the `antfly` binary the user launched, which understands `inference
+_worker`). A library host has no such self -- `argv[0]` is the Go test
+binary, `examples/dogfood`, or whatever else linked `libantfly` -- so the
+runtime resolves the worker executable in this order:
+
+1. `ANTFLY_INFERENCE_WORKER`, an environment variable naming the worker
+   executable directly (typically the path to an `antfly` binary).
+2. The image this code was loaded from, via `dladdr`: for the statically
+   linked `antfly` executable this is itself (unchanged CLI behavior); for a
+   shared `libantfly`/`libantfly.dylib`, the runtime looks for a sibling
+   `antfly` binary in the same directory.
+3. `antfly` on `PATH`.
+
+If none of these resolve, model construction on a process-isolated backend
+fails with a clear error naming `ANTFLY_INFERENCE_WORKER`. Set that variable
+(or ship an `antfly` binary next to `libantfly`, or put one on `PATH`) when
+embedding Lite in a host that is not the `antfly` binary itself and needs
+Metal/CUDA/ONNX/PJRT models.
+
 #### Manual Maintenance
 
 Hosted/manual mode is important for environments such as WASM, mobile, plugins,

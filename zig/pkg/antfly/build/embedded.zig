@@ -340,9 +340,16 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const capi_smoke_step = b.step("capi-smoke", "Compile and run a C consumer smoke test for libantfly");
     capi_smoke_step.dependOn(&run_capi_smoke.step);
 
+    // The Go test binary is not the `antfly` executable, so it cannot re-exec
+    // itself the way the CLI does to spawn the sandboxed inference worker
+    // (see inference_worker.zig's `resolveWorkerExecutable`). Point it at the
+    // `antfly` binary this same build tree produces so it never falls
+    // through to an unrelated `antfly` a developer happens to have on PATH.
+    const lite_go_worker_env = b.fmt("ANTFLY_INFERENCE_WORKER={s}", .{b.getInstallPath(.bin, "antfly")});
     const run_lite_go_tests = b.addSystemCommand(&.{
         "env",
         "GOWORK=off",
+        lite_go_worker_env,
         "go",
         "test",
         "-tags",
@@ -359,6 +366,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const run_lite_go_example = b.addSystemCommand(&.{
         "env",
         "GOWORK=off",
+        lite_go_worker_env,
         "go",
         "run",
         ".",
@@ -377,6 +385,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const run_lite_go_retrieval_template = b.addSystemCommand(&.{
         "env",
         "GOWORK=off",
+        lite_go_worker_env,
         "go",
         "run",
         ".",

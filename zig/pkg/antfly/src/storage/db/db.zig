@@ -29166,7 +29166,53 @@ pub const DB = struct {
     }
 
     pub fn runUntilIdle(self: *DB) !void {
+        const started_ns = platform_time.monotonicNs();
+        const before = self.enrichmentThroughputSnapshot();
+        defer self.logRunUntilIdleSummary(started_ns, before);
         try self.runUntilIdleWithReplayDrainOptions(.{ .wait_for_enrichment_retries = true });
+    }
+
+    const EnrichmentThroughputSnapshot = struct {
+        embed_batches: u64 = 0,
+        embed_items: u64 = 0,
+        embed_ns: u64 = 0,
+        extract_batches: u64 = 0,
+        extract_items: u64 = 0,
+        extract_ns: u64 = 0,
+    };
+
+    fn enrichmentThroughputSnapshot(self: *DB) EnrichmentThroughputSnapshot {
+        const runtime = self.enrichment_runtime orelse return .{};
+        return .{
+            .embed_batches = runtime.embed_batches_completed,
+            .embed_items = runtime.embed_items_completed,
+            .embed_ns = runtime.total_embed_ns,
+            .extract_batches = runtime.extract_batches_completed,
+            .extract_items = runtime.extract_items_completed,
+            .extract_ns = runtime.total_extract_ns,
+        };
+    }
+
+    /// One-line throughput summary so a caller (Lite's `dogfood`-style ingest
+    /// drain, in particular) can see embed/extract batch counts and wall time
+    /// without instrumenting its own driver loop. Deltas isolate this call's
+    /// own contribution on a long-lived, repeatedly-drained runtime.
+    fn logRunUntilIdleSummary(self: *DB, started_ns: u64, before: EnrichmentThroughputSnapshot) void {
+        const after = self.enrichmentThroughputSnapshot();
+        const wall_ns = platform_time.monotonicNs() -| started_ns;
+        if (after.embed_batches == before.embed_batches and after.extract_batches == before.extract_batches) return;
+        std.log.info(
+            "runUntilIdle summary wall_ms={d} embed_batches={d} embed_items={d} embed_ns={d} extract_batches={d} extract_items={d} extract_ns={d}",
+            .{
+                wall_ns / std.time.ns_per_ms,
+                after.embed_batches -| before.embed_batches,
+                after.embed_items -| before.embed_items,
+                after.embed_ns -| before.embed_ns,
+                after.extract_batches -| before.extract_batches,
+                after.extract_items -| before.extract_items,
+                after.extract_ns -| before.extract_ns,
+            },
+        );
     }
 
     /// Resident managed writers already have an asynchronous enrichment owner.

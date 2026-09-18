@@ -87,6 +87,24 @@ application requests a local inference runtime; Lite reports `local_embedded`
 whenever the loaded build advertises `LocalInferenceRuntime`, which is true
 by default for the standard `libantfly` (see "Embedded inference" above).
 
+**Worker executable resolution.** GPU-hosted and driver-backed backends
+(Metal, CUDA, ONNX, PJRT) construct and, for Metal/CUDA/PJRT, execute models
+in a separate, replaceable worker process rather than inside the Go process
+-- crash containment for an unabortable driver call or GPU state corruption
+means the process that made the call must be the one that gets killed and
+respawned, and that must never be the Go host. Unlike the `antfly` CLI (which
+re-execs `argv[0]`, itself), a Go binary linking `libantfly` has no
+`antfly`-shaped `argv[0]` to re-exec, so the runtime resolves the worker
+executable itself, in order: the `ANTFLY_INFERENCE_WORKER` environment
+variable (a path to the worker executable, typically an `antfly` binary);
+otherwise an `antfly` binary next to the loaded `libantfly`; otherwise
+`antfly` on `PATH`. If none of these resolve, calls into a process-isolated
+backend fail with a clear error naming `ANTFLY_INFERENCE_WORKER` -- set it
+(or place an `antfly` binary next to `libantfly` or on `PATH`) before opening
+a `LocalRuntimeConfigured` handle that needs Metal/CUDA/ONNX/PJRT models. See
+`zig/LITE.md`'s "Local Embedded Inference" section for the full resolution
+order and rationale.
+
 Use `BeginTransaction`, `WriteTransaction`, `ResolveTransaction`,
 `TransactionStatus`, and `CommitVersion` when an embedded application needs the
 local transaction/OCC path exposed by the Antfly C ABI.

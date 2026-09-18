@@ -151,8 +151,15 @@ pub fn createEmbeddedInferenceNode(data_dir: []const u8, io: std.Io) !EmbeddedIn
         .preload_ptr = null,
         .preload_len = 0,
         .keep_alive = .{},
+        // Explicitly unlimited (model_manager.zig: 0 means unbounded), not
+        // merely unset. A Lite handle typically enrichs with a small,
+        // fixed set of models (an embedder and an extractor, say); the
+        // unset default of 10 would technically cover that too, but an
+        // interleaved embed/extract workload that evicts and reloads either
+        // model between documents is exactly the kind of self-inflicted
+        // thrash this embedded node must not reproduce.
         .max_loaded_models = 0,
-        .has_max_loaded_models = 0,
+        .has_max_loaded_models = 1,
         .content_security_json = .{},
         .s3_credentials_json = .{},
         .runtime_config_json = inference_bridge.String.init("{}"),
