@@ -522,11 +522,20 @@ def _create_not_admitted():
 
 
 @pytest.mark.parametrize("success_status", [200, 202])
+@pytest.mark.parametrize(
+    "rejection_body",
+    [
+        _create_not_admitted()[1],
+        b"metadata cluster upgrade in progress; retry later",
+        b"metadata mutation deadline exceeded before admission; retry later",
+    ],
+)
 def test_cluster_create_retries_only_proven_non_admission(
-    monkeypatch, capsys, success_status
+    monkeypatch, capsys, success_status, rejection_body
 ):
     cluster, session, calls = _seed_cluster(
-        monkeypatch, [_create_not_admitted(), (success_status, b"{}")]
+        monkeypatch,
+        [(503, rejection_body, _create_not_admitted()[2]), (success_status, b"{}")],
     )
     definition = {"num_shards": 3, "description": "backup"}
     assert (
@@ -580,6 +589,15 @@ def test_cluster_create_retries_only_proven_non_admission(
             503,
             b'{"code":"different_error","retryable":true}',
             _create_not_admitted()[2],
+        ),
+        (503, b"metadata cluster upgrade in progress; retry later"),
+        (
+            503,
+            b"metadata cluster upgrade in progress; retry later",
+            {
+                **_create_not_admitted()[2],
+                "X-Antfly-Raft-Mutation-Outcome": "unknown-v1",
+            },
         ),
         (503, b"malformed response", _create_not_admitted()[2]),
         (500, b"internal failure"),
@@ -724,3 +742,175 @@ def test_wait_until_preserves_nonretryable_service_unavailable():
         helpers.wait_until(probe, timeout_s=1.0)
 
     assert raised.value is expected
+
+
+@pytest.mark.parametrize("visible", [True, False])
+def test_cluster_seed_observes_uncertain_commit_without_replaying(monkeypatch, visible):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch,
+        [(409, b'{"code":"transaction_outcome_unknown","retryable":false}')],
+    )
+    docs = {"a": {"title": "a"}, "b": {"title": "b"}}
+    reads = []
+
+    def lookup(_session, _url, _table, key, **_kwargs):
+        reads.append(key)
+        return docs[key] if visible or key == "a" else {"title": "wrong"}
+
+    monkeypatch.setattr(backups, "_lookup_doc_from_url", lookup)
+    if visible:
+        assert (
+            backups._seed_cluster_docs_when_writable(
+                cluster, session, "docs", docs, timeout_s=0.25
+            )
+            is None
+        )
+        assert reads == ["a", "b"]
+    else:
+        with pytest.raises(
+            AssertionError, match="did not commit every expected document"
+        ):
+            backups._seed_cluster_docs_when_writable(
+                cluster, session, "docs", docs, timeout_s=0.25
+            )
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("absent", [True, False])
+def test_cluster_delete_observes_uncertain_commit_without_replaying(
+    monkeypatch, absent
+):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch,
+        [
+            (
+                409,
+                b"table mutation outcome is unknown; observe table state before retrying",
+                {"X-Antfly-Raft-Mutation-Outcome": "unknown-v1"},
+            )
+        ],
+    )
+    session.delete = session.post
+    observations = []
+
+    def check(table, table_id, group_ids):
+        observations.append((table, table_id, group_ids))
+        return absent
+
+    cluster.table_absent_on_all_metadata_nodes = check
+    if absent:
+        backups._delete_cluster_table_and_observe(
+            cluster, session, "docs", 7, {71, 72, 73}, timeout_s=0.5
+        )
+    else:
+        with pytest.raises(AssertionError, match="table remained in metadata"):
+            backups._delete_cluster_table_and_observe(
+                cluster, session, "docs", 7, {71, 72, 73}, timeout_s=0.5
+            )
+    assert observations
+    assert all(item == ("docs", 7, {71, 72, 73}) for item in observations)
+    assert len(calls) == 1
+
+
+def test_cluster_delete_rejects_unknown_without_outcome_contract(monkeypatch):
+    cluster, session, calls = _seed_cluster(
+        monkeypatch,
+        [
+            (
+                409,
+                b"table mutation outcome is unknown; observe table state before retrying",
+            )
+        ],
+    )
+    session.delete = session.post
+    with pytest.raises(AssertionError, match="delete="):
+        backups._delete_cluster_table_and_observe(cluster, session, "docs", 7, {71})
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "status,body",
+    [
+        (204, b""),
+        (202, b'{"status":"committed_visibility_pending"}'),
+        (202, b'{"status":"committed_repair_required"}'),
+        (202, b'{"status":"committed_repair_unavailable"}'),
+    ],
+)
+def test_cluster_delete_waits_for_visibility_after_committed_response(
+    monkeypatch, status, body
+):
+    cluster, session, calls = _seed_cluster(monkeypatch, [(status, body)])
+    session.delete = session.post
+    observations = iter([False, True])
+    cluster.table_absent_on_all_metadata_nodes = lambda *_args: next(observations)
+    backups._delete_cluster_table_and_observe(
+        cluster, session, "docs", 7, {71}, timeout_s=1.0
+    )
+    assert len(calls) == 1
+
+
+def _replicated_cluster_snapshot(table_id=7, groups=(71, 72, 73)):
+    return {
+        "tables": [{"table_id": table_id, "name": "docs"}],
+        "ranges": [{"table_id": table_id, "group_id": group} for group in groups],
+        "placement_intents": [
+            {"record": {"group_id": group, "local_node_id": node}}
+            for group in groups
+            for node in (4, 5, 6)
+        ],
+        "merged_group_statuses": [
+            {
+                "group_id": group,
+                "leader_known": True,
+                "voter_count_known": True,
+                "voter_count": 3,
+                "healthy_voter_reports": 3,
+            }
+            for group in groups
+        ],
+    }
+
+
+def test_cluster_replication_returns_topology_without_a_second_probe():
+    observations = iter(
+        [[_replicated_cluster_snapshot() for _ in range(3)], [None] * 3]
+    )
+    cluster = SimpleNamespace(
+        assert_processes_alive=lambda: None,
+        metadata_snapshots=lambda: next(observations),
+    )
+    topology = backups.ThreeByThreeBackupCluster.fully_replicated_topology(
+        cluster, "docs"
+    )
+    assert topology == (7, {71, 72, 73})
+    # A later transient probe failure cannot invalidate the completed observation.
+    assert (
+        backups.ThreeByThreeBackupCluster.fully_replicated_topology(cluster, "docs")
+        is None
+    )
+    assert topology == (7, {71, 72, 73})
+
+
+@pytest.mark.parametrize(
+    "defect", ["table_identity", "group_identity", "placement", "health", "missing"]
+)
+def test_cluster_replication_requires_matching_ready_topology_on_every_node(defect):
+    snapshots = [_replicated_cluster_snapshot() for _ in range(3)]
+    if defect == "table_identity":
+        snapshots[2] = _replicated_cluster_snapshot(table_id=8)
+    elif defect == "group_identity":
+        snapshots[2] = _replicated_cluster_snapshot(groups=(81, 82, 83))
+    elif defect == "placement":
+        snapshots[2]["placement_intents"].pop()
+    elif defect == "health":
+        snapshots[2]["merged_group_statuses"][0]["healthy_voter_reports"] = 2
+    else:
+        snapshots[2] = None
+    cluster = SimpleNamespace(
+        assert_processes_alive=lambda: None, metadata_snapshots=lambda: snapshots
+    )
+    assert (
+        backups.ThreeByThreeBackupCluster.fully_replicated_topology(cluster, "docs")
+        is None
+    )

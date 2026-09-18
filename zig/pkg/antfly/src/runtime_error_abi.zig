@@ -424,6 +424,8 @@ pub const Detail = enum(c_int) {
     metadata_incarnation_unavailable,
     invalid_metadata_incarnation,
     metadata_incarnation_mismatch,
+    metadata_proposal_superseded,
+    metadata_proposal_apply_timeout,
 };
 
 pub const Status = extern struct {
@@ -634,6 +636,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.LeaderTransferInProgress => status(.retryable, .leader_transfer_in_progress),
         error.MetadataLinearizableReadTimeout => status(.timeout, .metadata_linearizable_read_timeout),
         error.ReconcileLeaseNotHeld => status(.retryable, .reconcile_lease_not_held),
+        error.MetadataProposalSuperseded => status(.conflict, .metadata_proposal_superseded),
+        error.MetadataProposalApplyTimeout => status(.timeout, .metadata_proposal_apply_timeout),
         error.MetadataMutationOutcomeUnknown => status(.conflict, .metadata_mutation_outcome_unknown),
         error.MissingEmbeddingArtifactProducer => status(.invalid_argument, .missing_embedding_artifact_producer),
         error.InvalidEmbeddingArtifactProducer => status(.invalid_argument, .invalid_embedding_artifact_producer),
@@ -1211,6 +1215,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .graph_min_weight_domain_violation => "GraphMinWeightDomainViolation",
         .graph_max_weight_domain_violation => "GraphMaxWeightDomainViolation",
         .graph_path_weight_overflow => "GraphPathWeightOverflow",
+        .metadata_proposal_superseded => "MetadataProposalSuperseded",
+        .metadata_proposal_apply_timeout => "MetadataProposalApplyTimeout",
         .metadata_mutation_outcome_unknown => "MetadataMutationOutcomeUnknown",
         .missing_embedding_artifact_producer => "MissingEmbeddingArtifactProducer",
         .invalid_embedding_artifact_producer => "InvalidEmbeddingArtifactProducer",
@@ -1410,4 +1416,11 @@ test "storage owner contention retains retryability and exact identity" {
     try std.testing.expectEqual(@intFromEnum(Code.retryable), wire.code);
     try std.testing.expect(errorHasStableDetail(error.StorageBusy));
     try std.testing.expectEqual(error.StorageBusy, errorFromStatus(wire));
+}
+
+test "metadata proposal recovery errors preserve identity across runtime archives" {
+    for ([_]anyerror{ error.MetadataProposalSuperseded, error.MetadataProposalApplyTimeout, error.MetadataMutationOutcomeUnknown }) |err| {
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(statusFromErrorWithFallback(err, error.RestoreJobPersistenceUnavailable)));
+    }
 }
