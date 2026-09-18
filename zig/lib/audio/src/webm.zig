@@ -209,10 +209,20 @@ const DecodedTrack = struct {
 };
 
 /// Silence a decoded track may gain to honour the container's timeline.
-/// Recordings paused for a few minutes are ordinary; a timestamp claiming
-/// hours is broken input, and materialising hours of silence would cost far
-/// more than any transcript of it is worth.
-const max_timeline_silence_seconds: u64 = 600;
+/// A recorder paused for minutes is ordinary and an hour is already
+/// generous; past that the timestamps are broken input, and materialising
+/// the silence would cost far more than any transcript of it is worth.
+///
+/// Exceeding it fails the decode. Trimming the silence instead would move
+/// every word after the gap earlier while still reporting success, and a
+/// transcript whose offsets do not match the recording is worse than one
+/// the caller knows it did not get.
+///
+/// The silence is materialised, so an hour of it at 48 kHz stereo is about
+/// 1.4 GB. Callers that decode untrusted input go through `decodeBounded`,
+/// whose working-memory ceiling turns that into `error.AudioTooLarge` long
+/// before it is reached.
+const max_timeline_silence_seconds: u64 = 3600;
 
 /// Puts decoded audio where the recording says it belongs.
 ///
@@ -251,17 +261,17 @@ fn placeOnTimelineAlloc(
     // Rounding a block time to frames can land a frame either side of the
     // truth; only a gap wider than a millisecond is a real one.
     const tolerance_frames: usize = @max(1, sample_rate / 1000);
-    var budget_frames: usize = std.math.cast(usize, max_timeline_silence_seconds * sample_rate) orelse
+    const budget_frames: usize = std.math.cast(usize, max_timeline_silence_seconds * sample_rate) orelse
         std.math.maxInt(usize);
 
     const frames = access_unit_frames orelse {
         // Start offset only: everything decoded stays contiguous after it.
         const offset = nsToFrames(times_ns[0], sample_rate) -| delay_frames;
         if (offset <= tolerance_frames) return samples;
-        const lead = @min(offset, budget_frames);
-        const out = try allocator.alloc(f32, (total_frames + lead) * channels);
-        @memset(out[0 .. lead * channels], 0);
-        @memcpy(out[lead * channels ..], samples);
+        if (offset > budget_frames) return error.UnsupportedAudioFormat;
+        const out = try allocator.alloc(f32, (total_frames + offset) * channels);
+        @memset(out[0 .. offset * channels], 0);
+        @memcpy(out[offset * channels ..], samples);
         allocator.free(samples);
         return out;
     };
@@ -275,9 +285,10 @@ fn placeOnTimelineAlloc(
     for (frames, times_ns) |unit_frames, time_ns| {
         const want = nsToFrames(time_ns, sample_rate) -| delay_frames;
         if (want > timeline_cursor + tolerance_frames) {
-            const gap = @min(want - timeline_cursor, budget_frames);
-            budget_frames -= gap;
-            inserted_total += gap;
+            const gap = want - timeline_cursor;
+            inserted_total = std.math.add(usize, inserted_total, gap) catch
+                return error.UnsupportedAudioFormat;
+            if (inserted_total > budget_frames) return error.UnsupportedAudioFormat;
             timeline_cursor += gap;
         }
         const available = total_frames -| source_cursor;
@@ -292,17 +303,11 @@ fn placeOnTimelineAlloc(
     const out = try allocator.alloc(f32, (total_frames + inserted_total) * channels);
     errdefer allocator.free(out);
     @memset(out, 0);
-    budget_frames = std.math.cast(usize, max_timeline_silence_seconds * sample_rate) orelse
-        std.math.maxInt(usize);
     source_cursor = 0;
     timeline_cursor = 0;
     for (frames, times_ns) |unit_frames, time_ns| {
         const want = nsToFrames(time_ns, sample_rate) -| delay_frames;
-        if (want > timeline_cursor + tolerance_frames) {
-            const gap = @min(want - timeline_cursor, budget_frames);
-            budget_frames -= gap;
-            timeline_cursor += gap;
-        }
+        if (want > timeline_cursor + tolerance_frames) timeline_cursor = want;
         const available = total_frames -| source_cursor;
         const copied = @min(unit_frames, available);
         if (copied != 0) {
@@ -1261,6 +1266,25 @@ fn buildCluster(allocator: std.mem.Allocator, timecode: u8, blocks: []const []co
     return out.toOwnedSlice(allocator);
 }
 
+/// A cluster stamped at an arbitrary millisecond offset, for fixtures that
+/// need a timestamp wider than one byte.
+fn buildClusterAtMs(allocator: std.mem.Allocator, timecode_ms: u64, blocks: []const []const u8) ![]u8 {
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, timecode_ms, .big);
+    var first: usize = 0;
+    while (first < encoded.len - 1 and encoded[first] == 0) first += 1;
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try appendLeafElement(&body, allocator, &.{0xE7}, encoded[first..]);
+    for (blocks) |b| try body.appendSlice(allocator, b);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try appendLeafElement(&out, allocator, &.{ 0x1F, 0x43, 0xB6, 0x75 }, body.items);
+    return out.toOwnedSlice(allocator);
+}
+
 fn buildClusterUnknownSize(allocator: std.mem.Allocator, timecode: u8, blocks: []const []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -1516,6 +1540,56 @@ test "webm demux decodes real opus packets laced with Xiph and EBML lacing" {
         defer reference.deinit();
 
         try expectPcmClose(reference.samples, decoded.samples);
+    }
+}
+
+test "webm decoding refuses a gap it cannot place" {
+    const allocator = std.testing.allocator;
+
+    var ogg_packets = try ogg.parsePacketsAlloc(allocator, tone_opus_bytes);
+    defer ogg_packets.deinit();
+    const opus_head = ogg_packets.packets[0].bytes;
+    const audio_packets = ogg_packets.packets[2..];
+
+    const entry = try buildAudioTrackEntry(allocator, 1, "A_OPUS", opus_head, 2, null);
+    defer allocator.free(entry);
+    const tracks = try buildTracks(allocator, &.{entry});
+    defer allocator.free(tracks);
+
+    var blocks: [2][]u8 = undefined;
+    var built: usize = 0;
+    defer for (blocks[0..built]) |block| allocator.free(block);
+    for (audio_packets[0..2]) |packet| {
+        blocks[built] = try buildSimpleBlockNoLacing(allocator, 1, packet.bytes);
+        built += 1;
+    }
+
+    // An hour of silence is still placed: a recorder left paused that long
+    // is unusual but real, and the offsets have to stay true.
+    {
+        const first = try buildClusterAtMs(allocator, 0, blocks[0..1]);
+        defer allocator.free(first);
+        const second = try buildClusterAtMs(allocator, 59 * 60 * 1000, blocks[1..2]);
+        defer allocator.free(second);
+        const file = try buildWebmFile(allocator, tracks, &.{ first, second });
+        defer allocator.free(file);
+        var decoded = try decodeInterleaved(allocator, file);
+        defer decoded.deinit();
+        const frames = decoded.samples.len / decoded.channels;
+        try std.testing.expect(frames > 59 * 60 * decoded.sample_rate);
+    }
+
+    // Past that the timestamps are not credible. Placing what fits and
+    // returning success would move the second half of the recording hours
+    // earlier while reporting nothing wrong, so the decode fails instead.
+    {
+        const first = try buildClusterAtMs(allocator, 0, blocks[0..1]);
+        defer allocator.free(first);
+        const second = try buildClusterAtMs(allocator, 5 * 60 * 60 * 1000, blocks[1..2]);
+        defer allocator.free(second);
+        const file = try buildWebmFile(allocator, tracks, &.{ first, second });
+        defer allocator.free(file);
+        try std.testing.expectError(error.UnsupportedAudioFormat, decodeInterleaved(allocator, file));
     }
 }
 

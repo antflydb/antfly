@@ -751,15 +751,29 @@ pub fn transcriptSpansFromSegmentsAlloc(alloc: Allocator, text: []const u8, segm
     errdefer spans.deinit(alloc);
     var speakers = SpeakerIndexer{};
     var cursor: usize = 0;
+    // The cursor is a verified position only while every phrase so far has
+    // been found: it is the end of the last one. A phrase the provider
+    // worded differently from the transcript breaks that, because the text
+    // it covered is still ahead of the cursor and nothing says how much.
+    var cursor_verified = true;
     for (segments) |segment| {
         const phrase = std.mem.trim(u8, segment.text, " \t\r\n");
         if (phrase.len == 0) continue;
-        // A phrase the provider worded differently from the transcript it
-        // also returned cannot be located. Skipping it costs that phrase its
-        // timing; abandoning the walk would cost every later phrase too, and
-        // the ones after it still match at or beyond the cursor, so their
-        // offsets stay right.
-        const start = std.mem.indexOfPos(u8, text, cursor, phrase) orelse continue;
+        const found = std.mem.indexOfPos(u8, text, cursor, phrase) orelse {
+            // Skipping costs this phrase its timing; abandoning the walk
+            // would cost every later phrase too.
+            cursor_verified = false;
+            continue;
+        };
+        if (!cursor_verified) {
+            // With the cursor adrift, the first match may belong to text the
+            // skipped phrase covered. Only a phrase that occurs once in
+            // what is left is certainly the right one; anything repeated
+            // stays untimed rather than being pinned to the wrong moment.
+            if (std.mem.indexOfPos(u8, text, found + 1, phrase) != null) continue;
+            cursor_verified = true;
+        }
+        const start = found;
         const end = start + phrase.len;
         const segment_end_ms = @max(segment.end_ms, segment.start_ms);
         const speaker_index = speakers.indexOf(segment.speaker);
@@ -5127,6 +5141,54 @@ test "recordings in video containers take the transcription route" {
     // Documents still are not audio.
     try std.testing.expect(!isAudioContent("application/pdf", "report.pdf", "", "%PDF-1.4"));
     try std.testing.expect(!isAudioContent("text/plain", "notes.txt", "", "hello"));
+}
+
+test "a repeated phrase after a mismatch stays untimed" {
+    const alloc = std.testing.allocator;
+    // The provider worded its own transcript differently, so the phrases
+    // before this one could not be located and the cursor no longer marks
+    // where the next phrase begins. "Yes." appears twice: pinning it to the
+    // first occurrence would give the closing "Yes." the opening's moment
+    // and speaker, so it is left untimed instead.
+    const text = "Yes. $20. Yes.";
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = "Yeah.", .start_ms = 0, .end_ms = 500, .speaker = "A" },
+        .{ .text = "twenty dollars.", .start_ms = 500, .end_ms = 1500, .speaker = "B" },
+        .{ .text = "Yes.", .start_ms = 1500, .end_ms = 2000, .speaker = "A" },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+    try std.testing.expectEqual(@as(usize, 0), spans.len);
+
+    // A phrase that occurs only once is certainly the right one, so it
+    // re-anchors the walk and what follows is timed again.
+    const recovering = [_]TranscriptSegmentInput{
+        .{ .text = "Yeah.", .start_ms = 0, .end_ms = 500, .speaker = "A" },
+        .{ .text = "twenty dollars.", .start_ms = 500, .end_ms = 1500, .speaker = "B" },
+        .{ .text = "No thanks.", .start_ms = 1500, .end_ms = 2000, .speaker = "A" },
+        .{ .text = "Bye.", .start_ms = 2000, .end_ms = 2500, .speaker = "B" },
+    };
+    const recovered = try transcriptSpansFromSegmentsAlloc(alloc, "Yes. $20. No thanks. Bye.", &recovering);
+    defer alloc.free(recovered);
+    try std.testing.expectEqual(@as(usize, 2), recovered.len);
+    try std.testing.expectEqual(@as(u32, 10), recovered[0].char_start);
+    try std.testing.expectEqual(@as(u64, 1500), recovered[0].start_ms);
+    try std.testing.expectEqual(@as(u32, 21), recovered[1].char_start);
+    try std.testing.expectEqual(@as(u64, 2000), recovered[1].start_ms);
+
+    // With every phrase located, a repeat is not ambiguous at all: the
+    // cursor says which one is meant.
+    const located = [_]TranscriptSegmentInput{
+        .{ .text = "Yes.", .start_ms = 0, .end_ms = 500, .speaker = "A" },
+        .{ .text = "$20.", .start_ms = 500, .end_ms = 1500, .speaker = "B" },
+        .{ .text = "Yes.", .start_ms = 1500, .end_ms = 2000, .speaker = "A" },
+    };
+    const all = try transcriptSpansFromSegmentsAlloc(alloc, text, &located);
+    defer alloc.free(all);
+    try std.testing.expectEqual(@as(usize, 3), all.len);
+    try std.testing.expectEqual(@as(u32, 0), all[0].char_start);
+    try std.testing.expectEqual(@as(u32, 10), all[2].char_start);
+    try std.testing.expectEqual(@as(u64, 1500), all[2].start_ms);
 }
 
 test "an unlocatable phrase costs only its own timing" {
