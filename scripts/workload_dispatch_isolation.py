@@ -76,6 +76,11 @@ def require_denial(result):
         raise AssertionError("expected exact pre-execution AdmissionFull HTTP 429")
 
 
+def require_head_success(result):
+    if result.get("error") or result.get("status") != 200 or result.get("body") != "":
+        raise AssertionError("protected HEAD probe must return HTTP 200 and no body")
+
+
 def require_overlap(before, after):
     if before != 32 or after != 32:
         raise AssertionError("protected probes must overlap all 32 held clients")
@@ -181,6 +186,7 @@ class DispatchCluster(frontend.FrontendCluster):
                 or json.loads(result["body"]).get("status") != expected
             ):
                 raise AssertionError("protected control probe failed")
+            require_head_success(self.probe("HEAD", path))
         nonce = secrets.randbits(128) or 1
         coordinator, destination = 7, self.nodes["api"]["node_id"]
         result = self.probe(

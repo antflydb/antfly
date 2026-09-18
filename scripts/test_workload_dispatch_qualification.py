@@ -78,6 +78,19 @@ class DispatchQualificationTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             dispatch.require_success(denial())
 
+    def test_head_requires_success_and_empty_client_body(self):
+        dispatch.require_head_success(
+            {"status": 200, "body": "", "headers": {"Content-Length": "20"}}
+        )
+        for result in (
+            {"status": 405, "body": ""},
+            {"status": 200, "body": "unexpected"},
+            {"status": 200, "body": "", "error": "timeout"},
+            {"status": 200},
+        ):
+            with self.assertRaises(AssertionError):
+                dispatch.require_head_success(result)
+
     def test_all_held_clients_must_overlap_protected_probes(self):
         dispatch.require_overlap(32, 32)
         for before, after in ((31, 32), (32, 31), (0, 0), (33, 33)):
@@ -91,12 +104,16 @@ class DispatchQualificationTests(unittest.TestCase):
         captured = []
         cluster.record = captured.append
         tamper = [None]
+        seen_heads = []
 
         def probe(method, path, *, body=None, headers=None):
             if path == dispatch.LOOKUP or (
                 path == dispatch.CONTROL and headers is None
             ):
                 return denial()
+            if method == "HEAD":
+                seen_heads.append(path)
+                return {"status": 200, "body": ""}
             if path != dispatch.CONTROL:
                 return {
                     "status": 200,
@@ -130,6 +147,7 @@ class DispatchQualificationTests(unittest.TestCase):
 
         cluster.probe = probe
         cluster.protected_probes()
+        self.assertEqual(seen_heads, ["/healthz", "/readyz"])
         self.assertEqual(len(captured), 1)
         for field in (
             "nonce",
