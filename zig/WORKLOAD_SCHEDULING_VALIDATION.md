@@ -140,9 +140,33 @@ valid Prometheus snapshots. Exit 0 indicates clean evidence only for the tested
 subset; `telemetry_complete` attests collection and sample format, not metric
 coverage or full release qualification. Expected 429 overload responses remain distinct from failures.
 
-Remaining release work includes full ingress/planning/stream ownership,
-protected execution and recovery progress, operator fairness, remote coordinator
+Remaining release work includes storage streaming ownership, protected
+execution and recovery progress, operator fairness, remote coordinator
 reconciliation, all write-recovery paths, and the optimized resource matrix.
 See the [implementation record](WORKLOAD_SCHEDULING_IMPLEMENTATION.md) for
 implemented stages and the [operations guide](WORKLOAD_SCHEDULING_OPERATIONS.md)
 for configuration and the document-lookup admission behavior change.
+
+## Frontend ownership follow-up
+
+The following focused checks cover the stage 1 follow-up. They are correctness
+checks, not release performance results. The combined integration gate passed;
+the production Debug rebuild is recorded separately when complete.
+
+| Check | Result | Local log |
+| --- | --- | --- |
+| Combined stage 1 integration, with local TCP access | 137 passed, 1 optional Wasmtime skip, zero failures/leaks, 6 expected / 0 unexpected error logs, exit 0 | `/tmp/workload-stage1-final-unsandboxed.log` |
+| Serverless metadata/write policy plus earlier request/session ownership | 117/117, zero leaks, 6 expected / 0 unexpected error logs, exit 0 | `/tmp/workload-serverless-policy-final.log` |
+| Ingress hard partitions and drain-safe outstanding leases (`6dca417df5`) | 14/14 standalone tests, exit 0 | Tool receipt |
+| Allocation owner safety, ReleaseSafe | 21/21 standalone tests, exit 0 | `/tmp/workload-owner-releasesafe.log` |
+| HTTPx ownership hooks (`f050df6ae9`) | 32/32 selected transport/client tests, exit 0 | `/tmp/workload-httpx-ingress-owner.log` |
+| Common configuration | 49/49 selected tests, zero leaks, exit 0; workload-prefixed additions run in the combined gate | `/tmp/workload-ingress-config-test.log` |
+| A2A retained allocator installation and parse allocation failures | 15/15 library tests, exit 0 | `/tmp/workload-a2a-owner-library.log` |
+| Wasmtime finite limits/fuel and C memory-handle ABI (`a371c3c5ce`) | 3/3, including real local Wasmtime 45.0.2 fuel, memory, and table-limit rejection | Agent tool receipt |
+
+The Wasmtime ceiling is per linear memory, with at most 16 memories, 64 tables,
+64 instances, and 65,536 elements per table. The existing default 64 MiB per
+memory therefore permits up to 1 GiB of linear memory per invocation, not a
+64 MiB aggregate process cap. Frontend ingress bounds invocation concurrency;
+Wasm engine/runtime allocation is outside the tracked Zig frontend allocator.
+The core ABI now installs the same fuel/resource limits as the component path.

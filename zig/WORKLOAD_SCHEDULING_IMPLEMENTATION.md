@@ -34,6 +34,37 @@ waiting and dense scheduling remain opt-in, and coordinator dispatch remains
 disabled. Document lookups now joining the existing query gate is an intentional
 default behavior change that reviewers should assess explicitly.
 
+## Follow-up implementation stages
+
+These review stages subdivide the broader design phases below. Stage 1 closes
+frontend ownership; stage 2 extends read execution. They do not imply completion
+of distributed coordinator recovery or release qualification.
+
+The stage 1 follow-up adds:
+
+- Actual HTTP body-buffer capacity accounting, including simultaneous old/new
+  buffers during growth, and response retention through native/linked drain.
+- Cancellation and deadline checks during streaming, stalled H2 progress limits,
+  committed-stream reset handling, and transport-neutral stream commitment.
+- An optional ingress request/byte envelope with a nonborrowable empty-probe
+  partition. Accepted request counts survive handler completion and server
+  teardown until the exported response retires. Query/write allocations retain
+  both the class and ingress ancestors, including offload forks.
+- Explicit allocators for authentication, catalog parsing, query planning,
+  retrieval, MCP protocol envelopes, and serverless request handling. Persistent
+  catalog caches keep their separately bounded runtime allocator.
+- A separate retained MCP/A2A/transaction-session budget. Stable transaction starts
+  prepay completion memory, startup restores outstanding recovery reservations,
+  and retries/expiry cannot discard uncertain execution on lease loss or an
+  unavailable coordinator.
+
+The combined stage 1 gate passed 137 tests with zero leaks; one optional real
+Wasmtime test was skipped there and passed in its separate engine gate. The
+validation record lists focused checks and production build evidence separately. Storage, inference, connection framing,
+Wasm runtime, and durable job memory retain their own owners; frontend allocation
+accounting is not a process RSS cap. Existing public query/write concurrency
+limits remain coarse execution admission, while ingress counts include drain.
+
 ## Implemented admission contract
 
 `common/workload_admission.zig` owns an allocation-free intrusive FIFO, active
@@ -61,8 +92,9 @@ the former admission controller. The compiled API bridge retains both the
 foreign response and its allocator descriptors instead of copying the body.
 Serverless adapters transfer the buffers and their owner together. Large HTTP/1
 responses send directly from their retained body instead of building a second
-full response buffer. Transport/header metadata and unconverted streaming paths
-remain outside this allocation owner.
+full response buffer. Request context and response header allocations use the
+ingress owner when enabled. Connection framing and HPACK remain under their
+separate transport bounds.
 
 Serverless query sessions now receive the admitted request allocator explicitly
 for manifests and read buffers, while shared caches, metrics, and lease-cache
@@ -82,7 +114,7 @@ The REST/httpx, alternate-listener API-kernel paths, MCP, query builder, A2A,
 extension-host query/write calls, and serverless query/write handlers share this
 owner at their existing admission boundaries. Legacy nonwaiting callers cannot
 jump ahead of queued work. Metadata/data teardown can close admission across the
-compiled API boundary. The current API ABI is 24, storage-owner ABI is 63, and
+compiled API boundary. The current API ABI is 25, storage-owner ABI is 63, and
 native runtime ABI is 8; these include admission diagnostics, dense I/O context,
 executor capabilities, and worker configuration. Incompatible layouts are
 rejected. No inference-provider admission or transaction durability contract
@@ -96,10 +128,11 @@ No separate lookup gate or new default capacity was introduced. HTTP lookup
 projections/results and the MCP application result use the query allocation
 owner. Incoming request cancellation/deadlines reach storage lookup options and
 readiness retries; a late result is freed before returning timeout/cancellation.
-The final MCP protocol envelope retains its existing adapter ownership. The
-serverless route inventory has no document-lookup endpoint; its existing query
-routes already use query admission. Metadata, readiness, metrics, and control
-routes retain their existing bypass policy. This behavior change still requires
+The final MCP protocol envelope and agent output retain their request/class
+owner through response drain. The serverless route inventory has no document
+lookup endpoint; its existing query routes use query admission. Substantive
+serverless metadata and publication work now enters query/write admission.
+Only empty health/readiness probes use the ingress control partition. This behavior change still requires
 release qualification; it is not evidence that all overload timeouts are fixed.
 
 Query and write classes have independent fixed count/byte budgets. This preserves
@@ -314,7 +347,7 @@ does not raise a transport's independent connection or request-task limit.
 | Execution path | Current owner and boundaries | Requirement before fine-grained scheduling |
 | --- | --- | --- |
 | Public queries, document lookups, and writes | Admission lease held around the existing synchronous operation, including joins of its helpers; lookups share query capacity | Split runnable, retained state, and request lifetime at verified quiescent boundaries |
-| Query decoding/planning | Foreground body reservations plus tracked public single/NDJSON query and serverless query allocations; some catalog/auth/session resolution precedes the grant | Complete all frontend coverage and introduce separately protected planning capacity |
+| Query decoding/planning | Foreground body reservations plus tracked public single/NDJSON query and serverless query allocations; authentication/catalog/planning use ingress ownership before the class grant | Introduce separately protected execution for verified bounded planning |
 | Dense rerank and helpers | Shared scheduler owns drivers/helpers; exact workspaces and opted-in native read arenas own actual bytes; serial immutable pread suspends only with proven executor affinity | Audit remaining boundaries; remove enclosing thread-affine scopes for portable suspension; add durable ownership for cached HBC scratch |
 | Vector, text, graph, aggregation | Existing cancellation/work budgets and storage resource reservations; no scheduler continuation contract established | Inventory maximum nonyielding intervals, resumable state, and minimum completion resources; remain in the general lane until verified |
 | Scan/stream output | Tracked buffered bodies retain actual allocation charges through transport drain, including API-kernel and serverless handoffs; streaming snapshots remain storage/transport-owned | Complete streaming retained-state ownership and resume only through admission |
@@ -391,7 +424,7 @@ release qualification.
 | Design phase | Current status |
 | --- | --- |
 | Ownership/progress prerequisite | Typed ledger, scheduler, allocator, and attempt state models are implemented and tested; complete operator inventory and process-wide progress proof remain open |
-| Phase 1 | Fixed foreground waiting, contextual allocation ownership, deadlines, overload diagnostics, and SDK contracts are integrated on the paths above; full ingress/planning/output coverage and protected floors remain open |
+| Phase 1 | Fixed foreground waiting, contextual allocation ownership, deadlines, overload diagnostics, and SDK contracts are integrated on the paths above; frontend ingress/planning/output ownership and empty-probe floors are integrated; process-wide execution/cleanup floors remain open |
 | Phase 2 | Dense driver/helper ownership, exact working bytes, one pinned-executor I/O boundary, session recovery bounds, and opt-in durable join-row workers are integrated; full operator scheduling, fairness, distributed coordinator ownership, and all write recovery remain open |
 | Phase 3 | SDK pools/retries, engine diagnostics, and qualification tooling exist; native pressure qualification, optimized release qualification, Cloud integration, sizing/defaults, and adaptive policy remain open |
 

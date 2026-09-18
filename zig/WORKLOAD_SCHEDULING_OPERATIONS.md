@@ -198,3 +198,45 @@ for native results and retained failed experiments. No optimized performance
 pass is claimed by this guide. Full operator coverage, fair bounded/general
 lanes, protected control/recovery progress, coordinator reconciliation,
 streaming retention, and Cloud policy integration remain release work.
+
+## Frontend and retained session envelopes
+
+The optional `admission.ingress` envelope limits accepted requests until their
+response has drained. Its count and byte totals include a nonborrowable control
+partition; they are not additional capacity on top of the totals. Only empty
+GET/HEAD health and readiness probes use this partition. Other requests acquire
+ordinary ingress capacity before authentication and application parsing.
+
+```yaml
+admission:
+  ingress:
+    max_requests: 128
+    max_retained_bytes: 67108864
+    control_requests: 2
+    control_retained_bytes: 262144
+  session_max_retained_bytes: 67108864
+```
+
+These are explicit example limits, not qualified defaults. Ingress defaults to
+disabled (`max_requests: 0`, `max_retained_bytes: 0`). Enabling it requires both
+ordinary and control capacity. Query/write limits still apply beneath ingress;
+a request cannot bypass either ceiling by moving work to an offload executor.
+Slow consumers keep their outstanding reservation and output charge until the
+transport releases the response. Streaming also observes transport progress
+limits and request cancellation.
+
+`session_max_retained_bytes` defaults to 64 MiB and separately bounds retained
+MCP, A2A task, and transaction-session allocations. Before a stable transaction begins
+execution, the server reserves completion memory for its sealed request and
+terminal record. Startup rebuilds reservations for existing recovery obligations
+before ordinary sessions can consume that capacity. Reducing the limit below
+existing obligations fails initialization; it does not discard those obligations.
+An uncertain transaction must be observed or retried using its existing ID.
+Lease loss or an unavailable coordinator does not establish that it aborted.
+
+Ingress covers tracked frontend allocation, not all process memory. HTTP body
+buffers, connection framing/HPACK, storage snapshots/caches, inference runtimes,
+Wasm stores, and durable background jobs retain their own resource owners and
+limits. In particular, these settings do not qualify a process RSS ceiling or a
+protected CPU service guarantee. Execution scheduling and release qualification
+have separate gates.
