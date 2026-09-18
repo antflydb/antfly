@@ -146,3 +146,85 @@ The native stage's focused suite passed 21 tests in each of Debug and
 ReleaseSafe, with zero failures, skips or leaks. From `zig/`, run
 `zig build lsm-backend-test -j1` (or add `-Doptimize=ReleaseSafe`), followed by
 `-- --test-filter 'workload admission lsm' --test-filter 'observer metadata pin' --test-filter 'lsm WAL uncertainty' --test-filter 'lsm backend write stats separate'`.
+
+## Next stage: one durable transaction completion slot
+
+This is proposed work, not an implemented guarantee or an activation instruction.
+The accepted scheduling design requires completion resources and durable recovery
+information before an irrevocable vote or decision. Calling the one-shot helper
+at resolution does not meet that requirement: its memory, manifest, WAL and FD
+admission can still fail after a participant has voted prepared. Its COW candidate
+also describes the current mutable root; retaining that candidate through other
+writes does not make it a valid successor later or after restart.
+
+The first target is a transaction with one participant and one overwrite of an
+existing live document, with an inline value, complete identity mappings and a
+pinned schema. It excludes inserts, resurrection, deletes, relational storage,
+payload externalization, secondary or derived indexes, generated/graph/artifact
+work, child dispatch and HA outboxes. Unsupported profiles must be rejected
+before `prepared=true`. The existing identity classifier can prove an ordinary
+overwrite needs no identity mutations, but schema, identity and topology fencing
+must preserve that proof through resolution. This profile is not yet certified.
+
+The integration boundary is `TxnManager.writeIntentsExtraBatch`: its atomic
+batch publishes `prepared=true` alongside intents, membership, locks, admission
+and the schema lease. `DB.prepareTransactionRows` currently prepares relational
+row encoding, not a complete physical plan. Resolution enters the general DB
+batch expander again. Even the proposed document overwrite needs document and
+TTL writes, transaction status, intent/member/lock/admission/schema cleanup,
+completion accounting and derived replay. Transaction resolution explicitly
+cannot elide replay; `docstore.writeReplayEntries` adds sequence metadata and
+replay entries. Commit version, replay sequence, Raft markers and shared ledger
+values cannot be frozen to their earlier values. The persisted plan must enumerate
+operations plus bounded late-binding fields and encoding workspace. It must never
+replay a stale shared-counter value over intervening transactions.
+
+Implement this as one internal vertical slice: a single durable completion slot
+holding a private bounded delta generation, rather than rebasing against an
+arbitrarily changed foreground tree. Before publishing the prepare batch, reserve
+the slot's generation/publication metadata, input and late-binding buffers, WAL
+encoding and retained growth, native FD bundle, and one bounded SST/manifest drain
+workspace. Persist a versioned descriptor containing the operation shape, bounds,
+transaction identity, intent revision and fencing information in that same batch.
+Ordinary writers must not consume the reserved slot or drain capacity. Resolution
+publishes the private generation without new ordinary allocation or FD admission;
+reader-held state keeps its physical charge until its last reference disappears.
+The delta must participate in existing read precedence and atomic publication,
+including writes that occurred while the transaction was prepared.
+
+This requires actual SST and manifest support beyond `NativeWalCompletionIo`,
+which currently serves only WAL operations. Existing manifest wire/backlog credit
+is not preallocated table-builder memory, output buffers, run-directory nodes or
+file capacity. WAL reservation must cover prepare, decision, application and
+cleanup records, segment/control overhead and retention until a durable checkpoint;
+it cannot be released merely because one append succeeded. Existing I/O errors
+still produce durable uncertainty. Resource accounting does not reserve filesystem
+free space or promise a device operation will succeed.
+
+Startup restoration belongs in this same slice. Before foreground admission,
+read authoritative pending-slot records and restore their bounded memory,
+publication/drain slots, WAL debt and FD capacity, including undecided prepared
+votes. Smaller configured limits must not silently discard old obligations or
+send them through ordinary admission. `reconcileCompletionAdmission` currently
+reconstructs logical count/byte debt only; its records are not physical slot
+certificates. Preserve the original transaction identity and existing terminal,
+participant-acknowledgement and outbox retirement conditions. Replicated activation
+must establish compatible capacity before accepting obligations; a committed Raft
+apply cannot acquire a new node-local admission veto.
+
+Acceptance for this stage requires actual prepare and resolution paths:
+
+- Prepare, perform unrelated writes, reduce ordinary memory and FD limits, then
+  resolve using only the reserved slot and drain resources.
+- Crash while prepared and after a durable decision but before publication;
+  restore ownership before traffic and complete under the original identity.
+- Hold an old reader through resolution and retirement, proving its physical
+  memory stays charged and ordinary writes cannot consume completion resources.
+- Exercise allocation, storage and publication failures without losing debt,
+  repeating a mutation under a new identity, or reporting uncertain work aborted.
+- Reject every unsupported profile before the prepare vote, and verify exact
+  read/reopen results plus atomic metadata cleanup for both commit and abort.
+
+Keep this path internal until those proofs pass. A physical-plan encoder alone,
+or a successful one-shot WAL test, does not establish mandatory transaction
+completion or full performance qualification.
