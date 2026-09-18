@@ -435,3 +435,51 @@ does not establish coordinator reconciliation or interruption immediately after
 a durable decision. Those require distinct fault schedules and evidence. The
 prepared inputs have offline structural tests; native config parsing and live
 candidate execution remain pending until a matching build is supplied.
+
+### Production coordinator reconciliation cell
+
+`workload-fixed-policy-plans/local-reconciliation.json` adds a distinct
+production-path schedule. It uses public reads through the API coordinator and
+advertised worker proxy, with one coordinator attempt available. Each response
+loss must produce HTTP 503, forwarded requests and discarded response bytes,
+and a fresh sampled coordinator-record count of one. Healing must restore the
+exact document and a coordinator-record count of zero. Separate cycles restart
+the worker and then the API process on their existing persistent roots. This
+plan still requires a newly pinned candidate build and has not been run.
+
+A `metrics` action polls the node's dedicated health listener. It declares
+`timeout_seconds` (at most 30), `interval_seconds` (0.1–1),
+`max_age_seconds` (at most 1), `stable_seconds`, exact `expected` series and
+optional hard `ceilings`. Its absolute deadline starts at the original scheduled
+action time, so dispatch delay consumes its budget. Missing, malformed or stale
+samples cannot satisfy the stability window. A hard ceiling violation fails
+immediately. Every raw body and age observation is retained in `events.jsonl`,
+including HTML and failed samples; this is sampled state, not proof of unseen
+transitions between samples. The candidate requests 250 ms metric collection;
+source age plus scrape duration must still meet the declared limit.
+
+A signed `discover` action may include:
+
+```json
+{
+  "compare": {
+    "previous": "initial",
+    "namespace": "same",
+    "epoch": "increased"
+  }
+}
+```
+
+The previous result must already have a verified signature. Coordinator,
+destination, protocol and durable namespace must match exactly; the epoch must
+increase after worker restart or remain `same` after API-only restart. A new
+namespace or epoch rollback fails instead of manufacturing retirement evidence.
+
+The production schedule reserves 21 seconds between restart dispatch and its
+next assertion; the existing lateness gate remains enforced. Its observed
+production ledger is separate from the runner's manual
+`fixture_protocol_obligations`. Fresh aggregate counts and signed discovery do
+not bind individual attempts or independently prove signed generation closure;
+that requires per-attempt/fence receipts. Durable write decision interruption,
+namespace-loss recovery and replicated failover remain separate cells. Worker
+terminal tombstones are intentionally not required to return to zero.

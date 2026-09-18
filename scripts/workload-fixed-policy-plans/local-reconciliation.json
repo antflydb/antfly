@@ -1,0 +1,623 @@
+{
+  "actions": [
+    {
+      "action": "discover",
+      "at": 0,
+      "coordinator": 3,
+      "id": "initial",
+      "node": "data"
+    },
+    {
+      "action": "proxy_checkpoint",
+      "at": 1,
+      "id": "routed",
+      "node": "data"
+    },
+    {
+      "action": "request",
+      "at": 2,
+      "body": null,
+      "expect": {
+        "checks": [
+          {
+            "equals": "durable-a",
+            "path": [
+              "marker"
+            ]
+          }
+        ],
+        "status": 200
+      },
+      "is_write": false,
+      "method": "GET",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture/documents/a"
+    },
+    {
+      "action": "assert_proxy",
+      "at": 4,
+      "checkpoint": "routed",
+      "minimums": {
+        "forwarded_downstream_bytes": 1,
+        "forwarded_upstream_bytes": 1
+      },
+      "node": "data",
+      "path_prefixes_include": [
+        "/internal/"
+      ]
+    },
+    {
+      "action": "metrics",
+      "at": 5,
+      "ceilings": {
+        "antfly_remote_attempt_coordinator_logical_bytes": 2097152,
+        "antfly_remote_attempt_coordinator_records": 1
+      },
+      "expected": {
+        "antfly_remote_attempt_coordinator_enabled": 1,
+        "antfly_remote_attempt_coordinator_records": 0,
+        "antfly_remote_attempt_coordinator_sample_available": 1
+      },
+      "interval_seconds": 0.25,
+      "max_age_seconds": 1,
+      "node": "api",
+      "stable_seconds": 1,
+      "timeout_seconds": 5
+    },
+    {
+      "action": "proxy_checkpoint",
+      "at": 12,
+      "id": "loss_one",
+      "node": "data"
+    },
+    {
+      "action": "drop_response",
+      "at": 13,
+      "node": "data"
+    },
+    {
+      "action": "request",
+      "at": 14,
+      "body": null,
+      "expect": {
+        "status": 503
+      },
+      "is_write": false,
+      "method": "GET",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture/documents/a"
+    },
+    {
+      "action": "metrics",
+      "at": 18,
+      "ceilings": {
+        "antfly_remote_attempt_coordinator_logical_bytes": 2097152,
+        "antfly_remote_attempt_coordinator_records": 1
+      },
+      "expected": {
+        "antfly_remote_attempt_coordinator_enabled": 1,
+        "antfly_remote_attempt_coordinator_records": 1,
+        "antfly_remote_attempt_coordinator_sample_available": 1
+      },
+      "interval_seconds": 0.25,
+      "max_age_seconds": 1,
+      "node": "api",
+      "stable_seconds": 1,
+      "timeout_seconds": 5
+    },
+    {
+      "action": "assert_proxy",
+      "at": 24,
+      "checkpoint": "loss_one",
+      "minimums": {
+        "dropped_response_bytes": 1,
+        "forwarded_upstream_bytes": 1
+      },
+      "node": "data"
+    },
+    {
+      "action": "heal",
+      "at": 25,
+      "node": "data"
+    },
+    {
+      "action": "request",
+      "at": 26,
+      "body": null,
+      "expect": {
+        "checks": [
+          {
+            "equals": "durable-a",
+            "path": [
+              "marker"
+            ]
+          }
+        ],
+        "status": 200
+      },
+      "is_write": false,
+      "method": "GET",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture/documents/a"
+    },
+    {
+      "action": "metrics",
+      "at": 30,
+      "ceilings": {
+        "antfly_remote_attempt_coordinator_logical_bytes": 2097152,
+        "antfly_remote_attempt_coordinator_records": 1
+      },
+      "expected": {
+        "antfly_remote_attempt_coordinator_enabled": 1,
+        "antfly_remote_attempt_coordinator_records": 0,
+        "antfly_remote_attempt_coordinator_sample_available": 1
+      },
+      "interval_seconds": 0.25,
+      "max_age_seconds": 1,
+      "node": "api",
+      "stable_seconds": 1,
+      "timeout_seconds": 5
+    },
+    {
+      "action": "proxy_checkpoint",
+      "at": 40,
+      "id": "loss_worker",
+      "node": "data"
+    },
+    {
+      "action": "drop_response",
+      "at": 41,
+      "node": "data"
+    },
+    {
+      "action": "request",
+      "at": 42,
+      "body": null,
+      "expect": {
+        "status": 503
+      },
+      "is_write": false,
+      "method": "GET",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture/documents/a"
+    },
+    {
+      "action": "metrics",
+      "at": 46,
+      "ceilings": {
+        "antfly_remote_attempt_coordinator_logical_bytes": 2097152,
+        "antfly_remote_attempt_coordinator_records": 1
+      },
+      "expected": {
+        "antfly_remote_attempt_coordinator_enabled": 1,
+        "antfly_remote_attempt_coordinator_records": 1,
+        "antfly_remote_attempt_coordinator_sample_available": 1
+      },
+      "interval_seconds": 0.25,
+      "max_age_seconds": 1,
+      "node": "api",
+      "stable_seconds": 1,
+      "timeout_seconds": 5
+    },
+    {
+      "action": "assert_proxy",
+      "at": 52,
+      "checkpoint": "loss_worker",
+      "minimums": {
+        "dropped_response_bytes": 1,
+        "forwarded_upstream_bytes": 1
+      },
+      "node": "data"
+    },
+    {
+      "action": "kill",
+      "at": 53,
+      "node": "data"
+    },
+    {
+      "action": "restart",
+      "at": 54,
+      "node": "data"
+    },
+    {
+      "action": "discover",
+      "at": 75,
+      "compare": {
+        "epoch": "increased",
+        "namespace": "same",
+        "previous": "initial"
+      },
+      "coordinator": 3,
+      "id": "after_worker",
+      "node": "data"
+    },
+    {
+      "action": "heal",
+      "at": 76,
+      "node": "data"
+    },
+    {
+      "action": "request",
+      "at": 77,
+      "body": null,
+      "expect": {
+        "checks": [
+          {
+            "equals": "durable-a",
+            "path": [
+              "marker"
+            ]
+          }
+        ],
+        "status": 200
+      },
+      "is_write": false,
+      "method": "GET",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture/documents/a"
+    },
+    {
+      "action": "metrics",
+      "at": 81,
+      "ceilings": {
+        "antfly_remote_attempt_coordinator_logical_bytes": 2097152,
+        "antfly_remote_attempt_coordinator_records": 1
+      },
+      "expected": {
+        "antfly_remote_attempt_coordinator_enabled": 1,
+        "antfly_remote_attempt_coordinator_records": 0,
+        "antfly_remote_attempt_coordinator_sample_available": 1
+      },
+      "interval_seconds": 0.25,
+      "max_age_seconds": 1,
+      "node": "api",
+      "stable_seconds": 1,
+      "timeout_seconds": 5
+    },
+    {
+      "action": "proxy_checkpoint",
+      "at": 90,
+      "id": "loss_api",
+      "node": "data"
+    },
+    {
+      "action": "drop_response",
+      "at": 91,
+      "node": "data"
+    },
+    {
+      "action": "request",
+      "at": 92,
+      "body": null,
+      "expect": {
+        "status": 503
+      },
+      "is_write": false,
+      "method": "GET",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture/documents/a"
+    },
+    {
+      "action": "metrics",
+      "at": 96,
+      "ceilings": {
+        "antfly_remote_attempt_coordinator_logical_bytes": 2097152,
+        "antfly_remote_attempt_coordinator_records": 1
+      },
+      "expected": {
+        "antfly_remote_attempt_coordinator_enabled": 1,
+        "antfly_remote_attempt_coordinator_records": 1,
+        "antfly_remote_attempt_coordinator_sample_available": 1
+      },
+      "interval_seconds": 0.25,
+      "max_age_seconds": 1,
+      "node": "api",
+      "stable_seconds": 1,
+      "timeout_seconds": 5
+    },
+    {
+      "action": "assert_proxy",
+      "at": 102,
+      "checkpoint": "loss_api",
+      "minimums": {
+        "dropped_response_bytes": 1,
+        "forwarded_upstream_bytes": 1
+      },
+      "node": "data"
+    },
+    {
+      "action": "kill",
+      "at": 103,
+      "node": "api"
+    },
+    {
+      "action": "restart",
+      "at": 104,
+      "node": "api"
+    },
+    {
+      "action": "discover",
+      "at": 125,
+      "compare": {
+        "epoch": "same",
+        "namespace": "same",
+        "previous": "after_worker"
+      },
+      "coordinator": 3,
+      "id": "after_api",
+      "node": "data"
+    },
+    {
+      "action": "heal",
+      "at": 126,
+      "node": "data"
+    },
+    {
+      "action": "request",
+      "at": 127,
+      "body": null,
+      "expect": {
+        "checks": [
+          {
+            "equals": "durable-a",
+            "path": [
+              "marker"
+            ]
+          }
+        ],
+        "status": 200
+      },
+      "is_write": false,
+      "method": "GET",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture/documents/a"
+    },
+    {
+      "action": "metrics",
+      "at": 131,
+      "ceilings": {
+        "antfly_remote_attempt_coordinator_logical_bytes": 2097152,
+        "antfly_remote_attempt_coordinator_records": 1
+      },
+      "expected": {
+        "antfly_remote_attempt_coordinator_enabled": 1,
+        "antfly_remote_attempt_coordinator_records": 0,
+        "antfly_remote_attempt_coordinator_sample_available": 1
+      },
+      "interval_seconds": 0.25,
+      "max_age_seconds": 1,
+      "node": "api",
+      "stable_seconds": 1,
+      "timeout_seconds": 5
+    }
+  ],
+  "artifacts": {
+    "candidate": {
+      "binary": "/absolute/path/to/antfly",
+      "optimization": "Debug",
+      "revision": "REPLACE",
+      "sha256": "REPLACE"
+    }
+  },
+  "max_schedule_lateness_seconds": 5,
+  "nodes": [
+    {
+      "artifact": "candidate",
+      "config": {
+        "health_metrics_interval_ms": 250
+      },
+      "name": "metadata",
+      "role": "metadata"
+    },
+    {
+      "artifact": "candidate",
+      "config": {
+        "admission": {
+          "dense_execution": {
+            "max_runnable_tasks": 0
+          },
+          "ingress": {
+            "control_requests": 2,
+            "control_retained_bytes": 262144,
+            "max_requests": 24,
+            "max_retained_bytes": 16777216,
+            "recovery_requests": 2,
+            "recovery_retained_bytes": 1048576
+          },
+          "query": {
+            "max_concurrent_requests": 4,
+            "waiting": {
+              "max_queued_bytes": 1048576,
+              "max_queued_requests": 8,
+              "max_retained_bytes": 8388608,
+              "max_wait_ms": 1000
+            }
+          },
+          "read_execution": {
+            "max_outstanding_tasks": 8,
+            "max_queued_tasks": 8,
+            "max_runnable_tasks": 2,
+            "max_scan_snapshot_ms": 30000,
+            "max_scan_state_bytes": 0,
+            "max_suspended_io": 2,
+            "max_wait_ms": 1000,
+            "max_working_bytes": 4194304,
+            "protected": {
+              "max_outstanding_tasks": 0,
+              "max_runnable_tasks": 0,
+              "max_transition_bytes": 0,
+              "max_transition_tasks": 0,
+              "max_working_bytes": 0
+            }
+          },
+          "remote_attempt_coordinator": {
+            "max_attempts": 1,
+            "max_bytes": 2097152,
+            "max_destination_attempts": 1,
+            "max_destinations": 2,
+            "max_run_ms": 1000
+          },
+          "remote_attempt_worker": {
+            "max_attempts": 8,
+            "max_bytes": 2097152,
+            "max_run_ms": 1000
+          },
+          "session_max_retained_bytes": 8388608,
+          "transaction_completion_bytes": 8388608,
+          "write": {
+            "max_concurrent_requests": 4,
+            "waiting": {
+              "max_queued_bytes": 1048576,
+              "max_queued_requests": 8,
+              "max_retained_bytes": 8388608,
+              "max_wait_ms": 1000
+            }
+          }
+        },
+        "health_metrics_interval_ms": 250
+      },
+      "metadata": "metadata",
+      "name": "data",
+      "node_id": 2,
+      "proxy_api": true,
+      "role": "data",
+      "store_role": "data"
+    },
+    {
+      "artifact": "candidate",
+      "config": {
+        "admission": {
+          "dense_execution": {
+            "max_runnable_tasks": 0
+          },
+          "ingress": {
+            "control_requests": 2,
+            "control_retained_bytes": 262144,
+            "max_requests": 24,
+            "max_retained_bytes": 16777216,
+            "recovery_requests": 2,
+            "recovery_retained_bytes": 1048576
+          },
+          "query": {
+            "max_concurrent_requests": 4,
+            "waiting": {
+              "max_queued_bytes": 1048576,
+              "max_queued_requests": 8,
+              "max_retained_bytes": 8388608,
+              "max_wait_ms": 1000
+            }
+          },
+          "read_execution": {
+            "max_outstanding_tasks": 8,
+            "max_queued_tasks": 8,
+            "max_runnable_tasks": 2,
+            "max_scan_snapshot_ms": 30000,
+            "max_scan_state_bytes": 0,
+            "max_suspended_io": 2,
+            "max_wait_ms": 1000,
+            "max_working_bytes": 4194304,
+            "protected": {
+              "max_outstanding_tasks": 0,
+              "max_runnable_tasks": 0,
+              "max_transition_bytes": 0,
+              "max_transition_tasks": 0,
+              "max_working_bytes": 0
+            }
+          },
+          "remote_attempt_coordinator": {
+            "max_attempts": 1,
+            "max_bytes": 2097152,
+            "max_destination_attempts": 1,
+            "max_destinations": 2,
+            "max_run_ms": 1000
+          },
+          "remote_attempt_worker": {
+            "max_attempts": 8,
+            "max_bytes": 2097152,
+            "max_run_ms": 1000
+          },
+          "session_max_retained_bytes": 8388608,
+          "transaction_completion_bytes": 8388608,
+          "write": {
+            "max_concurrent_requests": 4,
+            "waiting": {
+              "max_queued_bytes": 1048576,
+              "max_queued_requests": 8,
+              "max_retained_bytes": 8388608,
+              "max_wait_ms": 1000
+            }
+          }
+        },
+        "health_metrics_interval_ms": 250
+      },
+      "metadata": "metadata",
+      "name": "api",
+      "node_id": 3,
+      "role": "data",
+      "store_role": "api"
+    }
+  ],
+  "note": "Prepared production coordinator reconciliation correctness cell, not manual signed fixture debt. Public API lookup uses an advertised worker proxy and a one-attempt coordinator budget. Each lost response must yield503, observed discarded bytes, and fresh stable coordinator records1; healing must restore exact lookup semantics and records0. Repeat with worker restart on the same persistent root (verified namespace same, epoch increases) and API restart on its same root. Polls have original absolute deadlines and <=1s source freshness. 21-second restart gaps are preselected; excess schedule lateness still fails. Worker terminal tombstones are not required to become zero. These sampled production ledger observations do not themselves bind per-attempt IDs or prove a signed generation closure; no durable-decision write crash, namespace-loss repair, replication failover, or performance qualification is claimed. Candidate native parsing and execution pending.",
+  "policy_version": 1,
+  "purpose": "fault_correctness",
+  "request_timeout": 3,
+  "schema": 1,
+  "setup": [
+    {
+      "action": "request",
+      "body": {
+        "num_shards": 1,
+        "storage": {
+          "transaction_recovery": {
+            "max_bytes": 4194304,
+            "max_count": 4,
+            "max_transaction_bytes": 1048576,
+            "protocol_version": 1
+          }
+        }
+      },
+      "expect": {
+        "checks": [
+          {
+            "equals": "policy_fixture",
+            "path": [
+              "name"
+            ]
+          }
+        ],
+        "status": 200
+      },
+      "is_write": true,
+      "method": "POST",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture"
+    },
+    {
+      "action": "request",
+      "body": {
+        "inserts": {
+          "a": {
+            "marker": "durable-a"
+          }
+        },
+        "sync_level": "full_index"
+      },
+      "expect": {
+        "checks": [
+          {
+            "equals": 1,
+            "path": [
+              "inserted"
+            ]
+          }
+        ],
+        "status": 201
+      },
+      "is_write": true,
+      "method": "POST",
+      "node": "api",
+      "path": "/db/v1/tables/policy_fixture/batch"
+    }
+  ],
+  "startup_timeout": 60
+}

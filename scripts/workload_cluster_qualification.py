@@ -171,6 +171,7 @@ def validate(plan):
             "restart",
             "ready",
             "discover",
+            "metrics",
             "partition",
             "heal",
             "delay",
@@ -276,6 +277,18 @@ def validate(plan):
             node for node in nodes if node["name"] == action["node"]
         ).get("proxy_api"):
             raise ValueError("via_proxy requires configured owned proxy")
+        if kind == "metrics":
+            validate_metrics_action(action)
+        if kind == "discover" and "compare" in action:
+            relation = action["compare"]
+            if (
+                relation.get("previous") not in discovery_ids
+                or relation.get("namespace") != "same"
+                or relation.get("epoch") not in {"same", "increased"}
+            ):
+                raise ValueError(
+                    "discovery comparison requires a prior identity and exact namespace/epoch relation"
+                )
         if kind == "discover" and action.get("id"):
             if not NAME.fullmatch(action["id"]) or action["id"] in discovery_ids:
                 raise ValueError("discovery IDs must be unique")
@@ -324,6 +337,121 @@ def validate(plan):
             type(action.get("coordinator")) is not int or action["coordinator"] <= 0
         ):
             raise ValueError("discovery needs explicit coordinator node ID")
+
+
+def validate_metrics_action(action):
+    for key, lower, upper in (
+        ("timeout_seconds", 0.1, 30),
+        ("interval_seconds", 0.1, 1),
+        ("max_age_seconds", 0.001, 1),
+        ("stable_seconds", 0, 10),
+    ):
+        value = action.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not lower <= value <= upper
+        ):
+            raise ValueError(f"invalid bounded metrics {key}")
+    if action["stable_seconds"] >= action["timeout_seconds"]:
+        raise ValueError("metrics stability window must fit original timeout")
+    if not action.get("expected"):
+        raise ValueError("metrics action needs exact expected series")
+    q.evidence.validate(action)
+
+
+def compare_discovery(previous, current, relation):
+    # Both values must already have verified signatures and request-bound nonces.
+    for name in ("coordinator", "destination", "protocol_version", "worker_namespace"):
+        if previous.get(name) != current.get(name) or name not in current:
+            raise ValueError(f"discovery relation changed {name}")
+    before, after = previous["worker_incarnation"], current["worker_incarnation"]
+    if not (after == before if relation["epoch"] == "same" else after > before):
+        raise ValueError("discovery incarnation relation failed")
+
+
+def poll_metrics(port, action, submitted, emit):
+    """Health listener only; stale caches never satisfy a sampled stability window."""
+    validate_metrics_action(action)
+    deadline = submitted + action["timeout_seconds"]
+    stable_since, count, passed, failure = None, 0, False, None
+    while time.monotonic() < deadline:
+        began = time.monotonic()
+        row = request(
+            port,
+            {
+                "method": "GET",
+                "path": "/metrics",
+                "is_write": False,
+                "expect": {"status": 200},
+            },
+            min(1, deadline - began),
+            submitted=began,
+            raw=True,
+        )
+        count += 1
+        valid = False
+        try:
+            if not row["passed"]:
+                raise ValueError("metrics transport/status unavailable")
+            headers = {key.lower(): value for key, value in row["headers"].items()}
+            if not headers.get("content-type", "").startswith(
+                ("text/plain", "application/openmetrics-text")
+            ):
+                raise ValueError("health listener did not return Prometheus metrics")
+            values = q.evidence.metrics(row["body"].encode())
+            source_age = float(headers["x-antfly-metrics-age-ms"]) / 1000
+            if not math.isfinite(source_age) or source_age < 0:
+                raise ValueError("invalid metrics source age")
+            age = source_age + time.monotonic() - began
+            row["source_age_seconds"] = age
+            if not math.isfinite(age) or not 0 <= age <= action["max_age_seconds"]:
+                raise ValueError("metrics source age unavailable or stale")
+            for name, maximum in action.get("ceilings", {}).items():
+                if name not in values:
+                    raise ValueError(f"missing required metric {name}")
+                if values[name] > maximum:
+                    failure = f"hard metric ceiling exceeded: {name}"
+            valid = all(
+                values.get(name) == expected
+                for name, expected in action["expected"].items()
+            )
+            row["observed"] = {
+                name: values.get(name)
+                for name in {*action["expected"], *action.get("ceilings", {})}
+            }
+        except (ValueError, KeyError, TypeError) as error:
+            row["evidence_error"] = str(error)
+        now = time.monotonic()
+        valid = valid and now <= deadline and failure is None
+        stable_since = (
+            (now if stable_since is None else stable_since) if valid else None
+        )
+        row["matches_expected"] = valid
+        row["stable_seconds"] = 0 if stable_since is None else now - stable_since
+        emit(row)  # Retain every raw body, including malformed HTML and stale samples.
+        if failure:
+            break
+        if stable_since is not None and now - stable_since >= action["stable_seconds"]:
+            passed = True
+            break
+        time.sleep(min(action["interval_seconds"], max(0, deadline - time.monotonic())))
+    return {
+        "passed": passed,
+        "samples": count,
+        "started_monotonic": submitted,
+        "deadline_monotonic": deadline,
+        "finished_monotonic": time.monotonic(),
+        "failure": (
+            failure
+            if failure
+            else None if passed else "original metrics action deadline expired"
+        ),
+        "expected": action["expected"],
+        "sampled_stable_seconds": action["stable_seconds"],
+        "scope": "fresh sampled production metrics, not signed per-attempt retirement proof",
+    }
 
 
 def encode(value):
@@ -439,7 +567,7 @@ def node_command(node, binary, directory, ports, all_ports):
     return command
 
 
-def request(port, action, timeout, headers=None, submitted=None):
+def request(port, action, timeout, headers=None, submitted=None, *, raw=False):
     dispatched = time.monotonic()
     started = dispatched if submitted is None else submitted
     deadline = started + timeout
@@ -493,6 +621,8 @@ def request(port, action, timeout, headers=None, submitted=None):
         expect = action["expect"]
         if response.status != expect.get("status"):
             receipt["passed"] = False
+        elif raw:
+            receipt["passed"] = True
         elif 200 <= response.status < 300:
             receipt["passed"] = (
                 scenarios.classify(action, response.status, data) == "completed"
@@ -959,6 +1089,11 @@ def run(plan, output):
                         nonce,
                         protocol_version,
                     )
+                    if action.get("compare"):
+                        with results_lock:
+                            prior = discoveries[action["compare"]["previous"]]
+                        compare_discovery(prior, result["discovery"], action["compare"])
+                        result["verified_discovery_relation"] = action["compare"]
                     if action.get("id"):
                         with results_lock:
                             discoveries[action["id"]] = result["discovery"]
@@ -1062,7 +1197,27 @@ def run(plan, output):
                         raise RuntimeError(
                             f"unexpected {name} exit {process.returncode}"
                         )
-                if action["action"] in {
+                if action["action"] == "metrics":
+                    result = poll_metrics(
+                        cluster.ports[action["node"]]["health"],
+                        action,
+                        due,
+                        lambda row: cluster.record(
+                            {
+                                "event": "metrics_sample",
+                                "index": index,
+                                "node": action["node"],
+                                **row,
+                            }
+                        ),
+                    )
+                    result.update(node=action["node"], action="metrics")
+                    with results_lock:
+                        results.append(result)
+                    cluster.record({"event": "metrics_result", **result})
+                    if not result["passed"]:
+                        raise RuntimeError(f"action{index} metrics assertion failed")
+                elif action["action"] in {
                     "request",
                     "discover",
                     "attempt_status",

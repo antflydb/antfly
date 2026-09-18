@@ -169,6 +169,13 @@ class FixedPolicyTests(unittest.TestCase):
             policy.correctness_plan(),
         )
 
+    def test_retained_reconciliation_plan_matches_generator(self):
+        path = (
+            Path(__file__).parent
+            / "workload-fixed-policy-plans/local-reconciliation.json"
+        )
+        self.assertEqual(json.loads(path.read_text()), policy.reconciliation_plan())
+
 
 if __name__ == "__main__":
     unittest.main()

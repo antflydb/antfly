@@ -300,6 +300,131 @@ def correctness_plan():
     return plan
 
 
+def reconciliation_plan():
+    plan = correctness_plan()
+    for node in plan["nodes"][1:]:
+        coordinator = node["config"]["admission"]["remote_attempt_coordinator"]
+        coordinator.update(max_attempts=1, max_destination_attempts=1, max_run_ms=1000)
+        node["config"]["admission"]["remote_attempt_worker"]["max_run_ms"] = 1000
+    lookup = next(
+        copy.deepcopy(action)
+        for action in plan["actions"]
+        if action["action"] == "request"
+    )
+    lookup.pop("at")
+    lost = {**lookup, "expect": {"status": 503}}
+
+    def metrics(at, records, node="api"):
+        scope = "antfly_remote_attempt_coordinator_"
+        return {
+            "at": at,
+            "action": "metrics",
+            "node": node,
+            "timeout_seconds": 5,
+            "interval_seconds": 0.25,
+            "max_age_seconds": 1,
+            "stable_seconds": 1,
+            "expected": {
+                scope + "enabled": 1,
+                scope + "sample_available": 1,
+                scope + "records": records,
+            },
+            "ceilings": {scope + "records": 1, scope + "logical_bytes": 2 * MIB},
+        }
+
+    def fault(at, action, **extra):
+        return {"at": at, "action": action, "node": "data", **extra}
+
+    def loss_assertion(at, checkpoint):
+        return fault(
+            at,
+            "assert_proxy",
+            checkpoint=checkpoint,
+            minimums={
+                "forwarded_upstream_bytes": 1,
+                "dropped_response_bytes": 1,
+            },
+        )
+
+    plan["actions"] = [
+        fault(0, "discover", coordinator=3, id="initial"),
+        fault(1, "proxy_checkpoint", id="routed"),
+        {"at": 2, **lookup},
+        fault(
+            4,
+            "assert_proxy",
+            checkpoint="routed",
+            minimums={"forwarded_upstream_bytes": 1, "forwarded_downstream_bytes": 1},
+            path_prefixes_include=["/internal/"],
+        ),
+        metrics(5, 0),
+        fault(12, "proxy_checkpoint", id="loss_one"),
+        fault(13, "drop_response"),
+        {"at": 14, **lost},
+        metrics(18, 1),
+        loss_assertion(24, "loss_one"),
+        fault(25, "heal"),
+        {"at": 26, **lookup},
+        metrics(30, 0),
+        fault(40, "proxy_checkpoint", id="loss_worker"),
+        fault(41, "drop_response"),
+        {"at": 42, **lost},
+        metrics(46, 1),
+        loss_assertion(52, "loss_worker"),
+        fault(53, "kill"),
+        fault(54, "restart"),
+        fault(
+            75,
+            "discover",
+            coordinator=3,
+            id="after_worker",
+            compare={
+                "previous": "initial",
+                "namespace": "same",
+                "epoch": "increased",
+            },
+        ),
+        fault(76, "heal"),
+        {"at": 77, **lookup},
+        metrics(81, 0),
+        fault(90, "proxy_checkpoint", id="loss_api"),
+        fault(91, "drop_response"),
+        {"at": 92, **lost},
+        metrics(96, 1),
+        loss_assertion(102, "loss_api"),
+        {"at": 103, "action": "kill", "node": "api"},
+        {"at": 104, "action": "restart", "node": "api"},
+        fault(
+            125,
+            "discover",
+            coordinator=3,
+            id="after_api",
+            compare={
+                "previous": "after_worker",
+                "namespace": "same",
+                "epoch": "same",
+            },
+        ),
+        fault(126, "heal"),
+        {"at": 127, **lookup},
+        metrics(131, 0),
+    ]
+    plan["note"] = (
+        "Prepared production coordinator reconciliation correctness cell, not manual signed fixture debt. "
+        "Public API lookup uses an advertised worker proxy and a one-attempt coordinator budget. "
+        "Each lost response must yield503, observed discarded bytes, and fresh stable coordinator "
+        "records1; healing must restore exact lookup semantics and records0. Repeat with worker "
+        "restart on the same persistent root (verified namespace same, epoch increases) and API "
+        "restart on its same root. Polls have original absolute deadlines and <=1s source freshness. "
+        "21-second restart gaps are preselected; excess schedule lateness still fails. "
+        "Worker terminal tombstones are not required to become zero. These sampled production "
+        "ledger observations do not themselves bind per-attempt IDs or prove a signed generation "
+        "closure; no durable-decision write crash, namespace-loss repair, replication failover, "
+        "or performance qualification is claimed. Candidate native parsing and execution pending."
+    )
+    return plan
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -316,6 +441,7 @@ def main():
             performance_plan(tier, operators=args.operators),
         )
     q.save(args.output / "local-correctness.json", correctness_plan())
+    q.save(args.output / "local-reconciliation.json", reconciliation_plan())
 
 
 if __name__ == "__main__":
