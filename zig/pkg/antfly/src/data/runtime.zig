@@ -26714,7 +26714,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     var alloc_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer _ = alloc_state.deinit();
     const alloc = alloc_state.allocator();
-    var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) the LSM and Raft image backends remain explicit differential boundaries
+    var tmp = @import("../common/test_directory.zig").fastTmpDir(.{}); // vopr-audit: allow(host_filesystem) the LSM and Raft image backends remain explicit differential boundaries
     defer tmp.cleanup();
 
     var roots: [3][:0]u8 = undefined;
@@ -26786,11 +26786,32 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         };
     }
 
+    const profile_work = @import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE");
+    // Counts cover the borrowed runtime filesystem interface, not direct
+    // adapter/OS calls. The wrappers preserve the original I/O and errors.
+    const DiskWork = struct {
+        var syncs: std.atomic.Value(u64) = .init(0);
+        var writes: std.atomic.Value(u64) = .init(0);
+        fn sync(ptr: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            _ = syncs.fetchAdd(1, .monotonic);
+            return std.testing.io.vtable.fileSync(ptr, file);
+        }
+        fn write(ptr: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            _ = writes.fetchAdd(1, .monotonic);
+            return std.testing.io.vtable.fileWritePositional(ptr, file, header, data, splat, offset);
+        }
+    };
+    DiskWork.syncs.store(0, .monotonic);
+    DiskWork.writes.store(0, .monotonic);
+    var filesystem_vtable = std.testing.io.vtable.*;
+    filesystem_vtable.fileSync = DiskWork.sync;
+    filesystem_vtable.fileWritePositional = DiskWork.write;
+    const filesystem_io: std.Io = if (profile_work) .{ .userdata = std.testing.io.userdata, .vtable = &filesystem_vtable } else std.testing.io;
     var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
         // Each production-shaped node keeps its LSM files on the host-backed
         // differential boundary while scheduling runtime work through VoprIo.
-        .filesystem_io = std.testing.io,
+        .filesystem_io = filesystem_io,
         .borrowed_io = .{
             .general = io,
             .raft_inbound = io,
@@ -28208,7 +28229,16 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     var replay_index: usize = 0;
     var replay_stutters: usize = 0;
     var replay_failure: ?anyerror = null;
+    var profile_stage = shared.stage;
+    var profile_started = if (profile_work) platform_time.monotonicNs() else 0; // vopr-audit: allow(host_clock) diagnostic only; never feeds scheduler decisions
+    defer if (profile_work) std.debug.print("\nWORK vopr-history replay={} transitions={d} rounds={any} filesystem_syncs={d} positional_writes={d}\n", .{ replay_trace != null, transitions, shared.driver_rounds, DiskWork.syncs.load(.monotonic), DiskWork.writes.load(.monotonic) });
     while (!shared.done or !std.mem.allEqual(bool, &shared.driver_done, true)) {
+        if (profile_work and shared.stage != profile_stage) {
+            const now = platform_time.monotonicNs(); // vopr-audit: allow(host_clock) diagnostic only; never feeds scheduler decisions
+            std.debug.print("\nWORK vopr-stage replay={} stage={d} elapsed_ms={d} transitions={d} rounds={any} filesystem_syncs={d} positional_writes={d}\n", .{ replay_trace != null, profile_stage, (now -| profile_started) / std.time.ns_per_ms, transitions, shared.driver_rounds, DiskWork.syncs.load(.monotonic), DiskWork.writes.load(.monotonic) });
+            profile_stage = shared.stage;
+            profile_started = now;
+        }
         enabled.items.clearRetainingCapacity();
         try vopr_io.scheduler().enumerateReady(&enabled, alloc);
         try enabled.canonicalize();

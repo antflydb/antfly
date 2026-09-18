@@ -1513,6 +1513,7 @@ test "storage.posting segment store publishes checkpoint and committed WAL gener
 }
 
 test "storage.posting segment store poisons ambiguous CURRENT publication" {
+    @import("../test_error_logs.zig").expectErrorLogs(1);
     const alloc = std.testing.allocator;
     var memory = lsm_backend.MemoryStorage.init(alloc);
     defer memory.deinit();
@@ -1793,6 +1794,7 @@ test "storage.posting sealed WAL handoff reuses the active file and recovers sam
 }
 
 test "storage.posting ambiguous WAL seal requires reopen and preserves the committed extent" {
+    @import("../test_error_logs.zig").expectErrorLogs(1);
     const alloc = std.testing.allocator;
     var memory = lsm_backend.MemoryStorage.init(alloc);
     defer memory.deinit();
