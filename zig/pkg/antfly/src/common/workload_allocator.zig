@@ -10,6 +10,7 @@ const MemoryAccount = @import("workload_admission.zig").MemoryAccount;
 pub const Owner = struct {
     backing: std.mem.Allocator,
     account: *MemoryAccount,
+    parent: ?*Owner = null,
     refs: std.atomic.Value(usize) = .init(1),
     live: std.atomic.Value(usize) = .init(0),
     budget_exhausted: std.atomic.Value(bool) = .init(false),
@@ -34,6 +35,21 @@ pub const Owner = struct {
         return self;
     }
 
+    /// Check a class ceiling and its enclosing ingress envelope for the same
+    /// allocation. A denied parent/backing allocation rolls back the class
+    /// charge; no allocator waits while holding a partial reservation.
+    pub fn createChild(parent: *Owner, gate: *Controller) !*Owner {
+        const account = try gate.memoryAccount(parent.account.allocator);
+        if (account == parent.account) {
+            account.release();
+            return error.DuplicateMemoryAccount;
+        }
+        const self = try createWithAccount(parent.allocator(), account);
+        parent.retain();
+        self.parent = parent;
+        return self;
+    }
+
     /// A joined offload or separately retained output can use a different,
     /// thread-safe backing allocator without escaping its originating budget.
     /// The new owner retains the shared account, never the request allocator.
@@ -41,6 +57,14 @@ pub const Owner = struct {
         // A reserved owner's buffers must share its completion working set;
         // retain that owner instead of silently borrowing foreground bytes.
         if (self.prepaid_capacity != null) return error.ReservedOwnerCannotFork;
+        if (self.parent) |parent| {
+            const forked_parent = try parent.fork(backing);
+            errdefer forked_parent.release();
+            self.account.retain();
+            const result = try createWithAccount(forked_parent.allocator(), self.account);
+            result.parent = forked_parent;
+            return result;
+        }
         self.account.retain();
         return createWithAccount(backing, self.account);
     }
@@ -64,12 +88,14 @@ pub const Owner = struct {
         std.debug.assert(self.live.load(.acquire) == 0);
         const account = self.account;
         const backing = self.backing;
+        const parent = self.parent;
         const prepaid = self.prepaid_capacity orelse 0;
         std.debug.assert(self.prepaid_remaining.load(.acquire) == prepaid);
         backing.destroy(self);
         account.free(prepaid);
         account.free(@sizeOf(Owner));
         account.release();
+        if (parent) |owner| owner.release();
     }
 
     pub fn allocator(self: *Owner) std.mem.Allocator {
@@ -105,6 +131,7 @@ pub const Owner = struct {
         self.reserve(len) catch return null;
         const result = self.backing.rawAlloc(len, alignment, ret_addr) orelse {
             self.returnBytes(len);
+            if (self.parent) |parent| if (parent.budget_exhausted.load(.acquire)) self.budget_exhausted.store(true, .release);
             return null;
         };
         _ = self.live.fetchAdd(len, .monotonic);
@@ -152,6 +179,51 @@ pub const Owner = struct {
         self.returnBytes(memory.len);
     }
 };
+
+test "workload admission child allocations enforce class and process envelopes together" {
+    const alloc = std.testing.allocator;
+    var ingress = Controller.initConfigured(1, .{ .max_retained_bytes = 2 * @sizeOf(Owner) + 192 });
+    defer ingress.deinitMemory();
+    var foreground = Controller.initConfigured(1, .{ .max_retained_bytes = @sizeOf(Owner) + 128 });
+    defer foreground.deinitMemory();
+    const parent = try Owner.create(alloc, &ingress);
+    var parent_live = true;
+    defer if (parent_live) parent.release();
+    const child = try Owner.createChild(parent, &foreground);
+    defer child.release();
+    const body = try child.allocator().alloc(u8, 100);
+    defer child.allocator().free(body);
+    const planning = try parent.allocator().alloc(u8, 92);
+    try std.testing.expectError(error.OutOfMemory, child.allocator().alloc(u8, 1));
+    try std.testing.expect(child.budget_exhausted.load(.acquire));
+    try std.testing.expectEqual(@sizeOf(Owner) + 100, foreground.stats().retained_bytes);
+    parent.allocator().free(planning);
+    try std.testing.expectError(error.OutOfMemory, child.allocator().alloc(u8, 29));
+    parent.release();
+    parent_live = false;
+    ingress.deinitMemory();
+    foreground.deinitMemory();
+    try std.testing.expectEqual(2 * @sizeOf(Owner) + 100, child.parent.?.account.retainedBytes());
+}
+
+test "workload admission child offloads preserve both enclosing budgets" {
+    const alloc = std.testing.allocator;
+    var ingress = Controller.initConfigured(1, .{ .max_retained_bytes = 4 * @sizeOf(Owner) + 128 });
+    defer ingress.deinitMemory();
+    var foreground = Controller.initConfigured(1, .{ .max_retained_bytes = 2 * @sizeOf(Owner) + 128 });
+    defer foreground.deinitMemory();
+    const parent = try Owner.create(alloc, &ingress);
+    const child = try Owner.createChild(parent, &foreground);
+    const offload = try child.fork(alloc);
+    defer offload.release();
+    const body = try offload.allocator().alloc(u8, 128);
+    defer offload.allocator().free(body);
+    try std.testing.expectError(error.OutOfMemory, offload.allocator().alloc(u8, 1));
+    child.release();
+    parent.release();
+    try std.testing.expectEqual(2 * @sizeOf(Owner) + 128, ingress.stats().retained_bytes);
+    try std.testing.expectEqual(@sizeOf(Owner) + 128, foreground.stats().retained_bytes);
+}
 
 test "workload admission prepaid completion cannot be consumed by foreground or shutdown" {
     const alloc = std.testing.allocator;
