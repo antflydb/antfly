@@ -301,3 +301,63 @@ properties stay in `unmeasured`, and `performance_qualified` and
 `release_qualified` always remain false. Receipts retain artifact checksums,
 commands, PIDs/generations, exact fault and request times, responses, node logs,
 shutdown outcomes, and a checksum manifest even when setup or assertions fail.
+
+### Advertised worker traffic faults and signed evidence
+
+Set `proxy_api: true` on a data node to bind a separate owned relay and pass its
+URL as `--api-advertise-url`. Metadata then advertises the relay to coordinators;
+the real API listener remains separate for readiness and direct diagnostic
+requests. `proxy_checkpoint` records counters under an `id`. `assert_proxy`
+requires that checkpoint plus positive `minimums` deltas (for example
+`forwarded_upstream_bytes` and `forwarded_downstream_bytes`) and optional
+`paths_include`/`path_prefixes_include`. This distinguishes actual coordinator
+routing from a proxy that was launched but never used. A request's explicit
+`via_proxy: true` selects the same relay directly; receipts distinguish these
+manual requests from public coordinator requests.
+
+Timed network actions target that advertised worker API:
+
+- `partition` resets existing relay connections and rejects new ones.
+- `delay` with `delay_ms` delays newly received chunks in both directions.
+- `drop_response` forwards requests but discards worker response bytes. Those
+  bytes and the forwarded request bytes are counted separately.
+- `heal` removes all policies; it cannot restore bytes already discarded.
+
+Policy application is acknowledged by the relay before its action completes.
+One event-loop thread owns each relay, with at most64 connection pairs and64KiB
+pending per direction per pair. Backpressure stops reading at that bound.
+Healthy delayed connections drain queued bytes before forwarding EOF. Source
+addresses, observed first HTTP request lines, connection events, fault times,
+and counter snapshots are retained. This is an API endpoint fault, not a Raft
+network partition or a per-packet latency model.
+
+A `discover` action can save its verified result under `id: "worker"`. A later
+`request` or `submit` can declare:
+
+```json
+{
+  "id": "attempt-one",
+  "attempt": {
+    "from_discovery": "worker",
+    "generation": 1,
+    "sequence": 1,
+    "operation": 7
+  }
+}
+```
+
+The runner signs the exact method, target and body using its disposable local
+credential. Protocol3 binds the worker's durable namespace and monotonic epoch,
+plus coordinator, destination, generation, sequence and operation. Lost responses
+leave the fixture attempt explicitly `unproven`. `attempt_status` or
+`close_generation` with `attempt_ref: "attempt-one"` verifies the returned
+terminal/fence signature before retiring that fixture debt. Terminal evidence
+also binds the HTTP status and exact response-body digest; fences must cover the
+requested generation as quiescent in the same namespace and epoch. A successful
+unsigned control response fails. A changed namespace, restart, elapsed deadline,
+or healthy endpoint never clears debt. Any remaining unproven fixture attempt
+fails the run. These manual protocol obligations do not attest the production
+coordinator's ledger; that needs a public distributed query and its own retained
+metrics/retirement evidence. Protocol3 control behavior requires the rebuilt
+candidate; healthy advertised routing and transport faults can be checked on the
+older frozen binary independently.

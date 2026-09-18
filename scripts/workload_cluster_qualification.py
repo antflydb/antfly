@@ -22,11 +22,14 @@ import socket
 import subprocess
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import workload_qualification as q
 import workload_scenarios as scenarios
+import workload_fault_proxy as proxy_module
+import workload_attempt_evidence as attempt_evidence
 
 NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 
@@ -126,6 +129,10 @@ def validate(plan):
             or not isinstance(node.get("config"), dict)
         ):
             raise ValueError("invalid node artifact/role/config")
+        if "proxy_api" in node and (
+            type(node["proxy_api"]) is not bool or node["role"] != "data"
+        ):
+            raise ValueError("API advertisement proxy requires an explicit data role")
         if node["role"] == "data":
             if roles.get(node.get("metadata")) != "metadata" or node.get(
                 "store_role", "data"
@@ -148,6 +155,8 @@ def validate(plan):
     ):
         raise ValueError("bounded setup and fault schedule required")
     submitted = set()
+    checkpoints = set()
+    discovery_ids, attempt_ids = set(), set()
     previous = 0
     for action in plan.get("setup", []) + plan["actions"]:
         kind = action.get("action")
@@ -162,6 +171,14 @@ def validate(plan):
             "restart",
             "ready",
             "discover",
+            "partition",
+            "heal",
+            "delay",
+            "drop_response",
+            "proxy_checkpoint",
+            "assert_proxy",
+            "attempt_status",
+            "close_generation",
         }:
             raise ValueError("unsupported fault/action; no implicit shell commands")
         if kind != "await" and action.get("node") not in names:
@@ -207,6 +224,86 @@ def validate(plan):
                     raise ValueError("checks need exact JSON path/value semantics")
             if len(json.dumps(action.get("body")).encode()) > 16 << 20:
                 raise ValueError("request exceeds16MiB bounded fixture body")
+        if kind in {
+            "partition",
+            "heal",
+            "delay",
+            "drop_response",
+            "proxy_checkpoint",
+            "assert_proxy",
+        }:
+            target = next(node for node in nodes if node["name"] == action["node"])
+            if target.get("proxy_api") is not True or target["role"] != "data":
+                raise ValueError("network faults need an advertised data API proxy")
+            if kind == "delay" and (
+                type(action.get("delay_ms")) is not int
+                or not 0 <= action["delay_ms"] <= 10000
+            ):
+                raise ValueError("delay_ms must be0..10000")
+            if kind == "proxy_checkpoint":
+                key = (action["node"], action.get("id"))
+                if not NAME.fullmatch(action.get("id", "")) or key in checkpoints:
+                    raise ValueError("proxy checkpoint needs unique safe ID")
+                checkpoints.add(key)
+            if kind == "assert_proxy":
+                if (action["node"], action.get("checkpoint")) not in checkpoints:
+                    raise ValueError(
+                        "proxy assertion requires an earlier checkpoint on the same node"
+                    )
+                if (
+                    not action.get("minimums")
+                    and not action.get("paths_include")
+                    and not action.get("path_prefixes_include")
+                ):
+                    raise ValueError(
+                        "proxy assertion needs actual forwarded traffic evidence"
+                    )
+                for metric, value in action.get("minimums", {}).items():
+                    if (
+                        metric
+                        not in {
+                            "accepted_connections",
+                            "forwarded_upstream_bytes",
+                            "forwarded_downstream_bytes",
+                            "dropped_response_bytes",
+                            "partition_rejections",
+                        }
+                        or type(value) is not int
+                        or value < 1
+                    ):
+                        raise ValueError("invalid positive proxy counter delta")
+        if action.get("via_proxy") and not next(
+            node for node in nodes if node["name"] == action["node"]
+        ).get("proxy_api"):
+            raise ValueError("via_proxy requires configured owned proxy")
+        if kind == "discover" and action.get("id"):
+            if not NAME.fullmatch(action["id"]) or action["id"] in discovery_ids:
+                raise ValueError("discovery IDs must be unique")
+            discovery_ids.add(action["id"])
+        if "attempt" in action:
+            if (
+                kind not in {"request", "submit"}
+                or not NAME.fullmatch(action.get("id", ""))
+                or action["attempt"].get("from_discovery") not in discovery_ids
+                or action["id"] in attempt_ids
+            ):
+                raise ValueError(
+                    "signed request requires unique ID and prior named discovery"
+                )
+            for field, bits in (
+                ("generation", 64),
+                ("sequence", 64),
+                ("operation", 128),
+            ):
+                value = action["attempt"].get(field)
+                if type(value) is not int or not 0 < value < 1 << bits:
+                    raise ValueError("invalid configured attempt identity")
+            attempt_ids.add(action["id"])
+        if (
+            kind in {"attempt_status", "close_generation"}
+            and action.get("attempt_ref") not in attempt_ids
+        ):
+            raise ValueError("signed status/fence requires a named prior attempt")
         if kind == "submit":
             if (
                 not NAME.fullmatch(action.get("id", ""))
@@ -253,7 +350,9 @@ def service_headers(secret, issuer, coordinator):
     return {"X-Antfly-Trusted-Principal": (unsigned + b"." + signature).decode()}
 
 
-def verify_discovery(frame, secret, issuer, coordinator, destination, nonce):
+def verify_discovery(
+    frame, secret, issuer, coordinator, destination, nonce, protocol_version=2
+):
     if len(frame) > 8192:
         raise ValueError("oversized discovery evidence")
     payload, supplied = frame.encode().split(b".")
@@ -271,7 +370,7 @@ def verify_discovery(frame, secret, issuer, coordinator, destination, nonce):
             value.get(key) != expected
             for key, expected in {
                 "version": 1,
-                "protocol_version": 2,
+                "protocol_version": protocol_version,
                 "coordinator": coordinator,
                 "destination": destination,
                 "nonce": nonce,
@@ -281,6 +380,10 @@ def verify_discovery(frame, secret, issuer, coordinator, destination, nonce):
         or value["worker_incarnation"] <= 0
     ):
         raise ValueError("discovery identity/nonce/protocol mismatch")
+    if protocol_version == 3 and (
+        type(value.get("worker_namespace")) is not int or value["worker_namespace"] <= 0
+    ):
+        raise ValueError("protocol3 discovery requires durable namespace identity")
     return value
 
 
@@ -331,6 +434,8 @@ def node_command(node, binary, directory, ports, all_ports):
             "--store-role",
             node.get("store_role", "data"),
         ]
+    if node.get("proxy_api"):
+        command += ["--api-advertise-url", f"http://127.0.0.1:{ports['api_proxy']}"]
     return command
 
 
@@ -435,7 +540,8 @@ class Cluster:
         self.nodes = {node["name"]: node for node in plan["nodes"]}
         self.ports, self.reservations, self.processes, self.logs = {}, {}, {}, {}
         self.generations, self.paused, self.expected_stopped = {}, set(), set()
-        self.events, self.lock = [], threading.Lock()
+        self.events, self.lock = deque(maxlen=1024), threading.Lock()
+        self.proxies, self.proxy_checkpoints = {}, {}
         self.secret, self.issuer = (
             secrets.token_hex(32),
             "antfly-local-workload-correctness",
@@ -452,13 +558,26 @@ class Cluster:
         try:
             for name in self.nodes:
                 self.ports[name], self.reservations[name] = {}, []
-                for kind in ("api", "raft", "health"):
+                for kind in (
+                    "api",
+                    "raft",
+                    "health",
+                    *(["api_proxy"] if self.nodes[name].get("proxy_api") else []),
+                ):
                     reservation = socket.socket()
                     self.reservations[name].append(reservation)
                     reservation.bind(("127.0.0.1", 0))
                     self.ports[name][kind] = reservation.getsockname()[1]
             q.save(output / "ports.json", self.ports)
+            for name, node in self.nodes.items():
+                if node.get("proxy_api"):
+                    listener = self.reservations[name].pop()
+                    self.proxies[name] = proxy_module.FaultProxy(
+                        listener, self.ports[name]["api"], self.record, name
+                    )
         except BaseException:
+            for proxy in self.proxies.values():
+                proxy.close()
             for reservations in self.reservations.values():
                 for reservation in reservations:
                     reservation.close()
@@ -581,6 +700,55 @@ class Cluster:
 
     def fault(self, action):
         name, kind = action["node"], action["action"]
+        if kind in {
+            "partition",
+            "heal",
+            "delay",
+            "drop_response",
+            "proxy_checkpoint",
+            "assert_proxy",
+        }:
+            proxy = self.proxies[name]
+            snapshot = proxy.snapshot()
+            if snapshot["error"]:
+                raise RuntimeError(snapshot["error"])
+            if kind == "proxy_checkpoint":
+                self.proxy_checkpoints[(name, action["id"])] = snapshot
+            elif kind == "assert_proxy":
+                before = self.proxy_checkpoints[(name, action["checkpoint"])]
+                for metric, minimum in action.get("minimums", {}).items():
+                    if snapshot.get(metric, 0) - before.get(metric, 0) < minimum:
+                        raise AssertionError(
+                            f"proxy {name} lacks required {metric} traffic since checkpoint"
+                        )
+                for path in action.get("paths_include", []):
+                    if snapshot["paths"].get(path, 0) <= before["paths"].get(path, 0):
+                        raise AssertionError(
+                            f"proxy {name} did not observe expected path {path}"
+                        )
+                for prefix in action.get("path_prefixes_include", []):
+                    if not any(
+                        path.startswith(prefix) and count > before["paths"].get(path, 0)
+                        for path, count in snapshot["paths"].items()
+                    ):
+                        raise AssertionError(
+                            f"proxy {name} did not observe expected prefix {prefix}"
+                        )
+            else:
+                policy = snapshot["policy"]
+                if kind == "heal":
+                    policy = {}
+                elif kind == "partition":
+                    policy["partition"] = True
+                elif kind == "delay":
+                    policy["delay_ms"] = action["delay_ms"]
+                else:
+                    policy["drop_response"] = True
+                proxy.set_policy(**policy)
+            self.record(
+                {"event": kind, "node": name, "proxy_snapshot": proxy.snapshot()}
+            )
+            return
         process = self.processes[name]
         if kind in {"pause", "resume"}:
             if process.poll() is not None:
@@ -623,6 +791,18 @@ class Cluster:
                 )
             except Exception as error:
                 errors.append(str(error))
+        for name, proxy in self.proxies.items():
+            try:
+                proxy.close()
+                self.record(
+                    {
+                        "event": "proxy_final",
+                        "node": name,
+                        "proxy_snapshot": proxy.snapshot(),
+                    }
+                )
+            except Exception as error:
+                errors.append(str(error))
         for reservations in self.reservations.values():
             for reservation in reservations:
                 reservation.close()
@@ -642,6 +822,8 @@ def run(plan, output):
         scenarios.__file__,
         q.vectors.__file__,
         q.evidence.__file__,
+        proxy_module.__file__,
+        attempt_evidence.__file__,
     ):
         shutil.copy2(source, output / Path(source).name)
     q.save(
@@ -655,6 +837,7 @@ def run(plan, output):
     )
     cluster, failure, cleanup_errors = None, None, []
     results, pending, schedule_invalid = [], {}, []
+    discoveries, signed_attempts, protocol_debt = {}, {}, {}
     results_lock = threading.Lock()
     try:
         (output / "artifacts").mkdir()
@@ -676,6 +859,73 @@ def run(plan, output):
                     cluster.secret, cluster.issuer, action["coordinator"]
                 )
             actual = action
+            attempt, protocol_version = None, action.get("protocol_version", 3)
+            if action["action"] in {"attempt_status", "close_generation"}:
+                with results_lock:
+                    attempt = signed_attempts[action["attempt_ref"]].copy()
+                actual = {
+                    **action,
+                    "method": "POST",
+                    "path": "/internal/v1/workload/control",
+                    "is_write": False,
+                    "body": {
+                        "workload_attempt_control": (
+                            "status"
+                            if action["action"] == "attempt_status"
+                            else "close_generation"
+                        )
+                    },
+                    "expect": action.get(
+                        "expect",
+                        {"status": 200, "checks": [{"path": [], "equals": {}}]},
+                    ),
+                }
+            elif "attempt" in action:
+                configured = action["attempt"]
+                with results_lock:
+                    discovery = discoveries[configured["from_discovery"]]
+                attempt = {
+                    key: configured[key]
+                    for key in ("generation", "sequence", "operation")
+                }
+                attempt.update(
+                    {
+                        key: discovery[key]
+                        for key in (
+                            "coordinator",
+                            "destination",
+                            "worker_incarnation",
+                            "worker_namespace",
+                        )
+                    }
+                )
+                attempt_evidence.validate_attempt(attempt, protocol_version)
+                with results_lock:
+                    signed_attempts[action["id"]] = attempt.copy()
+                    protocol_debt[action["id"]] = "unproven"
+            if attempt is not None:
+                if attempt["destination"] != node["node_id"]:
+                    raise ValueError(
+                        "signed attempt destination differs from target node"
+                    )
+                headers = service_headers(
+                    cluster.secret, cluster.issuer, attempt["coordinator"]
+                )
+                body = json.dumps(actual.get("body"), separators=(",", ":")).encode()
+                remaining = plan["request_timeout"] - (
+                    time.monotonic() - submitted if submitted is not None else 0
+                )
+                headers["X-Antfly-Workload-Attempt"] = attempt_evidence.sign_request(
+                    cluster.secret,
+                    cluster.issuer,
+                    attempt,
+                    actual["method"],
+                    actual["path"],
+                    body,
+                    max(1, int(remaining * 1e9)),
+                    version=protocol_version,
+                    acknowledged_through=action.get("acknowledged_through", 0),
+                )
             if action["action"] == "discover":
                 nonce = secrets.randbits(127) + 1
                 actual = {
@@ -687,7 +937,9 @@ def run(plan, output):
                     "expect": {"status": 200, "checks": [{"path": [], "equals": {}}]},
                 }
             result = request(
-                cluster.ports[action["node"]]["api"],
+                cluster.ports[action["node"]][
+                    "api_proxy" if action.get("via_proxy") else "api"
+                ],
                 actual,
                 plan["request_timeout"],
                 headers,
@@ -705,9 +957,71 @@ def run(plan, output):
                         action["coordinator"],
                         node["node_id"],
                         nonce,
+                        protocol_version,
                     )
+                    if action.get("id"):
+                        with results_lock:
+                            discoveries[action["id"]] = result["discovery"]
                 except (ValueError, KeyError, TypeError) as error:
                     result.update(passed=False, evidence_error=str(error))
+            if attempt is not None:
+                result["attempt"] = attempt
+                frame = {
+                    key.lower(): value
+                    for key, value in result.get("headers", {}).items()
+                }.get("x-antfly-workload-evidence")
+                if frame is not None:
+                    try:
+                        if action["action"] == "close_generation":
+                            proof = attempt_evidence.fence(
+                                cluster.secret,
+                                cluster.issuer,
+                                frame,
+                                attempt,
+                                protocol_version,
+                            )
+                        else:
+                            proof = attempt_evidence.terminal(
+                                cluster.secret,
+                                cluster.issuer,
+                                frame,
+                                attempt,
+                                result["status"],
+                                result["body"].encode(),
+                                protocol_version,
+                            )
+                        result["verified_retirement_evidence"] = proof
+                        with results_lock:
+                            if action["action"] == "close_generation":
+                                for key, prior in signed_attempts.items():
+                                    if (
+                                        all(
+                                            prior[field] == attempt[field]
+                                            for field in (
+                                                "coordinator",
+                                                "destination",
+                                                "worker_incarnation",
+                                                "worker_namespace",
+                                            )
+                                        )
+                                        and prior["generation"]
+                                        <= proof["quiesced_through"]
+                                    ):
+                                        protocol_debt[key] = "verified_fence"
+                            else:
+                                protocol_debt[
+                                    action.get("attempt_ref", action.get("id"))
+                                ] = "verified_terminal"
+                    except (ValueError, KeyError, TypeError) as error:
+                        result.update(passed=False, evidence_error=str(error))
+                elif (
+                    action["action"] in {"attempt_status", "close_generation"}
+                    and result.get("status") == 200
+                ):
+                    result.update(
+                        passed=False,
+                        evidence_error="successful control response lacks signed retirement proof",
+                    )
             result.update(
                 node=action["node"], action=action["action"], id=action.get("id")
             )
@@ -748,7 +1062,12 @@ def run(plan, output):
                         raise RuntimeError(
                             f"unexpected {name} exit {process.returncode}"
                         )
-                if action["action"] in {"request", "discover"}:
+                if action["action"] in {
+                    "request",
+                    "discover",
+                    "attempt_status",
+                    "close_generation",
+                }:
                     if not execute(action)["passed"]:
                         raise RuntimeError(f"action{index} assertion failed")
                 elif action["action"] == "submit":
@@ -779,6 +1098,7 @@ def run(plan, output):
             failure is None
             and not cleanup_errors
             and not unresolved
+            and all(value != "unproven" for value in protocol_debt.values())
             and not schedule_invalid
             and all(result["passed"] for result in results)
         )
@@ -793,13 +1113,15 @@ def run(plan, output):
             "schedule_invalid": schedule_invalid,
             "unknown_write_outcomes": len(unresolved),
             "unresolved_durable_obligations": len(unresolved),
+            "fixture_protocol_obligations": protocol_debt,
+            "protocol_obligation_scope": "manual signed fixture attempts only; not coordinator production ledger accounting",
             "requests": len(results),
             "results": results,
             "performance_qualified": False,
             "release_qualified": False,
             "unmeasured": [
                 "Cloud resource envelopes and performance",
-                "network partitions (process pause is distinct)",
+                "network faults not explicitly asserted through an advertised proxy",
                 "exact durable-decision crash boundary",
                 "unasserted remote ownership/reconciliation states",
             ],
