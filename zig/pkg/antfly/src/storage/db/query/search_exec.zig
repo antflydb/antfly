@@ -12849,6 +12849,66 @@ fn countAnalyzedTokensInJsonValue(alloc: Allocator, value: std.json.Value) !u64 
     };
 }
 
+/// The vector API borrows a boolean cancellation callback. Keep the original
+/// native-clock deadline in that callback through every scan/rerank queue and
+/// helper join, then restore its typed outcome at the storage boundary.
+const DenseRequestLifetime = struct {
+    deadline_ns: ?u64,
+    cancellation: ?types.CancellationToken,
+
+    fn init(req: types.SearchRequest) DenseRequestLifetime {
+        return .{ .deadline_ns = req.execution_deadline_ns, .cancellation = req.cancellation };
+    }
+
+    fn check(self: *const DenseRequestLifetime) !void {
+        if (self.cancellation) |source| {
+            if (source.check_fn != null) try source.check() else if (source.isCancelled()) return error.Cancelled;
+        }
+        if (self.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+    }
+
+    fn cancelled(ptr: *const anyopaque) bool {
+        const self: *const DenseRequestLifetime = @ptrCast(@alignCast(ptr));
+        self.check() catch return true;
+        return false;
+    }
+
+    fn token(self: *const DenseRequestLifetime) ?vectorindex_mod.CancellationToken {
+        if (self.deadline_ns == null and self.cancellation == null) return null;
+        return .{ .ptr = self, .is_cancelled_fn = cancelled };
+    }
+
+    fn failure(self: *const DenseRequestLifetime, err: anyerror) anyerror {
+        if (err == error.Cancelled or err == error.Canceled) self.check() catch |cause| return cause;
+        return err;
+    }
+};
+
+test "workload admission dense request deadline cancels the real driver queue" {
+    const resource_manager = @import("../../resource_manager.zig");
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var manager = resource_manager.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    try manager.configureDenseExecution(.{ .max_runnable_tasks = 1, .max_outstanding_tasks = 2, .max_queued_tasks = 1, .max_wait_ms = 5000 });
+    var blocker = try manager.acquireDenseDriver(io, null);
+    defer blocker.release();
+    const started = platform_time.monotonicNs();
+    const lifetime = DenseRequestLifetime.init(.{ .execution_deadline_ns = started + 20 * std.time.ns_per_ms });
+    const token = lifetime.token().?;
+    if (manager.acquireDenseDriver(io, .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn })) |owned| {
+        var lease = owned;
+        lease.release();
+        return error.UnexpectedExecution;
+    } else |err| {
+        try std.testing.expectEqual(error.Timeout, lifetime.failure(err));
+    }
+    try std.testing.expect(platform_time.monotonicNs() - started < 2 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u64, 0), manager.denseExecutionStats().queued);
+    try std.testing.expectEqual(@as(u64, 1), manager.denseExecutionStats().runnable);
+}
+
 pub fn searchDense(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -12856,7 +12916,8 @@ pub fn searchDense(
     executor: DenseSearchExecutor,
 ) !types.SearchResult {
     var profile = DenseSearchProfile{};
-    return try searchDenseInternal(alloc, req, dense, executor, &profile, false);
+    return searchDenseInternal(alloc, req, dense, executor, &profile, false) catch |err|
+        return DenseRequestLifetime.init(req).failure(err);
 }
 
 pub fn searchDenseProfiled(
@@ -12867,7 +12928,8 @@ pub fn searchDenseProfiled(
 ) !ProfiledDenseSearchResult {
     var profile = DenseSearchProfile{};
     return .{
-        .result = try searchDenseInternal(alloc, req, dense, executor, &profile, true),
+        .result = searchDenseInternal(alloc, req, dense, executor, &profile, true) catch |err|
+            return DenseRequestLifetime.init(req).failure(err),
         .profile = profile,
     };
 }
@@ -12881,6 +12943,8 @@ fn searchDenseInternal(
     include_hbc_profile: bool,
 ) !types.SearchResult {
     resetLastSortRejectionDiagnostic();
+    const lifetime = DenseRequestLifetime.init(req);
+    try lifetime.check();
     try rejectApproximateSortPageOptions(req);
     const total_start = platform_time.monotonicNs();
 
@@ -13017,10 +13081,7 @@ fn searchDenseInternal(
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
             .exclude_ids = effective_exclude_ids,
-            .cancellation = if (req.cancellation) |token|
-                vectorindex_mod.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
-            else
-                null,
+            .cancellation = lifetime.token(),
         };
 
         const hbc_search_start = platform_time.monotonicNs();
