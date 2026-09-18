@@ -352,9 +352,10 @@ The next native reconciliation cell reached the worker, which returned a signed
 HTTP 504 after approximately 11 ms on a healthy read. Bounded response capture
 confirmed the complete `request deadline exceeded` response originated at the
 worker. Evidence: `/tmp/workload-worker-response-b6dfbb8409-receipts`.
-The cause is a missing native-to-catalog clock translation in provisioned route
-fence validation; its targeted fix is under validation. The reconciliation cell
-has therefore not passed yet.
+The cause was a missing native-to-catalog clock translation in provisioned route
+fence validation. Commit `04c5f3da89` translates the deadline through the catalog
+clock; the focused regression passed with deliberately different clock epochs.
+The native reconciliation cell is being rerun with this fix.
 
 A second independently compiled regression proved that reverse replay callbacks
 also mistranslated private consumer errors. Commit `9c834c7d45` keeps those errors
@@ -362,10 +363,47 @@ in the consumer's synchronous stack and sends only a stable stop bit across the
 boundary. The two compiled callback tests passed with zero leaks; the negative
 and fixed receipts are `/tmp/workload-replay-callback-private-before.log` and
 `/tmp/workload-replay-callback-after.log`. ABI versions are now API 29, storage 67,
-and native callback 11; an integrated rebuild is still required for this change.
+and native callback 11. The subsequent production rebuild includes this change.
 
 The exact proposal-guard test (`d542ed4854`) passed: missing or older decoder
 activation rejects both single and batch policy proposals without advancing the
 Raft log, and matching activation allows policy-preserving publication. Its
 metadata artifact runs 123 tests after instantiating the HTTP-service fixture,
 all passing without leaks (`/tmp/workload-metadata-proposal-activation.log`).
+
+
+### Local replicated correctness
+
+`ce3ff4cfe0` adds `scripts/workload_metadata_quorum.py` and five harness tests.
+The final native run passed on the frozen `c10e602778` Debug binary:
+`/tmp/workload-metadata-quorum-c10-final/receipt.json`. All 30 receipt-file
+checksums verified. The wrapper archives its dependencies and rendered topology.
+
+The six local processes form one three-voter metadata group and three actual
+data voters. Status checks bind the metadata group, incarnation and voter-set
+fingerprint across restart; data-store reports prove actual local voter roles,
+a common three-voter fingerprint and applied progress. The test kills the
+observed metadata leader, verifies its successor, loses quorum, submits one
+mutation, restores the original roots, and verifies new writes and all earlier
+sentinels through all three data processes. The no-quorum mutation timed out;
+its unknown outcome was observed without replay. All owned processes exited
+cleanly, with no cleanup errors.
+
+Data scheduling uses 24 ingress requests/16 MiB, four active query and write
+requests with eight queued each, and two read tasks with 4 MiB working memory.
+Coordinator/worker attempt ownership and transaction completion reserves are
+explicitly disabled in this independent Raft case. These are application
+budgets, not enforced process-memory or CPU envelopes. This run does not qualify
+performance, data-replica loss, or a durable transaction-decision crash.
+
+
+### Integrated clock and callback checkpoint
+
+The production Debug build at product revision `04c5f3da89` exited zero. Its
+frozen binary SHA-256 is
+`b84aa8e91e7b6b2a572187d672f90152e29d19f610bea2d0b7ee5ae9c2399f5a`;
+receipt: `/tmp/workload-recovery-04c-production-debug-receipt.json`.
+The combined admission gate also exited zero: metadata 123/123 and
+request/runtime 213 passed, one optional Wasmtime skip, zero failures/leaks,
+six expected and zero unexpected error logs. These artifacts overlap; counts
+are not additive. Log: `/tmp/workload-recovery-coordination-checkpoint15.log`.
