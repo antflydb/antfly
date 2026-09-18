@@ -231,6 +231,16 @@ or coverage gaps over two seconds produce unavailable evidence. A peak above
 series ceilings apply to observed samples; invisible gauge excursions still need
 runtime invariants/counters and cannot be disproved by sampling.
 
+HTTP poll frequency does not establish underlying metric freshness: the health
+server historically caches metrics for five seconds. Ownership/recovery timing
+requires `X-Antfly-Metrics-Age-Ms` (plus full scrape duration) or an actual
+`antfly_metrics_collected_timestamp_seconds` source timestamp and sample age no
+older than one second. Missing/stale freshness marks those gates unavailable.
+Raw body hashes, source-age evidence, and collection-versus-receipt times are
+retained; identical values alone never prove either freshness or staleness.
+The independent kernel cgroup peak verdict remains available when metrics are
+cached. A faster HTTP polling loop cannot qualify a five-second cached source.
+
 The recovery evaluator attributes latency to original submission and requires
 every one-second window from ten seconds after pressure removal through the end
 of recovery to meet baseline 50%-load p99 × 1.10 + 1 ms and the declared summed
@@ -243,3 +253,51 @@ exit 4. Request correctness failures (exit 1) and invalid generators (exit 2)
 retain precedence. Fault schedules and remote/durable reconciliation evidence
 belong to the separate cluster correctness runner; no Cloud-sized machine is
 required to execute those correctness schedules.
+
+## Small process fault correctness
+
+`workload_cluster_qualification.py` is a separate correctness runner. It requires
+no Cloud-sized resources, containers, or Kubernetes. Its default local topology
+uses one metadata process, one data owner, and one API-only process, following
+the native integration fixture. Each node receives separate ports, config,
+persistent data directory, and logs. Plans may also use standalone processes or
+other bounded metadata/data arrangements; the template does not establish a
+replicated Raft topology by merely increasing the node count.
+
+```sh
+python3 scripts/workload_cluster_qualification.py template --output /tmp/fault-plan.json
+# Pin each binary path, actual SHA256, source revision, optimization and node config.
+# Add exact checked setup operations and predeclared fault/request actions.
+python3 scripts/workload_cluster_qualification.py run /tmp/fault-plan.json --output /tmp/fault-receipts
+```
+
+`setup` contains synchronous `request` actions with node, method, path, body,
+`is_write`, and exact expected status/semantic checks, using the scenario check
+format above. Timed `actions` have a monotonic `at` offset after setup and support
+`request`, `submit` (with a unique `id`), `await` (that ID), `pause`, `resume`,
+`stop`, `kill`, `restart`, `ready`, and `discover`. Restart preserves the data
+directory; an optional artifact name selects another pinned binary for rolling
+version tests. No arbitrary shell commands or external process identifiers are
+accepted. A process is killed only when owned by the current run. Cleanup resumes
+paused processes before graceful termination, records every exit, and fails on
+unexpected crashes or forced shutdown. Every asynchronous request is joined and
+its original timeout preserved. Schedule lateness beyond the declared bound
+invalidates the run instead of pretending the planned overlap occurred.
+
+Discovery sends an internal service identity `node:<coordinator>` and verifies
+the signed response's issuer, coordinator, destination, worker incarnation,
+protocol version, and fresh nonce. It requires a binary implementing the node
+control route and explicit worker configuration; the template leaves that
+configuration disabled. The runner mints a disposable fixture-only credential,
+passes it to its children, and retains it in a mode-0600 receipt for offline
+verification. Do not reuse this credential outside the local experiment.
+
+A deliberately expected transport failure does not resolve an unknown write
+outcome: these remain explicit unresolved obligations and fail correctness until
+a dedicated durable-evidence validator is added. Pausing a process is distinct
+from partitioning a network path. A kill scheduled by elapsed time is distinct
+from a kill proven immediately after a durable decision. Those unexercised
+properties stay in `unmeasured`, and `performance_qualified` and
+`release_qualified` always remain false. Receipts retain artifact checksums,
+commands, PIDs/generations, exact fault and request times, responses, node logs,
+shutdown outcomes, and a checksum manifest even when setup or assertions fail.
