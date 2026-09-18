@@ -135,6 +135,14 @@ def validate(plan):
             type(node["proxy_api"]) is not bool or node["role"] != "data"
         ):
             raise ValueError("API advertisement proxy requires an explicit data role")
+        if "proxy_capture_response_bytes" in node and (
+            type(node["proxy_capture_response_bytes"]) is not int
+            or not 1 <= node["proxy_capture_response_bytes"] <= 16384
+            or not node.get("proxy_api")
+        ):
+            raise ValueError(
+                "bounded response capture requires advertised proxy and1..16384bytes"
+            )
         if node["role"] == "data":
             if roles.get(node.get("metadata")) != "metadata" or node.get(
                 "store_role", "data"
@@ -748,7 +756,14 @@ class Cluster:
                 if node.get("proxy_api"):
                     listener = self.reservations[name].pop()
                     self.proxies[name] = proxy_module.FaultProxy(
-                        listener, self.ports[name]["api"], self.record, name
+                        listener,
+                        self.ports[name]["api"],
+                        self.record,
+                        name,
+                        capture_response_bytes=node.get(
+                            "proxy_capture_response_bytes", 0
+                        ),
+                        redact_values=(self.secret,),
                     )
         except BaseException:
             for proxy in self.proxies.values():

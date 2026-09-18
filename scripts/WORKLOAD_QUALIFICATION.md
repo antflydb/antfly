@@ -304,6 +304,16 @@ shutdown outcomes, and a checksum manifest even when setup or assertions fail.
 
 ### Advertised worker traffic faults and signed evidence
 
+For a bounded local diagnostic, set `proxy_capture_response_bytes: 16384`
+on a node with `proxy_api: true` (accepted range 1–16384; disabled by default).
+The relay retains only the first response prefix per connection, including a
+status line, allowlisted content headers and signed workload evidence, and a
+bounded body prefix. It records received/captured byte counts and truncation;
+incomplete headers are not emitted. Authorization and cookie headers are
+excluded, and the disposable local signing secret is redacted. Capture also
+observes discarded responses, but is not a parser for persistent/pipelined
+exchanges and does not itself verify signatures or prove terminal retirement.
+
 Set `proxy_api: true` on a data node to bind a separate owned relay and pass its
 URL as `--api-advertise-url`. Metadata then advertises the relay to coordinators;
 the real API listener remains separate for readiness and direct diagnostic

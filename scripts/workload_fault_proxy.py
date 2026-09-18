@@ -26,7 +26,16 @@ class FaultProxy:
         *,
         max_connections=64,
         buffer_bytes=65536,
+        capture_response_bytes=0,
+        redact_values=(),
     ):
+        if (
+            type(capture_response_bytes) is not int
+            or not 0 <= capture_response_bytes <= 16384
+        ):
+            raise ValueError("response capture must be0..16384bytes")
+        self.capture_response_bytes = capture_response_bytes
+        self.redact_values = tuple(value for value in redact_values if value)
         self.listener = listener
         self.listener.listen(128)
         self.listener.setblocking(False)
@@ -99,6 +108,44 @@ class FaultProxy:
                 self.counters[name] += value
 
         def retire(pair, reason):
+            if self.capture_response_bytes:
+                captured = bytes(pair["response_prefix"])
+                head, separator, body = captured.partition(b"\r\n\r\n")
+                lines = head.decode(errors="replace").split("\r\n")
+                allowed = {
+                    "content-type",
+                    "content-length",
+                    "x-antfly-workload-evidence",
+                }
+                headers = []
+                if separator:
+                    for line in lines[1:]:
+                        key, colon, value = line.partition(":")
+                        if colon and key.lower() in allowed:
+                            headers.append([key, value.strip()])
+
+                def redact(value):
+                    for secret in self.redact_values:
+                        value = value.replace(secret, "[REDACTED]")
+                    return value
+
+                self.record(
+                    {
+                        "event": "proxy_response_capture",
+                        "proxy": self.name,
+                        "connection": pair["id"],
+                        "status_line": redact(lines[0]) if separator else None,
+                        "headers": [[key, redact(value)] for key, value in headers],
+                        "body_prefix": (
+                            redact(body.decode(errors="replace")) if separator else None
+                        ),
+                        "captured_bytes": len(captured),
+                        "received_bytes": pair["response_bytes"],
+                        "truncated": pair["response_bytes"] > len(captured),
+                        "headers_complete": bool(separator),
+                        "scope": "first connection response prefix; not parsed pipelined evidence",
+                    }
+                )
             for peer in (pair["client"], pair["server"]):
                 pairs.pop(peer, None)
                 if reason == "partition":
@@ -221,6 +268,8 @@ class FaultProxy:
                                 "sizes": {client: 0, server: 0},
                                 "prefix": bytearray(),
                                 "path_seen": False,
+                                "response_prefix": bytearray(),
+                                "response_bytes": 0,
                                 "eof": set(),
                                 "shutdown": set(),
                             }
@@ -294,6 +343,14 @@ class FaultProxy:
                                     "path": path,
                                 }
                             )
+                    if not from_client and self.capture_response_bytes:
+                        pair["response_bytes"] += len(chunk)
+                        pair["response_prefix"].extend(
+                            chunk[
+                                : self.capture_response_bytes
+                                - len(pair["response_prefix"])
+                            ]
+                        )
                     if not from_client and policy["drop_response"]:
                         count("dropped_response_bytes", len(chunk))
                         continue

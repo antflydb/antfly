@@ -250,9 +250,13 @@ class FaultProxyTests(unittest.TestCase):
             def do_GET(self):
                 served.append(self.path)
                 body = b"x" * (200000 if self.path == "/large" else 128)
+                if self.path == "/diagnostic":
+                    body = b"request deadline exceeded fixture-secret"
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Connection", "close")
+                self.send_header("Authorization", "Bearer credential-must-not-leak")
+                self.send_header("X-Antfly-Workload-Evidence", "signed-fixture-proof")
                 self.end_headers()
                 self.wfile.write(body)
                 self.close_connection = True
@@ -272,6 +276,8 @@ class FaultProxyTests(unittest.TestCase):
             self.receipts.append,
             "worker",
             buffer_bytes=4096,
+            capture_response_bytes=2048,
+            redact_values=("fixture-secret",),
         )
 
     def tearDown(self):
@@ -289,6 +295,25 @@ class FaultProxyTests(unittest.TestCase):
         finally:
             client.close()
 
+    def test_bounded_response_capture_keeps_proof_and_redacts_credentials(self):
+        self.assertEqual(self.get("/diagnostic")[0], 200)
+        deadline = time.monotonic() + 1
+        while not any(
+            row["event"] == "proxy_response_capture" for row in self.receipts
+        ):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+        capture = next(
+            row for row in self.receipts if row["event"] == "proxy_response_capture"
+        )
+        self.assertIn("200", capture["status_line"])
+        self.assertIn(
+            ["X-Antfly-Workload-Evidence", "signed-fixture-proof"], capture["headers"]
+        )
+        self.assertEqual(capture["body_prefix"], "request deadline exceeded [REDACTED]")
+        self.assertFalse(capture["truncated"])
+        self.assertNotIn("credential-must-not-leak", json.dumps(capture))
+
     def test_healthy_delayed_half_close_drains_bounded_queues(self):
         self.proxy.set_policy(delay_ms=20)
         started = time.monotonic()
@@ -301,6 +326,18 @@ class FaultProxyTests(unittest.TestCase):
         self.assertGreaterEqual(snapshot["forwarded_downstream_bytes"], 200000)
         self.assertEqual(snapshot["paths"]["/large"], 1)
         self.assertIsNone(snapshot["error"])
+        deadline = time.monotonic() + 1
+        while not any(
+            row["event"] == "proxy_response_capture" for row in self.receipts
+        ):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+        capture = next(
+            row for row in self.receipts if row["event"] == "proxy_response_capture"
+        )
+        self.assertEqual(capture["captured_bytes"], 2048)
+        self.assertTrue(capture["truncated"])
+        self.assertGreaterEqual(capture["received_bytes"], 200000)
 
     def test_partition_and_response_discard_have_distinct_receipts_and_recover(self):
         self.proxy.set_policy(partition=True)
