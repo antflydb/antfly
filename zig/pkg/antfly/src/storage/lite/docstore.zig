@@ -47,6 +47,8 @@ pub const Store = struct {
     allocator: Allocator,
     file: native.NativeFile,
     read_only: bool = false,
+    /// Guarded by mutex. Secret publication failures fence every adapter until reopen.
+    secret_store_uncertain: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
     writer_mutex: std.Io.Mutex = .init,
     writer_ready: std.Io.Condition = .init,

@@ -161,6 +161,13 @@ pub const Handle = struct {
     root_namespace_alias: ?[]u8 = null,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
+    /// Scope is a trusted authorization boundary chosen by the embedding host.
+    /// The returned adapter borrows this handle and the key provider.
+    pub fn secretStore(self: *Handle, allocator: Allocator, scope: []const u8, provider: @import("../../common/secret_record.zig").KeyProvider) !@import("secret_store.zig").Store {
+        const docs = self.native_docstore orelse return error.UnsupportedOperation;
+        return @import("secret_store.zig").Store.init(allocator, docs, scope, provider);
+    }
+
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
         if (!isAflitePath(path)) return error.InvalidArgument;
 

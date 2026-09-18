@@ -137,13 +137,13 @@ resolution semantics.
 | Antfly Lite | Reserved encrypted records inside the native `.aflite` file | Atomic durable commit through the existing single-writer machinery |
 | Antfly Serverless | Immutable encrypted objects and a versioned head per scope | Successful conditional publication of the head |
 
-This is the intended architecture, **not yet the runtime storage implementation**.
-The foundations implemented now are `common/secret_contract.zig` and
-`common/secret_record.zig`. They are exported through `common` and tested, but
-existing runtime consumers still use `FileStore`. Existing JSON files remain
-plaintext and are not silently converted or described as encrypted. Backend
-adapters, migration, key-provider configuration, RPCs, and runtime integration
-remain follow-up work.
+The common contracts (`common/secret_contract.zig`), AFSE codec
+(`common/secret_record.zig`), and Lite persistence adapter
+(`storage/lite/secret_store.zig`) are implemented. Embedding hosts can obtain a
+scope-bound adapter through `lite.backend.Handle.secretStore`. Existing runtime
+consumers still use `FileStore`: JSON files remain plaintext and are not silently
+converted. Distributed/serverless adapters, migration, production key-provider
+configuration, RPCs, and runtime resolver integration remain follow-up work.
 
 ### Common source and native writer contract
 
@@ -258,14 +258,75 @@ Authenticated internal RPCs authorize each worker's scope and required secret.
 Publish invalidations after commit and periodically reconcile revisions so missed
 notifications cannot leave permanent stale caches.
 
-**Lite:** Add a reserved internal record namespace to the existing native file
-engine. Commit ciphertext, entry revision, and scope revision atomically with its
-existing writer lock and durability guarantees. Read-only handles have no writer.
-The embedding application supplies a key-provider callback, or CLI integration
-uses an explicit platform/mounted-key provider. The database never stores its
+**Lite (implemented):** A reserved metadata catalog namespace stores encrypted
+records inside the existing native file. A single catalog batch commits
+ciphertext, entry revision, and scope revision through the existing writer lock
+and checkpoint durability guarantees. Read-only and `no_sync` handles expose
+only a source, because unsynced writes cannot promise durable mutation success.
+The embedding application supplies a key-provider callback. Future CLI
+integration will use an explicit platform/mounted-key provider. The database never stores its
 unwrapped root key. File copies and backups carry ciphertext; key access/recovery
 must be provisioned separately. Opening storage must not require resolving an
 application secret from that same unopened store.
+
+The embedding API is:
+
+```zig
+var secrets = try handle.secretStore(allocator, trusted_scope, key_provider);
+defer secrets.deinit();
+const source = secrets.source();
+if (secrets.nativeStore()) |native_store| {
+    const committed = try native_store.writer.put(
+        trusted_scope, "provider.token", token_bytes, .absent,
+    );
+    var value = try source.resolve(allocator, trusted_scope, "provider.token",
+        .{ .min_revision = committed.revision });
+    defer value.deinit(allocator);
+}
+```
+
+The handle and key provider must outlive the adapter and all calls. Keep the
+adapter at a stable address while its borrowed interfaces exist. The host chooses
+authorized scope identities; calls with a different scope fail `Unauthorized`.
+The bridge engine does not support this adapter. Key-provider callbacks may do
+I/O, but must not reenter a writer or maintenance operation on the same handle:
+a mutation retains the writer reservation while releasing the catalog mutex for
+wrapping. Readers and index writers can proceed during wrapping.
+
+The private metadata layout is versioned separately from AFSE:
+
+- Prefix: `\x00antfly.secrets.v1/<hex SHA-256(scope)>/`.
+- `head`: exactly one little-endian `u64` scope revision. An absent head means
+  the initial revision zero. Once written, it survives removal of every entry.
+- `entries/<hex SHA-256(key)>`: little-endian `u64` entry revision, `u16` UTF-8
+  key length, key bytes, then an AFSE v1 envelope. The index supplies the expected
+  revision and identity when opening the envelope; they are not selected from
+  unauthenticated AFSE fields. Hashes bound catalog-key size and avoid delimiter
+  ambiguities. Index metadata and names are visible, while values stay encrypted.
+
+A successful mutation is durably published. Conditional writes use entry
+revisions and serialize across adapters sharing the handle. Deletion of an
+absent entry is a no-op; deletion and recreation never reuse a committed revision.
+Counter exhaustion fails `Unavailable`. Reads copy the index and record under
+the catalog lock, then unwrap outside it. Listings return sorted index metadata
+without invoking the key provider; they validate record framing and matching
+identities, but do not authenticate ciphertext. Resolving a value authenticates
+it and never treats a corrupt record or unavailable key provider as absence.
+
+There is no secret cache. `refresh` reports the handle's current snapshot; it
+does not reopen a read-only file or discover writes made through another process.
+Minimum-revision reads fail when that snapshot is too old. A catalog publication
+failure returns `OutcomeUnknown` and fences all secret adapters on that live
+handle, including reads, listings, and refresh. Reopen is required to select a
+complete checkpoint before continuing. A new adapter on the same handle does
+not clear the fence. Failed key wrapping happens before publication and does
+not advance the revision.
+
+Vacuum and stable file snapshots preserve the private catalog and its encrypted
+records; ordinary document reads/exports do not include them. File backups still
+need separately provisioned key access. Whole-file rollback has the restore and
+freshness limitations described above; restoring a backup is not a monotonic
+secret revision update.
 
 **Serverless:** Store immutable encrypted records or, initially, a small encrypted
 record collection under a dedicated per-scope prefix. Upload objects before
@@ -295,8 +356,8 @@ whether still-valid last-known-good values are usable during outages. Expired
 caches fail; backend outages must not silently change the winning source. Remove
 native override and revoke external credential remain different operations.
 
-Implement Lite persistence first, then distributed Raft persistence and serverless
-publication against the same contract suite. Backend tests must cover crash
+Lite persistence is implemented; next add distributed Raft persistence and
+serverless publication against the same contract suite. Backend tests must cover crash
 recovery, competing conditional writers, delete/recreate without revision reuse,
 missed invalidations, stale/partitioned reads, key-provider failure and rotation,
 unauthorized scope access, and backup/restore. Migration from existing JSON is an
@@ -671,7 +732,8 @@ as AFSE v1 above. It encrypts individual secret values with authenticated identi
 metadata; it does not encrypt the existing `PersistedSecretsFile` JSON wholesale.
 The codec has an independently generated libsodium/PyNaCl wire vector and tests
 for tampering, truncation, wrong keys, entropy failure, and allocation cleanup.
-Native backend integration remains pending. Projected external files continue to
+Lite persistence is available to embedding hosts; runtime resolver integration
+and distributed/serverless persistence remain pending. Projected files continue to
 use the existing JSON format and last-known-good reload behavior. Any future
 encrypted-file adapter must enforce an explicit cache freshness policy on failed
 authentication rather than treating an unreadable native store as absence.
@@ -906,8 +968,8 @@ Additional runtime tests:
 5. Kubernetes-projected files are the primary enterprise integration surface.
    Direct external secret manager integrations are deferred.
 6. Plaintext JSON remains the initial store format, protected by filesystem
-   permissions. The shared AFSE codec exists; encrypted native backend adapters
-   and explicit migration remain to be implemented.
+   permissions. The AFSE codec and Lite adapter are implemented; runtime
+   integration, other persistence adapters, and explicit migration remain pending.
 7. Start true live rotation with managed embedder API keys.
 8. Support live rotation for all credential-bearing integrations that Antfly
    owns: generator/reranker providers, remote-content credentials, S3/backup
