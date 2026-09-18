@@ -78,6 +78,7 @@ pub const BootstrapConfig = struct {
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
     query_admission_waiting: @import("../../common/workload_admission.zig").Config = .{},
     write_admission_waiting: @import("../../common/workload_admission.zig").Config = .{},
+    ingress_admission: @import("../../common/workload_ingress.zig").Config = .{},
     graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// CPU fanout available to one graph-metric kernel. Work is scheduled on
@@ -454,6 +455,7 @@ pub const OwnedStack = struct {
     handler: api_mod.HttpHandler,
 
     pub fn init(self: *OwnedStack, alloc: Allocator, cfg: BootstrapConfig, io: std.Io) !void {
+        try cfg.ingress_admission.validate();
         if (cfg.node_config) |node_config| if (node_config.admission.remote_attempt_worker.max_attempts != 0)
             return error.RemoteAttemptDurabilityRequired;
         try validateConfig(alloc, cfg);
@@ -678,6 +680,7 @@ pub const OwnedStack = struct {
         self.handler.configureAdmission(cfg.query_max_concurrent_requests, cfg.write_max_concurrent_requests);
         try self.handler.query_admission.configure(cfg.query_admission_waiting);
         try self.handler.write_admission.configure(cfg.write_admission_waiting);
+        self.handler.ingress_admission = .init(cfg.ingress_admission);
         self.handler.setRemoteContent(cfg.remote_content);
         if (self.query_cache) |*query_cache| self.handler.setQueryCache(query_cache);
         self.handler.setPublishedSearchSources(search_sources.publishedSearchSourcesForNames(
@@ -712,6 +715,7 @@ pub const OwnedStack = struct {
     pub fn deinit(self: *OwnedStack) void {
         self.handler.query_admission.deinitMemory();
         self.handler.write_admission.deinitMemory();
+        self.handler.ingress_admission.deinitMemory();
         self.runtime.deinit();
         if (self.managed_query_embedder) |*query_embedder| query_embedder.deinit();
         self.embedding_provider_runtime.deinit();

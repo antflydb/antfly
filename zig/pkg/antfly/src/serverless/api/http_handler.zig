@@ -130,6 +130,9 @@ const CancellationToken = @import("../../common/cancellation.zig").CancellationT
 const api_operation = @import("../../api/operation.zig");
 const request_admission = @import("../../common/request_admission.zig");
 const RequestAdmission = request_admission.RequestAdmission;
+const ingress_mod = @import("ingress.zig");
+const workload_ingress = @import("../../common/workload_ingress.zig");
+const MemoryOwner = @import("../../common/workload_allocator.zig").Owner;
 
 pub const HttpRequest = http_types.HttpRequest;
 pub const HttpResponse = http_types.HttpResponse;
@@ -264,6 +267,7 @@ pub const HttpHandler = struct {
     // Request facades borrow diagnostics; the controllers themselves contain
     // live locks and ownership and must never be copied into a facade.
     admission_stats_source: ?*const HttpHandler = null,
+    ingress_admission: workload_ingress.Runtime = .init(.{}),
 
     pub fn init(
         alloc: Allocator,
@@ -297,6 +301,32 @@ pub const HttpHandler = struct {
     }
 
     pub fn handle(self: *HttpHandler, incoming: HttpRequest) !HttpResponse {
+        var request = incoming;
+        const acquired = if (incoming.ingress == null)
+            self.beginIngress(incoming) catch |err| return admissionFailureResponse(self.alloc, err)
+        else
+            null;
+        defer if (acquired) |scope| scope.release();
+        request.ingress = incoming.ingress orelse acquired;
+        var response = try self.handleAdmitted(request);
+        if (request.ingress) |scope| {
+            scope.retain();
+            response.ingress = scope;
+        }
+        return response;
+    }
+
+    /// Adapters invoke this before buffering bodies; direct callers acquire at
+    /// handle entry. Only scalar liveness/readiness routes use the control floor.
+    pub fn beginIngress(self: *HttpHandler, request: HttpRequest) !?*ingress_mod.Scope {
+        if (!self.ingress_admission.enabled()) return null;
+        try request.ensureActive();
+        const control = request.method == .get and
+            (std.mem.eql(u8, request.path, "/healthz") or std.mem.eql(u8, request.path, "/readyz"));
+        return try ingress_mod.Scope.create(self.alloc, if (control) &self.ingress_admission.control else &self.ingress_admission.general);
+    }
+
+    fn handleAdmitted(self: *HttpHandler, incoming: HttpRequest) !HttpResponse {
         var req = incoming;
         req.ensureActive() catch |err| return admissionFailureResponse(self.alloc, err);
         const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
@@ -306,11 +336,14 @@ pub const HttpHandler = struct {
             .query => &self.query_admission,
             .write => &self.write_admission,
         };
-        const memory = if (admission != null and admission.?.stats().max_retained_bytes != 0)
-            @import("../../common/workload_allocator.zig").Owner.create(self.alloc, admission.?) catch |err|
+        const parent = if (req.ingress) |scope| scope.owner else null;
+        const memory = if (admission != null and (parent != null or admission.?.stats().max_retained_bytes != 0))
+            (if (parent) |owner| MemoryOwner.createChild(owner, admission.?) else MemoryOwner.create(self.alloc, admission.?)) catch |err|
                 return admissionFailureResponse(self.alloc, err)
-        else
-            null;
+        else if (parent) |owner| blk: {
+            owner.retain();
+            break :blk owner;
+        } else null;
         defer if (memory) |owner| owner.release();
         const request_alloc = if (memory) |owner| owner.allocator() else self.alloc;
         if (admission_class != .none) {
@@ -350,6 +383,12 @@ pub const HttpHandler = struct {
         const request_deadline: RequestDeadlineCancellation = .{ .upstream = req.cancellation, .deadline_ns = req.deadline_ns };
         if (admission_class != .none) req.cancellation = request_deadline.token();
         var write_outcome: api_service.WriteOutcome = .{ .cancellation = req.cancellation };
+        if (req.ingress) |scope| scope.execution_started = admission_class != .write;
+        defer if (req.ingress) |scope| {
+            scope.write_started = write_outcome.started;
+            scope.write_completed = write_outcome.completed;
+            scope.execution_started = scope.execution_started or write_outcome.started;
+        };
         var response = (if (memory != null or admission_class == .write)
             self.withRequestAllocator(request_alloc, if (admission_class == .write) &write_outcome else null, HttpHandler.dispatchAdmitted, .{ req, route })
         else
@@ -10138,7 +10177,7 @@ fn updateJoinedResponseMetadata(
 
 fn admissionFailureResponse(alloc: Allocator, err: anyerror) !HttpResponse {
     const status: u16 = switch (err) {
-        error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge, error.AdmissionWaitTimeout => 429,
+        error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge, error.AdmissionWaitTimeout => 429,
         error.AdmissionClosed => 503,
         error.DeadlineExceeded => 504,
         else => return err,
@@ -12905,6 +12944,7 @@ test "workload admission serverless admitted execution uses retained allocator" 
 
     try testServerlessMetadataOwnership(&handler, namespace);
     try testServerlessWriteOwnership(&handler, &wal_store, namespace, ingest_body);
+    try testServerlessIngressOwnership(&handler);
 
     // The tiny returned projection fits this ceiling; reading and searching
     // its large source document does not. This catches output-only accounting.
@@ -12917,6 +12957,44 @@ test "workload admission serverless admitted execution uses retained allocator" 
     try std.testing.expect(std.mem.indexOf(u8, rejected.body, "\"execution_started\":true") != null);
     try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().in_flight);
     try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().retained_bytes);
+}
+
+fn testServerlessIngressOwnership(handler: *HttpHandler) !void {
+    const alloc = std.testing.allocator;
+    handler.ingress_admission = .init(.{ .max_requests = 3, .max_retained_bytes = 2 * 1024 * 1024, .control_requests = 1, .control_retained_bytes = 64 * 1024 });
+    defer {
+        handler.ingress_admission.deinitMemory();
+        handler.ingress_admission = .init(.{});
+    }
+    var first = try handler.handle(.{ .method = .get, .path = "/tables" });
+    var first_live = true;
+    defer if (first_live) first.deinit(alloc);
+    var second = try handler.handle(.{ .method = .get, .path = "/status" });
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+    try std.testing.expectEqual(@as(u16, 200), second.status);
+    try std.testing.expect(first.memory_owner.?.parent != null);
+    try std.testing.expectEqual(@as(usize, 0), handler.query_admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 2), handler.ingress_admission.general.stats().in_flight);
+    try std.testing.expect(handler.ingress_admission.general.stats().retained_bytes >= handler.query_admission.stats().retained_bytes);
+    var denied = try handler.handle(.{ .method = .put, .path = "/tables/docs/ingest-batch", .body = "{}" });
+    defer denied.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), denied.status);
+    try std.testing.expect(std.mem.indexOf(u8, denied.body, "\"execution_started\":false") != null);
+    // General work cannot borrow this unused slot; the readiness request can.
+    var ready = try handler.handle(.{ .method = .get, .path = "/readyz" });
+    defer ready.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), ready.status);
+    try std.testing.expectEqual(@as(usize, 1), handler.ingress_admission.control.stats().in_flight);
+    var control_full = try handler.handle(.{ .method = .get, .path = "/healthz" });
+    defer control_full.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), control_full.status);
+    first.deinit(alloc);
+    first_live = false;
+    try std.testing.expectEqual(@as(usize, 1), handler.ingress_admission.general.stats().in_flight);
+    var recovered = try handler.handle(.{ .method = .get, .path = "/tables" });
+    defer recovered.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), recovered.status);
 }
 
 fn testServerlessMetadataOwnership(handler: *HttpHandler, namespace: []const u8) !void {

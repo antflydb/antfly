@@ -17,6 +17,7 @@ const httpx = @import("httpx");
 const http_common = @import("raft/transport/http_common.zig");
 const serverless_http_routes = @import("serverless/api/http_routes.zig");
 const serverless_http_types = @import("serverless/api/http_types.zig");
+const IngressScope = @import("serverless/api/ingress.zig").Scope;
 
 pub const ServerlessHttpServerConfig = struct {};
 
@@ -64,16 +65,128 @@ test "workload admission serverless adapters retain body ownership through outpu
     try std.testing.expectEqualStrings("{\"ok\":true}", native.body.?);
 }
 
+test "workload admission serverless ingress protects probes before body read and retains composite output" {
+    const Owner = @import("common/workload_allocator.zig").Owner;
+    const Controller = @import("common/workload_admission.zig").Controller;
+    const Producer = struct {
+        ingress: @import("common/workload_ingress.zig").Runtime = .init(.{ .max_requests = 2, .max_retained_bytes = 16384, .control_requests = 1, .control_retained_bytes = 4096 }),
+        gate: Controller = .initConfigured(1, .{ .max_retained_bytes = 8192 }),
+        calls: usize = 0,
+        shrink_after_write: bool = false,
+
+        pub fn beginIngress(self: *@This(), req: serverless_http_types.HttpRequest) !?*IngressScope {
+            return try IngressScope.create(std.testing.allocator, if (std.mem.eql(u8, req.path, "/healthz")) &self.ingress.control else &self.ingress.general);
+        }
+        pub fn handle(self: *@This(), req: serverless_http_types.HttpRequest) !serverless_http_types.HttpResponse {
+            const acquired = if (req.ingress == null) try self.beginIngress(req) else null;
+            defer if (acquired) |scope| scope.release();
+            const scope = req.ingress orelse acquired.?;
+            const owner = try Owner.createChild(scope.owner, &self.gate);
+            errdefer owner.release();
+            const alloc = owner.allocator();
+            const content_type = try alloc.dupe(u8, "application/json");
+            errdefer alloc.free(content_type);
+            const body = try alloc.dupe(u8, "{\"ok\":true}");
+            errdefer alloc.free(body);
+            self.calls += 1;
+            if (self.shrink_after_write) {
+                scope.write_started = true;
+                scope.write_completed = true;
+                try self.ingress.general.reconfigure(1, .{ .max_retained_bytes = 1 });
+            }
+            scope.retain();
+            return .{ .status = 200, .content_type = content_type, .body = body, .memory_owner = owner, .ingress = scope };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var producer: Producer = .{};
+    var producer_live = true;
+    defer if (producer_live) {
+        producer.gate.deinitMemory();
+        producer.ingress.deinitMemory();
+    };
+    var server = ServerlessHttpServer.init(alloc, .{}, &producer);
+    var buffered = try server.handle(.{ .method = .GET, .uri = "/tables" });
+    var buffered_live = true;
+    defer if (buffered_live) buffered.deinit(alloc);
+    const Delegate = struct {
+        reads: usize = 0,
+        fn read(raw: ?*anyopaque) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.reads += 1;
+            return "{}";
+        }
+    };
+    var delegate: Delegate = .{};
+    var denied_request = try httpx.Request.init(alloc, .POST, "/tables/docs/batch");
+    defer denied_request.deinit();
+    var denied_ctx = httpx.Context.init(alloc, std.testing.io, &denied_request);
+    defer denied_ctx.deinit();
+    denied_ctx.body_delegate = .{ .ptr = &delegate, .read_all = Delegate.read, .streaming = true };
+    var denied = try server.handleHttpx(&denied_ctx);
+    defer denied.deinit();
+    try std.testing.expectEqual(@as(u16, 429), denied.status.code);
+    try std.testing.expectEqual(@as(usize, 0), delegate.reads);
+    try std.testing.expectEqual(@as(usize, 1), producer.calls);
+
+    var probe_request = try httpx.Request.init(alloc, .GET, "/healthz");
+    defer probe_request.deinit();
+    var probe_ctx = httpx.Context.init(alloc, std.testing.io, &probe_request);
+    var probe_ctx_live = true;
+    defer if (probe_ctx_live) probe_ctx.deinit();
+    var probe = try server.handleHttpx(&probe_ctx);
+    var probe_live = true;
+    defer if (probe_live) probe.deinit();
+    try std.testing.expectEqual(@as(u16, 200), probe.status.code);
+    probe_ctx.deinit();
+    probe_ctx_live = false;
+    try std.testing.expectEqual(@as(usize, 1), producer.ingress.general.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 1), producer.ingress.control.stats().in_flight);
+    buffered.deinit(alloc);
+    buffered_live = false;
+    try std.testing.expectEqual(@as(usize, 0), producer.ingress.general.stats().in_flight);
+
+    // A header/output allocation denied after durable work cannot become an
+    // execution_started=false retry signal at the transport adapter.
+    producer.shrink_after_write = true;
+    var write_request = try httpx.Request.init(alloc, .POST, "/tables/docs/batch");
+    defer write_request.deinit();
+    write_request.body = "{}";
+    var write_ctx = httpx.Context.init(alloc, std.testing.io, &write_request);
+    var write_ctx_live = true;
+    defer if (write_ctx_live) write_ctx.deinit();
+    var write_response = try server.handleHttpx(&write_ctx);
+    defer write_response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), write_response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, write_response.body.?, "committed_pending") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_response.body.?, "\"retryable\":false") != null);
+    write_ctx.deinit();
+    write_ctx_live = false;
+    try std.testing.expectEqual(@as(usize, 1), producer.ingress.general.stats().in_flight);
+    producer.gate.deinitMemory();
+    producer.ingress.deinitMemory();
+    producer_live = false;
+    producer = undefined;
+    try std.testing.expectEqualStrings("{\"ok\":true}", probe.body.?);
+    probe.deinit();
+    probe_live = false;
+}
+
 pub const Handler = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     const VTable = struct {
         handle: *const fn (*anyopaque, serverless_http_types.HttpRequest) anyerror!serverless_http_types.HttpResponse,
+        begin_ingress: *const fn (*anyopaque, serverless_http_types.HttpRequest) anyerror!?*IngressScope,
     };
 
     pub fn handle(self: Handler, req: serverless_http_types.HttpRequest) !serverless_http_types.HttpResponse {
         return self.vtable.handle(self.ptr, req);
+    }
+
+    pub fn beginIngress(self: Handler, req: serverless_http_types.HttpRequest) !?*IngressScope {
+        return self.vtable.begin_ingress(self.ptr, req);
     }
 };
 
@@ -117,8 +230,9 @@ pub const ServerlessHttpServer = struct {
         const self: *ServerlessHttpServer = @ptrCast(@alignCast(ptr));
         var response = try self.handle(req);
         defer response.deinit(self.alloc);
-        const headers = try alloc.alloc(http_common.RequestHeader, response.headers.len);
-        defer alloc.free(headers);
+        const header_alloc = response.owner_allocator orelse alloc;
+        const headers = try header_alloc.alloc(http_common.RequestHeader, response.headers.len);
+        defer header_alloc.free(headers);
         for (response.headers, headers) |source, *destination| {
             destination.* = .{ .name = source.name, .value = source.value };
         }
@@ -158,12 +272,17 @@ pub const ServerlessHttpServer = struct {
             .content_type = resp.content_type,
             .body = resp.body,
         };
-        if (resp.memory_owner) |owner|
+        if (resp.ingress) |scope| {
+            std.debug.assert(scope.previous_output == null);
+            if (resp.memory_owner) |owner| scope.previous_output = .{ .ptr = owner, .release = releaseResponseMemory };
+            response.allocation_owner = .{ .ptr = scope, .release = IngressScope.releaseOutput };
+        } else if (resp.memory_owner) |owner|
             response.allocation_owner = .{ .ptr = owner, .release = releaseResponseMemory };
         // Move the allocation owner and buffers together across the adapter.
         resp.content_type = &.{};
         resp.body = &.{};
         resp.memory_owner = null;
+        resp.ingress = null;
         errdefer response.deinit(alloc);
         if (resp.retry_after_seconds) |seconds| {
             const value = try std.fmt.allocPrint(alloc, "{d}", .{seconds});
@@ -196,6 +315,86 @@ pub const ServerlessHttpServer = struct {
     /// the transport edge; the serverless handler receives its canonical
     /// transport-neutral request exactly once.
     pub fn handleHttpx(self: *ServerlessHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const scope = self.handler.beginIngress(.{
+            .method = switch (ctx.request.method) {
+                .GET => .get,
+                .PUT => .put,
+                .DELETE => .delete,
+                else => .post,
+            },
+            .path = ctx.request.uri.path,
+            .deadline_ns = ctx.application_deadline_ns,
+            .deadline_io = ctx.application_deadline_io,
+            .cancellation = .{ .ptr = ctx, .is_cancelled_fn = contextCancelled },
+        }) catch |err| return self.ingressFailure(err, null);
+        defer if (scope) |value| value.release();
+        if (scope) |value| {
+            // This adapter is the first application callback. Transport-owned
+            // Request bytes keep their separate framing/body capacity owner.
+            if (ctx.request_memory != null or ctx.data != null or ctx.decoded_query_values.capacity != 0 or
+                ctx.response.body_memory != null or ctx.response.body_owned or ctx.response.headers.entries.capacity != 0)
+                return error.IngressMustPrecedePlanning;
+            const alloc = value.owner.allocator();
+            value.retain();
+            ctx.request_memory = .{ .allocator = alloc, .ptr = value, .retain = IngressScope.retainOpaque, .release = IngressScope.releaseOpaque };
+            ctx.allocator = alloc;
+            ctx.response.allocator = alloc;
+            ctx.response.headers.allocator = alloc;
+            value.owner.retain();
+            ctx.response.body_memory = .{ .allocator = alloc, .ptr = value.owner, .retain = retainResponseMemory, .release = releaseResponseMemory };
+        }
+        var result = self.handleHttpxAdmitted(ctx, scope) catch |err| blk: {
+            if (scope) |value| if (value.owner.budget_exhausted.load(.acquire))
+                break :blk try self.ingressFailure(error.AdmissionBytesExhausted, value);
+            return err;
+        };
+        if (scope) |value| {
+            std.debug.assert(value.previous_output == null);
+            if (result.retirement) |retirement| value.previous_output = .{ .ptr = retirement.ptr, .release = retirement.release };
+            value.retain();
+            result.retirement = .{ .ptr = value, .release = IngressScope.releaseOutput };
+        }
+        return result;
+    }
+
+    fn contextCancelled(raw: *const anyopaque) bool {
+        const ctx: *const httpx.Context = @ptrCast(@alignCast(raw));
+        return ctx.isCancellationRequested();
+    }
+
+    fn ingressFailure(self: *ServerlessHttpServer, err: anyerror, scope: ?*IngressScope) !httpx.Response {
+        if (scope) |value| if (value.write_started) {
+            var response = httpx.Response.init(self.alloc, 503);
+            errdefer response.deinit();
+            try response.headers.append("Content-Type", "application/json");
+            response.body = if (value.write_completed)
+                "{\"reason\":\"committed_pending\",\"stage\":\"execution\",\"execution_started\":true,\"retryable\":false,\"write_outcome\":\"committed\"}"
+            else
+                "{\"reason\":\"write_outcome_unknown\",\"stage\":\"execution\",\"execution_started\":true,\"retryable\":false,\"write_outcome\":\"unknown\"}";
+            return response;
+        };
+        const status: u16 = switch (err) {
+            error.AdmissionFull, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge => 429,
+            error.AdmissionClosed => 503,
+            error.DeadlineExceeded => 504,
+            else => return err,
+        };
+        var response = httpx.Response.init(self.alloc, status);
+        errdefer response.deinit();
+        try response.headers.append("Content-Type", "application/json");
+        response.body = switch (err) {
+            error.AdmissionFull => "{\"reason\":\"instance_busy\",\"stage\":\"admission\",\"execution_started\":false}",
+            error.AdmissionClosed => "{\"reason\":\"draining\",\"stage\":\"admission\",\"execution_started\":false}",
+            error.DeadlineExceeded => "{\"reason\":\"deadline_exceeded\",\"stage\":\"admission\",\"execution_started\":false}",
+            else => if (scope != null and scope.?.execution_started)
+                "{\"reason\":\"resource_exhausted\",\"stage\":\"execution\",\"execution_started\":true}"
+            else
+                "{\"reason\":\"resource_exhausted\",\"stage\":\"admission\",\"execution_started\":false}",
+        };
+        return response;
+    }
+
+    fn handleHttpxAdmitted(self: *ServerlessHttpServer, ctx: *httpx.Context, scope: ?*IngressScope) !httpx.Response {
         _ = self.cfg;
         const method: serverless_http_routes.HttpMethod = switch (ctx.request.method) {
             .GET => .get,
@@ -211,6 +410,7 @@ pub const ServerlessHttpServer = struct {
             .body = body,
             .deadline_ns = ctx.application_deadline_ns,
             .deadline_io = ctx.application_deadline_io,
+            .ingress = scope,
             .cancellation = .{
                 .ptr = ctx,
                 .is_cancelled_fn = struct {
@@ -224,7 +424,8 @@ pub const ServerlessHttpServer = struct {
         defer response.deinit(self.alloc);
 
         if (response.memory_owner) |owner| {
-            std.debug.assert(ctx.response.body_memory == null and !ctx.response.body_owned);
+            std.debug.assert(!ctx.response.body_owned);
+            if (ctx.response.body_memory) |previous| previous.release(previous.ptr);
             owner.retain();
             ctx.response.body_memory = .{
                 .allocator = owner.allocator(),
@@ -325,11 +526,20 @@ fn handlerIface(handler: anytype) Handler {
             const typed: *Child = @ptrCast(@alignCast(ptr));
             return typed.handle(req);
         }
+
+        fn beginIngress(ptr: *anyopaque, req: serverless_http_types.HttpRequest) !?*IngressScope {
+            if (comptime @hasDecl(Child, "beginIngress")) {
+                const typed: *Child = @ptrCast(@alignCast(ptr));
+                return typed.beginIngress(req);
+            }
+            return null;
+        }
     };
     return .{
         .ptr = handler,
         .vtable = &.{
             .handle = Adapter.handle,
+            .begin_ingress = Adapter.beginIngress,
         },
     };
 }

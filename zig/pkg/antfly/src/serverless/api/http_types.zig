@@ -27,6 +27,8 @@ pub const HttpRequest = struct {
     cancellation: cancellation_mod.CancellationToken = .none,
     deadline_ns: ?u64 = null,
     deadline_io: ?std.Io = null,
+    /// Borrowed from an adapter that admitted before body materialization.
+    ingress: ?*@import("ingress.zig").Scope = null,
 
     pub fn ensureActive(self: HttpRequest) !void {
         try self.cancellation.check();
@@ -43,6 +45,7 @@ pub const HttpResponse = struct {
     body: []u8,
     retry_after_seconds: ?u32 = null,
     memory_owner: ?*@import("../../common/workload_allocator.zig").Owner = null,
+    ingress: ?*@import("ingress.zig").Scope = null,
 
     pub fn deinit(self: *HttpResponse, fallback_alloc: Allocator) void {
         const owner = self.memory_owner;
@@ -50,6 +53,7 @@ pub const HttpResponse = struct {
         alloc.free(self.content_type);
         alloc.free(self.body);
         if (owner) |memory| memory.release();
+        if (self.ingress) |scope| scope.release();
         self.* = undefined;
     }
 };

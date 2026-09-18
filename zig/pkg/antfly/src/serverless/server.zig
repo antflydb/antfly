@@ -111,6 +111,7 @@ pub const ServerlessServer = struct {
     pub fn deinitWithDeadline(self: *ServerlessServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
         self.stack.handler.query_admission.close();
         self.stack.handler.write_admission.close();
+        self.stack.handler.ingress_admission.close();
         if (self.owned_listener) |listener| {
             self.stopListenerWithDeadline(deadline);
             listener.deinit();
