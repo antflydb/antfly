@@ -660,6 +660,11 @@ const Handle = struct {
     // which keeps today's behavior unchanged.
     lite_inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
     lite_inference_io: ?*std.Io.Threaded = null,
+    // Mirrors `LiteResolvedOpenOptions.generated_enrichment_replay` from this
+    // handle's open call. `refreshLiteManagedEmbeddingRuntime` must not lose
+    // this caller intent across its own reconfigure passes -- see its doc
+    // comment.
+    lite_generated_enrichment_replay: bool = false,
 
     fn liteAntflyProvider(self: *Handle) ?managed_embedder.AntflyProvider {
         const lifetime = if (self.lite_inference_lifetime) |*value| value else return null;
@@ -962,6 +967,26 @@ test "capi lite AddIndexJSON surfaces an unresolvable source_artifact_name as in
 /// relied on this feature keeps today's permissive, pass-through behavior;
 /// `refreshLiteManagedEmbeddingRuntime` is likewise a no-op for such an
 /// index.
+/// True for a plain embedder-only embeddings config -- no `field`/`template`
+/// of its own, and none of the other shapes that mean something different
+/// (an artifact-backed consumer, an external/caller-supplied index, or one
+/// still carrying its own chunker) -- where defaulting `field` to
+/// `"embedding"` is unambiguous. Keeps `litePhysicalIndexConfigJson` from
+/// defaulting a config whose author meant something other than "index the
+/// stored `embedding` field".
+fn needsDefaultEmbeddingField(object: std.json.ObjectMap) bool {
+    if (object.get("field") != null) return false;
+    if (object.get("template") != null) return false;
+    if (object.get("sources") != null) return false;
+    if (object.get("embedding_name") != null) return false;
+    if (object.get("source_artifact_name") != null) return false;
+    if (object.get("chunker") != null) return false;
+    if (object.get("external")) |external| {
+        if (external == .bool and external.bool) return false;
+    }
+    return true;
+}
+
 fn litePhysicalIndexConfigJson(
     alloc: Allocator,
     kind: db_mod.types.IndexKind,
@@ -978,6 +1003,19 @@ fn litePhysicalIndexConfigJson(
     const arena = arena_impl.allocator();
     var parsed = std.json.parseFromSlice(std.json.Value, arena, bridged, .{}) catch
         return try alloc.dupe(u8, config_json);
+    // The translator requires `field` (or `template`/an artifact source) on
+    // a non-external embeddings config and otherwise bails out before ever
+    // resolving dimensions -- before this, a caller relying on the same
+    // "embedding" default `field` this function's own post-failure fallback
+    // below injects would always take that fallback, which has no way to
+    // learn the real vector width and stores an index `db.addIndex` then
+    // rejects for a missing `dims`. Inject the default proactively so
+    // translation actually runs and probes the configured embedder (local or
+    // remote) for its output width instead of falling back before trying.
+    if (parsed.value == .object and needsDefaultEmbeddingField(parsed.value.object)) {
+        parsed.value.object.put(arena, "field", .{ .string = "embedding" }) catch
+            return try alloc.dupe(u8, config_json);
+    }
     // `provider` must be threaded through here too: an embedder with no
     // `api_url` translates to a durable `"antfly:embedded"` semantic
     // producer identity, and the translator rejects that identity outright
@@ -1068,9 +1106,22 @@ fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
     const merged_json = try liteMergedIndexesJsonAlloc(handle);
     defer alloc.free(merged_json);
 
-    try local_write.reconfigureManagedDbEnrichmentRuntime(
+    // Not `local_write.reconfigureManagedDbEnrichmentRuntime` directly: that
+    // helper derives `enable_without_producers` purely from
+    // `indexesJsonHasGeneratedEnrichment`'s scan of the *index* catalog's own
+    // config shape (an inline `"kind":"chunk"`/`"asset"` object, or an
+    // `"embeddings"` config). A full-text index that references a chunk
+    // enrichment by name -- `{"chunk_name":"..."}`, the shape
+    // `antfly_db_add_index_json` stores -- carries no such literal marker, so
+    // the scan misses it even though a caller that opened this handle with
+    // `generated_enrichment_replay` explicitly asked to resume exactly that
+    // pending work. This function runs unconditionally after every open,
+    // addIndex, and addEnrichment, so without preserving that intent here it
+    // silently tears down and never rebuilds the runtime
+    // `replayGeneratedEnrichmentsFromStoredDocs` depends on the very first
+    // time this handle reconciles anything.
+    var enrichments = try local_write.createManagedDbEnrichments(
         alloc,
-        &handle.db,
         merged_json,
         handle.db.backend_runtime,
         provider,
@@ -1080,6 +1131,10 @@ fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
         null,
         null,
     );
+    defer enrichments.deinit(alloc);
+    var cfg = enrichments.takeConfig();
+    cfg.enable_without_producers = cfg.enable_without_producers or handle.lite_generated_enrichment_replay;
+    try handle.db.reconfigureEnrichmentRuntime(cfg);
 }
 
 fn closeHandle(handle: *Handle) void {
@@ -7391,18 +7446,21 @@ fn openLiteHandleAllocWithRuntime(
     }
     try backend.configureDbOpenOptions(&opts);
 
+    // One identity policy for every Lite surface (C ABI, embedded package,
+    // CLI): pin a new file to the embedded root identity and adopt whatever
+    // identity an existing file already carries, so a database created
+    // through one surface opens through any other.
+    const identity = antfly.lite.connection.identityOpenOptions(create);
+    opts.identity_namespace = identity.identity_namespace;
+    opts.prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace;
     var db = try db_mod.DB.open(alloc, path, opts);
     errdefer db.close();
 
     if (create) {
         // Antfly Lite databases provision the same default full-text index
-        // the server provisions on every table create, so text search works
-        // out of the box without a separate `lite index create` step.
-        try db.addIndex(.{
-            .name = tables_api.default_full_text_index_name,
-            .kind = .full_text,
-            .config_json = "{}",
-        });
+        // the server provisions on every table create, through the routine
+        // shared with the CLI and the embedded package.
+        try antfly.lite.connection.provisionDefaultFullTextIndex(&db);
     }
 
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
@@ -7414,6 +7472,7 @@ fn openLiteHandleAllocWithRuntime(
         .owned_lite_backend = backend,
         .lite_profile = resolved.profile,
         .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
+        .lite_generated_enrichment_replay = resolved.generated_enrichment_replay,
     };
     // Only the native profile runs background enrichment automatically;
     // only builds that both advertise (lite-local-inference-runtime) and

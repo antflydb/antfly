@@ -31,6 +31,7 @@ const query_api = @import("../../api/query.zig");
 const tables_api = @import("../../api/tables.zig");
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const fs_paths = @import("../../common/fs_paths.zig");
+const full_text_index_defaults = @import("../../common/full_text_index_defaults.zig");
 
 pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
 
@@ -839,6 +840,17 @@ fn freeBackupShards(allocator: Allocator, shards: []const backups_api.ShardSnaps
     allocator.free(@constCast(shards));
 }
 
+/// Finds an index by name in a `listIndexes` result, order-independent. Every
+/// fresh Lite database now also carries the default full-text index (see
+/// `full_text_index_defaults.zig`), so tests assert specific names are
+/// present instead of relying on a fixed slice order.
+fn indexNamed(indexes: []const db_types.IndexConfig, name: []const u8) ?db_types.IndexConfig {
+    for (indexes) |index| {
+        if (std.mem.eql(u8, index.name, name)) return index;
+    }
+    return null;
+}
+
 test "lite restore staging writer close syncs unsynced batch before readonly reopen" {
     const allocator = std.testing.allocator;
 
@@ -971,8 +983,12 @@ test "lite portable publication never reports a retryable failure after adoption
     try std.testing.expectEqual(@as(u64, 2), recovered_runtime.portable_runtime_activation_attempts);
     const indexes = try target.db.listIndexes(allocator);
     defer db_types.freeIndexConfigs(allocator, indexes);
-    try std.testing.expectEqual(@as(usize, 1), indexes.len);
-    try std.testing.expectEqualStrings("published_ft", indexes[0].name);
+    // The import wholesale-replaces target's catalog with source's, which
+    // carries both source's explicit index and the default full-text index
+    // `LiteDb.create` provisions on every fresh Lite database.
+    try std.testing.expectEqual(@as(usize, 2), indexes.len);
+    try std.testing.expect(indexNamed(indexes, "published_ft") != null);
+    try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 
     var restored = (try target.db.lookup(allocator, "doc:published", .{})) orelse return error.MissingPublishedDocument;
     defer restored.deinit(allocator);
@@ -1029,8 +1045,12 @@ test "lite portable publication reports durability unknown after adopting runtim
     defer restored.deinit(allocator);
     const indexes = try target.db.listIndexes(allocator);
     defer db_types.freeIndexConfigs(allocator, indexes);
-    try std.testing.expectEqual(@as(usize, 1), indexes.len);
-    try std.testing.expectEqualStrings("durable_ft", indexes[0].name);
+    // See the comment in the sibling test above: import replaces target's
+    // catalog wholesale with source's, which includes source's own default
+    // full-text index alongside its explicit one.
+    try std.testing.expectEqual(@as(usize, 2), indexes.len);
+    try std.testing.expect(indexNamed(indexes, "durable_ft") != null);
+    try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 }
 
 test "lite portable import emptiness rejects tombstones and durable transactions" {
@@ -1644,7 +1664,11 @@ test "lite portable backup roundtrips through normal table backup APIs" {
 
         const indexes = try restored.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 4), indexes.len);
+        // `restored` starts with the default full-text index from
+        // `LiteDb.create`, and `populateUnpublishedLiteDb` additively layers
+        // the portable backup's 4 indexes on top of it.
+        try std.testing.expectEqual(@as(usize, 5), indexes.len);
+        try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 
         const enrichments = try restored.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
