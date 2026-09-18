@@ -4360,12 +4360,13 @@ pub const ApiHttpServer = struct {
         const local_node_id = self.localSessionNodeId();
         const now_ns = platform_time.realtimeNs();
         for (pending) |txn_id| {
-            var recovery = (self.txn_sessions.claimPendingRecovery(self.alloc, txn_id, local_node_id, now_ns) catch |err| {
+            var recovery = (self.txn_sessions.claimPendingRecoveryOwned(self.alloc, txn_id, local_node_id, now_ns) catch |err| {
                 std.log.warn("stable transaction recovery claim deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                 continue;
             }) orelse continue;
-            defer recovery.deinit(self.alloc);
-            switch (recovery) {
+            defer recovery.deinit();
+            const replay_alloc = recovery.allocator();
+            switch (recovery.work) {
                 .acknowledge => |acknowledgement| {
                     const acknowledged = source.acknowledgeTransactionCommit(
                         self.alloc,
@@ -4383,12 +4384,15 @@ pub const ApiHttpServer = struct {
                     }) orelse continue;
                 },
                 .commit => |*commit| {
-                    const distributed_tables = commit.request.distributedTables(self.alloc) catch |err| {
-                        std.log.err("invalid sealed stable transaction during recovery txn_id={x} err={s}", .{ txn_id, @errorName(err) });
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
+                    const distributed_tables = commit.request.distributedTables(replay_alloc) catch |err| {
+                        // Constructing the borrowed table view can fail before
+                        // recovery even reaches storage. Allocation failure is
+                        // not evidence that the original transaction aborted.
+                        // Keep its durable identity and prepaid completion debt.
+                        std.log.warn("stable transaction recovery preparation deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                         continue;
                     };
-                    defer if (distributed_tables.len > 0) self.alloc.free(distributed_tables);
+                    defer if (distributed_tables.len > 0) replay_alloc.free(distributed_tables);
                     const outcome = (source.commitTransactionWithId(
                         self.alloc,
                         txn_id,
@@ -36150,6 +36154,59 @@ test "api http server reloads durable transaction sessions after restart" {
     });
     defer stored.deinit();
     try std.testing.expectEqualStrings("after restart", stored.value.title);
+}
+
+test "workload admission recovery allocation failures never retire started transactions" {
+    const alloc = std.testing.allocator;
+    const Source = struct {
+        calls: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+        fn commit(ptr: *anyopaque, _: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // No terminal evidence: maintenance must preserve the obligation.
+            return null;
+        }
+    };
+    var source: Source = .{};
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    var server = ApiHttpServer.init(failing.allocator(), .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status } }, null, .{
+        .ptr = &source,
+        .vtable = &.{ .batch = Source.batch, .commit_transaction_with_id = Source.commit },
+    });
+    defer server.deinit();
+    try server.ensureTransactionSessionMemory();
+    const session = try server.txn_sessions.begin(alloc, .{ .sync_level = .write }, server.localSessionNodeId());
+    var request = try transactions_api.parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"doc:a":{"value":1}}}}}
+    );
+    defer request.deinit(alloc);
+    var sealed = (try server.txn_sessions.cloneCommitRequest(alloc, session.txn_id, &request)).?;
+    sealed.deinit(alloc);
+    _ = try server.txn_sessions.markCommitExecutionStarted(alloc, session.txn_id);
+    const reserved = server.session_memory_admission.stats().retained_bytes;
+    var reached_source = false;
+    for (0..128) |offset| {
+        failing.fail_index = failing.alloc_index + offset;
+        const before = source.calls;
+        server.retryPendingTransactionRecovery(1) catch |err| switch (err) {
+            error.OutOfMemory => {},
+            else => return err,
+        };
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expect((try server.txn_sessions.executionStarted(alloc, session.txn_id)).?);
+        try std.testing.expectEqual(reserved, server.session_memory_admission.stats().retained_bytes);
+        if (source.calls > before) {
+            reached_source = true;
+            break;
+        }
+    }
+    try std.testing.expect(reached_source);
 }
 
 test "api http server retries stable terminal commits without replaying writes" {

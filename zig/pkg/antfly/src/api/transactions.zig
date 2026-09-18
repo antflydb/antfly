@@ -405,6 +405,45 @@ pub const PendingSessionRecovery = union(enum) {
     }
 };
 
+/// A single replay owns its private prepaid workspace until all replay buffers
+/// are destroyed. Copies of the cached session share this identity, so a second
+/// maintenance pass cannot consume the first pass's reserved capacity.
+const RecoveryWorkspace = struct {
+    memory: *@import("../common/workload_allocator.zig").Owner,
+    refs: std.atomic.Value(usize) = .init(1),
+    claimed: std.atomic.Value(bool) = .init(false),
+
+    fn retain(self: *@This()) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *@This()) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const memory = self.memory;
+        memory.allocator().destroy(self);
+        memory.release();
+    }
+};
+
+pub const OwnedSessionRecovery = struct {
+    work: PendingSessionRecovery,
+    memory: ?*RecoveryWorkspace,
+    fallback: std.mem.Allocator,
+
+    pub fn allocator(self: *const @This()) std.mem.Allocator {
+        return if (self.memory) |memory| memory.memory.allocator() else self.fallback;
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.work.deinit(self.allocator());
+        if (self.memory) |memory| {
+            memory.claimed.store(false, .release);
+            memory.release();
+        }
+        self.* = undefined;
+    }
+};
+
 pub const SessionStatus = struct {
     txn_id: db_mod.types.TxnId,
     owner_node_id: u64,
@@ -652,6 +691,7 @@ pub const Savepoint = struct {
 pub const Session = struct {
     /// Process-local prepaid completion workspace; never serialized.
     recovery_memory: ?*@import("../common/workload_allocator.zig").Owner = null,
+    recovery_workspace: ?*RecoveryWorkspace = null,
     txn_id: db_mod.types.TxnId,
     owner_node_id: u64,
     /// Stable authenticated subject that created this session. `null` is the
@@ -690,8 +730,10 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session, fallback: std.mem.Allocator) void {
         const memory = self.recovery_memory;
+        const workspace = self.recovery_workspace;
         const alloc = self.allocationAllocator(fallback);
         defer if (memory) |owner| owner.release();
+        defer if (workspace) |value| value.release();
         if (self.principal) |principal| alloc.free(principal);
         if (self.staged) |*staged| staged.deinit(alloc);
         if (self.terminal_commit) |*terminal| terminal.deinit(alloc);
@@ -995,10 +1037,14 @@ pub const DurableSessionStore = struct {
     }
 
     pub fn load(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !?Session {
-        const key = try makeSessionKey(self.alloc, txn_id);
-        defer self.alloc.free(key);
+        return self.loadWithAllocator(self.alloc, txn_id);
+    }
+
+    fn loadWithAllocator(self: *DurableSessionStore, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?Session {
+        const key = try makeSessionKey(alloc, txn_id);
+        defer alloc.free(key);
         const value = switch (self.backend) {
-            .docstore => |store| store.get(self.alloc, key) catch |err| switch (err) {
+            .docstore => |store| store.get(alloc, key) catch |err| switch (err) {
                 error.NotFound => return null,
                 else => return err,
             },
@@ -1009,11 +1055,11 @@ pub const DurableSessionStore = struct {
                     error.NotFound => return null,
                     else => return err,
                 };
-                break :blk try self.alloc.dupe(u8, raw);
+                break :blk try alloc.dupe(u8, raw);
             },
         };
-        defer self.alloc.free(value);
-        return try decodeSessionRecord(self.alloc, txn_id, value);
+        defer alloc.free(value);
+        return try decodeSessionRecord(alloc, txn_id, value);
     }
 
     pub fn delete(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !void {
@@ -1661,14 +1707,82 @@ pub const SessionRegistry = struct {
             const encoded = try encodeSessionRecord(measured_alloc, next);
             defer measured_alloc.free(encoded);
             if (self.max_record_bytes) |limit| if (encoded.len > limit) return error.SessionRecordTooLarge;
+            // Persistence validates the previous durable row while the cached
+            // record, next candidate, and encoded replacement are live. Pay
+            // for that decoder's real arena and hash-map capacities as well.
+            // The public JSON decoder accepts signed integer fields, so use
+            // the largest representable value for this measurement only; the
+            // encoded replacement above still measures the full u64 ceiling.
+            probe.owner_node_id = std.math.maxInt(i64);
+            probe.begin_timestamp = std.math.maxInt(i64);
+            probe.last_touched_timestamp = std.math.maxInt(i64);
+            probe.terminal_commit.?.coordinator_group_id = std.math.maxInt(i64);
+            const previous_encoded = try encodeSessionRecord(measured_alloc, probe);
+            defer measured_alloc.free(previous_encoded);
+            var previous = try decodeSessionRecord(measured_alloc, probe.txn_id, previous_encoded);
+            defer previous.deinit(measured_alloc);
+            const session_key = try makeSessionKey(measured_alloc, probe.txn_id);
+            defer measured_alloc.free(session_key);
+            const old_expiry_key = try makeSessionExpiryKey(measured_alloc, std.math.maxInt(u64), probe.txn_id);
+            defer measured_alloc.free(old_expiry_key);
+            const expiry_key = try makeSessionExpiryKey(measured_alloc, std.math.maxInt(u64), probe.txn_id);
+            defer measured_alloc.free(expiry_key);
+            const recovery_key = try makeSessionRecoveryKey(measured_alloc, probe.txn_id);
+            defer measured_alloc.free(recovery_key);
             break :blk counter.peak;
         };
         const owner = try @import("../common/workload_allocator.zig").Owner.createReserved(self.recovery_backing.?, gate, capacity);
         errdefer owner.release();
+        const workspace = try self.reserveReplayWorkspace(candidate.*, alloc);
+        errdefer workspace.release();
         var reserved = try candidate.clone(owner.allocator());
         reserved.recovery_memory = owner;
+        reserved.recovery_workspace = workspace;
         candidate.deinit(alloc);
         candidate.* = reserved;
+    }
+
+    /// Measure the actual JSON decoder, including its arena and hash-table
+    /// capacities, while the immutable request clone and table view coexist.
+    /// This covers API replay preparation only; storage/RPC execution retains
+    /// its own allocator and separate admission contract.
+    fn reserveReplayWorkspace(self: *SessionRegistry, candidate: Session, alloc: std.mem.Allocator) !*RecoveryWorkspace {
+        var counter: CloneCounter = .{ .backing = self.retainedAllocator(alloc) };
+        const measured = counter.allocator();
+        var probe = try candidate.clone(measured);
+        defer probe.deinit(measured);
+        if (probe.terminal_commit) |*terminal| terminal.deinit(measured);
+        probe.terminal_commit = null;
+        const name = try measured.alloc(u8, completionNameBound(candidate));
+        @memset(name, 1);
+        probe.terminal_commit = .{
+            .status = .committed_visibility_pending,
+            .repair_required = false,
+            .coordinator_group_id = std.math.maxInt(i64),
+            .coordinator_table_name = name,
+            .coordinator_acknowledged = false,
+        };
+        probe.commit_execution_started = true;
+        const encoded = try encodeSessionRecord(measured, probe);
+        defer measured.free(encoded);
+        const key = try makeSessionKey(measured, candidate.txn_id);
+        defer measured.free(key);
+        var decoded = try decodeSessionRecord(measured, candidate.txn_id, encoded);
+        defer decoded.deinit(measured);
+        if (decoded.staged) |request| {
+            var replay = try request.clone(measured);
+            defer replay.deinit(measured);
+            const tables = try replay.distributedTables(measured);
+            defer if (tables.len > 0) measured.free(tables);
+        }
+        // The probe remains live throughout measurement, conservatively paying
+        // for metadata changes and terminal acknowledgement strings as well.
+        const capacity = try std.math.add(usize, counter.peak, @sizeOf(RecoveryWorkspace));
+        const memory = try @import("../common/workload_allocator.zig").Owner.createReserved(self.recovery_backing.?, self.recovery_gate.?, capacity);
+        errdefer memory.release();
+        const workspace = try memory.allocator().create(RecoveryWorkspace);
+        workspace.* = .{ .memory = memory };
+        return workspace;
     }
 
     fn cloneMutation(self: *SessionRegistry, source: Session, alloc: std.mem.Allocator) !Session {
@@ -1677,6 +1791,10 @@ pub const SessionRegistry = struct {
         if (memory) |owner| {
             owner.retain();
             cloned.recovery_memory = owner;
+        }
+        if (source.recovery_workspace) |workspace| {
+            workspace.retain();
+            cloned.recovery_workspace = workspace;
         }
         return cloned;
     }
@@ -2191,6 +2309,44 @@ pub const SessionRegistry = struct {
     /// Claims indexed work under the session lease and returns a stable clone
     /// of the exact action to execute. A foreign owner is transferred only
     /// after its durable lease expires.
+    pub fn claimPendingRecoveryOwned(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        owner_node_id: u64,
+        now_ns: u64,
+    ) !?OwnedSessionRecovery {
+        var memory: ?*RecoveryWorkspace = null;
+        if (self.recovery_gate != null) {
+            // Startup restores local obligations. An adopted foreign session
+            // must also acquire its full reservation before it can be replayed.
+            self.mutex.lock();
+            const cached = self.sessions.contains(txn_id);
+            self.mutex.unlock();
+            if (!cached) _ = (try self.getStatus(alloc, txn_id)) orelse return null;
+            self.mutex.lock();
+            memory = if (self.sessions.getPtr(txn_id)) |session| session.recovery_workspace else null;
+            if (memory) |workspace| workspace.retain();
+            self.mutex.unlock();
+            const workspace = memory orelse return error.RecoveryReservationRequired;
+            if (workspace.claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+                workspace.release();
+                return null;
+            }
+        }
+        var transferred = false;
+        defer if (!transferred) {
+            if (memory) |workspace| {
+                workspace.claimed.store(false, .release);
+                workspace.release();
+            }
+        };
+        const work_alloc = if (memory) |workspace| workspace.memory.allocator() else alloc;
+        const work = (try self.claimPendingRecovery(work_alloc, txn_id, owner_node_id, now_ns)) orelse return null;
+        transferred = true;
+        return .{ .work = work, .memory = memory, .fallback = alloc };
+    }
+
     pub fn claimPendingRecovery(
         self: *SessionRegistry,
         alloc: std.mem.Allocator,
@@ -2203,14 +2359,14 @@ pub const SessionRegistry = struct {
         defer session_lock.unlock();
 
         var candidate = if (self.durable) |durable|
-            (try durable.load(txn_id)) orelse return null
+            (try durable.loadWithAllocator(alloc, txn_id)) orelse return null
         else blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
             const session = self.sessions.getPtr(txn_id) orelse return null;
             break :blk try session.clone(alloc);
         };
-        defer candidate.deinit(if (self.durable) |durable| durable.alloc else alloc);
+        defer candidate.deinit(alloc);
 
         if (candidate.owner_node_id != owner_node_id) {
             const durable = self.durable orelse return null;
@@ -2224,12 +2380,12 @@ pub const SessionRegistry = struct {
             touchSession(&adopted);
             const reserved_slot = try self.reserveCachePublication(retained_alloc, txn_id);
             defer self.releaseCachePublication(reserved_slot);
-            var replay = try adopted.clone(durable.alloc);
+            var replay = try adopted.clone(alloc);
             var replay_owned = true;
-            defer if (replay_owned) replay.deinit(durable.alloc);
+            defer if (replay_owned) replay.deinit(alloc);
             const ttl_ms = @max(@as(u64, 1), self.owner_lease_ttl_ns.? / std.time.ns_per_ms);
             if (!(try durable.saveWithLease(adopted, expected_owner, now_ns / std.time.ns_per_ms, ttl_ms, true, self.max_record_bytes))) return null;
-            candidate.deinit(durable.alloc);
+            candidate.deinit(alloc);
             candidate = replay;
             replay_owned = false;
             try self.publishAdoptedCandidateAssumeStripe(retained_alloc, txn_id, &adopted);
@@ -2713,16 +2869,21 @@ pub const SessionRegistry = struct {
 
     fn cloneAdoptedCandidate(self: *SessionRegistry, persisted: Session, alloc: std.mem.Allocator) !Session {
         self.mutex.lock();
+        var cached_workspace: ?*RecoveryWorkspace = null;
         const cached_owner = if (self.sessions.getPtr(persisted.txn_id)) |cached| blk: {
             if (!std.meta.eql(cached.commit_body_digest, persisted.commit_body_digest)) break :blk null;
+            cached_workspace = cached.recovery_workspace;
+            if (cached_workspace) |workspace| workspace.retain();
             break :blk cached.recovery_memory;
         } else null;
         if (cached_owner) |owner| owner.retain();
         self.mutex.unlock();
         if (cached_owner) |owner| {
             errdefer owner.release();
+            errdefer if (cached_workspace) |workspace| workspace.release();
             var cloned = try persisted.clone(owner.allocator());
             cloned.recovery_memory = owner;
+            cloned.recovery_workspace = cached_workspace;
             return cloned;
         }
         var cloned = try persisted.clone(self.retainedAllocator(alloc));
@@ -2758,7 +2919,11 @@ pub const SessionRegistry = struct {
 
     fn persistLocked(self: *SessionRegistry, alloc: std.mem.Allocator, session: Session) !void {
         if (self.durable) |durable| {
-            durable.save(session, self.max_record_bytes) catch |err| {
+            // The view contains only borrowed backend handles and immutable
+            // options. Never mutate the shared store allocator across calls.
+            var scoped = durable.*;
+            scoped.alloc = session.allocationAllocator(alloc);
+            scoped.save(session, self.max_record_bytes) catch |err| {
                 if (err == error.TransactionCommitAlreadyStarted) {
                     // Discard only a stale pre-start cache entry. No live
                     // completion reserve may be released on this rejection.
@@ -6228,4 +6393,97 @@ test "workload admission completion record capacity is checked before execution 
     try std.testing.expectEqual(before, gate.stats().retained_bytes);
     try std.testing.expect(!(try registry.executionStarted(alloc, id)).?);
     try std.testing.expect(try registry.abortOpenSession(alloc, id));
+}
+
+test "workload admission recovery replay is prepaid exclusive and outlives its registry" {
+    const alloc = std.testing.allocator;
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(0, .{ .max_retained_bytes = 1024 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(alloc, &gate);
+    defer owner.release();
+    var registry = SessionRegistry.init(null);
+    var registry_live = true;
+    defer if (registry_live) registry.deinit(alloc);
+    try registry.installRetainedOwner(owner, &gate);
+    const id = try beginSealedRecoveryTestSession(&registry, alloc);
+    _ = try registry.markCommitExecutionStarted(alloc, id);
+    const reserved = gate.stats().retained_bytes;
+    try gate.reconfigure(0, .{ .max_retained_bytes = reserved });
+    gate.close();
+
+    var first = (try registry.claimPendingRecoveryOwned(alloc, id, 9, nextTxnTimestamp())).?;
+    defer first.deinit();
+    try std.testing.expect((try registry.claimPendingRecoveryOwned(alloc, id, 9, nextTxnTimestamp())) == null);
+    const tables = try first.work.commit.request.distributedTables(first.allocator());
+    defer first.allocator().free(tables);
+    try std.testing.expectEqualStrings("docs", tables[0].table_name);
+    try std.testing.expectEqual(reserved, gate.stats().retained_bytes);
+    // A cancelled client cannot abort this obligation. Terminal bookkeeping
+    // has a separate prepaid workspace and remains possible during a replay.
+    try std.testing.expectError(error.TransactionCommitAlreadyStarted, registry.abortOpenSession(alloc, id));
+    _ = try registry.recordTerminalCommit(alloc, id, .committed, 1, "docs");
+    try std.testing.expectEqual(reserved, gate.stats().retained_bytes);
+    registry.deinit(alloc);
+    registry_live = false;
+    try std.testing.expect(gate.stats().retained_bytes > 0);
+    try std.testing.expectEqualStrings("docs", first.work.commit.request.tables[0].table_name);
+}
+
+test "workload admission durable replay restores private memory before ordinary sessions" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/prepaid-replay", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+    var id: db_mod.types.TxnId = undefined;
+    {
+        var writer = SessionRegistry.init(&durable);
+        defer writer.deinit(alloc);
+        id = try beginSealedRecoveryTestSession(&writer, alloc);
+        _ = try writer.markCommitExecutionStarted(alloc, id);
+    }
+    var gate = @import("../common/workload_admission.zig").Controller.initConfigured(0, .{ .max_retained_bytes = 1024 * 1024 });
+    defer gate.deinitMemory();
+    const owner = try @import("../common/workload_allocator.zig").Owner.create(alloc, &gate);
+    defer owner.release();
+    var reader = SessionRegistry.init(&durable);
+    defer reader.deinit(alloc);
+    try reader.installRetainedOwner(owner, &gate);
+    const reserved = gate.stats().retained_bytes;
+    try gate.reconfigure(0, .{ .max_retained_bytes = reserved });
+    gate.close();
+    var rejected = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var replay = (try reader.claimPendingRecoveryOwned(rejected.allocator(), id, 9, nextTxnTimestamp())).?;
+    try std.testing.expectEqualStrings("docs", replay.work.commit.request.tables[0].table_name);
+    replay.deinit();
+    var retried = (try reader.claimPendingRecoveryOwned(rejected.allocator(), id, 9, nextTxnTimestamp())).?;
+    defer retried.deinit();
+    // Store serialization and validation use the original record completion
+    // reserve, independently of the currently active replay workspace.
+    durable.alloc = rejected.allocator();
+    defer durable.alloc = alloc;
+    _ = try reader.recordTerminalCommit(rejected.allocator(), id, .committed, 1, "docs");
+    try std.testing.expectEqual(reserved, gate.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), rejected.alloc_index);
+}
+
+test "workload admission durable session decoder releases every partial allocation" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(alloc);
+    const id = try beginSealedRecoveryTestSession(&registry, alloc);
+    _ = try registry.markCommitExecutionStarted(alloc, id);
+    _ = try registry.recordTerminalCommit(alloc, id, .committed_visibility_pending, 1, "docs");
+    const body = try encodeSessionRecord(alloc, registry.sessions.get(id).?);
+    defer alloc.free(body);
+    const Fixture = struct {
+        fn run(failing: std.mem.Allocator, txn_id: db_mod.types.TxnId, encoded: []const u8) !void {
+            var session = try decodeSessionRecord(failing, txn_id, encoded);
+            session.deinit(failing);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Fixture.run, .{ id, body });
 }

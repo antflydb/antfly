@@ -126,6 +126,21 @@ lease through their nonyielding regions. This stage does not assert arbitrary
 operator preemption, process-wide RSS limits, distributed fan-out ownership, or
 release performance qualification.
 
+### API recovery follow-up
+
+Started durable transaction sessions now retain an exclusive prepaid replay
+workspace as well as completion-record capacity. The reservation covers decoding,
+cloning, distributed table views, and replacement-record overlap. Startup restores
+it before ordinary sessions can consume that capacity. Allocation failure while
+preparing replay keeps the original durable obligation for another pass; it no
+longer removes the transaction. The allocator failure sweep also exposed and
+fixed a batch-parser key leak when value serialization fails.
+
+The integrated development checkpoint passed 190 tests, with one optional skip,
+zero failures/leaks, and six expected error logs. This validates the API replay
+slice; storage/index preparation, protected control progress under sustained
+load, and release performance qualification remain separate work.
+
 ## Implemented admission contract
 
 `common/workload_admission.zig` owns an allocation-free intrusive FIFO, active

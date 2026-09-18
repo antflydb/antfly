@@ -977,8 +977,10 @@ fn parseInserts(
         // preserve replay and movement of durable data written by older nodes.
         if (require_document_objects and entry.value_ptr.* != .object)
             return error.InvalidBatchRequest;
+        const key = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(key);
         writes[initialized] = .{
-            .key = try alloc.dupe(u8, entry.key_ptr.*),
+            .key = key,
             .value = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{}),
         };
         initialized += 1;
