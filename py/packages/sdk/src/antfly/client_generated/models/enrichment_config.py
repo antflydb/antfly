@@ -47,8 +47,10 @@ class EnrichmentConfig:
             transcriber (TranscriberEnrichmentConfig | Unset): Speech-to-text provider for the `transcriber` enrichment
                 shorthand.
 
-                Accepts every field of the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus
-                the transcription options below.
+                Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription
+                options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client
+                can leave an option out: a composed schema makes a typed client serialize every field, and a
+                `max_download_bytes` of zero would reject every recording.
 
                 **Example:**
                 ```yaml

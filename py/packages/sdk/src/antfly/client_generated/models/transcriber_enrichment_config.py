@@ -16,8 +16,10 @@ T = TypeVar("T", bound="TranscriberEnrichmentConfig")
 class TranscriberEnrichmentConfig:
     """Speech-to-text provider for the `transcriber` enrichment shorthand.
 
-    Accepts every field of the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the
-    transcription options below.
+    Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription
+    options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can
+    leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of
+    zero would reject every recording.
 
     **Example:**
     ```yaml
@@ -33,6 +35,15 @@ class TranscriberEnrichmentConfig:
 
         Attributes:
             provider (STTProvider): The STT provider to use.
+            model (str | Unset): Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1'
+                for openai).
+            api_url (str | Unset): Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+            base_url (str | Unset): OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+            api_key (str | Unset): Provider API key. Falls back to the provider's environment variable.
+            project_id (str | Unset): Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT.
+            location (str | Unset): Google Cloud location for the vertex provider.
+            credentials_path (str | Unset): Path to an ADC credential JSON file for the vertex provider. Falls back to the
+                default ADC chain.
             language_code (str | Unset): Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the
                 provider supports it.
             timestamps (bool | Unset): Request timestamped transcript segments so chunks carry recording offsets. Providers
@@ -44,6 +55,13 @@ class TranscriberEnrichmentConfig:
     """
 
     provider: STTProvider
+    model: str | Unset = UNSET
+    api_url: str | Unset = UNSET
+    base_url: str | Unset = UNSET
+    api_key: str | Unset = UNSET
+    project_id: str | Unset = UNSET
+    location: str | Unset = UNSET
+    credentials_path: str | Unset = UNSET
     language_code: str | Unset = UNSET
     timestamps: bool | Unset = True
     diarization: bool | Unset = False
@@ -52,6 +70,20 @@ class TranscriberEnrichmentConfig:
 
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
+
+        model = self.model
+
+        api_url = self.api_url
+
+        base_url = self.base_url
+
+        api_key = self.api_key
+
+        project_id = self.project_id
+
+        location = self.location
+
+        credentials_path = self.credentials_path
 
         language_code = self.language_code
 
@@ -68,6 +100,20 @@ class TranscriberEnrichmentConfig:
                 "provider": provider,
             }
         )
+        if model is not UNSET:
+            field_dict["model"] = model
+        if api_url is not UNSET:
+            field_dict["api_url"] = api_url
+        if base_url is not UNSET:
+            field_dict["base_url"] = base_url
+        if api_key is not UNSET:
+            field_dict["api_key"] = api_key
+        if project_id is not UNSET:
+            field_dict["project_id"] = project_id
+        if location is not UNSET:
+            field_dict["location"] = location
+        if credentials_path is not UNSET:
+            field_dict["credentials_path"] = credentials_path
         if language_code is not UNSET:
             field_dict["language_code"] = language_code
         if timestamps is not UNSET:
@@ -84,6 +130,20 @@ class TranscriberEnrichmentConfig:
         d = dict(src_dict)
         provider = STTProvider(d.pop("provider"))
 
+        model = d.pop("model", UNSET)
+
+        api_url = d.pop("api_url", UNSET)
+
+        base_url = d.pop("base_url", UNSET)
+
+        api_key = d.pop("api_key", UNSET)
+
+        project_id = d.pop("project_id", UNSET)
+
+        location = d.pop("location", UNSET)
+
+        credentials_path = d.pop("credentials_path", UNSET)
+
         language_code = d.pop("language_code", UNSET)
 
         timestamps = d.pop("timestamps", UNSET)
@@ -94,6 +154,13 @@ class TranscriberEnrichmentConfig:
 
         transcriber_enrichment_config = cls(
             provider=provider,
+            model=model,
+            api_url=api_url,
+            base_url=base_url,
+            api_key=api_key,
+            project_id=project_id,
+            location=location,
+            credentials_path=credentials_path,
             language_code=language_code,
             timestamps=timestamps,
             diarization=diarization,

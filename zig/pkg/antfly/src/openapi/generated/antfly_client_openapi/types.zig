@@ -1866,39 +1866,6 @@ pub const AntflyRerankerConfig = struct {
     }
 };
 
-/// Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider. Uses the Antfly inference service for speech-to-text inference. **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC **Docs:** See inference documentation
-pub const AntflySTTConfig = struct {
-    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    /// Explicit Antfly transcriber model name (e.g., 'openai/whisper-tiny').
-    model: []const u8,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "api_url", "api_url", true },
-        .{ "model", "model", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.api_url) |value| {
-            try jw.objectField("api_url");
-            try jw.write(value);
-        }
-        try jw.objectField("model");
-        try jw.write(self.model);
-        try jw.endObject();
-    }
-};
-
 pub const AntflyType = enum {
     search_as_you_type,
     keyword,
@@ -27553,48 +27520,6 @@ pub const OpenAIReasoningEffort = enum {
     }
 };
 
-/// Configuration for OpenAI STT (Whisper) provider. API key via `api_key` field or `OPENAI_API_KEY` environment variable. **Model:** whisper-1 **Supported Formats:** mp3, wav, webm, ogg, flac (max 25MB) **Docs:** https://platform.openai.com/docs/guides/speech-to-text
-pub const OpenAISTTConfig = struct {
-    /// Whisper model to use.
-    model: ?[]const u8 = null,
-    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
-    base_url: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", true },
-        .{ "api_key", "api_key", true },
-        .{ "base_url", "base_url", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.base_url) |value| {
-            try jw.objectField("base_url");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 /// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. Antfly currently supports dense text embeddings through this provider. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
 pub const OpenRouterEmbedderConfig = struct {
     provider: []const u8,
@@ -32479,101 +32404,6 @@ pub const SSEToolMode = struct {
     }
 };
 
-/// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
-pub const STTConfig = struct {
-    /// Whisper model to use.
-    model: ?[]const u8 = null,
-    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
-    base_url: ?[]const u8 = null,
-    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location.
-    location: ?[]const u8 = null,
-    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
-    credentials_path: ?[]const u8 = null,
-    /// Default language code (e.g., 'en-US', 'es-ES').
-    language_code: ?[]const u8 = null,
-    /// Enable automatic punctuation.
-    enable_automatic_punctuation: ?bool = null,
-    /// Use enhanced models for better accuracy (costs more).
-    use_enhanced: ?bool = null,
-    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    provider: STTProvider,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", true },
-        .{ "api_key", "api_key", true },
-        .{ "base_url", "base_url", true },
-        .{ "project_id", "project_id", true },
-        .{ "location", "location", true },
-        .{ "credentials_path", "credentials_path", true },
-        .{ "language_code", "language_code", true },
-        .{ "enable_automatic_punctuation", "enable_automatic_punctuation", true },
-        .{ "use_enhanced", "use_enhanced", true },
-        .{ "api_url", "api_url", true },
-        .{ "provider", "provider", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.base_url) |value| {
-            try jw.objectField("base_url");
-            try jw.write(value);
-        }
-        if (self.project_id) |value| {
-            try jw.objectField("project_id");
-            try jw.write(value);
-        }
-        if (self.location) |value| {
-            try jw.objectField("location");
-            try jw.write(value);
-        }
-        if (self.credentials_path) |value| {
-            try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        if (self.language_code) |value| {
-            try jw.objectField("language_code");
-            try jw.write(value);
-        }
-        if (self.enable_automatic_punctuation) |value| {
-            try jw.objectField("enable_automatic_punctuation");
-            try jw.write(value);
-        }
-        if (self.use_enhanced) |value| {
-            try jw.objectField("use_enhanced");
-            try jw.write(value);
-        }
-        if (self.api_url) |value| {
-            try jw.objectField("api_url");
-            try jw.write(value);
-        }
-        try jw.objectField("provider");
-        try jw.write(self.provider);
-        try jw.endObject();
-    }
-};
-
 /// The STT provider to use.
 pub const STTProvider = enum {
     openai,
@@ -36223,29 +36053,25 @@ pub const TransactionStatusResponse = struct {
     transaction_id: []const u8,
 };
 
-/// Speech-to-text provider for the `transcriber` enrichment shorthand. Accepts every field of the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. **Example:** ```yaml name: call_transcripts kind: asset field: recording_url transcriber: provider: antfly model: openai/whisper-base language_code: en timestamps: true ```
+/// Speech-to-text provider for the `transcriber` enrichment shorthand. Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording. **Example:** ```yaml name: call_transcripts kind: asset field: recording_url transcriber: provider: antfly model: openai/whisper-base language_code: en timestamps: true ```
 pub const TranscriberEnrichmentConfig = struct {
-    /// Whisper model to use.
+    provider: STTProvider,
+    /// Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1' for openai).
     model: ?[]const u8 = null,
-    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
-    base_url: ?[]const u8 = null,
-    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location.
-    location: ?[]const u8 = null,
-    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
-    credentials_path: ?[]const u8 = null,
-    /// Default language code (e.g., 'en-US', 'es-ES').
-    language_code: ?[]const u8 = null,
-    /// Enable automatic punctuation.
-    enable_automatic_punctuation: ?bool = null,
-    /// Use enhanced models for better accuracy (costs more).
-    use_enhanced: ?bool = null,
-    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
+    /// Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
     api_url: ?[]const u8 = null,
-    provider: ?STTProvider = null,
+    /// OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+    base_url: ?[]const u8 = null,
+    /// Provider API key. Falls back to the provider's environment variable.
+    api_key: ?[]const u8 = null,
+    /// Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for the vertex provider.
+    location: ?[]const u8 = null,
+    /// Path to an ADC credential JSON file for the vertex provider. Falls back to the default ADC chain.
+    credentials_path: ?[]const u8 = null,
+    /// Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it.
+    language_code: ?[]const u8 = null,
     /// Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text.
     timestamps: ?bool = null,
     /// Request speaker labels on transcript segments where the provider supports them.
@@ -36255,17 +36081,15 @@ pub const TranscriberEnrichmentConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
         .{ "model", "model", true },
-        .{ "api_key", "api_key", true },
+        .{ "api_url", "api_url", true },
         .{ "base_url", "base_url", true },
+        .{ "api_key", "api_key", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
         .{ "credentials_path", "credentials_path", true },
         .{ "language_code", "language_code", true },
-        .{ "enable_automatic_punctuation", "enable_automatic_punctuation", true },
-        .{ "use_enhanced", "use_enhanced", true },
-        .{ "api_url", "api_url", true },
-        .{ "provider", "provider", true },
         .{ "timestamps", "timestamps", true },
         .{ "diarization", "diarization", true },
         .{ "max_download_bytes", "max_download_bytes", true },
@@ -36281,16 +36105,22 @@ pub const TranscriberEnrichmentConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
         if (self.model) |value| {
             try jw.objectField("model");
             try jw.write(value);
         }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
             try jw.write(value);
         }
         if (self.base_url) |value| {
             try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
             try jw.write(value);
         }
         if (self.project_id) |value| {
@@ -36307,22 +36137,6 @@ pub const TranscriberEnrichmentConfig = struct {
         }
         if (self.language_code) |value| {
             try jw.objectField("language_code");
-            try jw.write(value);
-        }
-        if (self.enable_automatic_punctuation) |value| {
-            try jw.objectField("enable_automatic_punctuation");
-            try jw.write(value);
-        }
-        if (self.use_enhanced) |value| {
-            try jw.objectField("use_enhanced");
-            try jw.write(value);
-        }
-        if (self.api_url) |value| {
-            try jw.objectField("api_url");
-            try jw.write(value);
-        }
-        if (self.provider) |value| {
-            try jw.objectField("provider");
             try jw.write(value);
         }
         if (self.timestamps) |value| {
@@ -37691,76 +37505,6 @@ pub const VertexRerankerConfig = struct {
         }
         if (self.credentials_path) |value| {
             try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Configuration for Google Cloud Speech-to-Text provider (Vertex AI). Uses Application Default Credentials (ADC) for authentication. **Features:** Streaming, speaker diarization, automatic punctuation **Docs:** https://cloud.google.com/speech-to-text/docs
-pub const VertexSTTConfig = struct {
-    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location.
-    location: ?[]const u8 = null,
-    /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain.
-    credentials_path: ?[]const u8 = null,
-    /// Default language code (e.g., 'en-US', 'es-ES').
-    language_code: ?[]const u8 = null,
-    /// Enable automatic punctuation.
-    enable_automatic_punctuation: ?bool = null,
-    /// Use enhanced models for better accuracy (costs more).
-    use_enhanced: ?bool = null,
-    /// Recognition model (e.g., 'latest_long', 'telephony', 'medical_dictation').
-    model: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "project_id", "project_id", true },
-        .{ "location", "location", true },
-        .{ "credentials_path", "credentials_path", true },
-        .{ "language_code", "language_code", true },
-        .{ "enable_automatic_punctuation", "enable_automatic_punctuation", true },
-        .{ "use_enhanced", "use_enhanced", true },
-        .{ "model", "model", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.project_id) |value| {
-            try jw.objectField("project_id");
-            try jw.write(value);
-        }
-        if (self.location) |value| {
-            try jw.objectField("location");
-            try jw.write(value);
-        }
-        if (self.credentials_path) |value| {
-            try jw.objectField("credentials_path");
-            try jw.write(value);
-        }
-        if (self.language_code) |value| {
-            try jw.objectField("language_code");
-            try jw.write(value);
-        }
-        if (self.enable_automatic_punctuation) |value| {
-            try jw.objectField("enable_automatic_punctuation");
-            try jw.write(value);
-        }
-        if (self.use_enhanced) |value| {
-            try jw.objectField("use_enhanced");
-            try jw.write(value);
-        }
-        if (self.model) |value| {
-            try jw.objectField("model");
             try jw.write(value);
         }
         try jw.endObject();

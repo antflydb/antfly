@@ -93,8 +93,14 @@ pub const Config = struct {
 /// covers those with room to spare; `Config.max_download_bytes` raises it.
 pub const default_max_download_bytes: usize = 128 << 20;
 
+/// The fetch ceiling for a provider, falling back to the default.
+///
+/// Zero is treated as unset. The schema's minimum is one byte and a ceiling
+/// of zero rejects every recording, so it is always a client that filled in
+/// a field it meant to leave out rather than an operator asking for it.
 fn remoteFetchSecurity(max_download_bytes: ?usize) scraping.ContentSecurityConfig {
-    return .{ .max_download_size_bytes = max_download_bytes orelse default_max_download_bytes };
+    const configured = if (max_download_bytes) |value| (if (value == 0) null else value) else null;
+    return .{ .max_download_size_bytes = configured orelse default_max_download_bytes };
 }
 
 threadlocal var active_runtime: ?*const Runtime = null;
@@ -798,6 +804,11 @@ const VertexTranscriberState = struct {
     enable_automatic_punctuation: ?bool = null,
     max_response_bytes: ?usize = null,
     max_download_bytes: ?usize = null,
+    /// Provider-level defaults for the request options. A request may
+    /// override either; a registered provider that asks for speaker labels
+    /// must get them even when the caller says nothing about them.
+    timestamps: ?bool = null,
+    diarization: ?bool = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
         const state = try alloc.create(VertexTranscriberState);
@@ -814,6 +825,8 @@ const VertexTranscriberState = struct {
             .enable_automatic_punctuation = cfg.enable_automatic_punctuation,
             .max_response_bytes = cfg.max_response_bytes,
             .max_download_bytes = cfg.max_download_bytes,
+            .timestamps = cfg.timestamps,
+            .diarization = cfg.diarization,
         };
         errdefer state.deinitState();
 
@@ -909,8 +922,10 @@ const VertexTranscriberState = struct {
         // Word offsets are what segment timing is rebuilt from, so they are
         // requested whenever timestamps are wanted; speaker labels ride on
         // the same words when diarization is on.
-        const want_timestamps = req.timestamps orelse true;
-        const want_diarization = req.diarization orelse false;
+        // Request first, then what the provider was registered with, then
+        // the default.
+        const want_timestamps = req.timestamps orelse self.timestamps orelse true;
+        const want_diarization = req.diarization orelse self.diarization orelse false;
         const body = try httpx.json.Json.stringifyRequest(alloc, RequestBody{
             .config = .{
                 .model = self.model,
@@ -1214,6 +1229,101 @@ test "vertex segments keep the transcript's punctuation" {
     const text = response.text.?;
     try std.testing.expect(std.mem.indexOf(u8, text, segments[0].text.?) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, segments[1].text.?) != null);
+}
+
+test "vertex applies request, then provider config, then default" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    // A provider registered with diarization on must send it even when the
+    // request says nothing, and a request may still override it.
+    const Case = struct {
+        config_diarization: ?bool,
+        config_timestamps: ?bool,
+        request_diarization: ?bool,
+        request_timestamps: ?bool,
+        expect_diarization: bool,
+        expect_word_offsets: bool,
+    };
+    const cases = [_]Case{
+        .{ .config_diarization = true, .config_timestamps = null, .request_diarization = null, .request_timestamps = null, .expect_diarization = true, .expect_word_offsets = true },
+        .{ .config_diarization = null, .config_timestamps = null, .request_diarization = null, .request_timestamps = null, .expect_diarization = false, .expect_word_offsets = true },
+        .{ .config_diarization = null, .config_timestamps = false, .request_diarization = null, .request_timestamps = null, .expect_diarization = false, .expect_word_offsets = false },
+        .{ .config_diarization = true, .config_timestamps = null, .request_diarization = false, .request_timestamps = null, .expect_diarization = false, .expect_word_offsets = true },
+        .{ .config_diarization = null, .config_timestamps = false, .request_diarization = null, .request_timestamps = true, .expect_diarization = false, .expect_word_offsets = true },
+    };
+
+    for (cases) |case| {
+        var server = try httpx.TestServer.start(alloc, io, &.{.{
+            .method = .POST,
+            .path = "/projects/p/locations/global/recognizers/_:recognize",
+            .assert_request = captureVertexRequestBody,
+            .respond = .{ .body = "{\"results\":[{\"alternatives\":[{\"transcript\":\"hi\"}],\"languageCode\":\"en-US\"}]}" },
+        }});
+        defer server.deinit();
+        const endpoint = try std.fmt.allocPrint(alloc, "{s}", .{server.baseUrl()});
+        defer alloc.free(endpoint);
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        defer client.deinit();
+
+        var response: ?Response = null;
+        defer if (response) |*value| deinitResponse(alloc, value);
+        var run_err: ?anyerror = null;
+        var group = std.Io.Group.init;
+        const Fiber = struct {
+            fn run(a: Allocator, http: *httpx.Client, url: []const u8, c: Case, out: *?Response, err_out: *?anyerror) std.Io.Cancelable!void {
+                out.* = transcribeWithConfig(a, http, .{
+                    .provider = .vertex,
+                    .base_url = url,
+                    .project_id = "p",
+                    .api_key = "token",
+                    .timestamps = c.config_timestamps,
+                    .diarization = c.config_diarization,
+                }, .{
+                    .url = "data:audio/wav;base64,ZmFrZQ==",
+                    .timestamps = c.request_timestamps,
+                    .diarization = c.request_diarization,
+                }, .{}) catch |err| {
+                    err_out.* = err;
+                    return;
+                };
+            }
+        };
+        vertex_request_body_len = 0;
+        group.concurrent(io, Fiber.run, .{ alloc, &client, endpoint, case, &response, &run_err }) catch return;
+        try server.handleOne();
+        group.await(io) catch {};
+        if (run_err) |err| return err;
+
+        const sent = vertex_request_body[0..vertex_request_body_len];
+        const sent_diarization = std.mem.indexOf(u8, sent, "\"diarizationConfig\"") != null;
+        try std.testing.expectEqual(case.expect_diarization, sent_diarization);
+        const sent_word_offsets = std.mem.indexOf(u8, sent, "\"enableWordTimeOffsets\":true") != null;
+        try std.testing.expectEqual(case.expect_word_offsets, sent_word_offsets);
+    }
+}
+
+/// The body of the last request the Vertex fixture server received.
+var vertex_request_body: [8192]u8 = undefined;
+var vertex_request_body_len: usize = 0;
+
+fn captureVertexRequestBody(req: httpx.testing_mod.RequestInfo) !void {
+    vertex_request_body_len = @min(req.body.len, vertex_request_body.len);
+    @memcpy(vertex_request_body[0..vertex_request_body_len], req.body[0..vertex_request_body_len]);
+}
+
+test "a zero download ceiling is treated as unset" {
+    // A generated client that serializes every field sends
+    // max_download_bytes: 0, which as a literal ceiling rejects every
+    // recording. Zero is below the schema's minimum, so it means "unset".
+    const zero = remoteFetchSecurity(0);
+    try std.testing.expectEqual(default_max_download_bytes, zero.max_download_size_bytes);
+    const unset = remoteFetchSecurity(null);
+    try std.testing.expectEqual(default_max_download_bytes, unset.max_download_size_bytes);
+    const configured = remoteFetchSecurity(4096);
+    try std.testing.expectEqual(@as(usize, 4096), configured.max_download_size_bytes);
 }
 
 test "vertex durations parse protobuf seconds" {

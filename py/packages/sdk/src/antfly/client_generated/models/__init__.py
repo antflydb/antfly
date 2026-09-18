@@ -42,7 +42,6 @@ from .antfly_generator_config import AntflyGeneratorConfig
 from .antfly_generator_config_provider import AntflyGeneratorConfigProvider
 from .antfly_reranker_config import AntflyRerankerConfig
 from .antfly_reranker_config_provider import AntflyRerankerConfigProvider
-from .antfly_stt_config import AntflySTTConfig
 from .antfly_type import AntflyType
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
@@ -935,7 +934,6 @@ from .open_ai_embedder_config_provider import OpenAIEmbedderConfigProvider
 from .open_ai_generator_config import OpenAIGeneratorConfig
 from .open_ai_generator_config_provider import OpenAIGeneratorConfigProvider
 from .open_ai_reasoning_effort import OpenAIReasoningEffort
-from .open_aistt_config import OpenAISTTConfig
 from .open_router_embedder_config import OpenRouterEmbedderConfig
 from .open_router_embedder_config_provider import OpenRouterEmbedderConfigProvider
 from .open_router_generator_config import OpenRouterGeneratorConfig
@@ -1100,7 +1098,6 @@ from .storage_runtime_status import StorageRuntimeStatus
 from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
 from .stream_transcription_audio_format import StreamTranscriptionAudioFormat
-from .stt_config import STTConfig
 from .stt_provider import STTProvider
 from .success_message import SuccessMessage
 from .sync_level import SyncLevel
@@ -1219,7 +1216,6 @@ from .vertex_reranker_config import VertexRerankerConfig
 from .vertex_reranker_config_provider import VertexRerankerConfigProvider
 from .vertex_search_config import VertexSearchConfig
 from .vertex_search_config_service import VertexSearchConfigService
-from .vertex_stt_config import VertexSTTConfig
 from .web_search_config import WebSearchConfig
 from .web_search_connection import WebSearchConnection
 from .web_search_provider import WebSearchProvider
@@ -1269,7 +1265,6 @@ __all__ = (
     "AntflyGeneratorConfigProvider",
     "AntflyRerankerConfig",
     "AntflyRerankerConfigProvider",
-    "AntflySTTConfig",
     "AntflyType",
     "ApiKey",
     "ApiKeyRowFilterType0",
@@ -2150,7 +2145,6 @@ __all__ = (
     "OpenAIGeneratorConfig",
     "OpenAIGeneratorConfigProvider",
     "OpenAIReasoningEffort",
-    "OpenAISTTConfig",
     "OpenRouterEmbedderConfig",
     "OpenRouterEmbedderConfigProvider",
     "OpenRouterGeneratorConfig",
@@ -2315,7 +2309,6 @@ __all__ = (
     "StorageRuntimeStatusEngine",
     "StorageStatus",
     "StreamTranscriptionAudioFormat",
-    "STTConfig",
     "STTProvider",
     "SuccessMessage",
     "SyncLevel",
@@ -2434,7 +2427,6 @@ __all__ = (
     "VertexRerankerConfigProvider",
     "VertexSearchConfig",
     "VertexSearchConfigService",
-    "VertexSTTConfig",
     "WebSearchConfig",
     "WebSearchConnection",
     "WebSearchProvider",

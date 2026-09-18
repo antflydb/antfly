@@ -21865,110 +21865,6 @@ components:
           minimum: 1
           format: uint32
           description: Maximum PDF pages admitted for one request-atomic document operation.
-    OpenAISTTConfig:
-      type: object
-      description: >-
-        Configuration for OpenAI STT (Whisper) provider.
-
-
-        API key via `api_key` field or `OPENAI_API_KEY` environment variable.
-
-
-        **Model:** whisper-1
-
-
-        **Supported Formats:** mp3, wav, webm, ogg, flac (max 25MB)
-
-
-        **Docs:** https://platform.openai.com/docs/guides/speech-to-text
-      properties:
-        model:
-          type: string
-          default: whisper-1
-          description: Whisper model to use.
-        api_key:
-          type: string
-          description: OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
-        base_url:
-          type: string
-          format: uri
-          description: API base URL. Falls back to OPENAI_BASE_URL environment variable.
-      example:
-        model: whisper-1
-    VertexSTTConfig:
-      type: object
-      description: >-
-        Configuration for Google Cloud Speech-to-Text provider (Vertex AI).
-
-
-        Uses Application Default Credentials (ADC) for authentication.
-
-
-        **Features:** Streaming, speaker diarization, automatic punctuation
-
-
-        **Docs:** https://cloud.google.com/speech-to-text/docs
-      properties:
-        project_id:
-          type: string
-          description: Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-        location:
-          type: string
-          default: us-central1
-          description: Google Cloud location.
-        credentials_path:
-          type: string
-          description: Path to an ADC credential JSON file (service-account, authorized-user, or external-account).
-            Falls back to the default ADC chain.
-        language_code:
-          type: string
-          default: en-US
-          description: Default language code (e.g., 'en-US', 'es-ES').
-        enable_automatic_punctuation:
-          type: boolean
-          default: true
-          description: Enable automatic punctuation.
-        use_enhanced:
-          type: boolean
-          default: false
-          description: Use enhanced models for better accuracy (costs more).
-        model:
-          type: string
-          description: Recognition model (e.g., 'latest_long', 'telephony', 'medical_dictation').
-      example:
-        project_id: my-gcp-project
-        language_code: en-US
-        enable_automatic_punctuation: true
-    AntflySTTConfig:
-      type: object
-      required:
-        - model
-      description: >-
-        Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider.
-
-
-        Uses the Antfly inference service for speech-to-text inference.
-
-
-        **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base
-
-
-        **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC
-
-
-        **Docs:** See inference documentation
-      properties:
-        api_url:
-          type: string
-          format: uri
-          description: Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
-        model:
-          type: string
-          minLength: 1
-          description: Explicit Antfly transcriber model name (e.g., 'openai/whisper-tiny').
-      example:
-        api_url: http://localhost:8080
-        model: openai/whisper-base
     STTProvider:
       type: string
       enum:
@@ -21976,55 +21872,15 @@ components:
         - vertex
         - antfly
       description: The STT provider to use.
-    STTConfig:
-      description: >-
-        Unified configuration for an STT provider.
-
-
-        Select the provider type and configure provider-specific settings.
-
-
-        **Supported Providers:**
-
-        - `openai` - OpenAI Whisper (whisper-1)
-
-        - `vertex` - Google Cloud Speech-to-Text (Vertex AI)
-
-        - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT)
-
-
-        **Example:**
-
-        ```yaml
-
-        provider: antfly
-
-        api_url: "http://localhost:8080"
-
-        model: openai/whisper-base
-
-        ```
-      allOf:
-        - oneOf:
-            - $ref: '#/components/schemas/OpenAISTTConfig'
-            - $ref: '#/components/schemas/VertexSTTConfig'
-            - $ref: '#/components/schemas/AntflySTTConfig'
-        - properties:
-            provider:
-              $ref: '#/components/schemas/STTProvider'
-          required:
-            - provider
-      example:
-        provider: antfly
-        api_url: http://localhost:8080
-        model: openai/whisper-base
     TranscriberEnrichmentConfig:
       description: >-
         Speech-to-text provider for the `transcriber` enrichment shorthand.
 
 
-        Accepts every field of the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`,
-        ...) plus the transcription options below.
+        Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus
+        the transcription options below. The fields are declared inline rather than composed from `STTConfig`
+        so that a generated client can leave an option out: a composed schema makes a typed client serialize
+        every field, and a `max_download_bytes` of zero would reject every recording.
 
 
         **Example:**
@@ -22043,32 +21899,66 @@ components:
           language_code: en
           timestamps: true
         ```
-      allOf:
-        - $ref: '#/components/schemas/STTConfig'
-        - type: object
-          properties:
-            language_code:
-              x-go-type-skip-optional-pointer: true
-              type: string
-              description: Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where
-                the provider supports it.
-            timestamps:
-              x-go-type-skip-optional-pointer: true
-              type: boolean
-              default: true
-              description: Request timestamped transcript segments so chunks carry recording offsets.
-                Providers without segment timing return plain text.
-            diarization:
-              x-go-type-skip-optional-pointer: true
-              type: boolean
-              default: false
-              description: Request speaker labels on transcript segments where the provider supports them.
-            max_download_bytes:
-              x-go-type-skip-optional-pointer: true
-              type: integer
-              minimum: 1
-              description: Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which
-                covers a one hour voice memo or podcast.
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          $ref: '#/components/schemas/STTProvider'
+        model:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1'
+            for openai).
+        api_url:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: uri
+          description: Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+        base_url:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: uri
+          description: OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+        api_key:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Provider API key. Falls back to the provider's environment variable.
+        project_id:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT.
+        location:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Google Cloud location for the vertex provider.
+        credentials_path:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Path to an ADC credential JSON file for the vertex provider. Falls back to the
+            default ADC chain.
+        language_code:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where
+            the provider supports it.
+        timestamps:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: true
+          description: Request timestamped transcript segments so chunks carry recording offsets. Providers
+            without segment timing return plain text.
+        diarization:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: Request speaker labels on transcript segments where the provider supports them.
+        max_download_bytes:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          description: Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers
+            a one hour voice memo or podcast.
     EnrichmentConfig:
       type: object
       description: Inline managed enrichment definition. Enrichments materialize generated artifacts before

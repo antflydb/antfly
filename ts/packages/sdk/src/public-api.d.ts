@@ -10927,133 +10927,14 @@ export interface components {
             max_document_pages?: number;
         };
         /**
-         * @description Configuration for OpenAI STT (Whisper) provider.
-         *
-         *     API key via `api_key` field or `OPENAI_API_KEY` environment variable.
-         *
-         *     **Model:** whisper-1
-         *
-         *     **Supported Formats:** mp3, wav, webm, ogg, flac (max 25MB)
-         *
-         *     **Docs:** https://platform.openai.com/docs/guides/speech-to-text
-         * @example {
-         *       "model": "whisper-1"
-         *     }
-         */
-        OpenAISTTConfig: {
-            /**
-             * @description Whisper model to use.
-             * @default whisper-1
-             */
-            model?: string;
-            /** @description OpenAI API key. Falls back to OPENAI_API_KEY environment variable. */
-            api_key?: string;
-            /**
-             * Format: uri
-             * @description API base URL. Falls back to OPENAI_BASE_URL environment variable.
-             */
-            base_url?: string;
-        };
-        /**
-         * @description Configuration for Google Cloud Speech-to-Text provider (Vertex AI).
-         *
-         *     Uses Application Default Credentials (ADC) for authentication.
-         *
-         *     **Features:** Streaming, speaker diarization, automatic punctuation
-         *
-         *     **Docs:** https://cloud.google.com/speech-to-text/docs
-         * @example {
-         *       "project_id": "my-gcp-project",
-         *       "language_code": "en-US",
-         *       "enable_automatic_punctuation": true
-         *     }
-         */
-        VertexSTTConfig: {
-            /** @description Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable. */
-            project_id?: string;
-            /**
-             * @description Google Cloud location.
-             * @default us-central1
-             */
-            location?: string;
-            /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain. */
-            credentials_path?: string;
-            /**
-             * @description Default language code (e.g., 'en-US', 'es-ES').
-             * @default en-US
-             */
-            language_code?: string;
-            /**
-             * @description Enable automatic punctuation.
-             * @default true
-             */
-            enable_automatic_punctuation?: boolean;
-            /**
-             * @description Use enhanced models for better accuracy (costs more).
-             * @default false
-             */
-            use_enhanced?: boolean;
-            /** @description Recognition model (e.g., 'latest_long', 'telephony', 'medical_dictation'). */
-            model?: string;
-        };
-        /**
-         * @description Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider.
-         *
-         *     Uses the Antfly inference service for speech-to-text inference.
-         *
-         *     **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base
-         *
-         *     **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC
-         *
-         *     **Docs:** See inference documentation
-         * @example {
-         *       "api_url": "http://localhost:8080",
-         *       "model": "openai/whisper-base"
-         *     }
-         */
-        AntflySTTConfig: {
-            /**
-             * Format: uri
-             * @description Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
-             */
-            api_url?: string;
-            /** @description Explicit Antfly transcriber model name (e.g., 'openai/whisper-tiny'). */
-            model: string;
-        };
-        /**
          * @description The STT provider to use.
          * @enum {string}
          */
         STTProvider: "openai" | "vertex" | "antfly";
         /**
-         * @description Unified configuration for an STT provider.
-         *
-         *     Select the provider type and configure provider-specific settings.
-         *
-         *     **Supported Providers:**
-         *     - `openai` - OpenAI Whisper (whisper-1)
-         *     - `vertex` - Google Cloud Speech-to-Text (Vertex AI)
-         *     - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT)
-         *
-         *     **Example:**
-         *     ```yaml
-         *     provider: antfly
-         *     api_url: "http://localhost:8080"
-         *     model: openai/whisper-base
-         *     ```
-         * @example {
-         *       "provider": "antfly",
-         *       "api_url": "http://localhost:8080",
-         *       "model": "openai/whisper-base"
-         *     }
-         */
-        STTConfig: (components["schemas"]["OpenAISTTConfig"] | components["schemas"]["VertexSTTConfig"] | components["schemas"]["AntflySTTConfig"]) & {
-            provider: components["schemas"]["STTProvider"];
-        };
-        /**
          * @description Speech-to-text provider for the `transcriber` enrichment shorthand.
          *
-         *     Accepts every field of the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below.
+         *     Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording.
          *
          *     **Example:**
          *     ```yaml
@@ -11067,7 +10948,28 @@ export interface components {
          *       timestamps: true
          *     ```
          */
-        TranscriberEnrichmentConfig: components["schemas"]["STTConfig"] & {
+        TranscriberEnrichmentConfig: {
+            provider: components["schemas"]["STTProvider"];
+            /** @description Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1' for openai). */
+            model?: string;
+            /**
+             * Format: uri
+             * @description Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+             */
+            api_url?: string;
+            /**
+             * Format: uri
+             * @description OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+             */
+            base_url?: string;
+            /** @description Provider API key. Falls back to the provider's environment variable. */
+            api_key?: string;
+            /** @description Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT. */
+            project_id?: string;
+            /** @description Google Cloud location for the vertex provider. */
+            location?: string;
+            /** @description Path to an ADC credential JSON file for the vertex provider. Falls back to the default ADC chain. */
+            credentials_path?: string;
             /** @description Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it. */
             language_code?: string;
             /**
