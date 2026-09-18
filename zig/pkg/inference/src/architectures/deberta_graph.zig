@@ -113,8 +113,14 @@ pub const RegionObserver = struct {
     prelude: *const fn (*anyopaque, NodeId, NodeId) anyerror!void,
     layer: *const fn (*anyopaque, u32, NodeId, NodeId) anyerror!void,
 };
+pub const AttentionArithmetic = enum { scale_after_sum, pytorch_fp32 };
 pub const BuildOptions = struct {
     attention: Attention = .legacy_default,
+    /// Explicit materialized-training arithmetic; other callers retain their
+    /// existing scaling and matrix layouts.
+    attention_arithmetic: AttentionArithmetic = .scale_after_sum,
+    word_embedding_backward: ml.graph.node.ScatterReduction = .serial_v1,
+    word_embedding_padding_index: ?u32 = null,
     dropout: ?Dropout = null,
     regions: ?RegionObserver = null,
     /// Multiplicative 0/1 score mask, paired with the additive bias. This
@@ -139,6 +145,8 @@ pub fn buildForwardGraphWithOptions(
     seq_len: u32,
     options: BuildOptions,
 ) !DebertaGraph {
+    if (options.attention_arithmetic == .pytorch_fp32 and options.attention != .materialized)
+        return error.InvalidTrainingAttentionPlan;
     if (options.attention == .training_replay_v1) {
         const replay = options.training_attention_v1 orelse return error.InvalidTrainingAttentionPlan;
         if (!options.project_relative_before_gather or options.attention_score_mask != null or attn_bias != null_node)
@@ -220,7 +228,7 @@ fn buildForwardGraphInternal(
     const head_dim: u32 = H / num_heads;
 
     // ──────── Embeddings: word + LayerNorm (NO position embeddings) ────────
-    var hidden = try embeddings(bld, config, input_ids, total, H);
+    var hidden = try embeddings(bld, config, input_ids, total, H, options);
     if (embedding_mask) |mask| {
         hidden = try bld.mul(hidden, mask);
     }
@@ -264,12 +272,21 @@ fn buildForwardGraphInternal(
     var layer: u32 = 0;
     while (layer < config.num_hidden_layers) : (layer += 1) {
         const layer_input = hidden;
+        const relative_dropout = try applyDropout(bld, rel_emb_gathered, options, .{ .kind = .relative_positions, .layer = layer });
+        // PyTorch slices/unsqueezes the relative table once per layer before
+        // projecting Q and K. Preserve that shared adjoint boundary even when
+        // dropout is disabled: sum the two local contributions before joining
+        // other layers, rather than adding all projections to the table.
+        const relative_input = if (options.attention_arithmetic == .pytorch_fp32)
+            try bld.reshape(relative_dropout, bld.graph.node(relative_dropout).output_shape)
+        else
+            relative_dropout;
         hidden = try encoderLayer(
             bld,
             config,
             hidden,
             attn_bias,
-            try applyDropout(bld, rel_emb_gathered, options, .{ .kind = .relative_positions, .layer = layer }),
+            relative_input,
             if (options.project_relative_before_gather and !training_replay) relative.indices else null,
             pair_indices,
             rel_score_indices,
@@ -307,12 +324,19 @@ fn embeddings(
     input_ids: NodeId,
     total: u32,
     H: u32,
+    options: BuildOptions,
 ) !NodeId {
     const word_emb_param = try bld.parameter(
         "embeddings.word_embeddings.weight",
         Shape.init(.f32, &.{ @intCast(config.vocab_size), @intCast(H) }),
     );
     const word_lookup = try embeddingLookupTyped(bld, word_emb_param, input_ids, total, H);
+    if (options.word_embedding_backward != .serial_v1 or options.word_embedding_padding_index != null) {
+        if (options.word_embedding_backward != .pytorch_embedding_v1 or bld.graph.node(word_lookup).op != .gather) return error.InvalidTrainingEmbeddingPlan;
+        if (options.word_embedding_padding_index) |index| if (index >= config.vocab_size) return error.InvalidTrainingEmbeddingPlan;
+        bld.graph.nodeMut(word_lookup).op.gather.backward_reduction = options.word_embedding_backward;
+        bld.graph.nodeMut(word_lookup).op.gather.backward_padding_index = options.word_embedding_padding_index;
+    }
 
     const ln_w = try bld.parameter(
         "embeddings.LayerNorm.weight",
@@ -509,20 +533,24 @@ fn relProjPerHeadTiled(
     num_heads: u32,
     head_dim: u32,
     num_rel: u32,
+    retain_rhs_storage: bool,
 ) !NodeId {
     const bh: u32 = batch * num_heads;
-    // [num_rel, H] → [num_rel, nh, D] → [nh, D, num_rel]
+    // Retain [nh, num_rel, D] for a transposed-RHS contraction, or use the
+    // existing copied [nh, D, num_rel] layout for other callers.
+    const outer = if (retain_rhs_storage) num_rel else head_dim;
+    const inner = if (retain_rhs_storage) head_dim else num_rel;
     const rel_rnd = try bld.reshape(rel, Shape.init(.f32, &.{
         @intCast(num_rel), @intCast(num_heads), @intCast(head_dim),
     }));
-    const rel_ndr = try bld.transpose(rel_rnd, &.{ 1, 2, 0 });
+    const rel_ndr = try bld.transpose(rel_rnd, if (retain_rhs_storage) &.{ 1, 0, 2 } else &.{ 1, 2, 0 });
     if (batch == 1) return rel_ndr; // bh == nh
 
     const rel_4d = try bld.reshape(rel_ndr, Shape.init(.f32, &.{
-        1, @intCast(num_heads), @intCast(head_dim), @intCast(num_rel),
+        1, @intCast(num_heads), @intCast(outer), @intCast(inner),
     }));
     const target = Shape.init(.f32, &.{
-        @intCast(batch), @intCast(num_heads), @intCast(head_dim), @intCast(num_rel),
+        @intCast(batch), @intCast(num_heads), @intCast(outer), @intCast(inner),
     });
     const bcast = try bld.graph.addNode(.{
         .op = .{ .broadcast_in_dim = .{
@@ -535,7 +563,7 @@ fn relProjPerHeadTiled(
         .num_inputs = 1,
     });
     return bld.reshape(bcast, Shape.init(.f32, &.{
-        @intCast(bh), @intCast(head_dim), @intCast(num_rel),
+        @intCast(bh), @intCast(outer), @intCast(inner),
     }));
 }
 
@@ -579,10 +607,11 @@ fn contentToPositionGather(
     seq_len: u32,
     num_heads: u32,
     head_dim: u32,
+    retain_rhs_storage: bool,
 ) !NodeId {
     const num_rel: u32 = 2 * seq_len - 1;
-    const krt = try relProjPerHeadTiled(bld, k_r, batch, num_heads, head_dim, num_rel);
-    const scores = try bld.matmul3D(q_c, krt); // [bh, S, num_rel]
+    const krt = try relProjPerHeadTiled(bld, k_r, batch, num_heads, head_dim, num_rel, retain_rhs_storage);
+    const scores = if (retain_rhs_storage) try bld.matmul3DTransB(q_c, krt) else try bld.matmul3D(q_c, krt);
     return gatherRelScores(bld, scores, indices.c2p, batch * num_heads, seq_len, num_rel, indices.flat_heads);
 }
 
@@ -596,10 +625,11 @@ fn positionToContentGather(
     seq_len: u32,
     num_heads: u32,
     head_dim: u32,
+    retain_rhs_storage: bool,
 ) !NodeId {
     const num_rel: u32 = 2 * seq_len - 1;
-    const qrt = try relProjPerHeadTiled(bld, q_r, batch, num_heads, head_dim, num_rel);
-    const scores = try bld.matmul3D(k_c, qrt); // [bh, S(ki), num_rel]
+    const qrt = try relProjPerHeadTiled(bld, q_r, batch, num_heads, head_dim, num_rel, retain_rhs_storage);
+    const scores = if (retain_rhs_storage) try bld.matmul3DTransB(k_c, qrt) else try bld.matmul3D(k_c, qrt);
     return gatherRelScores(bld, scores, indices.p2c, batch * num_heads, seq_len, num_rel, indices.flat_heads);
 }
 
@@ -921,21 +951,31 @@ fn encoderLayer(
             @intCast(batch * num_heads), @intCast(seq_len), @intCast(head_dim),
         }));
 
-        const k_t = try bld.transpose(k_bhsd, &.{ 0, 2, 1 });
-        const c2c = try bld.matmul3D(q_bhsd, k_t);
+        const source_order = options.attention_arithmetic == .pytorch_fp32;
+        // Python's CPU scalar divisor is converted to a rounded reciprocal
+        // before CUDA multiplication. Scale K before the content contraction.
+        const source_scale = if (source_order) try bld.scalarConst(.f32, 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)) * 3.0)) else null_node;
+        const c2c = if (source_order)
+            try bld.matmul3DTransB(q_bhsd, try bld.mul(k_bhsd, source_scale))
+        else
+            try bld.matmul3D(q_bhsd, try bld.transpose(k_bhsd, &.{ 0, 2, 1 }));
 
         const c2p = if (rel_score_indices) |indices|
-            try contentToPositionGather(bld, q_bhsd, K_r, indices, batch, seq_len, num_heads, head_dim)
+            try contentToPositionGather(bld, q_bhsd, K_r, indices, batch, seq_len, num_heads, head_dim, source_order)
         else
             try contentToPosition(bld, q_bhsd, K_r, pair_indices orelse return error.InvalidAttentionPlan, batch, seq_len, num_heads, head_dim);
         const p2c = if (rel_score_indices) |indices|
-            try positionToContentGather(bld, k_bhsd, Q_r, indices, batch, seq_len, num_heads, head_dim)
+            try positionToContentGather(bld, k_bhsd, Q_r, indices, batch, seq_len, num_heads, head_dim, source_order)
         else
             try positionToContent(bld, k_bhsd, Q_r, pair_indices orelse return error.InvalidAttentionPlan, batch, seq_len, num_heads, head_dim);
 
-        const scores_sum = try bld.add(c2c, try bld.add(c2p, p2c));
-        const scale = try bld.scalarConst(.f32, 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)) * 3.0));
-        const scores_scaled = try bld.mul(scores_sum, scale);
+        const scores_scaled = if (source_order)
+            try bld.add(c2c, try bld.add(try bld.mul(c2p, source_scale), try bld.mul(p2c, source_scale)))
+        else default_order: {
+            const scores_sum = try bld.add(c2c, try bld.add(c2p, p2c));
+            const scale = try bld.scalarConst(.f32, 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)) * 3.0));
+            break :default_order try bld.mul(scores_sum, scale);
+        };
         const scores_valid = if (options.attention_score_mask) |mask| try bld.mul(scores_scaled, mask) else scores_scaled;
         const scores_masked = try bld.add(scores_valid, attn_bias);
         const probs = try applyDropout(bld, try bld.softmax(scores_masked), options, .{ .kind = .attention_probabilities, .layer = layer });

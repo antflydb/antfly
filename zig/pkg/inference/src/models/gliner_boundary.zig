@@ -90,9 +90,9 @@ pub const HeadConfig = struct {
     enable_abstention: bool = true,
     abstention_threshold: f32 = 0.5,
     proposal_loss_weight: f32 = 0.3,
-    consistency_loss_weight: f32 = 0.1,
+    consistency_loss_weight: f64 = 0.1,
     rerank_listwise_weight: f32 = 0.3,
-    soft_iou_aux_weight: f32 = 0.2,
+    soft_iou_aux_weight: f64 = 0.2,
     soft_iou_anneal_steps: u32 = 20_000,
     abstention_loss_weight: f32 = 0.2,
     consistency_warmup_steps: u32 = 2000,
@@ -126,7 +126,7 @@ pub const HeadConfig = struct {
     pub fn validate(self: HeadConfig) !void {
         inline for (@typeInfo(HeadConfig).@"struct".fields) |field| {
             const value = @field(self, field.name);
-            if (field.type == f32) {
+            if (field.type == f32 or field.type == f64) {
                 if (!std.math.isFinite(value) or value < 0) return error.InvalidGlinerBoundaryConfig;
             } else if (field.type == u32) {
                 if (value > std.math.maxInt(i32)) return error.InvalidGlinerBoundaryConfig;
@@ -282,8 +282,8 @@ pub fn parseHeadConfig(obj: std.json.ObjectMap) !HeadConfig {
         if (obj.get(field.name)) |value| {
             if (field.type == u32) {
                 @field(head, field.name) = try requiredU32(obj, field.name, true);
-            } else if (field.type == f32) {
-                @field(head, field.name) = try requiredF32(obj, field.name);
+            } else if (field.type == f32 or field.type == f64) {
+                @field(head, field.name) = try requiredFloat(field.type, obj, field.name);
             } else if (field.type == bool) {
                 if (value != .bool) return error.InvalidGlinerBoundaryConfig;
                 @field(head, field.name) = value.bool;
@@ -356,8 +356,11 @@ fn requiredU32(obj: std.json.ObjectMap, name: []const u8, allow_zero: bool) !u32
 }
 
 fn requiredF32(obj: std.json.ObjectMap, name: []const u8) !f32 {
+    return requiredFloat(f32, obj, name);
+}
+fn requiredFloat(comptime Float: type, obj: std.json.ObjectMap, name: []const u8) !Float {
     const value = obj.get(name) orelse return error.InvalidGlinerBoundaryConfig;
-    const result: f32 = switch (value) {
+    const result: Float = switch (value) {
         .integer => @floatFromInt(value.integer),
         .float => @floatCast(value.float),
         else => return error.InvalidGlinerBoundaryConfig,
@@ -486,4 +489,14 @@ test "gliner boundary encoder rejects negative overflowing and incompatible dime
         defer std.testing.allocator.free(bytes);
         try std.testing.expectError(replacement[2], parseConfig(std.testing.allocator, base_config, bytes));
     }
+}
+
+test "gliner boundary retains precise consistency weight and rejects nonfinite doubles" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"consistency_loss_weight\":0.100000000123}", .{});
+    defer parsed.deinit();
+    var head = try parseHeadConfig(parsed.value.object);
+    try std.testing.expectEqual(@as(f64, 0.100000000123), head.consistency_loss_weight);
+    try std.testing.expect(head.consistency_loss_weight != @as(f64, @as(f32, @floatCast(head.consistency_loss_weight))));
+    head.consistency_loss_weight = std.math.nan(f64);
+    try std.testing.expectError(error.InvalidGlinerBoundaryConfig, head.validate());
 }
