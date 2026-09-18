@@ -413,6 +413,10 @@ fn exportHttpResponse(
     out_handle: *?*anyopaque,
     out_view: *abi.HttpResponseView,
 ) !void {
+    // Consume the response on both paths. The ABI callers return Status rather
+    // than an error union, so their errdefer cannot handle export failures.
+    var owned_response = response;
+    errdefer owned_response.deinit();
     const response_state = try alloc.create(HttpResponseState);
     errdefer alloc.destroy(response_state);
     const response_headers = response.headers.iterator();
@@ -474,9 +478,7 @@ pub fn handlerAuthorizeInternalService(context: *const abi.InternalServiceAuthCo
     defer http_context.deinit();
     var legacy_accepted = false;
     if (state.handler.authorizeHostInternalServiceRoute(&http_context, &legacy_accepted) catch |err| return fail(err)) |response| {
-        var owned_response = response;
-        errdefer owned_response.deinit();
-        exportHttpResponse(state.server_owner, alloc, owned_response, context.out_response_handle, context.out_response) catch |err| return fail(err);
+        exportHttpResponse(state.server_owner, alloc, response, context.out_response_handle, context.out_response) catch |err| return fail(err);
     } else if (legacy_accepted) {
         context.out_legacy_accepted.* = 1;
     }
@@ -523,8 +525,7 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
     defer http_context.deinit();
     http_context.params = params;
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
-    var response = state.handler.dispatchLinkedRoute(&http_context, route.handler) catch |err| return fail(err);
-    errdefer response.deinit();
+    const response = state.handler.dispatchLinkedRoute(&http_context, route.handler) catch |err| return fail(err);
 
     exportHttpResponse(state.server_owner, alloc, response, context.out_response_handle, context.out_response) catch |err| return fail(err);
     return .ok;
@@ -749,6 +750,36 @@ fn responseHeader(response: abi.HttpResponseView, name: []const u8) ?[]const u8 
         if (std.ascii.eqlIgnoreCase(header.name.slice(), name)) return header.value.slice();
     }
     return null;
+}
+
+test "workload admission failed kernel response export retires output ownership" {
+    const alloc = std.testing.allocator;
+    const Owner = @import("../common/workload_allocator.zig").Owner;
+    const Controller = @import("../common/workload_admission.zig").Controller;
+    for (0..2) |failure_index| {
+        var gate = Controller.initConfigured(1, .{ .max_retained_bytes = 4096 });
+        defer gate.deinitMemory();
+        const owner = try Owner.create(alloc, &gate);
+        var response = httpx.Response.init(alloc, 200);
+        response.body = try owner.allocator().dupe(u8, "retained query output");
+        response.body_owned = true;
+        response.body_allocator = owner.allocator();
+        response.retirement = .{ .ptr = owner, .release = struct {
+            fn release(raw: *anyopaque) void {
+                const value: *Owner = @ptrCast(@alignCast(raw));
+                value.release();
+            }
+        }.release };
+        try response.headers.set("Content-Type", "application/json");
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = failure_index });
+        var handle: ?*anyopaque = null;
+        var view: abi.HttpResponseView = undefined;
+        // Fail the response-state allocation, then its nonempty header-view
+        // allocation. Both paths consume the already-produced response.
+        try std.testing.expectError(error.OutOfMemory, exportHttpResponse(null, failing.allocator(), response, &handle, &view));
+        try std.testing.expect(handle == null);
+        try std.testing.expectEqual(@as(usize, 0), gate.stats().retained_bytes);
+    }
 }
 
 test "workload admission exported kernel response survives server teardown" {
