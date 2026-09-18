@@ -35718,6 +35718,14 @@ test "api http server serves table batch writes" {
 
 test "api http server rewrite job authorization follows the complete cohort" {
     const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const Stub = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var names = ApiHttpServer.RestoreCatalogNames{ .source = .{ .ptr = undefined, .vtable = &.{ .status = Stub.status } }, .arena = arena.allocator() };
     var parent = try usermgr.Permission.initOwned(alloc, .table, "parents", .admin);
     defer parent.deinit(alloc);
     var child = try usermgr.Permission.initOwned(alloc, .table, "children", .admin);
@@ -35727,22 +35735,22 @@ test "api http server rewrite job authorization follows the complete cohort" {
     var permissions = [_]usermgr.Permission{ parent, child };
     var identity: AuthenticatedIdentity = .{ .username = @constCast("operator"), .permissions = &permissions };
     var state: restore_jobs.JobState = .{ .format_version = 1, .job_id = 1, .enqueue_sequence = 1, .dispatch_sequence = 1, .scope = .cluster, .source_kind = .schema_rewrite, .backup_id = "", .location = "", .connection = "internal", .table_names = &.{ "parents", "children" }, .idempotency_namespace = "", .idempotency_key = "", .request_fingerprint = "", .created_at_ms = 0, .updated_at_ms = 0, .expires_at_ms = 0 };
-    try std.testing.expect(ApiHttpServer.restoreJobStateAllowed(identity, state));
+    try std.testing.expect((try ApiHttpServer.restoreJobStateAllowed(identity, state, &names)));
     identity.permissions = permissions[0..1];
-    try std.testing.expect(!ApiHttpServer.restoreJobStateAllowed(identity, state));
+    try std.testing.expect(!(try ApiHttpServer.restoreJobStateAllowed(identity, state, &names)));
     identity.permissions = &permissions;
     state.table_names = &.{};
-    try std.testing.expect(!ApiHttpServer.restoreJobStateAllowed(identity, state));
+    try std.testing.expect(!(try ApiHttpServer.restoreJobStateAllowed(identity, state, &names)));
     state.table_names = null;
-    try std.testing.expect(!ApiHttpServer.restoreJobStateAllowed(identity, state));
+    try std.testing.expect(!(try ApiHttpServer.restoreJobStateAllowed(identity, state, &names)));
     state.table_names = &.{ "parents", "children" };
     state.source_kind = .cluster_cohort;
-    try std.testing.expect(!ApiHttpServer.restoreJobStateAllowed(identity, state));
+    try std.testing.expect(!(try ApiHttpServer.restoreJobStateAllowed(identity, state, &names)));
     var cluster_permissions = [_]usermgr.Permission{cluster_permission};
     identity.permissions = &cluster_permissions;
-    try std.testing.expect(ApiHttpServer.restoreJobStateAllowed(identity, state));
+    try std.testing.expect((try ApiHttpServer.restoreJobStateAllowed(identity, state, &names)));
     state.source_kind = .schema_rewrite;
-    try std.testing.expect(ApiHttpServer.restoreJobStateAllowed(identity, state));
+    try std.testing.expect((try ApiHttpServer.restoreJobStateAllowed(identity, state, &names)));
 }
 
 test "api http server coordinated batch outcomes retain prepared names and conflict keys" {

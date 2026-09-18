@@ -27,6 +27,9 @@ comptime {
     _ = @import("db/relational_index_catalog.zig");
     _ = @import("db/relational_index_records.zig");
     _ = @import("db/relational_index_jobs.zig");
+    _ = @import("db/relational_index_maintenance_sweep.zig");
+    _ = @import("rewrite_program_cache.zig");
+    _ = @import("rewrite_tail_spool.zig");
     _ = @import("db/relational_constraint_jobs.zig");
     _ = @import("db/relational_integrity.zig");
     _ = @import("db/relational_integrity_contract.zig");

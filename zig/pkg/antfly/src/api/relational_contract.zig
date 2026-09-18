@@ -36,26 +36,34 @@ pub const CheckValidation = EnumBridge(wire.RelationalConstraintValidationState,
 pub const ComparisonOp = EnumBridge(wire.RelationalComparisonOp, native.RelationalCheckOp);
 
 pub const IndexKey = struct {
-    /// Borrow strings from the decoded request; bind or copy this definition
-    /// before releasing its JSON arena. Name resolution and access-method
-    /// validation belong to the schema-bound tuple plan, not the wire model.
-    pub fn toNativeBorrowed(value: wire.RelationalIndexKey) !native.RelationalIndexKey {
-        if (value.column.len == 0) return error.InvalidRelationalIndexDefinition;
+    /// Strings remain borrowed from the request; expression bytes belong to
+    /// the supplied request arena. Schema binding validates expression types.
+    pub fn toNativeArena(arena: std.mem.Allocator, value: wire.RelationalIndexKey) !native.RelationalIndexKey {
+        const column = value.column orelse "";
+        if ((column.len != 0) == (value.expression != null) or
+            (value.column != null and column.len == 0) or
+            ((value.expression != null) != (value.result_type != null))) return error.InvalidRelationalIndexDefinition;
         if (value.collation) |collation| {
             if (collation.len == 0) return error.InvalidRelationalIndexDefinition;
         }
         return .{
-            .column = value.column,
+            .column = column,
+            .expression_json = if (value.expression) |expression| try std.json.Stringify.valueAlloc(arena, expression, .{ .emit_null_optional_fields = false }) else null,
+            .result_type = if (value.result_type) |kind| switch (kind) {
+                inline else => |tag| @field(storage.RelationalColumnType, @tagName(tag)),
+            } else null,
             .collation = value.collation,
             .direction = IndexKeyDirection.toNative(value.direction orelse .asc),
             .nulls = IndexKeyNulls.toNative(value.nulls orelse .default),
         };
     }
 
-    /// The encoded response must not outlive the pinned native definition.
-    pub fn toWireBorrowed(value: native.RelationalIndexKey) wire.RelationalIndexKey {
+    /// The response borrows native strings and arena-owned expression nodes.
+    pub fn toWireArena(arena: std.mem.Allocator, value: native.RelationalIndexKey) !wire.RelationalIndexKey {
         return .{
-            .column = value.column,
+            .column = if (value.column.len != 0) value.column else null,
+            .expression = if (value.expression_json) |json| try std.json.parseFromSliceLeaky(wire.RelationalScalarExpression, arena, json, .{}) else null,
+            .result_type = if (value.result_type) |kind| std.meta.stringToEnum(wire.RelationalExpressionType, @tagName(kind)) orelse return error.InvalidRelationalIndexDefinition else null,
             .collation = value.collation,
             .direction = IndexKeyDirection.toWire(value.direction),
             .nulls = IndexKeyNulls.toWire(value.nulls),
@@ -141,7 +149,7 @@ test "relational contract generated index key preserves defaults and typed optio
     const alloc = std.testing.allocator;
     var minimal = try std.json.parseFromSlice(wire.RelationalIndexKey, alloc, "{\"column\":\"id\"}", .{});
     defer minimal.deinit();
-    const default_key = try IndexKey.toNativeBorrowed(minimal.value);
+    const default_key = try IndexKey.toNativeArena(alloc, minimal.value);
     try std.testing.expectEqual(native.RelationalIndexKeyDirection.asc, default_key.direction);
     try std.testing.expectEqual(native.RelationalIndexKeyNulls.default, default_key.nulls);
     try std.testing.expectEqual(@as(?[]const u8, null), default_key.collation);
@@ -158,8 +166,8 @@ test "relational contract generated index key preserves defaults and typed optio
             defer alloc.free(encoded);
             var parsed = try std.json.parseFromSlice(wire.RelationalIndexKey, alloc, encoded, .{});
             defer parsed.deinit();
-            const restored = IndexKey.toWireBorrowed(try IndexKey.toNativeBorrowed(parsed.value));
-            try std.testing.expectEqualStrings(original.column, restored.column);
+            const restored = try IndexKey.toWireArena(alloc, try IndexKey.toNativeArena(alloc, parsed.value));
+            try std.testing.expectEqualStrings(original.column.?, restored.column.?);
             try std.testing.expectEqualStrings(original.collation.?, restored.collation.?);
             try std.testing.expectEqual(direction, restored.direction.?);
             try std.testing.expectEqual(nulls, restored.nulls.?);
@@ -169,10 +177,30 @@ test "relational contract generated index key preserves defaults and typed optio
 
 test "relational contract generated index key rejects invalid definitions" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidRelationalIndexDefinition, IndexKey.toNativeBorrowed(.{ .column = "" }));
-    try std.testing.expectError(error.InvalidRelationalIndexDefinition, IndexKey.toNativeBorrowed(.{ .column = "id", .collation = "" }));
-    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(wire.RelationalIndexKey, alloc, "{}", .{}));
+    try std.testing.expectError(error.InvalidRelationalIndexDefinition, IndexKey.toNativeArena(alloc, .{ .column = "" }));
+    try std.testing.expectError(error.InvalidRelationalIndexDefinition, IndexKey.toNativeArena(alloc, .{ .column = "id", .collation = "" }));
+    try std.testing.expectError(error.InvalidRelationalIndexDefinition, IndexKey.toNativeArena(alloc, .{}));
+    try std.testing.expectError(error.InvalidRelationalIndexDefinition, IndexKey.toNativeArena(alloc, .{ .column = "id", .result_type = .integer }));
+    try std.testing.expectError(error.InvalidRelationalIndexDefinition, IndexKey.toNativeArena(alloc, .{ .expression = .{ .op = .column, .column = "id" } }));
+    try std.testing.expectError(error.InvalidRelationalIndexDefinition, IndexKey.toNativeArena(alloc, .{ .column = "id", .expression = .{ .op = .column, .column = "id" }, .result_type = .integer }));
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(wire.RelationalIndexKey, alloc, "{\"column\":\"id\",\"direction\":\"sideways\"}", .{}));
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(wire.RelationalIndexKey, alloc, "{\"column\":\"id\",\"nulls\":\"middle\"}", .{}));
     try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(wire.RelationalIndexKey, alloc, "{\"column\":\"id\",\"direciton\":\"desc\"}", .{}));
+}
+
+test "relational contract expression index key survives arena conversion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const original: wire.RelationalIndexKey = .{
+        .expression = .{ .op = .column, .column = "id" },
+        .result_type = .integer,
+        .direction = .desc,
+        .nulls = .last,
+    };
+    const stored = try IndexKey.toNativeArena(alloc, original);
+    try std.testing.expectEqualStrings("", stored.column);
+    try std.testing.expectEqual(storage.RelationalColumnType.integer, stored.result_type.?);
+    const restored = try IndexKey.toWireArena(alloc, stored);
+    try std.testing.expectEqualDeep(original, restored);
 }

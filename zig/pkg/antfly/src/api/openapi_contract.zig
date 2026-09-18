@@ -735,6 +735,16 @@ test "generated route policy inventory is unique and describes wire modes" {
     try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("linearMerge").?);
     try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("commitTransaction").?);
     try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("commitTransactionSession").?);
+    inline for (.{
+        .{ "queryRelationalRows", "queryNamespaceRelationalRows" },
+        .{ "mutateRelationalRows", "mutateNamespaceRelationalRows" },
+        .{ "getRelationalConstraintStatus", "getNamespaceRelationalConstraintStatus" },
+        .{ "repairRelationalConstraints", "repairNamespaceRelationalConstraints" },
+        .{ "retryRelationalConstraints", "retryNamespaceRelationalConstraints" },
+        .{ "retireRelationalConstraints", "retireNamespaceRelationalConstraints" },
+        .{ "repairIndex", "repairNamespaceIndex" },
+        .{ "retryIndex", "retryNamespaceIndex" },
+    }) |pair| try std.testing.expectEqual(request_admission_policy.publicOperationClass(pair[0]).?, request_admission_policy.publicOperationClass(pair[1]).?);
 }
 
 test "bleve and metadata openapi modules are generated and wired" {

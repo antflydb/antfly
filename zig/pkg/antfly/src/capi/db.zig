@@ -407,12 +407,12 @@ const StorageOwnerTransactionRecovery = struct {
 };
 
 const StorageOwnerRuntimeHooks = struct {
-    fn coordinatedTtlPort(self: *StorageOwnerRuntimeHooks) ?@import("../storage/coordinated_ttl.zig").Port {
+    fn coordinatedTtlPort(self: *StorageOwnerRuntimeHooks) ?antfly.capi_dependencies.storage_coordinated_ttl.Port {
         if (self.config.coordinated_ttl_enqueue_fn == null) return null;
         return .{ .ptr = self, .expire_fn = enqueueCoordinatedTtl };
     }
 
-    fn enqueueCoordinatedTtl(ptr: *anyopaque, request: @import("../storage/coordinated_ttl.zig").Request) !u32 {
+    fn enqueueCoordinatedTtl(ptr: *anyopaque, request: antfly.capi_dependencies.storage_coordinated_ttl.Request) !u32 {
         const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
         const callback = self.config.coordinated_ttl_enqueue_fn orelse return error.CoordinatedTtlBackpressure;
         if (request.candidates.len > kernel_owner_abi.coordinated_ttl_page_capacity) return error.CoordinatedTtlBackpressure;
@@ -3142,7 +3142,7 @@ pub fn metadataApplyStoreBindHA(
 ) callconv(.c) kernel_owner_abi.Status {
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
-    const port: ?@import("../storage/metadata_ha_port.zig").Port = if (request.port) |ptr| @as(*const @import("../storage/metadata_ha_port.zig").Port, @ptrCast(@alignCast(ptr))).* else null;
+    const port: ?antfly.capi_dependencies.storage_metadata_ha_port.Port = if (request.port) |ptr| @as(*const antfly.capi_dependencies.storage_metadata_ha_port.Port, @ptrCast(@alignCast(ptr))).* else null;
     handle.store.bindHAPort(port) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
@@ -3163,7 +3163,7 @@ pub fn metadataApplyStoreProjection(
         },
         .apply_ha_record => blk: {
             if (request.key.len > 2 * 1024 * 1024) break :blk .invalid_argument;
-            const record = @import("../storage/hot_standby/replication_record.zig").decode(request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            const record = antfly.capi_dependencies.storage_hot_standby_replication_record.decode(request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
             handle.store.applyHARecord(record) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
@@ -3198,7 +3198,7 @@ pub fn metadataApplyStoreProjection(
         .backup_cohorts => blk: {
             if (request.arg1 > 1) break :blk .invalid_argument;
             const value = handle.store.listBackupCohorts(alloc, request.group_id, if (request.arg1 == 0) null else request.key.slice(), std.math.cast(usize, request.arg0) orelse break :blk .invalid_argument) catch |err| break :blk storageOwnerStatusFromError(err);
-            defer @import("../storage/docstore.zig").DocStore.freeResults(alloc, value);
+            defer antfly.capi_dependencies.storage_docstore.DocStore.freeResults(alloc, value);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
         .provisioning_catalog => blk: {
@@ -3247,13 +3247,13 @@ pub fn metadataApplyStoreProjection(
                 const value = handle.store.loadRestoreStagingProgress(alloc, request.group_id, id) catch |err| break :blk storageOwnerStatusFromError(err);
                 break :blk metadataProjectionJson(alloc, out_json, value);
             }
-            const state = std.enums.fromInt(@import("../metadata/restore_staging.zig").State, request.arg0) orelse break :blk .invalid_argument;
+            const state = std.enums.fromInt(antfly.capi_dependencies.metadata_restore_staging.State, request.arg0) orelse break :blk .invalid_argument;
             const value = handle.store.loadRestoreStagingReceipt(alloc, request.group_id, id, state, request.arg1) catch |err| break :blk storageOwnerStatusFromError(err);
             defer if (value) |bytes| alloc.free(bytes);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
         .standalone_command => blk: {
-            const physical = @import("../metadata/storage/raft_apply_store.zig");
+            const physical = antfly.capi_dependencies.metadata_storage_raft_apply_store;
             if (request.key.len > 32 * 1024 * 1024) break :blk .invalid_argument;
             var command = (physical.decodeTransitionCommand(alloc, request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err)) orelse break :blk .invalid_argument;
             defer command.deinit(alloc);
@@ -3262,7 +3262,7 @@ pub fn metadataApplyStoreProjection(
         },
         .replace_standalone_catalog => blk: {
             if (request.key.len > 64 * 1024 * 1024) break :blk .invalid_argument;
-            const Input = @import("../metadata/storage/raft_apply_contract.zig").StandaloneCatalogUpdate;
+            const Input = antfly.capi_dependencies.metadata_storage_raft_apply_contract.StandaloneCatalogUpdate;
             var input = std.json.parseFromSlice(Input, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
             defer input.deinit();
             handle.store.updateStandaloneCatalog(request.group_id, request.arg0, input.value) catch |err| break :blk storageOwnerStatusFromError(err);
@@ -4661,17 +4661,17 @@ pub fn storageOwnerOpen(
     if (request.restore_cancel_recovery > 1 or request.restore_ha_replay > 1 or
         (request.restore_cancel_recovery != 0 and request.restore_ha_replay != 0) or
         ((request.restore_cancel_recovery != 0 or request.restore_ha_replay != 0) and request.restore_bootstrap_json.len == 0) or request.restore_bootstrap_json.len > 16 * 1024 * 1024) return .invalid_argument;
-    var restore_bootstrap: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) = null;
+    var restore_bootstrap: ?std.json.Parsed(antfly.capi_dependencies.storage_db_restore_staging_contract.OwnerBootstrap) = null;
     defer if (restore_bootstrap) |*parsed| parsed.deinit();
     if (request.restore_bootstrap_json.len != 0) {
-        restore_bootstrap = std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, request.restore_bootstrap_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| return storageOwnerStatusFromError(err);
+        restore_bootstrap = std.json.parseFromSlice(antfly.capi_dependencies.storage_db_restore_staging_contract.OwnerBootstrap, alloc, request.restore_bootstrap_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| return storageOwnerStatusFromError(err);
         const bootstrap = restore_bootstrap.?.value;
         bootstrap.validate() catch |err| return storageOwnerStatusFromError(err);
         const namespace = identity_namespace orelse return .invalid_argument;
         if (!namespace.eql(bootstrap.scope.target_namespace) or !std.mem.eql(u8, bootstrap.table_name, table_name) or !std.mem.eql(u8, bootstrap.schema_json, request.schema_json.slice()) or !std.mem.eql(u8, bootstrap.indexes_json, request.indexes_json.slice())) return storageOwnerStatusFromError(error.RestoreStagingScopeChanged);
     }
     var open_options = db_mod.OpenOptions{
-        .online_source_authority = std.enums.fromInt(@import("../storage/source_authority.zig").Kind, request.online_source_authority) orelse return .invalid_argument,
+        .online_source_authority = std.enums.fromInt(antfly.capi_dependencies.storage_source_authority.Kind, request.online_source_authority) orelse return .invalid_argument,
         .table_storage = switch (request.dense_embedding_storage) {
             .persisted => null,
             .primary_lsm => .{ .dense_embeddings = .primary_lsm },
@@ -5358,22 +5358,22 @@ pub fn storageOwnerApplyHAReplicationRecord(
     return .ok;
 }
 
-var backup_pin_diagnostic_gate: @import("../api/bounded_diagnostic_gate.zig").Gate = .{};
+var backup_pin_diagnostic_gate: antfly.capi_dependencies.api_bounded_diagnostic_gate.Gate = .{};
 
 pub fn storageOwnerOnlineMergeIoJson(owner: ?*anyopaque, request: *const kernel_owner_abi.ControlledJsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     out.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    if (request.request_json.len > @import("../storage/db/online_merge_io_contract.zig").max_request_bytes) return .invalid_argument;
+    if (request.request_json.len > antfly.capi_dependencies.storage_db_online_merge_io_contract.max_request_bytes) return .invalid_argument;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    const wire = @import("../storage/db/online_merge_io_contract.zig");
+    const wire = antfly.capi_dependencies.storage_db_online_merge_io_contract;
     var parsed = std.json.parseFromSlice(wire.Request, handle.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
     defer parsed.deinit();
     parsed.value.validate() catch |err| return storageOwnerStatusFromError(err);
     if (parsed.value.ownerGroup() != handle.storage_owner_group_id) return .invalid_argument;
     const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
     control.ensureActive() catch |err| return storageOwnerStatusFromError(err);
-    const response = @import("../storage/db/online_merge_io.zig").executeJson(&handle.db, handle.alloc, parsed.value, control.token()) catch |err| return storageOwnerStatusFromError(err);
+    const response = antfly.capi_dependencies.storage_db_online_merge_io.executeJson(&handle.db, handle.alloc, parsed.value, control.token()) catch |err| return storageOwnerStatusFromError(err);
     if (response.len > wire.max_response_bytes) {
         handle.alloc.free(response);
         return .invalid_argument;
@@ -5388,7 +5388,7 @@ pub fn storageOwnerSourceArtifactJson(owner: ?*anyopaque, request: *const kernel
     if (request.request_json.len > 2 * 1024 * 1024) return .invalid_argument;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    const transfer = @import("../storage/db/source_artifact_transfer.zig");
+    const transfer = antfly.capi_dependencies.storage_db_source_artifact_transfer;
     var parsed = std.json.parseFromSlice(transfer.Request, handle.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
     defer parsed.deinit();
     const scope = parsed.value.scope();
@@ -5407,7 +5407,7 @@ pub fn storageOwnerSourcePinPublicationJson(owner: ?*anyopaque, request: *const 
     if (request.request_json.len > 4096) return .invalid_argument;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    var parsed = std.json.parseFromSlice(@import("../storage/db/online_source_contract.zig").Scope, handle.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+    var parsed = std.json.parseFromSlice(antfly.capi_dependencies.storage_db_online_source_contract.Scope, handle.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
     defer parsed.deinit();
     parsed.value.validate() catch |err| return storageOwnerStatusFromError(err);
     if (parsed.value.fence.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
@@ -5426,11 +5426,11 @@ pub fn storageOwnerBackupPinControlJson(owner: ?*anyopaque, request: *const kern
     if (request.request_json.len > 16 * 1024) return .invalid_argument;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    const seal = @import("../storage/db/native_backup_seal_contract.zig");
+    const seal = antfly.capi_dependencies.storage_db_native_backup_seal_contract;
     var parsed = std.json.parseFromSlice(seal.Request, handle.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
     defer parsed.deinit();
     const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
-    const response = @import("../api/table_writes.zig").executeBackupPinControl(handle.alloc, &handle.db, handle.storage_owner_group_id, parsed.value, control) catch |err| {
+    const response = antfly.capi_dependencies.api_table_writes.executeBackupPinControl(handle.alloc, &handle.db, handle.storage_owner_group_id, parsed.value, control) catch |err| {
         if (backup_pin_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs()))
             std.log.warn("backup pin failed phase=native_capture action={s} group_id={d} class={s}", .{ @tagName(parsed.value), handle.storage_owner_group_id, @errorName(err) });
         return storageOwnerStatusFromError(err);
@@ -5448,7 +5448,7 @@ pub fn storageBackupPinReclaimJson(context_ptr: ?*anyopaque, request: *const ker
     const context = asStorageOwnerContext(context_ptr) orelse return .invalid_argument;
     const alloc = context.alloc;
     const io = context.backend_runtime.ptr().filesystemIo() orelse return storageOwnerStatusFromError(error.BackendRuntimeIoUnavailable);
-    const seal = @import("../storage/db/native_backup_seal.zig");
+    const seal = antfly.capi_dependencies.storage_db_native_backup_seal;
     var parsed = std.json.parseFromSlice(seal.Request, alloc, request.control.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
     defer parsed.deinit();
     const fence = switch (parsed.value) {
@@ -5487,8 +5487,8 @@ pub fn storageOwnerBackupJson(
     if (request.cohort_json.len > 4096 or request.sealed_handle_json.len > 8192) return .invalid_argument;
     var arena: std.heap.ArenaAllocator = .init(handle.alloc);
     defer arena.deinit();
-    const cohort = if (request.cohort_json.len != 0) (std.json.parseFromSlice(@import("../storage/db/relational_integrity_topology_contract.zig").Fence, arena.allocator(), request.cohort_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err)).value else null;
-    const sealed = if (request.sealed_handle_json.len != 0) (std.json.parseFromSlice(@import("../storage/db/native_backup_seal_contract.zig").Handle, arena.allocator(), request.sealed_handle_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err)).value else null;
+    const cohort = if (request.cohort_json.len != 0) (std.json.parseFromSlice(antfly.capi_dependencies.storage_db_relational_integrity_topology_contract.Fence, arena.allocator(), request.cohort_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err)).value else null;
+    const sealed = if (request.sealed_handle_json.len != 0) (std.json.parseFromSlice(antfly.capi_dependencies.storage_db_native_backup_seal_contract.Handle, arena.allocator(), request.sealed_handle_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err)).value else null;
     const RequestCancellation = struct {
         fn canceled(ptr: *const anyopaque) bool {
             const value: *const kernel_owner_abi.BackupRequest = @ptrCast(@alignCast(ptr));
@@ -5905,11 +5905,11 @@ fn prepareStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareReques
 
 fn prepareNativeStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareRequest, native: []const u8) !*StorageSnapshot {
     const alloc = std.heap.c_allocator;
-    const snapshot_mod = @import("../storage/db/native_raft_snapshot.zig");
+    const snapshot_mod = antfly.capi_dependencies.storage_db_native_raft_snapshot;
     const expected = try snapshot_mod.identity(native);
     if (expected.group_id != request.group_id or request.projection_store == null or request.expected_applied_index == 0 or expected.through_index != request.expected_applied_index) return error.InvalidSnapshot;
     var namespace: [24]u8 = undefined;
-    @import("../storage/db/doc_identity.zig").encodeNamespace(&namespace, .{
+    antfly.capi_dependencies.storage_db_doc_identity.encodeNamespace(&namespace, .{
         .table_id = request.identity_table_id,
         .shard_id = request.identity_shard_id,
         .range_id = request.identity_range_id,
@@ -5955,7 +5955,7 @@ fn prepareNativeStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepare
 }
 
 const NativeSnapshotCapture = struct {
-    capture: @import("../storage/db/native_raft_snapshot.zig").Capture,
+    capture: antfly.capi_dependencies.storage_db_native_raft_snapshot.Capture,
     lease_ctx: ?*anyopaque = null,
     release_lease: ?*const fn (?*anyopaque) callconv(.c) void = null,
 };
@@ -14154,6 +14154,16 @@ test "capi request paths trigger readable lease hook" {
     try std.testing.expectEqualStrings("enrichment:search:read_index", recorder.contexts[8][0..recorder.context_lens[8]]);
 }
 
+test "capi relational expression errors preserve public status semantics" {
+    // Keep the public C error mapping aligned without importing schema source
+    // across the standalone C ABI module's directory boundary.
+    const expression_errors = antfly.capi_dependencies.relational_expression_errors;
+    inline for (@typeInfo(expression_errors.Error).error_set.?) |field| {
+        const err = @field(expression_errors.Error, field.name);
+        try std.testing.expectEqual(if (expression_errors.isInvalidInput(err)) capi.ErrorCode.invalid_argument else capi.ErrorCode.intent_conflict, capi.mapError(err));
+    }
+}
+
 test "capi artifact decode and lookup json" {
     var test_tmp = try TestDirectory.init("capi");
     defer test_tmp.cleanup();
@@ -14327,11 +14337,11 @@ test "capi dense search profile breakdown" {
 pub fn storageOwnerRestoreControlJson(owner_ptr: ?*anyopaque, request: *const kernel_owner_abi.RestoreOwnerControlRequest, out_result: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     out_result.* = .{};
     if (request.control.version != kernel_owner_abi.abi_version) return .invalid_abi;
-    @import("../api/restore_owner_contract.zig").validateRequestSize(request.control.request_json.len) catch |err| return storageOwnerStatusFromError(err);
+    antfly.capi_dependencies.api_restore_owner_contract.validateRequestSize(request.control.request_json.len) catch |err| return storageOwnerStatusFromError(err);
     if (request.source_byte_budget == 0 or request.source_byte_budget > 16 * 1024 * 1024) return .invalid_argument;
     const handle = asHandle(owner_ptr) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.control.table_name) orelse return .invalid_argument;
-    const restore = @import("../storage/restore_owner.zig");
+    const restore = antfly.capi_dependencies.storage_restore_owner;
     var input = std.json.parseFromSlice(restore.Request, handle.alloc, request.control.request_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| return storageOwnerStatusFromError(err);
     defer input.deinit();
     input.value.validate(handle.storage_owner_group_id) catch |err| return storageOwnerStatusFromError(err);
@@ -14343,14 +14353,14 @@ pub fn storageOwnerRestoreControlJson(owner_ptr: ?*anyopaque, request: *const ke
         alloc: Allocator,
         scope: [32]u8,
         batch_json: ?[]u8 = null,
-        fn propose(ptr: *anyopaque, batch: db_mod.types.BatchRequest, context: @import("../api/operation.zig").RequestContext) !void {
+        fn propose(ptr: *anyopaque, batch: db_mod.types.BatchRequest, context: antfly.capi_dependencies.api_operation.RequestContext) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
             if (self.batch_json != null) return error.InvalidRestoreStagingCommand;
             if (batch.restore_staging_scope) |scope| if (!std.mem.eql(u8, &scope, &self.scope)) return error.RestoreStagingScopeChanged;
             var scoped = batch;
             scoped.restore_staging_scope = self.scope;
-            self.batch_json = try @import("../api/batch.zig").encodeBatchRequest(self.alloc, scoped);
+            self.batch_json = try antfly.capi_dependencies.api_batch.encodeBatchRequest(self.alloc, scoped);
         }
     };
     var capture: Capture = .{ .alloc = handle.alloc, .scope = input.value.scope.digest() };
@@ -14385,15 +14395,15 @@ pub fn storageOwnerRelationalTransitionRead(owner_ptr: ?*anyopaque, request: *co
     var arena = std.heap.ArenaAllocator.init(handle.alloc);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const command = std.json.parseFromSlice(@import("../storage/db/relational_transition_contract.zig").Request, alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| return storageOwnerStatusFromError(err);
+    const command = std.json.parseFromSlice(antfly.capi_dependencies.storage_db_relational_transition_contract.Request, alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false }) catch |err| return storageOwnerStatusFromError(err);
     var output: std.Io.Writer.Allocating = .init(handle.alloc);
     defer output.deinit();
     var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
     switch (command.value) {
-        .identity => @import("../storage/db/relational_integrity_json.zig").write(handle.db.relationalTopologyIdentity() catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),
-        .status => @import("../storage/db/relational_integrity_json.zig").write(handle.db.relationalTopologyStatus() catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),
-        .manifest => |input| @import("../storage/db/relational_integrity_json.zig").write(handle.db.relationalHandoffManifest(alloc, input.source, input.destination, input.lower, input.upper, input.primary_sequence) catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),
-        .page => |input| @import("../storage/db/relational_integrity_json.zig").write(handle.db.relationalHandoffPage(alloc, input.manifest, input.progress) catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),
+        .identity => antfly.capi_dependencies.storage_db_relational_integrity_json.write(handle.db.relationalTopologyIdentity() catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),
+        .status => antfly.capi_dependencies.storage_db_relational_integrity_json.write(handle.db.relationalTopologyStatus() catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),
+        .manifest => |input| antfly.capi_dependencies.storage_db_relational_integrity_json.write(handle.db.relationalHandoffManifest(alloc, input.source, input.destination, input.lower, input.upper, input.primary_sequence) catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),
+        .page => |input| antfly.capi_dependencies.storage_db_relational_integrity_json.write(handle.db.relationalHandoffPage(alloc, input.manifest, input.progress) catch |err| return storageOwnerStatusFromError(err), &stream) catch |err| return storageOwnerStatusFromError(err),
     }
     const encoded = output.toOwnedSlice() catch |err| return storageOwnerStatusFromError(err);
     out_result.* = .{ .ptr = encoded.ptr, .len = @intCast(encoded.len) };

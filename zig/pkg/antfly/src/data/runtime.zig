@@ -1494,6 +1494,9 @@ const RaftTableApplyStateMachine = struct {
         // The caller pins the raw projection at this same durable index; native
         // capture separately rejects primary state ahead of that boundary.
         if (completed) |index| if (index != applied_index) return error.AppliedSnapshotIndexMismatch;
+        // Inline physical-source runtimes do not own a compiled storage ABI.
+        // Keep their unavailable capability path independent of that archive.
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
         const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
         return owner.captureNativeRaftSnapshot(group_id, applied_index);
     }

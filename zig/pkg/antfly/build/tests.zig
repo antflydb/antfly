@@ -1723,6 +1723,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lite_cmd_test_mod.addImport("antfly-zig", antfly_mod);
     lite_cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const lite_cmd_tests = b.addTest(.{
+        // macOS Debug with the embedded storage graph measured 15.9 GiB.
+        // Leave other targets on the aggregate's existing default budget.
+        .max_rss = if (target.result.os.tag == .macos) 20 * 1024 * 1024 * 1024 else 0,
         .root_module = lite_cmd_test_mod,
         .filters = &.{ "cmd.lite", "testing.backup_restore" },
         .test_runner = .{
@@ -5334,6 +5337,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.relational_index_catalog.",
             "storage.db.relational_index_records.",
             "storage.db.relational_index_jobs.",
+            "storage.db.relational_index_maintenance_sweep.",
             "storage.db.relational_index_system_test.",
             "storage.db.relational_constraint_jobs.",
             "storage.db.relational_integrity.",
@@ -5421,6 +5425,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.posting_segment_store.",
             "storage.resource_manager.",
             "storage.retained_effects.",
+            "storage.rewrite_program_cache.",
+            "storage.rewrite_tail_spool.",
             "storage.source_pin_state.",
             "storage.source_snapshot.",
             "storage.restore_owner.",

@@ -70,14 +70,15 @@ test "shard adapter archive boundary routed writes preserve deterministic errors
     inline for (.{ error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.IntegrityTopologyBusy, error.TopologyChanged, error.RaftBatchWriteOutcomeUnknown, error.RetainedEffectsFull, error.VersionConflict, error.IntentConflict, error.MergePageRequired, error.InvalidResponse, error.InvalidEmbeddingDimensions }) |err| {
         failure = errors.statusFromError(err);
         distinct = distinct or shard_adapter_test_error_ordinal(failure) != @intFromError(err);
-        try std.testing.expectError(err, writer.write(std.testing.allocator, .transaction, 17, "rows", request, forwarding, .none));
+        try std.testing.expectError(err, writer.write(std.testing.allocator, .transaction, 17, "rows", request, forwarding, .{}));
     }
     try std.testing.expect(distinct);
     failure = .ok;
-    try std.testing.expect((try writer.write(std.testing.allocator, .transaction, 17, "rows", request, forwarding, .none)) != null);
-    try std.testing.expect((try writer.write(std.testing.allocator, .transaction, 18, "rows", request, forwarding, .none)) == null);
+    try std.testing.expect((try writer.write(std.testing.allocator, .transaction, 17, "rows", request, forwarding, .{})) != null);
+    try std.testing.expect((try writer.write(std.testing.allocator, .transaction, 18, "rows", request, forwarding, .{})) == null);
     var canceled: std.atomic.Value(bool) = .init(true);
-    try std.testing.expectError(error.Canceled, writer.write(std.testing.allocator, .transaction, 17, "rows", request, forwarding, .fromAtomic(&canceled)));
+    try std.testing.expectError(error.Canceled, writer.write(std.testing.allocator, .transaction, 17, "rows", request, forwarding, .{ .cancellation = .fromAtomic(&canceled) }));
+    try std.testing.expectError(error.DeadlineExceeded, writer.write(std.testing.allocator, .transaction, 17, "rows", request, forwarding, .{ .deadline_ns = 0 }));
 }
 
 test "shard adapter archive boundary restore persistence attaches ABI5 and transports compound staging" {

@@ -241,7 +241,6 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
 }
 
 pub fn mapError(err: anyerror) ErrorCode {
-    if (@import("../schema/relational_expression_errors.zig").isInvalidInput(err)) return .invalid_argument;
     if (err == error.GeneratedColumnRewriteRequired) return .intent_conflict;
     return switch (err) {
         error.VersionConflict => .version_conflict,
@@ -249,6 +248,11 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.TxnNotFound => .txn_not_found,
         error.NotFound => .not_found,
         error.InvalidArgument,
+        error.RelationalExpressionOverflow,
+        error.RelationalExpressionDivisionByZero,
+        error.RelationalExpressionBudgetExceeded,
+        error.InvalidRelationalExpressionInput,
+        error.InvalidRelationalGeneratedValue,
         error.InvalidBatchRequest,
         error.TransactionTooLarge,
         error.UnsupportedBatchRequestEncoding,

@@ -746,7 +746,7 @@ test "retained effects capture allocation failures poison commit and release own
         fn openCursor(self: *@This()) !Cursor {
             return .{ .owner = self };
         }
-        fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
             const owned = try self.alloc.dupe(u8, value);
             errdefer self.alloc.free(owned);
             if (self.records.getPtr(key)) |old| {

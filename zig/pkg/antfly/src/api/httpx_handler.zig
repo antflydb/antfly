@@ -10953,6 +10953,7 @@ test "httpx antfly schema update returns full table status after projection" {
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
+    defer api_server.deinit();
 
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
@@ -10999,6 +11000,7 @@ test "httpx antfly schema update owns self partial support and rejects public in
     try source.replaceSchemaJson(alloc, initial);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
+    defer api_server.deinit();
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
@@ -11330,6 +11332,7 @@ test "httpx schema patch merges at the authority and accepts version zero ETag" 
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
+    defer api_server.deinit();
 
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);

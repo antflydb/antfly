@@ -1415,6 +1415,8 @@ test "transition service owns records and fences reentrant observations" {
                     @field(value, field.name) = observeSplit;
                 } else if (std.mem.eql(u8, field.name, "observe_merge")) {
                     @field(value, field.name) = observeMerge;
+                } else if (@typeInfo(field.type) == .optional) {
+                    @field(value, field.name) = null;
                 } else {
                     @field(value, field.name) = struct {
                         fn call(_: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field.type).pointer.child).@"fn".params[2].type.?) !void {

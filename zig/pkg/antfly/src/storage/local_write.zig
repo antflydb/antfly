@@ -800,6 +800,11 @@ pub fn prepareManagedSchemaBeforeIndexLoad(
     schema_json: ?[]const u8,
 ) !?db_mod.SchemaBeforeIndexLoad {
     if (mode == .query_readonly or mode == .status_only) return null;
+    // A restore descriptor binds the source's exact schema, including the
+    // absence of one. Applying table-creation defaults here changes both the
+    // public schema and runtime digest before the staged owner is verified.
+    if (mode == .restore_repair and schema_json != null and schema_json.?.len == 0)
+        return null;
     // Null means no authoritative contract was supplied; an explicit empty
     // contract means the default schema, even when there are no indexes.
     const effective = tables_api.effectiveSchemaJson(schema_json orelse return null);
@@ -809,6 +814,15 @@ pub fn prepareManagedSchemaBeforeIndexLoad(
         .runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed),
         .public_schema_json = effective,
     };
+}
+
+test "managed schema preparation preserves absent restore schema and normal create defaults" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect((try prepareManagedSchemaBeforeIndexLoad(alloc, .restore_repair, null)) == null);
+    try std.testing.expect((try prepareManagedSchemaBeforeIndexLoad(alloc, .restore_repair, "")) == null);
+    const created = (try prepareManagedSchemaBeforeIndexLoad(alloc, .default, "")).?;
+    defer storage_schema.freeSchema(alloc, created.runtime_schema);
+    try std.testing.expectEqualStrings(tables_api.default_schema_json, created.public_schema_json.?);
 }
 
 pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(

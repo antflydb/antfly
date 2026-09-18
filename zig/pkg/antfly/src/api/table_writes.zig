@@ -30072,136 +30072,6 @@ const reconfigureManagedDbEnrichmentRuntimePaused = physical_local_write.reconfi
 
 pub const StartupCatchUpMetadata = local_write_contract.StartupCatchUpMetadata;
 
-test "restore staging private provisioning primes hidden owner without public catalog admission" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hidden-owner", .{tmp.sub_path});
-    defer alloc.free(root);
-    var cache = ProvisionedTableWriteCache.init(alloc);
-    defer cache.deinit();
-    var source = ProvisionedTableWriteSource.init(root, table_catalog.emptyCatalogSource());
-    source.write_cache = &cache;
-    const namespace: doc_identity.Namespace = .{ .table_id = 99, .shard_id = 7001, .range_id = 7001 };
-    const table: metadata_table_manager.TableRecord = .{ .table_id = 99, .name = "hidden", .schema_json = "", .indexes_json = "{\"text\":{\"type\":\"full_text\"},\"enrichments\":[{\"name\":\"disabled_provider\",\"kind\":\"embedding\",\"field\":\"text\",\"expected_dims\":384}]}" };
-    const encoded_schema = try storage_schema.serializeSchema(alloc, .{});
-    defer alloc.free(encoded_schema);
-    const scope: @import("../storage/db/restore_staging.zig").Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .target_namespace = namespace, .target_schema_digest = @import("../storage/db/restore_staging.zig").digest(encoded_schema) };
-    try source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "a", .end = "z" }, scope);
-    try source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "a", .end = "z" }, scope);
-    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, root, 7001);
-    defer alloc.free(path);
-    var owner = try source.getOrOpenCachedDbModeForReplicatedApply(alloc, &cache, path, 7001, "hidden");
-    defer owner.deinit(alloc);
-    var progress = (try owner.db.restoreStagingStatus(alloc)).?;
-    defer progress.deinit();
-    try std.testing.expectEqual(.reserved, progress.value.phase);
-    try std.testing.expectEqualStrings("a", owner.db.getRange().start);
-    try std.testing.expectEqualStrings("z", owner.db.getRange().end);
-    try std.testing.expectError(error.RestoreStagingInProgress, owner.db.lookup(alloc, "b", .{}));
-    try std.testing.expectError(error.RestoreStagingInProgress, owner.db.batch(.{ .writes = &.{.{ .key = "b", .value = "{}" }} }));
-    var forged_scope = scope;
-    forged_scope.source_artifact_digest = @splat(4);
-    try std.testing.expectError(error.RestoreStagingScopeChanged, source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "a", .end = "z" }, forged_scope));
-    const enrichments = try owner.db.listEnrichments(alloc);
-    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
-    try std.testing.expectEqual(@as(usize, 0), enrichments.len);
-    const source_path = try std.fs.path.join(alloc, &.{ root, "source" });
-    defer alloc.free(source_path);
-    {
-        var input_writer = try db_mod.DB.open(alloc, source_path, .{ .identity_namespace = scope.source_namespace, .start_index_workers = false, .start_optional_runtimes = false });
-        defer input_writer.close();
-        try input_writer.updateRange(.{ .start = "a", .end = "z" });
-        try input_writer.batch(.{ .writes = &.{.{ .key = "alpha", .value = "{\"text\":\"projected keyword\"}" }} });
-    }
-    var input = try db_mod.DB.open(alloc, source_path, .{ .open_mode = .query_readonly, .identity_namespace = scope.source_namespace, .start_index_workers = false, .start_optional_runtimes = false });
-    defer input.close();
-    try owner.db.beginRestoreStaging(alloc, scope);
-    for (0..4) |_| {
-        var page = try owner.db.prepareRestoreStagingPage(alloc, scope, &input, 1, .none);
-        defer page.deinit();
-        if (page.batch) |batch| try owner.db.batch(batch);
-        if (page.phase == .imported) break;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expect(try owner.db.prepareRestoreStagingIndexesStep(alloc, scope.digest()));
-    _ = try owner.db.finishRestoreStaging(alloc, scope.digest(), .validated);
-    _ = try owner.db.finishRestoreStaging(alloc, scope.digest(), .published);
-    var result = try owner.db.search(alloc, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "text", .text = "keyword" } }, .limit = 1 });
-    defer result.deinit();
-    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
-}
-
-test "restore staging private provisioning rebuilds both migration read mappings after restart" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/migration-owner", .{tmp.sub_path});
-    defer alloc.free(root);
-    const previous = "{\"version\":0,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"x-antfly-types\":[\"text\"]}}}}}}";
-    const active = "{\"version\":1,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"x-antfly-types\":[\"keyword\"]}}}}}}";
-    const table: metadata_table_manager.TableRecord = .{ .table_id = 99, .name = "migrating", .schema_json = active, .read_schema_json = previous, .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}" };
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, active);
-    defer parsed.deinit(alloc);
-    const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(alloc, parsed);
-    defer storage_schema.freeSchema(alloc, schema);
-    const encoded = try storage_schema.serializeSchema(alloc, schema);
-    defer alloc.free(encoded);
-    const staging = @import("../storage/db/restore_staging.zig");
-    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .target_namespace = .{ .table_id = 99, .shard_id = 7001, .range_id = 7001 }, .target_schema_digest = staging.digest(encoded) };
-    const input_path = try std.fs.path.join(alloc, &.{ root, "input" });
-    defer alloc.free(input_path);
-    {
-        var input = try db_mod.DB.open(alloc, input_path, .{ .identity_namespace = scope.source_namespace, .start_index_workers = false, .start_optional_runtimes = false });
-        defer input.close();
-        try input.setSchemaJson(alloc, previous);
-        try input.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"name\":\"Old Mapping\"}" }} });
-        try input.setSchemaJson(alloc, active);
-    }
-    // Reopen the hidden target before importing: no accidental process-local
-    // schema history may make its old read index appear ready.
-    for (0..2) |iteration| {
-        var cache = ProvisionedTableWriteCache.init(alloc);
-        defer cache.deinit();
-        var source = ProvisionedTableWriteSource.init(root, table_catalog.emptyCatalogSource());
-        source.write_cache = &cache;
-        try source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "", .end = "" }, scope);
-        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, root, 7001);
-        defer alloc.free(path);
-        var target = try source.getOrOpenCachedDbModeForReplicatedApply(alloc, &cache, path, 7001, table.name);
-        defer target.deinit(alloc);
-        const historical = (try storage_schema.loadSchemaVersion(target.db.core.store, alloc, 0)) orelse return error.TestUnexpectedResult;
-        defer storage_schema.freeSchema(alloc, historical);
-        try std.testing.expectEqual(@as(u32, 0), historical.version);
-        var bootstrap = (try target.db.readRestoreStagingBootstrap(alloc)).?;
-        defer bootstrap.deinit();
-        try std.testing.expectEqualStrings(previous, bootstrap.value.read_schema_json);
-        var forged = table;
-        forged.read_schema_json = "{\"version\":0}";
-        try std.testing.expectError(error.RestoreStagingScopeChanged, source.primeRestoreStagingWriter(alloc, 7001, forged, .{ .start = "", .end = "" }, scope));
-        if (iteration == 0) continue;
-        var input = try db_mod.DB.open(alloc, input_path, .{ .open_mode = .query_readonly, .identity_namespace = scope.source_namespace, .start_index_workers = false, .start_optional_runtimes = false });
-        defer input.close();
-        try target.db.beginRestoreStaging(alloc, scope);
-        for (0..8) |_| {
-            var page = try target.db.prepareRestoreStagingPage(alloc, scope, &input, 1, .none);
-            defer page.deinit();
-            if (page.batch) |batch| try target.db.batch(batch);
-            if (page.phase == .imported) break;
-        } else return error.TestUnexpectedResult;
-        for (0..16) |_| {
-            if (try target.db.prepareRestoreStagingIndexesStep(alloc, scope.digest())) break;
-        } else return error.TestUnexpectedResult;
-        _ = try target.db.finishRestoreStaging(alloc, scope.digest(), .validated);
-        _ = try target.db.finishRestoreStaging(alloc, scope.digest(), .published);
-        var read_result = try target.db.search(alloc, .{ .index_name = "full_text_index_v0", .full_text = .{ .match = .{ .field = "name", .text = "mapping" } }, .limit = 1 });
-        defer read_result.deinit();
-        try std.testing.expectEqual(@as(u32, 1), read_result.total_hits);
-        var active_result = try target.db.search(alloc, .{ .index_name = "full_text_index_v1", .full_text = .{ .term = .{ .field = "name", .term = "Old Mapping" } }, .limit = 1 });
-        defer active_result.deinit();
-        try std.testing.expectEqual(@as(u32, 1), active_result.total_hits);
-    }
-}
-
 fn existingPrimaryBackend() @TypeOf((db_mod.OpenOptions{}).primary_backend) {
     return switch ((db_mod.OpenOptions{}).primary_backend) {
         .lsm => |default_options| blk: {
@@ -40792,6 +40662,135 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "restore staging private provisioning primes hidden owner without public catalog admission" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hidden-owner", .{tmp.sub_path});
+            defer alloc.free(root);
+            var cache = ProvisionedTableWriteCache.init(alloc);
+            defer cache.deinit();
+            var source = ProvisionedTableWriteSource.init(root, table_catalog.emptyCatalogSource());
+            source.write_cache = &cache;
+            const namespace: doc_identity.Namespace = .{ .table_id = 99, .shard_id = 7001, .range_id = 7001 };
+            const table: metadata_table_manager.TableRecord = .{ .table_id = 99, .name = "hidden", .schema_json = "", .indexes_json = "{\"text\":{\"type\":\"full_text\"},\"enrichments\":[{\"name\":\"disabled_provider\",\"kind\":\"embedding\",\"field\":\"text\",\"expected_dims\":384}]}" };
+            const encoded_schema = try storage_schema.serializeSchema(alloc, .{});
+            defer alloc.free(encoded_schema);
+            const scope: @import("../storage/db/restore_staging.zig").Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .target_namespace = namespace, .target_schema_digest = @import("../storage/db/restore_staging.zig").digest(encoded_schema) };
+            try source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "a", .end = "z" }, scope);
+            try source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "a", .end = "z" }, scope);
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, root, 7001);
+            defer alloc.free(path);
+            var owner = try source.getOrOpenCachedDbModeForReplicatedApply(alloc, &cache, path, 7001, "hidden");
+            defer owner.deinit(alloc);
+            var progress = (try owner.db.restoreStagingStatus(alloc)).?;
+            defer progress.deinit();
+            try std.testing.expectEqual(.reserved, progress.value.phase);
+            try std.testing.expectEqualStrings("a", owner.db.getRange().start);
+            try std.testing.expectEqualStrings("z", owner.db.getRange().end);
+            try std.testing.expectError(error.RestoreStagingInProgress, owner.db.lookup(alloc, "b", .{}));
+            try std.testing.expectError(error.RestoreStagingInProgress, owner.db.batch(.{ .writes = &.{.{ .key = "b", .value = "{}" }} }));
+            var forged_scope = scope;
+            forged_scope.source_artifact_digest = @splat(4);
+            try std.testing.expectError(error.RestoreStagingScopeChanged, source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "a", .end = "z" }, forged_scope));
+            const enrichments = try owner.db.listEnrichments(alloc);
+            defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+            try std.testing.expectEqual(@as(usize, 0), enrichments.len);
+            const source_path = try std.fs.path.join(alloc, &.{ root, "source" });
+            defer alloc.free(source_path);
+            {
+                var input_writer = try db_mod.DB.open(alloc, source_path, .{ .identity_namespace = scope.source_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+                defer input_writer.close();
+                try input_writer.updateRange(.{ .start = "a", .end = "z" });
+                try input_writer.batch(.{ .writes = &.{.{ .key = "alpha", .value = "{\"text\":\"projected keyword\"}" }} });
+            }
+            var input = try db_mod.DB.open(alloc, source_path, .{ .open_mode = .query_readonly, .identity_namespace = scope.source_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+            defer input.close();
+            try owner.db.beginRestoreStaging(alloc, scope);
+            for (0..4) |_| {
+                var page = try owner.db.prepareRestoreStagingPage(alloc, scope, &input, 1, .none);
+                defer page.deinit();
+                if (page.batch) |batch| try owner.db.batch(batch);
+                if (page.phase == .imported) break;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expect(try owner.db.prepareRestoreStagingIndexesStep(alloc, scope.digest()));
+            _ = try owner.db.finishRestoreStaging(alloc, scope.digest(), .validated);
+            _ = try owner.db.finishRestoreStaging(alloc, scope.digest(), .published);
+            var result = try owner.db.search(alloc, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "text", .text = "keyword" } }, .limit = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        }
+
+        test "restore staging private provisioning rebuilds both migration read mappings after restart" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/migration-owner", .{tmp.sub_path});
+            defer alloc.free(root);
+            const previous = "{\"version\":0,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"x-antfly-types\":[\"text\"]}}}}}}";
+            const active = "{\"version\":1,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"x-antfly-types\":[\"keyword\"]}}}}}}";
+            const table: metadata_table_manager.TableRecord = .{ .table_id = 99, .name = "migrating", .schema_json = active, .read_schema_json = previous, .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}" };
+            var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, active);
+            defer parsed.deinit(alloc);
+            const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(alloc, parsed);
+            defer storage_schema.freeSchema(alloc, schema);
+            const encoded = try storage_schema.serializeSchema(alloc, schema);
+            defer alloc.free(encoded);
+            const staging = @import("../storage/db/restore_staging.zig");
+            const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .target_namespace = .{ .table_id = 99, .shard_id = 7001, .range_id = 7001 }, .target_schema_digest = staging.digest(encoded) };
+            const input_path = try std.fs.path.join(alloc, &.{ root, "input" });
+            defer alloc.free(input_path);
+            {
+                var input = try db_mod.DB.open(alloc, input_path, .{ .identity_namespace = scope.source_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+                defer input.close();
+                try input.setSchemaJson(alloc, previous);
+                try input.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"name\":\"Old Mapping\"}" }} });
+                try input.setSchemaJson(alloc, active);
+            }
+            // Reopen the hidden target before importing: no accidental process-local
+            // schema history may make its old read index appear ready.
+            for (0..2) |iteration| {
+                var cache = ProvisionedTableWriteCache.init(alloc);
+                defer cache.deinit();
+                var source = ProvisionedTableWriteSource.init(root, table_catalog.emptyCatalogSource());
+                source.write_cache = &cache;
+                try source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "", .end = "" }, scope);
+                const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, root, 7001);
+                defer alloc.free(path);
+                var target = try source.getOrOpenCachedDbModeForReplicatedApply(alloc, &cache, path, 7001, table.name);
+                defer target.deinit(alloc);
+                const historical = (try storage_schema.loadSchemaVersion(target.db.core.store, alloc, 0)) orelse return error.TestUnexpectedResult;
+                defer storage_schema.freeSchema(alloc, historical);
+                try std.testing.expectEqual(@as(u32, 0), historical.version);
+                var bootstrap = (try target.db.readRestoreStagingBootstrap(alloc)).?;
+                defer bootstrap.deinit();
+                try std.testing.expectEqualStrings(previous, bootstrap.value.read_schema_json);
+                var forged = table;
+                forged.read_schema_json = "{\"version\":0}";
+                try std.testing.expectError(error.RestoreStagingScopeChanged, source.primeRestoreStagingWriter(alloc, 7001, forged, .{ .start = "", .end = "" }, scope));
+                if (iteration == 0) continue;
+                var input = try db_mod.DB.open(alloc, input_path, .{ .open_mode = .query_readonly, .identity_namespace = scope.source_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+                defer input.close();
+                try target.db.beginRestoreStaging(alloc, scope);
+                for (0..8) |_| {
+                    var page = try target.db.prepareRestoreStagingPage(alloc, scope, &input, 1, .none);
+                    defer page.deinit();
+                    if (page.batch) |batch| try target.db.batch(batch);
+                    if (page.phase == .imported) break;
+                } else return error.TestUnexpectedResult;
+                for (0..16) |_| {
+                    if (try target.db.prepareRestoreStagingIndexesStep(alloc, scope.digest())) break;
+                } else return error.TestUnexpectedResult;
+                _ = try target.db.finishRestoreStaging(alloc, scope.digest(), .validated);
+                _ = try target.db.finishRestoreStaging(alloc, scope.digest(), .published);
+                var read_result = try target.db.search(alloc, .{ .index_name = "full_text_index_v0", .full_text = .{ .match = .{ .field = "name", .text = "mapping" } }, .limit = 1 });
+                defer read_result.deinit();
+                try std.testing.expectEqual(@as(u32, 1), read_result.total_hits);
+                var active_result = try target.db.search(alloc, .{ .index_name = "full_text_index_v1", .full_text = .{ .term = .{ .field = "name", .term = "Old Mapping" } }, .limit = 1 });
+                defer active_result.deinit();
+                try std.testing.expectEqual(@as(u32, 1), active_result.total_hits);
+            }
+        }
         test "replicated merge retains its resident writer while graph ownership cleanup is pending" {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});

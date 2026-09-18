@@ -4753,6 +4753,13 @@ const TestCompute = struct {
     }
 
     const test_vtable = ComputeBackend.VTable{
+        // TestBuf stores f32 even when a graph declares integer index inputs.
+        // Report the physical dtype so scatter-add exercises its host fallback.
+        .tensorDType = struct {
+            fn dtype(_: *anyopaque, _: CT) !@import("../backends/tensor.zig").DType {
+                return .f32;
+            }
+        }.dtype,
         .backendKind = &backendKind,
         .deinitBackend = &deinitBackend,
         .freeTensor = &freeTensor,
