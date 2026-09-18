@@ -2448,7 +2448,7 @@ components:
         audio:
           type: string
           format: byte
-          description: Base64-encoded audio data (WAV, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
+          description: Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
         language:
           type: string
           description: Force specific language for transcription (optional, model-dependent)
@@ -2498,6 +2498,14 @@ components:
           type: string
           description: Detected or forced language
           example: en
+        duration_ms:
+          type: integer
+          description: Decoded clip duration in milliseconds.
+        segments:
+          type: array
+          items:
+            $ref: '#/components/schemas/DictationSegment'
+          description: Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip.
     DictationStyle:
       type: string
       description: |

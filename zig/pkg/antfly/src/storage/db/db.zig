@@ -42782,7 +42782,8 @@ fn completeDocumentExtractionGeneratedText(
                 .config_json = config.transcription_config_json,
                 .source_text = source_url,
                 .source_parts_json = parts_json,
-                .content_type = "text/plain",
+                // The full STT response, so timestamped segments reach the unit.
+                .content_type = "application/json",
             });
             errdefer alloc.free(produced);
             try applyGeneratedUnitText(alloc, unit, produced, "transcript_text", "completed", .transcript);
@@ -42938,7 +42939,14 @@ fn applyGeneratedUnitText(
         .transcript => {
             unit.transcript_used = true;
             unit.transcript_confidence = parsed.confidence;
+            if (unit.transcript_spans.len > 0) alloc.free(unit.transcript_spans);
+            unit.transcript_spans = parsed.spans;
+            parsed.spans = &.{};
         },
+    }
+    if (parsed.spans.len > 0) {
+        alloc.free(parsed.spans);
+        parsed.spans = &.{};
     }
     unit.extraction_warning = parsed.warning;
     parsed.warning = null;
@@ -43005,11 +43013,14 @@ const ParsedGeneratedUnitText = struct {
     text: []u8,
     confidence: ?f64 = null,
     bbox: ?[4]f64 = null,
+    /// Phrase timing when the producer returned transcript segments.
+    spans: []document_extraction_mod.TranscriptSpan = &.{},
     warning: ?[]u8 = null,
 
     fn deinit(self: *ParsedGeneratedUnitText, alloc: Allocator) void {
         if (self.text.len > 0) alloc.free(self.text);
         if (self.warning) |value| alloc.free(value);
+        if (self.spans.len > 0) alloc.free(self.spans);
         self.* = undefined;
     }
 };
@@ -43030,7 +43041,47 @@ fn parseGeneratedUnitTextOutputAlloc(alloc: Allocator, produced: []const u8) !Pa
     if (generatedTextJsonStringField(parsed.value.object, "warning") orelse generatedTextJsonStringField(parsed.value.object, "extraction_warning")) |warning| {
         out.warning = try alloc.dupe(u8, warning);
     }
+    out.spans = try generatedTextSpansAlloc(alloc, parsed.value.object, out.text);
     return out;
+}
+
+/// Transcript segments from a producer's JSON output resolved to byte spans
+/// of `text`.
+fn generatedTextSpansAlloc(alloc: Allocator, object: std.json.ObjectMap, text: []const u8) ![]document_extraction_mod.TranscriptSpan {
+    const value = object.get("segments") orelse return &.{};
+    if (value != .array or value.array.items.len == 0) return &.{};
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const inputs = try scratch.alloc(document_extraction_mod.TranscriptSegmentInput, value.array.items.len);
+    var count: usize = 0;
+    for (value.array.items) |item| {
+        if (item != .object) continue;
+        const segment_text = generatedTextJsonStringField(item.object, "text") orelse continue;
+        const start_ms = generatedTextJsonFloatField(item.object, "start_ms") orelse continue;
+        const end_ms = generatedTextJsonFloatField(item.object, "end_ms") orelse continue;
+        if (start_ms < 0 or end_ms < 0) continue;
+        var words: []document_extraction_mod.TranscriptWordInput = &.{};
+        if (item.object.get("words")) |words_value| {
+            if (words_value == .array and words_value.array.items.len > 0) {
+                words = try scratch.alloc(document_extraction_mod.TranscriptWordInput, words_value.array.items.len);
+                var word_count: usize = 0;
+                for (words_value.array.items) |word_item| {
+                    if (word_item != .object) continue;
+                    const word_text = generatedTextJsonStringField(word_item.object, "word") orelse continue;
+                    const word_start = generatedTextJsonFloatField(word_item.object, "start_ms") orelse continue;
+                    const word_end = generatedTextJsonFloatField(word_item.object, "end_ms") orelse continue;
+                    if (word_start < 0 or word_end < 0) continue;
+                    words[word_count] = .{ .text = word_text, .start_ms = @intFromFloat(word_start), .end_ms = @intFromFloat(word_end) };
+                    word_count += 1;
+                }
+                words = words[0..word_count];
+            }
+        }
+        inputs[count] = .{ .text = segment_text, .start_ms = @intFromFloat(start_ms), .end_ms = @intFromFloat(end_ms), .words = words };
+        count += 1;
+    }
+    return try document_extraction_mod.transcriptSpansFromSegmentsAlloc(alloc, text, inputs[0..count]);
 }
 
 fn generatedTextJsonStringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
@@ -43412,6 +43463,7 @@ fn appendDocumentUnitStoredChunkFullTextDocuments(
         else
             try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
         defer chunker_mod.freeChunks(alloc, chunks);
+        document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
         for (chunks) |chunk| {
             if (!chunk.isText()) continue;
@@ -43452,6 +43504,7 @@ fn documentUnitCanSkipLocalWrites(
         else
             try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
         defer chunker_mod.freeChunks(alloc, chunks);
+        document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
         for (chunks) |chunk| {
             if (!chunk.isText()) continue;
@@ -43523,6 +43576,7 @@ fn appendDocumentUnitChunkWrites(
             try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
         defer chunker_mod.freeChunks(alloc, chunks);
         if (chunks.len == 0) continue;
+        document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
         const include_default_full_text = entry.full_text_index or
             try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
@@ -44152,6 +44206,7 @@ fn documentUnitPayloadAlloc(
             .ocr_bbox = unit.ocr_bbox,
             .transcript_used = unit.transcript_used,
             .transcript_confidence = unit.transcript_confidence,
+            .transcript_spans = if (unit.transcript_spans.len > 0) unit.transcript_spans else null,
             .extraction_warning = unit.extraction_warning,
             .page_number = unit.page_number,
             .page_label = unit.page_label,
@@ -83596,6 +83651,93 @@ test "db document extraction completes audio transcription with transcriber prod
     const provenance = parsed.value.object.get("provenance").?.object;
     try std.testing.expectApproxEqAbs(@as(f64, 0.81), provenance.get("confidence").?.float, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.81), provenance.get("transcript_confidence").?.float, 0.0001);
+}
+
+test "db document extraction transcript segments time chunk artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{
+        .transcriber_output = "{\"text\":\"first phrase here. second phrase there.\",\"confidence\":0.9,\"duration_ms\":2500,\"segments\":[{\"text\":\"first phrase here.\",\"start_ms\":0,\"end_ms\":1200},{\"text\":\"second phrase there.\",\"start_ms\":1300,\"end_ms\":2500}]}",
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"mock-transcriber\"}}}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 20,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:timed-audio",
+            .value = "{\"filename\":\"audio.mp3\",\"mime_type\":\"audio/mpeg\",\"url\":\"data:audio/mpeg;base64,SUQzYXVkaW8gYnl0ZXM=\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(usize, 1), fake.transcriber_calls);
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:timed-audio", "document_units_v1", "audio:000001");
+    defer alloc.free(unit_key);
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    var parsed_unit = try std.json.parseFromSlice(std.json.Value, alloc, unit_payload, .{});
+    defer parsed_unit.deinit();
+    try std.testing.expectEqualStrings("first phrase here. second phrase there.", parsed_unit.value.object.get("text").?.string);
+    const spans = parsed_unit.value.object.get("provenance").?.object.get("transcript_spans").?.array;
+    try std.testing.expectEqual(@as(usize, 2), spans.items.len);
+    try std.testing.expectEqual(@as(i64, 0), spans.items[0].object.get("char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 18), spans.items[0].object.get("char_end").?.integer);
+    try std.testing.expectEqual(@as(i64, 1200), spans.items[0].object.get("end_ms").?.integer);
+    try std.testing.expectEqual(@as(i64, 19), spans.items[1].object.get("char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 1300), spans.items[1].object.get("start_ms").?.integer);
+    try std.testing.expectEqual(@as(i64, 2500), spans.items[1].object.get("end_ms").?.integer);
+
+    // Every chunk cut from the transcript carries the offsets of the phrases
+    // it overlaps, and the first chunk starts where the recording does.
+    var chunk_index: u32 = 0;
+    var timed_chunks: usize = 0;
+    var last_end_ms: f64 = 0;
+    while (true) : (chunk_index += 1) {
+        const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:timed-audio", "document_chunks_v1", "audio:000001", chunk_index);
+        defer alloc.free(chunk_key);
+        const chunk_payload = db.core.store.get(alloc, chunk_key) catch |err| switch (err) {
+            error.NotFound => break,
+            else => return err,
+        };
+        defer alloc.free(chunk_payload);
+        var parsed_chunk = try std.json.parseFromSlice(std.json.Value, alloc, chunk_payload, .{});
+        defer parsed_chunk.deinit();
+        const start_ms = jsonTestNumber(parsed_chunk.value.object.get("_start_time_ms").?);
+        const end_ms = jsonTestNumber(parsed_chunk.value.object.get("_end_time_ms").?);
+        if (chunk_index == 0) try std.testing.expectEqual(@as(f64, 0), start_ms);
+        try std.testing.expect(end_ms >= start_ms);
+        try std.testing.expect(start_ms >= last_end_ms or start_ms == 0 or start_ms == 1300);
+        last_end_ms = end_ms;
+        timed_chunks += 1;
+    }
+    try std.testing.expect(timed_chunks >= 2);
+    try std.testing.expectEqual(@as(f64, 2500), last_end_ms);
 }
 
 test "db document extraction stores rfc822 email units" {

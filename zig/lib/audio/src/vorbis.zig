@@ -607,7 +607,11 @@ pub fn demuxOggAlloc(allocator: std.mem.Allocator, ogg_bytes: []const u8) !Demux
     return demuxPacketsAlloc(allocator, packets.packets);
 }
 
-fn demuxPacketsAlloc(allocator: std.mem.Allocator, packets: []const ogg.Packet) !Demuxed {
+/// Demuxes already-collected Vorbis packets (the three headers followed by
+/// audio packets) without requiring Ogg page framing. This is the packet-level
+/// entry point used by non-Ogg containers such as Matroska/WebM, whose
+/// CodecPrivate blob holds the same three headers Xiph-laced together.
+pub fn demuxPacketsAlloc(allocator: std.mem.Allocator, packets: []const ogg.Packet) !Demuxed {
     const headers = try parseHeadersFromPacketsAlloc(allocator, packets);
     errdefer {
         var owned = headers;
@@ -770,7 +774,10 @@ fn resampledFrameCount(source_frames: usize, source_sample_rate: u32, target_sam
     return @intCast(@max(@as(u128, 1), @divFloor(numerator, source_sample_rate)));
 }
 
-fn decodeDemuxedInterleavedAlloc(allocator: std.mem.Allocator, demuxed: Demuxed) !DecodedInterleaved {
+/// Decodes an already-demuxed Vorbis stream to interleaved PCM. Exposed
+/// alongside `demuxPacketsAlloc` so non-Ogg containers can demux their own
+/// packet list and then reuse this decoder directly.
+pub fn decodeDemuxedInterleavedAlloc(allocator: std.mem.Allocator, demuxed: Demuxed) !DecodedInterleaved {
     const channels = demuxed.headers.identification.channels;
     if (channels == 0) return error.UnsupportedAudioFormat;
     if (demuxed.audio_packets.len == 0) return error.UnsupportedAudioFormat;

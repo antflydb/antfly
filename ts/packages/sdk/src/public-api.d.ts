@@ -10917,6 +10917,163 @@ export interface components {
              */
             max_document_pages?: number;
         };
+        /**
+         * @description Configuration for OpenAI STT (Whisper) provider.
+         *
+         *     API key via `api_key` field or `OPENAI_API_KEY` environment variable.
+         *
+         *     **Model:** whisper-1
+         *
+         *     **Supported Formats:** mp3, wav, webm, ogg, flac (max 25MB)
+         *
+         *     **Docs:** https://platform.openai.com/docs/guides/speech-to-text
+         * @example {
+         *       "model": "whisper-1"
+         *     }
+         */
+        OpenAISTTConfig: {
+            /**
+             * @description Whisper model to use.
+             * @default whisper-1
+             */
+            model?: string;
+            /** @description OpenAI API key. Falls back to OPENAI_API_KEY environment variable. */
+            api_key?: string;
+            /**
+             * Format: uri
+             * @description API base URL. Falls back to OPENAI_BASE_URL environment variable.
+             */
+            base_url?: string;
+        };
+        /**
+         * @description Configuration for Google Cloud Speech-to-Text provider (Vertex AI).
+         *
+         *     Uses Application Default Credentials (ADC) for authentication.
+         *
+         *     **Features:** Streaming, speaker diarization, automatic punctuation
+         *
+         *     **Docs:** https://cloud.google.com/speech-to-text/docs
+         * @example {
+         *       "project_id": "my-gcp-project",
+         *       "language_code": "en-US",
+         *       "enable_automatic_punctuation": true
+         *     }
+         */
+        VertexSTTConfig: {
+            /** @description Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable. */
+            project_id?: string;
+            /**
+             * @description Google Cloud location.
+             * @default us-central1
+             */
+            location?: string;
+            /** @description Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Falls back to the default ADC chain. */
+            credentials_path?: string;
+            /**
+             * @description Default language code (e.g., 'en-US', 'es-ES').
+             * @default en-US
+             */
+            language_code?: string;
+            /**
+             * @description Enable automatic punctuation.
+             * @default true
+             */
+            enable_automatic_punctuation?: boolean;
+            /**
+             * @description Use enhanced models for better accuracy (costs more).
+             * @default false
+             */
+            use_enhanced?: boolean;
+            /** @description Recognition model (e.g., 'latest_long', 'telephony', 'medical_dictation'). */
+            model?: string;
+        };
+        /**
+         * @description Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider.
+         *
+         *     Uses the Antfly inference service for speech-to-text inference.
+         *
+         *     **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base
+         *
+         *     **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC
+         *
+         *     **Docs:** See inference documentation
+         * @example {
+         *       "api_url": "http://localhost:8080",
+         *       "model": "openai/whisper-base"
+         *     }
+         */
+        AntflySTTConfig: {
+            /**
+             * Format: uri
+             * @description Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
+             */
+            api_url?: string;
+            /** @description Explicit Antfly transcriber model name (e.g., 'openai/whisper-tiny'). */
+            model: string;
+        };
+        /**
+         * @description The STT provider to use.
+         * @enum {string}
+         */
+        STTProvider: "openai" | "vertex" | "antfly";
+        /**
+         * @description Unified configuration for an STT provider.
+         *
+         *     Select the provider type and configure provider-specific settings.
+         *
+         *     **Supported Providers:**
+         *     - `openai` - OpenAI Whisper (whisper-1)
+         *     - `vertex` - Google Cloud Speech-to-Text (Vertex AI)
+         *     - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT)
+         *
+         *     **Example:**
+         *     ```yaml
+         *     provider: antfly
+         *     api_url: "http://localhost:8080"
+         *     model: openai/whisper-base
+         *     ```
+         * @example {
+         *       "provider": "antfly",
+         *       "api_url": "http://localhost:8080",
+         *       "model": "openai/whisper-base"
+         *     }
+         */
+        STTConfig: (components["schemas"]["OpenAISTTConfig"] | components["schemas"]["VertexSTTConfig"] | components["schemas"]["AntflySTTConfig"]) & {
+            provider: components["schemas"]["STTProvider"];
+        };
+        /**
+         * @description Speech-to-text provider for the `transcriber` enrichment shorthand.
+         *
+         *     Accepts every field of the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below.
+         *
+         *     **Example:**
+         *     ```yaml
+         *     name: call_transcripts
+         *     kind: asset
+         *     field: recording_url
+         *     transcriber:
+         *       provider: antfly
+         *       model: openai/whisper-base
+         *       language_code: en
+         *       timestamps: true
+         *     ```
+         */
+        TranscriberEnrichmentConfig: components["schemas"]["STTConfig"] & {
+            /** @description Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it. */
+            language_code?: string;
+            /**
+             * @description Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text.
+             * @default true
+             */
+            timestamps?: boolean;
+            /**
+             * @description Request speaker labels on transcript segments where the provider supports them.
+             * @default false
+             */
+            diarization?: boolean;
+            /** @description Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast. */
+            max_download_bytes?: number;
+        };
         /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
         EnrichmentConfig: {
             /** @description Stable generated artifact name. */
@@ -10949,6 +11106,8 @@ export interface components {
             producer_json?: string;
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
+            /** @description Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. content_type defaults to application/json. */
+            transcriber?: components["schemas"]["TranscriberEnrichmentConfig"];
         };
         /** @description Textual artifact stream consumed by a full-text index, with an optional source-local projection. */
         FullTextArtifactIndexSource: {
@@ -15880,7 +16039,7 @@ export interface components {
             model: string;
             /**
              * Format: byte
-             * @description Base64-encoded audio data (WAV, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
+             * @description Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
              */
             audio: string;
             /**
@@ -15916,6 +16075,10 @@ export interface components {
              * @example en
              */
             language?: string;
+            /** @description Decoded clip duration in milliseconds. */
+            duration_ms?: number;
+            /** @description Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip. */
+            segments?: components["schemas"]["InferenceDictationSegment"][];
         };
         /**
          * @description How the cleanup pass rewrites the transcript. `clean` removes fillers

@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.execution_policy import ExecutionPolicy
+    from ..models.transcriber_enrichment_config import TranscriberEnrichmentConfig
 
 
 T = TypeVar("T", bound="EnrichmentConfig")
@@ -43,6 +44,23 @@ class EnrichmentConfig:
                 Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
             execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
                 operation. These fields tune how work is batched and do not change generated artifact identity.
+            transcriber (TranscriberEnrichmentConfig | Unset): Speech-to-text provider for the `transcriber` enrichment
+                shorthand.
+
+                Accepts every field of the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus
+                the transcription options below.
+
+                **Example:**
+                ```yaml
+                name: call_transcripts
+                kind: asset
+                field: recording_url
+                transcriber:
+                  provider: antfly
+                  model: openai/whisper-base
+                  language_code: en
+                  timestamps: true
+                ```
     """
 
     name: str
@@ -59,6 +77,7 @@ class EnrichmentConfig:
     content_type: str | Unset = UNSET
     producer_json: str | Unset = UNSET
     execution: ExecutionPolicy | Unset = UNSET
+    transcriber: TranscriberEnrichmentConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,6 +111,10 @@ class EnrichmentConfig:
         if not isinstance(self.execution, Unset):
             execution = self.execution.to_dict()
 
+        transcriber: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.transcriber, Unset):
+            transcriber = self.transcriber.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -124,12 +147,15 @@ class EnrichmentConfig:
             field_dict["producer_json"] = producer_json
         if execution is not UNSET:
             field_dict["execution"] = execution
+        if transcriber is not UNSET:
+            field_dict["transcriber"] = transcriber
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.execution_policy import ExecutionPolicy
+        from ..models.transcriber_enrichment_config import TranscriberEnrichmentConfig
 
         d = dict(src_dict)
         name = d.pop("name")
@@ -165,6 +191,13 @@ class EnrichmentConfig:
         else:
             execution = ExecutionPolicy.from_dict(_execution)
 
+        _transcriber = d.pop("transcriber", UNSET)
+        transcriber: TranscriberEnrichmentConfig | Unset
+        if isinstance(_transcriber, Unset):
+            transcriber = UNSET
+        else:
+            transcriber = TranscriberEnrichmentConfig.from_dict(_transcriber)
+
         enrichment_config = cls(
             name=name,
             kind=kind,
@@ -180,6 +213,7 @@ class EnrichmentConfig:
             content_type=content_type,
             producer_json=producer_json,
             execution=execution,
+            transcriber=transcriber,
         )
 
         enrichment_config.additional_properties = d

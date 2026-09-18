@@ -8400,12 +8400,61 @@ pub const Node = struct {
         pipeline.execution_control = control;
 
         pipeline.batch_dispatch = self.tensorBatchDispatch(.transcribe);
-        var result = try pipeline.transcribePcm(decoded.samples, decoded.sample_rate);
+        // The same windowed path the HTTP handler takes: clips longer than
+        // one Whisper window are cut at pauses and decoded window by window,
+        // so an in-process enrichment gets the whole recording, not its first
+        // 30 seconds.
+        var result = try long_transcription.transcribeLong(allocator, &pipeline, decoded.samples, decoded.sample_rate, .{});
         defer result.deinit();
-        return .{
+        return try transcriptionResponseAlloc(allocator, &result);
+    }
+
+    /// The transcript as the shared STT response, with timestamped segments
+    /// and word spans so callers can link text back to a moment.
+    fn transcriptionResponseAlloc(allocator: std.mem.Allocator, result: *const long_transcription.Result) !transcribing_api.Response {
+        var response = transcribing_api.Response{
             .text = try allocator.dupe(u8, result.text),
-            .language = if (result.language) |language| try allocator.dupe(u8, language) else null,
+            .duration_ms = std.math.cast(i64, result.duration_ms) orelse std.math.maxInt(i64),
         };
+        errdefer transcribing_api.deinitResponse(allocator, &response);
+        if (result.language) |language| response.language = try allocator.dupe(u8, language);
+        const segments = try allocator.alloc(transcribing_api.Segment, result.segments.len);
+        var filled: usize = 0;
+        errdefer {
+            for (segments[0..filled]) |segment| {
+                if (segment.text) |text| allocator.free(text);
+                if (segment.words) |words| {
+                    for (words) |word| if (word.word) |value| allocator.free(value);
+                    allocator.free(words);
+                }
+            }
+            allocator.free(segments);
+        }
+        for (result.segments, 0..) |segment, i| {
+            const words = try allocator.alloc(transcribing_api.WordTimestamp, segment.words.len);
+            var words_filled: usize = 0;
+            errdefer {
+                for (words[0..words_filled]) |word| if (word.word) |value| allocator.free(value);
+                allocator.free(words);
+            }
+            for (segment.words, 0..) |word, j| {
+                words[j] = .{
+                    .word = try allocator.dupe(u8, word.word),
+                    .start_ms = std.math.cast(i64, word.start_ms) orelse std.math.maxInt(i64),
+                    .end_ms = std.math.cast(i64, word.end_ms) orelse std.math.maxInt(i64),
+                };
+                words_filled += 1;
+            }
+            segments[i] = .{
+                .text = try allocator.dupe(u8, segment.text),
+                .start_ms = std.math.cast(i64, segment.start_ms) orelse std.math.maxInt(i64),
+                .end_ms = std.math.cast(i64, segment.end_ms) orelse std.math.maxInt(i64),
+                .words = words,
+            };
+            filled += 1;
+        }
+        response.segments = segments;
+        return response;
     }
 
     pub fn extractDirect(
@@ -16794,11 +16843,15 @@ pub const Node = struct {
         };
         defer result.deinit();
 
+        var api_segments = try dictationTranscriptSegments(ctx.allocator, &result);
+        defer api_segments.deinit(ctx.allocator);
         const data = [_]api.TranscribeObject{.{
             .object = "transcription",
             .index = 0,
             .text = result.text,
             .language = result.language,
+            .duration_ms = std.math.cast(i64, result.duration_ms) orelse std.math.maxInt(i64),
+            .segments = api_segments.segments,
         }};
         return ctx.json(api.TranscribeResponse{
             .object = "list",
@@ -22182,6 +22235,7 @@ fn canonicalAudioMime(format: audio_mod.EncodedFormat) []const u8 {
         .aiff => "audio/aiff",
         .caf => "audio/caf",
         .au => "audio/basic",
+        .webm => "audio/webm",
     };
 }
 

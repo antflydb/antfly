@@ -8,42 +8,47 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="InferenceTranscribeRequest")
+T = TypeVar("T", bound="AntflySTTConfig")
 
 
 @_attrs_define
-class InferenceTranscribeRequest:
-    """
-    Attributes:
-        model (str): Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and
-            distributed execution resolve the same model. Example: openai/whisper-tiny.
-        audio (str): Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.).
-            Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
-        language (str | Unset): Force specific language for transcription (optional, model-dependent) Example: en.
+class AntflySTTConfig:
+    """Configuration for Antfly inference STT (Whisper, Wav2Vec2, HuBERT) provider.
+
+    Uses the Antfly inference service for speech-to-text inference.
+
+    **Supported Models:** openai/whisper-tiny, openai/whisper-base, facebook/wav2vec2-base
+
+    **Supported Formats:** WAV (recommended), MP3, FLAC, M4A/AAC
+
+    **Docs:** See inference documentation
+
+        Example:
+            {'api_url': 'http://localhost:8080', 'model': 'openai/whisper-base'}
+
+        Attributes:
+            model (str): Explicit Antfly transcriber model name (e.g., 'openai/whisper-tiny').
+            api_url (str | Unset): Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
     """
 
     model: str
-    audio: str
-    language: str | Unset = UNSET
+    api_url: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         model = self.model
 
-        audio = self.audio
-
-        language = self.language
+        api_url = self.api_url
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
                 "model": model,
-                "audio": audio,
             }
         )
-        if language is not UNSET:
-            field_dict["language"] = language
+        if api_url is not UNSET:
+            field_dict["api_url"] = api_url
 
         return field_dict
 
@@ -52,18 +57,15 @@ class InferenceTranscribeRequest:
         d = dict(src_dict)
         model = d.pop("model")
 
-        audio = d.pop("audio")
+        api_url = d.pop("api_url", UNSET)
 
-        language = d.pop("language", UNSET)
-
-        inference_transcribe_request = cls(
+        antfly_stt_config = cls(
             model=model,
-            audio=audio,
-            language=language,
+            api_url=api_url,
         )
 
-        inference_transcribe_request.additional_properties = d
-        return inference_transcribe_request
+        antfly_stt_config.additional_properties = d
+        return antfly_stt_config
 
     @property
     def additional_keys(self) -> list[str]:

@@ -31,6 +31,7 @@ const flac_impl = @import("flac.zig");
 const ogg_impl = @import("ogg.zig");
 const opus_impl = @import("opus.zig");
 const vorbis_impl = @import("vorbis.zig");
+const webm_impl = @import("webm.zig");
 const conformance_impl = @import("conformance.zig");
 
 const tone_wav_bytes = @embedFile("../testdata/tone.wav");
@@ -123,6 +124,7 @@ pub const flac = flac_impl;
 pub const ogg = ogg_impl;
 pub const opus = opus_impl;
 pub const vorbis = vorbis_impl;
+pub const webm = webm_impl;
 pub const conformance = conformance_impl;
 
 const VEC_LEN = if (builtin.cpu.arch == .wasm32) 4 else 8;
@@ -283,6 +285,7 @@ pub const EncodedFormat = enum {
     aiff,
     caf,
     au,
+    webm,
 };
 
 pub const DecodeOptions = struct {
@@ -345,6 +348,7 @@ pub fn detectFormat(audio_bytes: []const u8) ?EncodedFormat {
     if (audio_bytes.len >= 4 and std.mem.eql(u8, audio_bytes[0..4], "caff")) return .caf;
     if (audio_bytes.len >= 4 and std.mem.eql(u8, audio_bytes[0..4], ".snd")) return .au;
     if (audio_bytes.len >= 4 and std.mem.eql(u8, audio_bytes[0..4], "fLaC")) return .flac;
+    if (audio_bytes.len >= 4 and std.mem.eql(u8, audio_bytes[0..4], &[_]u8{ 0x1A, 0x45, 0xDF, 0xA3 })) return .webm;
     if (detectIsoBmffAudioFormat(audio_bytes)) |format| return format;
     if (audio_bytes.len >= 4 and std.mem.eql(u8, audio_bytes[0..4], "OggS")) {
         const probe_end = @min(audio_bytes.len, 96);
@@ -421,6 +425,13 @@ pub fn detectFormatFromMime(mime: []const u8) ?EncodedFormat {
 
     if (std.mem.eql(u8, normalized, "audio/vorbis")) return .ogg;
 
+    if (std.mem.eql(u8, normalized, "audio/webm") or
+        std.mem.eql(u8, normalized, "video/webm") or
+        std.mem.eql(u8, normalized, "audio/x-matroska") or
+        std.mem.eql(u8, normalized, "video/x-matroska") or
+        std.mem.eql(u8, normalized, "video/matroska"))
+        return .webm;
+
     return null;
 }
 
@@ -444,6 +455,7 @@ pub fn detectFormatFromFilename(file_name: []const u8) ?EncodedFormat {
     if (asciiEqlIgnoreCase(ext, "au") or asciiEqlIgnoreCase(ext, "snd")) return .au;
     if (asciiEqlIgnoreCase(ext, "ogg") or asciiEqlIgnoreCase(ext, "oga")) return .ogg;
     if (asciiEqlIgnoreCase(ext, "opus")) return .opus;
+    if (asciiEqlIgnoreCase(ext, "webm") or asciiEqlIgnoreCase(ext, "mkv") or asciiEqlIgnoreCase(ext, "mka")) return .webm;
 
     return null;
 }
@@ -539,6 +551,7 @@ pub fn decodeInterleaved(
         .aiff => decodeInterleavedAiff(allocator, audio_bytes),
         .caf => decodeInterleavedCaf(allocator, audio_bytes),
         .au => decodeInterleavedAu(allocator, audio_bytes),
+        .webm => decodeInterleavedWebm(allocator, audio_bytes),
     };
     errdefer decoded.deinit();
     normalizePcmInPlace(decoded.samples);
@@ -562,6 +575,7 @@ fn decodeInterleavedWithoutFallback(
         .aiff => decodeInterleavedAiff(allocator, audio_bytes),
         .caf => decodeInterleavedCafPureZig(allocator, audio_bytes),
         .au => decodeInterleavedAu(allocator, audio_bytes),
+        .webm => decodeInterleavedWebmPureZig(allocator, audio_bytes),
         else => return error.UnsupportedAudioFormat,
     };
     errdefer decoded.deinit();
@@ -571,7 +585,7 @@ fn decodeInterleavedWithoutFallback(
 
 pub fn canDecodeFormat(format: EncodedFormat) bool {
     return switch (format) {
-        .wav, .aac, .mp4, .ogg, .opus, .flac, .aiff, .caf, .au => true,
+        .wav, .aac, .mp4, .ogg, .opus, .flac, .aiff, .caf, .au, .webm => true,
         .mp3 => mp3.enabled(),
     };
 }
@@ -669,6 +683,20 @@ fn decodeInterleavedOggPureZig(allocator: std.mem.Allocator, audio_bytes: []cons
         },
         .opus => return decodeInterleavedOpusPureZig(allocator, audio_bytes),
     }
+}
+
+fn decodeInterleavedWebm(allocator: std.mem.Allocator, audio_bytes: []const u8) !AudioInterleaved {
+    return decodeInterleavedWebmPureZig(allocator, audio_bytes);
+}
+
+fn decodeInterleavedWebmPureZig(allocator: std.mem.Allocator, audio_bytes: []const u8) !AudioInterleaved {
+    const decoded = try webm.decodeInterleaved(allocator, audio_bytes);
+    return .{
+        .samples = decoded.samples,
+        .sample_rate = decoded.sample_rate,
+        .channels = decoded.channels,
+        .allocator = allocator,
+    };
 }
 
 fn decodeInterleavedAac(allocator: std.mem.Allocator, audio_bytes: []const u8) !AudioInterleaved {
@@ -1702,6 +1730,9 @@ test "detect format recognizes aac ogg opus and flac signatures" {
     try std.testing.expectEqual(EncodedFormat.flac, detectFormat(tone_flac_bytes).?);
     try std.testing.expectEqual(EncodedFormat.flac, detectFormat(tone_flac_24bit_bytes).?);
     try std.testing.expectEqual(EncodedFormat.ogg, detectFormat(tone_flac_ogg_bytes).?);
+
+    const webm_magic = [_]u8{ 0x1A, 0x45, 0xDF, 0xA3, 0x00, 0x00, 0x00, 0x00 };
+    try std.testing.expectEqual(EncodedFormat.webm, detectFormat(&webm_magic).?);
 }
 
 test "detect format from mime covers common audio media types" {
@@ -1719,6 +1750,12 @@ test "detect format from mime covers common audio media types" {
     try std.testing.expectEqual(EncodedFormat.ogg, detectFormatFromMime("audio/ogg").?);
     try std.testing.expectEqual(EncodedFormat.opus, detectFormatFromMime("audio/ogg; codecs=opus").?);
     try std.testing.expectEqual(EncodedFormat.flac, detectFormatFromMime("audio/flac").?);
+
+    try std.testing.expectEqual(EncodedFormat.webm, detectFormatFromMime("audio/webm").?);
+    try std.testing.expectEqual(EncodedFormat.webm, detectFormatFromMime("video/webm").?);
+    try std.testing.expectEqual(EncodedFormat.webm, detectFormatFromMime("audio/x-matroska").?);
+    try std.testing.expectEqual(EncodedFormat.webm, detectFormatFromMime("video/x-matroska").?);
+    try std.testing.expectEqual(EncodedFormat.webm, detectFormatFromMime("video/matroska").?);
 }
 
 test "compatibility helpers follow supported formats for mime and filename" {
@@ -1730,6 +1767,7 @@ test "compatibility helpers follow supported formats for mime and filename" {
     try std.testing.expect(canDecodeMime("audio/aiff"));
     try std.testing.expect(canDecodeMime("audio/caf"));
     try std.testing.expect(canDecodeMime("audio/flac"));
+    try std.testing.expect(canDecodeMime("audio/webm"));
     try std.testing.expect(!canDecodeMime("audio/unknown"));
 
     try std.testing.expect(canDecodeFilename("clip.wav"));
@@ -1743,6 +1781,9 @@ test "compatibility helpers follow supported formats for mime and filename" {
     try std.testing.expect(canDecodeFilename("clip.aiff"));
     try std.testing.expect(canDecodeFilename("clip.caf"));
     try std.testing.expect(canDecodeFilename("clip.flac"));
+    try std.testing.expect(canDecodeFilename("clip.webm"));
+    try std.testing.expect(canDecodeFilename("clip.mkv"));
+    try std.testing.expect(canDecodeFilename("clip.mka"));
     try std.testing.expect(!canDecodeFilename("clip.bin"));
 }
 
@@ -1787,6 +1828,9 @@ test "detect format from filename covers common audio extensions" {
     try std.testing.expectEqual(EncodedFormat.ogg, detectFormatFromFilename("clip.oga").?);
     try std.testing.expectEqual(EncodedFormat.opus, detectFormatFromFilename("clip.opus").?);
     try std.testing.expectEqual(EncodedFormat.flac, detectFormatFromFilename("clip.flac").?);
+    try std.testing.expectEqual(EncodedFormat.webm, detectFormatFromFilename("clip.webm").?);
+    try std.testing.expectEqual(EncodedFormat.webm, detectFormatFromFilename("clip.mkv").?);
+    try std.testing.expectEqual(EncodedFormat.webm, detectFormatFromFilename("clip.mka").?);
 }
 
 test "file name hint overrides ambiguous sync-word sniffing for flac" {
@@ -2073,6 +2117,33 @@ test "checked-in mono opus fixture decodes on the pure-zig no-fallback lane" {
     try std.testing.expectEqual(@as(u32, 48_000), zig.sample_rate);
     try std.testing.expectEqual(@as(u8, 1), zig.channels);
     try std.testing.expect(zig.samples.len > 40_000);
+}
+
+test "synthetic webm opus fixture decodes through the public dispatch and the pure-zig no-fallback lane" {
+    const allocator = std.testing.allocator;
+
+    var ogg_packets = try ogg.parsePacketsAlloc(allocator, tone_opus_bytes);
+    defer ogg_packets.deinit();
+    const opus_head = ogg_packets.packets[0].bytes;
+
+    var packets = std.ArrayList([]const u8).empty;
+    defer packets.deinit(allocator);
+    for (ogg_packets.packets[2..]) |packet| try packets.append(allocator, packet.bytes);
+
+    const file = try webm.buildOpusTestFileAlloc(allocator, opus_head, packets.items);
+    defer allocator.free(file);
+
+    try std.testing.expectEqual(EncodedFormat.webm, detectFormat(file).?);
+
+    var dispatched = try decodeInterleaved(allocator, file, .{});
+    defer dispatched.deinit();
+    var no_fallback = try decodeInterleavedWithoutFallback(allocator, file, .{});
+    defer no_fallback.deinit();
+
+    try std.testing.expectEqual(@as(u32, 48_000), dispatched.sample_rate);
+    try std.testing.expectEqual(@as(u8, 2), dispatched.channels);
+    try std.testing.expect(dispatched.samples.len > 0);
+    try std.testing.expectEqualSlices(f32, dispatched.samples, no_fallback.samples);
 }
 
 test "checked-in aac fixtures decode on the pure-zig no-fallback lane" {

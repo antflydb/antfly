@@ -2038,6 +2038,17 @@ pub fn build(b: *std.Build) void {
         "decode mono wav fast path handles pcm64 mono and stereo",
         "decode mono wav fast path handles pcm8 and g711 stereo",
         "checked-in mp3 demux rejection corpus handles raw fallback outcomes",
+        "webm demux extracts opus packets from a synthetic single-cluster file",
+        "webm demux extracts vorbis packets from a synthetic single-cluster file",
+        "webm demux extracts flac frames from a synthetic single-cluster file",
+        "webm demux skips a video track that precedes the audio track",
+        "webm demux decodes real opus packets laced with Xiph and EBML lacing",
+        "webm demux reconstructs frames for all three lacing modes",
+        "webm demux resolves unknown-size Segment and Cluster elements",
+        "webm demux honors CodecDelay when OpusHead reports no pre-skip",
+        "webm demux rejects a truncated file instead of crashing",
+        "webm demux rejects non-EBML input",
+        "synthetic webm opus fixture decodes through the public dispatch and the pure-zig no-fallback lane",
     };
     for (audio_module_test_filters, 0..) |filter, filter_index| {
         const audio_module_tests = b.addTest(.{

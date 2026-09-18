@@ -19,7 +19,7 @@ const current_domain = "antfly-document-unit-fingerprint-v2";
 // Adding extraction metadata is a persisted-format change: update the encoder,
 // assign a new stable tag, and bump the fingerprint version deliberately.
 comptime {
-    if (@typeInfo(document_extraction.Unit).@"struct".fields.len != 32) {
+    if (@typeInfo(document_extraction.Unit).@"struct".fields.len != 33) {
         @compileError("document_extraction.Unit changed; update and version document_unit_fingerprint");
     }
 }
@@ -57,6 +57,7 @@ const Field = enum(u8) {
     text_regions = 30,
     char_start = 31,
     char_end = 32,
+    transcript_spans = 33,
 };
 
 /// Computes the current document-unit fingerprint without constructing an
@@ -97,6 +98,11 @@ pub fn fingerprintAlloc(alloc: Allocator, unit: document_extraction.Unit) ![]u8 
     hashTaggedOptionalBbox(&hasher, .page_bbox, unit.page_bbox);
     hashTaggedOptionalI32(&hasher, .page_rotation, unit.page_rotation);
     hashTaggedTextRegions(&hasher, unit.text_regions);
+    // Transcript timing joined the format after v2 shipped. The tag is
+    // written only when spans exist, so every unit without them (all
+    // non-audio units, and audio units transcribed before timing was kept)
+    // keeps the digest it already has and is not re-materialized.
+    if (unit.transcript_spans.len > 0) hashTaggedTranscriptSpans(&hasher, unit.transcript_spans);
     hashTaggedOptionalU32(&hasher, .char_start, unit.char_start);
     hashTaggedOptionalU32(&hasher, .char_end, unit.char_end);
 
@@ -457,6 +463,17 @@ fn hashTaggedTextRegions(hasher: *Sha256, regions: []const document_extraction.T
     }
 }
 
+fn hashTaggedTranscriptSpans(hasher: *Sha256, spans: []const document_extraction.TranscriptSpan) void {
+    hashField(hasher, .transcript_spans);
+    hashU64(hasher, @intCast(spans.len));
+    for (spans) |span| {
+        hashU64(hasher, span.char_start);
+        hashU64(hasher, span.char_end);
+        hashU64(hasher, span.start_ms);
+        hashU64(hasher, span.end_ms);
+    }
+}
+
 fn hashU64(hasher: *Sha256, value: u64) void {
     var encoded: [@sizeOf(u64)]u8 = undefined;
     std.mem.writeInt(u64, &encoded, value, .big);
@@ -535,4 +552,33 @@ test "document unit fingerprint state version rejects legacy encodings" {
     try std.testing.expect(!stateVersionIsCurrent(.{ .integer = 1 }));
     try std.testing.expect(stateVersionIsCurrent(.{ .integer = current_state_version }));
     try std.testing.expect(!stateVersionIsCurrent(.{ .string = "2" }));
+}
+
+test "document unit fingerprint folds transcript spans in only when present" {
+    const alloc = std.testing.allocator;
+    const base = document_extraction.Unit{
+        .unit_id = @constCast("audio:000001"),
+        .unit_type = @constCast("audio"),
+        .text = @constCast("hello there"),
+        .method = @constCast("transcription"),
+        .transcript_used = true,
+    };
+    var spans = [_]document_extraction.TranscriptSpan{
+        .{ .char_start = 0, .char_end = 11, .start_ms = 0, .end_ms = 800 },
+    };
+    var timed = base;
+    timed.transcript_spans = &spans;
+
+    // A unit without spans keeps the digest it had before timing existed,
+    // so previously materialized audio is not rebuilt on upgrade.
+    const untimed_fingerprint = try fingerprintAlloc(alloc, base);
+    defer alloc.free(untimed_fingerprint);
+    const timed_fingerprint = try fingerprintAlloc(alloc, timed);
+    defer alloc.free(timed_fingerprint);
+    try std.testing.expect(!std.mem.eql(u8, untimed_fingerprint, timed_fingerprint));
+
+    spans[0].end_ms = 900;
+    const moved_fingerprint = try fingerprintAlloc(alloc, timed);
+    defer alloc.free(moved_fingerprint);
+    try std.testing.expect(!std.mem.eql(u8, timed_fingerprint, moved_fingerprint));
 }

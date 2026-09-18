@@ -1356,7 +1356,11 @@ fn decodePacketRunIndividuallyAlloc(
     }
 }
 
-fn decodeInterleavedPacketsAlloc(
+/// Decodes already-demuxed Opus packets to interleaved PCM. This is the
+/// packet-level entry point shared by the Ogg and Matroska/WebM demuxers:
+/// callers that already have raw Opus packets (with their parsed TOC bytes)
+/// and the OpusHead fields can decode directly without an Ogg container.
+pub fn decodeInterleavedPacketsAlloc(
     allocator: std.mem.Allocator,
     packets: []const []const u8,
     packet_tocs: []const Toc,
@@ -1431,12 +1435,20 @@ fn decodeInterleavedPacketsAlloc(
     errdefer allocator.free(owned);
     applyOutputGainInPlace(owned, output_gain_q8);
     if (pre_skip != 0 or playable_frames_opt != null) {
+        // With no explicit playable-frame count (no Ogg granule position to
+        // anchor it), the only sensible default is "everything decoded minus
+        // the leading pre-skip": defaulting to the full decoded frame count
+        // instead would make trimInterleavedOwned's own invariant
+        // (playable_frames <= decoded_frames - trim_start_frames) impossible
+        // to satisfy whenever pre_skip is nonzero.
+        const decoded_frames: u64 = @intCast(@divFloor(owned.len, channels));
+        const default_playable_frames = decoded_frames -| @as(u64, pre_skip);
         owned = try trimInterleavedOwned(
             allocator,
             owned,
             channels,
             pre_skip,
-            playable_frames_opt orelse @intCast(@divFloor(owned.len, channels)),
+            playable_frames_opt orelse default_playable_frames,
         );
     }
 

@@ -1998,6 +1998,8 @@ pub const Runtime = struct {
             const transcribe_request = transcribing.Request{
                 .url = request.source_text,
                 .language = cfg_parsed.value.language_code,
+                .timestamps = cfg_parsed.value.timestamps orelse true,
+                .diarization = cfg_parsed.value.diarization orelse false,
             };
             var result = if (local.transcribe_audio_with_context) |transcribe_audio|
                 try managed_embedder.AntflyProviderBoundary.call(
@@ -2772,6 +2774,8 @@ pub const Runtime = struct {
             const transcribe_request = transcribing.Request{
                 .url = request.source_text,
                 .language = cfg_parsed.value.language_code,
+                .timestamps = cfg_parsed.value.timestamps orelse true,
+                .diarization = cfg_parsed.value.diarization orelse false,
             };
             var result = if (local.transcribe_audio_with_context) |transcribe_audio|
                 try managed_embedder.AntflyProviderBoundary.call(
@@ -2841,7 +2845,11 @@ pub const Runtime = struct {
             alloc,
             self.http,
             cfg_parsed.value,
-            .{ .url = request.source_text },
+            .{
+                .url = request.source_text,
+                .timestamps = cfg_parsed.value.timestamps orelse true,
+                .diarization = cfg_parsed.value.diarization orelse false,
+            },
             .{
                 .source_table = self.execution.routing.source_table,
                 .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),

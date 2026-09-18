@@ -73,15 +73,29 @@ pub const Config = struct {
     use_enhanced: ?bool = null,
     /// Route-owned hard response ceiling for bounded orchestration.
     max_response_bytes: ?usize = null,
+    /// Largest source recording fetched from a URL, in bytes. Defaults to
+    /// `default_max_download_bytes`; the inference service applies its own
+    /// media admission on top.
+    max_download_bytes: ?usize = null,
+    /// Ask the provider for timestamped segments (on by default where the
+    /// provider supports them).
+    timestamps: ?bool = null,
+    /// Ask the provider for speaker labels where it supports them.
+    diarization: ?bool = null,
 
     pub fn resolvedUrl(self: Config) ?[]const u8 {
         return self.url orelse self.api_url;
     }
 };
 
-const remote_fetch_security = scraping.ContentSecurityConfig{
-    .max_download_size_bytes = 32 << 20,
-};
+/// A one hour recording is about 30 MB as 64 kbps AAC (a phone voice memo)
+/// and about 58 MB as 128 kbps MP3 (a podcast), so the default fetch ceiling
+/// covers those with room to spare; `Config.max_download_bytes` raises it.
+pub const default_max_download_bytes: usize = 128 << 20;
+
+fn remoteFetchSecurity(max_download_bytes: ?usize) scraping.ContentSecurityConfig {
+    return .{ .max_download_size_bytes = max_download_bytes orelse default_max_download_bytes };
+}
 
 threadlocal var active_runtime: ?*const Runtime = null;
 
@@ -352,6 +366,7 @@ const AntflyTranscriberState = struct {
     model: []const u8,
     language_code: ?[]const u8 = null,
     max_response_bytes: ?usize = null,
+    max_download_bytes: ?usize = null,
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
     framed_attachments: bool = false,
@@ -389,6 +404,7 @@ const AntflyTranscriberState = struct {
             .source_table = source_table,
             .language_code = language_code,
             .max_response_bytes = cfg.max_response_bytes,
+            .max_download_bytes = cfg.max_download_bytes,
             .timeout_ms = options.timeout_ms,
             .cancellation = options.cancellation,
             .framed_attachments = cfg.framed_attachments,
@@ -428,7 +444,7 @@ const AntflyTranscriberState = struct {
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *AntflyTranscriberState = @ptrCast(@alignCast(ptr));
-        var audio_content = try resolveAudioContentAlloc(alloc, req.url);
+        var audio_content = try resolveAudioContentAlloc(alloc, req.url, self.max_download_bytes);
         defer audio_content.deinit(alloc);
         var encoded: ?[]u8 = null;
         defer if (encoded) |value| alloc.free(value);
@@ -504,12 +520,56 @@ const AntflyTranscriberState = struct {
         defer parsed.deinit();
 
         const first = if (parsed.value.data.len > 0) parsed.value.data[0] else return error.EmptyResponse;
-        return .{
+        var response = Response{
             .text = try alloc.dupe(u8, first.text),
-            .language = try dupOpt(alloc, first.language),
+            .duration_ms = first.duration_ms,
         };
+        errdefer deinitResponse(alloc, &response);
+        response.language = try dupOpt(alloc, first.language);
+        if (first.segments) |api_segments| response.segments = try antflySegmentsAlloc(alloc, api_segments);
+        return response;
     }
 };
+
+/// The inference service's timestamped phrases as shared transcript segments.
+fn antflySegmentsAlloc(alloc: Allocator, api_segments: []const inference_api.types.DictationSegment) ![]Segment {
+    const segments = try alloc.alloc(Segment, api_segments.len);
+    var filled: usize = 0;
+    errdefer {
+        for (segments[0..filled]) |segment| {
+            var owned = segment;
+            deinitSegment(alloc, &owned);
+        }
+        alloc.free(segments);
+    }
+    for (api_segments, 0..) |api_segment, i| {
+        const words = try alloc.alloc(WordTimestamp, api_segment.words.len);
+        var words_filled: usize = 0;
+        errdefer {
+            for (words[0..words_filled]) |word| {
+                var owned = word;
+                deinitWordTimestamp(alloc, &owned);
+            }
+            alloc.free(words);
+        }
+        for (api_segment.words, 0..) |api_word, j| {
+            words[j] = .{
+                .word = try alloc.dupe(u8, api_word.word),
+                .start_ms = api_word.start_ms,
+                .end_ms = api_word.end_ms,
+            };
+            words_filled += 1;
+        }
+        segments[i] = .{
+            .text = try alloc.dupe(u8, api_segment.text),
+            .start_ms = api_segment.start_ms,
+            .end_ms = api_segment.end_ms,
+            .words = words,
+        };
+        filled += 1;
+    }
+    return segments;
+}
 
 const OpenAiTranscriberState = struct {
     alloc: Allocator,
@@ -519,6 +579,7 @@ const OpenAiTranscriberState = struct {
     model: []const u8,
     language_code: ?[]const u8 = null,
     max_response_bytes: ?usize = null,
+    max_download_bytes: ?usize = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
         const state = try alloc.create(OpenAiTranscriberState);
@@ -531,6 +592,7 @@ const OpenAiTranscriberState = struct {
             .model = try alloc.dupe(u8, cfg.model orelse "whisper-1"),
             .language_code = try dupOpt(alloc, cfg.language_code),
             .max_response_bytes = cfg.max_response_bytes,
+            .max_download_bytes = cfg.max_download_bytes,
         };
         if (cfg.bearer_token orelse cfg.api_key) |token| try state.setBearer(token);
 
@@ -562,7 +624,7 @@ const OpenAiTranscriberState = struct {
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *OpenAiTranscriberState = @ptrCast(@alignCast(ptr));
-        const audio_bytes = try resolveAudioInputAlloc(alloc, req.url);
+        const audio_bytes = try resolveAudioInputAlloc(alloc, req.url, self.max_download_bytes);
         defer alloc.free(audio_bytes);
 
         const content_type = "application/octet-stream";
@@ -587,13 +649,58 @@ const OpenAiTranscriberState = struct {
         if (!resp.ok()) return error.TranscribeRequestFailed;
 
         const payload = resp.body orelse return error.EmptyResponse;
-        var parsed = try std.json.parseFromSlice(audio.STTResponse, alloc, payload, .{
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-        return try cloneResponse(alloc, parsed.value);
+        return try parseOpenAiVerboseResponseAlloc(alloc, payload);
     }
 };
+
+/// OpenAI's `verbose_json` transcription: seconds become milliseconds and
+/// each segment keeps its text and span.
+fn parseOpenAiVerboseResponseAlloc(alloc: Allocator, payload: []const u8) !Response {
+    const Body = struct {
+        text: ?[]const u8 = null,
+        language: ?[]const u8 = null,
+        duration: ?f64 = null,
+        segments: []const struct {
+            start: f64 = 0,
+            end: f64 = 0,
+            text: ?[]const u8 = null,
+        } = &.{},
+    };
+    var parsed = try std.json.parseFromSlice(Body, alloc, payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    var response = Response{
+        .text = try dupOpt(alloc, parsed.value.text),
+        .duration_ms = if (parsed.value.duration) |seconds| secondsToMs(seconds) else null,
+    };
+    errdefer deinitResponse(alloc, &response);
+    response.language = try dupOpt(alloc, parsed.value.language);
+    if (parsed.value.segments.len > 0) {
+        const segments = try alloc.alloc(Segment, parsed.value.segments.len);
+        var filled: usize = 0;
+        errdefer {
+            for (segments[0..filled]) |segment| {
+                var owned = segment;
+                deinitSegment(alloc, &owned);
+            }
+            alloc.free(segments);
+        }
+        for (parsed.value.segments, 0..) |segment, i| {
+            segments[i] = .{
+                .text = try dupOpt(alloc, if (segment.text) |text| std.mem.trim(u8, text, " ") else null),
+                .start_ms = secondsToMs(segment.start),
+                .end_ms = secondsToMs(segment.end),
+            };
+            filled += 1;
+        }
+        response.segments = segments;
+    }
+    return response;
+}
+
+fn secondsToMs(seconds: f64) i64 {
+    if (!std.math.isFinite(seconds) or seconds <= 0) return 0;
+    return @intFromFloat(@round(seconds * 1000.0));
+}
 
 const VertexTranscriberState = struct {
     alloc: Allocator,
@@ -605,7 +712,9 @@ const VertexTranscriberState = struct {
     location: []const u8,
     model: []const u8,
     language_code: []const u8,
+    enable_automatic_punctuation: ?bool = null,
     max_response_bytes: ?usize = null,
+    max_download_bytes: ?usize = null,
 
     fn init(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcriber {
         const state = try alloc.create(VertexTranscriberState);
@@ -619,7 +728,9 @@ const VertexTranscriberState = struct {
             .location = try alloc.dupe(u8, cfg.location orelse "global"),
             .model = try alloc.dupe(u8, cfg.model orelse "latest_long"),
             .language_code = try alloc.dupe(u8, cfg.language_code orelse "en-US"),
+            .enable_automatic_punctuation = cfg.enable_automatic_punctuation,
             .max_response_bytes = cfg.max_response_bytes,
+            .max_download_bytes = cfg.max_download_bytes,
         };
         errdefer state.deinitState();
 
@@ -683,7 +794,7 @@ const VertexTranscriberState = struct {
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *VertexTranscriberState = @ptrCast(@alignCast(ptr));
-        const audio_bytes = try resolveAudioInputAlloc(alloc, req.url);
+        const audio_bytes = try resolveAudioInputAlloc(alloc, req.url, self.max_download_bytes);
         defer alloc.free(audio_bytes);
 
         const encoded_len = std.base64.standard.Encoder.calcSize(audio_bytes.len);
@@ -692,20 +803,40 @@ const VertexTranscriberState = struct {
         _ = std.base64.standard.Encoder.encode(encoded, audio_bytes);
 
         const language = req.language orelse self.language_code;
+        const DiarizationConfig = struct {
+            minSpeakerCount: u32 = 1,
+            maxSpeakerCount: u32 = 6,
+        };
+        const RecognitionFeatures = struct {
+            enableWordTimeOffsets: bool,
+            enableAutomaticPunctuation: ?bool = null,
+            diarizationConfig: ?DiarizationConfig = null,
+        };
         const RecognitionConfig = struct {
             explicitDecodingConfig: struct {} = .{},
             model: []const u8,
             languageCodes: []const []const u8,
+            features: RecognitionFeatures,
         };
         const RequestBody = struct {
             config: RecognitionConfig,
             content: []const u8,
         };
         const languages = [_][]const u8{language};
-        const body = try httpx.json.Json.stringify(alloc, RequestBody{
+        // Word offsets are what segment timing is rebuilt from, so they are
+        // requested whenever timestamps are wanted; speaker labels ride on
+        // the same words when diarization is on.
+        const want_timestamps = req.timestamps orelse true;
+        const want_diarization = req.diarization orelse false;
+        const body = try httpx.json.Json.stringifyRequest(alloc, RequestBody{
             .config = .{
                 .model = self.model,
                 .languageCodes = &languages,
+                .features = .{
+                    .enableWordTimeOffsets = want_timestamps or want_diarization,
+                    .enableAutomaticPunctuation = self.enable_automatic_punctuation,
+                    .diarizationConfig = if (want_diarization) DiarizationConfig{} else null,
+                },
             },
             .content = encoded,
         });
@@ -732,25 +863,199 @@ const VertexTranscriberState = struct {
         defer resp.deinit();
         if (!resp.ok()) return error.TranscribeRequestFailed;
 
-        const ResponseBody = struct {
-            results: []const struct {
-                alternatives: []const struct {
-                    transcript: ?[]const u8 = null,
-                } = &.{},
-                languageCode: ?[]const u8 = null,
-            } = &.{},
-        };
         const payload = resp.body orelse return error.EmptyResponse;
-        var parsed = try std.json.parseFromSlice(ResponseBody, alloc, payload, .{ .ignore_unknown_fields = true });
-        defer parsed.deinit();
-        if (parsed.value.results.len == 0 or parsed.value.results[0].alternatives.len == 0) return error.EmptyResponse;
-
-        return .{
-            .text = try dupOpt(alloc, parsed.value.results[0].alternatives[0].transcript),
-            .language = try dupOpt(alloc, parsed.value.results[0].languageCode),
-        };
+        return try parseVertexRecognizeResponseAlloc(alloc, payload);
     }
 };
+
+/// A word as Speech-to-Text v2 reports it: offsets are protobuf durations
+/// (`"1.500s"`), and `speakerLabel` is present only with diarization.
+const VertexWord = struct {
+    startOffset: ?[]const u8 = null,
+    endOffset: ?[]const u8 = null,
+    word: ?[]const u8 = null,
+    speakerLabel: ?[]const u8 = null,
+};
+
+/// Speech-to-Text v2 `recognize` answers with one result per utterance. The
+/// transcript is the results joined in order; when word offsets are present
+/// each result becomes a timed segment, split further wherever the speaker
+/// label changes, so diarized audio yields one segment per speaker turn.
+fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Response {
+    const ResponseBody = struct {
+        results: []const struct {
+            alternatives: []const struct {
+                transcript: ?[]const u8 = null,
+                words: []const VertexWord = &.{},
+            } = &.{},
+            languageCode: ?[]const u8 = null,
+            resultEndOffset: ?[]const u8 = null,
+        } = &.{},
+    };
+    var parsed = try std.json.parseFromSlice(ResponseBody, alloc, payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const results = parsed.value.results;
+    if (results.len == 0 or results[0].alternatives.len == 0) return error.EmptyResponse;
+
+    var text = std.ArrayListUnmanaged(u8).empty;
+    defer text.deinit(alloc);
+    var segments = std.ArrayListUnmanaged(Segment).empty;
+    errdefer {
+        for (segments.items) |*segment| deinitSegment(alloc, segment);
+        segments.deinit(alloc);
+    }
+    var last_end_ms: i64 = 0;
+    var speakers_seen = std.StringArrayHashMapUnmanaged(void).empty;
+    defer speakers_seen.deinit(alloc);
+
+    for (results) |result| {
+        if (result.alternatives.len == 0) continue;
+        const alternative = result.alternatives[0];
+        const transcript = std.mem.trim(u8, alternative.transcript orelse "", " ");
+        if (transcript.len > 0) {
+            if (text.items.len > 0) try text.append(alloc, ' ');
+            try text.appendSlice(alloc, transcript);
+        }
+        if (alternative.words.len == 0) {
+            if (transcript.len == 0) continue;
+            const end_ms = if (result.resultEndOffset) |offset| vertexDurationToMs(offset) orelse last_end_ms else last_end_ms;
+            try segments.append(alloc, .{
+                .text = try alloc.dupe(u8, transcript),
+                .start_ms = last_end_ms,
+                .end_ms = @max(end_ms, last_end_ms),
+            });
+            last_end_ms = @max(end_ms, last_end_ms);
+            continue;
+        }
+        // One segment per run of words with the same speaker label.
+        var run_start: usize = 0;
+        while (run_start < alternative.words.len) {
+            const speaker = alternative.words[run_start].speakerLabel;
+            var run_end = run_start + 1;
+            while (run_end < alternative.words.len and sameSpeaker(alternative.words[run_end].speakerLabel, speaker)) : (run_end += 1) {}
+            const run = alternative.words[run_start..run_end];
+
+            var phrase = std.ArrayListUnmanaged(u8).empty;
+            defer phrase.deinit(alloc);
+            var words = try alloc.alloc(WordTimestamp, run.len);
+            var filled: usize = 0;
+            errdefer {
+                for (words[0..filled]) |*word| deinitWordTimestamp(alloc, word);
+                alloc.free(words);
+            }
+            for (run) |word| {
+                const spelled = std.mem.trim(u8, word.word orelse "", " ");
+                if (phrase.items.len > 0 and spelled.len > 0) try phrase.append(alloc, ' ');
+                try phrase.appendSlice(alloc, spelled);
+                const start_ms = if (word.startOffset) |offset| vertexDurationToMs(offset) orelse last_end_ms else last_end_ms;
+                const end_ms = if (word.endOffset) |offset| vertexDurationToMs(offset) orelse start_ms else start_ms;
+                words[filled] = .{
+                    .word = try alloc.dupe(u8, spelled),
+                    .start_ms = start_ms,
+                    .end_ms = @max(end_ms, start_ms),
+                };
+                filled += 1;
+                last_end_ms = @max(last_end_ms, end_ms);
+            }
+            const start_ms = words[0].start_ms orelse last_end_ms;
+            const end_ms = words[filled - 1].end_ms orelse start_ms;
+            const segment_text = try phrase.toOwnedSlice(alloc);
+            errdefer alloc.free(segment_text);
+            const speaker_id = try dupOpt(alloc, speaker);
+            errdefer freeOpt(alloc, speaker_id);
+            if (speaker) |label| _ = try speakers_seen.getOrPut(alloc, label);
+            try segments.append(alloc, .{
+                .text = segment_text,
+                .start_ms = start_ms,
+                .end_ms = end_ms,
+                .speaker = speaker_id,
+                .words = words,
+            });
+            run_start = run_end;
+        }
+    }
+
+    var response = Response{
+        .text = try alloc.dupe(u8, text.items),
+        .language = try dupOpt(alloc, results[0].languageCode),
+        .duration_ms = if (last_end_ms > 0) last_end_ms else null,
+    };
+    errdefer deinitResponse(alloc, &response);
+    if (segments.items.len > 0) response.segments = try segments.toOwnedSlice(alloc);
+    if (speakers_seen.count() > 0) {
+        const speakers = try alloc.alloc(Speaker, speakers_seen.count());
+        var filled: usize = 0;
+        errdefer {
+            for (speakers[0..filled]) |*speaker| deinitSpeaker(alloc, speaker);
+            alloc.free(speakers);
+        }
+        for (speakers_seen.keys()) |label| {
+            speakers[filled] = .{ .id = try alloc.dupe(u8, label), .label = try alloc.dupe(u8, label) };
+            filled += 1;
+        }
+        response.speakers = speakers;
+    }
+    return response;
+}
+
+fn sameSpeaker(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// Parses a protobuf JSON duration such as `"1.500s"` or `"12s"` into
+/// milliseconds; anything else is treated as absent.
+fn vertexDurationToMs(text: []const u8) ?i64 {
+    const trimmed = std.mem.trimEnd(u8, text, "s");
+    if (trimmed.len == 0 or trimmed.len == text.len) return null;
+    const seconds = std.fmt.parseFloat(f64, trimmed) catch return null;
+    return secondsToMs(seconds);
+}
+
+test "vertex recognize response yields speaker turns with word timing" {
+    const alloc = std.testing.allocator;
+    var response = try parseVertexRecognizeResponseAlloc(alloc,
+        \\{"results":[{"alternatives":[{"transcript":"hello there how are you",
+        \\"words":[{"startOffset":"0s","endOffset":"0.400s","word":"hello","speakerLabel":"1"},
+        \\{"startOffset":"0.400s","endOffset":"0.900s","word":"there","speakerLabel":"1"},
+        \\{"startOffset":"1.200s","endOffset":"1.500s","word":"how","speakerLabel":"2"},
+        \\{"startOffset":"1.500s","endOffset":"1.700s","word":"are","speakerLabel":"2"},
+        \\{"startOffset":"1.700s","endOffset":"2s","word":"you","speakerLabel":"2"}]}],
+        \\"languageCode":"en-US","resultEndOffset":"2s"},
+        \\{"alternatives":[{"transcript":"fine thanks"}],"resultEndOffset":"3.250s"}]}
+    );
+    defer deinitResponse(alloc, &response);
+    try std.testing.expectEqualStrings("hello there how are you fine thanks", response.text.?);
+    try std.testing.expectEqualStrings("en-US", response.language.?);
+    try std.testing.expectEqual(@as(?i64, 3250), response.duration_ms);
+    const segments = response.segments.?;
+    try std.testing.expectEqual(@as(usize, 3), segments.len);
+    try std.testing.expectEqualStrings("hello there", segments[0].text.?);
+    try std.testing.expectEqual(@as(?i64, 0), segments[0].start_ms);
+    try std.testing.expectEqual(@as(?i64, 900), segments[0].end_ms);
+    try std.testing.expectEqualStrings("1", segments[0].speaker.?);
+    try std.testing.expectEqual(@as(usize, 2), segments[0].words.?.len);
+    try std.testing.expectEqualStrings("how are you", segments[1].text.?);
+    try std.testing.expectEqual(@as(?i64, 1200), segments[1].start_ms);
+    try std.testing.expectEqual(@as(?i64, 2000), segments[1].end_ms);
+    try std.testing.expectEqualStrings("2", segments[1].speaker.?);
+    // A result without word offsets still becomes a segment spanning from the
+    // previous end to its own end offset.
+    try std.testing.expectEqualStrings("fine thanks", segments[2].text.?);
+    try std.testing.expectEqual(@as(?i64, 2000), segments[2].start_ms);
+    try std.testing.expectEqual(@as(?i64, 3250), segments[2].end_ms);
+    try std.testing.expectEqual(@as(?[]const u8, null), segments[2].speaker);
+    try std.testing.expectEqual(@as(usize, 2), response.speakers.?.len);
+    try std.testing.expectEqualStrings("2", response.speakers.?[1].id.?);
+}
+
+test "vertex durations parse protobuf seconds" {
+    try std.testing.expectEqual(@as(?i64, 1500), vertexDurationToMs("1.500s"));
+    try std.testing.expectEqual(@as(?i64, 12000), vertexDurationToMs("12s"));
+    try std.testing.expectEqual(@as(?i64, null), vertexDurationToMs("12"));
+    try std.testing.expectEqual(@as(?i64, null), vertexDurationToMs("s"));
+}
 
 fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
     var cfg = if (credentials_path) |path| blk: {
@@ -789,7 +1094,7 @@ fn buildOpenAiMultipartAlloc(
 
     try appendMultipartField(&buf, alloc, boundary, "model", model);
     if (language) |lang| try appendMultipartField(&buf, alloc, boundary, "language", lang);
-    try appendMultipartField(&buf, alloc, boundary, "response_format", "json");
+    try appendMultipartField(&buf, alloc, boundary, "response_format", "verbose_json");
     try appendMultipartFile(&buf, alloc, boundary, "file", "audio", audio_content_type, audio_bytes);
     try buf.print(alloc, "--{s}--\r\n", .{boundary});
 
@@ -831,24 +1136,26 @@ fn appendMultipartFile(
     try buf.appendSlice(alloc, "\r\n");
 }
 
-fn resolveAudioInputAlloc(alloc: Allocator, url: []const u8) ![]u8 {
-    var content = try resolveAudioContentAlloc(alloc, url);
+fn resolveAudioInputAlloc(alloc: Allocator, url: []const u8, max_download_bytes: ?usize) ![]u8 {
+    var content = try resolveAudioContentAlloc(alloc, url, max_download_bytes);
     alloc.free(content.content_type);
     const data = content.data;
     content = undefined;
     return data;
 }
 
-fn resolveAudioContentAlloc(alloc: Allocator, url: []const u8) !scraping.DownloadedContent {
+fn resolveAudioContentAlloc(alloc: Allocator, url: []const u8, max_download_bytes: ?usize) !scraping.DownloadedContent {
+    const security = remoteFetchSecurity(max_download_bytes);
     if (scraping.data_uri.hasScheme(url)) {
         const parsed = try scraping.data_uri.parseRequired(url);
         if (!parsed.has_explicit_media_type or
-            !std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "audio/"))
+            !(std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "audio/") or
+                std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "video/")))
             return error.InvalidDataUri;
-        return try scraping.downloadContentAlloc(alloc, url, &remote_fetch_security, null);
+        return try scraping.downloadContentAlloc(alloc, url, &security, null);
     }
 
-    const fetched = try scraping.downloadContentOutcomeAlloc(alloc, url, &remote_fetch_security, null);
+    const fetched = try scraping.downloadContentOutcomeAlloc(alloc, url, &security, null);
     switch (fetched) {
         .http_error => |err_resp| {
             _ = err_resp;
@@ -856,16 +1163,6 @@ fn resolveAudioContentAlloc(alloc: Allocator, url: []const u8) !scraping.Downloa
         },
         .ok => |response| return response,
     }
-}
-
-fn cloneResponse(alloc: Allocator, response: Response) !Response {
-    return .{
-        .text = try dupOpt(alloc, response.text),
-        .language = try dupOpt(alloc, response.language),
-        .duration_ms = response.duration_ms,
-        .segments = try cloneSegments(alloc, response.segments),
-        .speakers = try cloneSpeakers(alloc, response.speakers),
-    };
 }
 
 fn cloneSegments(alloc: Allocator, segments: ?[]const Segment) !?[]Segment {

@@ -30,7 +30,9 @@ Antfly supports three explicit multimodal workflows:
    into a media part with `remoteMedia`, and the model embeds that part directly.
 2. **Application-managed descriptions** run OCR, captioning, or transcription
    before the write. Store the resulting text in a document field and use any
-   managed text embedder supported for index creation.
+   managed text embedder supported for index creation. For recordings, the
+   `transcriber` enrichment does this inside Antfly and keeps the timing; see
+   [Index Recorded Calls and Podcasts](/docs/guides/transcription).
 3. **Application-managed vectors** create an `external: true` embeddings index
    and write vectors through `_embeddings`. This is the escape hatch for a model
    or provider that Antfly's managed indexing runtime does not execute.

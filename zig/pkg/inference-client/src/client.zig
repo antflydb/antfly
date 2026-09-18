@@ -32,6 +32,29 @@ pub const Types = api.types;
 /// Raw generated client -- exposes every inference API operation.
 pub const RawClient = api.client.Client;
 
+/// One transcription result. `object()` is the first (and only) transcript
+/// object; `segments` carries its timestamped phrases when the server
+/// produced them.
+pub const Transcription = struct {
+    parsed: std.json.Parsed(api.TranscribeResponse),
+
+    pub fn object(self: *const Transcription) api.TranscribeObject {
+        return self.parsed.value.data[0];
+    }
+
+    pub fn text(self: *const Transcription) []const u8 {
+        return self.object().text;
+    }
+
+    pub fn segments(self: *const Transcription) []const api.DictationSegment {
+        return self.object().segments orelse &.{};
+    }
+
+    pub fn deinit(self: *Transcription) void {
+        self.parsed.deinit();
+    }
+};
+
 /// High-level Antfly inference client with convenience helpers.
 pub const Client = struct {
     raw: RawClient,
@@ -95,6 +118,33 @@ pub const Client = struct {
         }
 
         return error.UnexpectedContentType;
+    }
+
+    /// Transcribe one encoded audio clip (any container the server decodes:
+    /// WAV, MP3, M4A, MP4, Ogg, WebM, FLAC) and return the transcript with
+    /// timestamped segments. Clips longer than one Whisper window are
+    /// transcribed in windows cut at pauses by the server.
+    pub fn transcribe(self: *Client, model: []const u8, audio: []const u8, language: ?[]const u8) !Transcription {
+        const encoded = try self.allocator.alloc(u8, std.base64.standard.Encoder.calcSize(audio.len));
+        defer self.allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, audio);
+        var resp = try self.raw.transcribeAudio(.{
+            .model = model,
+            .audio = encoded,
+            .language = language,
+        });
+        defer resp.deinit();
+
+        if (resp.status_code < 200 or resp.status_code >= 300) {
+            return error.TranscribeRequestFailed;
+        }
+        const body = resp.body orelse return error.EmptyResponse;
+        const parsed = try std.json.parseFromSlice(api.TranscribeResponse, self.allocator, body, .{
+            .ignore_unknown_fields = true,
+        });
+        errdefer parsed.deinit();
+        if (parsed.value.data.len == 0) return error.EmptyResponse;
+        return .{ .parsed = parsed };
     }
 
     /// List available models on the Antfly inference server.

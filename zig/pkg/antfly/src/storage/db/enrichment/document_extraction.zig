@@ -686,6 +686,158 @@ pub const TextRegion = struct {
     bbox: [4]f64,
 };
 
+/// One transcript phrase: the byte range it occupies in the unit text and
+/// its offsets in the recording, so chunks cut from the text can carry the
+/// moment they came from.
+pub const TranscriptSpan = struct {
+    char_start: u32,
+    char_end: u32,
+    start_ms: u64,
+    end_ms: u64,
+};
+
+/// A word as a provider reports it inside a phrase, with its offsets.
+pub const TranscriptWordInput = struct {
+    text: []const u8,
+    start_ms: u64,
+    end_ms: u64,
+};
+
+/// A transcript phrase as a provider reports it: text plus its offsets, and
+/// the timed words inside it when the provider has them.
+pub const TranscriptSegmentInput = struct {
+    text: []const u8,
+    start_ms: u64,
+    end_ms: u64,
+    words: []const TranscriptWordInput = &.{},
+};
+
+/// Locates each phrase inside the transcript text, in order, and returns the
+/// spans found. Providers join phrases with single spaces, so a sequential
+/// search from the previous phrase's end recovers the byte ranges without
+/// assuming exact join rules; the walk stops at the first phrase that cannot
+/// be found, since later offsets would be unreliable.
+///
+/// A phrase that carries timed words is split at sentence ends (`.`, `?`,
+/// `!`) into finer spans, each timed by its first and last word. Whisper
+/// often returns one phrase for a whole 30 s window, and a chunk cut from the
+/// middle of it would otherwise inherit the entire window's range.
+pub fn transcriptSpansFromSegmentsAlloc(alloc: Allocator, text: []const u8, segments: []const TranscriptSegmentInput) ![]TranscriptSpan {
+    var spans = std.ArrayListUnmanaged(TranscriptSpan).empty;
+    errdefer spans.deinit(alloc);
+    var cursor: usize = 0;
+    for (segments) |segment| {
+        const phrase = std.mem.trim(u8, segment.text, " \t\r\n");
+        if (phrase.len == 0) continue;
+        const start = std.mem.indexOfPos(u8, text, cursor, phrase) orelse break;
+        const end = start + phrase.len;
+        const segment_end_ms = @max(segment.end_ms, segment.start_ms);
+        if (!try appendWordSentenceSpans(alloc, &spans, text[0..end], start, segment, segment_end_ms)) {
+            try spans.append(alloc, .{
+                .char_start = std.math.cast(u32, start) orelse break,
+                .char_end = std.math.cast(u32, end) orelse break,
+                .start_ms = segment.start_ms,
+                .end_ms = segment_end_ms,
+            });
+        }
+        cursor = end;
+    }
+    return try spans.toOwnedSlice(alloc);
+}
+
+/// Splits one phrase into sentence spans using its timed words. Returns
+/// false, appending nothing, when the phrase has no usable words, so the
+/// caller falls back to a single span for the whole phrase.
+fn appendWordSentenceSpans(
+    alloc: Allocator,
+    spans: *std.ArrayListUnmanaged(TranscriptSpan),
+    text: []const u8,
+    phrase_start: usize,
+    segment: TranscriptSegmentInput,
+    segment_end_ms: u64,
+) !bool {
+    if (segment.words.len == 0) return false;
+    const first_len = spans.items.len;
+    errdefer spans.shrinkRetainingCapacity(first_len);
+    var cursor = phrase_start;
+    var group_start: ?usize = null;
+    var group_start_ms: u64 = 0;
+    var group_end: usize = 0;
+    var group_end_ms: u64 = 0;
+    var located: usize = 0;
+    for (segment.words, 0..) |word, index| {
+        const spelled = std.mem.trim(u8, word.text, " \t\r\n");
+        if (spelled.len == 0) continue;
+        const start = std.mem.indexOfPos(u8, text, cursor, spelled) orelse break;
+        const end = start + spelled.len;
+        located += 1;
+        if (group_start == null) {
+            group_start = start;
+            group_start_ms = @min(@max(word.start_ms, segment.start_ms), segment_end_ms);
+        }
+        group_end = end;
+        group_end_ms = @min(@max(word.end_ms, group_start_ms), segment_end_ms);
+        cursor = end;
+        const last = index + 1 == segment.words.len;
+        if (last or endsSentence(spelled)) {
+            try spans.append(alloc, .{
+                .char_start = std.math.cast(u32, group_start.?) orelse return error.Overflow,
+                .char_end = std.math.cast(u32, group_end) orelse return error.Overflow,
+                .start_ms = group_start_ms,
+                .end_ms = group_end_ms,
+            });
+            group_start = null;
+        }
+    }
+    if (group_start) |start| {
+        try spans.append(alloc, .{
+            .char_start = std.math.cast(u32, start) orelse return error.Overflow,
+            .char_end = std.math.cast(u32, group_end) orelse return error.Overflow,
+            .start_ms = group_start_ms,
+            .end_ms = group_end_ms,
+        });
+    }
+    if (located == 0) {
+        spans.shrinkRetainingCapacity(first_len);
+        return false;
+    }
+    return true;
+}
+
+fn endsSentence(word: []const u8) bool {
+    var i = word.len;
+    while (i > 0) : (i -= 1) {
+        switch (word[i - 1]) {
+            '"', '\'', ')', ']' => continue,
+            '.', '?', '!' => return true,
+            else => return false,
+        }
+    }
+    return false;
+}
+
+/// Gives every chunk cut from a transcribed unit the recording offsets of
+/// the phrases it overlaps: the start of the first overlapping phrase and
+/// the end of the last. Chunks without byte offsets, and units without
+/// spans, are left untouched.
+pub fn applyTranscriptTiming(unit: Unit, chunks: anytype) void {
+    if (unit.transcript_spans.len == 0) return;
+    for (chunks) |*chunk| {
+        const start = chunk.start_offset orelse continue;
+        const end = chunk.end_offset orelse continue;
+        if (end <= start) continue;
+        var first: ?u64 = null;
+        var last: ?u64 = null;
+        for (unit.transcript_spans) |span| {
+            if (span.char_end <= start or span.char_start >= end) continue;
+            if (first == null) first = span.start_ms;
+            last = span.end_ms;
+        }
+        if (first) |value| chunk.start_time_ms = @floatFromInt(value);
+        if (last) |value| chunk.end_time_ms = @floatFromInt(value);
+    }
+}
+
 pub const Unit = struct {
     unit_id: []u8,
     unit_type: []u8,
@@ -711,6 +863,8 @@ pub const Unit = struct {
     ocr_bbox: ?[4]f64 = null,
     transcript_used: bool = false,
     transcript_confidence: ?f64 = null,
+    /// Phrase timing for transcribed units; empty for everything else.
+    transcript_spans: []TranscriptSpan = &.{},
     extraction_warning: ?[]u8 = null,
     page_number: ?u32 = null,
     page_label: ?[]u8 = null,
@@ -735,6 +889,7 @@ pub const Unit = struct {
         if (self.ocr_failure_stage) |value| alloc.free(value);
         if (self.page_label) |value| alloc.free(value);
         if (self.text_regions.len > 0) alloc.free(self.text_regions);
+        if (self.transcript_spans.len > 0) alloc.free(self.transcript_spans);
         self.* = undefined;
     }
 };
@@ -4782,4 +4937,105 @@ test "OCR prompt echo detection covers Florence task and canonical prompts" {
     try std.testing.expect(isOcrPromptEcho("what is the text in the image", florence_ocr_prompt));
     try std.testing.expect(isOcrPromptEcho("TRANSCRIBE this page faithfully!", "Transcribe this page faithfully."));
     try std.testing.expect(!isOcrPromptEcho("Invoice total: $123.45", florence_ocr_prompt));
+}
+
+test "transcript spans locate provider segments inside the joined transcript" {
+    const alloc = std.testing.allocator;
+    const text = "Hello there. How are you? I am fine.";
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = " Hello there.", .start_ms = 0, .end_ms = 900 },
+        .{ .text = "How are you?", .start_ms = 900, .end_ms = 1800 },
+        .{ .text = "", .start_ms = 1800, .end_ms = 1800 },
+        .{ .text = "I am fine.", .start_ms = 2000, .end_ms = 1500 },
+        .{ .text = "never said", .start_ms = 3000, .end_ms = 4000 },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+    try std.testing.expectEqual(@as(usize, 3), spans.len);
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 0, .char_end = 12, .start_ms = 0, .end_ms = 900 }, spans[0]);
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 13, .char_end = 25, .start_ms = 900, .end_ms = 1800 }, spans[1]);
+    // An inverted segment keeps its start and never ends before it.
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 26, .char_end = 36, .start_ms = 2000, .end_ms = 2000 }, spans[2]);
+}
+
+test "transcript spans split a timed phrase at sentence ends using its words" {
+    const alloc = std.testing.allocator;
+    const text = "Okay, let's start. First item is the date. Any questions?";
+    const words = [_]TranscriptWordInput{
+        .{ .text = "Okay,", .start_ms = 0, .end_ms = 300 },
+        .{ .text = "let's", .start_ms = 300, .end_ms = 600 },
+        .{ .text = "start.", .start_ms = 600, .end_ms = 1000 },
+        .{ .text = "First", .start_ms = 1400, .end_ms = 1700 },
+        .{ .text = "item", .start_ms = 1700, .end_ms = 1900 },
+        .{ .text = "is", .start_ms = 1900, .end_ms = 2000 },
+        .{ .text = "the", .start_ms = 2000, .end_ms = 2100 },
+        .{ .text = "date.", .start_ms = 2100, .end_ms = 2500 },
+        .{ .text = "Any", .start_ms = 3000, .end_ms = 3200 },
+        .{ .text = "questions?", .start_ms = 3200, .end_ms = 9000 },
+    };
+    const segments = [_]TranscriptSegmentInput{
+        .{ .text = text, .start_ms = 0, .end_ms = 4000, .words = &words },
+    };
+    const spans = try transcriptSpansFromSegmentsAlloc(alloc, text, &segments);
+    defer alloc.free(spans);
+    try std.testing.expectEqual(@as(usize, 3), spans.len);
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 0, .char_end = 18, .start_ms = 0, .end_ms = 1000 }, spans[0]);
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 19, .char_end = 42, .start_ms = 1400, .end_ms = 2500 }, spans[1]);
+    // Word timing never escapes the phrase it belongs to.
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 43, .char_end = 57, .start_ms = 3000, .end_ms = 4000 }, spans[2]);
+
+    // Words that cannot be located leave the phrase as one span.
+    const stray = [_]TranscriptWordInput{.{ .text = "missing", .start_ms = 0, .end_ms = 100 }};
+    const fallback = [_]TranscriptSegmentInput{
+        .{ .text = text, .start_ms = 0, .end_ms = 4000, .words = &stray },
+    };
+    const single = try transcriptSpansFromSegmentsAlloc(alloc, text, &fallback);
+    defer alloc.free(single);
+    try std.testing.expectEqual(@as(usize, 1), single.len);
+    try std.testing.expectEqual(TranscriptSpan{ .char_start = 0, .char_end = 57, .start_ms = 0, .end_ms = 4000 }, single[0]);
+}
+
+test "transcript timing stamps chunks with the phrases they overlap" {
+    const TestChunk = struct {
+        start_offset: ?u32 = null,
+        end_offset: ?u32 = null,
+        start_time_ms: ?f32 = null,
+        end_time_ms: ?f32 = null,
+    };
+    var spans = [_]TranscriptSpan{
+        .{ .char_start = 0, .char_end = 12, .start_ms = 0, .end_ms = 900 },
+        .{ .char_start = 13, .char_end = 25, .start_ms = 900, .end_ms = 1800 },
+        .{ .char_start = 26, .char_end = 36, .start_ms = 2000, .end_ms = 2600 },
+    };
+    const unit = Unit{
+        .unit_id = @constCast("audio:000001"),
+        .unit_type = @constCast("audio"),
+        .text = @constCast("Hello there. How are you? I am fine."),
+        .method = @constCast("transcription"),
+        .transcript_spans = &spans,
+    };
+    var chunks = [_]TestChunk{
+        .{ .start_offset = 0, .end_offset = 20 },
+        .{ .start_offset = 20, .end_offset = 36 },
+        .{ .start_offset = 12, .end_offset = 13 },
+        .{},
+    };
+    applyTranscriptTiming(unit, &chunks);
+    try std.testing.expectEqual(@as(?f32, 0), chunks[0].start_time_ms);
+    try std.testing.expectEqual(@as(?f32, 1800), chunks[0].end_time_ms);
+    try std.testing.expectEqual(@as(?f32, 900), chunks[1].start_time_ms);
+    try std.testing.expectEqual(@as(?f32, 2600), chunks[1].end_time_ms);
+    // The separator between phrases belongs to no span.
+    try std.testing.expectEqual(@as(?f32, null), chunks[2].start_time_ms);
+    try std.testing.expectEqual(@as(?f32, null), chunks[3].start_time_ms);
+
+    const untimed = Unit{
+        .unit_id = @constCast("document:000001"),
+        .unit_type = @constCast("document"),
+        .text = @constCast("plain"),
+        .method = @constCast("text"),
+    };
+    var plain = [_]TestChunk{.{ .start_offset = 0, .end_offset = 5 }};
+    applyTranscriptTiming(untimed, &plain);
+    try std.testing.expectEqual(@as(?f32, null), plain[0].start_time_ms);
 }
