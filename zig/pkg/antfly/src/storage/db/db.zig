@@ -11534,7 +11534,15 @@ pub const DB = struct {
             active_profile.identity_metadata_writes += @intCast(identity_writes.items.len);
         }
         const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
-        const merge_count_prepared = try @import("merge_cardinality.zig").prepare(self.alloc, self.core.store, effective_req, identity_upsert_keys.items, effective_req.deletes, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
+        // Plan once under the apply lock: counts, page state, and the durable
+        // transition must agree on whether a delayed checkpoint has authority.
+        const merge_existing_raw = if (req.merge_checkpoint != null) try merge_state_mod.loadRawAlloc(self.alloc, self.core.store) else null;
+        defer if (merge_existing_raw) |value| self.alloc.free(value);
+        var merge_existing_state: ?merge_state_mod.State = if (merge_existing_raw) |value| try merge_state_mod.decodeAlloc(self.alloc, value) else null;
+        defer if (merge_existing_state) |*state| state.deinit(self.alloc);
+        const merge_plan: ?merge_state_mod.ApplyPlan = if (req.merge_checkpoint) |checkpoint| try merge_state_mod.planCheckpointApply(self.alloc, if (merge_existing_state) |*state| state else null, self.core.byteRange(), checkpoint) else null;
+        defer if (merge_plan) |plan| plan.deinit(self.alloc);
+        const merge_count_prepared = try @import("merge_cardinality.zig").prepare(self.alloc, self.core.store, effective_req, if (merge_plan) |plan| plan.applies_checkpoint else false, identity_upsert_keys.items, effective_req.deletes, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
         if (!merge_count_prepared) if (pending_identity_visibility_summary) |summary| {
             try range_cardinality.appendIdentityTransitionAlloc(
                 self.alloc,
@@ -11805,20 +11813,7 @@ pub const DB = struct {
             } else if (checkpoint.allow_doc_identity_reassignment) {
                 return error.InvalidBatchRequest;
             }
-            const existing_raw = try merge_state_mod.loadRawAlloc(self.alloc, self.core.store);
-            defer if (existing_raw) |value| self.alloc.free(value);
-            var existing_state: ?merge_state_mod.State = if (existing_raw) |value|
-                try merge_state_mod.decodeAlloc(self.alloc, value)
-            else
-                null;
-            defer if (existing_state) |*state| state.deinit(self.alloc);
-            const plan = try merge_state_mod.planCheckpointApply(
-                self.alloc,
-                if (existing_state) |*state| state else null,
-                self.core.byteRange(),
-                checkpoint,
-            );
-            defer plan.deinit(self.alloc);
+            const plan = merge_plan.?;
             const pages = @import("merge_page_contract.zig");
             if ((checkpoint.page_source != null) != (checkpoint.page_receiver_namespace != null) or
                 (checkpoint.page_source != null and checkpoint.kind != .begin_copy and !(checkpoint.kind == .accept and checkpoint.page_source.?.integrity != null))) return error.InvalidMergeCheckpoint;
@@ -11826,7 +11821,7 @@ pub const DB = struct {
             defer if (page_raw) |value| self.alloc.free(value);
             var page_progress = if (page_raw) |value| try pages.decode(self.alloc, value) else null;
             defer if (page_progress) |*value| value.deinit();
-            const page_plan = try pages.checkpointPlan(existing_state, plan.state, checkpoint, if (page_progress) |value| value.value else null);
+            const page_plan = try pages.checkpointPlan(merge_existing_state, plan.state, checkpoint, if (page_progress) |value| value.value else null);
             switch (page_plan) {
                 .unchanged => {},
                 .clear => try delete_keys.append(self.alloc, pages.key),
@@ -11871,7 +11866,7 @@ pub const DB = struct {
             });
             try delete_keys.append(self.alloc, merge_state_mod.legacy_key);
             const shadow = @import("online_integrity_shadow.zig");
-            if ((checkpoint.kind == .begin_copy or (checkpoint.kind == .accept and plan.state.copy_attempt.sequence == 0)) and plan.state.phase == .accepting and checkpoint.page_source != null and checkpoint.page_source.?.integrity != null) {
+            if (plan.applies_checkpoint and (checkpoint.kind == .begin_copy or (checkpoint.kind == .accept and plan.state.copy_attempt.sequence == 0)) and plan.state.phase == .accepting and checkpoint.page_source != null and checkpoint.page_source.?.integrity != null) {
                 const shadow_state = try std.json.Stringify.valueAlloc(self.alloc, shadow.State{ .source = checkpoint.page_source.?, .context = .{ .transition_id = checkpoint.transition_id, .donor_group_id = checkpoint.donor_group_id, .receiver_group_id = checkpoint.receiver_group_id, .identity_namespace = self.core.identity_namespace, .copy_attempt = checkpoint.copy_attempt } }, .{});
                 try owned_store_values.append(self.alloc, shadow_state);
                 try store_writes.append(self.alloc, .{ .key = shadow.key, .value = shadow_state });
@@ -11879,13 +11874,13 @@ pub const DB = struct {
                 try owned_store_values.append(self.alloc, serving_range);
                 try store_writes.append(self.alloc, .{ .key = shadow.range_key, .value = serving_range });
             }
-            if (coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
+            if (plan.applies_checkpoint and coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
                 // Keep one bounded exact-source terminal receipt for lost
                 // checkpoint responses. A new transition replaces it; only
                 // the serving-range override controls live shadow admission.
                 try delete_keys.append(self.alloc, shadow.range_key);
             }
-            if (coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
+            if (plan.applies_checkpoint and coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
                 const catalog = @import("relational_integrity_catalog.zig");
                 const raw_catalog = try self.core.store.get(self.alloc, catalog.key);
                 defer self.alloc.free(raw_catalog);
@@ -53928,7 +53923,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
         keys,
     );
     const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
-    const merge_count_prepared = try @import("merge_cardinality.zig").prepare(ctx.alloc, ctx.store, req, &.{}, keys, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
+    const merge_count_prepared = try @import("merge_cardinality.zig").prepare(ctx.alloc, ctx.store, req, false, &.{}, keys, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
     if (!merge_count_prepared) if (pending_identity_visibility_summary) |summary| {
         try range_cardinality.appendIdentityTransitionAlloc(
             ctx.alloc,
@@ -72650,9 +72645,33 @@ test "relational index build pages fence races resume after reopen and prove rea
         try expectTestRelationalIndexRow(&db, "a", after, true);
         try expectTestRelationalIndexRow(&db, "b", before, false);
         try expectTestRelationalIndexRow(&db, "c", before, true);
+        // Exhausting primary rows only starts verification. Readiness requires
+        // bounded forward and reverse passes over the derived index as well.
+        try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("tenant_id")).state);
+        for (0..128) |_| {
+            if ((try db.relationalIndexBuildStatus("tenant_id")).state == .ready) break;
+            try db.buildRelationalIndexStep("tenant_id", .{ .records = 1, .time_ns = std.time.ns_per_s });
+        }
         try std.testing.expectEqual(.ready, (try db.relationalIndexBuildStatus("tenant_id")).state);
-        // Rebuild under a new schema generation in deliberately tiny pages.
+        // A compatible schema epoch preserves coverage; changing the index
+        // definition creates a new generation that must rebuild in tiny pages.
         try db.setSchema(.{ .version = 2, .storage_mode = .relational, .relational_columns = &columns });
+        try std.testing.expectEqual(.ready, (try db.relationalIndexBuildStatus("tenant_id")).state);
+        {
+            var view = db.core.acquireSchemaView().?;
+            defer view.release();
+            var definition = try db.core.relational_indexes.prepare(view, &.{.{
+                .name = "tenant_id",
+                .owner_kind = .table,
+                .owner_name = native.relational_table_index_owner_name,
+                .access_method = .ordered_tuple,
+                .keys = &.{ .{ .column = "tenant" }, .{ .column = "id", .direction = .asc } },
+            }});
+            defer definition.deinit();
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            _ = try db.core.relational_indexes.commit(&definition, &.{});
+        }
         try db.buildRelationalIndexStep("tenant_id", .{ .records = 1 });
         const saved = try db.relationalIndexBuildStatus("tenant_id");
         try std.testing.expectEqual(.building, saved.state);
@@ -75944,8 +75963,9 @@ test "relational columnar maintenance survives unrelated artifact corruption and
     const ready = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
     defer alloc.free(ready);
     try db.core.store.putBatch(&.{}, &.{ready});
+    const started = db.independentMaintenanceNowNs();
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
-    try std.testing.expect(db.artifact_metadata_retry_after_ns > platform_time.monotonicNs());
+    try std.testing.expect(db.artifact_metadata_retry_after_ns > started);
     try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) > 0);
     const retry = db.artifact_metadata_retry_after_ns;
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2}" }} });
@@ -129682,6 +129702,10 @@ test "db merge copy attempts fence delayed leaders before finalize across reopen
         var new_copy = old_copy;
         new_copy.copy_attempt = new_begin.copy_attempt;
         try Apply.command(&db, &index, .{ .merge_replication = new_copy, .writes = &.{.{ .key = "b", .value = "{\"new\":true}" }} });
+        const count_before = (try range_cardinality.loadOrProveEmpty(alloc, db.core.store)).?;
+        const cardinality_key = @import("merge_cardinality.zig").key;
+        const cardinality_before = (try db.core.getStoreValue(alloc, cardinality_key)).?;
+        defer alloc.free(cardinality_before);
         // A delayed begin cannot take ownership back. Nor can its completion
         // or finalize certify B's still-incomplete copy.
         try Apply.command(&db, &index, .{ .merge_checkpoint = old_begin });
@@ -129691,7 +129715,14 @@ test "db merge copy attempts fence delayed leaders before finalize across reopen
         try Apply.command(&db, &index, .{ .merge_checkpoint = stale });
         stale.kind = .finalize;
         try Apply.command(&db, &index, .{ .merge_checkpoint = stale });
+        stale.kind = .rollback;
+        stale.bootstrap_applied_index = 0;
+        try Apply.command(&db, &index, .{ .merge_checkpoint = stale });
         try Apply.command(&db, &index, .{ .merge_replication = old_copy, .deletes = &.{"b"} });
+        try std.testing.expectEqual(count_before, (try range_cardinality.loadOrProveEmpty(alloc, db.core.store)).?);
+        const cardinality_after = (try db.core.getStoreValue(alloc, cardinality_key)).?;
+        defer alloc.free(cardinality_after);
+        try std.testing.expectEqualSlices(u8, cardinality_before, cardinality_after);
         const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
         defer alloc.free(raw);
         var state = try merge_state_mod.decodeAlloc(alloc, raw);
@@ -130428,23 +130459,24 @@ test "db merge artifact import holds both apply locks through copy failure" {
         }
     };
     for ([_]bool{ true, false }) |donor_first| {
-        var donor_lock: apply_rw_lock_mod.ApplyRwLock = .{};
-        var receiver_lock: apply_rw_lock_mod.ApplyRwLock = .{};
-        var probe = Probe{ .donor = &donor_lock, .receiver = &receiver_lock };
-        // Allocation fails at the start of the actual copy; no store or index
-        // fields may be touched. Verify both lock orders and error unwinding.
-        var first_path = [_]u8{'a'};
-        var last_path = [_]u8{'z'};
-        var donor_core: db_core.DBCore = undefined;
-        donor_core.path = if (donor_first) &first_path else &last_path;
-        donor_core.apply_mutex = &donor_lock;
-        var receiver_core: db_core.DBCore = undefined;
-        receiver_core.path = if (donor_first) &last_path else &first_path;
-        receiver_core.apply_mutex = &receiver_lock;
-        var donor: DB = undefined;
-        donor.core = &donor_core;
-        var receiver: DB = undefined;
-        receiver.core = &receiver_core;
+        var first_tmp = try TestDirectory.init("merge-lock-a");
+        defer first_tmp.cleanup();
+        var last_tmp = try TestDirectory.init("merge-lock-z");
+        defer last_tmp.cleanup();
+        const first_path = std.mem.span(first_tmp.path().ptr);
+        const last_path = std.mem.span(last_tmp.path().ptr);
+        const ordered = std.mem.order(u8, first_path, last_path) == .lt;
+        var donor = try DB.open(std.testing.allocator, if (donor_first == ordered) first_path else last_path, .{ .start_optional_runtimes = false });
+        defer donor.close();
+        var receiver = try DB.open(std.testing.allocator, if (donor_first == ordered) last_path else first_path, .{ .start_optional_runtimes = false });
+        defer receiver.close();
+        const donor_lock = donor.core.apply_mutex;
+        const receiver_lock = receiver.core.apply_mutex;
+        var probe = Probe{ .donor = donor_lock, .receiver = receiver_lock };
+        // Exercise schema/topology admission with real initialized databases.
+        // Fail the first copy allocation, after both locks have been acquired.
+        const receiver_alloc = receiver.alloc;
+        defer receiver.alloc = receiver_alloc;
         receiver.alloc = .{ .ptr = &probe, .vtable = &.{
             .alloc = Probe.allocate,
             .resize = std.mem.Allocator.noResize,

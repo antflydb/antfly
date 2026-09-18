@@ -1782,6 +1782,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "transition destination requires a stable healthy voter set",
         "transition retry jitter is bounded and desynchronizes services",
         "transition service",
+        "raft.transition_service.test.",
         "raft scheduler ready priority cannot starve consensus ticks",
     };
     const raft_runtime_tests = b.addTest(.{

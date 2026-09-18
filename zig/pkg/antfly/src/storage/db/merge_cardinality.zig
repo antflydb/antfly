@@ -42,17 +42,18 @@ fn changed(current: u64, delta: i128) !u64 {
 
 /// Returns true when this transition supplied the authoritative range count.
 /// Work is O(touched keys), with no scans, row decoding, or payload reads.
-pub fn prepare(alloc: Allocator, store: *Store, req: types.BatchRequest, upserts: []const []const u8, deletes: []const []const u8, before: u64, after: u64, out: *std.ArrayListUnmanaged(KV)) !bool {
+pub fn prepare(alloc: Allocator, store: *Store, req: types.BatchRequest, checkpoint_applied: bool, upserts: []const []const u8, deletes: []const []const u8, before: u64, after: u64, out: *std.ArrayListUnmanaged(KV)) !bool {
+    const admitted_checkpoint = if (checkpoint_applied) req.merge_checkpoint else null;
     var txn = try store.beginProbeTxn();
     defer txn.abort();
     const raw = txn.get(key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
-    if (raw == null and req.merge_checkpoint == null) return false;
+    if (raw == null and admitted_checkpoint == null) return false;
     if (raw) |value| {
         if (value.len != 17 or value[16] > 2) return error.InvalidRangeDocumentCount;
-        if (value[16] == 2 and req.merge_checkpoint == null) return false;
+        if (value[16] == 2 and admitted_checkpoint == null) return false;
     }
     const state_raw = txn.get(merge.key) catch |err| switch (err) {
         error.NotFound => null,
@@ -60,7 +61,7 @@ pub fn prepare(alloc: Allocator, store: *Store, req: types.BatchRequest, upserts
     };
     var state = if (state_raw) |value| try merge.decodeAlloc(alloc, value) else null;
     defer if (state) |*value| value.deinit(alloc);
-    if (req.merge_checkpoint) |checkpoint| if (checkpoint.kind == .accept and
+    if (admitted_checkpoint) |checkpoint| if (checkpoint.kind == .accept and
         (state == null or state.?.transition_id != checkpoint.transition_id))
     {
         const count = (try counts.loadOrProveEmpty(alloc, store)) orelse return error.InvalidRangeDocumentCount;
@@ -77,7 +78,7 @@ pub fn prepare(alloc: Allocator, store: *Store, req: types.BatchRequest, upserts
     if (value.len != 17 or value[16] > 1 or std.mem.readInt(u64, value[0..8], .little) != current.transition_id) return error.InvalidRangeDocumentCount;
     var record: [17]u8 = value[0..17].*;
     const old_base = std.mem.readInt(u64, record[8..16], .little);
-    if (req.merge_checkpoint) |checkpoint| {
+    if (admitted_checkpoint) |checkpoint| {
         // A shared copy retry may bind a new immutable attempt. Its old donor
         // rows become uncounted staging data again; reset to the continuously
         // maintained live base count before bounded cleanup restarts.

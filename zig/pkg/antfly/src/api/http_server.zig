@@ -41733,13 +41733,6 @@ test "api http server serves table create and drop" {
     try std.testing.expectEqualStrings("text/plain; charset=utf-8", duplicate_create_resp.content_type.?);
     try std.testing.expectEqualStrings("table already exists", duplicate_create_resp.body);
 
-    var drop_resp = try executeHttpxTestRequest(&server, .{
-        .method = .DELETE,
-        .uri = "/tables/docs",
-    });
-    defer drop_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 204), drop_resp.status);
-
     const update_schema_body = try test_contract_helpers.encodeSchemaUpdateRequest(std.testing.allocator);
     defer std.testing.allocator.free(update_schema_body);
     var update_resp = try executeHttpxTestRequest(&server, .{
@@ -41801,6 +41794,23 @@ test "api http server serves table create and drop" {
     try std.testing.expectEqual(@as(u16, 201), drop_index_resp.status);
     try std.testing.expectEqualStrings("application/json", drop_index_resp.content_type.?);
     try std.testing.expectEqualStrings("{}", drop_index_resp.body);
+    var drop_resp = try executeHttpxTestRequest(&server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs",
+    });
+    defer drop_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 204), drop_resp.status);
+
+    // Schema mutation cannot resurrect a dropped table.
+    var missing_update_resp = try executeHttpxTestRequest(&server, .{
+        .method = .PUT,
+        .uri = "/tables/docs/schema",
+        .content_type = "application/json",
+        .body = update_schema_body,
+    });
+    defer missing_update_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), missing_update_resp.status);
+    try std.testing.expect(!source.created);
     // Catalog commit is the response boundary; local projection and index
     // installation converge asynchronously so structural UX is not coupled
     // to control-loop latency.
