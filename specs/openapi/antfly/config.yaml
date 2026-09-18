@@ -794,6 +794,15 @@ components:
       additionalProperties: false
       description: Node-local foreground database request admission settings.
       properties:
+        ingress:
+          $ref: "#/components/schemas/IngressAdmissionConfig"
+        session_max_retained_bytes:
+          type: integer
+          format: uint64
+          minimum: 4096
+          maximum: 1099511627776
+          default: 67108864
+          description: Shared retained-memory ceiling for MCP, A2A, and transaction sessions, separate from foreground query and write budgets.
         remote_attempt_worker:
           $ref: "#/components/schemas/RemoteAttemptWorkerConfig"
         dense_execution:
@@ -804,6 +813,40 @@ components:
           $ref: "#/components/schemas/WriteAdmissionConfig"
         inference:
           $ref: "#/components/schemas/InferenceAdmissionConfig"
+
+    IngressAdmissionConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Opt-in request/planning envelope held through transport drain. Totals
+        include a nonborrowable readiness/control partition. Transport framing
+        and durable session state use separate bounded pools. Zero requests
+        disables the envelope and requires zero retained bytes.
+      properties:
+        max_requests:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 65536
+          default: 0
+        max_retained_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+        control_requests:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 65535
+          default: 2
+        control_retained_bytes:
+          type: integer
+          format: uint64
+          minimum: 4096
+          maximum: 1099511627776
+          default: 262144
 
     RemoteAttemptWorkerConfig:
       type: object

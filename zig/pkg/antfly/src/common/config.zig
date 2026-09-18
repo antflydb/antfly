@@ -93,12 +93,24 @@ pub const Config = struct {
     };
 
     pub const AdmissionConfig = struct {
+        ingress: @import("workload_ingress.zig").Config = .{},
+        session_max_retained_bytes: usize = 64 * 1024 * 1024,
         remote_attempt_worker: @import("workload_worker_config.zig").Config = .{},
         dense_execution: @import("../storage/dense_execution.zig").Config = .{},
         query: RequestAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
         write: RequestAdmissionConfig = .{ .max_concurrent_requests = default_write_max_concurrent_requests },
         inference: RequestAdmissionConfig = .{ .max_concurrent_requests = default_inference_max_concurrent_requests },
     };
+
+    fn ingressFromOpenApi(value: ?common_openapi.IngressAdmissionConfig) !@import("workload_ingress.zig").Config {
+        const configured = value orelse return .{};
+        var result: @import("workload_ingress.zig").Config = .{};
+        inline for (std.meta.fields(@TypeOf(result))) |field| {
+            if (@field(configured, field.name)) |raw| @field(result, field.name) = std.math.cast(field.type, raw) orelse return error.InvalidConfig;
+        }
+        try result.validate();
+        return result;
+    }
 
     pub const McpConfig = struct {
         /// Zero disables the serialized MCP tool-result compatibility guard.
@@ -710,11 +722,12 @@ pub const Config = struct {
         };
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("admission")) |admission_value| {
-            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "dense_execution", "remote_attempt_worker" });
+            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "dense_execution", "remote_attempt_worker", "session_max_retained_bytes", "ingress" });
             const admission_object = switch (admission_value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
             };
+            if (admission_object.get("ingress") != null) try validateObjectMemberFields(admission_object, "ingress", &.{ "max_requests", "max_retained_bytes", "control_requests", "control_retained_bytes" });
             inline for (.{ "query", "write" }) |class| {
                 if (admission_object.get(class)) |value| {
                     try validateObjectMemberFields(admission_object, class, &.{ "max_concurrent_requests", "waiting" });
@@ -838,6 +851,8 @@ pub const Config = struct {
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
             .admission = .{
+                .ingress = try ingressFromOpenApi(if (validated.value.admission) |admission| admission.ingress else null),
+                .session_max_retained_bytes = try boundedPositiveInt(usize, if (validated.value.admission) |admission| admission.session_max_retained_bytes else null, 4096, 1099511627776, 64 * 1024 * 1024),
                 .remote_attempt_worker = try remoteAttemptWorkerFromOpenApi(if (validated.value.admission) |admission| admission.remote_attempt_worker else null),
                 .dense_execution = try denseExecutionFromOpenApi(if (validated.value.admission) |admission| admission.dense_execution else null),
                 .query = .{
@@ -2636,6 +2651,18 @@ test "common config preserves disabled foreground admission" {
     try std.testing.expectEqual(@as(u32, 0), cfg.admission.inference.max_concurrent_requests);
 }
 
+test "workload admission config bounds retained sessions independently of foreground" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"admission":{"session_max_retained_bytes":1048576}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 1048576), cfg.admission.session_max_retained_bytes);
+    try std.testing.expectEqual(default_query_max_concurrent_requests, cfg.admission.query.max_concurrent_requests);
+    inline for (.{ "0", "4095", "1099511627777" }) |value| {
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, "{\"admission\":{\"session_max_retained_bytes\":" ++ value ++ "}}"));
+    }
+}
+
 test "common config validates opt-in fixed dense execution" {
     var cfg = try Config.parseFromSlice(std.testing.allocator,
         \\{"admission":{"dense_execution":{"max_runnable_tasks":2,"max_outstanding_tasks":8,"max_queued_tasks":4,"max_wait_ms":25,"max_working_bytes":65536,"max_suspended_io":1}}}
@@ -3759,4 +3786,13 @@ test "common config applies standalone shard defaults when standalone mode is se
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
     try std.testing.expect(cfg.shard_allocation.disable_shard_alloc);
+}
+
+test "workload admission ingress config validates combined hard partitions" {
+    const alloc = std.testing.allocator;
+    var cfg = try Config.parseFromSlice(alloc, "{\"admission\":{\"ingress\":{\"max_requests\":16,\"max_retained_bytes\":1048576}}}");
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 16), cfg.admission.ingress.max_requests);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, "{\"admission\":{\"ingress\":{\"max_requests\":2,\"max_retained_bytes\":1048576}}}"));
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, "{\"admission\":{\"ingress\":{\"max_requests\":16}}}"));
 }

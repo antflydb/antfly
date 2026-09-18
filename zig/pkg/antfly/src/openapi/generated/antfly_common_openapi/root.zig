@@ -31,6 +31,7 @@ pub const HttpExternalIoConfig = types.HttpExternalIoConfig;
 pub const InferenceAdmissionConfig = types.InferenceAdmissionConfig;
 pub const InferenceConnectionConfig = types.InferenceConnectionConfig;
 pub const InferenceConnectionVariant = types.InferenceConnectionVariant;
+pub const IngressAdmissionConfig = types.IngressAdmissionConfig;
 pub const LiteStorageConfig = types.LiteStorageConfig;
 pub const LocalStorageConfig = types.LocalStorageConfig;
 pub const McpConfig = types.McpConfig;

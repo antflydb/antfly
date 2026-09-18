@@ -14,6 +14,9 @@ const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
 /// Node-local foreground database request admission settings.
 pub const AdmissionConfig = struct {
+    ingress: ?IngressAdmissionConfig = null,
+    /// Shared retained-memory ceiling for MCP, A2A, and transaction sessions, separate from foreground query and write budgets.
+    session_max_retained_bytes: ?i64 = null,
     remote_attempt_worker: ?RemoteAttemptWorkerConfig = null,
     dense_execution: ?DenseExecutionConfig = null,
     query: ?QueryAdmissionConfig = null,
@@ -22,6 +25,8 @@ pub const AdmissionConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "ingress", "ingress", true },
+        .{ "session_max_retained_bytes", "session_max_retained_bytes", true },
         .{ "remote_attempt_worker", "remote_attempt_worker", true },
         .{ "dense_execution", "dense_execution", true },
         .{ "query", "query", true },
@@ -39,6 +44,14 @@ pub const AdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.ingress) |value| {
+            try jw.objectField("ingress");
+            try jw.write(value);
+        }
+        if (self.session_max_retained_bytes) |value| {
+            try jw.objectField("session_max_retained_bytes");
+            try jw.write(value);
+        }
         if (self.remote_attempt_worker) |value| {
             try jw.objectField("remote_attempt_worker");
             try jw.write(value);
@@ -1693,6 +1706,51 @@ pub const InferenceConnectionVariant = struct {
         try jw.write(self.capabilities);
         try jw.objectField("inference");
         try jw.write(self.inference);
+        try jw.endObject();
+    }
+};
+
+/// Opt-in request/planning envelope held through transport drain. Totals include a nonborrowable readiness/control partition. Transport framing and durable session state use separate bounded pools. Zero requests disables the envelope and requires zero retained bytes.
+pub const IngressAdmissionConfig = struct {
+    max_requests: ?i64 = null,
+    max_retained_bytes: ?i64 = null,
+    control_requests: ?i64 = null,
+    control_retained_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_requests", "max_requests", true },
+        .{ "max_retained_bytes", "max_retained_bytes", true },
+        .{ "control_requests", "control_requests", true },
+        .{ "control_retained_bytes", "control_retained_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_requests) |value| {
+            try jw.objectField("max_requests");
+            try jw.write(value);
+        }
+        if (self.max_retained_bytes) |value| {
+            try jw.objectField("max_retained_bytes");
+            try jw.write(value);
+        }
+        if (self.control_requests) |value| {
+            try jw.objectField("control_requests");
+            try jw.write(value);
+        }
+        if (self.control_retained_bytes) |value| {
+            try jw.objectField("control_retained_bytes");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
