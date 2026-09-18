@@ -18,6 +18,7 @@ const platform_time = @import("antfly_platform").time;
 const shared_platform_time = @import("antfly_platform").time;
 const cache_budget = @import("../common/cache_budget.zig");
 pub const DenseWorkAdmission = @import("dense_work_admission.zig");
+pub const DenseExecution = @import("dense_execution.zig");
 const admission = @import("admission_waiter.zig");
 const dense_perf = @import("dense_perf_experiments.zig");
 pub const ProjectionPageCache = @import("projection_page_cache.zig");
@@ -810,12 +811,12 @@ test "dense aggregate resource manager bounds callers and helpers together" {
     manager.dense_driver_admission.capacity = 2;
     var caller = try manager.dense_driver_admission.acquire(null, null);
     defer caller.release();
-    try std.testing.expect(manager.tryAcquireDenseReadTask());
-    try std.testing.expect(!manager.tryAcquireDenseReadTask());
+    var helper = manager.tryAcquireDenseReadTask().?;
+    try std.testing.expect(manager.tryAcquireDenseReadTask() == null);
     try std.testing.expectEqual(@as(u32, 1), manager.denseReadTaskStats().active);
-    manager.releaseDenseReadTask();
-    try std.testing.expect(manager.tryAcquireDenseReadTask());
-    manager.releaseDenseReadTask();
+    helper.release();
+    helper = manager.tryAcquireDenseReadTask().?;
+    helper.release();
     caller.release();
     manager.dense_driver_admission.assertIdle();
 }
@@ -859,6 +860,7 @@ pub const ResourceManager = struct {
     dense_read_extra_task_limit: u32 = 0,
     dense_rerank_admission: DenseWorkAdmission.Queue = .{},
     dense_driver_admission: DenseWorkAdmission.Queue = .{},
+    dense_execution: ?*DenseExecution.Runtime = null,
     dense_aggregate_admission: bool = false,
     dense_phase_admission: bool = false,
     dense_scan_prediction: bool = false,
@@ -1005,16 +1007,71 @@ pub const ResourceManager = struct {
 
     /// Optional parallelism is nonblocking. The admitted query caller always
     /// drains its queue, so no generation/scratch lease waits for more workers.
-    pub fn tryAcquireDenseReadTask(self: *ResourceManager) bool {
+    pub const DenseDriverLease = struct {
+        legacy: DenseWorkAdmission.Queue.Lease = .{},
+        scheduled: DenseExecution.Runtime.Lease = .{},
+
+        pub fn release(self: *@This()) void {
+            self.scheduled.release();
+            self.legacy.release();
+        }
+    };
+
+    /// Configure before publishing the manager to callers. Repeated identical
+    /// setup is harmless; changing policy on a live manager is not supported.
+    pub fn configureDenseExecution(self: *ResourceManager, config: DenseExecution.Config) !void {
+        try config.validate();
+        if (self.dense_execution) |runtime| {
+            if (!std.meta.eql(runtime.config, config)) return error.AdmissionBusy;
+            return;
+        }
+        if (config.max_runnable_tasks != 0)
+            self.dense_execution = try DenseExecution.Runtime.create(self.identity_allocator, config);
+    }
+
+    pub fn acquireDenseDriver(self: *ResourceManager, io: std.Io, cancellation: ?DenseWorkAdmission.Cancellation) !DenseDriverLease {
+        if (self.dense_execution) |runtime| return .{ .scheduled = try runtime.acquire(.{
+            .io = io,
+            .cancellation = if (cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled } else .none,
+        }) };
+        return .{ .legacy = if (self.dense_aggregate_admission) try self.dense_driver_admission.acquire(io, cancellation) else .{} };
+    }
+
+    pub fn denseExecutionStats(self: *const ResourceManager) DenseExecution.Stats {
+        return if (self.dense_execution) |runtime| runtime.stats() else .{};
+    }
+
+    pub const DenseReadTaskLease = struct {
+        manager: ?*ResourceManager = null,
+        driver: DenseDriverLease = .{},
+
+        pub fn release(self: *@This()) void {
+            const manager = self.manager orelse return;
+            self.manager = null;
+            const previous = manager.dense_read_extra_tasks.fetchSub(1, .release);
+            std.debug.assert(previous != 0);
+            self.driver.release();
+        }
+    };
+
+    pub fn tryAcquireDenseReadTask(self: *ResourceManager) ?DenseReadTaskLease {
+        var scheduled: DenseExecution.Runtime.Lease = .{};
+        if (self.dense_execution) |runtime| {
+            scheduled = runtime.tryAcquire() orelse {
+                _ = self.dense_read_denied_tasks.fetchAdd(1, .monotonic);
+                return null;
+            };
+        }
         var driver: DenseWorkAdmission.Queue.Lease = .{};
-        if (self.dense_aggregate_admission) {
+        if (self.dense_execution == null and self.dense_aggregate_admission) {
             driver = self.dense_driver_admission.tryAcquire() orelse {
                 _ = self.dense_read_denied_tasks.fetchAdd(1, .monotonic);
-                return false;
+                return null;
             };
         }
         var granted = false;
         defer if (!granted) driver.release();
+        defer if (!granted) scheduled.release();
         var active = self.dense_read_extra_tasks.load(.monotonic);
         while (active < self.dense_read_extra_task_limit) {
             if (self.dense_read_extra_tasks.cmpxchgWeak(active, active + 1, .acquire, .monotonic)) |updated| {
@@ -1022,20 +1079,11 @@ pub const ResourceManager = struct {
             } else {
                 _ = self.dense_read_peak_extra_tasks.fetchMax(active + 1, .monotonic);
                 granted = true;
-                return true;
+                return .{ .manager = self, .driver = .{ .legacy = driver, .scheduled = scheduled } };
             }
         }
         _ = self.dense_read_denied_tasks.fetchAdd(1, .monotonic);
-        return false;
-    }
-
-    pub fn releaseDenseReadTask(self: *ResourceManager) void {
-        const previous = self.dense_read_extra_tasks.fetchSub(1, .release);
-        std.debug.assert(previous != 0);
-        if (self.dense_aggregate_admission) {
-            var driver: DenseWorkAdmission.Queue.Lease = .{ .queue = &self.dense_driver_admission };
-            driver.release();
-        }
+        return null;
     }
 
     pub fn denseReadTaskStats(self: *const ResourceManager) DenseReadTaskStats {
@@ -1545,6 +1593,7 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        if (self.dense_execution) |runtime| runtime.destroy();
         self.dense_checkpoint_ready.assertUnbound();
         self.dense_rerank_admission.assertIdle();
         self.dense_driver_admission.assertIdle();

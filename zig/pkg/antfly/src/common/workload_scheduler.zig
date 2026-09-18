@@ -99,6 +99,24 @@ pub const Scheduler = struct {
         return .{ .ledger = ledger, .policy = policy };
     }
 
+    /// Optional helpers cannot wait while their driver owns execution/state.
+    /// Respect all queued lanes and charge service only after a complete grant.
+    pub fn tryAcquire(self: *Scheduler, request: *const resources.RequestLease, lane: resources.Lane, minimum: resources.Bundle, estimated_units: u16) !?Job {
+        if (estimated_units == 0 or estimated_units > 1024) return error.InvalidEstimate;
+        if (!self.mutex.tryLock()) return null;
+        defer self.mutex.unlock();
+        if (self.closed) return error.AdmissionClosed;
+        if (try self.ledger.requestLane(request) != lane) return error.InvalidLease;
+        for (self.lanes) |pending| if (pending.head != null) return null;
+        const lease = self.ledger.acquire(.runnable, request, minimum) catch |err| {
+            if (err == error.ResourceTemporarilyUnavailable) return null;
+            return err;
+        };
+        self.lanes[@intFromEnum(lane)].service = @max(self.lanes[@intFromEnum(lane)].service, self.virtual_service);
+        self.account(lane, estimated_units);
+        return .{ .scheduler = self, .lease = lease, .lane = lane, .estimate = estimated_units };
+    }
+
     fn lock(self: *Scheduler) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }

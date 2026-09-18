@@ -3031,11 +3031,16 @@ pub fn runFromIterator(
     var storage_kernel_context = kernel_owner_client.Context{};
     defer if (control_only_storage_sources) storage_kernel_context.deinit();
     if (comptime control_only_storage_sources) {
+        const dense = if (loaded_config) |*cfg| cfg.admission.dense_execution else (antfly.common.config.Config.AdmissionConfig{}).dense_execution;
         try storage_kernel_context.ensureWith(.{
             .storage_kind = if (lite_path != null) .lite else .directory,
             .no_sync = @intFromBool(!lite_fsync),
             .storage_path = .fromSlice(lite_path orelse ""),
             .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+            .dense_max_runnable_tasks = dense.max_runnable_tasks,
+            .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
+            .dense_max_queued_tasks = dense.max_queued_tasks,
+            .dense_max_wait_ms = dense.max_wait_ms,
         });
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
@@ -3606,6 +3611,7 @@ pub fn runFromIterator(
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .query_admission_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
+            .dense_execution = if (loaded_config) |*cfg| cfg.admission.dense_execution else .{},
             .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,

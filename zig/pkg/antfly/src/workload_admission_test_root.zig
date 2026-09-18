@@ -12,6 +12,7 @@ test {
     _ = @import("common/workload_attempts.zig");
     _ = @import("storage/workload_memory.zig");
     _ = @import("common/workload_admission_vopr_test.zig");
+    _ = @import("storage/dense_execution.zig");
     _ = @import("api/httpx_handler.zig");
     _ = @import("api/kernel_exports.zig");
     _ = @import("serverless/api/http_handler.zig");

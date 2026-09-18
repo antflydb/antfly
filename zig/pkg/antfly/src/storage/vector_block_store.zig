@@ -3990,13 +3990,13 @@ fn runPositionalReadBatchProfiled(
         context: @TypeOf(context),
         requests: []Request,
         next: std.atomic.Value(usize) = .init(0),
-        manager: ?*resource_manager_mod.ResourceManager,
         profiled: bool,
         worker_wall_ns: std.atomic.Value(u64) = .init(0),
         worker_start_delay_ns: std.atomic.Value(u64) = .init(0),
 
-        fn worker(work: *@This(), submitted: u64) std.Io.Cancelable!void {
-            defer if (work.manager) |manager| manager.releaseDenseReadTask();
+        fn worker(work: *@This(), submitted: u64, owned_lease: resource_manager_mod.ResourceManager.DenseReadTaskLease) std.Io.Cancelable!void {
+            var lease = owned_lease;
+            defer lease.release();
             const start = if (work.profiled) time.monotonicNs() else 0;
             if (work.profiled) _ = work.worker_start_delay_ns.fetchAdd(start - submitted, .monotonic);
             defer if (work.profiled) {
@@ -4013,7 +4013,7 @@ fn runPositionalReadBatchProfiled(
             }
         }
     };
-    var work: Work = .{ .context = context, .requests = requests[completed..], .manager = resource_manager, .profiled = stats != null };
+    var work: Work = .{ .context = context, .requests = requests[completed..], .profiled = stats != null };
     var group = std.Io.Group.init;
     // Drain all tasks even if the caller is cancelled while doing its share:
     // request buffers and the stack-owned queue must never escape this call.
@@ -4022,12 +4022,15 @@ fn runPositionalReadBatchProfiled(
     const ceiling: usize = if (resource_manager) |m| (if (m.dense_read_single_helper and !adaptive) 2 else Opened.positional_read_wave) else Opened.positional_read_wave;
     const workers = @min(requests.len - completed, ceiling);
     for (1..workers) |_| {
-        if (resource_manager) |manager| if (!manager.tryAcquireDenseReadTask()) {
-            if (stats) |p| p.denied += 1;
-            break;
-        };
-        group.concurrent(io, Work.worker, .{ &work, if (stats != null) time.monotonicNs() else 0 }) catch {
-            if (resource_manager) |manager| manager.releaseDenseReadTask();
+        var helper_lease: resource_manager_mod.ResourceManager.DenseReadTaskLease = .{};
+        if (resource_manager) |manager| {
+            helper_lease = manager.tryAcquireDenseReadTask() orelse {
+                if (stats) |p| p.denied += 1;
+                break;
+            };
+        }
+        group.concurrent(io, Work.worker, .{ &work, if (stats != null) time.monotonicNs() else 0, helper_lease }) catch {
+            helper_lease.release();
             if (stats) |p| p.denied += 1;
             break;
         };

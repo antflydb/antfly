@@ -93,6 +93,7 @@ pub const Config = struct {
     };
 
     pub const AdmissionConfig = struct {
+        dense_execution: @import("../storage/dense_execution.zig").Config = .{},
         query: RequestAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
         write: RequestAdmissionConfig = .{ .max_concurrent_requests = default_write_max_concurrent_requests },
         inference: RequestAdmissionConfig = .{ .max_concurrent_requests = default_inference_max_concurrent_requests },
@@ -708,7 +709,7 @@ pub const Config = struct {
         };
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("admission")) |admission_value| {
-            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference" });
+            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "dense_execution" });
             const admission_object = switch (admission_value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
@@ -836,6 +837,7 @@ pub const Config = struct {
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
             .admission = .{
+                .dense_execution = try denseExecutionFromOpenApi(if (validated.value.admission) |admission| admission.dense_execution else null),
                 .query = .{
                     .max_concurrent_requests = if (validated.value.admission) |admission|
                         if (admission.query) |query|
@@ -1670,6 +1672,18 @@ fn parseRemoteContentS3Credential(alloc: std.mem.Allocator, value: std.json.Valu
         .buckets = if (scraping_cfg.value.buckets) |buckets| try dupOwnedStringSlice(alloc, buckets) else null,
         .security = if (scraping_cfg.value.security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
     };
+}
+
+fn denseExecutionFromOpenApi(input: ?common_openapi.DenseExecutionConfig) !@import("../storage/dense_execution.zig").Config {
+    const value = input orelse return .{};
+    const config: @import("../storage/dense_execution.zig").Config = .{
+        .max_runnable_tasks = std.math.cast(u32, value.max_runnable_tasks orelse 0) orelse return error.InvalidConfig,
+        .max_outstanding_tasks = std.math.cast(u32, value.max_outstanding_tasks orelse 0) orelse return error.InvalidConfig,
+        .max_queued_tasks = std.math.cast(u32, value.max_queued_tasks orelse 0) orelse return error.InvalidConfig,
+        .max_wait_ms = std.math.cast(u32, value.max_wait_ms orelse 0) orelse return error.InvalidConfig,
+    };
+    try config.validate();
+    return config;
 }
 
 fn admissionWaitingFromOpenApi(input: ?common_openapi.AdmissionWaitingConfig) !@import("workload_admission.zig").Config {
@@ -2591,6 +2605,24 @@ test "common config preserves disabled foreground admission" {
     try std.testing.expectEqual(@as(u32, 0), cfg.admission.query.max_concurrent_requests);
     try std.testing.expectEqual(@as(u32, 0), cfg.admission.write.max_concurrent_requests);
     try std.testing.expectEqual(@as(u32, 0), cfg.admission.inference.max_concurrent_requests);
+}
+
+test "common config validates opt-in fixed dense execution" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"admission":{"dense_execution":{"max_runnable_tasks":2,"max_outstanding_tasks":8,"max_queued_tasks":4,"max_wait_ms":25}}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 2), cfg.admission.dense_execution.max_runnable_tasks);
+    try std.testing.expectEqual(@as(u32, 4), cfg.admission.dense_execution.max_queued_tasks);
+    inline for (.{
+        \\{"admission":{"dense_execution":{"max_runnable_tasks":2,"max_outstanding_tasks":1}}}
+        ,
+        \\{"admission":{"dense_execution":{"max_runnable_tasks":0,"max_outstanding_tasks":2}}}
+        ,
+        \\{"admission":{"dense_execution":{"max_runnable_tasks":2,"max_outstanding_tasks":8,"max_wait_ms":10}}}
+        ,
+        \\{"admission":{"dense_execution":{"max_runnable_tasks":2,"max_outstanding_tasks":8,"max_queued_tasks":9,"max_wait_ms":10}}}
+    }) |json| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, json));
 }
 
 test "common config validates bounded query and write waiting" {

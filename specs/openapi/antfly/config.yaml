@@ -794,12 +794,48 @@ components:
       additionalProperties: false
       description: Node-local foreground database request admission settings.
       properties:
+        dense_execution:
+          $ref: "#/components/schemas/DenseExecutionConfig"
         query:
           $ref: "#/components/schemas/QueryAdmissionConfig"
         write:
           $ref: "#/components/schemas/WriteAdmissionConfig"
         inference:
           $ref: "#/components/schemas/InferenceAdmissionConfig"
+
+    DenseExecutionConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Opt-in fixed dense operator scheduling shared by callers and read helpers
+        on a provisioned storage node. Defaults preserve existing admission.
+        Coarse execution leases remain held through helper join; this does not
+        provide cooperative lane isolation or replace working-memory limits.
+      properties:
+        max_runnable_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Maximum combined dense callers and helpers; zero disables this scheduler.
+        max_outstanding_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Hard bound on active and queued dense tasks; must cover runnable capacity.
+        max_queued_tasks:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          default: 0
+          description: Waiting dense callers; helpers never queue. Must not exceed outstanding capacity.
+        max_wait_ms:
+          type: integer
+          minimum: 0
+          maximum: 60000
+          default: 0
+          description: Queue wait ceiling within the request deadline; zero requires a zero queue limit.
 
     GraphExecutionConfig:
       type: object

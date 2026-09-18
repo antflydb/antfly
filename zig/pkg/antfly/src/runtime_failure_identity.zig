@@ -29,6 +29,12 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .admission_full, .err = error.AdmissionFull },
+    .{ .status = .admission_queue_full, .err = error.AdmissionQueueFull },
+    .{ .status = .admission_bytes_exhausted, .err = error.AdmissionBytesExhausted },
+    .{ .status = .admission_request_too_large, .err = error.AdmissionRequestTooLarge },
+    .{ .status = .admission_wait_timeout, .err = error.AdmissionWaitTimeout },
+    .{ .status = .admission_closed, .err = error.AdmissionClosed },
     .{ .status = .catalog_already_exists, .err = error.CatalogAlreadyExists },
     .{ .status = .catalog_command_too_large, .err = error.CatalogCommandTooLarge },
     .{ .status = .catalog_generation_changed, .err = error.CatalogGenerationChanged },

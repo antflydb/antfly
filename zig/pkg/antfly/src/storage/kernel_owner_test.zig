@@ -1418,6 +1418,30 @@ test "opaque storage owner transaction recovery crosses callback ABI" {
     try std.testing.expect(cleaned);
 }
 
+test "opaque storage context activates and validates dense execution policy" {
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(abi.Status.invalid_config, abi.antfly_storage_context_create(&.{
+        .dense_max_runnable_tasks = 2,
+        .dense_max_outstanding_tasks = 1,
+    }, &context));
+    try std.testing.expect(context == null);
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{
+        .dense_max_runnable_tasks = 2,
+        .dense_max_outstanding_tasks = 8,
+        .dense_max_queued_tasks = 4,
+        .dense_max_wait_ms = 25,
+    }, &context));
+    defer _ = abi.antfly_storage_context_destroy(context);
+    var metrics: abi.ContextMetricsResult = undefined;
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
+    try std.testing.expectEqual(@as(u32, 2), metrics.dense_max_runnable_tasks);
+    try std.testing.expectEqual(@as(u32, 8), metrics.dense_max_outstanding_tasks);
+    try std.testing.expectEqual(@as(u32, 4), metrics.dense_max_queued_tasks);
+    try std.testing.expectEqual(@as(u32, 25), metrics.dense_max_wait_ms);
+    try std.testing.expectEqual(@as(u64, 0), metrics.dense_runnable);
+    try std.testing.expectEqual(@as(u64, 0), metrics.dense_outstanding);
+}
+
 test "opaque storage context enforces owner lifetime and shares process storage state" {
     const first_path = "/tmp/antfly-storage-kernel-context-first";
     const second_path = "/tmp/antfly-storage-kernel-context-second";

@@ -2263,6 +2263,19 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_consecutive_enqueue_failures", "gauge", "Consecutive dropped-table recovery worker allocations or durable queue submissions that failed", dropped_table_recovery.consecutive_enqueue_failures);
         try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_enqueue_failures_total", "counter", "Dropped-table recovery worker allocations or durable queue submissions that failed and were retained for watchdog retry", dropped_table_recovery.enqueue_failures);
         try writeResourceMetrics(writer, &self.data_server.provisioned_storage.resource_manager);
+        if (comptime linked_storage) {
+            if (self.data_server.kernel_owner_source) |source| {
+                if (source.contextMetrics()) |metrics| try writeDenseExecutionMetrics(writer, .{
+                    .max_runnable_tasks = metrics.dense_max_runnable_tasks,
+                    .max_outstanding_tasks = metrics.dense_max_outstanding_tasks,
+                    .max_queued_tasks = metrics.dense_max_queued_tasks,
+                    .max_wait_ms = metrics.dense_max_wait_ms,
+                    .runnable = metrics.dense_runnable,
+                    .outstanding = metrics.dense_outstanding,
+                    .queued = metrics.dense_queued,
+                }) else |_| {}
+            }
+        } else try writeDenseExecutionMetrics(writer, self.data_server.provisioned_storage.resource_manager.denseExecutionStats());
         try writeLsmCacheMetrics(writer, if (comptime linked_storage)
             self.data_server.storageOwnerLsmCacheStatsBestEffort()
         else
@@ -2967,6 +2980,17 @@ fn asyncMutexMetricValue(stats: antfly.db.types.DBMutexStats, field: AsyncMutexM
         .hold_ns => stats.hold_ns,
         .max_hold_ns => stats.max_hold_ns,
     };
+}
+
+fn writeDenseExecutionMetrics(writer: *std.Io.Writer, stats: resource_manager_mod.DenseExecution.Stats) !void {
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_enabled", "gauge", "Whether fixed dense caller and helper scheduling is enabled", @intFromBool(stats.max_runnable_tasks != 0));
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_runnable_limit", "gauge", "Configured and effective dense runnable task limit", stats.max_runnable_tasks);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_outstanding_limit", "gauge", "Configured and effective dense outstanding task limit", stats.max_outstanding_tasks);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_queue_limit", "gauge", "Configured and effective dense queued task limit", stats.max_queued_tasks);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_max_wait_ms", "gauge", "Maximum dense execution queue waiting time in milliseconds", stats.max_wait_ms);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_runnable", "gauge", "Dense drivers and helpers owning runnable leases", stats.runnable);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_outstanding", "gauge", "Dense drivers and helpers owning request leases", stats.outstanding);
+    try health_metrics.appendPromMetric(writer, "antfly_dense_execution_queued", "gauge", "Dense drivers waiting for runnable leases", stats.queued);
 }
 
 fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.ResourceManager) !void {
@@ -5650,6 +5674,8 @@ pub const DataServer = struct {
 
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
+        if (comptime !linked_storage)
+            try self.provisioned_storage.resource_manager.configureDenseExecution(self.api_server_cfg.dense_execution);
         var api_server_cfg = self.api_server_cfg;
         if (self.data_request_lifecycle_hook != null) {
             if (api_server_cfg.query_result_lifecycle_hook != null)
@@ -19679,12 +19705,19 @@ pub const DataServer = struct {
         if (comptime linked_storage) {
             if (cfg.storage_kernel_context_handle == null) {
                 var context = kernel_owner_client.Context{};
+                const dense = cfg.api_server_cfg.dense_execution;
+                const context_request: @import("kernel_owner_abi").ContextRequest = .{
+                    .dense_max_runnable_tasks = dense.max_runnable_tasks,
+                    .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
+                    .dense_max_queued_tasks = dense.max_queued_tasks,
+                    .dense_max_wait_ms = dense.max_wait_ms,
+                };
                 if (backend_runtime.?.usesBorrowedIo()) {
                     const services = @import("../storage/kernel_runtime_services.zig");
                     const io = backend_runtime.?.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
                     var borrow = services.executor.Borrow.init(&io);
-                    try context.ensureWithRuntime(.{ .io = &borrow, .memory_limit_bytes = cfg.process_memory_limit_bytes });
-                } else try context.ensure();
+                    try context.ensureWithRuntime(.{ .context = context_request, .io = &borrow, .memory_limit_bytes = cfg.process_memory_limit_bytes });
+                } else try context.ensureWith(context_request);
                 storage_kernel_context = context;
                 const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(
                     alloc,
@@ -25709,6 +25742,7 @@ pub fn runFromIterator(
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .query_admission_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
+            .dense_execution = if (loaded_config) |*cfg| cfg.admission.dense_execution else .{},
             .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,

@@ -18256,7 +18256,7 @@ pub const HBCIndex = struct {
     pub const SearchAdmissionLease = struct {
         bandwidth: resource_manager_mod.DenseSearchAdmissionLease = .{},
         rerank: resource_manager_mod.DenseWorkAdmission.Queue.Lease = .{},
-        driver: resource_manager_mod.DenseWorkAdmission.Queue.Lease = .{},
+        driver: resource_manager_mod.ResourceManager.DenseDriverLease = .{},
         generation: ?*ExperimentalPostingReadGeneration = null,
         /// Capture before retaining the generation. Sampling when a delayed
         /// admission becomes a transaction could pair old storage with new caches.
@@ -18366,10 +18366,10 @@ pub const HBCIndex = struct {
         // One aggregate slot accounts for the caller throughout both phases.
         // Acquire it before any scan permit or generation lease. Helpers only
         // try the same pool; they cannot wait while the caller owns a slot.
-        var driver: resource_manager_mod.DenseWorkAdmission.Queue.Lease = .{};
+        var driver: resource_manager_mod.ResourceManager.DenseDriverLease = .{};
         errdefer driver.release();
-        if (self.resource_manager) |manager| if (manager.dense_aggregate_admission and active_count != 0) {
-            driver = try manager.dense_driver_admission.acquire(self.runtimeIo(), if (req.cancellation) |token|
+        if (self.resource_manager) |manager| if (active_count != 0) {
+            driver = try manager.acquireDenseDriver(self.runtimeIo(), if (req.cancellation) |token|
                 .{ .ptr = token.ptr, .is_cancelled = token.is_cancelled_fn }
             else
                 null);

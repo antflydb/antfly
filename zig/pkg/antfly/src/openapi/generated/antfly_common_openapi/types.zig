@@ -14,12 +14,14 @@ const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
 /// Node-local foreground database request admission settings.
 pub const AdmissionConfig = struct {
+    dense_execution: ?DenseExecutionConfig = null,
     query: ?QueryAdmissionConfig = null,
     write: ?WriteAdmissionConfig = null,
     inference: ?InferenceAdmissionConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "dense_execution", "dense_execution", true },
         .{ "query", "query", true },
         .{ "write", "write", true },
         .{ "inference", "inference", true },
@@ -35,6 +37,10 @@ pub const AdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.dense_execution) |value| {
+            try jw.objectField("dense_execution");
+            try jw.write(value);
+        }
         if (self.query) |value| {
             try jw.objectField("query");
             try jw.write(value);
@@ -706,6 +712,55 @@ pub const ConnectionKind = enum {
             .{ "cdc", .cdc },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Opt-in fixed dense operator scheduling shared by callers and read helpers on a provisioned storage node. Defaults preserve existing admission. Coarse execution leases remain held through helper join; this does not provide cooperative lane isolation or replace working-memory limits.
+pub const DenseExecutionConfig = struct {
+    /// Maximum combined dense callers and helpers; zero disables this scheduler.
+    max_runnable_tasks: ?i64 = null,
+    /// Hard bound on active and queued dense tasks; must cover runnable capacity.
+    max_outstanding_tasks: ?i64 = null,
+    /// Waiting dense callers; helpers never queue. Must not exceed outstanding capacity.
+    max_queued_tasks: ?i64 = null,
+    /// Queue wait ceiling within the request deadline; zero requires a zero queue limit.
+    max_wait_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_runnable_tasks", "max_runnable_tasks", true },
+        .{ "max_outstanding_tasks", "max_outstanding_tasks", true },
+        .{ "max_queued_tasks", "max_queued_tasks", true },
+        .{ "max_wait_ms", "max_wait_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_runnable_tasks) |value| {
+            try jw.objectField("max_runnable_tasks");
+            try jw.write(value);
+        }
+        if (self.max_outstanding_tasks) |value| {
+            try jw.objectField("max_outstanding_tasks");
+            try jw.write(value);
+        }
+        if (self.max_queued_tasks) |value| {
+            try jw.objectField("max_queued_tasks");
+            try jw.write(value);
+        }
+        if (self.max_wait_ms) |value| {
+            try jw.objectField("max_wait_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 

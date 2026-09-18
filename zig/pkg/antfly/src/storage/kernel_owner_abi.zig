@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 60;
+pub const abi_version: u32 = 61;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -298,6 +298,10 @@ pub const ContextRequest = extern struct {
     _reserved0: [7]u8 = @splat(0),
     storage_path: BorrowedBytes = .{},
     auth_storage_path: BorrowedBytes = .{},
+    dense_max_runnable_tasks: u32 = 0,
+    dense_max_outstanding_tasks: u32 = 0,
+    dense_max_queued_tasks: u32 = 0,
+    dense_max_wait_ms: u32 = 0,
 };
 
 /// One low-volume engine namespace used by control-plane metadata or durable
@@ -407,6 +411,13 @@ pub const ContextMetricsResult = extern struct {
     lsm_run_table_index: ContextCacheKindStats = .{},
     lsm_run_table_block: ContextCacheKindStats = .{},
     lsm_run_table_physical_block: ContextCacheKindStats = .{},
+    dense_max_runnable_tasks: u32 = 0,
+    dense_max_outstanding_tasks: u32 = 0,
+    dense_max_queued_tasks: u32 = 0,
+    dense_max_wait_ms: u32 = 0,
+    dense_runnable: u64 = 0,
+    dense_outstanding: u64 = 0,
+    dense_queued: u64 = 0,
 };
 
 /// Process-owned data-Raft apply/projection store. Requests are deliberately

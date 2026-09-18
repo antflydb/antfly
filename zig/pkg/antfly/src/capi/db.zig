@@ -2313,6 +2313,12 @@ fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*Storag
         memory_budget.smartResourceBudgets(memory_limit);
     context.resources = try .initWithBudgets(alloc, budgets);
     errdefer context.resources.deinit();
+    try context.resources.resource_manager.configureDenseExecution(.{
+        .max_runnable_tasks = request.dense_max_runnable_tasks,
+        .max_outstanding_tasks = request.dense_max_outstanding_tasks,
+        .max_queued_tasks = request.dense_max_queued_tasks,
+        .max_wait_ms = request.dense_max_wait_ms,
+    });
     var runtime_config = db_mod.background_runtime.Config{};
     if (context.io_receiver) |*io| runtime_config = .{
         .backend = .manual,
@@ -2413,6 +2419,7 @@ pub fn storageOwnerContextMetrics(
     out_result.* = .{};
     const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
     const stats = owner_context.resources.lsm_cache.snapshotStats();
+    const dense = owner_context.resources.resource_manager.denseExecutionStats();
     out_result.* = .{
         .lsm_cache_used_bytes = @intCast(stats.used_bytes),
         .lsm_cache_entry_count = @intCast(stats.entry_count),
@@ -2421,6 +2428,13 @@ pub fn storageOwnerContextMetrics(
         .lsm_run_table_index = storageOwnerContextCacheKindStats(stats.run_table_index),
         .lsm_run_table_block = storageOwnerContextCacheKindStats(stats.run_table_block),
         .lsm_run_table_physical_block = storageOwnerContextCacheKindStats(stats.run_table_physical_block),
+        .dense_max_runnable_tasks = dense.max_runnable_tasks,
+        .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
+        .dense_max_queued_tasks = dense.max_queued_tasks,
+        .dense_max_wait_ms = dense.max_wait_ms,
+        .dense_runnable = dense.runnable,
+        .dense_outstanding = dense.outstanding,
+        .dense_queued = dense.queued,
     };
     return .ok;
 }
