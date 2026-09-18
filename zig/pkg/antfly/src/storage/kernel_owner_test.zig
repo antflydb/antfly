@@ -1128,6 +1128,26 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "portable-owner/groups/7001.afb") != null);
     try std.testing.expect(std.mem.indexOf(u8, portable_backup.bytes(), "\"artifact_sha256\"") != null);
 
+    // The earlier targeted reconcile deliberately admitted the sibling
+    // full_text_index_v0 without advancing its durable catalog-admission
+    // repair. Document artifact repair does not retire that index intent.
+    // Native backup must reject until the actual repair owner finishes it.
+    try std.testing.expectError(error.NativeBackupRepairStateNotQuiescent, owner.backupJson("docs", backup_root, "pending-repair", .native));
+    var repair_quiescent = false;
+    var indexes_repaired: u64 = 0;
+    for (0..64) |_| {
+        const progress = try owner.repairIndex("docs", null, .{});
+        try std.testing.expect(progress.state != .degraded);
+        indexes_repaired += progress.repair_repaired;
+        if (progress.state == .complete) {
+            try std.testing.expectEqual(@as(u64, 0), progress.repair_remaining);
+            repair_quiescent = true;
+            break;
+        }
+    }
+    try std.testing.expect(repair_quiescent);
+    try std.testing.expect(indexes_repaired > 0);
+
     var native_backup = try owner.backupJson(
         "docs",
         backup_root,

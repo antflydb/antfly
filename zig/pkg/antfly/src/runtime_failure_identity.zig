@@ -29,6 +29,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .native_backup_repair_state_not_quiescent, .err = error.NativeBackupRepairStateNotQuiescent },
     .{ .status = .admission_full, .err = error.AdmissionFull },
     .{ .status = .admission_queue_full, .err = error.AdmissionQueueFull },
     .{ .status = .admission_bytes_exhausted, .err = error.AdmissionBytesExhausted },
