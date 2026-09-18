@@ -670,28 +670,13 @@ const StandaloneHealthSource = struct {
         try antfly.common.health_server.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(self.supervisor.token().isCancelled()));
 
         const handler = antfly.public_api.kernel_bridge.handlerStats(self.handler);
-        try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, .{
-            .capacity = handler.query_capacity,
-            .in_flight = handler.query_in_flight,
-            .peak_in_flight = handler.query_peak_in_flight,
-            .rejected_total = handler.query_rejected_total,
-        });
-        try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, .{
-            .capacity = handler.write_capacity,
-            .in_flight = handler.write_in_flight,
-            .peak_in_flight = handler.write_peak_in_flight,
-            .rejected_total = handler.write_rejected_total,
-        });
-        try antfly.common.request_admission.appendPrometheusMetrics(writer, .inference, .{
-            .capacity = handler.inference_capacity,
-            .in_flight = handler.inference_in_flight,
-            .peak_in_flight = handler.inference_peak_in_flight,
-            .rejected_total = handler.inference_rejected_total,
-        });
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", handler.query_body_capacity);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body_in_flight);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body_peak_in_flight);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_rejected_total", "counter", "Streaming H2 query bodies rejected by admission control", handler.query_body_rejected_total);
+        try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, handler.query);
+        try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, handler.write);
+        try antfly.common.request_admission.appendPrometheusMetrics(writer, .inference, handler.inference);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", handler.query_body.capacity);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body.in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body.peak_in_flight);
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_rejected_total", "counter", "Streaming H2 query bodies rejected by admission control", handler.query_body.rejected_total);
         if (self.unified_lifecycle.runtimeStats()) |http| {
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_connection_limit", "gauge", "Maximum concurrent public HTTP connections", http.max_connections);
             try antfly.common.health_server.appendPromMetric(writer, "antfly_http_active_connections", "gauge", "Currently active public HTTP connections", http.active_connections);

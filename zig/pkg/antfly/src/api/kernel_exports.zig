@@ -362,22 +362,10 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
     const inference = handler.api_server.inferenceAdmissionStats();
     const query_body = handler.query_body_admission.stats();
     output(abi.HandlerStats, context).* = .{
-        .query_capacity = query.capacity,
-        .query_in_flight = query.in_flight,
-        .query_peak_in_flight = query.peak_in_flight,
-        .query_rejected_total = query.rejected_total,
-        .write_capacity = write.capacity,
-        .write_in_flight = write.in_flight,
-        .write_peak_in_flight = write.peak_in_flight,
-        .write_rejected_total = write.rejected_total,
-        .inference_capacity = inference.capacity,
-        .inference_in_flight = inference.in_flight,
-        .inference_peak_in_flight = inference.peak_in_flight,
-        .inference_rejected_total = inference.rejected_total,
-        .query_body_capacity = query_body.capacity,
-        .query_body_in_flight = query_body.in_flight,
-        .query_body_peak_in_flight = query_body.peak_in_flight,
-        .query_body_rejected_total = query_body.rejected_total,
+        .query = .fromNative(query),
+        .write = .fromNative(write),
+        .inference = .fromNative(inference),
+        .query_body = .fromNative(query_body),
     };
     return .ok;
 }
@@ -1269,4 +1257,90 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         handle = null;
         try Probe.run(std.testing.io);
     }
+}
+
+test "workload admission kernel telemetry preserves live ownership policy and diagnostics" {
+    const admission = @import("../common/request_admission.zig");
+    const bridge = @import("kernel_bridge.zig");
+    const alloc = std.testing.allocator;
+    var runtime = std.Io.Threaded.init(alloc, .{});
+    defer runtime.deinit();
+    const io = runtime.io();
+    const policy: admission.workload.Config = .{
+        .max_wait_ms = 5000,
+        .max_queued_requests = 1,
+        .max_queued_bytes = 8192,
+        .max_retained_bytes = 16384,
+    };
+    var source: KernelIngressTestStatus = .{};
+    var server = server_mod.ApiHttpServer.init(alloc, .{
+        .query_max_concurrent_requests = 1,
+        .query_admission_waiting = policy,
+        .write_max_concurrent_requests = 3,
+        .write_admission_waiting = .{ .max_retained_bytes = 4096 },
+    }, source.source(), null, null);
+    defer server.deinit();
+    var state: HandlerState = .{
+        .alloc = alloc,
+        .handler = .{ .api_server = &server },
+        .route_validator = httpx.Router.init(alloc),
+    };
+    defer state.route_validator.deinit();
+    var first = try server.query_admission.acquire(.{ .io = io, .retained_bytes = 32 });
+    defer first.release();
+    var write = try server.write_admission.acquire(.{ .io = io, .retained_bytes = 16 });
+    defer write.release();
+    const Worker = struct {
+        owner: *server_mod.RequestAdmission,
+        io: std.Io,
+        fn run(self: *@This()) !void {
+            var lease = try self.owner.acquire(.{ .io = self.io, .retained_bytes = 64 });
+            defer lease.release();
+        }
+    };
+    var worker: Worker = .{ .owner = &server.query_admission, .io = io };
+    var future = try io.concurrent(Worker.run, .{&worker});
+    defer _ = future.cancel(io) catch {};
+    const deadline = (admission.workload.Options{ .io = io }).now() + 2 * std.time.ns_per_s;
+    while (server.query_admission.stats().queued != 1) {
+        if ((admission.workload.Options{ .io = io }).now() >= deadline) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.AdmissionQueueFull, server.query_admission.acquire(.{ .io = io, .retained_bytes = 8 }));
+    try std.testing.expectError(error.AdmissionRequestTooLarge, server.query_admission.reserveMemory(32768));
+    try server.query_admission.reconfigure(1, policy);
+    const live = bridge.handlerStatsFromKernel(&state, getFunctionTable());
+    try std.testing.expectEqualDeep(server.queryAdmissionStats(), live.query);
+    try std.testing.expectEqualDeep(server.writeAdmissionStats(), live.write);
+    try std.testing.expectEqualDeep(server.inferenceAdmissionStats(), live.inference);
+    try std.testing.expectEqualDeep(state.handler.query_body_admission.stats(), live.query_body);
+    // Nonzero assertions ensure this test cannot pass with default-filled data.
+    try std.testing.expectEqual(@as(usize, 1), live.query.queued);
+    try std.testing.expectEqual(@as(usize, 64), live.query.queued_bytes);
+    try std.testing.expectEqual(@as(usize, 96), live.query.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 2), live.query.policy_generation);
+    try std.testing.expectEqual(@as(u64, 1), live.query.rejection_reasons[@intFromEnum(admission.workload.RejectionReason.queue_count)]);
+    try std.testing.expectEqual(@as(u64, 1), live.query.allocation_denials[@intFromEnum(admission.workload.AllocationDenial.allocation_bytes)]);
+    var rendered: std.Io.Writer.Allocating = .init(alloc);
+    defer rendered.deinit();
+    try admission.appendPrometheusMetrics(&rendered.writer, .query, live.query);
+    try admission.appendPrometheusMetrics(&rendered.writer, .write, live.write);
+    for ([_][]const u8{
+        "antfly_admission_query_queue_capacity_requests 1\n",
+        "antfly_admission_query_retained_bytes 96\n",
+        "antfly_admission_query_policy_generation 2\n",
+        "antfly_admission_query_rejections_by_reason_total{reason=\"queue_count\"} 1\n",
+        "antfly_admission_write_retained_bytes 16\n",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, rendered.writer.buffered(), line) != null);
+    first.release();
+    try future.await(io);
+    const completed = bridge.handlerStatsFromKernel(&state, getFunctionTable());
+    try std.testing.expectEqualDeep(server.queryAdmissionStats(), completed.query);
+    try std.testing.expectEqual(@as(u64, 1), completed.query.wait_completed_total);
+    try std.testing.expectEqual(@as(u64, 1), completed.query.wait_buckets[completed.query.wait_buckets.len - 1]);
+    try std.testing.expect(completed.query.wait_ns_total > 0);
+    try std.testing.expectEqual(@as(usize, 0), completed.query.queued);
+    try std.testing.expectEqual(@as(usize, 0), completed.query.retained_bytes);
+    server.closeForegroundAdmission();
+    try std.testing.expect(bridge.handlerStatsFromKernel(&state, getFunctionTable()).query.draining);
 }

@@ -304,7 +304,22 @@ fn callInfallible(
     callFallible(Input, Output, function, handle, input, output) catch @panic("infallible API kernel call failed");
 }
 
-pub const HandlerStats = abi.HandlerStats;
+pub const HandlerStats = struct {
+    const AdmissionStats = server_mod.RequestAdmission.Stats;
+    query: AdmissionStats,
+    write: AdmissionStats,
+    inference: AdmissionStats,
+    query_body: AdmissionStats,
+
+    fn fromWire(value: abi.HandlerStats) HandlerStats {
+        return .{
+            .query = value.query.toNative(AdmissionStats),
+            .write = value.write.toNative(AdmissionStats),
+            .inference = value.inference.toNative(AdmissionStats),
+            .query_body = value.query_body.toNative(AdmissionStats),
+        };
+    }
+};
 
 const OpaqueHttpxHandler = struct {
     const RouteSelection = enum {
@@ -325,9 +340,7 @@ const OpaqueHttpxHandler = struct {
     }
 
     pub fn stats(self: *const OpaqueHttpxHandler) HandlerStats {
-        var out: HandlerStats = undefined;
-        callInfallible(void, HandlerStats, self.functions.handler_stats, self.handle, null, &out);
-        return out;
+        return handlerStatsFromKernel(self.handle, self.functions);
     }
 
     pub fn registerRoutes(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
@@ -616,25 +629,21 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
         const inference = handler.api_server.inferenceAdmissionStats();
         const query_body = handler.query_body_admission.stats();
         return .{
-            .query_capacity = query.capacity,
-            .query_in_flight = query.in_flight,
-            .query_peak_in_flight = query.peak_in_flight,
-            .query_rejected_total = query.rejected_total,
-            .write_capacity = write.capacity,
-            .write_in_flight = write.in_flight,
-            .write_peak_in_flight = write.peak_in_flight,
-            .write_rejected_total = write.rejected_total,
-            .inference_capacity = inference.capacity,
-            .inference_in_flight = inference.in_flight,
-            .inference_peak_in_flight = inference.peak_in_flight,
-            .inference_rejected_total = inference.rejected_total,
-            .query_body_capacity = query_body.capacity,
-            .query_body_in_flight = query_body.in_flight,
-            .query_body_peak_in_flight = query_body.peak_in_flight,
-            .query_body_rejected_total = query_body.rejected_total,
+            .query = query,
+            .write = write,
+            .inference = inference,
+            .query_body = query_body,
         };
     }
     return handler.stats();
+}
+
+/// The production opaque path and tests use the same checked C call and full
+/// snapshot conversion; never reconstruct default-filled controller stats.
+pub fn handlerStatsFromKernel(handle: *anyopaque, functions: *const abi.FunctionTable) HandlerStats {
+    var out: abi.HandlerStats = undefined;
+    callInfallible(void, abi.HandlerStats, functions.handler_stats, handle, null, &out);
+    return HandlerStats.fromWire(out);
 }
 
 pub fn deinitHandler(handler: *HttpxHandler) void {

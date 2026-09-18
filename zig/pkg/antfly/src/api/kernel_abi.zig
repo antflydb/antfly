@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 23;
+pub const abi_version: u32 = 24;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -158,24 +158,7 @@ pub const RouteManifestContext = extern struct {
     out_len: *usize,
 };
 
-pub const HandlerStats = extern struct {
-    query_capacity: usize,
-    query_in_flight: usize,
-    query_peak_in_flight: usize,
-    query_rejected_total: u64,
-    write_capacity: usize,
-    write_in_flight: usize,
-    write_peak_in_flight: usize,
-    write_rejected_total: u64,
-    inference_capacity: usize,
-    inference_in_flight: usize,
-    inference_peak_in_flight: usize,
-    inference_rejected_total: u64,
-    query_body_capacity: usize,
-    query_body_in_flight: usize,
-    query_body_peak_in_flight: usize,
-    query_body_rejected_total: u64,
-};
+pub const HandlerStats = @import("admission_stats_abi.zig").HandlerStats;
 
 /// Features exposed by the independently code-generated API-kernel archive.
 /// Consumers must test a capability before using its corresponding optional
