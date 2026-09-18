@@ -483,3 +483,11 @@ not bind individual attempts or independently prove signed generation closure;
 that requires per-attempt/fence receipts. Durable write decision interruption,
 namespace-loss recovery and replicated failover remain separate cells. Worker
 terminal tombstones are intentionally not required to return to zero.
+
+For a diagnostic cell, `observe_unknown_setup: true` retains bounded read-only
+catalog observations before cleanup when setup returns an unknown write outcome.
+It makes at most three GET requests, each with a two-second ceiling, against the
+public catalog, affected table and owned metadata catalog. These observations
+never retry the mutation or classify its outcome as resolved. Explicit
+`X-Antfly-Raft-Mutation-Outcome: unknown-v1` responses remain unknown even when
+the configured HTTP status was expected; unknown setup stops the run.

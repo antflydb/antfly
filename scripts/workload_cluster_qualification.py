@@ -101,6 +101,8 @@ def validate(plan):
             or not 0 < value <= ceiling
         ):
             raise ValueError(f"invalid bounded {key}")
+    if type(plan.get("observe_unknown_setup", False)) is not bool:
+        raise ValueError("observe_unknown_setup must be an explicit diagnostic boolean")
     artifacts = plan.get("artifacts", {})
     if not 1 <= len(artifacts) <= 8:
         raise ValueError("need 1..8 pinned local artifacts")
@@ -337,6 +339,39 @@ def validate(plan):
             type(action.get("coordinator")) is not int or action["coordinator"] <= 0
         ):
             raise ValueError("discovery needs explicit coordinator node ID")
+
+
+def observe_unknown_setup(cluster, action, timeout):
+    """Read-only diagnostic receipts never resolve or retry an ambiguous mutation."""
+    target = action["node"]
+    requests = [(target, "/db/v1/tables")]
+    if action["path"].startswith("/db/v1/tables/"):
+        requests.append((target, "/".join(action["path"].split("/")[:5])))
+    metadata = cluster.nodes[target].get("metadata")
+    if metadata:
+        requests.append((metadata, "/metadata/v1/tables"))
+    observations = []
+    for node, path in requests:
+        receipt = request(
+            cluster.ports[node]["api"],
+            {
+                "method": "GET",
+                "path": path,
+                "is_write": False,
+                "expect": {"status": 200},
+            },
+            min(2, timeout),
+            raw=True,
+        )
+        receipt.update(
+            node=node,
+            path=path,
+            diagnostic_only=True,
+            original_mutation_remains_unknown=True,
+        )
+        cluster.record({"event": "unknown_setup_observation", **receipt})
+        observations.append(receipt)
+    return observations
 
 
 def validate_metrics_action(action):
@@ -977,6 +1012,7 @@ def run(plan, output):
     )
     cluster, failure, cleanup_errors = None, None, []
     results, pending, schedule_invalid = [], {}, []
+    setup_observations = []
     discoveries, signed_attempts, protocol_debt = {}, {}, {}
     results_lock = threading.Lock()
     try:
@@ -1176,7 +1212,14 @@ def run(plan, output):
             return result
 
         for action in plan.get("setup", []):
-            if not execute(action)["passed"]:
+            setup_result = execute(action)
+            if setup_result.get("unknown_write_outcome"):
+                if plan.get("observe_unknown_setup"):
+                    setup_observations.extend(
+                        observe_unknown_setup(cluster, action, plan["request_timeout"])
+                    )
+                raise RuntimeError("setup mutation outcome unknown; no writes replayed")
+            if not setup_result["passed"]:
                 raise RuntimeError("setup assertion failed; no writes replayed")
         origin = time.monotonic()
         cluster.record({"event": "schedule_start", "origin": origin})
@@ -1276,6 +1319,7 @@ def run(plan, output):
             "error": failure,
             "cleanup_errors": cleanup_errors,
             "schedule_invalid": schedule_invalid,
+            "setup_observations": setup_observations,
             "unknown_write_outcomes": len(unresolved),
             "unresolved_durable_obligations": len(unresolved),
             "fixture_protocol_obligations": protocol_debt,

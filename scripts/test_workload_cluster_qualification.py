@@ -158,6 +158,44 @@ class ClusterTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertTrue(result["unknown_write_outcome"])
 
+    def test_unknown_setup_observation_only_reads_catalog_and_never_resolves_write(
+        self,
+    ):
+        class Owned:
+            nodes = {"api": {"metadata": "metadata"}}
+            ports = {"api": {"api": 1}, "metadata": {"api": 2}}
+            events = []
+
+            def record(self, row):
+                self.events.append(row)
+
+        owned = Owned()
+        calls = []
+
+        def observe(port, action, timeout, **kwargs):
+            calls.append((port, action, timeout))
+            return {"passed": True, "status": 200, "body": "[]"}
+
+        with patch.object(cluster, "request", side_effect=observe):
+            rows = cluster.observe_unknown_setup(
+                owned,
+                {
+                    "node": "api",
+                    "path": "/db/v1/tables/t/batch",
+                    "is_write": True,
+                },
+                30,
+            )
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(calls[1][1]["path"], "/db/v1/tables/t")
+        self.assertTrue(
+            all(
+                action["method"] == "GET" and not action["is_write"] and timeout <= 2
+                for _, action, timeout in calls
+            )
+        )
+        self.assertTrue(all(row["original_mutation_remains_unknown"] for row in rows))
+
     def test_queued_request_does_not_restart_original_budget(self):
         class Connection:
             sent = 0
