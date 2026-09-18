@@ -151,7 +151,7 @@ for configuration and the document-lookup admission behavior change.
 
 The following focused checks cover the stage 1 follow-up. They are correctness
 checks, not release performance results. The combined integration gate passed;
-the production Debug rebuild is recorded separately when complete.
+the production Debug rebuild also passed from a clean, isolated checkout.
 
 | Check | Result | Local log |
 | --- | --- | --- |
@@ -170,3 +170,10 @@ memory therefore permits up to 1 GiB of linear memory per invocation, not a
 64 MiB aggregate process cap. Frontend ingress bounds invocation concurrency;
 Wasm engine/runtime allocation is outside the tracked Zig frontend allocator.
 The core ABI now installs the same fuel/resource limits as the component path.
+
+Stage 1 production Debug build: clean revision
+`7da1e4c7f9196ad3edd477ce842e5ac7b8668cf7`, exit 0, binary SHA-256
+`db4a723bb4d3869d3f4bf94059781f8875fd62ae2494a42533c8bbf07244a849`.
+Receipt: `/tmp/workload-stage1-production-debug-receipt.json`; build log:
+`/tmp/workload-stage1-production-debug.log`. The isolated checkout preserves this
+source/binary provenance while stage 2 changes proceed in the implementation worktree.
