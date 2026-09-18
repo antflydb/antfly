@@ -69,6 +69,7 @@ pub const Config = struct {
     deployment_mode: DeploymentMode = .distributed,
     health_enabled: bool = true,
     health_port: ?u16 = null,
+    health_metrics_interval_ms: u32 = 5000,
     log: ?logging_openapi.Config = null,
     tls: ?TlsConfig = null,
     cors: ?CorsConfig = null,
@@ -95,7 +96,9 @@ pub const Config = struct {
     pub const AdmissionConfig = struct {
         ingress: @import("workload_ingress.zig").Config = .{},
         session_max_retained_bytes: usize = 64 * 1024 * 1024,
+        transaction_completion_bytes: usize = 0,
         remote_attempt_worker: @import("workload_worker_config.zig").Config = .{},
+        remote_attempt_coordinator: @import("workload_coordinator_config.zig").Config = .{},
         dense_execution: @import("../storage/dense_execution.zig").Config = .{},
         read_execution: @import("../storage/dense_execution.zig").Config = .{},
         query: RequestAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
@@ -723,12 +726,12 @@ pub const Config = struct {
         };
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("admission")) |admission_value| {
-            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "dense_execution", "read_execution", "remote_attempt_worker", "session_max_retained_bytes", "ingress" });
+            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "dense_execution", "read_execution", "remote_attempt_worker", "remote_attempt_coordinator", "session_max_retained_bytes", "transaction_completion_bytes", "ingress" });
             const admission_object = switch (admission_value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
             };
-            if (admission_object.get("ingress") != null) try validateObjectMemberFields(admission_object, "ingress", &.{ "max_requests", "max_retained_bytes", "control_requests", "control_retained_bytes" });
+            if (admission_object.get("ingress") != null) try validateObjectMemberFields(admission_object, "ingress", &.{ "max_requests", "max_retained_bytes", "control_requests", "control_retained_bytes", "recovery_requests", "recovery_retained_bytes" });
             inline for (.{ "query", "write" }) |class| {
                 if (admission_object.get(class)) |value| {
                     try validateObjectMemberFields(admission_object, class, &.{ "max_concurrent_requests", "waiting" });
@@ -845,6 +848,7 @@ pub const Config = struct {
             .auth_enabled = try optionalBoolField(root, "enable_auth") orelse false,
             .deployment_mode = deployment_mode,
             .health_enabled = try optionalBoolField(root, "health_enabled") orelse true,
+            .health_metrics_interval_ms = try boundedPositiveInt(u32, validated.value.health_metrics_interval_ms, 100, 60_000, 5000),
             .health_port = if (validated.value.health_port) |value|
                 std.math.cast(u16, value) orelse return error.InvalidConfig
             else
@@ -858,7 +862,9 @@ pub const Config = struct {
             .admission = .{
                 .ingress = try ingressFromOpenApi(if (validated.value.admission) |admission| admission.ingress else null),
                 .session_max_retained_bytes = try boundedPositiveInt(usize, if (validated.value.admission) |admission| admission.session_max_retained_bytes else null, 4096, 1099511627776, 64 * 1024 * 1024),
+                .transaction_completion_bytes = try boundedPositiveInt(usize, if (validated.value.admission) |admission| admission.transaction_completion_bytes else null, 0, 1099511627776, 0),
                 .remote_attempt_worker = try remoteAttemptWorkerFromOpenApi(if (validated.value.admission) |admission| admission.remote_attempt_worker else null),
+                .remote_attempt_coordinator = try remoteAttemptCoordinatorFromOpenApi(if (validated.value.admission) |admission| admission.remote_attempt_coordinator else null),
                 .dense_execution = dense_execution,
                 .read_execution = read_execution,
                 .query = .{
@@ -1725,6 +1731,34 @@ fn protectedReadExecutionFromOpenApi(input: ?common_openapi.ProtectedReadExecuti
     };
 }
 
+test "workload admission remote coordinator policy is opt in with bounded destinations" {
+    const alloc = std.testing.allocator;
+    var defaults = try Config.parseFromSlice(alloc, "{}");
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(u32, 0), defaults.admission.remote_attempt_coordinator.max_attempts);
+    var enabled = try Config.parseFromSlice(alloc,
+        \\{"admission":{"remote_attempt_coordinator":{"max_attempts":4,"max_bytes":8192,"max_destination_attempts":2,"max_destinations":2}}}
+    );
+    defer enabled.deinit();
+    try std.testing.expectEqual(@as(u32, 2), enabled.admission.remote_attempt_coordinator.max_destination_attempts);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc,
+        \\{"admission":{"remote_attempt_coordinator":{"max_attempts":1,"max_bytes":8192,"max_destination_attempts":2,"max_destinations":2}}}
+    ));
+}
+
+fn remoteAttemptCoordinatorFromOpenApi(input: ?common_openapi.RemoteAttemptCoordinatorConfig) !@import("workload_coordinator_config.zig").Config {
+    const value = input orelse return .{};
+    const config: @import("workload_coordinator_config.zig").Config = .{
+        .max_attempts = std.math.cast(u32, value.max_attempts orelse 0) orelse return error.InvalidConfig,
+        .max_bytes = std.math.cast(u64, value.max_bytes orelse 0) orelse return error.InvalidConfig,
+        .max_destination_attempts = std.math.cast(u32, value.max_destination_attempts orelse 0) orelse return error.InvalidConfig,
+        .max_destinations = std.math.cast(u32, value.max_destinations orelse 0) orelse return error.InvalidConfig,
+        .max_run_ms = std.math.cast(u32, value.max_run_ms orelse 30_000) orelse return error.InvalidConfig,
+    };
+    try config.validate();
+    return config;
+}
+
 fn remoteAttemptWorkerFromOpenApi(input: ?common_openapi.RemoteAttemptWorkerConfig) !@import("workload_worker_config.zig").Config {
     const value = input orelse return .{};
     const config: @import("workload_worker_config.zig").Config = .{
@@ -2240,7 +2274,7 @@ fn validateObjectMemberFields(parent: std.json.ObjectMap, name: []const u8, allo
     if (!objectContainsOnly(object, allowed)) return error.InvalidConfig;
 }
 
-fn boundedPositiveInt(comptime T: type, value: ?i64, min: T, max: T, default_value: T) !T {
+fn boundedPositiveInt(comptime T: type, value: anytype, min: T, max: T, default_value: T) !T {
     const raw = value orelse return default_value;
     const cast = std.math.cast(T, raw) orelse return error.InvalidConfig;
     if (cast < min or cast > max) return error.InvalidConfig;
@@ -2680,6 +2714,30 @@ test "workload admission config bounds retained sessions independently of foregr
     try std.testing.expectEqual(default_query_max_concurrent_requests, cfg.admission.query.max_concurrent_requests);
     inline for (.{ "0", "4095", "1099511627777" }) |value| {
         try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, "{\"admission\":{\"session_max_retained_bytes\":" ++ value ++ "}}"));
+    }
+}
+
+test "workload admission completion reserve is explicit and independent of request limits" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"admission":{"transaction_completion_bytes":1048576}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 1048576), cfg.admission.transaction_completion_bytes);
+    try std.testing.expectEqual(default_write_max_concurrent_requests, cfg.admission.write.max_concurrent_requests);
+    try std.testing.expectEqual(@as(usize, 0), (Config.AdmissionConfig{}).transaction_completion_bytes);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{"admission":{"transaction_completion_bytes":1099511627777}}
+    ));
+}
+
+test "workload admission metrics collection interval is bounded independently from scrapes" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"health_metrics_interval_ms":250}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 250), cfg.health_metrics_interval_ms);
+    inline for (.{ "0", "99", "60001" }) |value| {
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, "{\"health_metrics_interval_ms\":" ++ value ++ "}"));
     }
 }
 

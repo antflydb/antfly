@@ -1234,6 +1234,12 @@ pub const ApiHttpServerConfig = struct {
     session_store_path: ?[]const u8 = null,
     session_store_scope: transactions_api.SessionStoreScope = .node_local,
     remote_attempt_worker: @import("../common/workload_worker_config.zig").Config = .{},
+    remote_attempt_coordinator: @import("../common/workload_coordinator_config.zig").Config = .{},
+    transaction_completion_bytes: usize = 0,
+    /// Trusted native startup proof: the same journal's exclusive writer lock
+    /// was acquired before opening this owner and outlives its teardown. Never
+    /// set for copied roots, unlocked stores, or concurrently live old owners.
+    remote_attempt_exclusive_owner: bool = false,
     /// Stable identity supplied by the owning node runtime, never by a caller.
     remote_attempt_node_id: u64 = 0,
     ha_admin_executor: ?ha_http_operation.Executor = null,
@@ -3120,6 +3126,7 @@ pub const ApiHttpServer = struct {
     first_request_started_at_ns: std.atomic.Value(u64) = .init(0),
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     remote_attempt_worker: ?*@import("workload_attempt_worker.zig").Store = null,
+    remote_attempt_coordinator: ?*@import("workload_coordinator_runtime.zig").Runtime = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .backing_alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     repair_job_store: repair_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
@@ -3499,7 +3506,7 @@ pub const ApiHttpServer = struct {
         self.query_admission.close();
         self.write_admission.close();
         self.inference_admission.close();
-        self.ingress_admission.close();
+        self.ingress_admission.closeForeground();
         self.session_memory_admission.close();
     }
 
@@ -3712,6 +3719,7 @@ pub const ApiHttpServer = struct {
         table_write_source: ?table_writes.TableWriteSource,
     ) !ApiHttpServer {
         try cfg.remote_attempt_worker.validate();
+        try cfg.remote_attempt_coordinator.validate();
         var effective_cfg = cfg;
         const request_alloc = if (builtin.is_test)
             alloc
@@ -3818,6 +3826,7 @@ pub const ApiHttpServer = struct {
         if (cfg.remote_attempt_worker.max_attempts != 0) {
             const durable = server.cfg.session_store orelse return error.RemoteAttemptDurabilityRequired;
             if (cfg.remote_attempt_node_id == 0) return error.RemoteAttemptNodeIdentityRequired;
+            if (cfg.internal_service_secret == null) return error.RemoteAttemptAuthenticationRequired;
             try internal_service_auth.validateRuntimeConfig(cfg.internal_service_secret, cfg.internal_service_verification_secret, cfg.internal_service_issuer);
             const worker = try alloc.create(@import("workload_attempt_worker.zig").Store);
             errdefer alloc.destroy(worker);
@@ -3830,9 +3839,25 @@ pub const ApiHttpServer = struct {
                 while (incarnation == 0) try threaded.io().randomSecure(std.mem.asBytes(&incarnation));
             }
             worker.* = try @import("workload_attempt_worker.zig").Store.init(alloc, durable, cfg.remote_attempt_node_id, incarnation, cfg.remote_attempt_worker);
+            errdefer worker.deinit();
+            if (cfg.remote_attempt_exclusive_owner) try worker.recoverPriorIncarnationAfterExclusiveRestart();
             server.remote_attempt_worker = worker;
         }
+        if (cfg.remote_attempt_coordinator.max_attempts != 0) {
+            const durable = server.cfg.session_store orelse return error.RemoteAttemptDurabilityRequired;
+            if (cfg.remote_attempt_node_id == 0) return error.RemoteAttemptNodeIdentityRequired;
+            try internal_service_auth.validateRuntimeConfig(cfg.internal_service_secret, cfg.internal_service_verification_secret, cfg.internal_service_issuer);
+            const secret = cfg.internal_service_secret orelse return error.RemoteAttemptAuthenticationRequired;
+            const owner = try alloc.create(@import("workload_coordinator_runtime.zig").Runtime);
+            errdefer alloc.destroy(owner);
+            owner.* = try @import("workload_coordinator_runtime.zig").Runtime.init(alloc, durable, cfg.remote_attempt_node_id, cfg.remote_attempt_coordinator, server.sharedApiNetworkIo(), cfg.session_executor, secret, cfg.internal_service_verification_secret, cfg.internal_service_issuer orelse "antfly-node");
+            server.remote_attempt_coordinator = owner;
+        }
         return server;
+    }
+
+    pub fn coordinatorPort(self: *ApiHttpServer) ?@import("../runtime_workload_abi.zig").CoordinatorPort {
+        return if (self.remote_attempt_coordinator) |owner| owner.port() else null;
     }
 
     pub fn setForeignRegistry(self: *ApiHttpServer, registry: *const foreign_mod.Registry) void {
@@ -3855,6 +3880,7 @@ pub const ApiHttpServer = struct {
 
     pub fn deinit(self: *ApiHttpServer) void {
         self.closeForegroundAdmission();
+        self.ingress_admission.close();
         self.query_admission.deinitMemory();
         self.write_admission.deinitMemory();
         self.inference_admission.deinitMemory();
@@ -3889,6 +3915,10 @@ pub const ApiHttpServer = struct {
         if (self.remote_attempt_worker) |worker| {
             worker.deinit();
             self.owner_alloc.destroy(worker);
+        }
+        if (self.remote_attempt_coordinator) |owner| {
+            owner.deinit();
+            self.owner_alloc.destroy(owner);
         }
         if (self.opened_session_store) |opened| {
             opened.deinit();
@@ -6323,18 +6353,24 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn authenticateInternalServiceRequest(self: *ApiHttpServer, token: []const u8) !AuthenticatedIdentity {
+        return self.authenticateInternalServiceRequestUsingAllocator(self.alloc, token);
+    }
+
+    pub fn authenticateInternalServiceRequestUsingAllocator(self: *ApiHttpServer, alloc: std.mem.Allocator, token: []const u8) !AuthenticatedIdentity {
         const secret = self.cfg.internal_service_secret orelse return error.Unauthorized;
         if (self.cfg.trusted_principal_secret) |trusted_secret| {
             if (std.mem.eql(u8, secret, trusted_secret)) return error.Unauthorized;
         }
-        return self.authenticateTrustedPrincipalWithIssuer(
+        return self.authenticateTrustedPrincipalWithIssuerAllocated(
+            alloc,
             token,
             secret,
             self.cfg.internal_service_issuer,
         ) catch |primary_err| {
             if (primary_err != error.Unauthorized) return primary_err;
             const verification_secret = self.cfg.internal_service_verification_secret orelse return primary_err;
-            return try self.authenticateTrustedPrincipalWithIssuer(
+            return try self.authenticateTrustedPrincipalWithIssuerAllocated(
+                alloc,
                 token,
                 verification_secret,
                 self.cfg.internal_service_issuer,
@@ -17188,7 +17224,7 @@ pub const ApiHttpServer = struct {
         try job.value.validate();
         if (table.storage_migration != null) {
             var reconciled = table;
-            if (job.value.published()) reconciled.storage = .{ .dense_embeddings = .vector_store };
+            if (job.value.published()) reconciled.storage.dense_embeddings = .vector_store;
             if (!job.value.active()) reconciled.storage_migration = null;
             if (!metadata_table_manager.tableDefinitionsEqual(table, reconciled))
                 try self.source.publishVectorMigrationTable(table, reconciled);

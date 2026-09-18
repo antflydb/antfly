@@ -1272,6 +1272,7 @@ pub fn runFromIterator(
         server.server.httpRuntime(),
     );
     defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
+    if (health_server) |hs| try hs.configureMetricsInterval(if (loaded_config) |*cfg| cfg.health_metrics_interval_ms else 5000);
 
     const preferred_bootstrap_campaigner = metadataClusterPreferredCampaigner(cluster_peers, local_node_id);
     const bootstrap_campaign_retry_interval_ns = metadataBootstrapCampaignRetryIntervalNs(cli.raft_tick_ms);

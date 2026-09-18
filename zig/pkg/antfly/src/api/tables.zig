@@ -1892,7 +1892,15 @@ fn buildTableStatusWithRanges(
         .name = table.name,
         .table_id = try std.fmt.allocPrint(alloc, "{d}", .{table.table_id}),
         .description = if (table.description.len > 0) table.description else null,
-        .storage = .{ .dense_embeddings = @tagName(table.storage.dense_embeddings) },
+        .storage = .{
+            .dense_embeddings = @tagName(table.storage.dense_embeddings),
+            .transaction_recovery = if (table.storage.transaction_recovery) |policy| .{ .value = .{
+                .protocol_version = policy.protocol_version,
+                .max_count = policy.max_count,
+                .max_bytes = policy.max_bytes,
+                .max_transaction_bytes = policy.max_transaction_bytes,
+            } } else .absent,
+        },
         .indexes = try parseTableIndexes(alloc, table.indexes_json),
         .shards = shards,
         .schema = if (definition) |value| value.schema else try parseOptionalTableSchema(alloc, table.schema_json),

@@ -43,6 +43,7 @@ pub const ObjectStorageLocation = types.ObjectStorageLocation;
 pub const ProtectedReadExecutionConfig = types.ProtectedReadExecutionConfig;
 pub const QueryAdmissionConfig = types.QueryAdmissionConfig;
 pub const ReadExecutionConfig = types.ReadExecutionConfig;
+pub const RemoteAttemptCoordinatorConfig = types.RemoteAttemptCoordinatorConfig;
 pub const RemoteAttemptWorkerConfig = types.RemoteAttemptWorkerConfig;
 pub const S3ExternalIoConfig = types.S3ExternalIoConfig;
 pub const StorageConfig = types.StorageConfig;

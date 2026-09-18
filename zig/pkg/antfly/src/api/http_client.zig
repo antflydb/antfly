@@ -333,6 +333,136 @@ test "workload admission attempt client requires authenticated terminal evidence
     }
 }
 
+test "workload admission coordinator dispatch durably owns sends and recovers lost terminal responses" {
+    const alloc = std.testing.allocator;
+    const protocol = @import("workload_attempt_protocol.zig");
+    const coordinator_module = @import("workload_attempt_coordinator.zig");
+    const worker_module = @import("workload_attempt_worker.zig");
+    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var storage = try backend.runtimeStore(alloc, .{ .name = "system/coordinator-client" });
+    defer storage.deinit();
+    var durable = @import("transactions.zig").DurableSessionStore.initRuntime(alloc, &storage);
+    const configuration: coordinator_module.Config = .{ .max_attempts = 2, .max_bytes = 8192, .max_destination_attempts = 1, .max_destinations = 2 };
+    var coordinator = try coordinator_module.Store.init(alloc, &durable, 7, configuration);
+    defer coordinator.deinit();
+    var worker = try worker_module.Store.init(alloc, &durable, 8, 10, .{ .max_attempts = 2, .max_bytes = 8192 });
+    defer worker.deinit();
+    const Fake = struct {
+        coordinator: *coordinator_module.Store,
+        worker: *worker_module.Store,
+        drop_terminal: bool = false,
+        status_available: bool = false,
+        executed: usize = 0,
+        fn respond(allocator: std.mem.Allocator, frame: ?[]u8) !http_common.HttpResponse {
+            errdefer if (frame) |owned| allocator.free(owned);
+            var response: http_common.HttpResponse = .{ .status = 200, .body = try allocator.dupe(u8, "{}") };
+            errdefer response.deinit(allocator);
+            if (frame) |owned| {
+                const name = try allocator.dupe(u8, protocol.evidence_header);
+                errdefer allocator.free(name);
+                response.headers = try allocator.alloc(http_common.Header, 1);
+                response.headers[0] = .{ .name = name, .value = owned };
+            }
+            return response;
+        }
+        fn execute(raw: *anyopaque, allocator: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            const keys: protocol.Keys = .{ .primary = "s" ** 32, .issuer = "cluster" };
+            const target = try protocol.requestTarget(request.uri);
+            if (std.mem.endsWith(u8, target, "/workload/control") and request.header(protocol.request_header) == null) {
+                var parsed = try std.json.parseFromSlice(struct { nonce: u128 }, allocator, request.body, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                return respond(allocator, try protocol.signDiscovery(allocator, keys, .{ .coordinator = 7, .destination = self.worker.node_id, .worker_incarnation = self.worker.incarnation, .worker_namespace = self.worker.namespace, .nonce = parsed.value.nonce }));
+            }
+            const signed = try protocol.verifyRequest(allocator, keys, request.header(protocol.request_header).?, "node:7", @tagName(request.method), target, request.body);
+            if (std.mem.endsWith(u8, target, "/workload/control")) {
+                if (std.mem.indexOf(u8, request.body, "\"status\"") != null) {
+                    if (!self.status_available or !try self.worker.terminalStatus(signed.attempt))
+                        return .{ .status = 409, .body = try allocator.dupe(u8, "{}") };
+                    return respond(allocator, try protocol.signTerminalAfterQuiescence(allocator, keys, signed.attempt, 200, "{}"));
+                }
+                const fence = (try self.worker.closeGeneration(7, signed.attempt.generation, signed.attempt.worker_incarnation)).?;
+                return respond(allocator, try protocol.signFenceAfterQuiescence(allocator, keys, fence));
+            }
+            // The transport is never reached before the persistent charge.
+            try std.testing.expectEqual(@as(u32, 1), (try self.coordinator.usage()).attempts);
+            const admitted = try self.worker.begin(signed);
+            try std.testing.expect(admitted == .started);
+            var lease = admitted.started;
+            self.executed += 1;
+            try lease.finish();
+            return respond(allocator, if (self.drop_terminal) null else try protocol.signTerminalAfterQuiescence(allocator, keys, signed.attempt, 200, "{}"));
+        }
+    };
+    var fake: Fake = .{ .coordinator = &coordinator, .worker = &worker };
+    var client = ApiHttpClient.init(alloc, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    _ = try client.withInternalServiceNodeAuth("s" ** 32, "cluster", 7);
+    const request: http_common.HttpRequest = .{ .method = .POST, .uri = "http://worker/internal/v1/groups/1/tables/docs/_query", .body = "{}" };
+    for (0..6) |_| {
+        var response = try client.executeCoordinatedRead(&coordinator, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null);
+        response.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 6), fake.executed);
+    try std.testing.expectEqual(@as(usize, 1), (try worker.usage()).attempts);
+    fake.drop_terminal = true;
+    try std.testing.expectError(error.AttemptOutcomeUncertain, client.executeCoordinatedRead(&coordinator, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null));
+    try std.testing.expectEqual(@as(u32, 1), (try coordinator.usage()).attempts);
+    try std.testing.expectError(error.AttemptCapacityExhausted, client.executeCoordinatedRead(&coordinator, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null));
+    try std.testing.expectEqual(@as(usize, 7), fake.executed);
+    fake.status_available = true;
+    fake.drop_terminal = false;
+    var reconciled = try client.executeCoordinatedRead(&coordinator, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null);
+    reconciled.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), (try coordinator.usage()).attempts);
+    fake.drop_terminal = true;
+    try std.testing.expectError(error.AttemptOutcomeUncertain, client.executeCoordinatedRead(&coordinator, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null));
+    var reopened = try coordinator_module.Store.init(alloc, &durable, 7, configuration);
+    defer reopened.deinit();
+    fake.coordinator = &reopened;
+    fake.drop_terminal = false;
+    var recovered = try client.executeCoordinatedRead(&reopened, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null);
+    recovered.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), (try reopened.usage()).attempts);
+    try std.testing.expectEqual(@as(usize, 10), fake.executed);
+    // A send lost before worker admission still consumes coordinator debt.
+    // Only a same-namespace predecessor epoch plus actual exclusive restart
+    // proof can retire it; discovery alone is not completion evidence.
+    const missing = try reopened.begin(8, worker.incarnation, 777);
+    try std.testing.expect(!try worker.terminalStatus(missing));
+    var next_worker = try worker_module.Store.init(alloc, &durable, 8, 999, .{ .max_attempts = 2, .max_bytes = 8192 });
+    defer next_worker.deinit();
+    try std.testing.expectEqual(worker.namespace, next_worker.namespace);
+    try std.testing.expectEqual(worker.incarnation + 1, next_worker.incarnation);
+    try std.testing.expect(!try next_worker.terminalStatus(missing));
+    try next_worker.recoverPriorIncarnationAfterExclusiveRestart();
+    try std.testing.expect(try next_worker.terminalStatus(missing));
+    var wrong_namespace = missing;
+    wrong_namespace.worker_namespace +%= 1;
+    try std.testing.expectError(error.AttemptIdentityMismatch, next_worker.terminalStatus(wrong_namespace));
+    fake.worker = &next_worker;
+    var after_worker_restart = try client.executeCoordinatedRead(&reopened, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null);
+    after_worker_restart.deinit(alloc);
+    // Repeated success compacts the acknowledged missing sequence instead of
+    // leaving an immortal hole that exhausts the tiny two-record worker.
+    for (0..4) |_| {
+        var next = try client.executeCoordinatedRead(&reopened, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null);
+        next.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(u32, 0), (try reopened.usage()).attempts);
+    try std.testing.expectEqual(@as(usize, 1), (try next_worker.usage()).attempts);
+    // Signing allocation failure happens after durable begin but before the
+    // transport callback. The proven-unsent record is safely retired.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var local_failure = ApiHttpClient.init(failing.allocator(), client.executor);
+    _ = try local_failure.withInternalServiceNodeAuth("s" ** 32, "cluster", 7);
+    const before_local_failure = fake.executed;
+    try std.testing.expectError(error.OutOfMemory, local_failure.executeCoordinatedRead(&reopened, 8, "http://worker", request, platform_time.monotonicNs() + 5 * std.time.ns_per_s, null));
+    try std.testing.expectEqual(before_local_failure, fake.executed);
+    try std.testing.expectEqual(@as(u32, 0), (try reopened.usage()).attempts);
+}
+
 pub const ApiHttpClient = struct {
     alloc: std.mem.Allocator,
     executor: http_common.RequestExecutor,
@@ -373,17 +503,29 @@ pub const ApiHttpClient = struct {
     /// only a response with identity-bound terminal evidence is returned.
     pub fn executeAttemptRequest(self: *ApiHttpClient, request: http_common.HttpRequest, id: @import("workload_attempt_protocol.zig").AttemptId, deadline_ns: u64, verification_secret: ?[]const u8) !http_common.HttpResponse {
         const protocol = @import("workload_attempt_protocol.zig");
+        var response = try self.executeSignedAttemptRequest(request, id, deadline_ns, 1, 0);
+        errdefer response.deinit(self.alloc);
+        const signing = self.internal_service orelse return error.AttemptAuthenticationUnavailable;
+        const keys: protocol.Keys = .{ .primary = signing.secret, .verification = verification_secret, .issuer = signing.issuer };
+        const evidence = response.header(protocol.evidence_header) orelse return error.AttemptOutcomeUncertain;
+        _ = protocol.verifyTerminal(self.alloc, keys, evidence, id, response.status, response.body) catch return error.AttemptOutcomeUncertain;
+        return response;
+    }
+
+    fn executeSignedAttemptRequest(self: *ApiHttpClient, request: http_common.HttpRequest, id: @import("workload_attempt_protocol.zig").AttemptId, deadline_ns: u64, version: u16, acknowledged_through: u64) !http_common.HttpResponse {
+        const protocol = @import("workload_attempt_protocol.zig");
         const signing = self.internal_service orelse return error.AttemptAuthenticationUnavailable;
         if (signing.node_id == null or signing.node_id.? != id.coordinator) return error.AttemptIdentityMismatch;
         if (!internal_service_auth.requestTargetsInternalApi(request.uri)) return error.InvalidAttemptTarget;
         const now = platform_time.monotonicNs();
         if (now >= deadline_ns) return error.DeadlineExceeded;
-        const keys: protocol.Keys = .{ .primary = signing.secret, .verification = verification_secret, .issuer = signing.issuer };
+        const keys: protocol.Keys = .{ .primary = signing.secret, .issuer = signing.issuer };
         const frame = try protocol.signRequest(self.alloc, keys, .{
-            .version = 1,
+            .version = version,
             .attempt = id,
             .remaining_ns = deadline_ns - now,
             .request_digest = protocol.requestDigest(@tagName(request.method), try protocol.requestTarget(request.uri), request.body),
+            .acknowledged_through = acknowledged_through,
         });
         defer self.alloc.free(frame);
         var headers: std.ArrayListUnmanaged(http_common.RequestHeader) = .empty;
@@ -397,11 +539,130 @@ pub const ApiHttpClient = struct {
         signed_request.headers = headers.items;
         const remaining_ms: u32 = @intCast(@min(std.math.maxInt(u32), (deadline_ns - now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms));
         signed_request.timeout_ms = @min(request.timeout_ms orelse remaining_ms, remaining_ms);
-        var response = self.executeRequest(signed_request) catch return error.AttemptOutcomeUncertain;
+        return self.executeRequest(signed_request) catch |err| {
+            if (signed_request.delivery_tracker) |tracker| if (tracker.load() == .not_sent) return err;
+            return error.AttemptOutcomeUncertain;
+        };
+    }
+
+    /// destination comes from the coordinator's authenticated catalog routing,
+    /// never from a response body or a public request. Every send is preceded
+    /// by durable ownership. Missing evidence leaves that record charged.
+    pub fn executeCoordinatedRead(self: *ApiHttpClient, coordinator: *@import("workload_attempt_coordinator.zig").Store, destination: u64, base_uri: []const u8, request: http_common.HttpRequest, deadline_ns: u64, verification_secret: ?[]const u8) !http_common.HttpResponse {
+        const protocol = @import("workload_attempt_protocol.zig");
+        if (request.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Canceled;
+        const signing = self.internal_service orelse return error.AttemptAuthenticationUnavailable;
+        if (signing.node_id != coordinator.node_id) return error.AttemptIdentityMismatch;
+        const keys: protocol.Keys = .{ .primary = signing.secret, .verification = verification_secret, .issuer = signing.issuer };
+        const incarnation = try coordinator.readyIncarnation(destination) orelse try self.refreshCoordinatedDestination(coordinator, destination, base_uri, deadline_ns, verification_secret, request.cancellation);
+        _ = try attemptRemainingMs(deadline_ns);
+        if (request.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Canceled;
+        // The durable sequence provides uniqueness; the digest also separates
+        // logical operations without retaining their request bodies in recovery.
+        const digest = protocol.requestDigest(@tagName(request.method), try protocol.requestTarget(request.uri), request.body);
+        const operation = std.mem.readInt(u128, digest[0..16], .big) | 1;
+        const id = coordinator.begin(destination, incarnation, operation) catch |err| retry: {
+            if (err != error.AttemptCapacityExhausted) return err;
+            const retired = try self.reconcileCoordinatedReads(coordinator, destination, base_uri, deadline_ns, verification_secret, request.cancellation);
+            const current_incarnation = if (retired) try self.refreshCoordinatedDestination(coordinator, destination, base_uri, deadline_ns, verification_secret, request.cancellation) else incarnation;
+            break :retry try coordinator.begin(destination, current_incarnation, operation);
+        };
+        const acknowledged = @min(coordinator.acknowledgedThrough(destination) catch |err| {
+            try coordinator.terminal(id); // No transport has been entered.
+            return err;
+        }, id.sequence - 1);
+        const Dispatch = struct {
+            delegate: http_common.RequestExecutor,
+            deadline_ns: u64,
+            entered: bool = false,
+            fn execute(raw: *anyopaque, alloc: std.mem.Allocator, input: http_common.HttpRequest) !http_common.HttpResponse {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                if (input.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Canceled;
+                const remaining = try ApiHttpClient.attemptRemainingMs(owner.deadline_ns);
+                var clamped = input;
+                clamped.timeout_ms = @min(input.timeout_ms orelse remaining, remaining);
+                owner.entered = true;
+                if (input.delivery_tracker) |tracker| tracker.markUnknown();
+                return owner.delegate.execute(alloc, clamped);
+            }
+            fn realtime(raw: *anyopaque) i128 {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                return owner.delegate.realtimeNs() orelse platform_time.realtimeNs();
+            }
+        };
+        var dispatch: Dispatch = .{ .delegate = self.executor, .deadline_ns = deadline_ns };
+        var dispatch_client = self.*;
+        dispatch_client.executor = .{ .ptr = &dispatch, .vtable = &.{ .execute = Dispatch.execute }, .realtime_ns_fn = Dispatch.realtime, .clock_io = self.executor.clock_io };
+        var tracker: http_common.RequestDeliveryTracker = .{};
+        tracker.markNotSent();
+        var outgoing = request;
+        outgoing.delivery_tracker = &tracker;
+        var response = dispatch_client.executeSignedAttemptRequest(outgoing, id, deadline_ns, 3, acknowledged) catch |err| {
+            if (!dispatch.entered or tracker.load() == .not_sent) try coordinator.terminal(id);
+            return err;
+        };
         errdefer response.deinit(self.alloc);
         const evidence = response.header(protocol.evidence_header) orelse return error.AttemptOutcomeUncertain;
         _ = protocol.verifyTerminal(self.alloc, keys, evidence, id, response.status, response.body) catch return error.AttemptOutcomeUncertain;
+        try coordinator.terminal(id);
+        // Only identity-bound terminal evidence permits this overload mapping.
+        // An unsigned 429 remains unknown and keeps its durable charge.
+        if (response.status == 429) return error.AdmissionFull;
         return response;
+    }
+
+    fn refreshCoordinatedDestination(self: *ApiHttpClient, coordinator: *@import("workload_attempt_coordinator.zig").Store, destination: u64, base_uri: []const u8, deadline_ns: u64, verification_secret: ?[]const u8, cancellation: ?*const http_common.RequestCancellation) !u64 {
+        const protocol = @import("workload_attempt_protocol.zig");
+        const signing = self.internal_service orelse return error.AttemptAuthenticationUnavailable;
+        const keys: protocol.Keys = .{ .primary = signing.secret, .verification = verification_secret, .issuer = signing.issuer };
+        const control_uri = try self.joinRoute(base_uri, "/internal/v1/workload/control");
+        defer self.alloc.free(control_uri);
+        var nonce: u128 = 0;
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        while (nonce == 0) try threaded.io().randomSecure(std.mem.asBytes(&nonce));
+        const discovery_body = try std.json.Stringify.valueAlloc(self.alloc, .{ .workload_attempt_control = "discover", .nonce = nonce }, .{});
+        defer self.alloc.free(discovery_body);
+        var discovered = try self.executeRequest(.{ .method = .POST, .uri = control_uri, .content_type = "application/json", .body = discovery_body, .timeout_ms = try attemptRemainingMs(deadline_ns), .cancellation = cancellation });
+        defer discovered.deinit(self.alloc);
+        if (discovered.status != 200) return error.UnsupportedAttemptProtocol;
+        const discovery = try protocol.verifyDiscovery(self.alloc, keys, discovered.header(protocol.evidence_header) orelse return error.UnsupportedAttemptProtocol, coordinator.node_id, destination, nonce);
+        const fence_id: protocol.AttemptId = .{ .coordinator = coordinator.node_id, .generation = coordinator.generation - 1, .sequence = 1, .operation = nonce, .destination = destination, .worker_incarnation = discovery.worker_incarnation, .worker_namespace = discovery.worker_namespace };
+        var fenced = try self.executeSignedAttemptRequest(.{ .method = .POST, .uri = control_uri, .content_type = "application/json", .body = "{\"workload_attempt_control\":\"close_generation\"}", .cancellation = cancellation }, fence_id, deadline_ns, 3, 0);
+        defer fenced.deinit(self.alloc);
+        if (fenced.status != 200) return error.FencingRequired;
+        const evidence = try protocol.verifyFence(self.alloc, keys, fenced.header(protocol.evidence_header) orelse return error.FencingRequired, fence_id);
+        try coordinator.ready(.{ .version = 1, .coordinator = coordinator.node_id, .destination = evidence.destination, .worker_incarnation = evidence.worker_incarnation, .worker_namespace = evidence.worker_namespace, .fenced_through = evidence.fenced_through, .quiesced_through = evidence.quiesced_through });
+        return discovery.worker_incarnation;
+    }
+
+    pub fn reconcileCoordinatedReads(self: *ApiHttpClient, coordinator: *@import("workload_attempt_coordinator.zig").Store, destination: u64, base_uri: []const u8, deadline_ns: u64, verification_secret: ?[]const u8, cancellation: ?*const http_common.RequestCancellation) !bool {
+        const protocol = @import("workload_attempt_protocol.zig");
+        const signing = self.internal_service orelse return error.AttemptAuthenticationUnavailable;
+        const keys: protocol.Keys = .{ .primary = signing.secret, .verification = verification_secret, .issuer = signing.issuer };
+        const pending = try coordinator.pending(self.alloc, destination);
+        defer self.alloc.free(pending);
+        const uri = try self.joinRoute(base_uri, "/internal/v1/workload/control");
+        defer self.alloc.free(uri);
+        var retired = false;
+        for (pending) |id| {
+            _ = try attemptRemainingMs(deadline_ns);
+            if (cancellation) |token| if (token.isCancelled()) return error.Canceled;
+            var response = self.executeSignedAttemptRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = "{\"workload_attempt_control\":\"status\"}", .cancellation = cancellation }, id, deadline_ns, 3, 0) catch continue;
+            defer response.deinit(self.alloc);
+            if (response.status != 200) continue;
+            const evidence = response.header(protocol.evidence_header) orelse continue;
+            _ = protocol.verifyTerminal(self.alloc, keys, evidence, id, response.status, response.body) catch continue;
+            try coordinator.terminal(id);
+            retired = true;
+        }
+        return retired;
+    }
+
+    fn attemptRemainingMs(deadline_ns: u64) !u32 {
+        const now = platform_time.monotonicNs();
+        if (now >= deadline_ns) return error.DeadlineExceeded;
+        return @intCast(@min(std.math.maxInt(u32), (deadline_ns - now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms));
     }
 
     /// Execute one request, attaching node authority only when the resolved

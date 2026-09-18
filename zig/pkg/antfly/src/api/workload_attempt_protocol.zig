@@ -31,7 +31,41 @@ pub const Request = struct {
     attempt: AttemptId,
     remaining_ns: u64,
     request_digest: [32]u8,
+    /// Protocol v2: retire only already-terminal contiguous sequence records.
+    acknowledged_through: u64 = 0,
 };
+
+pub const Discovery = struct {
+    version: u16 = 1,
+    coordinator: u64,
+    destination: u64,
+    worker_incarnation: u64,
+    worker_namespace: u128,
+    nonce: u128,
+    protocol_version: u16 = 3,
+};
+
+pub fn signDiscovery(alloc: std.mem.Allocator, keys: Keys, value: Discovery) ![]u8 {
+    if (value.version != 1 or value.coordinator == 0 or value.destination == 0 or value.worker_incarnation == 0 or value.worker_namespace == 0 or value.nonce == 0) return error.InvalidAttemptFrame;
+    return sign(alloc, keys, "antfly-workload-discovery-v1", value);
+}
+
+pub fn verifyDiscovery(alloc: std.mem.Allocator, keys: Keys, frame: []const u8, coordinator: u64, destination: u64, nonce: u128) !Discovery {
+    const value = try verify(Discovery, alloc, keys, "antfly-workload-discovery-v1", frame);
+    if (value.version != 1 or value.protocol_version != 3) return error.UnsupportedAttemptProtocol;
+    if (value.coordinator != coordinator or value.destination != destination or value.nonce != nonce or nonce == 0 or value.worker_incarnation == 0 or value.worker_namespace == 0) return error.AttemptIdentityMismatch;
+    return value;
+}
+
+test "workload admission worker discovery binds membership identity nonce and protocol" {
+    const alloc = std.testing.allocator;
+    const keys: Keys = .{ .primary = "x" ** 32, .issuer = "cluster" };
+    const frame = try signDiscovery(alloc, keys, .{ .coordinator = 7, .destination = 8, .worker_incarnation = 10, .worker_namespace = 44, .nonce = 123 });
+    defer alloc.free(frame);
+    try std.testing.expectEqual(@as(u64, 10), (try verifyDiscovery(alloc, keys, frame, 7, 8, 123)).worker_incarnation);
+    try std.testing.expectError(error.AttemptIdentityMismatch, verifyDiscovery(alloc, keys, frame, 7, 9, 123));
+    try std.testing.expectError(error.AttemptIdentityMismatch, verifyDiscovery(alloc, keys, frame, 7, 8, 124));
+}
 
 pub const Terminal = struct {
     version: u16,
@@ -45,6 +79,7 @@ pub const Fence = struct {
     coordinator: u64,
     destination: u64,
     worker_incarnation: u64,
+    worker_namespace: u128 = 0,
     fenced_through: u64,
     quiesced_through: u64,
 };
@@ -89,7 +124,9 @@ fn responseDigest(body: []const u8) [32]u8 {
 }
 
 pub fn signRequest(alloc: std.mem.Allocator, keys: Keys, request: Request) ![]u8 {
-    if (request.version != 1 or !validAttempt(request.attempt) or request.remaining_ns == 0)
+    if ((request.version != 1 and request.version != 2 and request.version != 3) or !validAttempt(request.attempt) or request.remaining_ns == 0 or
+        (request.version == 3 and request.attempt.worker_namespace == 0) or
+        request.acknowledged_through >= request.attempt.sequence or (request.version == 1 and request.acknowledged_through != 0))
         return error.InvalidAttemptFrame;
     return sign(alloc, keys, "antfly-workload-request-v1", request);
 }
@@ -98,8 +135,9 @@ pub fn signRequest(alloc: std.mem.Allocator, keys: Keys, request: Request) ![]u8
 /// from a request field. A valid frame is still a retransmission until deduped.
 pub fn verifyRequest(alloc: std.mem.Allocator, keys: Keys, frame: []const u8, subject: []const u8, method: []const u8, target: []const u8, body: []const u8) !Request {
     const request = try verify(Request, alloc, keys, "antfly-workload-request-v1", frame);
-    if (request.version != 1) return error.UnsupportedAttemptProtocol;
-    if (!validAttempt(request.attempt) or request.remaining_ns == 0) return error.InvalidAttemptFrame;
+    if (request.version != 1 and request.version != 2 and request.version != 3) return error.UnsupportedAttemptProtocol;
+    if (!validAttempt(request.attempt) or request.remaining_ns == 0 or request.acknowledged_through >= request.attempt.sequence or
+        (request.version == 1 and request.acknowledged_through != 0) or (request.version == 3 and request.attempt.worker_namespace == 0)) return error.InvalidAttemptFrame;
     if (request.attempt.coordinator != try nodeId(subject)) return error.AttemptIdentityMismatch;
     if (!std.mem.eql(u8, &request.request_digest, &requestDigest(method, target, body))) return error.AttemptRequestMismatch;
     return request;
@@ -135,10 +173,10 @@ pub fn verifyFence(alloc: std.mem.Allocator, keys: Keys, frame: []const u8, expe
     const fence = try verify(Fence, alloc, keys, "antfly-workload-fence-v1", frame);
     if (fence.version != 1) return error.UnsupportedAttemptProtocol;
     if (fence.coordinator != expected.coordinator or fence.destination != expected.destination or
-        fence.worker_incarnation != expected.worker_incarnation) return error.AttemptIdentityMismatch;
+        fence.worker_incarnation != expected.worker_incarnation or fence.worker_namespace != expected.worker_namespace) return error.AttemptIdentityMismatch;
     if (expected.generation == 0 or fence.fenced_through < expected.generation or fence.quiesced_through < expected.generation or
         fence.quiesced_through > fence.fenced_through) return error.FencingRequired;
-    return .{ .destination = fence.destination, .worker_incarnation = fence.worker_incarnation, .fenced_through = fence.fenced_through, .quiesced_through = fence.quiesced_through };
+    return .{ .destination = fence.destination, .worker_incarnation = fence.worker_incarnation, .worker_namespace = fence.worker_namespace, .fenced_through = fence.fenced_through, .quiesced_through = fence.quiesced_through };
 }
 
 fn signature(keys: Keys, secret: []const u8, domain: []const u8, payload: []const u8) [32]u8 {
@@ -226,7 +264,7 @@ test "workload admission remote terminal and fence evidence cannot cross attempt
     _ = try verifyTerminal(alloc, keys, terminal, id, 200, "result");
     try std.testing.expectError(error.AttemptResponseMismatch, verifyTerminal(alloc, keys, terminal, id, 503, "result"));
     try std.testing.expectError(error.AttemptResponseMismatch, verifyTerminal(alloc, keys, terminal, id, 200, "changed"));
-    inline for (.{ "coordinator", "generation", "sequence", "operation", "destination", "worker_incarnation" }) |field| {
+    inline for (.{ "coordinator", "generation", "sequence", "operation", "destination", "worker_incarnation", "worker_namespace" }) |field| {
         var replay = id;
         @field(replay, field) += 1;
         try std.testing.expectError(error.AttemptIdentityMismatch, verifyTerminal(alloc, keys, terminal, replay, 200, "result"));

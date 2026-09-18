@@ -126,6 +126,14 @@ const OpaqueApiHttpServer = struct {
         callInfallible(void, void, self.functions.close_foreground_admission, self.opaque_handle, null, null);
     }
 
+    pub fn coordinatorPort(self: *const OpaqueApiHttpServer) ?@import("../runtime_workload_abi.zig").CoordinatorPort {
+        if (!abi.validFunctionTable(self.functions, abi.Capability.workload_coordinator)) return null;
+        const Result = @import("../runtime_workload_abi.zig").OptionalCoordinatorPort;
+        var out: Result = .{};
+        callInfallible(void, Result, self.functions.coordinator_port, self.opaque_handle, null, &out);
+        return if (out.present != 0) out.port else null;
+    }
+
     pub fn writeAdmissionStats(self: *const OpaqueApiHttpServer) AdmissionStats {
         var out: AdmissionStats = undefined;
         callInfallible(void, AdmissionStats, self.functions.write_admission_stats, self.opaque_handle, null, &out);
@@ -310,6 +318,7 @@ pub const HandlerStats = struct {
     write: AdmissionStats,
     inference: AdmissionStats,
     query_body: AdmissionStats,
+    recovery: @import("admission_stats_abi.zig").RecoveryStats = .{},
 
     fn fromWire(value: abi.HandlerStats) HandlerStats {
         return .{
@@ -317,6 +326,7 @@ pub const HandlerStats = struct {
             .write = value.write.toNative(AdmissionStats),
             .inference = value.inference.toNative(AdmissionStats),
             .query_body = value.query_body.toNative(AdmissionStats),
+            .recovery = value.recovery,
         };
     }
 };
@@ -633,6 +643,7 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
             .write = write,
             .inference = inference,
             .query_body = query_body,
+            .recovery = .collect(handler.api_server),
         };
     }
     return handler.stats();

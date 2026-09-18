@@ -2939,6 +2939,7 @@ pub const ProvisionedTableReadSource = struct {
     /// additionally fenced by `graph_read_barrier` before derived-state use.
     distributed_router: ?table_router.HostedGroupRouter = null,
     distributed_executor: ?http_common.RequestExecutor = null,
+    remote_attempt_coordinator: ?@import("../runtime_workload_abi.zig").CoordinatorPort = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
     /// Production-neutral graph phase observation. This is installed by
@@ -3072,6 +3073,11 @@ pub const ProvisionedTableReadSource = struct {
         return self;
     }
 
+    pub fn withRemoteAttemptCoordinator(self: *ProvisionedTableReadSource, port: ?@import("../runtime_workload_abi.zig").CoordinatorPort) *ProvisionedTableReadSource {
+        self.remote_attempt_coordinator = port;
+        return self;
+    }
+
     pub fn withDistributedGraphLifecycleHook(
         self: *ProvisionedTableReadSource,
         hook: ?distributed_graph.LifecycleHook,
@@ -3108,6 +3114,7 @@ pub const ProvisionedTableReadSource = struct {
         hosted.io_impl = self.io_impl;
         hosted.internal_service_secret = self.internal_service_secret;
         hosted.internal_service_issuer = self.internal_service_issuer;
+        hosted.remote_attempt_coordinator = self.remote_attempt_coordinator;
         hosted.backend_runtime = self.backend_runtime;
         hosted.group_visible_root_generation = self.group_visible_root_generation;
         hosted.antfly_provider = self.antfly_provider;
@@ -5332,6 +5339,7 @@ pub const HostedProvisionedTableReadSource = struct {
     io_impl: ?FanoutIo = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
+    remote_attempt_coordinator: ?@import("../runtime_workload_abi.zig").CoordinatorPort = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
@@ -5349,6 +5357,11 @@ pub const HostedProvisionedTableReadSource = struct {
     incoming_graph_routes: ?*distributed_graph.IncomingSourceGroupCache = null,
     // Private fixture capability; production rejects non-global metric fanout.
     testing_allow_non_global_graph_metric_fanout: bool = false,
+
+    pub fn withRemoteAttemptCoordinator(self: *HostedProvisionedTableReadSource, port: ?@import("../runtime_workload_abi.zig").CoordinatorPort) *HostedProvisionedTableReadSource {
+        self.remote_attempt_coordinator = port;
+        return self;
+    }
 
     pub fn init(
         replica_root_dir: []const u8,
@@ -5475,6 +5488,10 @@ pub const HostedProvisionedTableReadSource = struct {
         writer: http_common.StreamWriter,
     ) anyerror!bool {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        // Signed terminal evidence requires iterator quiescence. Until the
+        // streaming contract carries a verified final frame, use the existing
+        // bounded buffered scan path under the same coordinator ownership.
+        if (self.remote_attempt_coordinator != null) return false;
         var client = http_client.ApiHttpClient.init(alloc, self.executor);
         _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         var routed_request = request;
@@ -5553,6 +5570,7 @@ pub const HostedProvisionedTableReadSource = struct {
         request: http_common.HttpRequest,
     ) anyerror!http_common.HttpResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const attempt_deadline = platform_time.monotonicNs() +| @as(u64, request.timeout_ms orelse 30_000) * std.time.ns_per_ms;
         var client = http_client.ApiHttpClient.init(alloc, self.executor);
         _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         var routed_request = request;
@@ -5592,7 +5610,12 @@ pub const HostedProvisionedTableReadSource = struct {
                 routed_request.headers = headers;
             }
         }
-        var response = client.executeRequest(routed_request) catch |err|
+        var response = (if (if (isJoinJobStateRequest(request)) null else self.remote_attempt_coordinator) |port| owned: {
+            const group_id = internalGroupIdFromUri(request.uri) orelse return error.DistributedQueryUnavailable;
+            const destination = try self.attemptDestination(alloc, group_id, request.uri, attempt_deadline);
+            defer alloc.free(destination.base_uri);
+            break :owned port.execute(alloc, destination.node_id, destination.base_uri, routed_request, attempt_deadline);
+        } else client.executeRequest(routed_request)) catch |err|
             return normalizeDistributedReadTransportError(err);
         errdefer response.deinit(alloc);
         if (encoded_fence != null) {
@@ -5606,6 +5629,30 @@ pub const HostedProvisionedTableReadSource = struct {
             }
         }
         return response;
+    }
+
+    fn attemptDestination(self: *HostedProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, uri: []const u8, deadline_ns: u64) !struct { node_id: u64, base_uri: []u8 } {
+        const router = self.router.withBudget(.{ .clock = .{ .deadline_ns = deadline_ns } });
+        const nodes = (try router.groupNodeIds(alloc, group_id)) orelse return error.DistributedQueryUnavailable;
+        defer alloc.free(nodes);
+        if (nodes.len > 256) return error.AdmissionRequestTooLarge;
+        var result: ?struct { node_id: u64, base_uri: []u8 } = null;
+        errdefer if (result) |value| alloc.free(value.base_uri);
+        for (nodes) |node_id| {
+            const base = (try router.nodeBaseUriForGroup(alloc, group_id, node_id)) orelse continue;
+            const prefix = std.mem.trimEnd(u8, base, "/");
+            if (!std.mem.startsWith(u8, uri, prefix) or uri.len == prefix.len or uri[prefix.len] != '/') {
+                alloc.free(base);
+                continue;
+            }
+            if (result != null) {
+                alloc.free(base);
+                return error.DistributedQueryUnavailable; // Ambiguous membership never trusts response identity.
+            }
+            result = .{ .node_id = node_id, .base_uri = base };
+        }
+        const value = result orelse return error.DistributedQueryUnavailable;
+        return .{ .node_id = value.node_id, .base_uri = value.base_uri };
     }
 
     fn internalGroupIdFromUri(uri: []const u8) ?u64 {

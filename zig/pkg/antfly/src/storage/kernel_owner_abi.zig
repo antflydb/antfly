@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 64;
+pub const abi_version: u32 = 65;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -317,6 +317,7 @@ pub const ContextRequest = extern struct {
     read_protected_working_bytes: u64 = 0,
     read_transition_tasks: u32 = 0,
     read_transition_bytes: u64 = 0,
+    transaction_completion_bytes: u64 = 0,
 };
 
 /// One low-volume engine namespace used by control-plane metadata or durable

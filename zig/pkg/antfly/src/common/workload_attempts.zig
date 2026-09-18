@@ -16,6 +16,7 @@ pub const AttemptId = struct {
     operation: u128,
     destination: u64,
     worker_incarnation: u64,
+    worker_namespace: u128 = 0,
 };
 
 /// Versioned remaining-duration contract. Neither endpoint serializes a local
@@ -37,6 +38,7 @@ pub const DestinationPolicy = struct { id: u64, max_attempts: u32, max_bytes: u6
 pub const FenceEvidence = struct {
     destination: u64,
     worker_incarnation: u64,
+    worker_namespace: u128 = 0,
     fenced_through: u64,
     quiesced_through: u64,
 };
@@ -56,6 +58,7 @@ pub const Attempts = struct {
     const Destination = struct {
         policy: DestinationPolicy,
         incarnation: u64 = 0,
+        namespace: u128 = 0,
         ready: bool = false,
         fenced_through: u64 = 0,
         active: u32 = 0,
@@ -114,6 +117,7 @@ pub const Attempts = struct {
             evidence.quiesced_through < self.generation - 1 or evidence.fenced_through >= self.generation)
             return error.FencingRequired;
         target.incarnation = evidence.worker_incarnation;
+        target.namespace = evidence.worker_namespace;
         target.fenced_through = @max(target.fenced_through, evidence.fenced_through);
         target.ready = true;
     }
@@ -137,7 +141,7 @@ pub const Attempts = struct {
         if (self.sequence == std.math.maxInt(u64)) return error.GenerationExhausted;
         const lease = try self.ledger.acquire(.remote_attempt, request, .{ .remote_attempts = 1, .retained_bytes = bytes });
         self.sequence += 1;
-        const id: AttemptId = .{ .coordinator = self.coordinator, .generation = self.generation, .sequence = self.sequence, .operation = operation, .destination = destination_id, .worker_incarnation = target.incarnation };
+        const id: AttemptId = .{ .coordinator = self.coordinator, .generation = self.generation, .sequence = self.sequence, .operation = operation, .destination = destination_id, .worker_incarnation = target.incarnation, .worker_namespace = target.namespace };
         slot.* = .{ .live = true, .id = id, .lease = lease, .bytes = bytes, .started_ns = now_ns, .deadline_ns = deadline_ns };
         target.active += 1;
         target.bytes += bytes;
@@ -201,7 +205,7 @@ pub const Attempts = struct {
         self.lock();
         defer self.mutex.unlock();
         const target = try self.destination(evidence.destination);
-        if (evidence.worker_incarnation != target.incarnation or evidence.fenced_through < self.generation or evidence.quiesced_through < self.generation)
+        if (evidence.worker_incarnation != target.incarnation or evidence.worker_namespace != target.namespace or evidence.fenced_through < self.generation or evidence.quiesced_through < self.generation)
             return error.FencingRequired;
         target.ready = false; // delayed dispatch of this generation is rejected
         target.fenced_through = @max(target.fenced_through, evidence.fenced_through);

@@ -2314,6 +2314,7 @@ fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*Storag
         memory_budget.smartResourceBudgets(memory_limit);
     context.resources = try .initWithBudgets(alloc, budgets);
     errdefer context.resources.deinit();
+    try context.resources.resource_manager.configureTransactionCompletion(std.math.cast(usize, request.transaction_completion_bytes) orelse return error.InvalidConfig);
     try context.resources.resource_manager.configureDenseExecution(.{
         .max_runnable_tasks = request.dense_max_runnable_tasks,
         .max_outstanding_tasks = request.dense_max_outstanding_tasks,

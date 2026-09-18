@@ -133,7 +133,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     workload_admission_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const workload_admission_tests = b.addTest(.{
         .root_module = workload_admission_mod,
-        .filters = &.{ "workload admission", "request_admission.test", "httpx query admission", "httpx write admission", "httpx request lifecycle hook", "shared application admission", "API kernel", "linked API dispatch", "serverless http handler serves internal namespace lifecycle" },
+        .filters = &.{ "workload admission", "request_admission.test", "httpx query admission", "httpx write admission", "httpx request lifecycle hook", "shared application admission", "API kernel", "linked API dispatch", "serverless http handler serves internal namespace lifecycle", "durable commit decision", "distributed txn propagates one absolute deadline", "db one-shot transaction recovery", "db transaction recovery runtime" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });

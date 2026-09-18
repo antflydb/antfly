@@ -24,6 +24,13 @@ components:
           description: "Port for the health/metrics server. Defaults to 4200."
           default: 4200
           example: 4200
+        health_metrics_interval_ms:
+          type: integer
+          format: uint32
+          minimum: 100
+          maximum: 60000
+          default: 5000
+          description: Delay between background metrics collections. Scraping does not trigger collection. Lower intervals improve observation freshness at the cost of additional collection work; responses report their actual sample age.
         admission:
           $ref: "#/components/schemas/AdmissionConfig"
         graph_execution:
@@ -803,8 +810,17 @@ components:
           maximum: 1099511627776
           default: 67108864
           description: Shared retained-memory ceiling for MCP, A2A, and transaction sessions, separate from foreground query and write budgets.
+        transaction_completion_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+          description: Node-wide prepaid scratch memory for completing durable storage transactions. Zero preserves legacy allocation. Reserve this before foreground admission; this setting is independent of replicated limits on outstanding recovery obligations.
         remote_attempt_worker:
           $ref: "#/components/schemas/RemoteAttemptWorkerConfig"
+        remote_attempt_coordinator:
+          $ref: "#/components/schemas/RemoteAttemptCoordinatorConfig"
         dense_execution:
           $ref: "#/components/schemas/DenseExecutionConfig"
         read_execution:
@@ -815,6 +831,42 @@ components:
           $ref: "#/components/schemas/WriteAdmissionConfig"
         inference:
           $ref: "#/components/schemas/InferenceAdmissionConfig"
+
+    RemoteAttemptCoordinatorConfig:
+      type: object
+      additionalProperties: false
+      description: Opt-in durable remote read ownership. Requires stable node identity, internal authentication, and a continuous durable session store; unavailable or unsupported workers never downgrade to unaccounted execution.
+      properties:
+        max_attempts:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 4096
+          default: 0
+        max_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 67108864
+          default: 0
+        max_destination_attempts:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 4096
+          default: 0
+        max_destinations:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 256
+          default: 0
+        max_run_ms:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 60000
+          default: 30000
 
     IngressAdmissionConfig:
       type: object
@@ -849,6 +901,19 @@ components:
           minimum: 4096
           maximum: 1099511627776
           default: 262144
+
+        recovery_requests:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          default: 0
+          description: Nonborrowable ingress slots for authenticated bounded recovery/control RPCs, inside max_requests. Zero disables this partition.
+        recovery_retained_bytes:
+          type: integer
+          minimum: 0
+          maximum: 1099511627776
+          default: 0
+          description: Nonborrowable recovery/control ingress bytes, inside max_retained_bytes. Requires recovery_requests and at least 65536 bytes when enabled.
 
     RemoteAttemptWorkerConfig:
       type: object

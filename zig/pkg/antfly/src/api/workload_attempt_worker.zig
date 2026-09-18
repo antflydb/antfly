@@ -12,7 +12,7 @@ const CancellationToken = @import("../common/cancellation.zig").CancellationToke
 pub const Config = @import("../common/workload_worker_config.zig").Config;
 const base_charge: u64 = 2048;
 const record_charge: u64 = 1024;
-const fence_charge: u64 = 192;
+const fence_charge: u64 = 384;
 const hard_record_limit = 4096;
 const key_capacity = 192;
 
@@ -24,6 +24,80 @@ const Record = struct {
 
 fn testRequest(incarnation: u64, generation: u64, sequence: u64) protocol.Request {
     return .{ .version = 1, .attempt = .{ .coordinator = 7, .generation = generation, .sequence = sequence, .operation = 4, .destination = 8, .worker_incarnation = incarnation }, .remaining_ns = 100, .request_digest = protocol.requestDigest("POST", "/join", "{}") };
+}
+
+test "workload admission worker durable rejection floor preserves active work and rejects delayed sends" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var storage = try backend.runtimeStore(alloc, .{ .name = "system/worker-rejection-floor" });
+    defer storage.deinit();
+    var durable = transactions.DurableSessionStore.initRuntime(alloc, &storage);
+    var worker = try Store.init(alloc, &durable, 8, 10, .{ .max_attempts = 1, .max_bytes = 8192 });
+    defer worker.deinit();
+    _ = try worker.closeGeneration(7, 1, worker.incarnation);
+    var first = testRequest(worker.incarnation, 2, 1);
+    first.version = 3;
+    first.attempt.worker_namespace = worker.namespace;
+    var live = (try worker.begin(first)).started;
+    var third = first;
+    third.attempt.sequence = 3;
+    try std.testing.expect((try worker.begin(third)) == .rejected);
+    try std.testing.expect(try worker.terminalStatus(third.attempt));
+    try std.testing.expect(!try worker.terminalStatus(first.attempt));
+    try std.testing.expect(!live.cancellation().isCancelled());
+    try std.testing.expect((try worker.begin(first)) == .active);
+    var delayed = first;
+    delayed.attempt.sequence = 2;
+    try std.testing.expect((try worker.begin(delayed)) == .rejected);
+    var fourth = first;
+    fourth.attempt.sequence = 4;
+    durable.fail_writes_for_test = true;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, worker.begin(fourth));
+    durable.fail_writes_for_test = false;
+    try std.testing.expect(!try worker.terminalStatus(fourth.attempt));
+    try live.finish();
+    fourth.acknowledged_through = 3;
+    var resumed = (try worker.begin(fourth)).started;
+    try resumed.finish();
+    try std.testing.expectEqual(@as(usize, 1), (try worker.usage()).attempts);
+}
+
+test "workload admission worker acknowledgements reclaim terminal records without retiring live work" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var storage = try backend.runtimeStore(alloc, .{ .name = "system/worker-acknowledgements" });
+    defer storage.deinit();
+    var durable = transactions.DurableSessionStore.initRuntime(alloc, &storage);
+    var worker = try Store.init(alloc, &durable, 8, 10, .{ .max_attempts = 2, .max_bytes = 8192 });
+    defer worker.deinit();
+    try std.testing.expect((try worker.closeGeneration(7, 1, 10)) != null);
+    var first = testRequest(10, 2, 1);
+    first.version = 2;
+    var first_lease = (try worker.begin(first)).started;
+    var second = testRequest(10, 2, 2);
+    second.version = 2;
+    second.acknowledged_through = 1;
+    var second_lease = (try worker.begin(second)).started;
+    try std.testing.expectEqual(@as(usize, 2), (try worker.usage()).attempts);
+    try second_lease.finish();
+    var third = testRequest(10, 2, 3);
+    third.version = 2;
+    third.acknowledged_through = 2;
+    try std.testing.expectError(error.AttemptCapacityExhausted, worker.begin(third));
+    try std.testing.expect(!first_lease.cancellation().isCancelled());
+    try first_lease.finish();
+    var third_lease = (try worker.begin(third)).started;
+    try std.testing.expectEqual(@as(usize, 1), (try worker.usage()).attempts);
+    try std.testing.expect((try worker.begin(first)) == .terminal);
+    try third_lease.finish();
+    // The compacted rejection floor survives reopening, so delayed duplicates
+    // cannot execute even after their individual records have been removed.
+    var reopened = try Store.init(alloc, &durable, 8, 11, .{ .max_attempts = 2, .max_bytes = 8192 });
+    defer reopened.deinit();
+    first.attempt.worker_incarnation = 11;
+    try std.testing.expect((try reopened.begin(first)) == .terminal);
 }
 
 test "workload admission worker journal closes before cancellation and retries quiesced durability" {
@@ -99,6 +173,16 @@ test "workload admission worker restart preserves uncertainty and reduced durabl
     try std.testing.expect((try worker.closeGeneration(7, 2, 11)) == null);
     try std.testing.expectError(error.AttemptIdentityMismatch, worker.closeGeneration(7, 2, 10));
     try std.testing.expectEqual(@as(usize, 1), (try worker.usage()).uncertain);
+    // Only the independently established exclusive native restart proof can
+    // retire this old local execution. Failure to persist retains the debt.
+    opened.durableStore().fail_writes_for_test = true;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, worker.recoverPriorIncarnationAfterExclusiveRestart());
+    opened.durableStore().fail_writes_for_test = false;
+    try std.testing.expectEqual(@as(usize, 1), (try worker.usage()).uncertain);
+    try worker.recoverPriorIncarnationAfterExclusiveRestart();
+    try std.testing.expectEqual(@as(usize, 0), (try worker.usage()).uncertain);
+    try std.testing.expect((try worker.closeGeneration(7, 2, 11)) != null);
+    try std.testing.expectEqual(@as(usize, 0), (try worker.usage()).attempts);
 }
 test "workload admission worker point journal refuses legacy state and only actual old execution reconciles" {
     const alloc = std.testing.allocator;
@@ -135,9 +219,19 @@ test "workload admission worker point journal refuses legacy state and only actu
     try next.finish();
 }
 
-const Closure = struct { coordinator: u64, through: u64 = 0 };
+const Closure = struct {
+    coordinator: u64,
+    through: u64 = 0,
+    acknowledged_generation: u64 = 0,
+    acknowledged_through: u64 = 0,
+    // This journal is already scoped to one immutable worker namespace.
+    rejected_generation: u64 = 0,
+    rejected_through: u64 = 0,
+};
 const Metadata = struct {
-    version: u16 = 2,
+    version: u16 = 3,
+    namespace: u128,
+    initial_epoch: u64,
     incarnation: u64,
     attempts: u32 = 0,
     coordinators: u32 = 0,
@@ -148,7 +242,7 @@ const Metadata = struct {
         return base_charge + @as(u64, self.attempts) * record_charge + @as(u64, self.coordinators) * fence_charge;
     }
     fn validate(self: Metadata) !void {
-        if (self.version != 2 or self.incarnation == 0 or self.attempts > hard_record_limit or self.coordinators > hard_record_limit or
+        if (self.version != 3 or self.namespace == 0 or self.initial_epoch == 0 or self.incarnation < self.initial_epoch or self.attempts > hard_record_limit or self.coordinators > hard_record_limit or
             self.active > self.attempts or self.uncertain > self.active) return error.InvalidWorkerJournal;
     }
 };
@@ -158,6 +252,8 @@ pub const Store = struct {
     durable: *transactions.DurableSessionStore,
     node_id: u64,
     incarnation: u64,
+    namespace: u128 = 0,
+    exclusive_restart_proven: bool = false,
     config: Config,
     mutex: std.atomic.Mutex = .unlocked,
     live: []Live,
@@ -189,19 +285,22 @@ pub const Store = struct {
             self.owner = null;
         }
     };
-    pub const Begin = union(enum) { started: Lease, active, terminal };
+    pub const Begin = union(enum) { started: Lease, active, terminal, rejected };
     pub const Usage = struct { attempts: usize, bytes: u64, uncertain: usize };
     const Op = union(enum) {
         open,
+        recover_exclusive_restart,
         begin: protocol.Request,
+        reject: protocol.Request,
         finish: protocol.AttemptId,
         close: struct { coordinator: u64, through: u64 },
         observe: struct { coordinator: u64, through: u64 },
     };
-    const Result = struct { disposition: enum { started, active, terminal } = .started, quiescent: bool = false };
+    const Result = struct { disposition: enum { started, active, terminal, rejected } = .started, quiescent: bool = false };
 
-    /// incarnation must be a fresh secure random process identity. Store
-    /// continuity is required; restoring/deleting this journal is not fencing.
+    /// The first incarnation seeds a monotonic epoch. Subsequent opens advance
+    /// the journal's epoch atomically; caller entropy never replaces its UUID.
+    /// Store continuity is required; deleting/restoring it is not fencing.
     pub fn init(alloc: std.mem.Allocator, durable: *transactions.DurableSessionStore, node_id: u64, incarnation: u64, config: Config) !Store {
         try config.validate();
         if (config.max_attempts == 0 or node_id == 0 or incarnation == 0) return error.InvalidConfig;
@@ -209,6 +308,9 @@ pub const Store = struct {
         errdefer alloc.free(live);
         for (live) |*entry| entry.* = .{};
         var self: Store = .{ .allocator = alloc, .durable = durable, .node_id = node_id, .incarnation = incarnation, .config = config, .live = live };
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded.deinit();
+        while (self.namespace == 0) try threaded.io().randomSecure(std.mem.asBytes(&self.namespace));
         _ = try self.transact(.open);
         return self;
     }
@@ -220,14 +322,31 @@ pub const Store = struct {
         self.allocator.free(self.live);
     }
 
+    /// Native startup only, before publishing this owner. The caller must
+    /// prove exclusive ownership of this exact journal across the entire
+    /// worker lifetime, and that all previous local execution is gone. A new
+    /// random incarnation, timeout, journal copy, or network partition is not
+    /// such proof. Remote child debt remains in its separate coordinator log.
+    pub fn recoverPriorIncarnationAfterExclusiveRestart(self: *Store) !void {
+        for (self.live) |entry| if (entry.state != .free) return error.InvalidWorkerRecoveryState;
+        _ = try self.transact(.recover_exclusive_restart);
+        self.exclusive_restart_proven = true;
+    }
+
     fn lock(self: *Store) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
-    pub fn begin(self: *Store, request: protocol.Request) !Begin {
-        if (request.version != 1 or request.attempt.coordinator == 0 or request.attempt.generation == 0 or
+    pub fn begin(self: *Store, original: protocol.Request) !Begin {
+        var request = original;
+        // Compatibility is internal to mechanism tests. Production ingress
+        // requires V3; every persisted record nevertheless has exact identity.
+        if (request.version < 3 and request.attempt.worker_namespace == 0) request.attempt.worker_namespace = self.namespace;
+        if ((request.version != 1 and request.version != 2 and request.version != 3) or request.attempt.coordinator == 0 or request.attempt.generation == 0 or
             request.attempt.sequence == 0 or request.attempt.operation == 0 or request.remaining_ns == 0 or
-            request.attempt.destination != self.node_id or request.attempt.worker_incarnation != self.incarnation)
+            request.acknowledged_through >= request.attempt.sequence or (request.version == 1 and request.acknowledged_through != 0) or
+            request.attempt.destination != self.node_id or request.attempt.worker_incarnation != self.incarnation or
+            request.attempt.worker_namespace != self.namespace)
             return error.AttemptIdentityMismatch;
         // Reconciliation must work even when every execution slot is occupied.
         // The serialized write transaction below rechecks this read before any
@@ -243,7 +362,7 @@ pub const Store = struct {
             }
         } else {
             self.mutex.unlock();
-            return error.AttemptCapacityExhausted;
+            return if (request.version == 3) self.reject(request) else error.AttemptCapacityExhausted;
         };
         self.mutex.unlock();
         var retained = false;
@@ -252,11 +371,25 @@ pub const Store = struct {
             self.live[slot].state = .free;
             self.mutex.unlock();
         };
-        const result = try self.transact(.{ .begin = request });
+        const result = self.transact(.{ .begin = request }) catch |err| {
+            if (err == error.AttemptCapacityExhausted and request.version == 3) return self.reject(request);
+            return err;
+        };
         if (result.disposition == .active) return .active;
         if (result.disposition == .terminal) return .terminal;
+        if (result.disposition == .rejected) return .rejected;
         retained = true;
         return .{ .started = .{ .owner = self, .slot = slot, .id = request.attempt } };
+    }
+
+    fn reject(self: *Store, request: protocol.Request) !Begin {
+        const result = try self.transact(.{ .reject = request });
+        return switch (result.disposition) {
+            .active => .active,
+            .terminal => .terminal,
+            .rejected => .rejected,
+            .started => unreachable,
+        };
     }
 
     fn retireQuiesced(self: *Store, id: protocol.AttemptId) void {
@@ -292,7 +425,7 @@ pub const Store = struct {
         }
         const result = try self.readOperation(.{ .observe = .{ .coordinator = coordinator, .through = through } });
         if (!result.quiescent) return null;
-        return .{ .version = 1, .coordinator = coordinator, .destination = self.node_id, .worker_incarnation = worker_incarnation, .fenced_through = through, .quiesced_through = through };
+        return .{ .version = 1, .coordinator = coordinator, .destination = self.node_id, .worker_incarnation = worker_incarnation, .worker_namespace = self.namespace, .fenced_through = through, .quiesced_through = through };
     }
 
     pub fn usage(self: *Store) !Usage {
@@ -300,11 +433,16 @@ pub const Store = struct {
         return .{ .attempts = meta.attempts, .bytes = meta.bytes(), .uncertain = meta.uncertain };
     }
 
+    pub fn terminalStatus(self: *Store, id: protocol.AttemptId) !bool {
+        if (id.destination != self.node_id or id.coordinator == 0 or id.generation == 0 or id.sequence == 0) return error.AttemptIdentityMismatch;
+        return (try self.readOperation(.{ .terminal = id })).quiescent;
+    }
+
     fn readOnly(self: *Store, request: protocol.Request) !?Begin {
         return (try self.readOperation(.{ .duplicate = request })).known;
     }
 
-    const Read = union(enum) { usage, duplicate: protocol.Request, observe: struct { coordinator: u64, through: u64 } };
+    const Read = union(enum) { usage, duplicate: protocol.Request, terminal: protocol.AttemptId, observe: struct { coordinator: u64, through: u64 } };
     const ReadResult = struct { metadata: ?Metadata = null, known: ?Begin = null, quiescent: bool = false };
 
     fn readOperation(self: *Store, op: Read) !ReadResult {
@@ -328,6 +466,23 @@ pub const Store = struct {
         if (meta.incarnation != self.incarnation) return error.WorkerIncarnationSuperseded;
         switch (op) {
             .duplicate => |request| return .{ .known = try self.knownAttempt(txn, request) },
+            .terminal => |id| {
+                if (id.worker_namespace != 0 and id.worker_namespace != meta.namespace) return error.AttemptIdentityMismatch;
+                if (self.exclusive_restart_proven and id.worker_namespace == meta.namespace and
+                    id.worker_incarnation >= meta.initial_epoch and id.worker_incarnation < meta.incarnation) return .{ .quiescent = true };
+                if (try self.loadClosure(txn, id.coordinator)) |closure| {
+                    if (closure.through >= id.generation) return .{ .quiescent = try self.observe(txn, id.coordinator, id.generation) };
+                    if (closure.acknowledged_generation == id.generation and id.sequence <= closure.acknowledged_through) return .{ .quiescent = true };
+                }
+                var buffer: [key_capacity]u8 = undefined;
+                const record = try self.get(Record, txn, try self.attemptKey(&buffer, id), record_charge) orelse {
+                    if (try self.loadClosure(txn, id.coordinator)) |closure|
+                        if (closure.rejected_generation == id.generation and id.sequence <= closure.rejected_through) return .{ .quiescent = true };
+                    return .{};
+                };
+                if (!std.meta.eql(record.id, id)) return error.AttemptIdentityMismatch;
+                return .{ .quiescent = record.terminal };
+            },
             .observe => |value| return .{ .quiescent = try self.observe(txn, value.coordinator, value.through) },
             .usage => unreachable,
         }
@@ -355,19 +510,19 @@ pub const Store = struct {
     }
 
     fn metadataKey(self: *Store, buffer: *[key_capacity]u8) ![]const u8 {
-        return std.fmt.bufPrint(buffer, "workload-attempt-worker/v2/{d}/metadata", .{self.node_id});
+        return std.fmt.bufPrint(buffer, "workload-attempt-worker/v3/{d}/metadata", .{self.node_id});
     }
     fn attemptsPrefix(self: *Store, buffer: *[key_capacity]u8, coordinator: ?u64) ![]const u8 {
         return if (coordinator) |id|
-            std.fmt.bufPrint(buffer, "workload-attempt-worker/v2/{d}/attempt/{x:0>16}/", .{ self.node_id, id })
+            std.fmt.bufPrint(buffer, "workload-attempt-worker/v3/{d}/attempt/{x:0>16}/", .{ self.node_id, id })
         else
-            std.fmt.bufPrint(buffer, "workload-attempt-worker/v2/{d}/attempt/", .{self.node_id});
+            std.fmt.bufPrint(buffer, "workload-attempt-worker/v3/{d}/attempt/", .{self.node_id});
     }
     fn attemptKey(self: *Store, buffer: *[key_capacity]u8, id: protocol.AttemptId) ![]const u8 {
-        return std.fmt.bufPrint(buffer, "workload-attempt-worker/v2/{d}/attempt/{x:0>16}/{x:0>16}/{x:0>16}", .{ self.node_id, id.coordinator, id.generation, id.sequence });
+        return std.fmt.bufPrint(buffer, "workload-attempt-worker/v3/{d}/attempt/{x:0>16}/{x:0>16}/{x:0>16}", .{ self.node_id, id.coordinator, id.generation, id.sequence });
     }
     fn closureKey(self: *Store, buffer: *[key_capacity]u8, coordinator: u64) ![]const u8 {
-        return std.fmt.bufPrint(buffer, "workload-attempt-worker/v2/{d}/fence/{x:0>16}", .{ self.node_id, coordinator });
+        return std.fmt.bufPrint(buffer, "workload-attempt-worker/v3/{d}/fence/{x:0>16}", .{ self.node_id, coordinator });
     }
 
     fn decode(self: *Store, comptime T: type, raw: []const u8, limit: u64) !T {
@@ -403,10 +558,16 @@ pub const Store = struct {
         return value;
     }
     fn knownAttempt(self: *Store, txn: anytype, request: protocol.Request) !?Begin {
-        if (try self.loadClosure(txn, request.attempt.coordinator)) |closure| if (closure.through >= request.attempt.generation)
-            return error.AttemptGenerationClosed;
+        if (try self.loadClosure(txn, request.attempt.coordinator)) |closure| {
+            if (closure.through >= request.attempt.generation) return error.AttemptGenerationClosed;
+            if (closure.acknowledged_generation == request.attempt.generation and request.attempt.sequence <= closure.acknowledged_through) return .terminal;
+        }
         var buffer: [key_capacity]u8 = undefined;
-        const record = try self.get(Record, txn, try self.attemptKey(&buffer, request.attempt), record_charge) orelse return null;
+        const record = try self.get(Record, txn, try self.attemptKey(&buffer, request.attempt), record_charge) orelse {
+            if (try self.loadClosure(txn, request.attempt.coordinator)) |closure|
+                if (closure.rejected_generation == request.attempt.generation and request.attempt.sequence <= closure.rejected_through) return .rejected;
+            return null;
+        };
         if (!std.meta.eql(record.id, request.attempt) or !std.mem.eql(u8, &record.digest, &request.request_digest)) return error.AttemptIdentityMismatch;
         return if (record.terminal) .terminal else .active;
     }
@@ -414,7 +575,7 @@ pub const Store = struct {
     fn update(self: *Store, txn: anytype, op: Op) !Result {
         const previous = try self.loadMetadata(txn);
         if (previous == null and op != .open) return error.InvalidWorkerJournal;
-        var meta = previous orelse Metadata{ .incarnation = self.incarnation };
+        var meta = previous orelse Metadata{ .namespace = self.namespace, .initial_epoch = self.incarnation, .incarnation = self.incarnation };
         var result: Result = .{};
         switch (op) {
             .open => {
@@ -427,14 +588,61 @@ pub const Store = struct {
                     error.NotFound => null,
                     else => return err,
                 }) |_| return error.WorkerJournalMigrationRequired;
-                if (previous) |value| if (value.incarnation == self.incarnation) return error.WorkerIncarnationReused;
+                const v2_key = try std.fmt.bufPrint(&legacy_buffer, "workload-attempt-worker/v2/{d}/metadata", .{self.node_id});
+                if (txn.get(v2_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                }) |_| return error.WorkerJournalMigrationRequired;
+                if (previous) |value| {
+                    if (value.incarnation == std.math.maxInt(u64)) return error.WorkerEpochExhausted;
+                    self.namespace = value.namespace;
+                    self.incarnation = value.incarnation + 1;
+                }
                 meta = try self.reconstruct(txn);
+                meta.initial_epoch = if (previous) |value| value.initial_epoch else self.incarnation;
                 if (previous == null and (meta.attempts != 0 or meta.coordinators != 0)) return error.InvalidWorkerJournal;
+            },
+            .recover_exclusive_restart => {
+                if (meta.incarnation != self.incarnation) return error.WorkerIncarnationSuperseded;
+                var records: std.ArrayListUnmanaged(Record) = .empty;
+                defer records.deinit(self.allocator);
+                var prefix_buffer: [key_capacity]u8 = undefined;
+                const prefix = try self.attemptsPrefix(&prefix_buffer, null);
+                {
+                    var cursor = try txn.openCursor();
+                    defer cursor.close();
+                    var entry = try cursor.seekAtOrAfter(prefix);
+                    var count: usize = 0;
+                    while (entry) |row| : (entry = try cursor.next()) {
+                        if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                        count += 1;
+                        if (count > hard_record_limit) return error.WorkerJournalTooLarge;
+                        var record = try self.decode(Record, row.value, record_charge);
+                        try self.validateRecord(row.key, record);
+                        if (!record.terminal and record.id.worker_incarnation != self.incarnation) {
+                            record.terminal = true;
+                            try records.append(self.allocator, record);
+                        }
+                    }
+                }
+                if (records.items.len != meta.uncertain or records.items.len > meta.active) return error.InvalidWorkerJournal;
+                for (records.items) |record| {
+                    var key_buffer: [key_capacity]u8 = undefined;
+                    try self.put(txn, try self.attemptKey(&key_buffer, record.id), record, record_charge);
+                }
+                meta.active -= @intCast(records.items.len);
+                meta.uncertain = 0;
             },
             .begin => |request| {
                 if (meta.incarnation != self.incarnation) return error.WorkerIncarnationSuperseded;
+                if (request.version >= 2) try self.reapAcknowledged(txn, &meta, request);
                 if (try self.knownAttempt(txn, request)) |known| {
-                    result.disposition = if (known == .terminal) .terminal else .active;
+                    result.disposition = switch (known) {
+                        .terminal => .terminal,
+                        .active => .active,
+                        .rejected => .rejected,
+                        .started => unreachable,
+                    };
                     return result;
                 }
                 if (meta.uncertain != 0) return error.WorkerUncertaintyUnreconciled;
@@ -445,6 +653,28 @@ pub const Store = struct {
                 try self.put(txn, try self.attemptKey(&buffer, request.attempt), Record{ .id = request.attempt, .digest = request.request_digest }, record_charge);
                 meta.attempts += 1;
                 meta.active += 1;
+            },
+            .reject => |request| {
+                if (meta.incarnation != self.incarnation) return error.WorkerIncarnationSuperseded;
+                if (try self.knownAttempt(txn, request)) |known| {
+                    result.disposition = switch (known) {
+                        .terminal => .terminal,
+                        .active => .active,
+                        .rejected => .rejected,
+                        .started => unreachable,
+                    };
+                    return result;
+                }
+                var closure = try self.ensureCoordinator(txn, &meta, request.attempt.coordinator);
+                if (closure.rejected_generation > request.attempt.generation) return error.AttemptGenerationClosed;
+                if (closure.rejected_generation != request.attempt.generation) {
+                    closure.rejected_generation = request.attempt.generation;
+                    closure.rejected_through = 0;
+                }
+                closure.rejected_through = @max(closure.rejected_through, request.attempt.sequence);
+                var key_buffer: [key_capacity]u8 = undefined;
+                try self.put(txn, try self.closureKey(&key_buffer, closure.coordinator), closure, fence_charge);
+                result.disposition = .rejected;
             },
             .finish => |id| {
                 var buffer: [key_capacity]u8 = undefined;
@@ -501,8 +731,41 @@ pub const Store = struct {
         return value;
     }
 
+    fn reapAcknowledged(self: *Store, txn: anytype, meta: *Metadata, request: protocol.Request) !void {
+        var closure = try self.ensureCoordinator(txn, meta, request.attempt.coordinator);
+        if (closure.through >= request.attempt.generation) return error.AttemptGenerationClosed;
+        if (closure.acknowledged_generation != request.attempt.generation) {
+            if (closure.through < request.attempt.generation - 1) return error.FencingRequired;
+            closure.acknowledged_generation = request.attempt.generation;
+            closure.acknowledged_through = 0;
+        }
+        var buffer: [key_capacity]u8 = undefined;
+        var count: usize = 0;
+        while (closure.acknowledged_through < request.acknowledged_through and count < hard_record_limit) : (count += 1) {
+            var candidate = request.attempt;
+            candidate.sequence = closure.acknowledged_through + 1;
+            const name = try self.attemptKey(&buffer, candidate);
+            const record = try self.get(Record, txn, name, record_charge) orelse {
+                // V3 acknowledges durable retirement of every lower sequence,
+                // including sends proven never delivered or fenced old epochs.
+                // V2 only sent a high-water mark and cannot make this claim.
+                if (request.version < 3) break;
+                closure.acknowledged_through += 1;
+                continue;
+            };
+            if (!record.terminal) break; // A sender acknowledgement never cancels or retires live work.
+            try self.validateRecord(name, record);
+            if (meta.attempts == 0) return error.InvalidWorkerJournal;
+            try txn.delete(name);
+            meta.attempts -= 1;
+            closure.acknowledged_through += 1;
+        }
+        try self.put(txn, try self.closureKey(&buffer, closure.coordinator), closure, fence_charge);
+    }
+
     fn validateRecord(self: *Store, key: []const u8, record: Record) !void {
         const id = record.id;
+        if (id.worker_namespace != self.namespace) return error.InvalidWorkerJournal;
         if (id.coordinator == 0 or id.generation == 0 or id.sequence == 0 or id.operation == 0 or id.worker_incarnation == 0 or id.destination != self.node_id)
             return error.InvalidWorkerJournal;
         var buffer: [key_capacity]u8 = undefined;
@@ -510,7 +773,7 @@ pub const Store = struct {
     }
 
     fn reconstruct(self: *Store, txn: anytype) !Metadata {
-        var meta: Metadata = .{ .incarnation = self.incarnation };
+        var meta: Metadata = .{ .namespace = self.namespace, .initial_epoch = self.incarnation, .incarnation = self.incarnation };
         var prefix_buffer: [key_capacity]u8 = undefined;
         const prefix = try self.attemptsPrefix(&prefix_buffer, null);
         {
@@ -531,7 +794,7 @@ pub const Store = struct {
                 }
             }
         }
-        const fence_prefix = try std.fmt.bufPrint(&prefix_buffer, "workload-attempt-worker/v2/{d}/fence/", .{self.node_id});
+        const fence_prefix = try std.fmt.bufPrint(&prefix_buffer, "workload-attempt-worker/v3/{d}/fence/", .{self.node_id});
         var cursor = try txn.openCursor();
         defer cursor.close();
         var entry = try cursor.seekAtOrAfter(fence_prefix);

@@ -673,6 +673,7 @@ const StandaloneHealthSource = struct {
         try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, handler.query);
         try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, handler.write);
         try antfly.common.request_admission.appendPrometheusMetrics(writer, .inference, handler.inference);
+        try handler.recovery.appendPrometheusMetrics(writer);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", handler.query_body.capacity);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body.in_flight);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body.peak_in_flight);
@@ -3019,6 +3020,7 @@ pub fn runFromIterator(
         const dense = if (loaded_config) |*cfg| cfg.admission.dense_execution else (antfly.common.config.Config.AdmissionConfig{}).dense_execution;
         const reads = if (loaded_config) |*cfg| cfg.admission.read_execution else (antfly.common.config.Config.AdmissionConfig{}).read_execution;
         try storage_kernel_context.ensureWith(.{
+            .transaction_completion_bytes = if (loaded_config) |*cfg| cfg.admission.transaction_completion_bytes else 0,
             .storage_kind = if (lite_path != null) .lite else .directory,
             .no_sync = @intFromBool(!lite_fsync),
             .storage_path = .fromSlice(lite_path orelse ""),
@@ -3617,6 +3619,8 @@ pub fn runFromIterator(
             .dense_execution = if (loaded_config) |*cfg| cfg.admission.dense_execution else .{},
             .read_execution = if (loaded_config) |*cfg| cfg.admission.read_execution else .{},
             .remote_attempt_worker = if (loaded_config) |*cfg| cfg.admission.remote_attempt_worker else .{},
+            .remote_attempt_coordinator = if (loaded_config) |*cfg| cfg.admission.remote_attempt_coordinator else .{},
+            .transaction_completion_bytes = if (loaded_config) |*cfg| cfg.admission.transaction_completion_bytes else 0,
             .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
@@ -3649,6 +3653,7 @@ pub fn runFromIterator(
             .node_config = if (loaded_config) |*cfg| cfg else null,
             .user_manager = if (user_manager) |*manager| manager else null,
             .session_store = if (lite_session_store) |*store| store else if (native_sessions) |*store| store else null,
+            .remote_attempt_exclusive_owner = if (session_backend) |*backend| backend.backend.root_writer_lock != null else false,
             .restore_job_store = restore_job_store,
             .incoming_graph_route_store = incoming_graph_route_store,
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
@@ -3878,6 +3883,7 @@ pub fn runFromIterator(
         return err;
     };
     defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
+    if (health_server) |hs| try hs.configureMetricsInterval(if (loaded_config) |*cfg| cfg.health_metrics_interval_ms else 5000);
 
     var api_lane_lease = try node_backend_runtime.ptr().acquireApiLane();
     defer api_lane_lease.release();

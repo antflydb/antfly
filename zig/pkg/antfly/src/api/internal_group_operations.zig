@@ -51,6 +51,8 @@ pub const Error = operation.ApiError || error{
     DecisionConflict,
     TransactionConflict,
     TransactionTooLarge,
+    TransactionRecoveryCapacityExhausted,
+    TransactionRecoveryReconciliationRequired,
     EnrichmentWaitCanceled,
     EnrichmentWaitTimeout,
     EnrichmentRetryInProgress,
@@ -498,6 +500,9 @@ pub const Operations = struct {
                 return error.PreDecisionDeadlineExceeded;
             },
             error.DecisionConflict => return error.DecisionConflict,
+            error.TransactionRecoveryCapacityExhausted => return error.TransactionRecoveryCapacityExhausted,
+            error.TransactionRecoveryReconciliationRequired => return error.TransactionRecoveryReconciliationRequired,
+            error.TransactionCompletionBusy, error.TransactionCompletionCapacityMismatch, error.TransactionCompletionPolicyRequired, error.TransactionCompletionChanged => return error.Unavailable,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
@@ -531,6 +536,9 @@ pub const Operations = struct {
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
             error.TransactionTooLarge => return error.TransactionTooLarge,
+            error.TransactionRecoveryCapacityExhausted => return error.TransactionRecoveryCapacityExhausted,
+            error.TransactionRecoveryReconciliationRequired => return error.TransactionRecoveryReconciliationRequired,
+            error.TransactionCompletionBusy, error.TransactionCompletionCapacityMismatch, error.TransactionCompletionPolicyRequired, error.TransactionCompletionChanged => return error.Unavailable,
             error.InvalidBatchRequest => return error.InvalidArgument,
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,

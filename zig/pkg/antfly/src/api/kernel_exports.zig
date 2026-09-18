@@ -193,7 +193,7 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         state.runtime_io.init(borrows) catch |err| return fail(err);
         imported_cfg.imported_runtime_io = state.runtime_io.views();
     }
-    if (imported_cfg.remote_attempt_worker.max_attempts != 0 and context.flags & CreateContext.fallible_init == 0)
+    if ((imported_cfg.remote_attempt_worker.max_attempts != 0 or imported_cfg.remote_attempt_coordinator.max_attempts != 0) and context.flags & CreateContext.fallible_init == 0)
         return fail(error.RemoteAttemptDurabilityRequired);
     state.server = if (context.flags & CreateContext.fallible_init != 0)
         server_mod.ApiHttpServer.initWithConfig(owner_alloc, imported_cfg, source.*, reads.*, writes.*) catch |err| {
@@ -242,6 +242,14 @@ pub fn queryAdmissionStats(context: *const CallContext) callconv(.c) abi.Status 
 pub fn closeForegroundAdmission(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, void, context)) |failure| return failure;
     serverState(context).server.closeForegroundAdmission();
+    return .ok;
+}
+
+pub fn coordinatorPort(context: *const CallContext) callconv(.c) abi.Status {
+    const Result = @import("../runtime_workload_abi.zig").OptionalCoordinatorPort;
+    if (validateCall(void, Result, context)) |failure| return failure;
+    const port = serverState(context).server.coordinatorPort();
+    output(Result, context).* = if (port) |value| .{ .present = 1, .port = value } else .{};
     return .ok;
 }
 
@@ -376,6 +384,7 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
         .write = .fromNative(write),
         .inference = .fromNative(inference),
         .query_body = .fromNative(query_body),
+        .recovery = .collect(handler.api_server),
     };
     return .ok;
 }
@@ -560,7 +569,8 @@ const function_table: abi.FunctionTable = .{
     .capabilities = abi.Capability.core |
         abi.Capability.route_manifest |
         abi.Capability.inference_admission_stats |
-        abi.Capability.internal_service_ingress,
+        abi.Capability.internal_service_ingress |
+        abi.Capability.workload_coordinator,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
@@ -587,6 +597,7 @@ const function_table: abi.FunctionTable = .{
     .handler_destroy = &handlerDestroy,
     .inference_admission_stats = &inferenceAdmissionStats,
     .handler_authorize_internal_service = &handlerAuthorizeInternalService,
+    .coordinator_port = &coordinatorPort,
 };
 
 pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {
@@ -1353,4 +1364,73 @@ test "workload admission kernel telemetry preserves live ownership policy and di
     try std.testing.expectEqual(@as(usize, 0), completed.query.retained_bytes);
     server.closeForegroundAdmission();
     try std.testing.expect(bridge.handlerStatsFromKernel(&state, getFunctionTable()).query.draining);
+}
+
+test "workload admission compiled coordinator port preserves durable uncertainty and transport errors" {
+    const alloc = std.testing.allocator;
+    const common = @import("../common/http/http_common.zig");
+    const protocol = @import("workload_attempt_protocol.zig");
+    const wire = @import("../runtime_workload_abi.zig");
+    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var storage = try backend.runtimeStore(alloc, .{ .name = "system/kernel-coordinator" });
+    defer storage.deinit();
+    var durable = @import("transactions.zig").DurableSessionStore.initRuntime(alloc, &storage);
+    const Fake = struct {
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, allocator: std.mem.Allocator, request: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(request.header(protocol.request_header) != null);
+            return .{ .status = 200, .body = try allocator.dupe(u8, "{}") };
+        }
+    };
+    var fake: Fake = .{};
+    const cfg: server_mod.ApiHttpServerConfig = .{
+        .session_store = &durable,
+        .session_executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } },
+        .remote_attempt_coordinator = .{ .max_attempts = 2, .max_bytes = 8192, .max_destination_attempts = 1, .max_destinations = 2 },
+        .remote_attempt_node_id = 7,
+        .internal_service_secret = "s" ** 32,
+        .internal_service_issuer = "cluster",
+    };
+    var source_owner: KernelIngressTestStatus = .{};
+    const source = source_owner.source();
+    const reads: ?table_reads.TableReadSource = null;
+    const writes: ?table_writes.TableWriteSource = null;
+    const allocator = abi.memory_abi.Allocator.fromStd(&alloc);
+    var handle: ?*anyopaque = null;
+    var request_alloc: ?*const abi.memory_abi.Allocator = null;
+    const created = create(&.{
+        .abi_version = abi.abi_version,
+        .flags = CreateContext.fallible_init,
+        .owner_alloc = &allocator,
+        .cfg = &cfg,
+        .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+        .source = &source,
+        .source_contract = .of(server_mod.StatusSource),
+        .table_reads = &reads,
+        .table_reads_contract = .of(?table_reads.TableReadSource),
+        .table_writes = &writes,
+        .table_writes_contract = .of(?table_writes.TableWriteSource),
+        .out_handle = &handle,
+        .out_request_alloc = &request_alloc,
+    });
+    try std.testing.expect(created.isOk());
+    defer destroy(handle.?);
+    const state: *ServerState = @ptrCast(@alignCast(handle.?));
+    const owner = state.server.remote_attempt_coordinator.?;
+    try owner.store.ready(.{ .version = 1, .coordinator = 7, .destination = 8, .worker_namespace = 44, .worker_incarnation = 10, .fenced_through = owner.store.generation - 1, .quiesced_through = owner.store.generation - 1 });
+    var exported: wire.OptionalCoordinatorPort = .{};
+    try std.testing.expect(abi.validFunctionTable(getFunctionTable(), abi.Capability.workload_coordinator));
+    try std.testing.expect(getFunctionTable().coordinator_port(&.{ .abi_version = abi.abi_version, .handle = handle.?, .output = &exported, .output_contract = .of(wire.OptionalCoordinatorPort) }).isOk());
+    try std.testing.expectEqual(@as(u8, 1), exported.present);
+    const request: common.HttpRequest = .{ .method = .POST, .uri = "http://worker/internal/v1/groups/1/tables/docs/_query", .body = "{}" };
+    const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    try std.testing.expectError(error.DistributedQueryUnavailable, exported.port.execute(alloc, 8, "http://worker", request, deadline));
+    try std.testing.expectEqual(@as(u32, 1), (try owner.store.usage()).attempts);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectError(error.AdmissionFull, exported.port.execute(alloc, 8, "http://worker", request, deadline));
+    try std.testing.expectEqual(@as(u32, 1), (try owner.store.usage()).attempts);
+    try std.testing.expectEqual(@as(u32, 0), owner.active.load(.acquire));
 }

@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 26;
+pub const abi_version: u32 = 27;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -168,6 +168,7 @@ pub const Capability = struct {
     pub const route_manifest: u64 = 1 << 3;
     pub const inference_admission_stats: u64 = 1 << 4;
     pub const internal_service_ingress: u64 = 1 << 5;
+    pub const workload_coordinator: u64 = 1 << 6;
 };
 
 /// The sole discovery point for the API-kernel ABI. Keeping the table itself
@@ -204,6 +205,7 @@ pub const FunctionTable = extern struct {
     inference_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     handler_authorize_internal_service: *const fn (*const InternalServiceAuthContext) callconv(.c) Status,
     close_foreground_admission: *const fn (*const CallContext) callconv(.c) Status,
+    coordinator_port: *const fn (*const CallContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -225,7 +227,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
     const known = Capability.core |
         Capability.route_manifest |
         Capability.inference_admission_stats |
-        Capability.internal_service_ingress;
+        Capability.internal_service_ingress |
+        Capability.workload_coordinator;
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     if (required_capabilities & Capability.core != 0)
@@ -236,6 +239,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         required = @max(required, functionTableFieldEnd("inference_admission_stats"));
     if (required_capabilities & Capability.internal_service_ingress != 0)
         required = @max(required, functionTableFieldEnd("handler_authorize_internal_service"));
+    if (required_capabilities & Capability.workload_coordinator != 0)
+        required = @max(required, functionTableFieldEnd("coordinator_port"));
     return required;
 }
 

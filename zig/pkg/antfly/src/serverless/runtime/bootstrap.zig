@@ -459,8 +459,13 @@ pub const OwnedStack = struct {
         try cfg.ingress_admission.validate();
         try cfg.read_execution.validate();
         if (cfg.read_execution.protected.enabled() or cfg.read_execution.max_scan_state_bytes != 0) return error.UnsupportedReadExecutionPolicy;
-        if (cfg.node_config) |node_config| if (node_config.admission.remote_attempt_worker.max_attempts != 0)
-            return error.RemoteAttemptDurabilityRequired;
+        if (cfg.node_config) |node_config| {
+            if (node_config.admission.transaction_completion_bytes != 0) return error.UnsupportedTransactionCompletionPolicy;
+            if (node_config.admission.remote_attempt_worker.max_attempts != 0 or
+                node_config.admission.remote_attempt_coordinator.max_attempts != 0)
+                return error.RemoteAttemptDurabilityRequired;
+        }
+        if (cfg.ingress_admission.recovery_requests != 0) return error.UnsupportedRecoveryIngressPolicy;
         try validateConfig(alloc, cfg);
         self.alloc = alloc;
         self.embedding_provider_runtime = managed_embedder.ProviderRuntime.init(alloc, io);

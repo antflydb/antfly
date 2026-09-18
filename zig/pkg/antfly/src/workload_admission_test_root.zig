@@ -7,6 +7,7 @@ pub const lsm_backend = @import("storage/lsm_backend.zig");
 
 test {
     _ = @import("common/request_admission.zig");
+    _ = @import("common/health_server.zig");
     _ = @import("common/workload_resources.zig");
     _ = @import("common/workload_allocator.zig");
     _ = @import("common/workload_scheduler.zig");

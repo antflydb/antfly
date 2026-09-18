@@ -912,6 +912,7 @@ const DataPublicHttpRuntime = struct {
         peak_connection_threads: usize,
         query: antfly.common.request_admission.RequestAdmission.Stats,
         write: antfly.common.request_admission.RequestAdmission.Stats,
+        recovery: @FieldType(antfly.public_api.kernel_bridge.HandlerStats, "recovery") = .{},
         accept_errors_total: u64,
         connection_dispatch_rejections_total: u64,
         request_dispatch_rejections_total: u64,
@@ -934,6 +935,7 @@ const DataPublicHttpRuntime = struct {
         fn appendAdmissionMetrics(self: RuntimeStats, writer: *std.Io.Writer) !void {
             try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, self.query);
             try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, self.write);
+            try self.recovery.appendPrometheusMetrics(writer);
         }
     };
 
@@ -1022,6 +1024,7 @@ const DataPublicHttpRuntime = struct {
             .peak_connection_threads = transport.peak_active_connections,
             .query = application.query,
             .write = application.write,
+            .recovery = application.recovery,
             .accept_errors_total = transport.accept_errors_total,
             .connection_dispatch_rejections_total = transport.connection_dispatch_rejections_total,
             .request_dispatch_rejections_total = transport.request_dispatch_rejections_total,
@@ -1215,6 +1218,7 @@ const RaftTableApplyStateMachine = struct {
         decision_conflict,
         txn_not_found,
         transaction_too_large,
+        transaction_recovery_capacity_exhausted,
         invalid_batch_request,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
@@ -1224,6 +1228,7 @@ const RaftTableApplyStateMachine = struct {
                 error.DecisionConflict => .decision_conflict,
                 error.TxnNotFound => .txn_not_found,
                 error.TransactionTooLarge => .transaction_too_large,
+                error.TransactionRecoveryCapacityExhausted => .transaction_recovery_capacity_exhausted,
                 // Public/physical schema validation is a deterministic result
                 // of the replicated command. Retrying it cannot repair input.
                 // Storage corruption and resource pressure remain retryable.
@@ -1239,6 +1244,7 @@ const RaftTableApplyStateMachine = struct {
                 .decision_conflict => error.DecisionConflict,
                 .txn_not_found => error.TxnNotFound,
                 .transaction_too_large => error.TransactionTooLarge,
+                .transaction_recovery_capacity_exhausted => error.TransactionRecoveryCapacityExhausted,
                 .invalid_batch_request => error.InvalidBatchRequest,
             };
         }
@@ -5178,6 +5184,10 @@ pub const DataServer = struct {
     owned_incoming_graph_route_backend: ?lsm_backend_mod.BackendHandle = null,
     owned_incoming_graph_route_io: ?lsm_storage_io.IoStorage = null,
     owned_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = null,
+    owned_session_backend: ?lsm_backend_mod.BackendHandle = null,
+    owned_session_io: ?lsm_storage_io.IoStorage = null,
+    owned_session_store: ?antfly.storage_backend_erased.Store = null,
+    owned_sessions: ?antfly.public_api.transactions.DurableSessionStore = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
@@ -5687,11 +5697,48 @@ pub const DataServer = struct {
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
         if (comptime !linked_storage) {
+            try self.provisioned_storage.resource_manager.configureTransactionCompletion(self.api_server_cfg.transaction_completion_bytes);
             try self.provisioned_storage.resource_manager.configureDenseExecution(self.api_server_cfg.dense_execution);
             try self.provisioned_storage.resource_manager.configureReadExecution(self.api_server_cfg.read_execution);
         }
         var api_server_cfg = self.api_server_cfg;
         api_server_cfg.remote_attempt_node_id = if (self.store_registration) |registration| registration.node_id else 0;
+        // Attempt journals must survive process restarts on every data/API role.
+        // Keep them in a native engine namespace; linked production builds do
+        // not provide the legacy LMDB session-store opener.
+        if ((api_server_cfg.remote_attempt_worker.max_attempts != 0 or
+            api_server_cfg.remote_attempt_coordinator.max_attempts != 0) and
+            api_server_cfg.session_store == null and api_server_cfg.session_store_path == null)
+        {
+            if (api_server_cfg.deployment_mode == .serverless) return error.RemoteAttemptDurabilityRequired;
+            const session_root = try std.fmt.allocPrint(self.alloc, "{s}/api-transaction-sessions", .{self.write_source.replica_root_dir});
+            defer self.alloc.free(session_root);
+            const runtime = try self.ensureBackendRuntime();
+            const filesystem_io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+            self.owned_session_io = lsm_storage_io.IoStorage.init(filesystem_io);
+            self.owned_session_backend = try lsm_backend_mod.BackendHandle.open(self.alloc, session_root, .{
+                .storage = if (runtime.usesBorrowedIo() or runtime.borrowed_filesystem_io != null) self.owned_session_io.?.storage() else null,
+            });
+            self.owned_session_store = self.owned_session_backend.?.backend.runtimeStore(self.alloc, .{ .name = "system/api-transaction-sessions" }) catch |err| {
+                self.owned_session_backend.?.close();
+                self.owned_session_backend = null;
+                return err;
+            };
+            self.owned_sessions = antfly.public_api.transactions.DurableSessionStore.initRuntime(self.alloc, &self.owned_session_store.?);
+            api_server_cfg.session_store = &self.owned_sessions.?;
+            // This lock is acquired before journal reads and survives all
+            // local worker execution. It proves only same-root process
+            // replacement; copied roots and externally supplied stores do not
+            // inherit this evidence.
+            api_server_cfg.remote_attempt_exclusive_owner = self.owned_session_backend.?.backend.root_writer_lock != null;
+        }
+        errdefer {
+            self.owned_sessions = null;
+            if (self.owned_session_store) |*store| store.deinit();
+            self.owned_session_store = null;
+            if (self.owned_session_backend) |*backend| backend.close();
+            self.owned_session_backend = null;
+        }
         if (self.data_request_lifecycle_hook != null) {
             if (api_server_cfg.query_result_lifecycle_hook != null)
                 return error.AmbiguousQueryResultLifecycleOwner;
@@ -5898,10 +5945,17 @@ pub const DataServer = struct {
             self.read_source.source(),
             self.write_source.source(),
         );
+        const coordinator_port = self.http_server.?.coordinatorPort();
+        if (api_server_cfg.remote_attempt_coordinator.max_attempts != 0 and coordinator_port == null) {
+            self.http_server.?.deinit();
+            self.http_server = null;
+            return error.RemoteAttemptCoordinatorUnavailable;
+        }
         // Graph queries issued through the provisioned source and auxiliary
         // API helpers share one fenced directory. This prevents duplicate L1s
         // from diverging and gives both paths the configured durable L2.
         self.http_server.?.bindIncomingGraphRoutes(self.read_source.source());
+        _ = self.read_source.withRemoteAttemptCoordinator(coordinator_port);
         antfly.public_api.kernel_bridge.setAntflyProvider(&self.http_server.?, self.read_source.antfly_provider);
     }
 
@@ -7740,6 +7794,7 @@ pub const DataServer = struct {
         self.http_observer_lease = null;
         if (self.http_server) |*http_server| http_server.deinit();
         self.http_server = null;
+        _ = self.read_source.withRemoteAttemptCoordinator(null);
         _ = self.read_source.withAntflyProvider(null);
         _ = self.write_source.withAntflyProvider(null);
         if (self.data_raft_apply) |apply_sm| {
@@ -7873,6 +7928,9 @@ pub const DataServer = struct {
         self.write_source.deinit();
         if (self.owned_incoming_graph_route_store) |*store| store.deinit();
         if (self.owned_incoming_graph_route_backend) |*backend| backend.close();
+        self.owned_sessions = null;
+        if (self.owned_session_store) |*store| store.deinit();
+        if (self.owned_session_backend) |*backend| backend.close();
         if (self.remote_metadata) |remote_metadata| {
             remote_metadata.deinit();
             self.alloc.destroy(remote_metadata);
@@ -7897,6 +7955,8 @@ pub const DataServer = struct {
         self.query_io_impl = null;
         self.owned_incoming_graph_route_store = null;
         self.owned_incoming_graph_route_backend = null;
+        self.owned_session_store = null;
+        self.owned_session_backend = null;
     }
 
     fn ensureHttpRuntime(self: *DataServer) !*httpx.HttpRuntime {
@@ -19760,6 +19820,7 @@ pub const DataServer = struct {
                 const dense = cfg.api_server_cfg.dense_execution;
                 const reads = cfg.api_server_cfg.read_execution;
                 const context_request: @import("kernel_owner_abi").ContextRequest = .{
+                    .transaction_completion_bytes = cfg.api_server_cfg.transaction_completion_bytes,
                     .dense_max_runnable_tasks = dense.max_runnable_tasks,
                     .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
                     .dense_max_queued_tasks = dense.max_queued_tasks,
@@ -25721,8 +25782,31 @@ pub fn runFromIterator(
     defer if (process_storage_kernel_context) |*context| context.deinit();
     if (comptime linked_storage) {
         var context = kernel_owner_client.Context{};
+        const admission = if (loaded_config) |*cfg| cfg.admission else antfly.common.config.Config.AdmissionConfig{};
+        const dense = admission.dense_execution;
+        const reads = admission.read_execution;
         try context.ensureWith(.{
             .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+            .transaction_completion_bytes = admission.transaction_completion_bytes,
+            .dense_max_runnable_tasks = dense.max_runnable_tasks,
+            .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
+            .dense_max_queued_tasks = dense.max_queued_tasks,
+            .dense_max_wait_ms = dense.max_wait_ms,
+            .dense_max_working_bytes = dense.max_working_bytes,
+            .dense_max_suspended_io = dense.max_suspended_io,
+            .read_max_runnable_tasks = reads.max_runnable_tasks,
+            .read_max_outstanding_tasks = reads.max_outstanding_tasks,
+            .read_max_queued_tasks = reads.max_queued_tasks,
+            .read_max_wait_ms = reads.max_wait_ms,
+            .read_max_working_bytes = reads.max_working_bytes,
+            .read_max_suspended_io = reads.max_suspended_io,
+            .read_max_scan_state_bytes = reads.max_scan_state_bytes,
+            .read_max_scan_snapshot_ms = reads.max_scan_snapshot_ms,
+            .read_protected_runnable_tasks = reads.protected.max_runnable_tasks,
+            .read_protected_outstanding_tasks = reads.protected.max_outstanding_tasks,
+            .read_protected_working_bytes = reads.protected.max_working_bytes,
+            .read_transition_tasks = reads.protected.max_transition_tasks,
+            .read_transition_bytes = reads.protected.max_transition_bytes,
         });
         process_storage_kernel_context = context;
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
@@ -25815,6 +25899,8 @@ pub fn runFromIterator(
             .dense_execution = if (loaded_config) |*cfg| cfg.admission.dense_execution else .{},
             .read_execution = if (loaded_config) |*cfg| cfg.admission.read_execution else .{},
             .remote_attempt_worker = if (loaded_config) |*cfg| cfg.admission.remote_attempt_worker else .{},
+            .remote_attempt_coordinator = if (loaded_config) |*cfg| cfg.admission.remote_attempt_coordinator else .{},
+            .transaction_completion_bytes = if (loaded_config) |*cfg| cfg.admission.transaction_completion_bytes else 0,
             .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
@@ -25900,6 +25986,7 @@ pub fn runFromIterator(
         try data_server.ensureHttpRuntime(),
     );
     defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
+    if (health_server) |hs| try hs.configureMetricsInterval(if (loaded_config) |*cfg| cfg.health_metrics_interval_ms else 5000);
 
     try supervisor.publishReady();
     while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {

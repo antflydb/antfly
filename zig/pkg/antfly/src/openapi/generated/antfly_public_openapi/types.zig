@@ -12761,11 +12761,13 @@ pub const TableStatus = struct {
 
 /// Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required.
 pub const TableStorageSettings = struct {
+    transaction_recovery: OpenApiOptionalNullable(TransactionRecoveryStoragePolicy) = .absent,
     /// Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
     dense_embeddings: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "transaction_recovery", "transaction_recovery", false },
         .{ "dense_embeddings", "dense_embeddings", true },
     };
 
@@ -12779,6 +12781,17 @@ pub const TableStorageSettings = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        switch (self.transaction_recovery) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("transaction_recovery");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("transaction_recovery");
+                try jw.write(value);
+            },
+        }
         if (self.dense_embeddings) |value| {
             try jw.objectField("dense_embeddings");
             try jw.write(value);
@@ -13056,6 +13069,15 @@ pub const TransactionReadItem = struct {
     key: []const u8,
     /// Version token observed at read time (from X-Antfly-Version header). Use "0" to assert the key did not exist at read time.
     version: []const u8,
+};
+
+/// Immutable, creation-only transaction completion policy. Enable only after every replica is upgraded to support protocol version 1. Existing tables require a separate migration; this setting does not fence older live peers. The node transaction completion reserve must accommodate this policy.
+pub const TransactionRecoveryStoragePolicy = struct {
+    protocol_version: u32,
+    max_count: u64,
+    max_bytes: u64,
+    /// Total deterministic metadata and intent completion credits per transaction; cannot exceed max_bytes.
+    max_transaction_bytes: u64,
 };
 
 pub const TransactionSavepointResponse = struct {

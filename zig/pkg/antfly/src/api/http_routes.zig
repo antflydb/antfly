@@ -15,6 +15,7 @@
 const std = @import("std");
 
 pub const Routes = struct {
+    pub const workload_attempt_control = "/internal/v1/workload/control";
     pub const healthz = "/healthz";
     pub const readyz = "/readyz";
     pub const status = "/status";

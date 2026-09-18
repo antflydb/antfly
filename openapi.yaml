@@ -13775,6 +13775,41 @@ components:
       properties:
         byte_range:
           $ref: '#/components/schemas/ByteRange'
+    TransactionRecoveryStoragePolicy:
+      type: object
+      additionalProperties: false
+      required:
+        - protocol_version
+        - max_count
+        - max_bytes
+        - max_transaction_bytes
+      description: Immutable, creation-only transaction completion policy. Enable only after every replica
+        is upgraded to support protocol version 1. Existing tables require a separate migration; this
+        setting does not fence older live peers. The node transaction completion reserve must accommodate
+        this policy.
+      properties:
+        protocol_version:
+          type: integer
+          format: uint32
+          enum:
+            - 1
+        max_count:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 65536
+        max_bytes:
+          type: integer
+          format: uint64
+          minimum: 4096
+          maximum: 1099511627776
+        max_transaction_bytes:
+          type: integer
+          format: uint64
+          minimum: 4096
+          maximum: 1099511627776
+          description: Total deterministic metadata and intent completion credits per transaction; cannot
+            exceed max_bytes.
     TableStorageSettings:
       type: object
       additionalProperties: false
@@ -13784,6 +13819,10 @@ components:
         default does not migrate data. Snapshot/backup and split operations currently reject vector_store
         tables; explicitly select primary_lsm when these operations are required.
       properties:
+        transaction_recovery:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/TransactionRecoveryStoragePolicy'
         dense_embeddings:
           type: string
           enum:

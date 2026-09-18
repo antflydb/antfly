@@ -709,6 +709,27 @@ pub const AntflyApiHandler = struct {
         return if (err == error.OutOfMemory and ownerMemoryExhausted(owner)) error.AdmissionBytesExhausted else err;
     }
 
+    /// Only fixed-shape, authenticated completion/control RPCs may consume the
+    /// recovery partition. Pre-authentication uses bounded stack scratch, so a
+    /// full general envelope cannot prevent verifying the caller's credential.
+    fn usesRecoveryIngress(self: *AntflyApiHandler, ctx: *httpx.Context) bool {
+        if (self.api_server.ingress_admission.config.recovery_requests == 0 or ctx.request.method != .POST) return false;
+        const path = ctx.request.uri.path;
+        if (!std.mem.eql(u8, path, routes.workload_attempt_control) and
+            routes.matchGroupTxnResolve(path) == null and routes.matchGroupTxnStatus(path) == null and
+            routes.matchGroupTxnAcknowledge(path) == null) return false;
+        if (ctx.header("transfer-encoding") != null or ctx.header("content-encoding") != null or
+            ctx.request.bodyLen() > 8192 or (ctx.request.headers.getContentLength() orelse 0) > 8192 or
+            (ctx.hasStreamingRequestBody() and ctx.request.headers.getContentLength() == null)) return false;
+        const token = ctx.header(internal_service_auth.header_name) orelse return false;
+        if (token.len > 4096) return false;
+        var scratch: [32 * 1024]u8 = undefined;
+        var arena = std.heap.FixedBufferAllocator.init(&scratch);
+        var identity = self.api_server.authenticateInternalServiceRequestUsingAllocator(arena.allocator(), token) catch return false;
+        defer identity.deinit(arena.allocator());
+        return identity.is_internal_service;
+    }
+
     fn installIngressOwner(self: *AntflyApiHandler, ctx: *httpx.Context) !?*IngressState {
         if (ingressState(ctx)) |state| return state;
         const runtime = &self.api_server.ingress_admission;
@@ -723,7 +744,7 @@ pub const AntflyApiHandler = struct {
             (std.mem.eql(u8, ctx.request.uri.path, routes.healthz) or std.mem.eql(u8, ctx.request.uri.path, routes.readyz)) and
             ctx.request.bodyLen() == 0 and (ctx.request.headers.getContentLength() orelse 0) == 0 and
             ctx.header("transfer-encoding") == null and !ctx.hasStreamingRequestBody();
-        const gate = if (control) &runtime.control else &runtime.general;
+        const gate = if (control) &runtime.control else if (self.usesRecoveryIngress(ctx)) &runtime.recovery else &runtime.general;
         const account = try gate.memoryAccount(self.api_server.alloc);
         defer account.release();
         var lease = try account.acquireOutstanding();
@@ -977,14 +998,14 @@ pub const AntflyApiHandler = struct {
             }
             return @as(?httpx.Response, try unauthorizedResponse(ctx));
         };
-        var identity = self.api_server.authenticateInternalServiceRequest(token) catch
+        var identity = self.api_server.authenticateInternalServiceRequestUsingAllocator(ctx.allocator, token) catch
             return @as(?httpx.Response, try unauthorizedResponse(ctx));
         var transferred = false;
-        defer if (!transferred) identity.deinit(self.api_server.alloc);
+        defer if (!transferred) identity.deinit(ctx.allocator);
         if (!identity.is_internal_service)
             return @as(?httpx.Response, try jsonErrorResponse(ctx, 403, "internal service credential required"));
         const authenticated = try ctx.allocator.create(ServiceAuthentication);
-        authenticated.* = .{ .allocator = ctx.allocator, .identity_allocator = self.api_server.alloc, .identity = identity, .received_ns = received_ns };
+        authenticated.* = .{ .allocator = ctx.allocator, .identity_allocator = ctx.allocator, .identity = identity, .received_ns = received_ns };
         ctx.setData(service_authentication_key, authenticated, ServiceAuthentication.destroy) catch |err| {
             ctx.allocator.destroy(authenticated);
             return err;
@@ -1002,16 +1023,16 @@ pub const AntflyApiHandler = struct {
                 .issuer = self.api_server.cfg.internal_service_issuer orelse "",
             }, frame, identity.username, @tagName(ctx.request.method), target, body) catch
                 return @as(?httpx.Response, try unauthorizedResponse(ctx));
+            if (authenticated.attempt.?.version != 3)
+                return @as(?httpx.Response, try jsonErrorResponse(ctx, 503, "remote attempt protocol upgrade required"));
             // Preserve elapsed authentication/body-read time and an earlier
             // application deadline across repeated host/kernel authentication.
             const deadline = received_ns +| authenticated.attempt.?.remaining_ns;
             ctx.application_deadline_ns = @min(requestCancellation(ctx).query_deadline_ns orelse deadline, deadline);
             ctx.application_deadline_io = null;
-            // Only the synchronous join-row worker has a durable attempt owner.
-            // Other routes and unconfigured workers must not downgrade to legacy
-            // execution, or sign a rejection without a durable tombstone/fence.
-            if (self.api_server.remote_attempt_worker == null or ctx.request.method != .POST or
-                routes.matchGroupJoinRows(ctx.request.uri.path) == null)
+            // Unsupported routes never downgrade authenticated attempts to
+            // legacy execution or issue terminal evidence without a durable owner.
+            if (self.api_server.remote_attempt_worker == null or !supportsOwnedRead(ctx))
                 return @as(?httpx.Response, try jsonErrorResponse(ctx, 503, "remote attempt worker protocol unavailable"));
         }
         return null;
@@ -1316,6 +1337,7 @@ pub const AntflyApiHandler = struct {
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
         try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
+        try server.post(routes.workload_attempt_control, httpx.Handler.bind(self, internalWorkloadControl));
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
@@ -2368,6 +2390,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGroupLookup(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalGroupLookupUnowned);
+    }
+
+    fn internalGroupLookupUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const encoded_key = ctx.param("key") orelse return textResponse(ctx, 400, "invalid path parameter");
@@ -2463,6 +2489,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalJoinFinalize(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalJoinFinalizeUnowned);
+    }
+
+    fn internalJoinFinalizeUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid join finalize request");
@@ -2482,6 +2512,47 @@ pub const AntflyApiHandler = struct {
         return jsonResponse(ctx, 200, encoded);
     }
 
+    fn internalWorkloadControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const authentication = ServiceAuthentication.fromContext(ctx) orelse return unauthorizedResponse(ctx);
+        const worker = self.api_server.remote_attempt_worker orelse return jsonErrorResponse(ctx, 503, "remote attempt worker unavailable");
+        const coordinator = attempt_protocol.nodeId(authentication.identity.username) catch return unauthorizedResponse(ctx);
+        const body = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "missing workload control");
+        if (body.len > 8192) return jsonErrorResponse(ctx, 413, "workload control too large");
+        const Control = struct { workload_attempt_control: []const u8, nonce: u128 = 0 };
+        var parsed = std.json.parseFromSlice(Control, ctx.allocator, body, .{}) catch return jsonErrorResponse(ctx, 400, "invalid workload control");
+        defer parsed.deinit();
+        const keys: attempt_protocol.Keys = .{ .primary = self.api_server.cfg.internal_service_secret.?, .verification = self.api_server.cfg.internal_service_verification_secret, .issuer = self.api_server.cfg.internal_service_issuer.? };
+        if (std.mem.eql(u8, parsed.value.workload_attempt_control, "discover")) {
+            if (parsed.value.nonce == 0 or authentication.attempt != null) return jsonErrorResponse(ctx, 400, "invalid discovery request");
+            const signed = try attempt_protocol.signDiscovery(ctx.allocator, keys, .{ .coordinator = coordinator, .destination = worker.node_id, .worker_namespace = worker.namespace, .worker_incarnation = worker.incarnation, .nonce = parsed.value.nonce });
+            defer ctx.allocator.free(signed);
+            var response = try jsonResponse(ctx, 200, "{}");
+            errdefer response.deinit();
+            try response.headers.set(attempt_protocol.evidence_header, signed);
+            return response;
+        }
+        const attempt = authentication.attempt orelse return unauthorizedResponse(ctx);
+        if (attempt.attempt.destination != worker.node_id) return jsonErrorResponse(ctx, 400, "wrong workload destination");
+        if (std.mem.eql(u8, parsed.value.workload_attempt_control, "status")) {
+            if (!(worker.terminalStatus(attempt.attempt) catch return jsonErrorResponse(ctx, 503, "remote attempt status unavailable"))) return jsonErrorResponse(ctx, 409, "remote attempt is not terminal");
+            const signed = try attempt_protocol.signTerminalAfterQuiescence(ctx.allocator, keys, attempt.attempt, 200, "{}");
+            defer ctx.allocator.free(signed);
+            var response = try jsonResponse(ctx, 200, "{}");
+            errdefer response.deinit();
+            try response.headers.set(attempt_protocol.evidence_header, signed);
+            return response;
+        }
+        if (!std.mem.eql(u8, parsed.value.workload_attempt_control, "close_generation")) return jsonErrorResponse(ctx, 400, "unsupported workload control");
+        if (attempt.version >= 3 and attempt.attempt.worker_namespace != worker.namespace) return jsonErrorResponse(ctx, 409, "workload namespace mismatch");
+        const evidence = (worker.closeGeneration(coordinator, attempt.attempt.generation, attempt.attempt.worker_incarnation) catch return jsonErrorResponse(ctx, 503, "remote attempt fence unavailable")) orelse return jsonErrorResponse(ctx, 409, "remote attempt generation is not quiescent");
+        const signed = try attempt_protocol.signFenceAfterQuiescence(ctx.allocator, keys, evidence);
+        defer ctx.allocator.free(signed);
+        var response = try jsonResponse(ctx, 200, "{}");
+        errdefer response.deinit();
+        try response.headers.set(attempt_protocol.evidence_header, signed);
+        return response;
+    }
+
     fn internalJoinRows(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const authentication = ServiceAuthentication.fromContext(ctx);
         const request = if (authentication) |authenticated| authenticated.attempt else null;
@@ -2498,7 +2569,8 @@ pub const AntflyApiHandler = struct {
                 return jsonErrorResponse(ctx, 400, "invalid remote attempt control");
             defer control.deinit();
             if (control.value.workload_attempt_control) |action| {
-                if (!std.mem.eql(u8, action, "close_generation") or attempt.attempt.destination != worker.node_id)
+                if (!std.mem.eql(u8, action, "close_generation") or attempt.attempt.destination != worker.node_id or
+                    (attempt.version >= 3 and attempt.attempt.worker_namespace != worker.namespace))
                     return jsonErrorResponse(ctx, 400, "invalid remote attempt control");
                 const evidence = (worker.closeGeneration(attempt.attempt.coordinator, attempt.attempt.generation, attempt.attempt.worker_incarnation) catch
                     return jsonErrorResponse(ctx, 503, "remote attempt fence unavailable")) orelse
@@ -2508,38 +2580,67 @@ pub const AntflyApiHandler = struct {
                 try ctx.setHeader(attempt_protocol.evidence_header, signed);
                 return jsonResponse(ctx, 200, "{}");
             }
-            const admitted = worker.begin(attempt) catch
-                return jsonErrorResponse(ctx, 503, "remote attempt admission unavailable");
-            if (admitted == .active) return jsonErrorResponse(ctx, 409, "remote attempt is still active");
-            var response: httpx.Response = undefined;
-            if (admitted == .terminal) {
-                response = try jsonErrorResponse(ctx, 409, "remote attempt already completed; result unavailable");
-            } else {
-                var lease = admitted.started;
-                authentication.?.worker_cancellation = lease.cancellation();
-                defer authentication.?.worker_cancellation = .none;
-                const deadline = authentication.?.received_ns +| @min(attempt.remaining_ns, @as(u64, worker.config.max_run_ms) * std.time.ns_per_ms);
-                const existing_deadline = requestCancellation(ctx).query_deadline_ns;
-                ctx.application_deadline_ns = @min(existing_deadline orelse deadline, deadline);
-                ctx.application_deadline_io = null;
-                response = self.internalJoinRowsLegacy(ctx) catch |err| {
-                    authentication.?.worker_cancellation = .none;
-                    try lease.finish();
-                    return err;
-                };
-                authentication.?.worker_cancellation = .none;
-                lease.finish() catch |err| {
-                    response.deinit();
-                    return err;
-                };
-            }
-            errdefer response.deinit();
-            const signed = try attempt_protocol.signTerminalAfterQuiescence(ctx.allocator, keys, attempt.attempt, response.status.code, response.body orelse "");
-            defer ctx.allocator.free(signed);
-            try response.headers.set(attempt_protocol.evidence_header, signed);
-            return response;
+            return self.executeOwnedRead(ctx, internalJoinRowsLegacy);
         }
         return self.internalJoinRowsLegacy(ctx);
+    }
+
+    fn supportsOwnedRead(ctx: *const httpx.Context) bool {
+        const path = ctx.request.uri.path;
+        if (ctx.request.method == .GET) return routes.matchGroupLookup(path) != null;
+        if (ctx.request.method != .POST) return false;
+        return std.mem.eql(u8, path, routes.workload_attempt_control) or
+            routes.matchGroupScan(path) != null or routes.matchGroupJoinFinalize(path) != null or
+            routes.matchGroupJoinPartition(path) != null or routes.matchGroupJoinUnmatched(path) != null or
+            routes.matchGroupJoinRows(path) != null or routes.matchGroupQuery(path) != null or
+            routes.matchGroupQueryPreflight(path) != null or routes.matchGroupVectorWorker(path) != null or
+            routes.matchGroupGraphExpand(path) != null or routes.matchGroupGraphHydrate(path) != null or
+            routes.matchGroupGraphEdges(path) != null or routes.matchGroupTextStats(path) != null or
+            routes.matchGroupAlgebraicPartials(path) != null;
+    }
+
+    fn executeOwnedRead(self: *AntflyApiHandler, ctx: *httpx.Context, comptime operation: anytype) !httpx.Response {
+        const authentication = ServiceAuthentication.fromContext(ctx);
+        const attempt = (if (authentication) |authenticated| authenticated.attempt else null) orelse return operation(self, ctx);
+        const worker = self.api_server.remote_attempt_worker orelse return jsonErrorResponse(ctx, 503, "remote attempt worker unavailable");
+        const keys: attempt_protocol.Keys = .{ .primary = self.api_server.cfg.internal_service_secret.?, .verification = self.api_server.cfg.internal_service_verification_secret, .issuer = self.api_server.cfg.internal_service_issuer.? };
+        const admitted = worker.begin(attempt) catch
+            return jsonErrorResponse(ctx, 503, "remote attempt admission unavailable");
+        if (admitted == .active) return jsonErrorResponse(ctx, 409, "remote attempt is still active");
+        var response: httpx.Response = undefined;
+        if (admitted == .terminal) {
+            response = try jsonErrorResponse(ctx, 409, "remote attempt already completed; result unavailable");
+        } else if (admitted == .rejected) {
+            // The worker persisted a rejection floor before returning this
+            // disposition. A delayed duplicate cannot begin execution after
+            // the coordinator releases its matching remote ownership.
+            response = try jsonErrorResponse(ctx, 429, "remote attempt capacity exhausted");
+            errdefer response.deinit();
+            try response.headers.set("Retry-After", "1");
+        } else {
+            var lease = admitted.started;
+            authentication.?.worker_cancellation = lease.cancellation();
+            defer authentication.?.worker_cancellation = .none;
+            const deadline = authentication.?.received_ns +| @min(attempt.remaining_ns, @as(u64, worker.config.max_run_ms) * std.time.ns_per_ms);
+            const existing_deadline = requestCancellation(ctx).query_deadline_ns;
+            ctx.application_deadline_ns = @min(existing_deadline orelse deadline, deadline);
+            ctx.application_deadline_io = null;
+            response = operation(self, ctx) catch |err| {
+                authentication.?.worker_cancellation = .none;
+                try lease.finish();
+                return err;
+            };
+            authentication.?.worker_cancellation = .none;
+            lease.finish() catch |err| {
+                response.deinit();
+                return err;
+            };
+        }
+        errdefer response.deinit();
+        const signed = try attempt_protocol.signTerminalAfterQuiescence(ctx.allocator, keys, attempt.attempt, response.status.code, response.body orelse "");
+        defer ctx.allocator.free(signed);
+        try response.headers.set(attempt_protocol.evidence_header, signed);
+        return response;
     }
 
     fn internalJoinRowsLegacy(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -2566,6 +2667,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalJoinUnmatched(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalJoinUnmatchedUnowned);
+    }
+
+    fn internalJoinUnmatchedUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid join unmatched request");
@@ -2589,6 +2694,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalJoinPartition(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalJoinPartitionUnowned);
+    }
+
+    fn internalJoinPartitionUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid join partition request");
@@ -3051,6 +3160,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGroupQuery(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalGroupQueryUnowned);
+    }
+
+    fn internalGroupQueryUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse "";
@@ -3097,6 +3210,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGroupQueryPreflight(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalGroupQueryPreflightUnowned);
+    }
+
+    fn internalGroupQueryPreflightUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse "";
@@ -3124,6 +3241,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGroupVectorWorker(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalGroupVectorWorkerUnowned);
+    }
+
+    fn internalGroupVectorWorkerUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse "";
@@ -3152,6 +3273,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGroupScan(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalGroupScanUnowned);
+    }
+
+    fn internalGroupScanUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse "";
@@ -3164,6 +3289,28 @@ pub const AntflyApiHandler = struct {
         input.opts.execution_deadline_ns = request.deadline_ns;
         if (request.cancellation.ptr != null and request.cancellation.is_cancelled_fn != null)
             input.opts.cancellation = request.cancellation;
+        if (ServiceAuthentication.fromContext(ctx)) |authentication| {
+            if (authentication.attempt != null) {
+                // A terminal proof covers the complete response and is issued
+                // only after the iterator and its storage leases unwind.
+                // Until authenticated streaming trailers are available, owned
+                // scans use the request's bounded response allocation.
+                var result = self.internalGroupOperations().scan(
+                    ctx.allocator,
+                    request,
+                    params.group_id,
+                    params.table_name,
+                    input.from,
+                    input.to,
+                    input.opts,
+                ) catch |err| return internalGroupErrorResponse(ctx, err);
+                defer result.deinit(ctx.allocator);
+                var response = try textResponse(ctx, 200, result.ndjson);
+                errdefer response.deinit();
+                try response.headers.set("Content-Type", "application/x-ndjson");
+                return response;
+            }
+        }
         const HttpScanSink = struct {
             ctx: *httpx.Context,
             writer: ?httpx.Context.StreamWriter = null,
@@ -3211,6 +3358,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGraphExpand(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalGraphExpandUnowned);
+    }
+
+    fn internalGraphExpandUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid graph expand request");
@@ -3225,6 +3376,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGraphHydrate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalGraphHydrateUnowned);
+    }
+
+    fn internalGraphHydrateUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid graph hydrate request");
@@ -3239,6 +3394,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGraphEdges(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalGraphEdgesUnowned);
+    }
+
+    fn internalGraphEdgesUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid graph edges request");
@@ -3269,6 +3428,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalTextStats(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalTextStatsUnowned);
+    }
+
+    fn internalTextStatsUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse "";
@@ -3279,6 +3442,10 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalAlgebraicPartials(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.executeOwnedRead(ctx, internalAlgebraicPartialsUnowned);
+    }
+
+    fn internalAlgebraicPartialsUnowned(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse "";
@@ -3379,6 +3546,8 @@ pub const AntflyApiHandler = struct {
             try ctx.setHeader(distributed_txn_contract.pre_decision_outcome_header, distributed_txn_contract.pre_decision_not_proposed_v1);
         return switch (err) {
             error.InvalidArgument => textResponse(ctx, 400, "invalid transaction request"),
+            error.TransactionRecoveryCapacityExhausted => textResponse(ctx, 503, "transaction recovery capacity exhausted"),
+            error.TransactionRecoveryReconciliationRequired => textResponse(ctx, 503, "transaction recovery reconciliation required"),
             error.TransactionTooLarge => textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions"),
             error.DecisionConflict => textResponse(ctx, 409, "decision conflict"),
             error.TransactionConflict => textResponse(ctx, 409, "transaction conflict"),
@@ -8065,6 +8234,7 @@ test "workload admission durable join rows deduplicate and sign only after actua
     }, status.iface(), fake.source(), null);
     defer server.deinit();
     fake.worker = server.remote_attempt_worker;
+    try std.testing.expect((try fake.worker.?.closeGeneration(7, 1, fake.worker.?.incarnation)) != null);
     var handler: AntflyApiHandler = .{ .api_server = &server };
     const target = "/internal/v1/groups/8/tables/docs/join-rows";
     const query_body = "{\"join\":{\"right_table\":\"docs\",\"on\":{\"left_field\":\"customer_id\",\"right_field\":\"_id\"}}}";
@@ -8076,8 +8246,8 @@ test "workload admission durable join rows deduplicate and sign only after actua
         fake.close_during_query = comptime std.mem.eql(u8, mode, "cancel");
         const body = if (fencing) "{\"workload_attempt_control\":\"close_generation\"}" else query_body;
         const attempt: attempt_protocol.Request = .{
-            .version = 1,
-            .attempt = .{ .coordinator = 7, .generation = generation, .sequence = 1, .operation = 1, .destination = 8, .worker_incarnation = fake.worker.?.incarnation },
+            .version = 3,
+            .attempt = .{ .coordinator = 7, .generation = generation, .sequence = 1, .operation = 1, .destination = 8, .worker_namespace = fake.worker.?.namespace, .worker_incarnation = fake.worker.?.incarnation },
             .remaining_ns = 5 * std.time.ns_per_s,
             .request_digest = attempt_protocol.requestDigest("POST", target, body),
         };
@@ -11944,4 +12114,137 @@ test "workload admission gzip growth charges simultaneous allocations and retire
         request_live = false;
         try std.testing.expectEqual(@as(usize, 0), budget.stats().in_use);
     }
+}
+
+test "workload admission authenticated recovery control survives full ingress and foreground drain" {
+    const alloc = std.testing.allocator;
+    var status: AuthStatusSource = .{};
+    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var storage = try backend.runtimeStore(alloc, .{ .name = "system/control-reserve" });
+    defer storage.deinit();
+    var durable = transactions_api.DurableSessionStore.initRuntime(alloc, &storage);
+    const secret = "r" ** 32;
+    var server = try ApiHttpServer.initWithConfig(alloc, .{
+        .session_store = &durable,
+        .remote_attempt_worker = .{ .max_attempts = 4, .max_bytes = 8192 },
+        .remote_attempt_node_id = 8,
+        .internal_service_secret = secret,
+        .internal_service_issuer = "cluster",
+        .ingress_admission = .{ .max_requests = 3, .max_retained_bytes = 256 * 1024, .control_requests = 1, .control_retained_bytes = 64 * 1024, .recovery_requests = 1, .recovery_retained_bytes = 64 * 1024 },
+    }, status.iface(), null, null);
+    defer server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &server };
+    const account = try server.ingress_admission.general.memoryAccount(alloc);
+    defer account.release();
+    var general = try account.acquireOutstanding();
+    defer general.release();
+    const probe_account = try server.ingress_admission.control.memoryAccount(alloc);
+    defer probe_account.release();
+    var probe = try probe_account.acquireOutstanding();
+    defer probe.release();
+    const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "cluster", .node_id = 7 }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    inline for (.{ "unauthenticated", "authenticated", "draining" }) |mode| {
+        if (comptime std.mem.eql(u8, mode, "draining")) server.closeForegroundAdmission();
+        var request = try httpx.Request.init(alloc, .POST, routes.workload_attempt_control);
+        defer request.deinit();
+        request.body = "{\"workload_attempt_control\":\"discover\",\"nonce\":99}";
+        if (comptime !std.mem.eql(u8, mode, "unauthenticated")) try request.headers.set(internal_service_auth.header_name, token);
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.dispatchLinkedRoute(&ctx, httpx.Handler.bind(&handler, AntflyApiHandler.internalWorkloadControl));
+        defer response.deinit();
+        const authenticated = comptime !std.mem.eql(u8, mode, "unauthenticated");
+        try std.testing.expectEqual(@as(u16, if (authenticated) 200 else 429), response.status.code);
+        if (authenticated) {
+            const evidence = response.headers.get(attempt_protocol.evidence_header).?;
+            const discovered = try attempt_protocol.verifyDiscovery(alloc, .{ .primary = secret, .issuer = "cluster" }, evidence, 7, 8, 99);
+            try std.testing.expectEqual(server.remote_attempt_worker.?.incarnation, discovered.worker_incarnation);
+            try std.testing.expectEqual(@as(usize, 1), server.ingress_admission.recovery.stats().in_flight);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.ingress_admission.recovery.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), server.ingress_admission.recovery.stats().retained_bytes);
+}
+
+test "workload admission owned scan proves terminal only after bounded iteration unwinds" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        worker: ?*@import("workload_attempt_worker.zig").Store = null,
+        calls: usize = 0,
+        iterating: bool = false,
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query, .scan_group_local = scanGroup } };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+        fn scanGroup(raw: *anyopaque, a: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, opts: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.iterating = true;
+            defer self.iterating = false;
+            try std.testing.expect(opts.execution_deadline_ns != null);
+            try std.testing.expectEqual(@as(usize, 1), (try self.worker.?.usage()).attempts);
+            // Closing a live generation cancels it but cannot attest quiescence.
+            try std.testing.expect((try self.worker.?.closeGeneration(7, 2, self.worker.?.incarnation)) == null);
+            return .{ .ndjson = try a.dupe(u8, "{\"_id\":\"a\"}\n") };
+        }
+    };
+    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var storage = try backend.runtimeStore(alloc, .{ .name = "system/owned-scan" });
+    defer storage.deinit();
+    var durable = transactions_api.DurableSessionStore.initRuntime(alloc, &storage);
+    var status: AuthStatusSource = .{};
+    var fake: Fake = .{};
+    const secret = "s" ** 32;
+    const keys: attempt_protocol.Keys = .{ .primary = secret, .issuer = "cluster" };
+    var server = try ApiHttpServer.initWithConfig(alloc, .{
+        .session_store = &durable,
+        .remote_attempt_worker = .{ .max_attempts = 4, .max_bytes = 8192 },
+        .remote_attempt_node_id = 8,
+        .internal_service_secret = secret,
+        .internal_service_issuer = "cluster",
+    }, status.iface(), fake.source(), null);
+    defer server.deinit();
+    fake.worker = server.remote_attempt_worker;
+    try std.testing.expect((try fake.worker.?.closeGeneration(7, 1, fake.worker.?.incarnation)) != null);
+    var handler: AntflyApiHandler = .{ .api_server = &server };
+    const target = "/internal/v1/groups/8/tables/docs/documents";
+    const body = "{}";
+    const attempt: attempt_protocol.Request = .{
+        .version = 3,
+        .attempt = .{ .coordinator = 7, .generation = 2, .sequence = 1, .operation = 1, .destination = 8, .worker_namespace = fake.worker.?.namespace, .worker_incarnation = fake.worker.?.incarnation },
+        .remaining_ns = 5 * std.time.ns_per_s,
+        .request_digest = attempt_protocol.requestDigest("POST", target, body),
+    };
+    const signed = try attempt_protocol.signRequest(alloc, keys, attempt);
+    defer alloc.free(signed);
+    const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "cluster", .node_id = 7 }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    var request = try httpx.Request.init(alloc, .POST, target);
+    defer request.deinit();
+    request.body = body;
+    try request.headers.set(internal_service_auth.header_name, token);
+    try request.headers.set(attempt_protocol.request_header, signed);
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    context.params = &.{ .{ .name = "group_id", .value = "8" }, .{ .name = "table_name", .value = "docs" } };
+    var response = try handler.dispatchLinkedRoute(&context, httpx.Handler.bind(&handler, AntflyApiHandler.internalGroupScan));
+    defer response.deinit();
+    try std.testing.expect(!fake.iterating);
+    if (fake.calls != 1) std.debug.print("owned scan status={d} body={s}\n", .{ response.status.code, response.body orelse "" });
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    const evidence = response.headers.get(attempt_protocol.evidence_header).?;
+    _ = try attempt_protocol.verifyTerminal(alloc, keys, evidence, attempt.attempt, response.status.code, response.body orelse "");
+    try std.testing.expect((try fake.worker.?.closeGeneration(7, 2, fake.worker.?.incarnation)) != null);
+    try std.testing.expectEqual(@as(usize, 0), (try fake.worker.?.usage()).attempts);
 }

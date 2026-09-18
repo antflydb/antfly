@@ -208,6 +208,7 @@ pub fn runFromIterator(
         srv.httpRuntime(),
     );
     defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
+    if (health_server) |hs| try hs.configureMetricsInterval(if (loaded_config) |*cfg| cfg.health_metrics_interval_ms else 5000);
 
     try supervisor.publishReady();
     while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {

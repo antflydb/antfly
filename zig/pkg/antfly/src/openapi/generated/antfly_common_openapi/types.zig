@@ -16,8 +16,11 @@ const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 pub const AdmissionConfig = struct {
     ingress: ?IngressAdmissionConfig = null,
     /// Shared retained-memory ceiling for MCP, A2A, and transaction sessions, separate from foreground query and write budgets.
-    session_max_retained_bytes: ?i64 = null,
+    session_max_retained_bytes: ?u64 = null,
+    /// Node-wide prepaid scratch memory for completing durable storage transactions. Zero preserves legacy allocation. Reserve this before foreground admission; this setting is independent of replicated limits on outstanding recovery obligations.
+    transaction_completion_bytes: ?u64 = null,
     remote_attempt_worker: ?RemoteAttemptWorkerConfig = null,
+    remote_attempt_coordinator: ?RemoteAttemptCoordinatorConfig = null,
     dense_execution: ?DenseExecutionConfig = null,
     read_execution: ?ReadExecutionConfig = null,
     query: ?QueryAdmissionConfig = null,
@@ -28,7 +31,9 @@ pub const AdmissionConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "ingress", "ingress", true },
         .{ "session_max_retained_bytes", "session_max_retained_bytes", true },
+        .{ "transaction_completion_bytes", "transaction_completion_bytes", true },
         .{ "remote_attempt_worker", "remote_attempt_worker", true },
+        .{ "remote_attempt_coordinator", "remote_attempt_coordinator", true },
         .{ "dense_execution", "dense_execution", true },
         .{ "read_execution", "read_execution", true },
         .{ "query", "query", true },
@@ -54,8 +59,16 @@ pub const AdmissionConfig = struct {
             try jw.objectField("session_max_retained_bytes");
             try jw.write(value);
         }
+        if (self.transaction_completion_bytes) |value| {
+            try jw.objectField("transaction_completion_bytes");
+            try jw.write(value);
+        }
         if (self.remote_attempt_worker) |value| {
             try jw.objectField("remote_attempt_worker");
+            try jw.write(value);
+        }
+        if (self.remote_attempt_coordinator) |value| {
+            try jw.objectField("remote_attempt_coordinator");
             try jw.write(value);
         }
         if (self.dense_execution) |value| {
@@ -367,6 +380,8 @@ pub const Config = struct {
     health_enabled: ?bool = null,
     /// Port for the health/metrics server. Defaults to 4200.
     health_port: ?i64 = null,
+    /// Delay between background metrics collections. Scraping does not trigger collection. Lower intervals improve observation freshness at the cost of additional collection work; responses report their actual sample age.
+    health_metrics_interval_ms: ?u32 = null,
     admission: ?AdmissionConfig = null,
     graph_execution: ?GraphExecutionConfig = null,
     mcp: ?McpConfig = null,
@@ -426,6 +441,7 @@ pub const Config = struct {
         .{ "log", "log", false },
         .{ "health_enabled", "health_enabled", true },
         .{ "health_port", "health_port", true },
+        .{ "health_metrics_interval_ms", "health_metrics_interval_ms", true },
         .{ "admission", "admission", true },
         .{ "graph_execution", "graph_execution", true },
         .{ "mcp", "mcp", true },
@@ -487,6 +503,10 @@ pub const Config = struct {
         }
         if (self.health_port) |value| {
             try jw.objectField("health_port");
+            try jw.write(value);
+        }
+        if (self.health_metrics_interval_ms) |value| {
+            try jw.objectField("health_metrics_interval_ms");
             try jw.write(value);
         }
         if (self.admission) |value| {
@@ -1718,10 +1738,14 @@ pub const InferenceConnectionVariant = struct {
 
 /// Opt-in request/planning envelope held through transport drain. Totals include a nonborrowable readiness/control partition. Transport framing and durable session state use separate bounded pools. Zero requests disables the envelope and requires zero retained bytes.
 pub const IngressAdmissionConfig = struct {
-    max_requests: ?i64 = null,
-    max_retained_bytes: ?i64 = null,
-    control_requests: ?i64 = null,
-    control_retained_bytes: ?i64 = null,
+    max_requests: ?u32 = null,
+    max_retained_bytes: ?u64 = null,
+    control_requests: ?u32 = null,
+    control_retained_bytes: ?u64 = null,
+    /// Nonborrowable ingress slots for authenticated bounded recovery/control RPCs, inside max_requests. Zero disables this partition.
+    recovery_requests: ?i64 = null,
+    /// Nonborrowable recovery/control ingress bytes, inside max_retained_bytes. Requires recovery_requests and at least 65536 bytes when enabled.
+    recovery_retained_bytes: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -1729,6 +1753,8 @@ pub const IngressAdmissionConfig = struct {
         .{ "max_retained_bytes", "max_retained_bytes", true },
         .{ "control_requests", "control_requests", true },
         .{ "control_retained_bytes", "control_retained_bytes", true },
+        .{ "recovery_requests", "recovery_requests", true },
+        .{ "recovery_retained_bytes", "recovery_retained_bytes", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1755,6 +1781,14 @@ pub const IngressAdmissionConfig = struct {
         }
         if (self.control_retained_bytes) |value| {
             try jw.objectField("control_retained_bytes");
+            try jw.write(value);
+        }
+        if (self.recovery_requests) |value| {
+            try jw.objectField("recovery_requests");
+            try jw.write(value);
+        }
+        if (self.recovery_retained_bytes) |value| {
+            try jw.objectField("recovery_retained_bytes");
             try jw.write(value);
         }
         try jw.endObject();
@@ -2231,14 +2265,65 @@ pub const ReadExecutionConfig = struct {
     }
 };
 
+/// Opt-in durable remote read ownership. Requires stable node identity, internal authentication, and a continuous durable session store; unavailable or unsupported workers never downgrade to unaccounted execution.
+pub const RemoteAttemptCoordinatorConfig = struct {
+    max_attempts: ?u32 = null,
+    max_bytes: ?u64 = null,
+    max_destination_attempts: ?u32 = null,
+    max_destinations: ?u32 = null,
+    max_run_ms: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_attempts", "max_attempts", true },
+        .{ "max_bytes", "max_bytes", true },
+        .{ "max_destination_attempts", "max_destination_attempts", true },
+        .{ "max_destinations", "max_destinations", true },
+        .{ "max_run_ms", "max_run_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_attempts) |value| {
+            try jw.objectField("max_attempts");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        if (self.max_destination_attempts) |value| {
+            try jw.objectField("max_destination_attempts");
+            try jw.write(value);
+        }
+        if (self.max_destinations) |value| {
+            try jw.objectField("max_destinations");
+            try jw.write(value);
+        }
+        if (self.max_run_ms) |value| {
+            try jw.objectField("max_run_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Opt-in durable join-row worker deduplication and generation fencing. Requires the node's durable API session backend and internal service authentication. Journal bytes include active and uncertain attempts, terminal tombstones and coordinator fences. Coordinator dispatch is not enabled by this setting. Unknown prior incarnations remain charged.
 pub const RemoteAttemptWorkerConfig = struct {
     /// Zero disables worker execution under the attempt protocol.
-    max_attempts: ?i64 = null,
+    max_attempts: ?u32 = null,
     /// Journal reservation ceiling; enabled workers require at least 4096 bytes.
-    max_bytes: ?i64 = null,
+    max_bytes: ?u64 = null,
     /// Local execution budget ceiling; expiry never certifies quiescence.
-    max_run_ms: ?i64 = null,
+    max_run_ms: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
