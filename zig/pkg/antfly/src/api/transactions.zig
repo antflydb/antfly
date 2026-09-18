@@ -3039,6 +3039,30 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
         defer alloc.free(bindings);
         try out.appendSlice(alloc, bindings);
     }
+    if (trusted) {
+        // Private durable dependencies are distinct from the public read set.
+        // Savepoints and recovery use this same encoding; public bodies cannot
+        // supply these observations or receive their physical content digests.
+        try out.appendSlice(alloc, ",\"observed_predicates\":{");
+        for (req.tables, 0..) |table, i| {
+            if (i != 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, &out, table.table_name);
+            try out.appendSlice(alloc, ":[");
+            for (table.predicates.items, 0..) |predicate, j| {
+                if (j != 0) try out.append(alloc, ',');
+                var version_buf: [20]u8 = undefined;
+                const encoded = try std.json.Stringify.valueAlloc(alloc, .{
+                    .key = predicate.key,
+                    .version = try std.fmt.bufPrint(&version_buf, "{d}", .{predicate.expected_version}),
+                    .digest = predicate.expected_content_digest,
+                }, .{});
+                defer alloc.free(encoded);
+                try out.appendSlice(alloc, encoded);
+            }
+            try out.append(alloc, ']');
+        }
+        try out.append(alloc, '}');
+    }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
@@ -3212,6 +3236,26 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
             const physical = requireString(binding.object, "physical");
             if (logical.len == 0 or physical.len == 0) return error.InvalidTransactionSessionRecord;
             try request.bind(alloc, logical, physical);
+        }
+    }
+    if (value.object.get("observed_predicates")) |observations| {
+        if (observations != .object) return error.InvalidTransactionSessionRecord;
+        var entries = observations.object.iterator();
+        while (entries.next()) |entry| {
+            const table = for (request.tables) |*table| {
+                if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
+            } else return error.InvalidTransactionSessionRecord;
+            const Stored = struct { key: []const u8, version: []const u8, digest: ?[32]u8 };
+            var parsed = try std.json.parseFromValue([]const Stored, alloc, entry.value_ptr.*, .{});
+            defer parsed.deinit();
+            const predicates = try alloc.alloc(db_mod.types.TransactionVersionPredicate, parsed.value.len);
+            defer alloc.free(predicates);
+            for (predicates, parsed.value) |*predicate, stored| predicate.* = .{
+                .key = stored.key,
+                .expected_version = try parseVersionString(stored.version),
+                .expected_content_digest = stored.digest,
+            };
+            try appendPredicates(alloc, &table.predicates, predicates);
         }
     }
     return request;
@@ -3811,13 +3855,28 @@ fn appendPredicates(
     extras: []const db_mod.types.TransactionVersionPredicate,
 ) !void {
     if (extras.len == 0) return;
+    // One dependency per key, independent of statement count. Never replace an
+    // earlier observation with a newer one: that would bless a lost update.
+    var by_key = std.StringHashMapUnmanaged(usize).empty;
+    defer by_key.deinit(alloc);
+    try by_key.ensureTotalCapacity(alloc, @intCast(predicates.items.len + extras.len));
+    for (predicates.items, 0..) |predicate, i| by_key.putAssumeCapacity(predicate.key, i);
     try predicates.ensureTotalCapacity(alloc, predicates.items.len + extras.len);
     for (extras) |predicate| {
+        if (by_key.get(predicate.key)) |index| {
+            const previous = &predicates.items[index];
+            if (previous.expected_version != predicate.expected_version) return error.VersionConflict;
+            if (previous.expected_content_digest) |digest| {
+                if (predicate.expected_content_digest) |next| if (!std.mem.eql(u8, &digest, &next)) return error.VersionConflict;
+            } else previous.expected_content_digest = predicate.expected_content_digest;
+            continue;
+        }
         predicates.appendAssumeCapacity(.{
             .key = try alloc.dupe(u8, predicate.key),
             .expected_version = predicate.expected_version,
             .expected_content_digest = predicate.expected_content_digest,
         });
+        by_key.putAssumeCapacity(predicates.items[predicates.items.len - 1].key, predicates.items.len - 1);
     }
 }
 
@@ -5621,4 +5680,33 @@ test "transaction catalog binding clone releases partial allocations" {
     defer request.deinit(alloc);
     try request.bind(alloc, "docs", "table:original");
     try std.testing.checkAllAllocationFailures(alloc, checkCatalogBoundRequestClone, .{request});
+}
+
+test "distributed txn session observed predicates survive private persistence without public injection or duplicate growth" {
+    const alloc = std.testing.allocator;
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[{"table":"docs","key":"a","version":"18446744073709551615"}],"tables":{"docs":{}},"observed_predicates":{"docs":[{"key":"forged","version":"1","digest":null}]}}
+    );
+    defer request.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), request.tables[0].predicates.items.len);
+    const observations = [_]db_mod.types.TransactionVersionPredicate{
+        .{ .key = "a", .expected_version = std.math.maxInt(u64), .expected_content_digest = @splat(255) },
+        .{ .key = "b", .expected_version = 0 },
+    };
+    try appendPredicates(alloc, &request.tables[0].predicates, &observations);
+    const public = try encodeCommitRequest(alloc, request);
+    defer alloc.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "observed_predicates") == null);
+    const stored = try encodeCommitRequestMode(alloc, request, true);
+    defer alloc.free(stored);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    var restored = try parseStoredCommitValue(alloc, parsed.value);
+    defer restored.deinit(alloc);
+    try restored.mergeFrom(alloc, &request);
+    const predicates = restored.tables[0].predicates.items;
+    try std.testing.expectEqual(@as(usize, 2), predicates.len);
+    try std.testing.expectEqual(std.math.maxInt(u64), predicates[0].expected_version);
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(255)), &predicates[0].expected_content_digest.?);
+    try std.testing.expectEqual(@as(u64, 0), predicates[1].expected_version);
 }

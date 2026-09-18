@@ -11,7 +11,7 @@ const types = @import("../storage/db/types.zig");
 
 pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionCommitRequest, updates: []const contract.TableCommitRequest) !void {
     for (updates) |update| {
-        if (update.writes.len == 0 and update.deletes.len == 0) continue;
+        if (update.writes.len == 0 and update.deletes.len == 0 and update.predicates.len == 0) continue;
         for (candidate.tables) |*table| if (std.mem.eql(u8, candidate.physicalName(table.table_name), update.table_name)) {
             var writes: std.ArrayList(types.BatchWrite) = .empty;
             defer writes.deinit(alloc);
@@ -50,7 +50,14 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
         // New cascade participants also receive a server-authored binding;
         // never reinterpret their physical identity as a public table name.
         try candidate.bind(alloc, label, update.table_name);
-        var entry = [_]sessions.TableCommitRequest{.{ .table_name = @constCast(label), .batch = .{ .writes = writes, .deletes = @constCast(update.deletes) } }};
+        // These are observations of the live rows used to derive the staged
+        // result, not observations of the staged result itself. Keep them even
+        // for read-only dependencies and across subsequent statements.
+        var entry = [_]sessions.TableCommitRequest{.{
+            .table_name = @constCast(label),
+            .batch = .{ .writes = writes, .deletes = @constCast(update.deletes) },
+            .predicates = .{ .items = @constCast(update.predicates), .capacity = update.predicates.len },
+        }};
         var binding = [_]sessions.CatalogBinding{.{ .logical = label, .physical = update.table_name }};
         const request: sessions.OwnedTransactionCommitRequest = .{ .tables = &entry, .catalog_bindings = .{ .items = &binding, .capacity = binding.len } };
         try candidate.mergeFrom(alloc, &request);
@@ -119,4 +126,23 @@ test "distributed txn session normalization coalesces catalog aliases and new ca
     try std.testing.expectEqual(@as(usize, 2), result.len);
     for (result) |table| try std.testing.expectEqual(@as(usize, 2), table.writes.len);
     try std.testing.expectEqualStrings("{\"id\":2}", candidate.tables[0].batch.writes[0].value);
+}
+
+test "distributed txn session normalization retains bounded physical observations including read-only dependencies" {
+    const alloc = std.testing.allocator;
+    var candidate = try sessions.parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{}}");
+    defer candidate.deinit(alloc);
+    const observations = [_]types.TransactionVersionPredicate{.{ .key = "child", .expected_version = 42, .expected_content_digest = @splat(7) }};
+    const updates = [_]contract.TableCommitRequest{.{ .table_name = "table:child", .predicates = &observations }};
+    for (0..100) |_| try apply(alloc, &candidate, &updates);
+    var cloned = try candidate.clone(alloc);
+    defer cloned.deinit(alloc);
+    const tables = try cloned.distributedTables(alloc);
+    defer alloc.free(tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqual(@as(usize, 1), tables[0].predicates.len);
+    try std.testing.expectEqual(@as(u64, 42), tables[0].predicates[0].expected_version);
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(7)), &tables[0].predicates[0].expected_content_digest.?);
+    try std.testing.expectError(error.VersionConflict, apply(alloc, &candidate, &.{.{ .table_name = "table:child", .predicates = &.{.{ .key = "child", .expected_version = 43 }} }}));
+    try std.testing.expectError(error.VersionConflict, apply(alloc, &candidate, &.{.{ .table_name = "table:child", .predicates = &.{.{ .key = "child", .expected_version = 42, .expected_content_digest = @splat(8) }} }}));
 }

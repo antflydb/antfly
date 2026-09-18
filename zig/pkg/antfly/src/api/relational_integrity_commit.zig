@@ -125,10 +125,14 @@ const Work = struct {
     key: []const u8,
     before: ?reads.LookupResponse,
     after: ?[]const u8,
+    observed_version: u64 = 0,
+    observed_digest: ?[32]u8 = null,
     assignments: std.StringHashMapUnmanaged(std.json.Value) = .empty,
     queued: bool = false,
     dirty: bool = false,
     explicit: bool = false,
+    // Immutable statement input, before any cascading edge changes `after`.
+    explicit_after: ?[]const u8 = null,
     expansion: ?planner.Expansion = null,
 };
 
@@ -360,6 +364,8 @@ const Builder = struct {
         var old = try self.lookup(table.name, key, .{});
         if (old) |row| if (row.expected_content_digest == null)
             return error.MissingPrimaryObservation;
+        const observed_version = if (old) |row| row.version else 0;
+        const observed_digest = if (old) |row| row.expected_content_digest else null;
         if (self.previousRow(table.name, key)) |overlay| {
             const version = if (old) |row| row.version else 0;
             const digest = if (old) |row| row.expected_content_digest else null;
@@ -367,7 +373,7 @@ const Builder = struct {
         }
         try self.charge(key.len + if (old) |row| row.json.len else @as(usize, 0));
         const item = try self.alloc.create(Work);
-        item.* = .{ .table = table, .key = try self.alloc.dupe(u8, key), .before = old, .after = if (old) |row| row.json else null };
+        item.* = .{ .table = table, .key = try self.alloc.dupe(u8, key), .before = old, .after = if (old) |row| row.json else null, .observed_version = observed_version, .observed_digest = observed_digest };
         try self.work.append(self.alloc, item);
         try self.by_row.put(self.alloc, identity, item);
         return item;
@@ -409,7 +415,7 @@ const Builder = struct {
         // Explicit moves sever their old relationship. A row already moved by
         // another cascading edge still participates in its original edges, so
         // contradictory cascades are detected rather than silently skipped.
-        const json = if (!final_row and !item.explicit and item.before != null) item.before.?.json else after;
+        const json = if (final_row) after else if (item.explicit) item.explicit_after orelse return false else if (item.before) |before| before.json else after;
         const view = item.table.view;
         var row = try mapper.PreparedRelationalWrite.init(self.alloc, item.key, json, if (item.explicit) view.validator() else null, view.tableSchema().*, view.physicalLayout());
         defer row.deinit(self.alloc);
@@ -840,12 +846,29 @@ fn prepareModeInternal(alloc: Allocator, source: reads.TableReadSource, metadata
             const item = try builder.getWork(table, entry.key_ptr.*);
             item.explicit = true;
             item.after = entry.value_ptr.*;
+            item.explicit_after = item.after;
             if (item.after) |json| {
                 try builder.charge(json.len);
                 const parsed = try std.json.parseFromSlice(std.json.Value, builder.alloc, json, .{ .allocate = .alloc_always, .parse_numbers = false });
                 if (parsed.value != .object) return error.InvalidBatchRequest;
+                const before = if (item.before) |row| (try std.json.parseFromSliceLeaky(std.json.Value, builder.alloc, row.json, .{ .parse_numbers = false })).object else null;
                 var fields = parsed.value.object.iterator();
-                while (fields.next()) |field| try item.assignments.put(builder.alloc, field.key_ptr.*, field.value_ptr.*);
+                while (fields.next()) |field| {
+                    // Replacements carry unchanged fields too. Only a logical
+                    // change constrains cascade assignment. Compare scalar FK
+                    // columns with row coercions, not JSON spelling; complex
+                    // fields cannot participate in an FK and need no comparison.
+                    if (before) |old| {
+                        const columns = table.view.tableSchema().relational_columns;
+                        if (table.view.physicalLayout().ordinalForName(columns, field.key_ptr.*)) |ordinal| switch (columns[ordinal].column_type) {
+                            .integer, .number, .datetime, .boolean, .string, .blob => {
+                                if (try assignmentEqual(table, field.key_ptr.*, old.get(field.key_ptr.*) orelse .null, field.value_ptr.*)) continue;
+                            },
+                            else => {},
+                        };
+                    }
+                    try item.assignments.put(builder.alloc, field.key_ptr.*, field.value_ptr.*);
+                }
             }
             try builder.enqueue(item);
         }
@@ -877,7 +900,7 @@ fn prepareModeInternal(alloc: Allocator, source: reads.TableReadSource, metadata
     for (builder.work.items) |item| {
         if (!item.dirty) continue;
         const i = try builder.outputIndex(item.table.name, item.table.view.version());
-        try builder.appendPredicate(i, item.key, if (item.before) |row| row.version else 0, if (item.before) |row| row.expected_content_digest else null);
+        try builder.appendPredicate(i, item.key, item.observed_version, item.observed_digest);
         if (item.after) |json| try final_writes[i].append(builder.alloc, .{ .key = item.key, .value = json }) else try final_deletes[i].append(builder.alloc, item.key);
         // This arena is owned transitively by the returned request arena.
         const expansion = try builder.expandWork(item);
@@ -897,7 +920,7 @@ fn prepareModeInternal(alloc: Allocator, source: reads.TableReadSource, metadata
     for (builder.final_references.items) |pending| {
         if (!try builder.childStillReferences(pending.child, pending.definition, pending.address, true)) continue;
         const child_index = try builder.outputIndex(pending.child.table.name, pending.child.table.view.version());
-        try builder.appendPredicate(child_index, pending.child.key, if (pending.child.before) |row| row.version else 0, if (pending.child.before) |row| row.expected_content_digest else null);
+        try builder.appendPredicate(child_index, pending.child.key, pending.child.observed_version, pending.child.observed_digest);
         try builder.appendCommand(pending.definition.parent_table, .{ .address = pending.address, .operation = .{ .detach = pending.reference } });
         try builder.appendCommand(pending.definition.parent_table, .{ .address = pending.address, .operation = .{ .attach = pending.reference } });
     }
@@ -905,7 +928,7 @@ fn prepareModeInternal(alloc: Allocator, source: reads.TableReadSource, metadata
         var dependency = pending.dependency;
         dependency.after = pending.child.after;
         const child_index = try builder.outputIndex(pending.child.table.name, pending.child.table.view.version());
-        try builder.appendPredicate(child_index, pending.child.key, if (pending.child.before) |row| row.version else 0, if (pending.child.before) |row| row.expected_content_digest else null);
+        try builder.appendPredicate(child_index, pending.child.key, pending.child.observed_version, pending.child.observed_digest);
         try builder.appendPartial(dependency);
     }
     if (validate_statement) try builder.validateStatement();

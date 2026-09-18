@@ -11698,7 +11698,10 @@ pub const ApiHttpServer = struct {
         const a = arena.allocator();
         var names: std.ArrayList([]const u8) = .empty;
         for (tables) |table| {
-            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0) continue;
+            // Sessions retain predicate-only dependencies too. Give those the
+            // same catalog identity and authorization as other participants.
+            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0 and
+                (candidate == null or table.predicates.len == 0)) continue;
             try names.append(a, table.table_name);
         }
         var revision: ?u64 = null;
