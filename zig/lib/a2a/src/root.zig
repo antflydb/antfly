@@ -220,6 +220,16 @@ pub const InMemoryTaskStore = struct {
         return .{ .alloc = alloc, .io = io, .options = options };
     }
 
+    /// Install before publishing the store. Even an empty map can retain
+    /// capacity allocated by the previous allocator after its last task expires.
+    pub fn installAllocator(self: *InMemoryTaskStore, alloc: std.mem.Allocator) !void {
+        const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.authorities.capacity() != 0) return error.A2aTaskStoreAlreadyAllocated;
+        self.alloc = alloc;
+    }
+
     pub fn deinit(self: *InMemoryTaskStore, fallback_alloc: std.mem.Allocator) void {
         const alloc = self.alloc orelse fallback_alloc;
         const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
@@ -696,7 +706,8 @@ pub const Dispatcher = struct {
         defer arena_impl.deinit();
         const temp_alloc = arena_impl.allocator();
 
-        const request = std.json.parseFromSliceLeaky(std.json.Value, temp_alloc, body, .{}) catch {
+        const request = std.json.parseFromSliceLeaky(std.json.Value, temp_alloc, body, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
             return try stringifyValue(alloc, try errorResponse(temp_alloc, .null, -32700, "parse error"));
         };
         if (request != .object) {
@@ -762,7 +773,8 @@ pub const Dispatcher = struct {
         defer arena_impl.deinit();
         const temp_alloc = arena_impl.allocator();
 
-        const request = std.json.parseFromSliceLeaky(std.json.Value, temp_alloc, body, .{}) catch {
+        const request = std.json.parseFromSliceLeaky(std.json.Value, temp_alloc, body, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
             try sink.emit(alloc, try errorResponse(temp_alloc, .null, -32700, "parse error"));
             return;
         };
@@ -1598,4 +1610,55 @@ test "a2a task store rejects oversized records and identifiers" {
         error.InvalidTaskId,
         store.iface().reserve(arena, "principal:alice", "identifier-too-long", .null),
     );
+}
+
+test "a2a task store refuses allocator changes after retained map allocation" {
+    const alloc = std.testing.allocator;
+    var store = InMemoryTaskStore.init(alloc);
+    defer store.deinit(alloc);
+    try store.installAllocator(alloc);
+    const generation = try store.iface().reserve(alloc, "authority", "task", .null);
+    store.iface().release("authority", "task", generation);
+    try std.testing.expectEqual(@as(usize, 0), store.task_count);
+    try std.testing.expect(store.authorities.capacity() > 0);
+    try std.testing.expectError(error.A2aTaskStoreAlreadyAllocated, store.installAllocator(alloc));
+}
+
+test "a2a parse allocation failure remains exhaustion without protocol output" {
+    const OnceFailing = struct {
+        failed: bool = false,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn allocate(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.failed) {
+                self.failed = true;
+                return null;
+            }
+            return std.testing.allocator.rawAlloc(len, alignment, ret);
+        }
+        fn resize(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) bool {
+            return std.testing.allocator.rawResize(bytes, alignment, len, ret);
+        }
+        fn remap(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) ?[*]u8 {
+            return std.testing.allocator.rawRemap(bytes, alignment, len, ret);
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ret);
+        }
+    };
+    const Sink = struct {
+        fn emit(_: *anyopaque, _: std.mem.Allocator, _: std.json.Value) !void {
+            return error.UnexpectedProtocolOutput;
+        }
+    };
+    var dispatcher = Dispatcher{ .io = std.Io.Threaded.global_single_threaded.io() };
+    defer dispatcher.deinit(std.testing.allocator);
+    var buffered_alloc = OnceFailing{};
+    // Later allocations succeed, so swallowing the parse failure would produce
+    // a successful JSON-RPC parse-error response instead of exhaustion.
+    try std.testing.expectError(error.OutOfMemory, dispatcher.handleJsonRpc(buffered_alloc.allocator(), "{\"method\":\"tasks/get\"}"));
+    var stream_alloc = OnceFailing{};
+    try std.testing.expectError(error.OutOfMemory, dispatcher.handleJsonRpcStream(stream_alloc.allocator(), "{\"method\":\"message/stream\"}", .{ .ptr = undefined, .emit_fn = Sink.emit }));
 }
