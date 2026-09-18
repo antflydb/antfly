@@ -448,3 +448,41 @@ separate gate does not import the renderer fixture.
 The allocator-provenance prerequisite is integrated as `05bd7c5b0e`; its
 [scope and measured structure overhead](WORKLOAD_LSM_COMPLETION.md) remain
 explicit. It does not activate backend completion credits or durable tickets.
+
+
+### Native response-loss and distinct-destination evidence
+
+The production Debug build at product revision `05bd7c5b0e` exited zero. Its
+frozen binary SHA-256 is
+`f37e9cf92b8fc5299136a10432b540b6e1823d69e820085ae8f36ded7be00c91`;
+receipt: `/tmp/workload-recovery-05bd-production-debug-receipt.json`.
+
+The fresh reconciliation run passed initial exact lookup and the strict fresh
+metrics gate. Its first injected response loss then failed: the expected HTTP
+503 became HTTP 500 (`DistributedQueryUnavailable` escaped the public lookup
+adapter). The worker had returned a valid signed HTTP 200 for coordinator 3,
+generation 2, sequence 2. The relay observed all 814 response bytes and discarded
+them all; none were forwarded. The preceding sequence 1 response was forwarded
+normally. No threshold or expected status was relaxed.
+
+Evidence: `/tmp/workload-reconciliation-05bd7c5b0e-receipts`, with all 20 checksums
+verified. The independent checker verified four request-associated signed
+proofs (discovery, initial fence and two terminals), with zero errors:
+`/tmp/workload-reconciliation-05bd7c5b0e-receipts-proof-check.json`.
+This proves worker termination and relay-observed response loss. It does not
+prove the coordinator received the discarded response or retired its record.
+The run stopped before debt sampling, healing or restart closure; all three
+processes exited zero, with no cleanup errors or schedule violations.
+
+Commit `ae31b25866` adds a separate four-process destination-isolation wrapper.
+Its setup-only run on the frozen `04c5f3da89` Debug binary passed:
+`/tmp/workload-destination-04c5f3da89-setup2`, all 24 checksums verified.
+Two tables had distinct actual single-voter leader groups on destinations 4 and
+2, confirmed by metadata store reports and matching advertised-proxy group
+paths. Both seeded document lookups returned their exact expected values.
+All four processes exited zero. This setup-only result does not qualify fault
+isolation. Full mode requires loss on one destination while three reads on the
+other succeed, fresh coordinator debt samples, and retirement after healing.
+The coordinator has two total attempts and one per destination. An earlier
+setup fixture expected table-space creation status 200 instead of the actual
+201; that failed receipt remains preserved, and setup2 used a fresh lifecycle.
