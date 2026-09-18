@@ -7,7 +7,7 @@ The current implementation provides fixed foreground admission with opt-in
 bounded waiting, shared read driver/helper scheduling, and bounded SDK read
 retries. Audited dense I/O and streamed scans can suspend with prepaid state;
 narrow LMDB existence probes have an opt-in protected partition. Opt-in internal read workers and coordinator dispatch have durable attempt
-ownership; the new integration is undergoing local fault qualification. These stages do not complete the operator scheduling design
+ownership; local response-loss, restart, and destination-isolation scenarios now pass. These stages do not complete the operator scheduling design
 or qualify new defaults.
 
 ## Review order
@@ -555,7 +555,7 @@ release qualification.
 | --- | --- |
 | Ownership/progress prerequisite | Typed ledger, scheduler, allocator, and attempt state models are implemented and tested; complete operator inventory and process-wide progress proof remain open |
 | Phase 1 | Fixed foreground waiting, contextual allocation ownership, deadlines, overload diagnostics, and SDK contracts are integrated on the paths above; frontend ingress/planning/output ownership and empty-probe floors are integrated; process-wide execution/cleanup floors remain open |
-| Phase 2 | Dense driver/helper ownership, exact working bytes, one pinned-executor I/O boundary, session recovery bounds, and opt-in durable join-row workers are integrated; shared coarse reads, protected existence probes, measured pinned work, demotion and scan suspension are integrated; opt-in coordinator ownership and protected recovery mechanisms are implemented but awaiting full local fault qualification; further cooperative operators and complete write/index memory proof remain open |
+| Phase 2 | Dense driver/helper ownership, exact working bytes, one pinned-executor I/O boundary, session recovery bounds, and opt-in durable join-row workers are integrated; shared coarse reads, protected existence probes, measured pinned work, demotion and scan suspension are integrated; opt-in coordinator ownership passes local response-loss, worker/API restart, and destination-isolation qualification; protected recovery mechanisms and broader fault coverage remain partial; further cooperative operators and complete write/index memory proof remain open |
 | Phase 3 | SDK pools/retries, engine diagnostics, and qualification tooling exist; native pressure qualification, optimized release qualification, Cloud integration, sizing/defaults, and adaptive policy remain open |
 
 - Audit the tested ownership foundations against real continuation, remote
