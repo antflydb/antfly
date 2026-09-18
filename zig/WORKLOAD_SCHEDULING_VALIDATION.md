@@ -335,3 +335,37 @@ quiescence guard (`NativeBackupRepairStateNotQuiescent`), with zero leaks;
 therefore the storage-owner gate is **not passed**. Evidence:
 `/tmp/workload-storage-bulk-context.log` and
 `/tmp/workload-storage-bulk-final.log`. No backup guard was weakened.
+
+
+### Compiled callbacks and native deadlines
+
+The independently compiled read-handle regression passed at `b6dfbb8409`,
+including distinct error ordinals and missing-key `NotFound` through reads,
+probes, scopes and forks. The production Debug rebuild passed with SHA-256
+`0e3e5b0d0a2e51a3f4287daf5aca9b26bad935e50e64eb6643609c82d1d9c6f5`
+(`/tmp/workload-recovery-b6-production-debug-receipt.json`). The combined gate
+then passed its 213-test request/runtime artifact and 64-test metadata artifact,
+with one optional skip and zero failures/leaks
+(`/tmp/workload-recovery-coordination-checkpoint14.log`). These counts overlap.
+
+The next native reconciliation cell reached the worker, which returned a signed
+HTTP 504 after approximately 11 ms on a healthy read. Bounded response capture
+confirmed the complete `request deadline exceeded` response originated at the
+worker. Evidence: `/tmp/workload-worker-response-b6dfbb8409-receipts`.
+The cause is a missing native-to-catalog clock translation in provisioned route
+fence validation; its targeted fix is under validation. The reconciliation cell
+has therefore not passed yet.
+
+A second independently compiled regression proved that reverse replay callbacks
+also mistranslated private consumer errors. Commit `9c834c7d45` keeps those errors
+in the consumer's synchronous stack and sends only a stable stop bit across the
+boundary. The two compiled callback tests passed with zero leaks; the negative
+and fixed receipts are `/tmp/workload-replay-callback-private-before.log` and
+`/tmp/workload-replay-callback-after.log`. ABI versions are now API 29, storage 67,
+and native callback 11; an integrated rebuild is still required for this change.
+
+The exact proposal-guard test (`d542ed4854`) passed: missing or older decoder
+activation rejects both single and batch policy proposals without advancing the
+Raft log, and matching activation allows policy-preserving publication. Its
+metadata artifact runs 123 tests after instantiating the HTTP-service fixture,
+all passing without leaks (`/tmp/workload-metadata-proposal-activation.log`).

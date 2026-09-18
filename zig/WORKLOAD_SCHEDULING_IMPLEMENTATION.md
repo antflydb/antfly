@@ -26,6 +26,7 @@ main contracts and representative commits, rather than an exhaustive history.
 | Recovery and remote workers | Reserve durable obligations before prepare; authenticate attempts; persist opt-in worker deduplication and generation closure | `341f08a8b5`, `43ed43cabd`, `0d07db7932`, `b11a01530b`, `7fc30a22ef` |
 | API replay and storage recovery | Prepaid replay; two protected memory lanes; durable table recovery credits and guarded legacy completion | `de95b61f4f`, `bd0b9f5585`, `38bfa197af` |
 | Retained joins and distributed integration | Bounded persistent join state, allocation-failure cleanup, protocol-3 coordinator/worker ownership, protected control ingress, compiled runtime configuration | `48baab7337`, `63f2eb025f` |
+| Native integration corrections | Table recovery-policy persistence and decoder activation; error-safe read handles and reverse replay visitors across compiled boundaries | `c10e602778`, `b6dfbb8409`, `9c834c7d45` |
 | Local fault and policy plans | Advertised transport faults, signed fixture evidence, separate actual candidate policies and scaled correctness topology | `c6122532ea`, `1018036e1d`, `121d96fbf3` |
 | Runtime pressure | Defer background submissions on finite executor pressure; preserve admission failures across the compiled callback ABI | `9511272560`, `2be51d61ad` |
 | Evidence and operations | Retained native/container harness, vector calibration, numerical Cloud gates, explicit failure outcomes and telemetry validation | `ebe085a24d`, `0f9a1a05f2`, `dff1a3d9f7`, `0c9395fc32`, `fc2d5878ec`, `f550aefaf0`, `811956a541`, `c6ad0692ec`, `488637eb6b` |
@@ -143,6 +144,29 @@ and coordination checkpoint passed 206 tests with one optional skip and the same
 zero-failure/leak result. Production transport fault tests, backend completion
 credits, sustained-load progress, and release performance qualification remain
 separate work.
+
+### Backend completion boundary still to implement
+
+The protected row/metadata lanes above reserve preparation and recovery-record
+work. They do not reserve the full physical LSM write. `CompletionCredit`
+(`f8c71099cd`) supplies atomic accounting transfer into retained ownership, but
+is deliberately not activated in the write path yet.
+
+The next backend stage must charge incoming and copy-on-write candidate memory
+before allocation, retain that ownership until the final snapshot reader frees
+it, and avoid counting the same allocation in both the credit and the backend
+observer. WAL, manifest and flush capacity must remain admitted. A backend-only
+point-batch stage cannot promise mandatory transaction completion until those
+other domains also have prepaid capacity.
+
+A public completion ticket must be stored atomically with intents and the
+prepared vote, bound to transaction revision, schema, backend namespace and a
+sealed physical write plan. The plan must include identity, timestamp, replay
+and derived-index writes. Startup must reconstruct its reservations before
+foreground admission; replicas must not reject a committed prepare because
+ordinary local capacity is exhausted. Unsupported plans must be rejected before
+the prepared vote. These are implementation requirements, not guarantees of the
+current opt-in recovery policy.
 
 ## Implemented admission contract
 
