@@ -4061,6 +4061,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "linked inference ABI rejects mismatched context and function-table prefixes",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
             "standalone resolves the default secret store before full config parsing",
+            "standalone runtime secret store follows projected symlink rotation",
+            "standalone runtime secret store writes preserve symlinks across target rotation",
+            "standalone default secret store follows projected symlink rotation",
             "embedded provider lifetime rejects new calls and joins admitted calls",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
@@ -5276,10 +5279,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     };
     const unit_storage_db_core_shard_index = 3;
-    // Recent CI timings put these DB categories at 279 seconds and the
-    // complement at 297 seconds. Run the two halves from one compiled DB-core
-    // artifact so the dominant shard gets parallel runtime without duplicating
-    // its expensive semantic analysis and code generation.
+    // CI run 35277188581 measured the previous lanes at 232s / 887s.
+    // Moving relational columnar and source-vector cases to the category lane
+    // balances the recorded work without another compiler or test process.
+    // The complement excludes these same filters, preserving unique execution.
     const unit_storage_db_core_lane_filters = [_][]const u8{
         "db restore",
         "db explicit doc-id",
@@ -5287,6 +5290,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db document",
         "db dense",
         "db split",
+        "relational columnar",
+        "source vector",
+    };
+    // Nested imported test names contain storage.db.db and survive its compile
+    // filter. The enrichment owner already executes them in storage-support,
+    // including when this standalone gate runs without aggregate ownership rules.
+    const unit_storage_db_core_skip_filters = [_][]const u8{
+        "storage.db.enrichment.enrichment_runtime.test.",
     };
     const unit_storage_recall_filters = [_][]const u8{"HBC recall"};
     const unit_storage_sharded_test_step = b.step(
@@ -5438,6 +5449,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_storage_compile_step.dependOn(&unit_storage_engine_tests.step);
     unit_storage_compile_step.dependOn(&unit_storage_db_core_tests.step);
 
+    // Zig 0.16's eager Group.async fallback can enter a long Run step while
+    // still dispatching ready compiler siblings. At -j2 this left DB-core
+    // uncompiled for the entire support run despite an idle build worker.
+    // Finish the existing compilation set before entering default unit runs.
+    if (storage_runtime_filter_is_default)
+        run_unit_storage_support_tests.step.dependOn(unit_storage_compile_step);
+
     // Keep an explicit, opt-in equivalence check for future changes to these
     // groupings. It compiles the former seven-artifact layout and compares the
     // union of declared named tests with the default three-artifact layout.
@@ -5507,6 +5525,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // one scheduler-visible step that launches both filtered DB processes,
         // preserving one compile while realizing the overlap.
         const run_db_core_partitioned_tests = b.addSystemCommand(&.{"python3"});
+        run_db_core_partitioned_tests.step.dependOn(unit_storage_compile_step);
         run_db_core_partitioned_tests.setName("run test storage-db-core-tests partitioned");
         run_db_core_partitioned_tests.addFileArg(b.path("tools/run_test_partitions.py"));
         run_db_core_partitioned_tests.addArg("--executable");
@@ -5521,6 +5540,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
         }
         for (release_scale_test_filters) |filter| {
+            run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
+        }
+        for (unit_storage_db_core_skip_filters) |filter| {
             run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
         }
         if (b.args) |runtime_args| {
@@ -5543,7 +5565,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             true,
             &lib_unit_default_filters,
             &root_test_skip_filters,
-            &.{},
+            &unit_storage_db_core_skip_filters,
             false,
         );
         unit_test_step.dependOn(&run_unit_storage_db_core_tests.step);

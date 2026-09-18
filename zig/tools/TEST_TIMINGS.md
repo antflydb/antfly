@@ -150,3 +150,24 @@ the original named-test union, and fails on repeated names. Inspect
 `zig-out/unit-test-inventory.json` for each test's owner. Anonymous `.test_0`
 reachability probes are preserved but excluded from name-based comparisons.
 The audit queries metadata/listing modes; it does not execute test bodies.
+
+The wide-vector update/reopen, relational selection/reference scan, and reopened
+PageRank scheduler fixtures also emit cumulative phase durations with
+`ANTFLY_TEST_WORK_PROFILE=1`. The overwrite fixture emits flush, compaction, and
+manifest work counts. See [CI_STORAGE_FOLLOWUP.md](CI_STORAGE_FOLLOWUP.md) for
+interpretation and the post-merge suite reassessment.
+
+### Backtraces and storage group measurements
+
+Graph-runtime, HBC, vector-payload and algebraic-index fixtures use a shared
+leak-checking DebugAllocator without allocation/free stack traces by default.
+Set `ANTFLY_TEST_ALLOCATOR_TRACES=1` to restore traces when diagnosing ownership
+failures. This setting does not disable leak detection or failure injection.
+
+For a compiled storage-support binary, compare the same filters and repeat on
+an otherwise idle machine. Preserve unit exclusions when using a diagnostic
+binary compiled with broader filters (`--skip-test-filter 'production scale'`).
+`ANTFLY_TEST_WORK_PROFILE=1` reports payload failure-sweep attempt counts and
+HBC routing/centroid work in addition to the phase timings. Tight wall-clock
+limits are intentionally absent from correctness assertions. See
+[the storage follow-up](CI_STORAGE_FOLLOWUP.md) for measurements and work contracts.

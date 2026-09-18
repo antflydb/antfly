@@ -630,3 +630,10 @@ regressions: 17,472 baseline executions became 16,508 executions of the same
 16,508 distinct names, with zero lost, added, or duplicated tests. These are local
 macOS counts; the failed Linux CI inventory reported 16,506 distinct names.
 The audit-tool and partition-tool Python checks also passed (eight tests).
+
+## Post-merge storage follow-up
+
+[CI_STORAGE_FOLLOWUP.md](CI_STORAGE_FOLLOWUP.md) records the next six workload
+profiles, the shutdown-wakeable durable-job reaper, three additional trace-free
+fixtures, and rebalancing of the existing DB-core execution lanes. Original
+fixture sizes and scale exclusions are preserved.
