@@ -13,15 +13,19 @@ first such review.
 
 | Artifact | Backbone | Precision | Backend | Status |
 | --- | --- | --- | --- | --- |
-| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | native | Qualified |
-| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | metal | Qualified |
+| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | native | Qualified (single-window) |
+| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | metal | Qualified (single-window) |
+| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | native | Qualified (long-document windowing, up to 99,008 document bytes -- section 9) |
+| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | metal | Qualified (long-document windowing, up to 99,008 document bytes -- section 9) |
 | `fastino/gliner2.5-small-v1` | small | any | any | Not reviewed |
 | `fastino/gliner2.5-multi-v1` | multi | any | any | Not reviewed |
 | Any other digest, revision, or precision of `gliner2.5-base-v1` | base | any | any | Not reviewed |
 
 `gliner_boundary.runtime_available` is now `true`, and
 `gliner_boundary_qualification.zig`'s production table carries exactly the
-two rows above (same identity, native and Metal). Everything else --
+four rows above (same identity; single-window and long-document rows are
+separate features/bounds, each reviewed for native and Metal). Everything
+else --
 including a re-downloaded `gliner2.5-base-v1` whose upstream revision
 changes, or a quantized/GGUF conversion of it -- still fails closed with
 `error.UnsupportedGlinerBoundaryRuntime` at request time, and pull-time
@@ -313,6 +317,191 @@ change the outcome in testing), so operators embedding this checkpoint
 in-process cannot currently raise these specific generation budgets the way
 `antfly inference run`'s CLI flags allow. That gap is in the embedded
 worker/`antflylite` configuration surface, outside this file's ownership.
+
+### 9. Follow-up: long-document windowing qualified for the real dogfood schema
+
+Section 8 widened the single-window bound to `document_bytes<=610` for the
+real dogfood schema, but recorded that most of `examples/dogfood`'s
+longer design-doc sections still needed long-document windowing, which
+remained unqualified (`.long_document` was not in the feature set) and
+correctly failed closed with `error.UnsupportedGlinerBoundaryRuntime`. This
+section qualifies it.
+
+**Design already in place.** `extractors/gliner_boundary_long_executor.zig`
+(landed with the boundary architecture in PR #720) already implements
+windowed execution: overlapping windows sized to the checkpoint's own
+declared per-window body-word capacity (`config.max_len` = 4096 words for
+the base backbone, matching the wire's own `long_document.window_words`
+default), offsets mapped back to whole-document coordinates
+(`gliner_boundary_long_document.zig`'s `Plan`/`rebaseSource`), entities
+deduplicated across overlapping windows (`mergeMentions`), and relations
+resolved only when both endpoints fall in one window and then merged/
+deduplicated document-wide (`gliner_boundary_long_relations.zig`). Model
+tensors (encoder/head activations) are freed after every window; only
+bounded scalar evidence survives to the next, so one window's memory
+profile is independent of document length, and cumulative admission
+(`Limits.max_total_encoded_tokens`/`max_total_attention_work`) bounds total
+work across the whole document regardless of window count. This section's
+job was purely to measure and review this existing design against real
+long documents, not to build it.
+
+**Document-size bound.** Section boundaries in this repository come from
+`docsaf.MarkdownProcessor` (one section per Markdown heading, no minimum
+merge threshold as `examples/dogfood` configures it -- see
+`examples/dogfood/ingest.go`). A survey of every such section under
+`zig/*.md` and `work-log/**/*.md` (2,355 sections) found: p50 = 982 bytes,
+p90 = 4,378, **p95 = 7,285**, p99 = 23,428, **max = 99,008** (`zig/PDF.md`'s
+"Review findings and required fixes"). This matches the follow-up brief's
+"typical sections are 1-8 KB, some are 20-90 KB" characterization.
+
+**Geometry.** `extractors/gliner_boundary_qualification.zig`'s new
+`"gliner boundary qualification measures pinned base checkpoint
+long-document production geometry"` test tokenizes and plans (no model
+weights) real sections through the long executor's window planner, with
+`long_document.mode=window` and the wire's default window/overlap words
+(4096/128), against the real dogfood schema (11 entities, 6 relations):
+
+- The two short single-window-shaped fixtures from section 3 (still sent
+  with `long_document.mode=window`, since `examples/dogfood` now requests
+  it unconditionally -- see below), producing exactly one window each.
+- `zig/pkg/antfly/src/storage/lsm/LSM.md`'s "Read And Scan Work" (6,787
+  bytes, ~p95): 1 window, window_words=1183, padded_sequence_tokens=1455.
+- `zig/VOPR.md`'s "Completion-Claim Audit" (37,143 bytes): 2 windows,
+  window_words=[2139,4096], padded_sequence_tokens=[3131,5708].
+- `zig/PDF.md`'s "Review findings and required fixes" (99,008 bytes, the
+  corpus max): 4 windows, window_words=[3994,4096],
+  padded_sequence_tokens=[4594,4690].
+
+Exact observed range across all cases: `document_bytes=[26,99008]
+document_words=[5,15894] window_count=[1,4] window_words=[5,4096]
+padded_sequence_tokens=[106,5708]`. This is the exact `LengthContract` on
+the new `fastino_gliner25_base_v1_long_document_features` production rows
+(native and Metal) in `models/gliner_boundary_qualification.zig`, with
+features `entities, relations, word_whitespace, overlap_flat, offset_utf8,
+decoder_auto, long_document, record_identity_occurrence, confidence, spans`
+-- exactly `examples/dogfood`'s real schema shape (entities + relations
+only) and nothing wider. This is a separate row from the single-window
+row, not a widening of it: the two require disjoint features
+(`.single_window` vs `.long_document`), so a single-window request cannot
+borrow the long-document row's wider bounds, and vice versa.
+
+**Canonical envelope shape.** The long executor's `mergeAll` builds the
+same `pipeline.Sample` type the single-window executor does, so both are
+serialized by the identical `extraction_v2.zig` `writeSample`/`endpoint`
+code: entities carry `text`/`label`/`start`/`end`/`score`; relations carry
+`type` and `source`/`target` objects resolved to `entity_index` (matched
+against the final deduplicated entities array by exact rebased byte span
+and text) plus `score` -- never the pipeline's internal `head`/`tail`
+value representation. This was exercised end to end, on both backends,
+through both the HTTP handler and the in-process provider entry (matching
+the two real call sites of `extractWithAdmission` from section 8):
+
+- `"gliner boundary long executor HTTP canonical schema_version 2 shape for
+  a real multi-window document with relations native/Metal"`
+  (`server/gliner_boundary_service_test.zig`): a real HTTP `/ai/v1/extract`
+  request against `zig/VOPR.md`'s "Completion-Claim Audit" (37KB, 2
+  windows), asserting every entity and relation in the response matches the
+  canonical shape and that no `head`/`tail` key ever appears.
+- `"gliner boundary long executor provider extractDirect canonical
+  schema_version 2 relations shape for a windowed request native/Metal"`:
+  the same assertions through `Node.extractDirect`, the entry point the
+  in-process/embedded worker actually calls.
+
+Both passed on native and Metal (`zig build inference-test -Doptimize=ReleaseFast
+-- --test-filter "gliner boundary"`, `152` -> `156` selected as these tests
+were added, `134` passed / `22` skipped -- the 22 skips are unrelated pinned
+`small`-backbone tests gated on `ANTFLY_GLINER25_SMALL_MODEL_DIR`, not set
+in this environment).
+
+**Metal is a process-required backend** (`backends.zig`'s
+`requiresProcessIsolation`): a test harness that loads a Metal session
+through `Node`/`ModelManager` (rather than a raw `session_factory` session,
+as the small-backbone Metal parity tests do) must set
+`process_termination_available = true` in `Node.init`'s config or the
+model manager refuses to close/reopen the session
+(`error.ProcessIsolationRequired`), matching
+`gliner_boundary_metal_socket_test.zig`'s existing convention.
+
+**A real geometry pitfall found while measuring:** the qualified row's
+`padded_sequence_tokens` floor (106) was measured only against the wide
+11-entity/6-relation dogfood schema. A request using the narrower
+3-entity/2-relation schema from section 3/5's earlier evidence (fewer
+schema-prefix tokens for the same document) produces
+`padded_sequence_tokens` around 56-118 -- below this row's floor -- and is
+correctly refused with `error.UnsupportedGlinerBoundaryRuntime` even
+though it is "shorter." A row's bounds are schema-shape-specific, not just
+document-size-specific; this is by design (see "Two-tier gate" above), not
+a bug, and is why the provider-path test above deliberately uses the wide
+schema rather than section 5's original repro schema.
+
+**Throughput** (Metal, `antfly inference run --port 8098` with the same
+generous budget flags as section 7, 12 real long sections from `zig/*.md`
+and `work-log/**/*.md`, 21-40KB each, dogfood schema): sequential
+(one in flight at a time, the "direct" baseline) completed all 12 in 47.8s
+wall time -- 21 total windows, **~2.28s/window**, **~0.25 sections/s**
+(versus GLiNER2's ~13 sections/s on much shorter single-tiny-window
+sections -- not a comparable workload; GLiNER2.5's windows here average
+~3,500-4,000 words each). Submitting the same 12 requests concurrently
+completed in 35.7s wall time but only 9/12 returned 200 (3 were refused
+with 503 under concurrent admission pressure): this machine has one Metal
+device, so concurrent long-document requests do not exceed the sequential
+per-request rate -- they approach it at best, consistent with GPU-bound
+single-device serialization. True request-level batching (multiple
+documents in one encoded forward pass) is not part of this qualification's
+measured `request_items=[1,1]` contract.
+
+**End-to-end verification.** With the runtime rebuilt
+(`zig build antfly -Doptimize=ReleaseFast`) and `antfly inference run
+--port 8098 --host-budget-mb 16384 --backend-budget-mb 16384
+--scratch-budget-mb 16384 --combined-budget-mb 32768 --kv-budget-mb 4096`
+running, a 6,144-byte real excerpt starting at `zig/VOPR.md`'s "## Purpose"
+heading, POSTed with the dogfood schema and `"long_document":{"mode":
+"window"}`, returned HTTP 200 in 3.1s with 11 entities and 3 relations in
+the canonical shape (one window, since 6KB is well under the 4096-word
+per-window budget).
+
+**`examples/dogfood` now requests windowing.** `index_config.go`'s
+`knowledgeGraphIndexJSON` previously never set `long_document` at all
+(mode defaults to `.reject`), so no real ingest ever exercised windowing
+regardless of qualification. This was the one `examples/dogfood` change
+this task's contract required (see the file's rules on not otherwise
+touching `examples/dogfood`): its extraction producer options now include
+`"long_document":{"mode":"window"}`.
+
+**In-process ingest result: not yet ~0 failures, for a reason outside this
+file's ownership.** Running `examples/dogfood ingest -reset` in-process
+(`ANTFLY_INFERENCE_WORKER=zig-out/bin/antfly`, no HTTP, the real
+1,203-section corpus) completed (`runUntilIdle summary wall_ms=428142
+embed_batches=184 embed_items=5000 extract_batches=195
+extract_items=1267`), but essentially every `relations_v1` extraction call
+still failed (1,198 `InferenceProviderFailure` + 5
+`InferenceInvocationMemoryExceeded`). The sampled underlying causes
+(`error.MemoryBudgetExceeded` x12, `error.LongDocumentWorkLimitExceeded`
+x5, deduplicated by diagnostic fingerprint) are **not** a long-document
+windowing correctness problem and **not** caused by this task's changes:
+they reproduce identically for a single short plain request with no
+`long_document` option at all, through the same embedded worker, on this
+machine. Section 7's already-recorded gap is the root cause: the
+in-process/embedded worker's automatic "lite embedded inference resource
+policy" (`zig/pkg/antfly/src/standalone/inference_provider.zig`) derives
+only a whole-process host memory limit and has no equivalent of `antfly
+inference run`'s independent `--backend-budget-mb`/`--scratch-budget-mb`/
+`--kv-budget-mb` flags, so the checkpoint's admission estimate cannot be
+satisfied there regardless of document size or windowing -- this
+checkpoint has never been able to serve any extraction through the
+embedded worker path on this machine, single-window included. The 5
+`LongDocumentWorkLimitExceeded` cases are a separate, correct fail-closed
+outcome: cumulative attention work across windows near the top of the
+qualified range (padded_sequence_tokens approaching 5,708 across up to 4
+windows) can exceed the executor's generic, backend-independent
+`Limits.max_total_attention_work` default (8 GiB of attention-score
+elements) even while remaining within this row's reviewed geometry bounds
+-- a real document-size-dependent safety cap distinct from, and additional
+to, the qualification table. Both are documented in detail, with the exact
+fix needed, in
+`gliner25-longdoc-handoff.md` (scratchpad; not committed, since the fix
+lives in `zig/pkg/antfly/**`/`go/pkg/antflylite`, outside this file's
+ownership).
 
 ## How to re-qualify a different or wider artifact
 

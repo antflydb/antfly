@@ -221,12 +221,95 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
     .padded_sequence_tokens = .{ .min = 14, .max = 218 },
 };
 
+// Long-document windowed execution, reviewed 2026-09-18. Evidence:
+//
+//  - Design: gliner_boundary_long_executor.zig's executor tokenizes and
+//    admits each window serially (model tensors -- encoder/head activations
+//    -- are freed after every window; only bounded scalar evidence survives
+//    into the next), so a window's memory profile is bounded independent of
+//    document length; cumulative admission
+//    (Limits.max_total_encoded_tokens/max_total_attention_work) bounds total
+//    work across the whole document. Entities are deduplicated across
+//    overlapping windows by gliner_boundary_long_document.zig's
+//    mergeMentions; relations are resolved only when both endpoints fall in
+//    one window and then merged/deduplicated document-wide by
+//    gliner_boundary_long_relations.zig's merge -- exactly the design this
+//    row qualifies, not a superset of it.
+//  - Correctness/shape: "gliner boundary long executor HTTP canonical
+//    schema_version 2 shape for a real multi-window document with relations
+//    native/Metal" and "gliner boundary long executor provider extractDirect
+//    canonical schema_version 2 relations shape for a windowed request
+//    native/Metal" (server/gliner_boundary_service_test.zig) exercise this
+//    exact merge path end to end -- one against a real 37KB multi-window
+//    design-doc section (zig/VOPR.md's "Completion-Claim Audit"), one
+//    deterministically against the known repro relation -- through both the
+//    HTTP handler and the in-process provider entry, and assert the
+//    response matches zig/EXTRACT.md's canonical envelope (entities with
+//    text/label/start/end/score; relations with type,
+//    source.entity_index/target.entity_index, score) with no head/tail
+//    fields, on both backends.
+//  - Geometry: measured directly against the pinned tokenizer/planner (no
+//    model weights) over the real examples/dogfood production schema (11
+//    entities, 6 relations) against the same short fixtures as the
+//    single-window row above, plus three real repository sections spanning
+//    the corpus-wide range this file's long-document section documents
+//    (95th percentile and max section size across zig/*.md and
+//    work-log/**/*.md): zig/pkg/antfly/src/storage/lsm/LSM.md's "Read And
+//    Scan Work" (6.8KB, 1 window), zig/VOPR.md's "Completion-Claim Audit"
+//    (37KB, 2 windows), and zig/PDF.md's "Review findings and required
+//    fixes" (99KB, the corpus max, 4 windows) -- in
+//    ../../extractors/gliner_boundary_qualification.zig ("gliner boundary
+//    qualification measures pinned base checkpoint long-document production
+//    geometry"). The bounds below are the exact observed range.
+//  - Throughput: see GLINER25.md's long-document section for per-window and
+//    per-section batched throughput on Metal.
+//
+// This is a SEPARATE row from fastino_gliner25_base_v1's single-window row
+// above, not a widening of it: the two rows require disjoint features
+// (.single_window vs .long_document) and this row's feature set covers
+// exactly examples/dogfood's real schema shape (entities + relations only;
+// no entity attributes, classification, records, or JointIE have been
+// measured through this merge path), so a request for any of those task
+// types together with long-document windowing still correctly fails closed.
+const fastino_gliner25_base_v1_long_document_features = Features.initMany(&.{
+    .entities,    .relations,    .word_whitespace, .overlap_flat,
+    .offset_utf8, .decoder_auto, .long_document,   .record_identity_occurrence,
+    .confidence,  .spans,
+});
+
+// Exact min/max observed across every case in the long-document geometry
+// test cited above: the two short single-window-shaped fixtures (still
+// requested with long_document.mode=window, since examples/dogfood now
+// requests it unconditionally -- see index_config.go's
+// knowledgeGraphIndexJSON) through the three real multi-window sections.
+// window_count > 1 only appears once a document's word count exceeds one
+// window's 4096-word body budget (config.max_len for the base backbone);
+// short documents still take exactly one window. A document needing more
+// than this measured range -- window_count > 4, or bytes/words/tokens above
+// the printed maxima -- has not been measured and correctly fails closed.
+const fastino_gliner25_base_v1_long_document_lengths = LengthContract{
+    .request_items = .{ .min = 1, .max = 1 },
+    .document_bytes = .{ .min = 26, .max = 99008 },
+    .document_words = .{ .min = 5, .max = 15894 },
+    .window_count = .{ .min = 1, .max = 4 },
+    .window_words = .{ .min = 5, .max = 4096 },
+    .padded_sequence_tokens = .{ .min = 106, .max = 5708 },
+};
+
 const production_entries: []const Entry = &.{
     .{ .identity = fastino_gliner25_base_v1, .backend = .native, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
     .{ .identity = fastino_gliner25_base_v1, .backend = .metal, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
+    .{ .identity = fastino_gliner25_base_v1, .backend = .native, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
+    .{ .identity = fastino_gliner25_base_v1, .backend = .metal, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
 };
 
 comptime {
+    // Each entry's five digests are hex-validated one character at a time
+    // (validDigest); the default 1000-branch comptime quota covers roughly
+    // three entries' worth of that work at 64 hex characters each. Four
+    // reviewed rows (single-window + long-document, native + Metal) need
+    // more room than the default.
+    @setEvalBranchQuota(1 << 14);
     if (!validEntries(production_entries)) @compileError("invalid GLiNER2.5 runtime qualification policy");
 }
 

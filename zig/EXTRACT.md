@@ -167,3 +167,16 @@ variant or precision. A boundary checkpoint's `model_manifest.json`
 (`antfly inference pull`) only advertises the `extract` task and its
 capabilities once its exact weight/sidecar digests have been reviewed; an
 unreviewed digest, revision, or variant is refused at request time.
+
+A document larger than the qualified checkpoint's single-window bound can be
+served with `options.long_document`, e.g. `{"mode": "window"}`: the request is
+split into overlapping windows sized to the model's real per-window word
+capacity, entities are deduplicated across overlapping windows, and relations
+are resolved within a window and merged document-wide, before being returned
+through the same canonical `entities`/`relations` shape above (the response's
+`long_document.window_count` field reports how many windows were used). This
+is qualified independently of, and more narrowly than, single-window
+extraction -- see GLINER25.md's long-document section for the reviewed
+document-size bound and feature coverage. A request outside the reviewed
+bound, or for a task combination not yet measured with windowing, still fails
+closed instead of silently truncating or misbehaving.
