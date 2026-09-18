@@ -1073,6 +1073,25 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(std.mem.indexOf(u8, repaired.bytes(), "\"scanned\":0") != null);
 
     try std.testing.expectError(error.InvalidArgument, owner.beginBulkIngest("articles"));
+    // The prior artifact fixture leaves only a chunk-backed text index and
+    // moves its child range away. A parent-only bulk row cannot match that
+    // index. Build an ordinary text index to verify bulk search publication.
+    const bulk_indexes_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s},\"bulk_visibility\":{{\"type\":\"full_text\"}}}}",
+        .{replacement_indexes_json[0 .. replacement_indexes_json.len - 1]},
+    );
+    defer std.testing.allocator.free(bulk_indexes_json);
+    var bulk_index_ready = false;
+    for (0..64) |_| {
+        const result = try owner.reconcile("docs", "", bulk_indexes_json, "bulk_visibility", true);
+        try std.testing.expect(result.state != .degraded);
+        if (result.state == .complete) {
+            bulk_index_ready = true;
+            break;
+        }
+    }
+    try std.testing.expect(bulk_index_ready);
     try owner.beginBulkIngest("docs");
     var bulk_batch = try owner.batchJson(
         "docs",
@@ -1085,7 +1104,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     });
     var bulk_query = try owner.queryJson(
         "docs",
-        "{\"query\":{\"match_all\":{}},\"limit\":10}",
+        "{\"query\":{\"match_all\":{}},\"indexes\":[\"bulk_visibility\"],\"limit\":10}",
     );
     defer bulk_query.deinit();
     try std.testing.expect(std.mem.indexOf(u8, bulk_query.bytes(), "doc:bulk") != null);
