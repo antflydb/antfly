@@ -4,6 +4,7 @@ import json
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,6 +13,156 @@ import workload_qualification as qualification
 
 
 class WorkloadQualificationTests(unittest.TestCase):
+    def test_outcome_summary_separates_correctness_generator_and_overload(self):
+        clean = [{"exit_code": 0, "forced_kill": False, "oom_killed": False}]
+        for purpose in ("smoke", "qualification"):
+            accepted = qualification.outcome_summary(
+                purpose, [{"counts": {"completed": 4, "rejected": 2}}], clean, None
+            )
+            self.assertTrue(accepted["correctness_passed"])
+            self.assertEqual(accepted["exit_code"], 0)
+            for kind in (
+                "unexpected_http_error",
+                "transport_error",
+                "unknown_write_outcome",
+                "invalid_result",
+                "late_response",
+            ):
+                with self.subTest(purpose=purpose, kind=kind):
+                    failed = qualification.outcome_summary(
+                        purpose, [{"counts": {kind: 1}}], clean, None
+                    )
+                    self.assertEqual(failed["status"], "experiment_failed")
+                    self.assertEqual(failed["exit_code"], 1)
+                    self.assertFalse(failed["correctness_passed"])
+            for kind in ("generator_dropped", "client_deadline_before_dispatch"):
+                invalid = qualification.outcome_summary(
+                    purpose, [{"counts": {kind: 1}}], clean, None
+                )
+                self.assertTrue(invalid["correctness_passed"])
+                self.assertFalse(invalid["generator_valid"])
+                self.assertEqual(invalid["status"], "generator_invalid")
+                self.assertEqual(invalid["exit_code"], 2)
+        recall = qualification.outcome_summary(
+            "smoke",
+            [{"counts": {"completed": 1}, "vector": {"recall_floor_pass": False}}],
+            clean,
+            None,
+        )
+        self.assertFalse(recall["correctness_passed"])
+        for runtime in (
+            {"exit_code": 1},
+            {"exit_code": 0, "oom_killed": True},
+            {"exit_code": 0, "forced_kill": True},
+            {"exit_code": 0, "exited_before_shutdown": True},
+            {},
+        ):
+            with self.subTest(runtime=runtime):
+                failed = qualification.outcome_summary(
+                    "smoke", [{"counts": {"completed": 1}}], [runtime], None
+                )
+                self.assertEqual(failed["exit_code"], 1)
+                self.assertFalse(failed["shutdown_clean"])
+
+    def test_run_fails_on_warmup_errors_and_retains_receipts_after_shutdown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "antfly"
+            binary.write_bytes(b"test artifact")
+            plan = qualification.template("process")
+            plan.update(
+                runs=1,
+                concurrency=[1],
+                open_factors=[0.5],
+                workloads=[plan["workloads"][0]],
+            )
+            for arm in plan["arms"].values():
+                arm.update(binary=str(binary), revision="a" * 40)
+            output = root / "receipts"
+
+            @contextmanager
+            def launch(_plan, _arm, directory):
+                directory.mkdir(parents=True)
+                runtime = {"port": 9999, "resource_limits_verified": False}
+                try:
+                    yield runtime
+                finally:
+                    runtime.update(exit_code=0, forced_kill=False, oom_killed=False)
+                    qualification.save(directory / "runtime.json", runtime)
+
+            def load(_port, _workload, _plan, path, **_kwargs):
+                # All measurements pass; only candidate warmup is malformed.
+                bad = path.parent.name == "candidate" and "warmup" in path.name
+                counts = {"invalid_result" if bad else "completed": 1}
+                path.write_text(json.dumps({"counts": counts}) + "\n")
+                return {"counts": counts, "completed_qps": 10}
+
+            with (
+                patch.object(qualification, "launch", launch),
+                patch.object(qualification, "seed"),
+                patch.object(qualification, "snapshot", return_value={}),
+                patch.object(qualification, "run_load", side_effect=load),
+            ):
+                summary = qualification.run(plan, output)
+            self.assertEqual(summary["status"], "experiment_failed")
+            self.assertEqual(summary["exit_code"], 1)
+            self.assertTrue(summary["shutdown_clean"])
+            self.assertTrue(
+                all("warmup" in row["phase"] for row in summary["correctness_failures"])
+            )
+            self.assertEqual(json.loads((output / "summary.json").read_text()), summary)
+            hashes = json.loads((output / "checksums.json").read_text())
+            for name in (
+                "summary.json",
+                "warmups.json",
+                "trial-0/candidate/runtime.json",
+            ):
+                self.assertEqual(hashes[name], qualification.checksum(output / name))
+
+            # Exceptions still finish the lifecycle and checksum final evidence.
+            failed_output = root / "exception-receipts"
+            with (
+                patch.object(qualification, "launch", launch),
+                patch.object(
+                    qualification, "seed", side_effect=RuntimeError("fixture failed")
+                ),
+                self.assertRaisesRegex(RuntimeError, "fixture failed"),
+            ):
+                qualification.run(plan, failed_output)
+            failed_summary = json.loads((failed_output / "summary.json").read_text())
+            self.assertEqual(failed_summary["exit_code"], 1)
+            self.assertTrue(failed_summary["shutdown_clean"])
+            self.assertTrue((failed_output / "checksums.json").exists())
+
+    def test_cli_returns_recorded_failure_or_generator_invalid_exit_code(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plan = Path(temporary) / "plan.json"
+            plan.write_text("{}")
+            for code in (0, 1, 2):
+                result = {
+                    "status": "test",
+                    "exit_code": code,
+                    "correctness_passed": code != 1,
+                    "release_qualified": False,
+                    "generator_valid": code != 2,
+                    "shutdown_clean": code != 1,
+                }
+                with (
+                    patch(
+                        "sys.argv",
+                        [
+                            "workload_qualification.py",
+                            "run",
+                            str(plan),
+                            "--output",
+                            str(plan.parent / "receipts"),
+                        ],
+                    ),
+                    patch.object(qualification, "run", return_value=result),
+                    patch("builtins.print"),
+                ):
+                    self.assertEqual(qualification.main(), code)
+
     def test_plan_rejects_unpinned_or_mismatched_qualification(self):
         plan = qualification.template("process")
         with tempfile.NamedTemporaryFile() as binary:

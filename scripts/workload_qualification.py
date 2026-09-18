@@ -906,6 +906,7 @@ def launch(plan: dict[str, Any], arm: dict[str, Any], directory: Path):
     finally:
         stopped = time.monotonic()
         if process is not None:
+            runtime["exited_before_shutdown"] = process.poll() is not None
             process.terminate()
             try:
                 process.wait(timeout=30)
@@ -916,6 +917,10 @@ def launch(plan: dict[str, Any], arm: dict[str, Any], directory: Path):
                 runtime["forced_kill"] = True
             runtime["exit_code"] = process.returncode
         if runtime.get("container"):
+            before_stop = json.loads(
+                command(["docker", "inspect", runtime["container"]]).stdout
+            )[0]["State"]
+            runtime["exited_before_shutdown"] = not before_stop["Running"]
             command(
                 ["docker", "stop", "--time", "30", runtime["container"]],
                 timeout=45,
@@ -1033,6 +1038,86 @@ def freeze_artifacts(plan: dict[str, Any], output: Path) -> dict[str, Any]:
     return execution_plan
 
 
+def outcome_summary(
+    purpose: str,
+    observations: list[dict[str, Any]],
+    lifecycles: list[dict[str, Any]],
+    error: str | None,
+) -> dict[str, Any]:
+    """Fail closed on incorrect results without mislabeling generator pressure."""
+    failures = []
+    generator_valid = True
+    generator_outcomes = {"generator_dropped", "client_deadline_before_dispatch"}
+    for point in observations:
+        counts = point["counts"]
+        generator_valid &= not any(counts.get(kind, 0) for kind in generator_outcomes)
+        unexpected = {
+            kind: count
+            for kind, count in counts.items()
+            if count and kind not in {"completed", "rejected", *generator_outcomes}
+        }
+        vector_failed = (
+            point.get("vector") is not None and not point["vector"]["recall_floor_pass"]
+        )
+        if unexpected or vector_failed:
+            failures.append(
+                {
+                    "source": "requests",
+                    **{
+                        key: point.get(key)
+                        for key in ("arm", "trial", "workload", "phase")
+                    },
+                    "outcomes": unexpected,
+                    "recall_floor_failed": vector_failed,
+                }
+            )
+    shutdown_clean = bool(lifecycles)
+    for index, lifecycle in enumerate(lifecycles):
+        clean = (
+            lifecycle.get("exit_code") == 0
+            and not lifecycle.get("forced_kill")
+            and not lifecycle.get("oom_killed")
+            and not lifecycle.get("exited_before_shutdown")
+        )
+        shutdown_clean &= clean
+        if not clean:
+            failures.append(
+                {
+                    "source": "runtime",
+                    "lifecycle": index,
+                    **{
+                        key: lifecycle.get(key)
+                        for key in (
+                            "exit_code",
+                            "forced_kill",
+                            "oom_killed",
+                            "exited_before_shutdown",
+                        )
+                    },
+                }
+            )
+    if not observations or not lifecycles:
+        failures.append({"source": "incomplete_experiment"})
+    correctness_passed = not error and not failures
+    status = (
+        "experiment_failed"
+        if not correctness_passed
+        else "generator_invalid"
+        if not generator_valid
+        else "smoke_evidence"
+        if purpose == "smoke"
+        else "partial_matrix_evidence"
+    )
+    return {
+        "status": status,
+        "exit_code": 1 if not correctness_passed else 2 if not generator_valid else 0,
+        "correctness_passed": correctness_passed,
+        "correctness_failures": failures,
+        "generator_valid": generator_valid,
+        "shutdown_clean": shutdown_clean,
+    }
+
+
 def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
     validate(plan)
     output = output.resolve()
@@ -1057,6 +1142,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
     )
     points: list[dict[str, Any]] = []
     lifecycles: list[dict[str, Any]] = []
+    warmups: list[dict[str, Any]] = []
     error = None
     baseline_rates: dict[str, float] = {}
     vector_fixture = None
@@ -1104,7 +1190,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                         name = workload["name"]
                         for concurrency in plan["concurrency"]:
                             prefix = f"{name}-closed-{concurrency}"
-                            run_load(
+                            warmup = run_load(
                                 port,
                                 workload,
                                 plan,
@@ -1112,6 +1198,14 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                                 seconds=plan["warmup_seconds"],
                                 concurrency=concurrency,
                             )
+                            warmup.update(
+                                arm=arm_name,
+                                trial=trial,
+                                workload=name,
+                                phase=prefix + "-warmup",
+                            )
+                            warmups.append(warmup)
+                            save(output / "warmups.json", warmups)
                             snapshot(runtime, port, directory, prefix + "-before")
                             point = run_load(
                                 port,
@@ -1155,7 +1249,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                         rate = baseline_rates[name]
                         for factor in plan["open_factors"]:
                             prefix = f"{name}-open-{factor}"
-                            run_load(
+                            warmup = run_load(
                                 port,
                                 workload,
                                 plan,
@@ -1163,6 +1257,14 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                                 seconds=plan["warmup_seconds"],
                                 rate=rate * factor,
                             )
+                            warmup.update(
+                                arm=arm_name,
+                                trial=trial,
+                                workload=name,
+                                phase=prefix + "-warmup",
+                            )
+                            warmups.append(warmup)
+                            save(output / "warmups.json", warmups)
                             point = run_load(
                                 port,
                                 workload,
@@ -1215,11 +1317,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
         raise
     finally:
         summary = {
-            "status": "experiment_failed"
-            if error
-            else "smoke_evidence"
-            if plan["purpose"] == "smoke"
-            else "partial_matrix_evidence",
+            **outcome_summary(plan["purpose"], points + warmups, lifecycles, error),
             "release_qualified": False,
             "error": error,
             "comparisons": compare(points, plan["runs"])
@@ -1241,19 +1339,9 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
                 "cold storage",
                 "automatic/adaptive policy",
             ],
-            "generator_valid": all(
-                not point["counts"].get("generator_dropped") for point in points
-            ),
             "runtime_resource_envelope_verified": bool(lifecycles)
             and all(
                 lifecycle.get("resource_limits_verified") for lifecycle in lifecycles
-            ),
-            "shutdown_clean": bool(lifecycles)
-            and all(
-                lifecycle.get("exit_code") == 0
-                and not lifecycle.get("forced_kill")
-                and not lifecycle.get("oom_killed")
-                for lifecycle in lifecycles
             ),
         }
         save(output / "summary.json", summary)
@@ -1271,7 +1359,7 @@ def run(plan: dict[str, Any], output: Path) -> dict[str, Any]:
     return summary
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     create = sub.add_parser("template")
@@ -1335,6 +1423,8 @@ def main() -> None:
                     key: result[key]
                     for key in (
                         "status",
+                        "exit_code",
+                        "correctness_passed",
                         "release_qualified",
                         "generator_valid",
                         "shutdown_clean",
@@ -1343,7 +1433,9 @@ def main() -> None:
                 indent=2,
             )
         )
+        return result["exit_code"]
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
