@@ -776,11 +776,17 @@ fn appendVertexContent(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), messa
             const args = try std.json.parseFromSlice(std.json.Value, alloc, call.arguments, .{});
             defer args.deinit();
             if (args.value != .object) return error.InvalidAgentToolCall;
-            const part = try std.json.Stringify.valueAlloc(alloc, .{ .functionCall = .{
-                .id = call.id,
-                .name = call.name,
-                .args = args.value,
-            } }, .{});
+            // Imported tool history has no Google thought signatures. Use Google's
+            // documented placeholder; native Google parts are replayed above.
+            // https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures#faqs
+            const part = try std.json.Stringify.valueAlloc(alloc, .{
+                .functionCall = .{
+                    .id = call.id,
+                    .name = call.name,
+                    .args = args.value,
+                },
+                .thoughtSignature = "skip_thought_signature_validator",
+            }, .{});
             defer alloc.free(part);
             try out.appendSlice(alloc, part);
             count += 1;
@@ -1399,6 +1405,7 @@ test "vertex provider tools preserve parallel calls signatures and repeated turn
     const parts = contents[1].object.get("parts").?.array.items;
     try std.testing.expectEqualStrings("text-signature", parts[0].object.get("thoughtSignature").?.string);
     try std.testing.expectEqualStrings("call-signature", parts[1].object.get("thoughtSignature").?.string);
+    try std.testing.expect(!parts[2].object.contains("thoughtSignature"));
     try std.testing.expect(!parts[1].object.get("functionCall").?.object.contains("id"));
     const results = contents[2].object.get("parts").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), results.len);
@@ -1410,6 +1417,54 @@ test "vertex provider tools preserve parallel calls signatures and repeated turn
     try std.testing.expectEqualStrings("native-id", two.get("id").?.string);
     try std.testing.expectEqualStrings("plain text", two.get("response").?.object.get("result").?.string);
     try std.testing.expectError(error.InvalidAgentToolCall, vertexGenerateRequestJsonAlloc(alloc, messages[2..], .{}));
+}
+
+test "vertex provider tools replay imported parallel and sequential calls" {
+    const alloc = std.testing.allocator;
+    const body = try vertexGenerateRequestJsonAlloc(alloc, &.{
+        .{ .role = .user, .content = .{ .text = "search" } },
+        .{ .role = .assistant, .content = .{ .text = "Searching" }, .tool_calls = &.{
+            .{ .id = "call-openai-1", .name = "search", .arguments = "{\"query\":\"one\"}" },
+            .{ .id = "call-openai-2", .name = "search", .arguments = "{\"query\":\"two\"}" },
+        } },
+        .{ .role = .tool, .tool_call_id = "call-openai-1", .content = .{ .text = "first result" } },
+        .{ .role = .tool, .tool_call_id = "call-openai-2", .content = .{ .text = "second result" } },
+        .{ .role = .assistant, .tool_calls = &.{
+            .{ .id = "call-openai-3", .name = "search", .arguments = "{\"query\":\"three\"}" },
+        } },
+        .{ .role = .tool, .tool_call_id = "call-openai-3", .content = .{ .text = "third result" } },
+    }, .{});
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const contents = parsed.value.object.get("contents").?.array.items;
+    try std.testing.expectEqual(@as(usize, 5), contents.len);
+    const parallel_parts = contents[1].object.get("parts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), parallel_parts.len);
+    try std.testing.expectEqualStrings("Searching", parallel_parts[0].object.get("text").?.string);
+    try std.testing.expect(!parallel_parts[0].object.contains("thoughtSignature"));
+    const sequential_parts = contents[3].object.get("parts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), sequential_parts.len);
+    const calls = [_]std.json.Value{ parallel_parts[1], parallel_parts[2], sequential_parts[0] };
+    const parallel_results = contents[2].object.get("parts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), parallel_results.len);
+    const sequential_results = contents[4].object.get("parts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), sequential_results.len);
+    const results = [_]std.json.Value{ parallel_results[0], parallel_results[1], sequential_results[0] };
+    const ids = [_][]const u8{ "call-openai-1", "call-openai-2", "call-openai-3" };
+    const queries = [_][]const u8{ "one", "two", "three" };
+    const outputs = [_][]const u8{ "first result", "second result", "third result" };
+    for (calls, results, ids, queries, outputs) |part, result, id, query, output| {
+        try std.testing.expectEqualStrings("skip_thought_signature_validator", part.object.get("thoughtSignature").?.string);
+        const call = part.object.get("functionCall").?.object;
+        try std.testing.expectEqualStrings(id, call.get("id").?.string);
+        try std.testing.expectEqualStrings("search", call.get("name").?.string);
+        try std.testing.expectEqualStrings(query, call.get("args").?.object.get("query").?.string);
+        const response = result.object.get("functionResponse").?.object;
+        try std.testing.expectEqualStrings(id, response.get("id").?.string);
+        try std.testing.expectEqualStrings("search", response.get("name").?.string);
+        try std.testing.expectEqualStrings(output, response.get("response").?.object.get("result").?.string);
+    }
 }
 
 test "vertex provider tools translate schemas and all tool choices" {
