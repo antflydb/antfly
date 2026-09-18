@@ -698,6 +698,30 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_runtime_io_abi_tests = b.addRunArtifact(runtime_io_abi_tests);
     b.step("runtime-io-abi-test", "Run executor contracts across independent error domains").dependOn(&run_runtime_io_abi_tests.step);
 
+    const runtime_callback_abi_provider = b.addLibrary(.{
+        .name = "runtime-callback-abi-test-provider",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/runtime_callback_abi_test_provider.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const runtime_callback_abi_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/runtime_callback_abi_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    runtime_callback_abi_test_mod.linkLibrary(runtime_callback_abi_provider);
+    const runtime_callback_abi_tests = b.addTest(.{
+        .root_module = runtime_callback_abi_test_mod,
+        .filters = &.{"callback archive boundary"},
+    });
+    const run_runtime_callback_abi_tests = b.addRunArtifact(runtime_callback_abi_tests);
+    b.step("runtime-callback-abi-test", "Run dense admission errors across independently compiled callback archives").dependOn(&run_runtime_callback_abi_tests.step);
+
     const scan_sink_provider = b.addLibrary(.{
         .name = "runtime-scan-sink-test-provider",
         .linkage = .static,
@@ -4129,6 +4153,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_secret_store_abi_tests.step);
     unit_test_step.dependOn(&run_runtime_io_abi_tests.step);
+    unit_test_step.dependOn(&run_runtime_callback_abi_tests.step);
     unit_test_step.dependOn(&run_scan_sink_tests.step);
 
     unit_test_step.dependOn(&run_api_http_runtime_tests.step);

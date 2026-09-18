@@ -7280,6 +7280,11 @@ pub const ApiHttpServer = struct {
             else => {
                 if (normalizeQueryOperationalError(err)) |normalized| {
                     const message = switch (normalized) {
+                        error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionWaitTimeout => "query execution capacity exhausted",
+                        error.AdmissionRequestTooLarge => "query execution resource limit exceeded",
+                        error.AdmissionClosed => "query execution draining",
+                        error.Canceled => "query canceled",
+                        error.DeadlineExceeded => "query timed out",
                         error.QueryEmbeddingInputTooLarge => "query embedding input too large",
                         error.QueryEmbeddingOverloaded => "query embedding overloaded",
                         error.EmbedRateLimited => "query embedding rate limited",
@@ -11445,6 +11450,14 @@ pub const ApiHttpServer = struct {
         try ensureTableOperationActive(request);
         const native_deadline = table_catalog.RoutingBudget.init(null).deadlineFrom(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io });
         const response = self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation, null, null, null, native_deadline) catch |err| switch (err) {
+            error.AdmissionFull,
+            error.AdmissionQueueFull,
+            error.AdmissionBytesExhausted,
+            error.AdmissionRequestTooLarge,
+            error.AdmissionWaitTimeout,
+            error.AdmissionClosed,
+            error.DeadlineExceeded,
+            => return @errorCast(err),
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -12745,8 +12758,11 @@ pub const ApiHttpServer = struct {
                     .invalid_request => return error.InvalidQueryRequest,
                     .rebuilding => return error.IndexRebuilding,
                 },
-                error.Timeout, error.Cancelled, error.DistributedQueryUnavailable => return err,
+                error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded, error.DistributedQueryUnavailable => return err,
                 else => {
+                    // Expected execution pressure is returned once, without
+                    // replaying the query or emitting one warning per denial.
+                    if (normalizeQueryAdmissionError(err)) |denial| return denial;
                     std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
                     return err;
                 },
@@ -22476,12 +22492,27 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
 }
 
 pub fn normalizeQueryOperationalError(err: anyerror) ?anyerror {
+    if (normalizeQueryAdmissionError(err)) |denial| return denial;
+    if (err == error.Canceled or err == error.DeadlineExceeded) return err;
     if (normalizeQueryEmbeddingOperationalError(err)) |normalized| return normalized;
     return switch (reranking_runtime.normalizeOperationalError(err)) {
         error.RerankRateLimited,
         error.RerankTransientFailure,
         error.RerankUpstreamFailure,
         => |normalized| normalized,
+        else => null,
+    };
+}
+
+fn normalizeQueryAdmissionError(err: anyerror) ?anyerror {
+    return switch (err) {
+        error.AdmissionFull,
+        error.AdmissionQueueFull,
+        error.AdmissionBytesExhausted,
+        error.AdmissionRequestTooLarge,
+        error.AdmissionWaitTimeout,
+        error.AdmissionClosed,
+        => err,
         else => null,
     };
 }
@@ -25756,6 +25787,8 @@ test "api http plain public query preserves outer absolute request deadline thro
     const FakeReads = struct {
         expected_deadline_ns: u64,
         oversized: bool = false,
+        failure: ?anyerror = null,
+        calls: usize = 0,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -25802,6 +25835,8 @@ test "api http plain public query preserves outer absolute request deadline thro
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
             try std.testing.expectEqual(self.expected_deadline_ns, req.execution_deadline_ns.?);
+            self.calls += 1;
+            if (self.failure) |failure| return failure;
             try std.testing.expectEqualStrings("full_text_index", req.index_name.?);
             try std.testing.expectEqualStrings("full_text_index", req.primary_text_index_name.?);
             if (self.oversized) {
@@ -25873,6 +25908,26 @@ test "api http plain public query preserves outer absolute request deadline thro
     try std.testing.expectEqual(@as(u16, 429), excessive.status);
     try std.testing.expect(std.mem.indexOf(u8, excessive.body, "resource_exhausted") != null);
     try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().retained_bytes);
+
+    reads.oversized = false;
+    const failures = [_]anyerror{ error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge, error.AdmissionWaitTimeout, error.AdmissionClosed };
+    for (failures) |failure| {
+        reads.failure = failure;
+        const before = reads.calls;
+        var denied = try server.handlePublicTableQueryWithContentTypeCancellation("docs", body, null, null, &valid);
+        var denied_live = true;
+        defer if (denied_live) denied.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, if (failure == error.AdmissionClosed) 503 else 429), denied.status);
+        try std.testing.expect(std.mem.indexOf(u8, denied.body, @errorName(failure)) != null);
+        try std.testing.expect(std.mem.indexOf(u8, denied.body, "\"stage\":\"execution\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, denied.body, "\"execution_started\":true") != null);
+        try std.testing.expectEqual(before + 1, reads.calls);
+        try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+        // Error responses own their small fallback serialization until retired.
+        denied.deinit(alloc);
+        denied_live = false;
+        try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().retained_bytes);
+    }
 }
 
 test "api http hierarchy traversal preserves policy and cursor across remote hydration seam" {

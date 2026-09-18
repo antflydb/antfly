@@ -131,6 +131,12 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteQueryError = error{
+        AdmissionFull,
+        AdmissionQueueFull,
+        AdmissionBytesExhausted,
+        AdmissionRequestTooLarge,
+        AdmissionWaitTimeout,
+        AdmissionClosed,
         InvalidQueryRequest,
         InvalidFilterQueryRequest,
         InvalidExclusionQueryRequest,
@@ -1703,6 +1709,22 @@ pub fn handleTableQueryRequest(
     };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
         switch (err) {
+            error.AdmissionFull,
+            error.AdmissionQueueFull,
+            error.AdmissionBytesExhausted,
+            error.AdmissionRequestTooLarge,
+            error.AdmissionWaitTimeout,
+            error.AdmissionClosed,
+            => return .{
+                .status = if (err == error.AdmissionClosed) 503 else 429,
+                .json = true,
+                .body = try std.json.Stringify.valueAlloc(alloc, .{
+                    .@"error" = @errorName(err),
+                    .reason = if (err == error.AdmissionClosed) "draining" else if (err == error.AdmissionRequestTooLarge) "resource_exhausted" else "instance_busy",
+                    .stage = "execution",
+                    .execution_started = true,
+                }, .{}),
+            },
             error.InvalidQueryRequest => {
                 if (db_mod.peekLastSortRejectionDiagnostic() != null) {
                     std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });

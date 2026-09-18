@@ -424,6 +424,14 @@ pub const Detail = enum(c_int) {
     metadata_incarnation_unavailable,
     invalid_metadata_incarnation,
     metadata_incarnation_mismatch,
+    // Execution admission crosses both the storage owner status ABI and this
+    // independent callback ABI. Append only; never exchange Zig error IDs.
+    admission_full,
+    admission_queue_full,
+    admission_bytes_exhausted,
+    admission_request_too_large,
+    admission_wait_timeout,
+    admission_closed,
 };
 
 pub const Status = extern struct {
@@ -441,6 +449,12 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.AdmissionFull => status(.retryable, .admission_full),
+        error.AdmissionQueueFull => status(.retryable, .admission_queue_full),
+        error.AdmissionBytesExhausted => status(.retryable, .admission_bytes_exhausted),
+        error.AdmissionRequestTooLarge => status(.invalid_argument, .admission_request_too_large),
+        error.AdmissionWaitTimeout => status(.timeout, .admission_wait_timeout),
+        error.AdmissionClosed => status(.unavailable, .admission_closed),
         error.HASeedSnapshotRuntimeBusy => status(.unavailable, .ha_seed_snapshot_runtime_busy),
         error.HASeedCaptureAlreadyInProgress => status(.unavailable, .ha_seed_capture_already_in_progress),
         error.StorageKernelOwnerUnavailable => status(.unavailable, .storage_kernel_owner_unavailable),
@@ -865,6 +879,12 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .admission_full => "AdmissionFull",
+        .admission_queue_full => "AdmissionQueueFull",
+        .admission_bytes_exhausted => "AdmissionBytesExhausted",
+        .admission_request_too_large => "AdmissionRequestTooLarge",
+        .admission_wait_timeout => "AdmissionWaitTimeout",
+        .admission_closed => "AdmissionClosed",
         .table_topology_protocol_upgrade_required => "TableTopologyProtocolUpgradeRequired",
         .database_not_found => "DatabaseNotFound",
         .namespace_not_found => "NamespaceNotFound",
