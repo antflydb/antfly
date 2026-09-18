@@ -2273,7 +2273,10 @@ const PortableArchiveValidation = struct {
 };
 
 test "portable archive accepts long history with a bounded decoded working set" {
-    const alloc = std.testing.allocator;
+    // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var source_tmp = std.testing.tmpDir(.{});
     defer source_tmp.cleanup();
     var source = try openTestStore(alloc, &source_tmp);

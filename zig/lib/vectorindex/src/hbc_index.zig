@@ -8005,6 +8005,27 @@ pub fn insertWithMetadataTxnOptions(
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !void {
+    return insertWithMetadataTxnOptionsRouted(self, txn, vector_id, vector_data, pretransformed_vector, metadata_value, transformed_vector, options, now_fn_u64, elapsed_fn_u64, null);
+}
+
+// Valid only until the next mutation in this transaction. The batch fast path
+// already found both postings before deciding that this vector must relocate.
+// Reuse that routing decision rather than traversing the identical tree twice.
+const MutationRoute = struct { existing_leaf: u64, target_leaf: u64 };
+
+fn insertWithMetadataTxnOptionsRouted(
+    self: anytype,
+    txn: anytype,
+    vector_id: u64,
+    vector_data: []const f32,
+    pretransformed_vector: ?[]const f32,
+    metadata_value: []const u8,
+    transformed_vector: []f32,
+    options: anytype,
+    now_fn_u64: fn () u64,
+    elapsed_fn_u64: fn (u64) u64,
+    route: ?MutationRoute,
+) !void {
     try self.bindTxnLike(txn);
     self.write_profile.insert_calls += 1;
     const Options = @TypeOf(options);
@@ -8051,7 +8072,7 @@ pub fn insertWithMetadataTxnOptions(
     var previous_transformed_storage: ?[]f32 = null;
     defer if (previous_transformed_storage) |buf| self.alloc.free(buf);
 
-    const existing_leaf_id = if (assume_absent_ids)
+    const existing_leaf_id = if (route) |resolved| resolved.existing_leaf else if (assume_absent_ids)
         0
     else
         self.getVecLeaf(txn, vector_id) catch |err| blk: {
@@ -8071,9 +8092,13 @@ pub fn insertWithMetadataTxnOptions(
 
     const target_leaf_id = blk_leaf: {
         if (existing_leaf_id != 0) {
-            const find_leaf_start = now_fn_u64();
-            const leaf_id = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, effective_transformed, allow_quantized_routing);
-            self.write_profile.insert_find_leaf_ns += elapsed_fn_u64(find_leaf_start);
+            const leaf_id = if (route) |resolved| resolved.target_leaf else route_leaf: {
+                const find_leaf_start = now_fn_u64();
+                const found = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, effective_transformed, allow_quantized_routing);
+                self.write_profile.insert_find_leaf_ns += elapsed_fn_u64(find_leaf_start);
+                self.write_profile.insert_find_leaf_calls += 1;
+                break :route_leaf found;
+            };
             if (existing_leaf_id == leaf_id) {
                 if (try tryUpdateExistingVectorInLeafTxnOptions(
                     self,
@@ -8102,6 +8127,7 @@ pub fn insertWithMetadataTxnOptions(
         const find_leaf_start = now_fn_u64();
         const leaf_id = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, effective_transformed, allow_quantized_routing);
         self.write_profile.insert_find_leaf_ns += elapsed_fn_u64(find_leaf_start);
+        self.write_profile.insert_find_leaf_calls += 1;
         break :blk_leaf leaf_id;
     };
 
@@ -11097,6 +11123,7 @@ pub fn batchInsertWithMetadataTxnOptions(
     defer deferred_ancestor_centroid_refresh_ids.deinit(self.alloc);
     var membership_changed = options.recompute_coalesced_centroids;
     for (items) |item| {
+        var route: ?MutationRoute = null;
         self.write_profile.insert_calls += 1;
         const effective_transformed = blk: {
             const transform_start = nowNsU64Fixed();
@@ -11127,6 +11154,8 @@ pub fn batchInsertWithMetadataTxnOptions(
                     !options.centroid_only_routing;
                 const leaf_id = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, effective_transformed, allow_quantized_routing);
                 self.write_profile.insert_find_leaf_ns += elapsedSinceU64Fixed(find_leaf_start);
+                self.write_profile.insert_find_leaf_calls += 1;
+                route = .{ .existing_leaf = existing_leaf_id, .target_leaf = leaf_id };
                 if (existing_leaf_id == leaf_id) {
                     if (try tryCoalesceExistingVectorInLeafTxnOptions(
                         self,
@@ -11165,7 +11194,7 @@ pub fn batchInsertWithMetadataTxnOptions(
         }
 
         membership_changed = true;
-        try self.insertWithMetadataTxnOptions(txn, item.vector_id, item.vector, item.transformed, item.metadata, transformed_vector, options);
+        try insertWithMetadataTxnOptionsRouted(self, txn, item.vector_id, item.vector, effective_transformed, item.metadata, transformed_vector, options, nowNsU64Fixed, elapsedSinceU64Fixed, route);
     }
 
     for (deferred_leaf_centroid_deltas.items) |entry| {

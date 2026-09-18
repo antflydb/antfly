@@ -1016,7 +1016,9 @@ test "graph metric runtime role gates apply without durable lease ownership" {
 }
 
 test "graph metric runtime worker pool identity is order independent" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const workers_ab = [_][]const u8{ "worker-a", "worker-b" };
     const workers_ba = [_][]const u8{ "worker-b", "worker-a" };
     const workers_ac = [_][]const u8{ "worker-a", "worker-c" };
@@ -1293,7 +1295,9 @@ fn isShutdown(runtime: *GraphMetricRuntime) bool {
 
 test "db graph metric runtime lease ownership blocks duplicate owners and allows takeover" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -1438,7 +1442,9 @@ test "db graph metric runtime lease ownership blocks duplicate owners and allows
 
 test "db graph metric runtime lease releases durable owner lease on deinit" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -1545,7 +1551,9 @@ test "db graph metric runtime lease releases durable owner lease on deinit" {
 
 test "db graph metric runtime lease stale deinit preserves replacement owner lease" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -1711,7 +1719,9 @@ test "db graph metric runtime lease stale deinit preserves replacement owner lea
 
 test "db graph metric runtime role leases allow split owners and block duplicate coordinators" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -1914,7 +1924,9 @@ test "db graph metric runtime role leases allow split owners and block duplicate
 
 test "db graph metric runtime role worker leases are scoped by worker identity" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -2066,7 +2078,9 @@ test "db graph metric runtime role worker leases are scoped by worker identity" 
 
 test "db graph metric runtime role worker pool leases are scoped by worker identity set" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -2200,7 +2214,9 @@ test "db graph metric runtime role worker pool leases are scoped by worker ident
 
 test "db graph metric runtime role planned worker pools reject duplicate worker identities" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -2243,7 +2259,9 @@ test "db graph metric runtime role planned worker pools reject duplicate worker 
 
 test "db graph metric runtime role owned runtime worker calls are bound to configured identity" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -2399,7 +2417,9 @@ test "db graph metric runtime role owned runtime worker calls are bound to confi
 
 test "db graph metric runtime role automatic coordinator and worker loops stay separate" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -2562,7 +2582,9 @@ test "db graph metric runtime role automatic coordinator and worker loops stay s
 
 test "db graph metric runtime role distinct worker owners complete separate active pages" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -2843,7 +2865,9 @@ test "db graph metric runtime role distinct worker owners complete separate acti
 
 test "db graph metric runtime background skips paused metrics" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -2965,7 +2989,9 @@ test "db graph metric runtime background skips paused metrics" {
 
 test "db graph metric runtime background idles after synchronously cleaning a small failed generation" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -3102,7 +3128,9 @@ test "db graph metric runtime background idles after synchronously cleaning a sm
 
 test "db graph metric runtime background skips paused active planned builds" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -3269,7 +3297,9 @@ test "db graph metric runtime background skips paused active planned builds" {
 
 test "db graph metric runtime background starts automatically and drains notified degree" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -3375,7 +3405,9 @@ test "db graph metric runtime background starts automatically and drains notifie
 
 test "db graph metric runtime background open-configured split owners publish degree" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -3582,7 +3614,9 @@ test "db graph metric runtime background open-configured split owners publish de
 
 test "db graph metric runtime background separates coordinator and worker ticks" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -3702,7 +3736,9 @@ test "db graph metric runtime background separates coordinator and worker ticks"
 
 test "db graph metric runtime background coordinator and worker loops publish degree" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -3846,7 +3882,9 @@ test "db graph metric runtime background coordinator and worker loops publish de
 
 test "db graph metric runtime background coordinator and worker pool loops publish degree" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -4005,7 +4043,9 @@ test "db graph metric runtime background coordinator and worker pool loops publi
 
 test "db graph metric runtime background coordinator and worker pool loops publish pagerank" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -4153,7 +4193,9 @@ test "db graph metric runtime background coordinator and worker pool loops publi
 
 test "db graph metric runtime background coordinator and worker pool loops publish eigenvector" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -4301,7 +4343,9 @@ test "db graph metric runtime background coordinator and worker pool loops publi
 
 test "db graph metric runtime background coordinator and worker pool loops publish hits pair" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -4462,7 +4506,9 @@ test "db graph metric runtime background coordinator and worker pool loops publi
 
 test "db graph metric runtime background worker pool survives separate reopened handles" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -4709,7 +4755,9 @@ test "db graph metric runtime background worker pool survives separate reopened 
 
 test "db graph metric runtime background open-configured pagerank worker pool survives separate reopened handles" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -4933,7 +4981,9 @@ test "db graph metric runtime background open-configured pagerank worker pool su
 
 test "db graph metric runtime background open-configured eigenvector worker pool survives separate reopened handles" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -5155,7 +5205,9 @@ test "db graph metric runtime background open-configured eigenvector worker pool
 
 test "db graph metric runtime background open-configured hits worker pool survives separate reopened handles" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -5396,7 +5448,9 @@ test "db graph metric runtime background open-configured hits worker pool surviv
 
 test "db graph metric runtime background split ticks survive reopened pagerank handles" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -5692,7 +5746,9 @@ test "db graph metric runtime background split ticks survive reopened pagerank h
 
 test "db graph metric runtime background reopened coordinators do not duplicate pagerank publish" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -6044,7 +6100,9 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
 
 test "db graph metric runtime background reopened coordinators do not duplicate eigenvector publish" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -6396,7 +6454,9 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
 
 test "db graph metric runtime background reopened coordinators do not duplicate hits publish" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -6770,7 +6830,9 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
 
 test "db graph metric runtime background cycles multiple worker ids across planned pages" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -6876,7 +6938,9 @@ test "db graph metric runtime background cycles multiple worker ids across plann
 
 test "db graph metric runtime planned scheduler does not auto retry failed graph metric generation" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -6990,7 +7054,9 @@ test "db graph metric runtime planned scheduler does not auto retry failed graph
 
 test "db graph metric runtime planned scheduler boundary completes degree by name" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -7078,7 +7144,9 @@ test "db graph metric runtime planned scheduler boundary completes degree by nam
 
 test "db graph metric runtime planned scheduler sweeps active degree work" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -7176,7 +7244,9 @@ test "db graph metric runtime planned scheduler sweeps active degree work" {
 
 test "db graph metric runtime planned scheduler sweeps active pagerank work" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -7265,14 +7335,18 @@ test "db graph metric runtime planned scheduler sweeps active pagerank work" {
 
 test "db graph metric runtime planned single-vector failed planned rebuild preserves published public reads" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     try TestHelpers.verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(DB, alloc, "pagerank", "pagerank");
     try TestHelpers.verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(DB, alloc, "eigenvector", "eigenvector");
 }
 
 test "db graph metric runtime planned paired hits failed planned rebuild preserves published public reads" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -7588,6 +7662,8 @@ test "db graph metric runtime planned paired hits failed planned rebuild preserv
 }
 
 test "db graph metric runtime planned scheduler sweeps pagerank across reopened handles" {
+    var profile = @import("../../test_work_profile.zig").Profile(enum { setup, open, worker, coordinator, close, read }).init();
+    defer profile.report("reopened-pagerank");
     const DB = @import("../mod.zig").DB;
     var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
     defer std.debug.assert(allocator_state.deinit() == .ok);
@@ -7645,6 +7721,7 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
         try std.testing.expect(initial_tick.active_builds > 0);
     }
 
+    profile.mark(.setup);
     const workers = [_][]const u8{ "reopened-pagerank-a", "reopened-pagerank-b", "reopened-pagerank-c" };
     var finished = false;
     var step_index: usize = 0;
@@ -7654,11 +7731,17 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
                 .start_index_workers = false,
                 .ttl_cleanup = .{ .enabled = false },
             });
-            defer worker_db.close();
-            break :blk try worker_db.runGraphMetricPlannedWorkerSweep(.{
+            profile.mark(.open);
+            defer {
+                worker_db.close();
+                profile.mark(.close);
+            }
+            const sweep = try worker_db.runGraphMetricPlannedWorkerSweep(.{
                 .worker_id = workers[step_index % workers.len],
                 .max_pages = 1,
             });
+            profile.mark(.worker);
+            break :blk sweep;
         };
 
         const coordinator = blk: {
@@ -7666,7 +7749,11 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
                 .start_index_workers = false,
                 .ttl_cleanup = .{ .enabled = false },
             });
-            defer coordinator_db.close();
+            profile.mark(.open);
+            defer {
+                coordinator_db.close();
+                profile.mark(.close);
+            }
             const sweep = try coordinator_db.runGraphMetricPlannedCoordinatorSweep(.{
                 .max_metrics = 8,
                 .start_background_builds = false,
@@ -7681,6 +7768,7 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
                     finished = true;
                 }
             }
+            profile.mark(.coordinator);
             break :blk sweep;
         };
         if (finished) break;
@@ -7689,6 +7777,7 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
         }
     }
     try std.testing.expect(finished);
+    if (profile.enabled) std.debug.print("\nWORK reopened-pagerank steps={d}\n", .{step_index + 1});
 
     {
         var reader = try DB.open(alloc, std.mem.span(path), .{
@@ -7717,11 +7806,14 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
         try std.testing.expectEqualStrings("doc:d", published_result.graph_metric_results[0].scores[0].node);
         try std.testing.expect(published_result.graph_metric_results[0].scores[0].score >= published_result.graph_metric_results[0].scores[1].score);
     }
+    profile.mark(.read);
 }
 
 test "db graph metric runtime planned scheduler reopened coordinators do not duplicate pagerank publish" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -7930,7 +8022,9 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
 
 test "db graph metric runtime planned scheduler reopened coordinators do not duplicate eigenvector publish" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -8139,7 +8233,9 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
 
 test "db graph metric runtime planned scheduler reopened coordinators do not duplicate hits publish" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -8386,7 +8482,9 @@ test "db graph metric runtime planned scheduler reopened coordinators do not dup
 
 test "db graph metric runtime planned maintenance drains background pagerank work" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -8457,7 +8555,9 @@ test "db graph metric runtime planned maintenance drains background pagerank wor
 
 test "db graph metric runtime background drains pagerank through planned maintenance" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -8596,7 +8696,9 @@ test "db graph metric runtime background drains pagerank through planned mainten
 
 test "db graph metric runtime planned maintenance reports budget exhaustion and resumes" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -8730,7 +8832,9 @@ test "db graph metric runtime planned maintenance reports budget exhaustion and 
 
 test "db graph metric runtime planned pagerank production budget matches local oracle" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -8867,7 +8971,9 @@ test "db graph metric runtime planned pagerank production budget matches local o
 
 test "db graph metric runtime planned eigenvector production budget matches local oracle" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -9005,7 +9111,9 @@ test "db graph metric runtime planned eigenvector production budget matches loca
 
 test "db graph metric runtime planned hits production budget matches local oracle" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var local_path_buf: [256]u8 = undefined;
     const local_path = TestHelpers.tempPath(&local_path_buf);
@@ -9198,7 +9306,9 @@ test "db graph metric runtime planned hits production budget matches local oracl
 
 test "db graph metric runtime planned maintenance drains background centrality family work" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -9308,7 +9418,9 @@ test "db graph metric runtime planned maintenance drains background centrality f
 
 test "db graph metric runtime planned scheduler sweeps active eigenvector work" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -9397,7 +9509,9 @@ test "db graph metric runtime planned scheduler sweeps active eigenvector work" 
 
 test "db graph metric runtime planned scheduler sweeps active hits work" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -9506,7 +9620,9 @@ test "db graph metric runtime planned scheduler sweeps active hits work" {
 
 test "db graph metric runtime query public reads fail not ready before first publish" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -9593,7 +9709,9 @@ test "db graph metric runtime query public reads fail not ready before first pub
 
 test "db graph metric runtime query freshness distinguishes published stale scores from fresh requirement" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -9760,7 +9878,9 @@ test "db graph metric runtime query freshness distinguishes published stale scor
 
 test "db graph metric runtime query rerank applies published metric scores to search hits" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -9968,7 +10088,9 @@ test "db graph metric runtime query rerank applies published metric scores to se
 
 test "db graph metric runtime query not ready semantics distinguish projection from ranking" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -10060,7 +10182,9 @@ test "db graph metric runtime query not ready semantics distinguish projection f
 
 test "db graph metric runtime query freshness distinguishes stale projection from fresh ordering and filtering" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -10243,7 +10367,9 @@ test "db graph metric runtime query freshness distinguishes stale projection fro
 
 test "db graph metric runtime degree canary gate tracks queued active and capped degree work" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -10311,7 +10437,9 @@ test "db graph metric runtime degree canary gate tracks queued active and capped
 
 test "db graph metric runtime degree canary gate blocks non degree queued work" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -10348,7 +10476,9 @@ test "db graph metric runtime degree canary gate blocks non degree queued work" 
 
 test "db graph metric runtime degree canary runUntilIdle uses planned maintenance for one degree" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -10416,7 +10546,9 @@ test "db graph metric runtime degree canary runUntilIdle uses planned maintenanc
 
 test "db graph metric runtime degree canary planned maintenance reports bounded rounds and resumes" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -10489,7 +10621,9 @@ test "db graph metric runtime degree canary planned maintenance reports bounded 
 
 test "db graph metric runtime degree canary runUntilIdle preserves published scores while rebuild is active" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -10671,7 +10805,9 @@ test "db graph metric runtime degree canary runUntilIdle preserves published sco
 
 test "db graph metric runtime degree canary runUntilIdle fails fast when active planned work is outside guardrails" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -10730,7 +10866,9 @@ test "db graph metric runtime degree canary runUntilIdle fails fast when active 
 
 test "db graph metric runtime degree canary runUntilIdle falls back to local oracle for mixed metrics" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -10964,7 +11102,9 @@ test "db graph metric runtime default gate runUntilIdle publishes configured gra
 
 test "db graph metric runtime operations manual refresh rebuild and delete operate on configured metric" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -11048,7 +11188,9 @@ test "db graph metric runtime operations manual refresh rebuild and delete opera
 
 test "db graph metric runtime operations pause and resume controls background maintenance" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -11219,7 +11361,9 @@ test "db graph metric runtime operations pause and resume controls background ma
 
 test "db graph metric runtime default gate runUntilIdle can use planned graph metric maintenance when enabled" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -11281,7 +11425,9 @@ test "db graph metric runtime default gate runUntilIdle can use planned graph me
 
 test "db graph metric runtime default gate runUntilIdle planned graph metric maintenance reports budget exhaustion and resumes" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -11363,7 +11509,9 @@ test "db graph metric runtime default gate runUntilIdle planned graph metric mai
 
 test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto chooses planned for one degree" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -11437,7 +11585,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
 
 test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto chooses planned for one small pagerank" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -11519,7 +11669,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
 
 test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto can cap larger pagerank" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -11593,7 +11745,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
 
 test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto can widen pagerank planned gate" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -11678,7 +11832,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
 
 test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto chooses bounded planned for multi metric indexes" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -11766,7 +11922,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
 
 test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto chooses planned for one small eigenvector" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -11842,7 +12000,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
 
 test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto chooses planned for compatible hits by default" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -11929,7 +12089,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
 
 test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto resumes active planned pagerank" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -12013,7 +12175,9 @@ test "db graph metric runtime default gate runUntilIdle default graph metric mai
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance chooses planned for one small pagerank" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -12083,7 +12247,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance chooses planned for one degree" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -12151,7 +12317,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance chooses planned for one small eigenvector" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -12221,7 +12389,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance chooses bounded planned for multi metric indexes" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -12303,7 +12473,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate prepares topology while numerical capacity is occupied" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
@@ -12364,7 +12536,9 @@ test "db graph metric runtime default gate prepares topology while numerical cap
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance defers queued work at per-index cap" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -12438,7 +12612,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance can cap larger pagerank" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -12512,7 +12688,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance can cap larger eigenvector" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -12586,7 +12764,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance can widen eigenvector planned gate" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -12672,7 +12852,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance chooses planned for compatible hits by default" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -12760,7 +12942,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate standalone HITS lanes use resumable planned maintenance" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     for ([_]graph_mod.GraphMetricKind{ .hits_authority, .hits_hub }) |kind| {
         var path_buf: [256]u8 = undefined;
         const path = TestHelpers.tempPath(&path_buf);
@@ -12792,7 +12976,9 @@ test "db graph metric runtime default gate standalone HITS lanes use resumable p
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance bounds independent incompatible hits lifecycles" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -12878,7 +13064,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance chooses planned for one compatible small hits pair" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -12978,7 +13166,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance resumes active planned degree" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -13063,7 +13253,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance resumes active planned eigenvector" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
@@ -13148,7 +13340,9 @@ test "db graph metric runtime default gate runUntilIdle auto graph metric mainte
 
 test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance resumes active planned hits pair" {
     const DB = @import("../mod.zig").DB;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
