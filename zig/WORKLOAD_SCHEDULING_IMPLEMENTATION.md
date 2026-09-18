@@ -10,6 +10,30 @@ join-row worker has durable attempt ownership. Coordinator attempt dispatch
 remains disabled. These stages do not complete the operator scheduling design
 or qualify new defaults.
 
+## Review order
+
+The commits preserve implementation stages and subsequent integration fixes.
+Review the final tree with those fixes applied; intermediate commits are not
+independently qualified release artifacts. The following groups identify the
+main contracts and representative commits, rather than an exhaustive history.
+
+| Stage | Contract to review | Main commits |
+| --- | --- | --- |
+| Design and scope | Ownership model, fixed-policy rollout, local qualification; deployment tooling deferred | `74820f0ec2`, `64f1afbb37` |
+| Foreground and SDK admission | Bounded FIFO, original deadlines, optional shared pools, explicit safe read retries | `c1f58483f4`, `ee9e19c705`, `d88ab51e6b`, `ea4d822345`, `dc1d530f0a`, `10a7369392`, `56bba4933f` |
+| Execution and memory | Typed ownership, shared dense driver/helper capacity, actual working bytes, audited native read suspension | `44021169fe`, `1ec9843299`, `3cc6c9b647`, `849d822623`, `508311b930`, `9c687e2670` |
+| Request/output lifetime | Tracked allocation ownership through kernel, HTTP, and serverless handoffs; lookup admission | `1b527c5129`, `42b8c19983`, `fe9ede7c7c`, `afe3c72ae3`, `803b886294`, `85c22d2c8b`, `3d9b3aaa1b`, `8213869f68`, `9920f56295`, `18af5c041a`, `288746b7c5`, `95aba99ad4` |
+| Recovery and remote workers | Reserve durable obligations before prepare; authenticate attempts; persist opt-in worker deduplication and generation closure | `341f08a8b5`, `43ed43cabd`, `0d07db7932`, `b11a01530b`, `7fc30a22ef` |
+| Runtime pressure | Defer background submissions on finite executor pressure; preserve admission failures across the compiled callback ABI | `9511272560`, `2be51d61ad` |
+| Evidence and operations | Retained native/container harness, vector calibration, numerical Cloud gates, explicit failure outcomes and telemetry validation | `ebe085a24d`, `0f9a1a05f2`, `dff1a3d9f7`, `0c9395fc32`, `fc2d5878ec`, `f550aefaf0` |
+
+The [validation record](WORKLOAD_SCHEDULING_VALIDATION.md) identifies exact tested
+source revisions and failures. The remaining-phase table below distinguishes
+implemented mechanisms from unfinished integration. In particular, fixed-policy
+waiting and dense scheduling remain opt-in, and coordinator dispatch remains
+disabled. Document lookups now joining the existing query gate is an intentional
+default behavior change that reviewers should assess explicitly.
+
 ## Implemented admission contract
 
 `common/workload_admission.zig` owns an allocation-free intrusive FIFO, active

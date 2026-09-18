@@ -68,6 +68,24 @@ its SHA-256 is
 `adac556d2402b043b2ec91d483c0a68f05a6f78f936231c6adb59f4469cfaebf`.
 The harness freezes each arm's executable before starting either lifecycle.
 
+## Telemetry correction
+
+The receipt audit found that the earlier harness requested `/metrics` on the
+public API port while disabling the dedicated health/metrics listener. The API
+served dashboard HTML with HTTP 200. The `.prom` files in the experiments above
+must not be used as Prometheus evidence. Their request samples, process exit
+records, and artifact checksums remain valid; they do not establish the
+per-stage metrics or memory-reservation release gates.
+
+Harness commit `fc2d5878ec` enables the dedicated health/metrics listener and
+rejects HTML or invalid sample text. A real native probe of the `95aba99ad4`
+binary then returned valid Prometheus text but failed its capability assertion:
+`antfly_admission_query_diagnostics_available` was zero, and configured queue
+and memory limits were missing. The standalone handler statistics projection
+carried only the four legacy counters. Its zero queue/retained observations
+cannot establish ownership retirement. This failed probe is retained unchanged
+at `/tmp/workload-metrics-native-95aba99ad4-probe/`.
+
 ## Interpretation
 
 The mixed smoke verifies that the two original process crashes no longer
@@ -79,8 +97,10 @@ needs pressure coverage.
 The harness now counts warmup failures, checks clean process shutdown, and
 retains a machine-readable failure list. Exit 1 indicates request/runtime
 failure, exit 2 indicates generator-invalid evidence without detected
-correctness failure, and exit 0 indicates clean evidence only for the tested
-subset. Expected 429 overload responses remain distinct from failures.
+correctness failure, and exit 3 indicates otherwise-clean execution without
+valid Prometheus snapshots. Exit 0 indicates clean evidence only for the tested
+subset; `telemetry_complete` attests collection and sample format, not metric
+coverage or full release qualification. Expected 429 overload responses remain distinct from failures.
 
 Remaining release work includes full ingress/planning/stream ownership,
 protected execution and recovery progress, operator fairness, remote coordinator
