@@ -293,14 +293,21 @@ const generated_replay_default_window_items: usize = 2048;
 /// chunk set per document. This window still spans several provider batches,
 /// preserving throughput while producing an early durable partial generation.
 const generated_preparation_default_window_items: usize = 64;
-const generated_embed_default_batch_items: usize = 8;
+// Direct-baseline throughput measurements (Qwen3-Embedding-0.6B on Metal) hit
+// their stride at 32-64 texts per call; a smaller default starves the
+// provider round-trip with per-call overhead and, worse, keeps the
+// per-document enrichment loop looping (and its lease-heartbeat task
+// starved of scheduler time) far longer than necessary to drain a backlog.
+const generated_embed_default_batch_items: usize = 32;
 const generated_embed_default_batch_bytes: usize = 256 * 1024;
 // Text embedding batches are commonly kilobytes; rendered PDF pages are not.
 // Keeping a distinct total-media default lets a preferred eight-page image
 // batch retain the same per-page quality it would receive as a singleton.
 const generated_pdf_embed_default_batch_bytes: usize = 64 * 1024 * 1024;
+// Matches the GLiNER2 direct-baseline batch size; the ceiling allows an
+// operator (or a busy backlog) to grow it toward 16 without code changes.
 const generated_ocr_default_batch_items: usize = 8;
-const generated_ocr_default_batch_max_items: usize = 8;
+const generated_ocr_default_batch_max_items: usize = 16;
 // Keep control-plane arrays and pre-admission prototypes bounded even when an
 // operator accidentally configures an unreasonably large batch. The inference
 // server applies the same absolute ceiling to generated and serial-family work.
@@ -3741,6 +3748,15 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     last_embed_batch_completed_ms: u64 = 0,
     last_embed_batch_ns: u64 = 0,
     total_embed_ns: u64 = 0,
+    // Asset-producer (extraction/OCR/knowledge-graph) batch counters. Kept
+    // deliberately simple (no mutex ceremony, unlike the embed_* fields
+    // above): they exist only to print a RunUntilIdle throughput summary,
+    // not to drive any control-flow decision, so a best-effort count under
+    // concurrent access is an acceptable tradeoff against duplicating the
+    // three-way freestanding/io_impl/plain locking dance for a diagnostic.
+    extract_batches_completed: u64 = 0,
+    extract_items_completed: u64 = 0,
+    total_extract_ns: u64 = 0,
     inference_recovery_mutex: std.atomic.Mutex = .unlocked,
     inference_recovery: std.AutoHashMapUnmanaged(InferenceRecoveryKey, InferenceRecoveryState) = .empty,
     inference_timeout_count: std.atomic.Value(u64) = .init(0),
@@ -4243,6 +4259,15 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     last_embed_batch_completed_ms: u64 = 0,
     last_embed_batch_ns: u64 = 0,
     total_embed_ns: u64 = 0,
+    // Asset-producer (extraction/OCR/knowledge-graph) batch counters. Kept
+    // deliberately simple (no mutex ceremony, unlike the embed_* fields
+    // above): they exist only to print a RunUntilIdle throughput summary,
+    // not to drive any control-flow decision, so a best-effort count under
+    // concurrent access is an acceptable tradeoff against duplicating the
+    // three-way freestanding/io_impl/plain locking dance for a diagnostic.
+    extract_batches_completed: u64 = 0,
+    extract_items_completed: u64 = 0,
+    total_extract_ns: u64 = 0,
     inference_recovery_mutex: std.atomic.Mutex = .unlocked,
     inference_recovery: std.AutoHashMapUnmanaged(InferenceRecoveryKey, InferenceRecoveryState) = .empty,
     inference_timeout_count: std.atomic.Value(u64) = .init(0),
@@ -10894,14 +10919,23 @@ fn flushAssetProducerBatch(
             batch_bytes = addUsizeSaturating(batch_bytes, item_bytes);
         }
         std.debug.assert(end > start);
+        const extract_started_ns = runtime.clock.nowRealtimeNs();
         flushAssetProducerBatchItems(runtime, items.items[start..end], window) catch |err| {
+            runtime.extract_batches_completed += 1;
+            runtime.extract_items_completed += @intCast(end - start);
+            runtime.total_extract_ns += elapsedNsSince(runtime, extract_started_ns);
             if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                 return err;
             if (deferred_retry_error == null) {
                 deferred_retry_error = err;
                 deferred_retry_fingerprint = runtime.active_failure_fingerprint;
             }
+            start = end;
+            continue;
         };
+        runtime.extract_batches_completed += 1;
+        runtime.extract_items_completed += @intCast(end - start);
+        runtime.total_extract_ns += elapsedNsSince(runtime, extract_started_ns);
         start = end;
     }
     if (deferred_retry_error) |err| {

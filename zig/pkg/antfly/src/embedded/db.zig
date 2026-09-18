@@ -18,6 +18,7 @@ const db_mod = support.db;
 const db_core = support.db_core;
 const lite_restore_staging = support.lite.restore_staging;
 const template_remote_host = support.template_remote_host;
+const full_text_index_defaults = support.full_text_index_defaults;
 
 pub const lsm_storage = support.lsm_storage;
 pub const enrichment_runtime = support.enrichment_runtime;
@@ -107,7 +108,7 @@ pub const DB = struct {
             .no_sync = opts.no_sync,
             .io = liteIo(opts),
         });
-        return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend);
+        return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend, false);
     }
 
     pub fn createLiteWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
@@ -117,10 +118,10 @@ pub const DB = struct {
             .no_sync = opts.no_sync,
             .io = liteIo(opts),
         });
-        return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend);
+        return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend, true);
     }
 
-    fn openWithLiteBackend(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile, lite_backend: *support.lite.backend.Handle) !DB {
+    fn openWithLiteBackend(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile, lite_backend: *support.lite.backend.Handle, create: bool) !DB {
         errdefer lite_backend.deinit();
 
         var db_opts = toDbOpenOptions(opts, profile);
@@ -129,6 +130,19 @@ pub const DB = struct {
         const inner = db_mod.DB.openOwned(alloc, path, db_opts) catch |err| {
             return err;
         };
+        errdefer inner.closeOwned();
+
+        if (create) {
+            // Antfly Lite databases provision the same default full-text
+            // index the server provisions on every table create, so text
+            // search works out of the box without a separate index-create
+            // step. Opening an existing database must not add anything.
+            try inner.addIndex(.{
+                .name = full_text_index_defaults.default_full_text_index_name,
+                .kind = .full_text,
+                .config_json = "{}",
+            });
+        }
 
         const moved_lite_backend = lite_backend.*;
         lite_backend.* = undefined;

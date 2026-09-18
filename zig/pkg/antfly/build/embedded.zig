@@ -273,6 +273,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_mod.addImport("antfly_source_root", capi_root_mod);
     const capi_options = b.addOptions();
     capi_options.addOption(bool, "linked_storage", false);
+    // The inference runtime is always linked into libantfly (see
+    // link_anchor.zig and addRuntime's storage_kernel unit), so this is
+    // unconditionally true. Unit tests compile the inference call path
+    // directly (no archive/trap boundary either way).
+    capi_options.addOption(bool, "inference_enabled", true);
     capi_mod.addOptions("capi_build_options", capi_options);
     capi_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("antfly_vector", vector_mod);
@@ -280,6 +285,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     // The public C ABI and executable reuse the distributed PIC storage
     // archive, so production builds analyze and optimize that graph once.
+    // libantfly embeds the standalone inference runtime in-process, the same
+    // as the `antfly` executable (see link_anchor.zig and addRuntime's
+    // storage_kernel unit): this is a deliberate product decision
+    // (2026-09-17) so Lite hosts get local inference without a separate
+    // runtime, at the cost of a much larger shared library (see
+    // COMPILATION.md's "C API composition" section).
     const libantfly_link_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/capi/link_anchor.zig"),
         .target = target,
@@ -292,7 +303,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .linkage = .dynamic,
         .name = "antfly",
         .root_module = libantfly_link_mod,
-        .max_rss = 2 * 1024 * 1024 * 1024,
+        .max_rss = 4 * 1024 * 1024 * 1024,
     });
     libantfly.link_gc_sections = true;
     // Homebrew rewrites the dylib ID to its absolute opt/lib path on install.
@@ -329,9 +340,16 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const capi_smoke_step = b.step("capi-smoke", "Compile and run a C consumer smoke test for libantfly");
     capi_smoke_step.dependOn(&run_capi_smoke.step);
 
+    // The Go test binary is not the `antfly` executable, so it cannot re-exec
+    // itself the way the CLI does to spawn the sandboxed inference worker
+    // (see inference_worker.zig's `resolveWorkerExecutable`). Point it at the
+    // `antfly` binary this same build tree produces so it never falls
+    // through to an unrelated `antfly` a developer happens to have on PATH.
+    const lite_go_worker_env = b.fmt("ANTFLY_INFERENCE_WORKER={s}", .{b.getInstallPath(.bin, "antfly")});
     const run_lite_go_tests = b.addSystemCommand(&.{
         "env",
         "GOWORK=off",
+        lite_go_worker_env,
         "go",
         "test",
         "-tags",
@@ -348,6 +366,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const run_lite_go_example = b.addSystemCommand(&.{
         "env",
         "GOWORK=off",
+        lite_go_worker_env,
         "go",
         "run",
         ".",
@@ -366,6 +385,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const run_lite_go_retrieval_template = b.addSystemCommand(&.{
         "env",
         "GOWORK=off",
+        lite_go_worker_env,
         "go",
         "run",
         ".",
@@ -404,6 +424,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "packed dense response exposes public ids not doc ordinals",
         "dense response identity generation footer",
         "capi aggregate hits rejects stale identity generation before aggregation materialization",
+        "capi lite local-runtime-configured flag reports local_embedded only when the build links inference",
+        "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
+        "capi get edges json does not double free a non-empty edge slice",
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_mod,

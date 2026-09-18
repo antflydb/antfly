@@ -137,6 +137,12 @@ antfly lite vacuum app.aflite
 antfly lite serve app.aflite --addr 127.0.0.1:8080 --config production.json
 ```
 
+A Lite database created through the embedding surfaces (the C ABI and the
+native Go/Zig `embedded` package) is provisioned with the default
+`full_text_index_v0` full-text index, matching the server's table-create
+behavior, so `antfly lite index create` is only needed for indexes beyond
+that default.
+
 `antfly lite init` should be non-destructive: it creates a new `.aflite` file
 and rejects an existing database path. Destructive replacement should stay on
 explicit restore/import flows where the source and target are both known.
@@ -675,15 +681,58 @@ unexpectedly start sending data to a network provider.
 
 #### Local Embedded Inference
 
-Local inference should be optional packaging:
+Local inference is built in, not optional packaging: every `libantfly`/
+`antfly lite` build embeds the standalone inference runtime in-process, the
+same as the `antfly` executable (see COMPILATION.md's "C API composition"
+section). There is no separate base/full build distinction -- `zig build
+capi` always links the inference archive (2026-09-17 product decision: Lite
+hosts get local inference without a separate runtime, at the cost of a much
+larger shared library).
 
-- `antfly lite` base build: database, search, vector indexes, no heavy model
-  runtime requirement.
-- `antfly lite` full build: bundled or dynamically available inference runtime.
-- Application embedding: caller links the inference runtime if wanted.
+Opening a Lite handle with the local-runtime-configured flag constructs an
+embedded inference provider owned by the handle and reports
+`local_inference_runtime: true` and `inference_mode: "local_embedded"`.
+Adding an `embeddings` index whose `embedder` (or chunker/extractor producer)
+uses `"provider": "antfly"` with no `api_url` runs against that embedded
+provider instead of failing or requiring a remote URL -- `antfly lite
+run-until-idle app.aflite` drains the resulting enrichment work locally, with
+no network calls. Application embedding (see `go/pkg/antflylite/README.md`
+for the Go binding) gets the same embedded behavior automatically by linking
+the standard `libantfly` -- no separate library or extra link flags.
 
-Local inference is important for demos and offline use, but it should not be
-required for the core embedded database.
+Models are still auto-discovered the same way as `antfly inference pull`,
+under `~/.antfly/inference/models/`.
+
+**Worker process.** GPU-hosted and driver-backed backends (Metal, CUDA, ONNX,
+PJRT) run model construction and, for Metal/CUDA/PJRT, execution itself in a
+separate, replaceable child process (`<worker executable> inference
+_worker`), not in the host process -- see
+`BackendRuntime.requiresProcessIsolation` in
+`zig/pkg/inference/src/backends/backends.zig`. This is crash containment, not
+an implementation accident: an unabortable driver call or a model load that
+corrupts GPU state can only be recovered by killing and respawning the
+process that made it, and that must never be the process embedding
+`libantfly`. Native-only backends (CPU) never need this and run in-process.
+
+The `antfly` CLI resolves the worker by re-executing itself (`argv[0]` names
+the `antfly` binary the user launched, which understands `inference
+_worker`). A library host has no such self -- `argv[0]` is the Go test
+binary, `examples/dogfood`, or whatever else linked `libantfly` -- so the
+runtime resolves the worker executable in this order:
+
+1. `ANTFLY_INFERENCE_WORKER`, an environment variable naming the worker
+   executable directly (typically the path to an `antfly` binary).
+2. The image this code was loaded from, via `dladdr`: for the statically
+   linked `antfly` executable this is itself (unchanged CLI behavior); for a
+   shared `libantfly`/`libantfly.dylib`, the runtime looks for a sibling
+   `antfly` binary in the same directory.
+3. `antfly` on `PATH`.
+
+If none of these resolve, model construction on a process-isolated backend
+fails with a clear error naming `ANTFLY_INFERENCE_WORKER`. Set that variable
+(or ship an `antfly` binary next to `libantfly`, or put one on `PATH`) when
+embedding Lite in a host that is not the `antfly` binary itself and needs
+Metal/CUDA/ONNX/PJRT models.
 
 #### Manual Maintenance
 
@@ -791,6 +840,9 @@ antfly lite serve
 
 The CLI should accept JSON request files that match the public API contracts.
 This keeps Lite compatible with normal Antfly examples, tests, and SDKs.
+`antfly lite index create` adds indexes beyond the default `full_text_index_v0`
+full-text index that embedding-surface creation already provisions, matching
+the server; it does not need to be run just to make text search work.
 
 ## Packaging
 

@@ -27851,6 +27851,11 @@ pub const DB = struct {
         truncate_replay: bool = true,
         wait_for_enrichment_retries: bool = false,
         cancellation: types.CancellationToken = .none,
+        /// Run the foreground enrichment catch-up pass to full completion
+        /// instead of bounding it at the request-visibility default
+        /// (`sync_wait_timeout_ms`, 5 minutes). Only `runUntilIdle` sets
+        /// this; see `runEnrichmentUntilForDrainUnbounded`.
+        unbounded_enrichment_wait: bool = false,
     };
 
     fn runDerivedUntilWithOptions(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
@@ -27941,9 +27946,39 @@ pub const DB = struct {
         }
     }
 
+    /// Unlike `runEnrichmentUntilWithVisibilityDeadline`, never substitutes
+    /// the request-visibility default (`sync_wait_timeout_ms`, 5 minutes)
+    /// when no deadline is supplied, even when `optional_runtime_workers_enabled`
+    /// -- worker-mode's `waitForAppliedWithVisibilityDeadline` only passively
+    /// waits for a separate background worker to make progress and bounds
+    /// that wait unconditionally when `deadline_ns` is null. `runUntilIdle`
+    /// (Lite's synchronous ingest drain, in particular) never supplies a
+    /// deadline and must run the foreground catch-up pass itself until the
+    /// full enrichment backlog clears, however long that legitimately takes,
+    /// not silently truncate at 5 minutes and surface a slow-but-progressing
+    /// drain as a hard failure. Scoped to `runUntilIdle`'s own drain call
+    /// (via `ReplayDrainOptions.unbounded_enrichment_wait`) rather than
+    /// `runEnrichmentUntilWithVisibilityDeadline` generally: other callers
+    /// (plain `runEnrichmentUntil`, `runMaintenanceUntil`, request-visibility
+    /// barriers) still rely on the passive bounded wait deferring to that
+    /// background worker, and forcing them through inline foreground
+    /// execution instead changed observable enrichment-worker ownership
+    /// behavior (see the `TestLiteHostedPauseResumeGeneratedEnrichment`
+    /// regression this scoping fixes).
+    fn runEnrichmentUntilForDrainUnbounded(self: *DB, sequence: u64) !void {
+        if (sequence == 0) return;
+        const runtime = self.enrichment_runtime orelse return;
+        runtime.notifySequence(sequence);
+        try runtime.catchUpUntil(sequence);
+    }
+
     fn runEnrichmentUntilForDrain(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
         while (true) {
-            self.runEnrichmentUntilWithCancellation(sequence, options.cancellation) catch |err| switch (err) {
+            const outcome = if (options.unbounded_enrichment_wait and options.cancellation.ptr == null)
+                self.runEnrichmentUntilForDrainUnbounded(sequence)
+            else
+                self.runEnrichmentUntilWithCancellation(sequence, options.cancellation);
+            outcome catch |err| switch (err) {
                 error.EnrichmentRetryInProgress => {
                     if (!options.wait_for_enrichment_retries) return err;
                     sleepNs(25 * std.time.ns_per_ms);
@@ -29176,7 +29211,56 @@ pub const DB = struct {
     }
 
     pub fn runUntilIdle(self: *DB) !void {
-        try self.runUntilIdleWithReplayDrainOptions(.{ .wait_for_enrichment_retries = true });
+        const started_ns = platform_time.monotonicNs();
+        const before = self.enrichmentThroughputSnapshot();
+        defer self.logRunUntilIdleSummary(started_ns, before);
+        try self.runUntilIdleWithReplayDrainOptions(.{
+            .wait_for_enrichment_retries = true,
+            .unbounded_enrichment_wait = true,
+        });
+    }
+
+    const EnrichmentThroughputSnapshot = struct {
+        embed_batches: u64 = 0,
+        embed_items: u64 = 0,
+        embed_ns: u64 = 0,
+        extract_batches: u64 = 0,
+        extract_items: u64 = 0,
+        extract_ns: u64 = 0,
+    };
+
+    fn enrichmentThroughputSnapshot(self: *DB) EnrichmentThroughputSnapshot {
+        const runtime = self.enrichment_runtime orelse return .{};
+        return .{
+            .embed_batches = runtime.embed_batches_completed,
+            .embed_items = runtime.embed_items_completed,
+            .embed_ns = runtime.total_embed_ns,
+            .extract_batches = runtime.extract_batches_completed,
+            .extract_items = runtime.extract_items_completed,
+            .extract_ns = runtime.total_extract_ns,
+        };
+    }
+
+    /// One-line throughput summary so a caller (Lite's `dogfood`-style ingest
+    /// drain, in particular) can see embed/extract batch counts and wall time
+    /// without instrumenting its own driver loop. Deltas isolate this call's
+    /// own contribution on a long-lived, repeatedly-drained runtime.
+    fn logRunUntilIdleSummary(self: *DB, started_ns: u64, before: EnrichmentThroughputSnapshot) void {
+        const after = self.enrichmentThroughputSnapshot();
+        const wall_ns = platform_time.monotonicNs() -| started_ns;
+        if (after.embed_batches == before.embed_batches and after.extract_batches == before.extract_batches) return;
+        std.log.info(
+            "runUntilIdle summary wall_ms={d} embed_batches={d} embed_items={d} embed_ns={d} extract_batches={d} extract_items={d} extract_ns={d}",
+            .{
+                wall_ns / std.time.ns_per_ms,
+                after.embed_batches -| before.embed_batches,
+                after.embed_items -| before.embed_items,
+                after.embed_ns -| before.embed_ns,
+                after.extract_batches -| before.extract_batches,
+                after.extract_items -| before.extract_items,
+                after.extract_ns -| before.extract_ns,
+            },
+        );
     }
 
     /// Resident managed writers already have an asynchronous enrichment owner.
@@ -33397,7 +33481,23 @@ pub const DB = struct {
     }
 
     fn portableImportTargetEmptyLocked(self: *DB, alloc: Allocator) !bool {
-        if (self.core.schema != null or self.core.indexCount() != 0) return false;
+        if (self.core.schema != null) return false;
+        // Every Lite database is now provisioned with the default full-text
+        // index at creation, matching the server's table-create behavior, so
+        // a target carrying only that pristine index is still eligible for a
+        // full physical import. Anything beyond that single default index
+        // means the target has been configured and must not be silently
+        // overwritten.
+        switch (self.core.indexCount()) {
+            0 => {},
+            1 => {
+                const configs = try self.core.listIndexes(alloc);
+                defer types.freeIndexConfigs(alloc, configs);
+                if (configs.len != 1 or configs[0].kind != .full_text or
+                    !std.mem.eql(u8, configs[0].name, "full_text_index_v0")) return false;
+            },
+            else => return false,
+        }
 
         // Primary rows can be empty while durable identity tombstones and
         // forward/reverse mappings remain. Publishing over that state would

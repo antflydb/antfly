@@ -481,7 +481,7 @@ const HttpExtractorState = struct {
             framed_body = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, metadata, attachments);
         }
 
-        const base = self.cfg.resolvedUrl() orelse switch (self.cfg.provider) {
+        const base_raw = self.cfg.resolvedUrl() orelse switch (self.cfg.provider) {
             .antfly => "http://127.0.0.1:8080",
             else => return error.InvalidExtractionConfig,
         };
@@ -489,6 +489,16 @@ const HttpExtractorState = struct {
             .pioneer => "/inference",
             else => "/extract",
         };
+        // A configured antfly extractor `url`/`api_url` is commonly a bare
+        // `scheme://host:port` (the same value a caller reuses for the
+        // embedder and chunker on the same inference service), which must
+        // resolve under the joined public API's `/ai/v1` prefix rather than
+        // the process root. Other providers' URLs are used exactly as given.
+        const base = if (self.cfg.provider == .antfly)
+            try normalizedAntflyExtractionBaseAlloc(alloc, base_raw)
+        else
+            try alloc.dupe(u8, base_raw);
+        defer alloc.free(base);
         const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base, path });
         defer alloc.free(url);
 
@@ -766,6 +776,22 @@ fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: [
     const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(encoded);
     try out.appendSlice(alloc, encoded);
+}
+
+/// A bare `scheme://host:port` antfly extractor base gets `/ai/v1` appended
+/// so it lands on the joined public API instead of the process root; a base
+/// that already carries a path (including one already ending in `/ai/v1`) is
+/// left exactly as configured. Mirrors
+/// `managed_embedder.zig`'s `normalizeAntflyInferenceBaseUrl` for the
+/// embedder/chunker paths.
+fn normalizedAntflyExtractionBaseAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, raw, "/");
+    if (std.mem.endsWith(u8, trimmed, "/ai/v1")) return try alloc.dupe(u8, trimmed);
+    const scheme_pos = std.mem.indexOf(u8, trimmed, "://");
+    const host_start = if (scheme_pos) |pos| pos + 3 else 0;
+    const path_pos = std.mem.indexOfPos(u8, trimmed, host_start, "/");
+    if (path_pos == null) return try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{trimmed});
+    return try alloc.dupe(u8, trimmed);
 }
 
 fn parseProvider(raw: []const u8) !Provider {
