@@ -7342,7 +7342,7 @@ pub const ApiHttpServer = struct {
                 };
                 defer query_req.deinit(alloc);
                 query_req.req.execution_deadline_ns = if (query_req.req.execution_deadline_ns) |deadline| @min(deadline, runner.deadline_ns) else runner.deadline_ns;
-                runner.server.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
+                runner.server.routeQueryToReadSchemaWithResolver(alloc, table_name, &query_req.req, null) catch |err| switch (err) {
                     error.TableNotFound => return err,
                     error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,
                     else => return err,
@@ -7484,15 +7484,16 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn maybeRouteQueryToReadSchema(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest) !void {
-        return self.routeQueryToReadSchemaWithResolver(table_name, query_req, null);
+        return self.routeQueryToReadSchemaWithResolver(self.alloc, table_name, query_req, null);
     }
 
-    fn routeQueryToReadSchemaWithResolver(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest, resolver: ?*CatalogQueryResolver) !void {
+    fn routeQueryToReadSchemaWithResolver(self: *ApiHttpServer, request_alloc: std.mem.Allocator, table_name: []const u8, query_req: *db_mod.types.SearchRequest, resolver: ?*CatalogQueryResolver) !void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const alloc = if (resolver) |cache| cache.arena else arena.allocator();
         const table = (try self.queryTableDefinition(alloc, resolver, table_name, .{ .deadline_ns = query_req.execution_deadline_ns, .cancellation = query_req.cancellation orelse .none })) orelse return;
-        try tables_api.routeQueryRequestToActiveReadIndex(self.alloc, &table, query_req);
+        // Index names become owned fields of the parsed request and must use its allocator.
+        try tables_api.routeQueryRequestToActiveReadIndex(request_alloc, &table, query_req);
         query_req.prepared_read_table_id = table.table_id;
     }
 
@@ -12415,7 +12416,7 @@ pub const ApiHttpServer = struct {
         }
         query_req.req.cancellation = cancellation;
         query_req.req.response_table_name = response_label;
-        self.routeQueryToReadSchemaWithResolver(table_name, &query_req.req, resolver) catch |err| switch (err) {
+        self.routeQueryToReadSchemaWithResolver(alloc, table_name, &query_req.req, resolver) catch |err| switch (err) {
             error.TableNotFound => return error.TableNotFound,
             error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidQueryRequest,
             else => return err,
@@ -12792,7 +12793,7 @@ pub const ApiHttpServer = struct {
         errdefer owned.deinit(alloc);
         owned.req.cancellation = cancellation;
         try ensureRequestActive(cancellation);
-        try self.routeQueryToReadSchemaWithResolver(table_name, &owned.req, resolver);
+        try self.routeQueryToReadSchemaWithResolver(alloc, table_name, &owned.req, resolver);
         try self.validateQuerySortWithResolver(table_name, owned.req, resolver);
         return owned;
     }
@@ -25700,7 +25701,7 @@ test "api http plain public query preserves outer absolute request deadline thro
                     .table_id = 1,
                     .name = "docs",
                     .schema_json = "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}",
-                    .indexes_json = "{}",
+                    .indexes_json = "{\"full_text_index\":{\"type\":\"full_text\"}}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = null }})[0..]),
@@ -25763,6 +25764,8 @@ test "api http plain public query preserves outer absolute request deadline thro
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
             try std.testing.expectEqual(self.expected_deadline_ns, req.execution_deadline_ns.?);
+            try std.testing.expectEqualStrings("full_text_index", req.index_name.?);
+            try std.testing.expectEqualStrings("full_text_index", req.primary_text_index_name.?);
             if (self.oversized) {
                 const excessive = try inner_alloc.alloc(u8, 2 * 1024 * 1024);
                 defer inner_alloc.free(excessive);
