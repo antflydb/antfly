@@ -3350,19 +3350,20 @@ pub const Server = struct {
         try ensureDateHeader(self.io, &response);
 
         // Build response headers outside the lock.
+        const header_alloc = response.body_allocator orelse response.allocator;
         var resp_extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
-        defer resp_extra.deinit(self.allocator);
+        defer resp_extra.deinit(header_alloc);
 
-        try appendH2ResponseHeaders(self.allocator, &resp_extra, &response.headers);
+        try appendH2ResponseHeaders(header_alloc, &resp_extra, &response.headers);
 
         var status_buf: [3]u8 = undefined;
         const h2_headers = try H2Connection.buildResponseHeaders(
             response.status.code,
             resp_extra.items,
             &status_buf,
-            self.allocator,
+            header_alloc,
         );
-        defer self.allocator.free(h2_headers);
+        defer header_alloc.free(h2_headers);
 
         const has_body = response.body != null and response.body.?.len > 0;
 
