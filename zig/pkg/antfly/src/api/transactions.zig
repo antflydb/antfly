@@ -2599,7 +2599,7 @@ pub fn ownedRequestFromStageReadRequest(alloc: std.mem.Allocator, req: StageRead
 }
 
 pub fn parseStageWriteRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedTransactionCommitRequest {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
     const obj = switch (parsed.value) {
         .object => |obj| obj,
@@ -2672,7 +2672,7 @@ pub fn buildStageReadResponse(
     const txn_hex = distributed_txn.encodeTxnIdHex(txn_id);
     const version_text = try std.fmt.allocPrint(alloc, "{d}", .{snapshot.version});
     const document = if (snapshot.document_json) |document_json|
-        (try std.json.parseFromSlice(std.json.Value, alloc, document_json, .{})).value
+        (try std.json.parseFromSlice(std.json.Value, alloc, document_json, .{ .parse_numbers = false })).value
     else
         .null;
     return .{
@@ -2740,7 +2740,7 @@ fn buildSessionReadSnapshotResponse(
         .key = snapshot.key,
         .version = snapshot.version,
         .document = if (snapshot.document_json) |document_json|
-            (try std.json.parseFromSlice(std.json.Value, alloc, document_json, .{})).value
+            (try std.json.parseFromSlice(std.json.Value, alloc, document_json, .{ .parse_numbers = false })).value
         else
             null,
     };
@@ -2961,13 +2961,13 @@ pub fn encodeRollbackResponse(alloc: std.mem.Allocator, info: SavepointInfo) ![]
 }
 
 pub fn parseCommitRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedTransactionCommitRequest {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
     return try parseCommitValue(alloc, parsed.value);
 }
 
 pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedTransactionCommitRequest {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
 
     const root = switch (parsed.value) {
@@ -3691,6 +3691,7 @@ fn decodeReadSnapshotsInto(
         if (table_name.len == 0 or key.len == 0) return error.InvalidTransactionSessionRecord;
         const version = switch (obj.get("version") orelse return error.InvalidTransactionSessionRecord) {
             .integer => |v| try nonNegativeRecordInteger(v),
+            .number_string => |text| try recordNumber(text),
             .string => |s| try parseVersionString(s),
             else => return error.InvalidTransactionSessionRecord,
         };
@@ -4248,7 +4249,9 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
 }
 
 fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, body: []const u8) !Session {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    // Staged rows, read snapshots, and savepoints share this durable envelope.
+    // Do not convert any user number until its schema is available.
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
     const obj = switch (parsed.value) {
         .object => |obj| obj,
@@ -4259,6 +4262,7 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         .owner_node_id = if (obj.get("owner_node_id")) |value|
             switch (value) {
                 .integer => |v| try nonNegativeRecordInteger(v),
+                .number_string => |text| try recordNumber(text),
                 else => return error.InvalidTransactionSessionRecord,
             }
         else
@@ -4273,12 +4277,14 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             null,
         .begin_timestamp = switch (obj.get("begin_timestamp") orelse return error.InvalidTransactionSessionRecord) {
             .integer => |v| try nonNegativeRecordInteger(v),
+            .number_string => |text| try recordNumber(text),
             else => return error.InvalidTransactionSessionRecord,
         },
         .last_touched_timestamp = 0,
         .sync_level = parseSyncLevel(obj.get("sync_level") orelse return error.InvalidTransactionSessionRecord) orelse return error.InvalidTransactionSessionRecord,
         .next_savepoint_id = switch (obj.get("next_savepoint_id") orelse return error.InvalidTransactionSessionRecord) {
             .integer => |v| try nonNegativeRecordInteger(v),
+            .number_string => |text| try recordNumber(text),
             else => return error.InvalidTransactionSessionRecord,
         },
     };
@@ -4286,6 +4292,7 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
     session.last_touched_timestamp = if (obj.get("last_touched_timestamp")) |value|
         switch (value) {
             .integer => |v| try nonNegativeRecordInteger(v),
+            .number_string => |text| try recordNumber(text),
             else => return error.InvalidTransactionSessionRecord,
         }
     else
@@ -4331,6 +4338,7 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             };
             const coordinator_group_id: ?u64 = switch (terminal_obj.get("coordinator_group_id") orelse return error.InvalidTransactionSessionRecord) {
                 .integer => |value| try nonNegativeRecordInteger(value),
+                .number_string => |text| try recordNumber(text),
                 .null => null,
                 else => return error.InvalidTransactionSessionRecord,
             };
@@ -4374,6 +4382,7 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         };
         const id: u64 = switch (entry_obj.get("id") orelse return error.InvalidTransactionSessionRecord) {
             .integer => |v| try nonNegativeRecordInteger(v),
+            .number_string => |text| try recordNumber(text),
             else => return error.InvalidTransactionSessionRecord,
         };
         const snapshot = try parseStoredCommitValue(alloc, entry_obj.get("snapshot") orelse return error.InvalidTransactionSessionRecord);
@@ -4428,6 +4437,10 @@ fn parseVersionString(text: []const u8) !u64 {
 fn nonNegativeRecordInteger(value: i64) !u64 {
     if (value < 0) return error.InvalidTransactionSessionRecord;
     return @intCast(value);
+}
+
+fn recordNumber(text: []const u8) !u64 {
+    return std.fmt.parseUnsigned(u64, text, 10) catch error.InvalidTransactionSessionRecord;
 }
 
 fn requireString(obj: std.json.ObjectMap, key: []const u8) []const u8 {
@@ -5641,6 +5654,36 @@ test "transaction commit response includes participant group diagnostics" {
     const participant = conflict.participant.?;
     try std.testing.expectEqual(@as(?u64, 7001), participant.group_id);
     try std.testing.expectEqualStrings("prepare", participant.phase.?);
+}
+
+test "distributed txn session preserves numeric tokens across staging savepoints and durable recovery" {
+    const alloc = std.testing.allocator;
+    const row = "{\"id\":9007199254740993.0,\"min\":-9223372036854775808e0}";
+    var session: Session = .{
+        .txn_id = @splat(1),
+        .owner_node_id = std.math.maxInt(u64),
+        .begin_timestamp = 42,
+        .last_touched_timestamp = 43,
+        .sync_level = .write,
+        .staged = try parseStageWriteRequest(alloc, "{\"table\":\"docs\",\"key\":\"a\",\"document\":" ++ row ++ "}"),
+    };
+    defer session.deinit(alloc);
+    try std.testing.expectEqualStrings(row, session.staged.?.tables[0].batch.writes[0].value);
+    const commit = "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":" ++ row ++ "}}}}";
+    var staged = try parseCommitRequest(alloc, commit);
+    defer staged.deinit(alloc);
+    try std.testing.expectEqualStrings(row, staged.tables[0].batch.writes[0].value);
+    try upsertReadSnapshot(alloc, &session.read_snapshots, .{ .table_name = "docs", .key = "a", .version = 44, .document_json = row });
+    try session.savepoints.put(alloc, 1, .{ .id = 1, .snapshot = try staged.clone(alloc), .read_snapshots = try cloneReadSnapshotMap(alloc, session.read_snapshots) });
+    const bytes = try encodeSessionRecord(alloc, session);
+    defer alloc.free(bytes);
+    var restored = try decodeSessionRecord(alloc, session.txn_id, bytes);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(session.owner_node_id, restored.owner_node_id);
+    try std.testing.expectEqualStrings(row, restored.staged.?.tables[0].batch.writes[0].value);
+    try std.testing.expectEqualStrings(row, restored.read_snapshots.values()[0].document_json.?);
+    try std.testing.expectEqualStrings(row, restored.savepoints.get(1).?.snapshot.tables[0].batch.writes[0].value);
+    try std.testing.expectEqualStrings(row, restored.savepoints.get(1).?.read_snapshots.values()[0].document_json.?);
 }
 
 test "transaction catalog bindings persist privately and cannot be injected publicly" {

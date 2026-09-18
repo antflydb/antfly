@@ -22,8 +22,11 @@ pub fn parseGenerationSet(value: std.json.Value) ![32]u8 {
     if (value != .array or value.array.items.len != 32) return error.InvalidBatchRequest;
     var result: [32]u8 = undefined;
     for (value.array.items, &result) |item, *byte| {
-        if (item != .integer) return error.InvalidBatchRequest;
-        byte.* = std.math.cast(u8, item.integer) orelse return error.InvalidBatchRequest;
+        byte.* = switch (item) {
+            .integer => |number| std.math.cast(u8, number) orelse return error.InvalidBatchRequest,
+            .number_string => |text| std.fmt.parseUnsigned(u8, text, 10) catch return error.InvalidBatchRequest,
+            else => return error.InvalidBatchRequest,
+        };
     }
     return result;
 }

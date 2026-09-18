@@ -2468,7 +2468,7 @@ pub fn freeTxnBeginRequest(alloc: std.mem.Allocator, req: *TxnBeginRequest) void
 }
 
 pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPrepareRequest {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
     const obj = switch (parsed.value) {
         .object => |obj| obj,
@@ -2541,6 +2541,24 @@ pub fn freeTxnPrepareRequest(alloc: std.mem.Allocator, req: *TxnPrepareRequest) 
     if (req.relational_retirement_owner) |*owner| owner.deinit();
     if (req.relational_index_maintenance_owner) |*owner| owner.deinit();
     req.* = undefined;
+}
+
+test "distributed txn prepare preserves exact numeric row and transform payloads" {
+    const alloc = std.testing.allocator;
+    const row = "{\"id\":9007199254740993.0,\"max\":9223372036854775807e0}";
+    const request: TxnPrepareRequest = .{ .txn_id = @splat(1), .topology_epoch = std.math.maxInt(u64), .req = .{
+        .writes = &.{.{ .key = "row", .value = row }},
+        .transforms = &.{.{ .key = "other", .operations = &.{.{ .op = .set, .path = "id", .value_json = "9007199254740993.0" }} }},
+        .relational_integrity_generation_set = @splat(255),
+    } };
+    const bytes = try encodeTxnPrepareRequest(alloc, request);
+    defer alloc.free(bytes);
+    var parsed = try parseTxnPrepareRequest(alloc, bytes);
+    defer freeTxnPrepareRequest(alloc, &parsed);
+    try std.testing.expectEqualStrings(row, parsed.req.writes[0].value);
+    try std.testing.expectEqualStrings("9007199254740993.0", parsed.req.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(request.topology_epoch, parsed.topology_epoch);
+    try std.testing.expectEqual(request.req.relational_integrity_generation_set, parsed.req.relational_integrity_generation_set);
 }
 
 test "distributed txn index maintenance prepare roundtrips owned exact observation" {

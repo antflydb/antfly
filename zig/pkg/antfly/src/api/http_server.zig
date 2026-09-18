@@ -11522,7 +11522,9 @@ pub const ApiHttpServer = struct {
         for (details.tables) |table| {
             const resource = resources.get(table.table_name) orelse table.table_name;
             if (resource.len == 0) return false;
-            if ((table.staged_read_count > 0 or table.staged_predicate_count > 0) and
+            // Private integrity predicates are not user reads or mutations.
+            // Explicit reads still require read access (and row filtering).
+            if (table.staged_read_count > 0 and
                 !admittedTablePermissionAllowed(authenticated_identity, resource, .read)) return false;
             if ((table.staged_write_count > 0 or table.staged_delete_count > 0) and
                 !admittedTablePermissionAllowed(authenticated_identity, resource, .write)) return false;
@@ -11560,7 +11562,9 @@ pub const ApiHttpServer = struct {
         }
         for (request.tables) |table| {
             const resource = resources.get(table.table_name) orelse table.table_name;
-            if (resource.len == 0 or !admittedTablePermissionAllowed(authenticated_identity, resource, .write)) return false;
+            if (resource.len == 0) return false;
+            if ((table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0) and
+                !admittedTablePermissionAllowed(authenticated_identity, resource, .write)) return false;
         }
         return true;
     }
@@ -11697,12 +11701,16 @@ pub const ApiHttpServer = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var names: std.ArrayList([]const u8) = .empty;
+        var mutations: std.ArrayList(bool) = .empty;
         for (tables) |table| {
-            // Sessions retain predicate-only dependencies too. Give those the
-            // same catalog identity and authorization as other participants.
-            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0 and
+            // Bind every retained participant in the same bounded catalog
+            // pass, but require mutation authority only for primary effects.
+            // A private FK witness does not grant access to the child's rows.
+            const mutates = table.writes.len != 0 or table.deletes.len != 0 or table.transforms.len != 0;
+            if (!mutates and
                 (candidate == null or table.predicates.len == 0)) continue;
             try names.append(a, table.table_name);
+            try mutations.append(a, mutates);
         }
         var revision: ?u64 = null;
         var start: usize = 0;
@@ -11712,9 +11720,9 @@ pub const ApiHttpServer = struct {
             const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
             if (resolved.logical_names.len != chunk.len) return error.UnsupportedOperation;
             revision = resolved.revision;
-            for (chunk, resolved.logical_names) |physical, logical| {
+            for (chunk, resolved.logical_names, mutations.items[start..][0..chunk.len]) |physical, logical, mutates| {
                 const name = logical orelse if (std.mem.startsWith(u8, physical, "table:")) return error.TableNotFound else physical;
-                if (authorize) {
+                if (authorize and mutates) {
                     const authority = request.table_write_authorization orelse return error.Forbidden;
                     if (!authority.allows(authority.ptr, name)) return error.Forbidden;
                 }
@@ -37707,6 +37715,7 @@ test "api http server retries stable terminal commits without replaying writes" 
 }
 
 test "api session maintenance recovers crash window after durable 2pc commit" {
+    @import("../test_error_logs.zig").expectErrorLogs(1);
     const alloc = std.testing.allocator;
     var session_path_tmp = try TestDirectory.init("antfly-api-http-session-post-commit-recovery");
     defer session_path_tmp.cleanup();
@@ -38285,9 +38294,12 @@ test "api http server keeps session maintenance off internal request paths" {
 
     var source = FakeSource{};
     var owner_router = FakeRouter{ .local_node_id = 7 };
+    const service_secret = "session-maintenance-internal-test-secret";
     var owner = try ApiHttpServer.initWithConfig(
         alloc,
         .{
+            .internal_service_secret = service_secret,
+            .internal_service_issuer = "session-maintenance-test",
             .session_store_path = session_path,
             .session_router = owner_router.iface(),
             .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
@@ -38310,9 +38322,17 @@ test "api http server keeps session maintenance off internal request paths" {
     defer parsed_begin.deinit();
     _ = try distributed_txn.parseTxnIdHex(parsed_begin.value.transaction_id);
     owner.last_session_lease_renew_ns.store(0, .release);
+    // Exercise the internal handler, not the fail-closed service-auth gate.
+    const token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = service_secret,
+        .issuer = "session-maintenance-test",
+        .subject = "node:7",
+    }, @intCast(@divFloor(nowNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
     var internal_resp = try executeHttpxTestRequest(&owner, .{
         .method = .GET,
         .uri = "/internal/v1/groups/7/db/median-key",
+        .headers = &.{.{ .name = internal_service_auth.header_name, .value = token }},
         .body = "",
     });
     defer internal_resp.deinit(alloc);

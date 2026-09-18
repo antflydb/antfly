@@ -393,6 +393,7 @@ pub const OwnedBatchRequest = struct {
 
 pub fn parseBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatchRequest {
     return try parseBatchRequestWithOptions(alloc, body, .{
+        .parse_numbers = false,
         .allocate = .alloc_always,
         .max_value_len = public_limits.max_json_value_len,
     }, false);
@@ -400,9 +401,28 @@ pub fn parseBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatch
 
 pub fn parseInternalBatchRequest(alloc: std.mem.Allocator, body: []const u8) !OwnedBatchRequest {
     return try parseBatchRequestWithOptions(alloc, body, .{
+        // Row/transform numbers belong to the schema, not the transport.
+        // Parsing decimal integer spellings as f64 here irreversibly rounds
+        // values before the storage owner's exact typed-row preparation.
+        .parse_numbers = false,
         .allocate = .alloc_always,
         .max_value_len = public_limits.max_json_value_len,
     }, true);
+}
+
+test "distributed txn batch transport preserves exact row and transform number tokens" {
+    const alloc = std.testing.allocator;
+    const row = "{\"id\":9007199254740993.0,\"min\":-9223372036854775808.0,\"max\":9223372036854775807e0,\"nested\":[1.234567890123456789]}";
+    const body = "{\"inserts\":{\"a\":" ++ row ++ "},\"transforms\":[{\"key\":\"b\",\"operations\":[{\"op\":\"$set\",\"path\":\"id\",\"value\":9007199254740993.0}]}]}";
+    var public = try parseBatchRequest(alloc, body);
+    defer public.deinit(alloc);
+    try std.testing.expectEqualStrings(row, public.req.writes[0].value);
+    const encoded = try encodeBatchRequest(alloc, public.req);
+    defer alloc.free(encoded);
+    var internal = try parseInternalBatchRequest(alloc, encoded);
+    defer internal.deinit(alloc);
+    try std.testing.expectEqualStrings(row, internal.req.writes[0].value);
+    try std.testing.expectEqualStrings("9007199254740993.0", internal.req.transforms[0].operations[0].value_json.?);
 }
 
 fn parseBatchRequestWithOptions(
