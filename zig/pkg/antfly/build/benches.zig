@@ -81,12 +81,14 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = .ReleaseFast,
     }));
     b.step("antfly-system-catalog-bench", "Benchmark indexed catalog lookups and mutation planning").dependOn(&b.addRunArtifact(system_catalog_bench).step);
+    // Benchmarks sharing the product graph use its selected optimization mode.
+    // Pass -Doptimize=ReleaseFast for performance measurements.
     const system_catalog_routing_bench = b.addExecutable(.{
         .name = "antfly-system-catalog-routing-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("pkg/antfly/src/system_catalog_routing_bench.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
         }),
     });
     const catalog_bench_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
@@ -684,7 +686,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const build_quality_mod = b.createModule(.{
         .root_source_file = b.path("tools/bench_build_quality.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     build_quality_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
     const build_quality = b.addExecutable(.{ .name = "bench_build_quality", .root_module = build_quality_mod });
