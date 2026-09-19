@@ -71,6 +71,7 @@ const document_delete_flag: u8 = 1 << 0;
 const document_external_value_flag: u8 = 1 << 1;
 const document_namespace_link_flag: u8 = 1 << 2;
 const namespace_directory_key = "\x00antfly.document_namespaces.v1";
+pub const secret_catalog_prefix = "\x00antfly.secrets.v1/";
 const namespace_directory_magic = "AFNSIDX2";
 const namespace_directory_snapshot_interval: u16 = 256;
 const value_page_header_size: usize = 8;
@@ -1440,6 +1441,17 @@ pub const NativeFile = struct {
 
     pub fn getCatalogRecordAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
         return try self.getCatalogRecordFromRootAlloc(allocator, .metadata, key);
+    }
+
+    /// Includes scope heads retained after every secret has been deleted.
+    /// Caller holds the catalog lock; values never need to be loaded/decrypted.
+    pub fn hasSecretState(self: *NativeFile) !bool {
+        const keys = try self.snapshotCatalogKeysFromRootAlloc(self.allocator, .metadata);
+        defer freeSnapshotCatalogKeys(self.allocator, keys);
+        for (keys) |entry| {
+            if (std.mem.startsWith(u8, entry.key, secret_catalog_prefix)) return true;
+        }
+        return false;
     }
 
     pub fn getIndexCatalogRecordAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {

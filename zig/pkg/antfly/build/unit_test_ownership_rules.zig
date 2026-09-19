@@ -56,6 +56,10 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "backup heartbeat ",
         .skip = &.{
+            // The generating lane owns conversation and backend contracts,
+            // even when this HTTP root imports them through agent tools.
+            "api.agent_tools.test.agent conversation",
+            "generating.mod.test.generating backend",
             "api.distributed_join.test.distributed join context forwards one absolute deadline to every query callback",
             "api.http_server.test.api http server drop table observes metadata absence before local cleanup",
             "api.http_server.test.shared application admission covers MCP query and write operations",

@@ -12,28 +12,120 @@ compiled each as a separate executable; the measured compile steps summed to
 1,077 seconds, excluding the actual test executables and auxiliary tools.
 Summed compile durations are not elapsed gate time.
 
-The root `inference-finetune-test` and standalone `test-finetune` gate now use
-35 compile/link groups for 68 entrypoints after merging the two new GLiNER2.5
-commands from main (the measured change initially used 34 groups for 66). Groups must have identical named imports, asset owner,
-native linkage, libc setting, and release metadata. The generated dispatcher
+The root `inference-finetune-test` and standalone `test-finetune` gates now use
+24 compile/link groups for 68 entrypoints, down from 35 at `addc7fa2ca`. Groups
+share asset owner, native linkage, libc setting, release metadata, and ownership
+of the Metal translation unit. Different named import lists no longer force
+another compilation: each command gets only its declared imports, referencing
+shared dependency module identities within its group. The generated dispatcher
 selects a CLI at runtime, keeping every registered `main` reachable for semantic
 analysis, code generation, and linking. The checks are not installed or executed.
 Individual CLI targets retain their original modules and run behavior.
 
-Five entrypoints require isolated checks because they import another CLI through
-relative paths; Zig rejects those files appearing in two modules. Their registry
-entries set `shared_check = false`. A future conflicting entrypoint fails the
-build instead of silently disappearing from coverage. New registry entries are
-automatically checked. The ordinary finetuning test executables remain in the gate.
+Six entrypoints require isolated checks because their relative source imports
+overlap another CLI's source tree; Zig rejects those files appearing in two
+modules. Their registry entries set `shared_check = false`, including fused
+chunker evaluation, which shares native-compute sources with training. A future
+conflicting entrypoint fails the build instead of silently disappearing from
+coverage. New registry entries are automatically checked. Command checks remain
+separate from the single ordinary finetuning test executable described below.
 
-`python3 -m unittest tools/test_finetune_command_checks.py` checks that runtime
-dispatch rejects semantic and linker failures in an unexecuted second entrypoint.
+`python3 -m unittest tools.test_finetune_command_checks
+tools.test_runtime_cache.RuntimeCacheTest.test_finetune_command_registry`
+checks runtime dispatch rejects semantic and linker failures in an unexecuted
+second entrypoint. It also inspects the actual build graph for every registered
+command exactly once and for each command's declared imports. Negative mutations
+prove it detects a disconnected compile-check gate and an undeclared import.
+The registry check previously assumed individually compiled commands and is now
+updated for the grouped gate.
+
 `zig build inference-finetune-command-check -Dmetal=false -Dcuda=false` runs only
 the command checks. The standalone name is `test-finetune-command-check`.
 
-This change halves the number of command compilations. A clean Linux CI run is
-still needed to establish the resulting gate wall-time reduction; local follow-up
-builds reuse caches and should not be presented as cold-build speedups.
+In Linux CI run 35372508595, the prior finetuning gate compiled 35 command groups
+and 21 test executables. Their rounded compile durations summed to about 644
+seconds while test runs summed to about seven seconds. These are overlapping
+step durations, not exclusive wall time. This follow-up removes 11 command
+compilations (31%) without changing test selection or executing commands. A clean
+Linux CI run is needed to measure elapsed improvement; cached local builds are
+not a cold-build speedup measurement.
+
+## One ordinary finetuning test executable
+
+`inference-finetune-test` and standalone `test-finetune` now run one shared
+`finetune-tests` executable instead of 21. The 24 command-check compilations
+remain distinct compile/link coverage. `inference-finetune-unit-test` (root) and
+`test-finetune-unit` (standalone) run only the shared test executable. Existing
+focused targets such as `test-gliner2-data` reuse that same compile artifact and
+select tests at runtime; `-- --test-filter <substring>` also selects runtime tests.
+
+The shared source root imports all ordinary test roots, and the test registry
+supplies their dependency union. Data/tokenizer test wrappers now reference
+inference's existing implementation owner rather than creating a second module
+for the same files. The runner retains a fresh allocator and I/O lifecycle per
+test. `--reverse-test-order` exercises the same selection in reverse order
+without recompiling or duplicating normal CI execution.
+
+Four inference-owned compatibility targets (graph cache and entity cleanup
+families) remain explicitly callable, but are not dependencies of the finetuning
+gate. Standalone `test` includes both inference and the shared finetuning owner;
+requesting `test` and `test-finetune` together reuses the same run node.
+
+The consolidation exposed 47 existing repeat executions: trainer/evaluator tests
+had different namespace prefixes when compiled as independent roots, so the
+old name-based ownership audit did not recognize the overlap. The default
+inference run now excludes those three test-name prefixes; finetuning owns them.
+Explicitly filtered inference runs retain their historical reachability.
+
+Validation on macOS ARM64, Debug, CPU configuration:
+
+- Before/after executable inventories retain all 136 prior tests exactly once
+  within finetuning, after normalizing the newly shared root's namespace. The
+  only added test is the aggregate import check.
+- Both normal and reverse CPU execution passed: 124 passed, 13 skipped.
+- Reverse execution with the host Metal device passed: 127 passed, 10 skipped
+  (CUDA/optional model fixtures unavailable). All three Metal gradient-parity
+  objectives passed in the shared process.
+- Two focused standalone targets selected the original 43 data and 3 recipe
+  tests while compiling the shared artifact once. The evaluator target also
+  retains all 13 tests, including six imported adapter tests.
+- Replacing the finetuning entries in the previous full local inventory and
+  applying the new inference ownership exclusions gives 16,740 named tests /
+  16,740 executions, down from 16,787 executions. This is a recomposed inventory,
+  not a fresh compilation of every gate; CI runs the full ownership audit.
+- Build-graph regression checks reject omitted test roots, repeated aggregate
+  execution, missing inference ownership exclusions, and a disconnected
+  standalone owner. Every ordinary focused target must reuse the same artifact.
+
+Run the command/ownership checks from `zig/`:
+
+```sh
+python3 -m unittest tools.test_finetune_command_checks \
+  tools.test_runtime_cache.RuntimeCacheTest.test_finetune_command_registry \
+  tools.test_runtime_cache.RuntimeCacheTest.test_finetune_shared_test_ownership \
+  tools.test_runtime_cache.RuntimeCacheTest.test_finetune_standalone_shared_targets
+```
+
+## VOPR admission by memory rather than a single build job
+
+The VOPR workflow now invokes `tools/run_bounded_zig_build.py` for qualification,
+runner compilation, production compilation, and compiled-owner soak iterations.
+All four invocations remove `-j1`, retain ReleaseSafe and their existing cache
+paths, and cap the cgroup/host-aware scheduler budget at 22 GiB. The wrapper also
+uses the patched Zig 0.16 memory-accounting build runner.
+
+Focused and build-only workflow roots now receive the same conservative default
+compile/run reservations as aggregate tests; existing measured reservations are
+preserved. Linux's production-owner VOPR root reserves 16 GiB, based on a measured
+13.26 GB compiler peak; the runtime adapter reserves 10 GiB. Those two large
+compilations cannot overlap under this cap, but smaller independent work can.
+This changes build admission, not scenario budgets or simulated scheduling.
+
+Regression checks inspect the actual Linux ReleaseSafe build graph for missing
+or over-cap claims, inject an unbudgeted artifact to prove detection, execute the
+workflow command blocks with failing stubs to verify exit-status propagation,
+and retain coverage of wrapper memory detection/accounting. CI must establish
+the elapsed benefit; no VOPR speedup is claimed from these graph checks.
 
 ## Ownership and boundaries
 
@@ -630,3 +722,10 @@ regressions: 17,472 baseline executions became 16,508 executions of the same
 16,508 distinct names, with zero lost, added, or duplicated tests. These are local
 macOS counts; the failed Linux CI inventory reported 16,506 distinct names.
 The audit-tool and partition-tool Python checks also passed (eight tests).
+
+## Post-merge storage follow-up
+
+[CI_STORAGE_FOLLOWUP.md](CI_STORAGE_FOLLOWUP.md) records the next six workload
+profiles, the shutdown-wakeable durable-job reaper, three additional trace-free
+fixtures, and rebalancing of the existing DB-core execution lanes. Original
+fixture sizes and scale exclusions are preserved.

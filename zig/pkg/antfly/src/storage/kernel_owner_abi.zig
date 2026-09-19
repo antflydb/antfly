@@ -255,7 +255,10 @@ pub const LocalQueryReturnMode = enum(u32) {
 pub const LocalQueryExecutionOptions = extern struct {
     enabled: u8 = 0,
     include_stored: u8 = 1,
-    _reserved0: [2]u8 = @splat(0),
+    /// Return a raw shard result for coordinator finalization. Keep aggregation
+    /// specifications during search: they also govern exact candidate totals.
+    raw_search_result: u8 = 0,
+    _reserved0: u8 = 0,
     return_mode: LocalQueryReturnMode = .parent,
     max_chunks_per_parent: u32 = 0,
     /// Presentation only; never used for storage lookup or authorization.

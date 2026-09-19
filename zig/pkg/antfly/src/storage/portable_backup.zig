@@ -2273,8 +2273,11 @@ const PortableArchiveValidation = struct {
 };
 
 test "portable archive accepts long history with a bounded decoded working set" {
-    const alloc = std.testing.allocator;
-    var source_tmp = std.testing.tmpDir(.{});
+    // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    var source_tmp = @import("../common/test_directory.zig").fastTmpDir(.{});
     defer source_tmp.cleanup();
     var source = try openTestStore(alloc, &source_tmp);
     defer source.close();
@@ -2283,14 +2286,17 @@ test "portable archive accepts long history with a bounded decoded working set" 
         .schema_cache_bytes = 1024,
     };
     defer archive.deinit(alloc);
+    var seeds: ArrayList(KVPair) = .empty;
+    defer freeAllocatedKVPairs(alloc, &seeds);
     for (0..4100) |version| {
         const encoded = try storage_schema.serializeSchema(alloc, .{ .version = @intCast(version) });
-        defer alloc.free(encoded);
+        errdefer alloc.free(encoded);
         const key = try storage_schema.schemaVersionKeyAlloc(alloc, @intCast(version));
-        defer alloc.free(key);
+        errdefer alloc.free(key);
         try validateMetadataEntries(alloc, &.{.{ .key = key, .value = encoded }}, &archive);
-        try source.put(key, encoded);
+        try seeds.append(alloc, .{ .key = key, .value = encoded });
     }
+    try source.putBatch(seeds.items, &.{});
     try std.testing.expectEqual(@as(usize, 4100), archive.layouts.count());
     for (0..4100) |version| {
         const layout = (try archive.layoutForVersion(@intCast(version))).?;
@@ -2315,7 +2321,7 @@ test "portable archive accepts long history with a bounded decoded working set" 
     defer portable.deinit(alloc);
     try exportPortable(alloc, &source, &portable);
     for ([_]bool{ false, true }) |staged| {
-        var destination_tmp = std.testing.tmpDir(.{});
+        var destination_tmp = @import("../common/test_directory.zig").fastTmpDir(.{});
         defer destination_tmp.cleanup();
         var destination = try openTestStore(alloc, &destination_tmp);
         defer destination.close();
@@ -3212,7 +3218,8 @@ fn decodeEdgeBatch(alloc: Allocator, data: []const u8) !struct {
 
 fn openTestStore(alloc: Allocator, tmp: *std.testing.TmpDir) !DocStore {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = path_buf[0..path_len];
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
     return DocStore.open(alloc, path_z, .{});

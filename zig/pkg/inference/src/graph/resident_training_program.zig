@@ -219,7 +219,7 @@ pub const Program = struct {
         var combined = CombinedControl{ .original = backend.execution_control, .request = control };
         const active = combined.control();
         try active.check();
-        if (backend.kind() != .metal or backend.vtable.residentTrainingInstruction == null)
+        if ((backend.kind() != .metal and backend.kind() != .cuda) or backend.vtable.residentTrainingInstruction == null)
             return error.UnsupportedResidentProgramBackend;
         if (bindings.len != self.admission.parameters) return error.MissingResidentProgramBinding;
         var cb = backend.*;

@@ -126,7 +126,7 @@ const Stamp = struct {
     }
 };
 fn strictBackend(backend: *const ops.ComputeBackend) !void {
-    if (backend.kind() != .metal or backend.vtable.residentTrainingPrimitive == null or
+    if ((backend.kind() != .metal and backend.kind() != .cuda) or backend.vtable.residentTrainingPrimitive == null or
         backend.vtable.residentTrainingInstruction == null or backend.vtable.glinerBoundaryDownload == null)
         return error.UnsupportedSeededTrainingBackend;
 }

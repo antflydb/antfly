@@ -7,7 +7,7 @@ const std = @import("std");
 const boundary = @import("gliner_boundary_decode.zig");
 const matching = @import("extraction_assignment.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
-pub const Span = @import("../architectures/gliner_boundary_ops.zig").Span;
+pub const Span = @import("../architectures/gliner/boundary_ops.zig").Span;
 pub const Mode = enum { natural, latent, anchorless };
 pub const Field = struct {
     query_id: usize,

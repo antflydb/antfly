@@ -606,6 +606,12 @@ fn importPortableIntoExistingLite(
         var lite = try LiteDb.open(allocator, target_path, .status_only);
         defer lite.close();
         try ensureOfflineRootOnlyOperationSupported(&lite);
+        // Offline publication renames the staged file directly, bypassing the
+        // live-handle generation guard. The target writer lock stays held from
+        // this check through publication so secret state cannot be lost.
+        if (try lite.backend.native_docstore.?.file.hasSecretState()) {
+            return error.LiteImportTargetNotEmpty;
+        }
         if (!(try lite_restore_staging.isImportTargetEmpty(allocator, &lite.db))) {
             return error.LiteImportTargetNotEmpty;
         }
@@ -2904,4 +2910,105 @@ test "lite promote helper stages backup then submits normal restore request" {
     defer manifest.deinit(allocator);
     try std.testing.expectEqualStrings("docs", manifest.table_name);
     try std.testing.expectEqualStrings(staged.snapshot_path, manifest.shards[0].snapshot_path);
+}
+
+// Test-only authenticated key wrapping; never a production provider.
+const TestSecretKeyProvider = struct {
+    const Record = antfly.common.secret_record;
+    const DataKey = Record.DataKey;
+    const Identity = Record.Identity;
+    const KeyProvider = Record.KeyProvider;
+    const WrappedKey = Record.WrappedKey;
+    const Aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
+
+    key: DataKey = [_]u8{7} ** 32,
+    unavailable: bool = false,
+    unwrap_calls: usize = 0,
+    fn provider(self: *@This()) KeyProvider {
+        return .{ .ptr = self, .vtable = &.{ .wrap = wrap, .unwrap = unwrap } };
+    }
+    fn wrap(ptr: *anyopaque, alloc: std.mem.Allocator, identity: Identity, key: *const DataKey) !WrappedKey {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.unavailable) return error.Unavailable;
+        const id = try alloc.dupe(u8, "test-key-1");
+        errdefer alloc.free(id);
+        const bytes = try alloc.alloc(u8, 24 + 32 + 16);
+        errdefer alloc.free(bytes);
+        try std.Options.debug_io.randomSecure(bytes[0..24]);
+        var tag: [16]u8 = undefined;
+        Aead.encrypt(bytes[24..56], &tag, key, identity.scope, bytes[0..24].*, self.key);
+        @memcpy(bytes[56..72], &tag);
+        return .{ .key_id = id, .bytes = bytes };
+    }
+    fn unwrap(ptr: *anyopaque, identity: Identity, key_id: []const u8, bytes: []const u8, key: *DataKey) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.unwrap_calls += 1;
+        if (self.unavailable) return error.Unavailable;
+        if (!std.mem.eql(u8, key_id, "test-key-1") or bytes.len != 72) return error.CorruptInput;
+        Aead.decrypt(key, bytes[24..56], bytes[56..72].*, identity.scope, bytes[0..24].*, self.key) catch return error.CorruptInput;
+    }
+};
+
+test "lite import without replace preserves live secrets and deleted scope revisions" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secret-source.aflite", .{tmp.sub_path});
+    defer alloc.free(source_path);
+    const backup_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secret-backup.afb", .{tmp.sub_path});
+    defer alloc.free(backup_path);
+    var portable: std.ArrayList(u8) = .empty;
+    defer portable.deinit(alloc);
+    {
+        var source = try LiteDb.create(alloc, source_path, true);
+        defer source.close();
+        try source.db.batch(.{ .writes = &.{.{ .key = "document", .value = "{}" }} });
+        try portable_backup.exportPortable(alloc, source.db.core.store, &portable);
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = backup_path, .data = portable.items });
+    for ([_]bool{ false, true }) |deleted| {
+        const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secret-target-{s}.aflite", .{ tmp.sub_path, if (deleted) "deleted" else "live" });
+        defer alloc.free(target_path);
+        var provider = TestSecretKeyProvider{};
+        const expected_revision: u64 = if (deleted) 2 else 1;
+        {
+            var target = try LiteDb.create(alloc, target_path, true);
+            defer target.close();
+            var secrets = try target.backend.secretStore(alloc, "scope", provider.provider());
+            defer secrets.deinit();
+            const writer = secrets.nativeStore().?.writer;
+            _ = try writer.put("scope", "token", "credential", .absent);
+            if (deleted) _ = try writer.removeOverride("scope", "token", .{ .exact = 1 });
+        }
+        // CLI dispatch, explicitly without --replace, must reject before staging.
+        try std.testing.expectError(error.LiteImportTargetNotEmpty, importFromSourceFile(alloc, io, backup_path, target_path, false));
+        const staged = try restoreTempPathAlloc(alloc, target_path);
+        defer alloc.free(staged);
+        try std.testing.expect(!pathExists(io, staged));
+        {
+            var target = try LiteDb.open(alloc, target_path, .status_only);
+            defer target.close();
+            var secrets = try target.backend.secretStore(alloc, "scope", provider.provider());
+            defer secrets.deinit();
+            var found = try secrets.source().resolve(alloc, "scope", "token", .{});
+            defer found.deinit(alloc);
+            try std.testing.expectEqual(expected_revision, found.revision);
+            if (deleted) {
+                try std.testing.expect(found.value == null);
+            } else {
+                try std.testing.expectEqualStrings("credential", found.value.?.secret.bytes);
+            }
+            try std.testing.expect((try target.db.lookup(alloc, "document", .{})) == null);
+        }
+        // Deliberate whole-file replacement retains its existing CLI semantics.
+        try importFromSourceFile(alloc, io, backup_path, target_path, true);
+        var replaced = try LiteDb.open(alloc, target_path, .status_only);
+        defer replaced.close();
+        try std.testing.expect(!try replaced.backend.native_docstore.?.file.hasSecretState());
+        var document = (try replaced.db.lookup(alloc, "document", .{})).?;
+        defer document.deinit(alloc);
+    }
 }

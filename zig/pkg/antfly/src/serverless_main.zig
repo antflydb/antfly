@@ -94,10 +94,13 @@ pub fn runFromIterator(
     defer runtime_io_impl.deinit();
     const runtime_io = runtime_io_impl.io();
 
-    var secret_store: ?antfly.common.secrets.FileStore = if (cli.secret_store_path orelse init.environ_map.get("ANTFLY_SECRET_STORE_PATH")) |path|
-        try antfly.common.secrets.FileStore.initWithIo(alloc, runtime_io, path)
-    else
-        null;
+    const legacy_secret_path = cli.secret_store_path orelse init.environ_map.get("ANTFLY_SECRET_STORE_PATH");
+    var secret_store = try antfly.common.secrets.initFromConfigPathWithIo(
+        alloc,
+        runtime_io,
+        cli.config_path,
+        if (legacy_secret_path) |path| &.{path} else &.{},
+    );
     defer if (secret_store) |*store| store.deinit();
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |path|
         try antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(alloc, runtime_io, path, if (secret_store) |*store| store else null, .serverless)

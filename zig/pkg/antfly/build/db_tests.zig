@@ -430,6 +430,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "match_all unordered source loads selected hits through projected batch",
         "text field sort uses sorted segment membership path when index sort matches",
         "text projected source load rejects expired deadline before stored load",
+        "text projected source batch preserves selection and cleans up failed hydration",
         "native numeric sort rejects non-finite doc values",
         "native sort zero limit avoids generic collector decoration",
         "text doc values sort zero limit avoids budget and decoration",

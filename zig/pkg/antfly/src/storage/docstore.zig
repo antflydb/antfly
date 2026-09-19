@@ -1234,7 +1234,10 @@ pub const DocStore = struct {
     }
 
     fn lockPayloadPolicy(self: *DocStore) void {
-        while (!self.payload_policy_mutex.tryLock()) std.atomic.spinLoopHint();
+        // Capturing the primary view below can wait on backend publication and
+        // reclamation. Contending readers must yield instead of monopolizing
+        // the CPUs the lock holder needs to finish that work.
+        platform.sync.lockYielding(&self.payload_policy_mutex);
     }
 
     /// DB apply admission excludes writers. Reader admission holds this mutex

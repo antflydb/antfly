@@ -620,6 +620,9 @@ pub const OpenOptions = struct {
     prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
+    /// Borrowed realtime clock for durable repair retry scheduling. Defaults to
+    /// the backend runtime clock; the caller must keep an override alive until close.
+    index_repair_clock: ?platform_clock.Clock = null,
     /// Private proof installed only by a validated `NativeRestoreOpenPlan`.
     /// A path-bound proof prevents a copied option set from silently skipping
     /// configuration for a different DB namespace.
@@ -5091,6 +5094,7 @@ pub const DB = struct {
     root_incarnation: u128 = 0,
     async_context: *AsyncContext,
     backend_runtime: *background_runtime_mod.BackendRuntime,
+    index_repair_clock: ?platform_clock.Clock = null,
     backend_owner_id: u64,
     status_owner_epoch: u64 = 0,
     status_publication_mutex: std.atomic.Mutex = .unlocked,
@@ -5903,6 +5907,7 @@ pub const DB = struct {
                 .ha_recovery_owner_id = ha_recovery_owner_id,
                 .owned_backend_runtime = owned_backend_runtime,
                 .owned_resource_manager = owned_resource_manager,
+                .index_repair_clock = opts.index_repair_clock,
                 .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
                 .executor = executor,
                 .start_index_workers = start_index_workers,
@@ -15260,6 +15265,10 @@ pub const DB = struct {
         publishIndexRepairProgressWaitHint(ctx);
     }
 
+    fn indexRepairNowMs(self: *const DB) u64 {
+        return (self.index_repair_clock orelse self.backend_runtime.clock()).nowRealtimeMs();
+    }
+
     const progressive_index_repair_audit_interval_ms: u64 = 5 * std.time.ms_per_s;
 
     fn deferIndexRepairForProgress(
@@ -15268,7 +15277,7 @@ pub const DB = struct {
         expected_revision: u64,
         wake_at_sequence: u64,
     ) bool {
-        const fallback_at_ms = currentTimeNs() / std.time.ns_per_ms +|
+        const fallback_at_ms = self.indexRepairNowMs() +|
             progressive_index_repair_audit_interval_ms;
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
         defer self.async_context.index_repair_scheduler_mutex.unlock();
@@ -15288,7 +15297,7 @@ pub const DB = struct {
         repair_id: u128,
         expected_revision: u64,
     ) bool {
-        const fallback_at_ms = currentTimeNs() / std.time.ns_per_ms +|
+        const fallback_at_ms = self.indexRepairNowMs() +|
             progressive_index_repair_audit_interval_ms;
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
         defer self.async_context.index_repair_scheduler_mutex.unlock();
@@ -15994,7 +16003,7 @@ pub const DB = struct {
             if (try self.core.index_manager.isRepairCandidateActive(entry.intent.index_name, candidate)) {
                 const cfg = self.core.index_manager.get(entry.intent.index_name) orelse
                     return error.InvalidIndexRepairState;
-                const now_ms = currentTimeNs() / std.time.ns_per_ms;
+                const now_ms = self.indexRepairNowMs();
                 const target_sequence = self.core.nextDerivedSequence();
                 var replacement_intent = index_repair_state.IndexRepairIntent{
                     .repair_id = try index_repair_state.newRepairId(alloc),
@@ -16170,7 +16179,7 @@ pub const DB = struct {
         errdefer txn.abort();
         const build_floor = try self.core.store.lastReplaySequenceFromTxn(&txn, 0);
         entry.intent.build_floor_sequence = build_floor;
-        entry.intent.updated_at_ms = currentTimeNs() / std.time.ns_per_ms;
+        entry.intent.updated_at_ms = self.indexRepairNowMs();
         entry.pin.?.retain_after_sequence = build_floor;
         const control_revision = try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
         self.core.index_manager.publishRepairAdmission(
@@ -16439,7 +16448,7 @@ pub const DB = struct {
         var replacement_last_error_owned = replacement_last_error != null;
         errdefer if (replacement_last_error_owned) alloc.free(replacement_last_error.?);
 
-        const now_ms = currentTimeNs() / std.time.ns_per_ms;
+        const now_ms = self.indexRepairNowMs();
         if (update.attempt_failure) |failure| {
             entry.intent.attempt_count = @max(entry.intent.attempt_count, 1);
             entry.intent.failure_streak +|= 1;
@@ -16871,7 +16880,7 @@ pub const DB = struct {
         defer state.deinit(alloc);
         if (state.findIndex(cfg.name)) |i| return state.entries.items[i].intent.repair_id;
         const location = try self.indexRepairStateLocation();
-        const now_ms = currentTimeNs() / std.time.ns_per_ms;
+        const now_ms = self.indexRepairNowMs();
         const target_sequence = @max(
             self.core.nextDerivedSequence(),
             minimum_target_sequence orelse 0,
@@ -18256,7 +18265,7 @@ pub const DB = struct {
             }
 
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
-            const now_ms = currentTimeNs() / std.time.ns_per_ms;
+            const now_ms = self.indexRepairNowMs();
             const target_sequence = self.core.nextDerivedSequence();
             const repair_id = try index_repair_state.newRepairId(alloc);
             const index_name = try alloc.dupe(u8, cfg.name);
@@ -18780,7 +18789,7 @@ pub const DB = struct {
             result.deferred = true;
             return result;
         }
-        const now_ms = currentTimeNs() / std.time.ns_per_ms;
+        const now_ms = self.indexRepairNowMs();
         if (entry.intent.next_retry_at_ms > now_ms) {
             result.deferred = true;
             result.next_retry_at_ms = entry.intent.next_retry_at_ms;
@@ -19447,7 +19456,7 @@ pub const DB = struct {
             @intCast(directory.cursor),
         );
         try selection.repairs.ensureTotalCapacity(alloc, inspection.budget);
-        const now_ms = currentTimeNs() / std.time.ns_per_ms;
+        const now_ms = self.indexRepairNowMs();
         while (selection.inspected < inspection.budget) : (selection.inspected += 1) {
             const record_index = (inspection.start + selection.inspected) % directory.records.items.len;
             const record = directory.records.items[record_index];
@@ -32087,7 +32096,7 @@ pub const DB = struct {
             "paused"
         else if (intent.phase == .terminal)
             "terminal"
-        else if (intent.next_retry_at_ms > currentTimeNs() / std.time.ns_per_ms)
+        else if (intent.next_retry_at_ms > self.indexRepairNowMs())
             "backoff"
         else if (intent.phase == .rolling_back)
             "rollback"
@@ -35647,6 +35656,45 @@ pub const DB = struct {
         return try self.searchWithCapturedRequestAndExecutionContext(alloc, req, .{});
     }
 
+    /// Own one primary read generation across a local query's selection and
+    /// aggregation collection. Acquire only after the Raft read barrier; never
+    /// wait for another apply barrier while this lease excludes writers.
+    pub const QueryReadLease = struct {
+        db: *DB,
+
+        pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+            const db = self.db;
+            const snapshot_req = try db.searchRequestAtCurrentIdentityGeneration(req);
+            if (!types.canonicalHierarchyExecutionWithinBudget(snapshot_req)) return error.InvalidQueryRequest;
+            var identity_prefix = try db.searchRequestWithIdentityPrefixFilterAlloc(snapshot_req);
+            defer identity_prefix.deinit();
+            var profile: db_query_search.DenseSearchProfile = .{};
+            const result = try db.searchLockedWithExecutionContextImpl(alloc, identity_prefix.req, .{}, true, if (req.profile) &profile else null);
+            return .{
+                .request = snapshot_req,
+                .result = result,
+                .dense_profile = if (profile.search_route.len > 0) profile else null,
+            };
+        }
+
+        pub fn release(self: *QueryReadLease) void {
+            const db = self.db;
+            db.core.unlockApplyShared();
+            if (db.async_context.resource_manager) |manager| manager.finishForegroundQuery();
+            self.* = undefined;
+        }
+    };
+
+    pub fn beginQueryReadLease(self: *DB) !QueryReadLease {
+        if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
+        errdefer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
+        try self.enforcePortableRuntimeGate();
+        lockApplyShared(self);
+        errdefer self.core.unlockApplyShared();
+        try self.enforcePortableRuntimeGate();
+        return .{ .db = self };
+    }
+
     pub fn searchWithExecutionContext(
         self: *DB,
         alloc: Allocator,
@@ -36564,6 +36612,7 @@ pub const DB = struct {
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
+            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
@@ -68765,6 +68814,10 @@ test "relational columnar dirty scans intersect query and shard bounds before de
 }
 
 test "relational columnar existence and null projection do not fetch payload records" {
+    // Assert payload/admission semantics independently of the real-time build
+    // quantum. Bounded/resumable maintenance is tested separately.
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -69683,6 +69736,10 @@ test "relational columnar byte costing retains wide clean rows and switches for 
 }
 
 test "relational columnar adaptive admission preserves age across hot updates and restart" {
+    // Assert payload/admission semantics independently of the real-time build
+    // quantum. Bounded/resumable maintenance is tested separately.
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -69945,22 +70002,35 @@ test "relational columnar JSON numeric predicates preserve document semantics" {
 }
 
 test "relational columnar bound selection and late projection match primary semantics" {
-    // Keep the original fixture: its physical block layout makes the tail
-    // selection choose late materialization rather than sequential reads.
+    try testColumnarSelection(true);
+}
+
+test "relational columnar projection matrix matches primary semantics on small fixtures" {
+    try testColumnarSelection(false);
+}
+
+fn testColumnarSelection(comptime physical_plan: bool) !void {
+    const row_count = if (physical_plan) 768 else 32;
+    var profile = @import("../test_work_profile.zig").Profile(enum { setup, columnar, primary, assertions, dense }).init();
+    defer profile.report("relational-selection");
+    // Keep 768 rows for physical plans: 512 changes block layout and selects
+    // sequential reads instead of late materialization. The semantic matrix
+    // retains boundary keys on a smaller fixture without asserting that plan.
     var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
     defer std.debug.assert(allocator_state.deinit() == .ok);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_tmp = try TestDirectory.init("db");
+        var path_tmp = try TestDirectory.initFast("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
-        try seedColumnScanPlanTest(&db, alloc);
-        try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) >= 2);
+        try seedColumnScanPlanRows(&db, alloc, row_count);
+        if (physical_plan) try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) >= 2);
+        profile.mark(.setup);
         const selections = [_][]const []const u8{
             &.{},                     &.{"user-name"}, &.{ "payload.items.id", "payload.nil", "missing.name" },
             &.{"payload.items.1.id"}, &.{"-wide"},     &.{"user-*"},
@@ -69978,22 +70048,26 @@ test "relational columnar bound selection and late projection match primary sema
                 .{ .key = "k0761", .value = "{\"n\":761,\"user-name\":\"Grace\",\"payload\":{\"items\":[{\"id\":761}],\"nil\":null},\"embedding\":[1,2,3]}" },
                 .{ .key = "k0761a", .value = "{\"n\":761,\"payload\":{\"items\":[{\"id\":761}]}}" },
             }, .deletes = &.{"k0762"} });
-            for (selections) |fields| for (filters) |filter| for ([_]u32{ 0, 2 }) |limit| {
+            for (if (physical_plan) selections[0..1] else &selections) |fields| for (if (physical_plan) filters[0..1] else &filters) |filter| for ([_]u32{ 0, 2 }) |limit| {
                 var stats: types.ColumnarScanStats = .{};
                 var opts = types.ScanOptions{ .include_documents = true, .fields = fields, .filter_query_json = filter, .limit = limit, .columnar_stats = &stats, .include_content_hashes = true };
                 var actual = try db.scan(alloc, "k0000", "k0767", opts);
                 defer actual.deinit(alloc);
+                profile.mark(.columnar);
                 try std.testing.expect(stats.used);
                 try std.testing.expectEqual(@as(u64, 1), stats.scan_plans_built);
-                try std.testing.expect(stats.scan_plan_hits > 0);
+                if (physical_plan) try std.testing.expect(stats.scan_plan_hits > 0);
                 if (dirty == 0 and RelationalProjectionPlan.supports(fields, true)) try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
-                if (dirty == 0 and fields.len == 0) try std.testing.expectEqual(@as(u64, actual.documents.len), stats.late_materialized_rows);
+                if (physical_plan and dirty == 0 and fields.len == 0) try std.testing.expectEqual(@as(u64, actual.documents.len), stats.late_materialized_rows);
                 opts.disable_columnar_scan = true;
                 opts.columnar_stats = null;
+                profile.mark(.assertions);
                 var expected = try db.scan(alloc, "k0000", "k0767", opts);
                 defer expected.deinit(alloc);
+                profile.mark(.primary);
                 try std.testing.expectEqualDeep(expected.documents, actual.documents);
                 try std.testing.expectEqualDeep(expected.hashes, actual.hashes);
+                profile.mark(.assertions);
             };
         }
         // Dense full output must choose sequential primary access, not turn
@@ -70001,9 +70075,10 @@ test "relational columnar bound selection and late projection match primary sema
         var stats: types.ColumnarScanStats = .{};
         var dense = try db.scan(alloc, "", "", .{ .include_documents = true, .columnar_stats = &stats });
         defer dense.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 768), dense.documents.len);
-        try std.testing.expect(stats.dense_delta_scans > 0);
+        try std.testing.expectEqual(@as(usize, row_count), dense.documents.len);
+        if (physical_plan) try std.testing.expect(stats.dense_delta_scans > 0);
         try std.testing.expectEqual(@as(u64, 0), stats.late_materialized_rows);
+        profile.mark(.dense);
     }
 }
 
@@ -70610,13 +70685,23 @@ test "relational columnar dense nested predicate benchmark" {
     }
 }
 
-test "relational columnar decoded reuse benchmark" {
-    const alloc = std.testing.allocator;
+test "relational columnar decoded reuse bounds decoding and allocations" {
+    try testRelationalDecodedReuse(false);
+}
+
+test "relational columnar decoded reuse production scale benchmark" {
+    try testRelationalDecodedReuse(true);
+}
+
+fn testRelationalDecodedReuse(comptime benchmark: bool) !void {
+    var allocator_state: @import("../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
         for ([_]bool{ true, false }) |shared| {
-            var path_tmp = try TestDirectory.init("db");
+            var path_tmp = try TestDirectory.initFast("db");
             defer path_tmp.cleanup();
             const path = path_tmp.path().ptr;
             defer cleanupTempDir(path);
@@ -70641,7 +70726,7 @@ test "relational columnar decoded reuse benchmark" {
             var allocated: [2]usize = @splat(0);
             var counters: [2]types.ColumnarScanStats = @splat(.{});
             // Alternate cache-off/on order; warm both paths before timing.
-            for (0..10) |round| for (0..2) |step| {
+            for (0..if (benchmark) @as(usize, 10) else 1) |round| for (0..2) |step| {
                 const mode = (round + step) % 2;
                 var measured = std.testing.FailingAllocator.init(alloc, .{});
                 var stats: types.ColumnarScanStats = .{};
@@ -70670,10 +70755,12 @@ test "relational columnar decoded reuse benchmark" {
                 allocated[mode] = measured.allocated_bytes;
                 counters[mode] = stats;
             };
-            for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
-            std.debug.print("\ncolumnar decoded reuse: backend={s}, shared={}, median ns off/on={d}/{d}, allocated bytes={d}/{d}, decodes={d}/{d}, hits={d}, peak={d}\n", .{
-                @tagName(backend), shared, elapsed[0][4], elapsed[1][4], allocated[0], allocated[1], counters[0].payload_pages_read, counters[1].payload_pages_read, counters[1].decoded_cache_hits, counters[1].decoded_cache_peak_bytes,
-            });
+            if (benchmark) {
+                for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+                std.debug.print("\ncolumnar decoded reuse: backend={s}, shared={}, median ns off/on={d}/{d}, allocated bytes={d}/{d}, decodes={d}/{d}, hits={d}, peak={d}\n", .{
+                    @tagName(backend), shared, elapsed[0][4], elapsed[1][4], allocated[0], allocated[1], counters[0].payload_pages_read, counters[1].payload_pages_read, counters[1].decoded_cache_hits, counters[1].decoded_cache_peak_bytes,
+                });
+            }
         }
     }
 }
@@ -70922,9 +71009,12 @@ test "relational columnar delete waves coalesce adjacent underfilled ranges" {
 }
 
 test "relational columnar clean coalescing preserves typed cells without primary reads" {
-    const alloc = std.testing.allocator;
+    // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_tmp = try TestDirectory.init("db");
+        var path_tmp = try TestDirectory.initFast("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
@@ -128108,7 +128198,7 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
     // diagnostics only poison and guard allocations that cross this boundary.
     const alloc = platform.allocator.processAllocator(std.testing.allocator);
 
-    var src_tmp = try TestDirectory.init("db");
+    var src_tmp = try TestDirectory.initFast("db");
     defer src_tmp.cleanup();
     const src_path = src_tmp.path().ptr;
     defer cleanupTempDir(src_path);
@@ -128153,7 +128243,7 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
     }
 
     for (0..32) |i| {
-        var restore_tmp = try TestDirectory.init("db");
+        var restore_tmp = try TestDirectory.initFast("db");
         defer restore_tmp.cleanup();
         const restore_path = restore_tmp.path().ptr;
         defer cleanupTempDir(restore_path);

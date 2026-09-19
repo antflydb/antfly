@@ -104,7 +104,9 @@ def _two_speaker_wav_b64() -> str:
             width = w.getsampwidth()
             raw = w.readframes(w.getnframes())
         if width == 1:
-            pcm = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+            pcm = (
+                np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0
+            ) / 128.0
         else:
             pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
         if rate != 16000:
@@ -139,7 +141,9 @@ def test_whisper_tiny_diarizes_two_speakers(api):
     transcript is the same one an undiarized request returns.
     """
     audio_uri = "data:audio/wav;base64," + _two_speaker_wav_b64()
-    resp = api.transcribe(audio=audio_uri, model="openai/whisper-tiny", diarization=True)
+    resp = api.transcribe(
+        audio=audio_uri, model="openai/whisper-tiny", diarization=True
+    )
     assert_openai_list_response(resp, expected_len=1)
     item = resp["data"][0]
 
@@ -151,7 +155,9 @@ def test_whisper_tiny_diarizes_two_speakers(api):
     segments = item["segments"]
     assert segments, "diarized response has no segments"
     labels = [segment.get("speaker") for segment in segments]
-    assert all(label in speakers for label in labels), f"unlabelled segments: {labels!r}"
+    assert all(label in speakers for label in labels), (
+        f"unlabelled segments: {labels!r}"
+    )
     assert labels[0] == "SPEAKER_00"
     assert sorted(set(labels)) == sorted(speakers), (
         f"speakers {speakers!r} do not match the labels used {sorted(set(labels))!r}"
