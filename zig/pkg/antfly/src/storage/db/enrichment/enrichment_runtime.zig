@@ -2040,6 +2040,34 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InferenceEncodedBytesExceeded,
         error.InferenceDecodedPixelsExceeded,
         error.InferenceMediaPartLimitExceeded,
+        // A pure byte-size estimate computed before the executor ever runs
+        // (asset_producer_runtime.zig's invocationMemoryForRequests): the
+        // same document produces the identical estimate and identical
+        // rejection on every retry, so retrying it wastes the full worker
+        // retry budget (five attempts plus backoff) chasing a guaranteed
+        // failure. Same kind of deterministic size-based rejection as
+        // InferenceBatchTooLarge/InferenceEncodedBytesExceeded above.
+        error.InferenceInvocationMemoryExceeded,
+        // GLiNER boundary extraction's reviewed length qualification
+        // (zig/pkg/inference/src/models/gliner_boundary_qualification.zig's
+        // LengthContract, one named error per exceeded dimension) and its
+        // generic "this request shape was never reviewed" sibling. The
+        // in-process/embedded provider path calls straight through
+        // AntflyProviderBoundary without the standalone HTTP boundary's
+        // status-code translation (provider_failure.zig's statusWithLogger,
+        // which collapses these to the already-terminal
+        // InferenceProviderFailure for remote/HTTP callers), so the raw
+        // error reaches this disposition directly here. Every one of these
+        // is a bounded-length refusal computed from the document's own size,
+        // not a load-dependent or transient condition -- retrying reproduces
+        // the identical rejection every time.
+        error.UnsupportedGlinerBoundaryRuntime,
+        error.GlinerBoundaryRequestItemsLimitExceeded,
+        error.GlinerBoundaryDocumentBytesLimitExceeded,
+        error.GlinerBoundaryDocumentWordsLimitExceeded,
+        error.GlinerBoundaryWindowCountLimitExceeded,
+        error.GlinerBoundaryWindowWordsLimitExceeded,
+        error.GlinerBoundaryPaddedSequenceLimitExceeded,
         error.MissingAssetProducer,
         error.ModelNotSpecified,
         error.PermanentPromptFailure,
@@ -2397,6 +2425,31 @@ test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.PdfEmbeddingArtifactFanoutExceeded));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.PdfEmbeddingArtifactScanBudgetExceeded));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnexpectedToken));
+}
+
+test "enrichment treats deterministic size-based inference rejections as terminal, not retryable" {
+    // InferenceInvocationMemoryExceeded is a pure function of request/response
+    // byte size (asset_producer_runtime.zig's invocationMemoryForRequests):
+    // retrying the same document reproduces the identical estimate and the
+    // identical rejection every time.
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InferenceInvocationMemoryExceeded));
+    try std.testing.expect(!isRetryableEnrichmentError(error.InferenceInvocationMemoryExceeded));
+
+    // Every named GLiNER boundary length-qualification rejection, and its
+    // generic "never reviewed" sibling, must be terminal: retrying does not
+    // change the document's size or the reviewed length contract.
+    for ([_]anyerror{
+        error.UnsupportedGlinerBoundaryRuntime,
+        error.GlinerBoundaryRequestItemsLimitExceeded,
+        error.GlinerBoundaryDocumentBytesLimitExceeded,
+        error.GlinerBoundaryDocumentWordsLimitExceeded,
+        error.GlinerBoundaryWindowCountLimitExceeded,
+        error.GlinerBoundaryWindowWordsLimitExceeded,
+        error.GlinerBoundaryPaddedSequenceLimitExceeded,
+    }) |err| {
+        try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(err));
+        try std.testing.expect(!isRetryableEnrichmentError(err));
+    }
 }
 
 test "enrichment worker attempt budget includes the current request" {

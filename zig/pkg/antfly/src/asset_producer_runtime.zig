@@ -56,6 +56,18 @@ const default_provider_response_envelope_bytes: usize = 1 << 20;
 // A JSON string may encode one logical byte as a six-byte \u00XX escape. Use
 // the task-neutral worst case until a provider publishes a tighter wire codec.
 const provider_json_result_wire_multiplier: usize = 6;
+// GLiNER boundary extraction's reviewed long-document contract (see
+// zig/pkg/inference/models/gliner2/GLINER25.md's LengthContract) qualifies
+// documents up to 182 KB / 28,275 words / 29 windows for the embedded
+// extraction path. A small, fixed fraction of the embedded node's own
+// host/scratch budget (tens of GiB by default; see
+// standalone/inference_provider.zig's createEmbeddedInferenceNode) --
+// comfortably covering that qualified bound -- so
+// invocationMemoryForRequests's allocator ceiling for local extraction never
+// falls below what a single qualified-length document needs, regardless of
+// what the generic caller-side response-envelope arithmetic happens to
+// produce for a given result-size configuration.
+const extraction_qualified_document_allocator_floor_bytes: usize = 256 << 20;
 
 pub const ResultLimits = struct {
     reader_bytes_per_item: usize = 256 << 10,
@@ -195,6 +207,65 @@ test "asset producer runtime local invocation ownership fails closed without exe
         inference_work.InvocationAllocatorOwner.executor,
         try localInvocationAllocatorOwner(provider),
     );
+}
+
+// Regression test for the "a single 182 KB document is rejected on a fixed
+// constant" defect: the generic nonmedia-bytes/response-envelope arithmetic
+// in invocationMemoryForRequests has no notion of GLiNER boundary
+// extraction's qualified long-document bound (GLINER25.md's LengthContract,
+// 182 KB / 28,275 words / 29 windows). For the local/embedded extraction
+// path the allocator ceiling must be floored at
+// extraction_qualified_document_allocator_floor_bytes so a document at that
+// qualified bound is comfortably admitted.
+test "asset producer runtime floors the local extractor allocator ceiling at the qualified document bound" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const Local = struct {
+        fn extract(_: *anyopaque, _: Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
+            return error.TestUnexpectedResult;
+        }
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var context: u8 = 0;
+    const provider = managed_embedder.AntflyProvider{
+        .ptr = &context,
+        .owns_invocation_admission = true,
+        .embed_dense_texts = Local.embedDense,
+        .embed_sparse_texts = Local.embedSparse,
+        .extract = Local.extract,
+    };
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = provider });
+    defer runtime.deinit();
+
+    // A document at the qualified long-document bound (182 KB), plus a
+    // modest schema, as the sole item in the invocation.
+    const document = try alloc.alloc(u8, 182 * 1024);
+    defer alloc.free(document);
+    @memset(document, 'a');
+    const request = asset_producer.Request{
+        .producer_type = .extractor,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"gliner-boundary\",\"schema\":{\"entities\":[\"person\"]}}",
+        .source_text = document,
+        .content_type = "application/json",
+    };
+
+    const plan = try runtime.producer().invocationMemoryForRequests(alloc, &.{request});
+    try std.testing.expectEqual(inference_work.InvocationAllocatorOwner.executor, plan.allocator_owner);
+    try std.testing.expect(plan.allocator_limit_bytes >= extraction_qualified_document_allocator_floor_bytes);
+    // The floor must never shrink the ceiling below what the generic
+    // arithmetic would have produced for a larger, well-provisioned response
+    // budget, and the invariant fixed_bytes >= allocator_limit_bytes >=
+    // max_result_bytes must still hold after flooring.
+    try plan.validate();
 }
 
 pub const Runtime = struct {
@@ -624,7 +695,7 @@ pub const Runtime = struct {
             response_limit,
             invocation_response_resident_multiplier - 1,
         ) catch return error.InferenceEncodedBytesExceeded;
-        const allocator_limit = std.math.add(usize, fixed, parser_and_copy_limit) catch
+        var allocator_limit = std.math.add(usize, fixed, parser_and_copy_limit) catch
             return error.InferenceEncodedBytesExceeded;
         const response_peak = std.math.mul(
             usize,
@@ -632,6 +703,28 @@ pub const Runtime = struct {
             invocation_response_resident_multiplier,
         ) catch return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, response_peak) catch return error.InferenceEncodedBytesExceeded;
+
+        // The arithmetic above sizes a caller-side JSON adapter's parsing and
+        // response-copy overhead; it has no notion of a document-extraction
+        // model's own qualified length contract (GLINER25.md's long-document
+        // LengthContract admits documents up to
+        // extraction_qualified_document_bound_bytes, windowed into dozens of
+        // sub-requests inside the executor). For the LOCAL/embedded
+        // extraction path -- allocator_owner == .executor, meaning the
+        // executor is admitted against the embedded node's own host/scratch
+        // budget (see standalone/inference_provider.zig's
+        // createEmbeddedInferenceNode, tens of GiB by default) rather than
+        // being purely a JSON transport -- floor the allocator ceiling well
+        // above what the generic response-envelope formula happens to
+        // produce, so a single document at or under the qualified bound is
+        // admitted instead of rejected by a constant sized for a small
+        // adapter. This is a small, fixed fraction of the embedded node's own
+        // budget, not a per-document scaling that could itself be exhausted
+        // by one oversized document.
+        if (requests[0].producer_type == .extractor and allocator_owner == .executor) {
+            allocator_limit = @max(allocator_limit, extraction_qualified_document_allocator_floor_bytes);
+            fixed = @max(fixed, allocator_limit);
+        }
         return .{
             .attachment_transport = transport,
             .fixed_bytes = fixed,
@@ -3793,8 +3886,19 @@ fn validateExtractorBatchCompatibility(
     attachment_transport: inference_work.AttachmentTransport,
     requests: []const asset_producer.Request,
 ) !void {
-    if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item or
-        capabilities.batch.mode == .none) return error.InvalidInferenceCapabilities;
+    if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item)
+        return error.InvalidInferenceCapabilities;
+    // An executor that advertises no batching (the GLiNER boundary contract:
+    // mode = .none, max_items = 1 -- see resolvedExecutorBatchImplementation
+    // in zig/pkg/inference/src/server/server.zig) is not a malformed
+    // capability, it is simply not batchable. `canExtractBatch` already
+    // treats this as "return false, use sequential production" without
+    // erroring; this gate must classify it the same way its caller
+    // (`produceBatch`'s `error.BatchIncompatible => {}` fallback) expects, so
+    // a direct `produceBatch`/`produceBatchReported` call against a
+    // one-item-at-a-time executor degrades to sequential instead of
+    // surfacing a hard failure.
+    if (capabilities.batch.mode == .none) return error.BatchIncompatible;
     var uses_media: ?bool = null;
     var media_prompt: ?[]u8 = null;
     defer if (media_prompt) |prompt| alloc.free(prompt);
@@ -7356,4 +7460,110 @@ test "asset producer runtime batches compatible antfly extractor requests" {
     try std.testing.expect(std.mem.indexOf(u8, results[0], "\"Ada\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, results[1], "\"Grace\"") != null);
     try std.testing.expectEqual(@as(usize, 1), local.extract_calls);
+}
+
+// Regression test for the "9 of 1,231" GLiNER boundary incident: an executor
+// that advertises `mode = .none, max_items = 1` (the boundary extraction
+// contract; see zig/pkg/inference/src/server/server.zig's
+// resolvedExecutorBatchImplementation and GLINER25.md's LengthContract) must
+// never see more than one document per extract() invocation, no matter how
+// many compatible requests the caller offers at once. `canExtractBatch`
+// (consulted by `batchMode`/`canProduceBatch`) must refuse batching outright,
+// and `tryExtractBatchReported`'s own `validateExtractorBatchCompatibility`
+// gate must independently refuse it too -- both read the same freshly
+// resolved capabilities, so there is no path that can silently widen the
+// group after admission.
+test "asset producer runtime never batches an extractor that advertises max_items=1" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Local = struct {
+        extract_calls: usize = 0,
+        max_inputs_seen: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .owns_invocation_admission = true,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .extract = extract,
+                .model_capabilities = modelCapabilities,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        // Mirrors the fixed native_gliner_extraction advertisement: batching
+        // is disabled outright (mode = .none), which BatchCapabilities.validate
+        // requires to carry preferred_items = max_items = 1.
+        fn modelCapabilities(_: *anyopaque, _: Allocator, _: []const u8, task: inference_work.Task) !inference_work.InferenceCapabilities {
+            try std.testing.expectEqual(inference_work.Task.extract, task);
+            return .{
+                .task = .extract,
+                .input_modalities = .{ .text = true },
+                .accepted_mime_types = .{ .text_plain = true },
+                .input_granularity = .item,
+                .batch = .{ .mode = .none, .preferred_items = 1, .max_items = 1 },
+                .output = .extraction,
+                .prompt_policy = .structured_schema,
+            };
+        }
+
+        fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.extract_calls += 1;
+            self.max_inputs_seen = @max(self.max_inputs_seen, request.inputs.len);
+            try std.testing.expectEqualStrings("gliner-boundary", model);
+            // The one invariant this regression test exists to lock in: every
+            // wire request the provider path issues carries exactly one
+            // document, matching the executor's advertised max_items. Falling
+            // back to sequential production (BatchIncompatible, not a batch
+            // chunk) leaves each Input.id null, so the response envelope
+            // matches the single-item shape (no "id" field) rather than the
+            // native-batch shape.
+            try std.testing.expectEqual(@as(usize, 1), request.inputs.len);
+            try std.testing.expect(request.inputs[0].id == null);
+            return .{
+                .allocator = a,
+                .json = try a.dupe(u8, "{\"object\":\"extraction\",\"model\":\"gliner-boundary\",\"data\":[{\"entities\":[],\"relations\":[]}]}"),
+            };
+        }
+    };
+
+    var local = Local{};
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
+    defer runtime.deinit();
+    const producer = runtime.producer();
+
+    const config_json = "{\"provider\":\"antfly\",\"model\":\"gliner-boundary\",\"schema\":{\"entities\":[\"person\"]}}";
+    const requests = [_]asset_producer.Request{
+        .{ .producer_type = .extractor, .config_json = config_json, .source_text = "Ada works at Antfly.", .content_type = "application/json" },
+        .{ .producer_type = .extractor, .config_json = config_json, .source_text = "Grace works at Antfly.", .content_type = "application/json" },
+        .{ .producer_type = .extractor, .config_json = config_json, .source_text = "Alan works at Antfly.", .content_type = "application/json" },
+    };
+
+    // The admission check must independently agree that this producer cannot
+    // batch: canProduceBatch/batchMode consult the same capabilities.
+    try std.testing.expect(!try producer.canProduceBatch(alloc, &requests));
+
+    const results = try producer.produceBatch(alloc, &requests);
+    defer {
+        for (results) |result| alloc.free(result);
+        alloc.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqual(@as(usize, 3), local.extract_calls);
+    try std.testing.expectEqual(@as(usize, 1), local.max_inputs_seen);
 }
