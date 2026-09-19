@@ -342,9 +342,14 @@ pub const BearerAuthHeaderCache = struct {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
 
-        if (self.header == null or self.generation != resolved.cacheGeneration()) {
+        // Generations are scoped to a source and may collide across fallback
+        // transitions (or remain zero for environment/literal values). Resolution
+        // already fetched the current value; never reuse a different credential.
+        const matches = if (self.header) |header| std.mem.eql(u8, header["Bearer ".len..], resolved.value) else false;
+        if (!matches or self.generation != resolved.cacheGeneration()) {
+            const header = try std.fmt.allocPrint(cache_alloc, "Bearer {s}", .{resolved.value});
             if (self.header) |value| cache_alloc.free(value);
-            self.header = try std.fmt.allocPrint(cache_alloc, "Bearer {s}", .{resolved.value});
+            self.header = header;
             self.generation = resolved.cacheGeneration();
         }
         return try out_alloc.dupe(u8, self.header.?);
@@ -795,7 +800,7 @@ pub const FileStore = struct {
         if (self.entries.get(key)) |stored| {
             return .{
                 .value = try alloc.dupe(u8, stored.value),
-                .generation = self.generation_value,
+                .generation = self.generationLocked(),
                 .source = .file_store,
             };
         }
@@ -814,7 +819,7 @@ pub const FileStore = struct {
         const value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound;
         return .{
             .value = value,
-            .generation = self.generation_value,
+            .generation = self.generationLocked(),
             .source = .env_var,
         };
     }
@@ -1969,6 +1974,24 @@ test "bearer auth header cache rebuilds on file generation change" {
     defer alloc.free(second);
     try std.testing.expectEqualStrings("Bearer second", second);
     try std.testing.expect(cache.generation > first_generation);
+}
+
+test "bearer auth header cache distinguishes credentials with equal generations" {
+    const alloc = std.testing.allocator;
+    var first = try SecretValue.initConfig(alloc, "first") orelse return error.TestUnexpectedResult;
+    defer first.deinit(alloc);
+    var second = try SecretValue.initConfig(alloc, "second") orelse return error.TestUnexpectedResult;
+    defer second.deinit(alloc);
+    var cache = BearerAuthHeaderCache{};
+    defer cache.deinit(alloc);
+    const before = try cache.getOwned(alloc, alloc, &first, null);
+    defer alloc.free(before);
+    const generation = cache.generation;
+    const after = try cache.getOwned(alloc, alloc, &second, null);
+    defer alloc.free(after);
+    try std.testing.expectEqual(generation, cache.generation);
+    try std.testing.expectEqualStrings("Bearer first", before);
+    try std.testing.expectEqualStrings("Bearer second", after);
 }
 
 test "environment secret discovery maps API key env vars" {

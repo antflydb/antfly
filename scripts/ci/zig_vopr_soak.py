@@ -347,7 +347,7 @@ def main():
     run = commands.add_parser("run")
     run.add_argument(
         "--scenario",
-        choices=("standby", "raft", "distributed-data", "standby-scaling"),
+        choices=("standby", "raft", "distributed-data", "standby-scaling", "secrets"),
         required=True,
     )
     run.add_argument("--seed", type=lambda value: int(value, 0), required=True)

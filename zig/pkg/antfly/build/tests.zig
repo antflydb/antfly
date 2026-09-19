@@ -623,7 +623,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "file secret store", "remote content runtime", "secret contract", "secret record" },
+        .filters = &.{ "file secret store", "bearer auth header cache", "remote content runtime", "secret contract", "secret record" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3618,6 +3618,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     config_extension_lifecycle_vopr_test_step.dependOn(&run_config_extension_lifecycle_vopr_tests.step);
 
+    const secret_lifecycle_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"secrets VOPR model exact replays"},
+    });
+    const run_secret_lifecycle_tests = b.addRunArtifact(secret_lifecycle_tests);
+    b.step("secrets-vopr-test", "Replay secret persistence, CAS, rotation, outage and crash histories").dependOn(&run_secret_lifecycle_tests.step);
+    const secrets_test_step = b.step("secrets-test", "Qualify native adapters, Lite persistence, and replayable lifecycle");
+    secrets_test_step.dependOn(&run_secret_backend_tests.step);
+    secrets_test_step.dependOn(&run_lib_common_secrets_tests.step);
+    secrets_test_step.dependOn(&run_secret_lifecycle_tests.step);
+    const lite_secret_tests = b.addTest(.{ .root_module = lite_native_test_mod, .filters = &.{"lite secrets"} });
+    const run_lite_secret_tests = b.addRunArtifact(lite_secret_tests);
+    b.step("lite-secrets-test", "Qualify Lite secret embedding, durability and restore rules").dependOn(&run_lite_secret_tests.step);
+    secrets_test_step.dependOn(&run_lite_secret_tests.step);
+
     const embedded_lite_lifecycle_vopr_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/vopr/embedded_lite_lifecycle.zig"),
         .target = target,
@@ -3881,6 +3896,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     vopr_test_step.dependOn(&run_generation_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_backfill_marker_discovery_vopr_tests.step);
     vopr_test_step.dependOn(&run_config_extension_lifecycle_vopr_tests.step);
+    vopr_test_step.dependOn(&run_secret_lifecycle_tests.step);
     vopr_test_step.dependOn(&run_embedded_lite_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_capi_lite_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_vopr_determinism_audit_tests.step);

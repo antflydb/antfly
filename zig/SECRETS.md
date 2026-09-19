@@ -1240,8 +1240,9 @@ Additional runtime tests:
 5. Kubernetes-projected files are the primary enterprise integration surface.
    Direct external secret manager integrations are deferred.
 6. Plaintext JSON remains the initial store format, protected by filesystem
-   permissions. The AFSE codec and Lite adapter are implemented; runtime
-   integration, other persistence adapters, and explicit migration remain pending.
+   permissions. AFSE records, Lite/distributed/serverless adapters, and runtime
+   integration are implemented; explicit migration of existing JSON stores remains
+   pending.
 7. Start true live rotation with managed embedder API keys.
 8. Support live rotation for all credential-bearing integrations that Antfly
    owns: generator/reranker providers, remote-content credentials, S3/backup
@@ -1258,3 +1259,68 @@ Additional runtime tests:
    first, and what bounded cache freshness policy should native backends use?
 3. Should S3/backup and remote-content clients share a generation-keyed
    credential cache, or should each subsystem own its own cache?
+
+## Secret-store qualification
+
+`zig build secrets-test` is a required CI gate. It combines the common resolver
+and encrypted record tests, distributed/serverless adapter tests, the Lite host
+lifecycle, and the `native-secret-lifecycle` VOPR scenario. Lite coverage uses the
+real `.aflite` host API and live resolver, including rotation, unavailable keys,
+read-only reopen, stable snapshots, concurrent writers, ambiguous sync fencing,
+tamper rejection, and the existing backup/import isolation rules.
+
+The VOPR scenario maintains an independent value/revision model while driving
+production Lite, standalone file, filesystem object-store CAS, and encrypted
+delivery implementations through deterministic `VoprIo`. Every fault is forced
+at least once in the bounded test; seeded histories explore different orderings.
+It covers competing/stale writers, lost acknowledgements before and after
+publication, key rotation, corruption, replayed delivery responses, denied grants,
+partitions, Lite sync failures, and crash/reopen. After an uncertain write the
+model permits only the complete old or complete new state; it checks that the
+adapter never retries the mutation. Every history is exactly replayed. This is
+not a virtual metadata Raft cluster: quorum routing and elections are exercised
+by the real-process suite below.
+
+`e2e/antfly/test_secrets.py` starts production standalone, three-node metadata
+plus data, and two-worker serverless deployments. A local OpenAI-compatible
+provider records the Authorization header used by real background enrichment.
+The suite checks native precedence, rotation, restart, deletion revealing file
+and environment fallback, key failure, metadata-only API responses, serverless
+admin authentication, concurrent writers, follower writes, metadata leader death
+and catch-up, read-only data nodes, delivery credential revocation, and metadata
+outage. The storage-owner ABI borrows the process resolver before any table opens;
+this is necessary for background enrichment to see the same native store as the
+public API. A cached bearer header must match the newly resolved value even if
+source generations collide.
+
+Run from `zig/`:
+
+```sh
+zig build antfly secrets-test vopr-build
+uv run --project e2e/antfly pytest -q e2e/antfly/test_secrets.py -m 'not objectstore_integration'
+python3 ../scripts/ci/zig_vopr_soak.py --binary zig-out/bin/vopr run \
+  --scenario secrets --histories 100 --seed 6195175 \
+  --corpus /tmp/secret-corpus --output /tmp/secret-campaign
+```
+
+The base E2E suite discovers these local tests. Nightly VOPR runs 1,000 secret
+histories per exploration-policy shard and retains replay traces and corpora.
+The separate `Zig secret store cloud qualification` workflow runs weekly or on
+manual dispatch once repository variable `SECRET_STORE_CLOUD_QUALIFICATION=true`
+is set. It runs trusted `main` code using the `secret-store-qualification`
+environment. Configure its variables `SECRET_STORE_S3_BUCKET`,
+`SECRET_STORE_GCS_BUCKET`, `SECRET_STORE_AWS_REGION`, and secrets
+`SECRET_STORE_AWS_ACCESS_KEY_ID`, `SECRET_STORE_AWS_SECRET_ACCESS_KEY`, optional
+`SECRET_STORE_AWS_SESSION_TOKEN`, and `SECRET_STORE_GCS_SERVICE_ACCOUNT_JSON`.
+Use dedicated test buckets and narrowly scoped credentials. The enabled workflow
+fails if settings are absent rather than silently skipping either provider.
+
+For local cloud qualification set `OBJECTSTORE_S3_INTEGRATION=1` and/or
+`OBJECTSTORE_GCS_INTEGRATION=1`, the corresponding `OBJECTSTORE_*_TEST_BUCKET`,
+and the normal object-store credentials; run the same pytest file with
+`-m objectstore_integration`. Each test uses a unique `antfly-secret-e2e/` prefix,
+checks concurrent conditional publication from separate workers and restart
+visibility, and removes its native overrides. Encrypted empty-head objects may
+remain: apply a lifecycle expiration policy to that test prefix. Cloud tests
+are skipped in ordinary developer/PR runs; filesystem and HTTP mock coverage
+must not be reported as real S3/GCS qualification.
