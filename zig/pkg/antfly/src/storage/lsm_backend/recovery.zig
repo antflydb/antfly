@@ -20,6 +20,7 @@ const compaction_mod = @import("compaction.zig");
 const runtime_mod = @import("runtime.zig");
 const storage_io = @import("storage_io.zig");
 const platform = @import("antfly_platform");
+const completion_recovery = @import("completion_recovery.zig");
 
 fn openDebugLogsEnabled() bool {
     return platform.env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
@@ -71,11 +72,17 @@ fn finishOpenFailure(comptime BackendType: type, backend: *BackendType) void {
 
 pub fn open(comptime BackendType: type, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !BackendType {
     var backend: BackendType = undefined;
-    try openInto(BackendType, &backend, allocator, root_dir, options, backend_options);
+    try openIntoPolicy(BackendType, &backend, allocator, root_dir, options, backend_options, false);
     return backend;
 }
 
+/// Restored completion slots pin accounting identities at the backend's final
+/// address. The caller must retain this address until close/abandon completes.
 pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype) !void {
+    return openIntoPolicy(BackendType, backend, allocator, root_dir, options, backend_options, true);
+}
+
+fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: Allocator, root_dir: []const u8, options: backend_types.OpenOptions, backend_options: anytype, stable_address: bool) !void {
     if (@hasDecl(BackendType, "initInPlace")) {
         BackendType.initInPlace(backend, allocator, backend_options);
     } else {
@@ -114,6 +121,12 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         }
     }
     errdefer cleanup(BackendType, backend, false);
+    errdefer if (@hasField(BackendType, "durable_completion")) {
+        if (backend.durable_completion) |slot| {
+            backend.durable_completion = null;
+            slot.destroy();
+        }
+    };
     errdefer finishOpenFailure(BackendType, backend);
     if (@hasDecl(BackendType, "initOutputCleanup")) try backend.initOutputCleanup();
 
@@ -127,6 +140,15 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         try backend.prepareWalOperationLockFile();
     }
 
+    if (comptime @hasField(BackendType, "durable_completion")) {
+        if (!stable_address) {
+            const guard = try std.fs.path.join(allocator, &.{ root_dir, @import("completion_runtime.zig").guard_filename });
+            defer allocator.free(guard);
+            if (backend.storage.?.fileSize(guard)) |_| return error.UnsupportedCompletionBackend else |err| {
+                if (err != error.FileNotFound) return err;
+            }
+        }
+    }
     cleanupRecoveredRunFiles(BackendType, backend, "before_manifest", true);
 
     const loaded_manifest = blk: {
@@ -215,11 +237,29 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         const locked = runtime_mod.lockBackend(BackendType, backend);
         defer runtime_mod.unlockBackend(BackendType, backend, locked);
 
+        // Native completion needs the manifest metadata/baseline mounted so
+        // its entire physical reservation can be reconstructed before replay.
+        if (comptime @hasField(BackendType, "durable_completion")) {
+            if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
+            if (@hasDecl(BackendType, "mountRunDirectory")) try backend.mountRunDirectory();
+        }
+        const guarded = if (comptime @hasField(BackendType, "durable_completion"))
+            try completion_recovery.restoreBeforeReplay(BackendType, backend)
+        else
+            false;
         if (@hasDecl(BackendType, "replayWalIntoMutable")) {
             if (debug_open) std.log.info("lsm backend open wal replay begin root={s}", .{backend.root_dir.?});
             const phase_start = beginOpenPhase(BackendType, backend, .replaying_wal);
             defer finishOpenPhase(BackendType, backend, .replaying_wal, phase_start);
-            try backend.replayWalIntoMutable();
+            if (comptime @hasField(BackendType, "durable_completion")) {
+                if (guarded) {
+                    const replay_stats = try completion_recovery.replay(BackendType, backend);
+                    try completion_recovery.finish(BackendType, backend, replay_stats);
+                } else {
+                    try backend.replayWalIntoMutable();
+                    try completion_recovery.rejectUnanchored(BackendType, backend);
+                }
+            } else try backend.replayWalIntoMutable();
             recordOpenReplayComplete(BackendType, backend);
             if (debug_open) {
                 std.log.info(
@@ -235,7 +275,9 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         const phase_start = beginOpenPhase(BackendType, backend, .mounting_runs);
         defer finishOpenPhase(BackendType, backend, .mounting_runs, phase_start);
         if (comptime @TypeOf(backend.runs) != @import("run_store.zig").Store) compaction_mod.sortRuns(backend.runs.items);
-        if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
+        if (comptime !@hasField(BackendType, "durable_completion")) {
+            if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
+        }
         // Build cold metadata before publishing the opened backend. Subsequent
         // writes maintain this root incrementally, including before first read.
         if (@hasDecl(BackendType, "mountRunDirectory")) try backend.mountRunDirectory();

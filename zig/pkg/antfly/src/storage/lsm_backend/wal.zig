@@ -90,6 +90,15 @@ pub const ReplayStats = struct {
     bytes: u64 = 0,
     segments: u64 = 0,
     truncated_tail_bytes: u64 = 0,
+    truncated_tail_segment: ?u64 = null,
+    multiple_truncated_segments: bool = false,
+
+    fn noteTail(self: *ReplayStats, segment: u64, bytes: usize) void {
+        if (self.truncated_tail_segment) |previous| {
+            if (previous != segment) self.multiple_truncated_segments = true;
+        } else self.truncated_tail_segment = segment;
+        self.truncated_tail_bytes += @intCast(bytes);
+    }
 };
 
 pub const ReplayHooks = struct {
@@ -601,11 +610,22 @@ pub fn reset(storage: storage_io.Storage, allocator: Allocator, root_dir: []cons
 /// Completion owns a durable manifest and recovery guard. Exclude every old
 /// segment durably before resetting numbering, so an interrupted reset cannot
 /// replay an older prefix over the newer manifested transaction decision.
-pub const ProtectedResetBoundary = enum { excluded_old_segments, emptied_first_segment, reset_current_index, reset_checkpoint };
+pub const ProtectedResetBoundary = enum { excluded_old_segments, emptied_first_segment, retired_old_segments, reset_current_index, reset_checkpoint };
 pub var test_protected_reset_hook: ?*const fn (ProtectedResetBoundary) bool = null;
 
 fn protectedResetBoundary(boundary: ProtectedResetBoundary) !void {
     if (builtin.is_test) if (test_protected_reset_hook) |hook| if (hook(boundary)) return error.InjectedProtectedResetCrash;
+}
+
+/// A reset interrupted before reopening the checkpoint floor has no live
+/// primary WAL. Writable recovery must finish it before admitting new appends.
+pub fn hasProtectedResetCut(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !bool {
+    const checkpoint = try readCheckpointIndex(storage, allocator, root_dir);
+    const current = readCurrentSegmentIfPresent(storage, allocator, root_dir) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return checkpoint.oldest_retained_segment > current.segment;
 }
 
 pub fn protectedReset(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !void {
@@ -644,6 +664,12 @@ fn resetInternal(storage: storage_io.Storage, allocator: Allocator, root_dir: []
         try storage.syncFileContentsAbsolute(first_segment);
         try storage.syncParentAbsolute(first_segment);
         try protectedResetBoundary(.emptied_first_segment);
+        // Finish deletion while the old index still records the full extent.
+        // Otherwise a crash after resetting the index loses the cleanup bound,
+        // and a later rotation could append onto an orphaned old segment.
+        try deleteResetSegments(storage, allocator, root_dir, current_segment);
+        try storage.syncParentAbsolute(first_segment);
+        try protectedResetBoundary(.retired_old_segments);
     }
     try writeCurrentSegment(storage, allocator, root_dir, 1, 0);
     if (protected) try protectedResetBoundary(.reset_current_index);
@@ -662,16 +688,7 @@ fn resetInternal(storage: storage_io.Storage, allocator: Allocator, root_dir: []
     defer allocator.free(replay_segments_path);
     try replaceFileAtomically(storage, allocator, replay_segments_path, "");
 
-    var segment: u64 = 2;
-    while (segment <= current_segment) : (segment += 1) {
-        const segment_path = try segmentPathAlloc(allocator, root_dir, segment);
-        errdefer allocator.free(segment_path);
-        storage.deleteFileAbsolute(segment_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-        allocator.free(segment_path);
-    }
+    if (!protected) try deleteResetSegments(storage, allocator, root_dir, current_segment);
 
     const legacy_path = try legacyPathAlloc(allocator, root_dir);
     defer allocator.free(legacy_path);
@@ -679,6 +696,18 @@ fn resetInternal(storage: storage_io.Storage, allocator: Allocator, root_dir: []
         error.FileNotFound => {},
         else => return err,
     };
+}
+
+fn deleteResetSegments(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, current_segment: u64) !void {
+    var segment: u64 = 2;
+    while (segment <= current_segment) : (segment += 1) {
+        const path = try segmentPathAlloc(allocator, root_dir, segment);
+        defer allocator.free(path);
+        storage.deleteFileAbsolute(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
 }
 
 pub fn snapshotRetention(
@@ -1422,7 +1451,7 @@ fn replayFileStreaming(
                     segment,
                     pending.items.len,
                 });
-                stats.truncated_tail_bytes += @intCast(pending.items.len);
+                stats.noteTail(segment, pending.items.len);
                 pending.clearRetainingCapacity();
                 releaseOversizedReplayPendingBuffer(allocator, &pending, retained_cap_bytes);
                 working_set.observePending(&pending);
@@ -1434,7 +1463,7 @@ fn replayFileStreaming(
         working_set.observePending(&pending);
     }
     if (pending.items.len > 0) {
-        stats.truncated_tail_bytes += @intCast(pending.items.len);
+        stats.noteTail(segment, pending.items.len);
     }
 }
 
@@ -2470,6 +2499,9 @@ test "lsm protected WAL reset never replays an older prefix after any durable cu
         try std.testing.expectEqual(@as(usize, 0), replayed.entryCount());
         // Repeating cleanup after restart is safe and enables subsequent WAL.
         try protectedReset(storage.storage(), alloc, root);
+        const retired = try segmentPathAlloc(alloc, root, 2);
+        defer alloc.free(retired);
+        try std.testing.expectError(error.FileNotFound, storage.storage().fileSize(retired));
         try state.upsert(alloc, .{}, "decision", "newer", false);
         _ = try appendStateWithOptions(storage.storage(), alloc, root, &state, true, .{ .segment_bytes = 1 });
         const after = try replayIntoMutable(storage.storage(), alloc, root, &replayed);

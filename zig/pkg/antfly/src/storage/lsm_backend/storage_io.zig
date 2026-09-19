@@ -1145,6 +1145,10 @@ const FdCache = if (!supports_posix_fd_cache)
             return .{};
         }
 
+        fn usableTransientDescriptorCapacity(_: *const FdCache) usize {
+            return 0;
+        }
+
         pub fn readRangeAlloc(_: *FdCache, _: u64, _: Allocator, _: []const u8, _: u64, _: usize) ![]u8 {
             return error.UnsupportedNativeStorageRuntime;
         }
@@ -1581,18 +1585,24 @@ else
             }
         }
 
+        fn transientLimit(self: *const FdCache, persistent: usize) usize {
+            const unused_reserve = self.persistent_reserve -| persistent;
+            const remaining = self.capacity -| persistent;
+            const open_headroom = if (remaining >= self.persistent_open_headroom) self.persistent_open_headroom else 0;
+            return self.capacity -| @max(unused_reserve, open_headroom);
+        }
+
+        fn usableTransientDescriptorCapacity(self: *const FdCache) usize {
+            const persistent = self.persistent_descriptors.load(.acquire);
+            return @min(self.capacity -| self.persistent_reserve, self.transientLimit(persistent) -| persistent);
+        }
+
         fn persistentDescriptorsPreventTransientProgress(self: *FdCache, count: usize) bool {
             const persistent = self.persistent_descriptors.load(.acquire);
             const admitted = self.admitted_descriptors.load(.acquire);
             if (admitted != persistent) return false;
 
-            const unused_reserve = self.persistent_reserve -| persistent;
-            const remaining_capacity = self.capacity -| persistent;
-            const open_headroom = if (remaining_capacity >= self.persistent_open_headroom)
-                self.persistent_open_headroom
-            else
-                0;
-            const transient_capacity = self.capacity - @max(unused_reserve, open_headroom);
+            const transient_capacity = self.transientLimit(persistent);
             return count > transient_capacity -| admitted;
         }
 
@@ -1604,14 +1614,7 @@ else
             // open backends can make transient admission wait forever even
             // though the aggregate pool still has unused descriptors.
             const persistent = self.persistent_descriptors.load(.acquire);
-            const unused_reserve = self.persistent_reserve -| persistent;
-            const remaining_capacity = self.capacity -| persistent;
-            const open_headroom = if (remaining_capacity >= self.persistent_open_headroom)
-                self.persistent_open_headroom
-            else
-                0;
-            const held_headroom = @max(unused_reserve, open_headroom);
-            const transient_capacity = self.capacity - held_headroom;
+            const transient_capacity = self.transientLimit(persistent);
             if (count > transient_capacity) return false;
             const available_at = transient_capacity - count;
             while (self.admitted_descriptors.load(.acquire) > available_at and self.evictOne()) {}
@@ -2105,8 +2108,14 @@ pub const NativeWalCompletionIo = struct {
     /// This excludes builders, encoders and generic allocating Storage helpers.
     /// Parent directories must already exist or be created top-down explicitly.
     pub fn createWithFiles(allocator: Allocator, native: *NativeStorage, root_dir: []const u8, specs: []const FileSpec) !*NativeCompletionIo {
+        return createWithFilesAndHeadroom(allocator, native, root_dir, specs, 0);
+    }
+
+    /// Durable scopes leave ordinary transient capacity for prepare/recovery.
+    /// Admission is nonblocking and tests the retained pair and headroom together.
+    pub fn createWithFilesAndHeadroom(allocator: Allocator, native: *NativeStorage, root_dir: []const u8, specs: []const FileSpec, headroom: usize) !*NativeCompletionIo {
         if (specs.len > 64) return error.CompletionFileCapacityExceeded;
-        const self = try create(allocator, native, root_dir);
+        const self = try createWithHeadroom(allocator, native, root_dir, headroom);
         errdefer self.deinit() catch unreachable;
         const files = try allocator.alloc(PreparedFile, specs.len);
         var initialized: usize = 0;
@@ -2149,6 +2158,10 @@ pub const NativeWalCompletionIo = struct {
     }
 
     pub fn create(allocator: Allocator, native: *NativeStorage, root_dir: []const u8) !*NativeWalCompletionIo {
+        return createWithHeadroom(allocator, native, root_dir, 0);
+    }
+
+    fn createWithHeadroom(allocator: Allocator, native: *NativeStorage, root_dir: []const u8, headroom: usize) !*NativeWalCompletionIo {
         if (comptime !supports_posix_fd_cache) return error.UnsupportedCompletionProvider;
         if (!std.fs.path.isAbsolute(root_dir) or std.mem.indexOfScalar(u8, root_dir, 0) != null)
             return error.UnsupportedCompletionPath;
@@ -2156,7 +2169,12 @@ pub const NativeWalCompletionIo = struct {
         // be held. A retained native state survives its public owner's close.
         const retained = try native.state.acquireLease();
         defer retained.release();
-        var permit = (try retained.tryAcquireFdPermits(2)) orelse return error.DescriptorAdmissionExhausted;
+        const total = std.math.add(usize, 2, headroom) catch return error.DescriptorAdmissionExhausted;
+        var permit = (try retained.tryAcquireFdPermits(total)) orelse return error.DescriptorAdmissionExhausted;
+        if (headroom != 0) {
+            permit.cache.releaseDescriptors(permit.io, headroom);
+            permit.count = 2;
+        }
         errdefer permit.release();
         const self = try allocator.create(NativeWalCompletionIo);
         errdefer allocator.destroy(self);
@@ -2399,6 +2417,27 @@ pub const NativeWalCompletionIo = struct {
         try unlinkPrepared(final);
         try syncParent(raw, value);
     }
+    /// Recovery supplies a checksum-verified valid prefix of the current WAL.
+    /// Never extend a file or touch a non-WAL path using this authority.
+    pub fn truncateWalTail(self: *NativeWalCompletionIo, segment_id: u64, valid_bytes: u64) !void {
+        try self.idle();
+        if (!self.allow_wal_reset or segment_id == 0) return error.UnsupportedCompletionOperation;
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buffer, "{s}/{d:0>20}.log", .{ self.wal_dir, segment_id });
+        const owned_path = try self.path(name);
+        const length = std.math.cast(i64, valid_bytes) orelse return error.FileTooBig;
+        self.permit.state.invalidatePath(name);
+        defer self.permit.state.invalidatePath(name);
+        const fd = try std.posix.openatZ(std.posix.AT.FDCWD, owned_path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        defer closeFd(fd);
+        if (valid_bytes > try fileSizeFromFd(fd)) return error.InvalidArgument;
+        while (true) switch (std.posix.errno(std.posix.system.ftruncate(fd, length))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => |err| return posixWriteError(err),
+        };
+        try fs_paths.syncFileFdPortable(fd);
+    }
     fn resetEmptyFirstSegment(raw: *anyopaque, value: []const u8, bytes: []const u8) !void {
         const self = get(raw);
         try self.idle();
@@ -2613,6 +2652,10 @@ pub const NativeStorage = if (!supports_native_storage)
             return .{};
         }
 
+        pub fn usableTransientDescriptorCapacity(_: *const NativeStorage) usize {
+            return 0;
+        }
+
         pub fn acquireFdPermit(_: *NativeStorage) !NativeFdPermit {
             return error.UnsupportedNativeStorageRuntime;
         }
@@ -2709,6 +2752,10 @@ else blk: {
 
             pub fn snapshotStats(self: *const NativeStorage) NativeStorageStats {
                 return self.state.fdCacheConst().snapshotStats();
+            }
+
+            pub fn usableTransientDescriptorCapacity(self: *const NativeStorage) usize {
+                return self.state.fdCacheConst().usableTransientDescriptorCapacity();
             }
 
             pub fn acquireFdPermit(self: *NativeStorage) !NativeFdPermit {
@@ -2991,6 +3038,10 @@ else blk: {
 
         pub fn snapshotStats(self: *const NativeStorage) NativeStorageStats {
             return self.state.fdCacheConst().snapshotStats();
+        }
+
+        pub fn usableTransientDescriptorCapacity(self: *const NativeStorage) usize {
+            return self.state.fdCacheConst().usableTransientDescriptorCapacity();
         }
 
         pub fn acquireFdPermit(self: *NativeStorage) !NativeFdPermit {
@@ -6077,6 +6128,11 @@ test "native completion scope protected WAL reset requires explicit authority an
     var scratch = std.heap.FixedBufferAllocator.init(&scratch_bytes);
     failing.fail_index = failing.alloc_index;
     pool.fd_cache.capacity = 1;
+    const valid_size = try scope.storage().fileSize(second_path);
+    try scope.storage().appendFileAbsolute(scratch.allocator(), second_path, "torn", true);
+    try std.testing.expectError(error.InvalidArgument, scope.truncateWalTail(2, valid_size + 5));
+    try scope.truncateWalTail(2, valid_size);
+    try std.testing.expectEqual(valid_size, try scope.storage().fileSize(second_path));
     try wal.protectedReset(scope.storage(), scratch.allocator(), root);
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(u64, 0), try scope.storage().fileSize(first_path));
@@ -6306,4 +6362,40 @@ test "native completion scope preserves files on failed atomic publication and l
     try storage.syncParentAbsolute(final);
     try std.testing.expectError(error.FileNotFound, storage.fileSize(final));
     try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+}
+
+test "workload admission native completion scopes preserve shared ordinary FD headroom" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const repository = @import("repository.zig");
+    var path_buffer: [256]u8 = undefined;
+    const root_z = repository.tmpPath(&path_buffer, "completion-shared-headroom");
+    const root = std.mem.span(root_z);
+    defer repository.cleanupTmp(root_z);
+    const ordinary_path = try std.fs.path.join(alloc, &.{ root, "ordinary" });
+    defer alloc.free(ordinary_path);
+    // Two native open-reserve slots leave four usable transient descriptors.
+    var pool = NativeStoragePool.initWithCapacityForTest(alloc, 6);
+    defer pool.deinit();
+    var first_native = try NativeStorage.initWithPool(alloc, .threaded, &pool);
+    defer first_native.deinit();
+    var second_native = try NativeStorage.initWithPool(alloc, .threaded, &pool);
+    defer second_native.deinit();
+    try first_native.storage().createDirPath(root);
+    try std.testing.expectEqual(@as(usize, 4), first_native.usableTransientDescriptorCapacity());
+    {
+        const first = try NativeCompletionIo.createWithFilesAndHeadroom(alloc, &first_native, root, &.{}, 2);
+        defer first.deinit() catch unreachable;
+        try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expectError(error.DescriptorAdmissionExhausted, NativeCompletionIo.createWithFilesAndHeadroom(alloc, &second_native, root, &.{}, 2));
+        try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+        // Actual ordinary append takes its parent/file pair while the first
+        // completion scope retains its independent pair.
+        try first_native.storage().appendFileAbsolute(alloc, ordinary_path, "ordinary", true);
+        try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+    }
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+    const replacement = try NativeCompletionIo.createWithFilesAndHeadroom(alloc, &second_native, root, &.{}, 2);
+    try replacement.deinit();
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
 }

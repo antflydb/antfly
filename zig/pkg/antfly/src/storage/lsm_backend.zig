@@ -25,6 +25,8 @@ const lsm_manifest = @import("lsm/manifest.zig");
 const lsm_table_file = @import("lsm/table_file.zig");
 const state_mod = @import("lsm_backend/state.zig");
 const completion_allocator = @import("lsm_backend/completion_allocator.zig");
+const completion_runtime = @import("lsm_backend/completion_runtime.zig");
+pub const completion_slot_codec = @import("lsm_backend/completion_slot.zig");
 const repository_mod = @import("lsm_backend/repository.zig");
 const runtime_mod = @import("lsm_backend/runtime.zig");
 const run_directory_mod = @import("lsm_backend/run_directory.zig");
@@ -1435,7 +1437,7 @@ pub const Backend = struct {
         replay: ?wal_mod.RetentionStats = null,
         replay_ns: u64 = 0,
 
-        fn appendPrepared(
+        pub fn appendPrepared(
             self: *@This(),
             storage: storage_io.Storage,
             allocator: Allocator,
@@ -1495,7 +1497,7 @@ pub const Backend = struct {
             }
         }
 
-        fn invalidatePrimary(self: *@This()) void {
+        pub fn invalidatePrimary(self: *@This()) void {
             self.primary = null;
             self.primary_ns = 0;
         }
@@ -1597,6 +1599,7 @@ pub const Backend = struct {
     next_run_id: u64 = 1,
     active_readers: usize = 0,
     completion_batches: ?*CompletionPointBatch = null,
+    durable_completion: ?*DurableCompletionSlot = null,
     active_readers_by_kind: [reader_pin_kind_count]usize = [_]usize{0} ** reader_pin_kind_count,
     manifest_dirty: bool = false,
     obsolete_paths: repository_mod.ObsoleteLedger = .empty,
@@ -1885,13 +1888,19 @@ pub const Backend = struct {
         self.closing.store(true, .release);
         self.background_executor.drain();
         self.waitForGenerationReadersToDrain();
+        // A pending/uncertain slot already has a durable WAL/guard handoff.
+        // Closing must not attempt an ordinary flush after dropping its
+        // protected resources, nor turn expected recovery into an error log.
+        const guarded = self.durable_completion != null;
+        self.releaseDurableCompletion();
         self.releaseTrackedResourceUsage();
-        recovery_mod.close(Backend, self);
+        if (guarded) recovery_mod.abandon(Backend, self) else recovery_mod.close(Backend, self);
     }
 
     pub fn abandonAfterCrash(self: *Backend) void {
         self.closing.store(true, .release);
         self.background_executor.drain();
+        self.releaseDurableCompletion();
         self.releaseTrackedResourceUsage();
         recovery_mod.abandon(Backend, self);
     }
@@ -1995,7 +2004,7 @@ pub const Backend = struct {
         process_lock_mode: ?storage_io.NativePathLockMode = null,
         native_locked: bool = false,
 
-        fn release(self: *WalOperationLock) void {
+        pub fn release(self: *WalOperationLock) void {
             if (self.native_locked) {
                 self.backend.wal_operation_lock_file.?.unlock();
                 self.native_locked = false;
@@ -2011,7 +2020,7 @@ pub const Backend = struct {
         }
     };
 
-    fn acquireWalOperationLock(self: *Backend, mode: storage_io.NativePathLockMode) !WalOperationLock {
+    pub fn acquireWalOperationLock(self: *Backend, mode: storage_io.NativePathLockMode) !WalOperationLock {
         var guard = WalOperationLock{ .backend = self };
         if (!self.options.wal_enabled or self.root_dir == null) return guard;
 
@@ -2084,6 +2093,7 @@ pub const Backend = struct {
     pub fn requestValueReclamation(self: *Backend) !void {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         if (self.options.backend.read_only) return error.ReadOnly;
         const current = try self.planningDirectory();
         var wire: u64 = 128;
@@ -3195,6 +3205,7 @@ pub const Backend = struct {
     }
 
     fn runMaintenanceStepLocked(self: *Backend, required_gc: bool) !bool {
+        if (self.durable_completion != null) return false;
         // Cleanup is safe even after a durability fence or under pressure.
         // The unlock path executes one bounded FIFO reclamation turn.
         if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return true;
@@ -4406,6 +4417,161 @@ pub const Backend = struct {
         } else if (locked) self.mu.unlock();
     }
 
+    pub const DurableCompletionSlot = completion_runtime.Slot(Backend);
+    pub const durable_completion_limits = completion_runtime.limits;
+    pub const DurableCompletionValues = completion_runtime.Values;
+
+    /// Called before the transaction's atomic prepare batch. The returned
+    /// descriptor must be included in that batch under completion storage_key.
+    /// The caller holds its apply serialization until confirm/cancel returns.
+    pub fn reserveDurableCompletion(self: *Backend, encoded: []const u8) !void {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        if (self.durable_completion != null) return error.CompletionReservationBusy;
+        if (self.closing.load(.acquire)) return error.LsmBackendClosed;
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        const native = self.storage_owner orelse return error.UnsupportedCompletionBackend;
+        if (self.root_dir == null or self.storage == null or self.options.backend.read_only or
+            self.options.backend.durability != .full or !self.options.wal_enabled or !self.options.wal_sync_on_commit or
+            self.storage.?.ptr != native.storage().ptr or self.storage.?.vtable != native.storage().vtable)
+            return error.UnsupportedCompletionBackend;
+        if (self.options.resource_manager == null) return error.CompletionResourceManagerRequired;
+        // Retained completion pair plus ordinary WAL parent/file pair, after
+        // subtracting persistent backend locks and native open headroom.
+        if (native.usableTransientDescriptorCapacity() < 4) return error.DescriptorAdmissionExhausted;
+        // Validate the proposed certificate before checkpointing existing data.
+        var checked = try completion_slot_codec.decode(self.allocator, encoded, .{});
+        defer checked.deinit();
+        if ((if (checked.descriptor.namespace) |name| !std.mem.eql(u8, name, "docs") else false) or
+            !std.meta.eql(checked.descriptor.limits, durable_completion_limits)) return error.UnsupportedCompletionProfile;
+        // The private local profile has no external replay-retention consumer.
+        // Do not reset a separate retained replay log as a side effect of
+        // attempting a completion reservation.
+        if ((try self.cachedWalReplayRetentionLocked()).bytes != 0) return error.UnsupportedCompletionProfile;
+        if (self.immutable_flush_build_in_flight or self.manifest_publish_in_flight or self.manifest_checkpoint_build_in_flight)
+            return error.CompletionReservationBusy;
+        try self.flushMutable();
+        try self.persistManifestLocked();
+        try self.prepareWalOperationLockFile();
+        // The reservation bounds replay of all subsequent ordinary writes.
+        // Establish an empty WAL before publishing its durable recovery guard.
+        {
+            var wal_lock = try self.acquireWalOperationLock(.exclusive);
+            defer wal_lock.release();
+            self.wal_retention.invalidateAll();
+            wal_mod.protectedReset(self.storage.?, self.allocator, self.root_dir.?) catch |err| {
+                self.fenceFailedBulkWal();
+                return err;
+            };
+            self.wal_retention.installReset(self.writeStatsNowNs());
+            self.syncTrackedWalRetentionUsageCurrentLocked();
+            self.clearPublishedWalLogicalDebtLocked();
+        }
+        self.durable_completion = try DurableCompletionSlot.create(self, encoded, false);
+    }
+
+    pub fn confirmDurableCompletion(self: *Backend, txn_id: [16]u8) !void {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        const slot = self.durable_completion orelse return error.CompletionNotPrepared;
+        if (!std.mem.eql(u8, &slot.descriptor.descriptor.txn_id, &txn_id)) return error.InvalidCompletionSlot;
+        const stored = try self.getMergedWithMutable(&self.mutable, .{ .name = slot.descriptor.descriptor.namespace }, completion_runtime.storage_key);
+        if (!std.mem.eql(u8, stored, slot.encoded)) return error.InvalidCompletionSlot;
+        slot.durable = true;
+    }
+
+    /// Clean failure before prepare may release ownership. Any ambiguous WAL
+    /// outcome retains the slot and fences the backend until reopen.
+    pub fn cancelUnpreparedCompletion(self: *Backend) void {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        const slot = self.durable_completion orelse return;
+        if (slot.durable or self.manifest_recovery_required) return;
+        if (self.getMergedWithMutable(&self.mutable, .{ .name = slot.descriptor.descriptor.namespace }, completion_runtime.storage_key)) |_| return else |err| {
+            if (err != error.NotFound) return;
+        }
+        slot.clearGuard() catch {
+            self.fenceFailedBulkWal();
+            return;
+        };
+        self.releaseDurableCompletion();
+    }
+
+    pub const DurableCompletionDecision = struct {
+        status: enum { pending, committed, aborted },
+        commit_version: u64,
+        finalized_at: u64,
+    };
+
+    fn durableCompletionDecisionLocked(self: *Backend, txn_id: [16]u8) !DurableCompletionDecision {
+        const slot = self.durable_completion orelse return error.CompletionNotPrepared;
+        // After an uncertain attempt the baseline may precede a durable SST
+        // publication. Only recovery may establish the authoritative outcome.
+        if (slot.attempted or self.manifest_recovery_required) return error.RecoveryRequired;
+        if (!std.mem.eql(u8, &slot.descriptor.descriptor.txn_id, &txn_id)) return error.InvalidCompletionSlot;
+        const prefix = "\x00\x00__txn_records__:";
+        var key: [prefix.len + 16]u8 = undefined;
+        @memcpy(key[0..prefix.len], prefix);
+        @memcpy(key[prefix.len..], &txn_id);
+        const raw = slot.currentMetadata(self, &key, if (slot.baseline_record) |*record| record else null) orelse return error.InvalidTxnRecord;
+        if (raw.len != 53 or raw[49] != 1 or raw[52] != 0 or
+            std.mem.readInt(u64, raw[33..41], .little) != slot.descriptor.descriptor.intent_revision)
+            return error.InvalidTxnRecord;
+        return .{
+            .status = switch (raw[0]) {
+                0 => .pending,
+                1 => .committed,
+                2 => .aborted,
+                else => return error.InvalidTxnRecord,
+            },
+            .commit_version = std.mem.readInt(u64, raw[9..17], .little),
+            .finalized_at = std.mem.readInt(u64, raw[25..33], .little),
+        };
+    }
+
+    pub fn durableCompletionDecision(self: *Backend, txn_id: [16]u8) !DurableCompletionDecision {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer self.unlockCompletionBoundary(locked, false);
+        return self.durableCompletionDecisionLocked(txn_id);
+    }
+
+    pub fn completeDurableCompletion(self: *Backend, txn_id: [16]u8, commit: bool, values: DurableCompletionValues) !void {
+        // The same gate used by all completion-ledger read/modify/write batches.
+        platform.sync.lockYielding(&self.serialized_write_mutex);
+        defer self.serialized_write_mutex.unlock();
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer self.unlockCompletionBoundary(locked, false);
+        const slot = self.durable_completion orelse return error.CompletionNotPrepared;
+        if (!std.mem.eql(u8, &slot.descriptor.descriptor.txn_id, &txn_id)) return error.InvalidCompletionSlot;
+        const decision = try self.durableCompletionDecisionLocked(txn_id);
+        if ((commit and decision.status == .aborted) or (!commit and decision.status == .committed)) return error.DecisionConflict;
+        if (values.commit_timestamp == 0) return error.InvalidArgument;
+        const decided_time = if (decision.status == .committed) decision.commit_version else if (decision.status == .aborted) decision.finalized_at else 0;
+        if (decided_time != 0 and decided_time != values.commit_timestamp) return error.DecisionConflict;
+        var bound = values;
+        const summary_key = "\x00\x00__metadata__:txn_completion_v1";
+        const credit_prefix = "\x00\x00__txn_completion_v1__:";
+        var credit_key: [credit_prefix.len + 16]u8 = undefined;
+        @memcpy(credit_key[0..credit_prefix.len], credit_prefix);
+        @memcpy(credit_key[credit_prefix.len..], &txn_id);
+        const credit = slot.currentMetadata(self, &credit_key, if (slot.baseline_credit) |*saved| saved else null);
+        if (credit) |bytes| {
+            const summary = slot.currentMetadata(self, summary_key, if (slot.baseline_summary) |*saved| saved else null) orelse return error.InvalidTxnRecord;
+            if (bytes.len != 16 or summary.len != 16) return error.InvalidTxnRecord;
+            const charge = try std.math.add(u64, std.mem.readInt(u64, bytes[0..8], .little), std.mem.readInt(u64, bytes[8..16], .little));
+            bound.shared_ledger_count = try std.math.sub(u64, std.mem.readInt(u64, summary[0..8], .little), 1);
+            bound.shared_ledger_bytes = try std.math.sub(u64, std.mem.readInt(u64, summary[8..16], .little), charge);
+        }
+        try slot.complete(self, commit, bound);
+        self.releaseDurableCompletion();
+    }
+
+    fn releaseDurableCompletion(self: *Backend) void {
+        const slot = self.durable_completion orelse return;
+        self.durable_completion = null;
+        slot.destroy();
+    }
+
     pub var test_completion_wal_sealed_hook: ?*const fn (*Backend, *storage_io.NativeWalCompletionIo) ?storage_io.Storage = null;
     pub var test_completion_wal_after_append_hook: ?*const fn (*Backend) bool = null;
 
@@ -4575,6 +4741,7 @@ pub const Backend = struct {
     }
 
     pub fn maybeFlushMutable(self: *Backend) !void {
+        if (self.durable_completion != null) return;
         if (self.shouldFlushMutable()) {
             if (self.shouldDeferCommitFlush()) {
                 try self.rotateMutableToImmutable();
@@ -5009,7 +5176,8 @@ pub const Backend = struct {
         return true;
     }
 
-    fn flushMutable(self: *Backend) !void {
+    pub fn flushMutable(self: *Backend) !void {
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         if (self.mutable.entryCount() > 0) {
             try self.rotateMutableToImmutable();
         }
@@ -5017,6 +5185,7 @@ pub const Backend = struct {
     }
 
     fn directIngestMutableAtBulkFinishIfPossible(self: *Backend) !bool {
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         if (!self.options.direct_bulk_ingest) return false;
         if (self.mutable.entryCount() == 0) return false;
         if (self.activeImmutableMemtableCount() != 0) return false;
@@ -5031,6 +5200,7 @@ pub const Backend = struct {
     }
 
     pub fn drainMutableBeforeBulkAppendDirectIngest(self: *Backend) !bool {
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         if (!self.options.direct_bulk_ingest) return false;
         if (self.canQueueDirectBulkStateWithPendingImmutable()) {
             // The queued epochs remain older than the incoming sorted state.
@@ -5068,6 +5238,7 @@ pub const Backend = struct {
     /// preserves last-write-wins without manufacturing a small run for the old
     /// mutable state followed immediately by another run for the new batch.
     pub fn directIngestCombinedMutable(self: *Backend, incoming: *ActiveMemTable) !bool {
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         if (!self.options.direct_bulk_ingest) return false;
 
         if (self.canQueueDirectBulkStateWithPendingImmutable()) {
@@ -5093,6 +5264,7 @@ pub const Backend = struct {
     }
 
     fn rotateMutableToImmutable(self: *Backend) !void {
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         if (self.mutable.entryCount() == 0) return;
         self.invalidateMutableReadSnapshot();
         const rotated_logical_bytes = self.mutable.logical_bytes;
@@ -5531,6 +5703,7 @@ pub const Backend = struct {
     }
 
     pub fn ingestSortedTableEntries(self: *Backend, entries: []const TableEntry) !void {
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         if (self.options.backend.read_only) return error.ReadOnly;
         if (entries.len == 0) return;
 
@@ -5566,6 +5739,7 @@ pub const Backend = struct {
     }
 
     pub fn ingestSortedState(self: *Backend, state: *const State) !void {
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         if (self.options.backend.read_only) return error.ReadOnly;
         if (state.entryCount() == 0) return;
 
@@ -5607,6 +5781,7 @@ pub const Backend = struct {
     }
 
     pub fn ingestOwnedSortedState(self: *Backend, state: *State) !void {
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         if (self.options.backend.read_only) return error.ReadOnly;
         if (state.entryCount() == 0) return;
         if (self.root_dir != null) {
@@ -5661,6 +5836,7 @@ pub const Backend = struct {
     /// the mutable WAL range belongs to the moved state and is transferred at
     /// the same lock-held visibility boundary.
     pub fn enqueueOwnedSortedStateForFlush(self: *Backend, state: *State) !bool {
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         if (self.options.immutable_flush_window_bytes == 0 or
             self.root_dir == null or
             self.storage == null or
@@ -5725,6 +5901,7 @@ pub const Backend = struct {
 
     /// Caller owns the backend mutex; publication may temporarily release it.
     pub fn persistManifestLocked(self: *Backend) !void {
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         const root_dir = self.root_dir orelse return;
         // A flush may have already installed its SSTs and retired the mutable
         // generation. Keep publication debt visible even when append/sync
@@ -5888,7 +6065,7 @@ pub const Backend = struct {
         return @import("lsm_backend/manifest_credit.zig").estimate(self.allocator, self.options, self.root_dir.?.len, incoming, bulk);
     }
 
-    fn manifestCreditFits(self: *const Backend, extra: u64) bool {
+    pub fn manifestCreditFits(self: *const Backend, extra: u64) bool {
         if (self.root_dir == null) return true;
         if (self.manifest_journal.segment_count >= @import("lsm_backend/manifest_set.zig").max_segments - 1) return false;
         const lifecycle = 4096 + 3 * 64 * (self.root_dir.?.len + 128);
@@ -5950,6 +6127,7 @@ pub const Backend = struct {
     }
 
     pub fn admitPreparedCommit(self: *Backend, incoming: *const ActiveMemTable, bulk: *const State, wire: u64) !CommitAdmission {
+        if (self.durable_completion) |slot| try slot.checkOrdinary(self, incoming, bulk);
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         const counted = incoming.entryCount() != 0 or bulk.entryCount() != 0;
         if (!counted) return .{ .backend = self, .bytes = 0, .counted = false };
@@ -6058,11 +6236,14 @@ pub const Backend = struct {
 
     fn appendWalWithPreparation(self: *Backend, state: anytype, prepared: ?*ActiveMemTable) !void {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
+        if (self.durable_completion) |slot| try slot.checkWalInput(self, state);
         const wal_enabled = self.options.wal_enabled and self.root_dir != null and !self.options.backend.read_only and state.entryCount() != 0;
 
         const encoded_bytes: u64 = @intCast(wal_mod.encodedStateRecordLen(state));
         if (wal_enabled) try self.prepareWalAppendForPressureLocked(encoded_bytes);
         if (self.manifest_recovery_required) return error.RecoveryRequired;
+        // Pressure relief may release the mutex and let another writer append.
+        if (self.durable_completion) |slot| try slot.checkWalInput(self, state);
         // Pressure relief can flush and unlock the backend. Pin/build the
         // successor only after that work, at the final serialized boundary.
         if (comptime @TypeOf(state.*) == ActiveMemTable) {
@@ -6181,6 +6362,16 @@ pub const Backend = struct {
             recovery_session.active_window_bytes = 0;
         }
         self.recovery_replaying_wal = false;
+        if (!self.options.backend.read_only and try wal_mod.hasProtectedResetCut(self.storage.?, self.allocator, self.root_dir.?)) {
+            // A pre-reservation reset can crash before a completion guard is
+            // published. The checkpoint cut proves all primary WAL is already
+            // manifested; reopen the floor before acknowledging new writes.
+            if (stats.records != 0) return error.RecoveryRequired;
+            var wal_lock = try self.acquireWalOperationLock(.exclusive);
+            defer wal_lock.release();
+            try wal_mod.protectedReset(self.storage.?, self.allocator, self.root_dir.?);
+            self.wal_retention.installReset(self.writeStatsNowNs());
+        }
         if (!self.options.backend.read_only and stats.truncated_tail_bytes > 0) {
             // A later append would complete the torn record with unrelated
             // bytes and make even acknowledged writes unreplayable. Publish
@@ -6296,6 +6487,7 @@ pub const Backend = struct {
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
 
         const saved_budget = self.maintenance_io_budget_remaining;
         self.maintenance_io_budget_remaining = null;
@@ -7438,6 +7630,7 @@ pub const Backend = struct {
 
     pub fn finalizeWriteReaderReleaseKind(self: *Backend, kind: ReaderPinKind) !void {
         self.releaseReaderKind(kind);
+        if (self.durable_completion != null) return;
         const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
         if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
             self.bulkIngestActive() or
@@ -7464,8 +7657,9 @@ pub const Backend = struct {
         self.persistManifestLocked() catch {};
     }
 
-    pub fn beginBatchMode(self: *Backend, options: backend_types.BatchOptions) void {
+    pub fn beginBatchMode(self: *Backend, options: backend_types.BatchOptions) !void {
         if (options.mode != .bulk_ingest) return;
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         self.active_bulk_ingest_batches += 1;
     }
 
@@ -7661,7 +7855,7 @@ pub const Backend = struct {
         self.notePotentialMaintenanceDebtLocked();
     }
 
-    fn clearPublishedWalLogicalDebtLocked(self: *Backend) void {
+    pub fn clearPublishedWalLogicalDebtLocked(self: *Backend) void {
         self.unpublished_wal_logical_bytes = 0;
         self.unpublished_wal_max_batch_logical_bytes = 0;
     }
@@ -8155,6 +8349,7 @@ pub const Backend = struct {
     }
 
     fn beginBulkIngestSessionLocked(self: *Backend) !void {
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         if (self.options.backend.read_only) return error.ReadOnly;
         if (self.active_bulk_ingest_batches == 0) {
             self.bulk_ingest_window_first_sequence = self.next_run_id;
@@ -8193,6 +8388,7 @@ pub const Backend = struct {
     }
 
     fn finishBulkIngestSessionWithOptionsLocked(self: *Backend, options: BulkIngestFinishOptions) !void {
+        if (self.durable_completion != null) return error.PreparedCompletionActive;
         std.debug.assert(self.active_bulk_ingest_batches > 0);
         if (!options.compact and self.active_bulk_ingest_batches == 1) {
             if ((options.flush or self.shouldFlushMemtablesOnLastBulkIngestFinish()) and
@@ -12957,7 +13153,7 @@ fn implementationTests() type {
             // Model another overlapping public request. It keeps generic leveled
             // compaction deferred, but unlike an explicit ingest session it owns no
             // final window and therefore leaves the sequence fence at zero.
-            backend.beginBatchMode(request_options);
+            try backend.beginBatchMode(request_options);
             var request_active = true;
             defer if (request_active) {
                 backend.finishBatchMode(request_options);
@@ -23092,6 +23288,354 @@ fn implementationTests() type {
             try std.testing.expectEqualStrings("old-b", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "b"));
         }
 
+        test "workload admission lsm durable slot drains interleaved writes with reserved heap and descriptors" {
+            const alloc = std.testing.allocator;
+            for ([_]bool{ false, true }) |commit| {
+                var failing = std.testing.FailingAllocator.init(alloc, .{});
+                var identity = std.testing.FailingAllocator.init(alloc, .{});
+                var pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 32);
+                defer pool.deinit();
+                var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = identity.allocator(), .memory_budget = .{ .hard_limit_bytes = 256 * 1024 * 1024 } });
+                defer manager.deinit(alloc);
+                var path_buffer: [256]u8 = undefined;
+                const path = repository_mod.tmpPath(&path_buffer, "durable-completion-drain");
+                defer repository_mod.cleanupTmp(path);
+                const options: Options = .{ .resource_manager = &manager, .native_storage_pool = &pool, .flush_threshold = 10000 };
+                {
+                    var backend = try Backend.open(failing.allocator(), std.mem.span(path), options);
+                    defer backend.close();
+                    {
+                        var batch = try backend.beginWrite();
+                        errdefer batch.abort();
+                        try batch.put(.{}, "document", "old");
+                        try batch.commit();
+                    }
+                    const id: [16]u8 = @splat(71);
+                    const encoded = try completion_slot_codec.encode(alloc, .{
+                        .txn_id = id,
+                        .intent_revision = 1,
+                        .limits = Backend.durable_completion_limits,
+                        .profile_fence = "native-test",
+                        .commit = &.{.{ .kind = .put, .key = "document", .value = "committed" }},
+                        .abort = &.{.{ .kind = .put, .key = "decision", .value = "aborted" }},
+                    }, .{});
+                    defer alloc.free(encoded);
+                    try backend.reserveDurableCompletion(encoded);
+                    {
+                        var prepare = try backend.beginWrite();
+                        errdefer prepare.abort();
+                        var record: [53]u8 = @splat(0);
+                        std.mem.writeInt(u64, record[33..41], 1, .little);
+                        record[49] = 1;
+                        const record_key = "\x00\x00__txn_records__:".* ++ id;
+                        try prepare.put(.{}, &record_key, &record);
+                        try prepare.put(.{}, completion_runtime.storage_key, encoded);
+                        try prepare.commit();
+                    }
+                    try backend.confirmDurableCompletion(id);
+                    {
+                        var unrelated = try backend.beginWrite();
+                        errdefer unrelated.abort();
+                        try unrelated.put(.{}, "independent", "survives");
+                        try unrelated.commit();
+                    }
+                    var old = try backend.beginRead();
+                    defer old.abort();
+                    manager.memory.budget.hard_limit_bytes = 1;
+                    pool.fd_cache.capacity = 1;
+                    failing.fail_index = failing.alloc_index;
+                    identity.fail_index = identity.alloc_index;
+                    const outcome = backend.completeDurableCompletion(id, commit, .{ .commit_timestamp = 200, .replay_sequence = 1, .shared_ledger_count = 0, .shared_ledger_bytes = 0 });
+                    failing.fail_index = std.math.maxInt(usize);
+                    identity.fail_index = std.math.maxInt(usize);
+                    manager.memory.budget.hard_limit_bytes = 256 * 1024 * 1024;
+                    pool.fd_cache.capacity = 32;
+                    try outcome;
+                    try std.testing.expect(!failing.has_induced_failure and !identity.has_induced_failure);
+                    try std.testing.expect(backend.durable_completion == null);
+                    try std.testing.expectEqualStrings("old", try old.get(.{}, "document"));
+                    try std.testing.expectEqualStrings(if (commit) "committed" else "old", try backend.getMergedWithMutable(&backend.mutable, .{}, "document"));
+                    try std.testing.expectEqualStrings("survives", try backend.getMergedWithMutable(&backend.mutable, .{}, "independent"));
+                    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, completion_runtime.storage_key));
+                }
+                {
+                    var reopened = try Backend.open(alloc, std.mem.span(path), options);
+                    defer reopened.close();
+                    try std.testing.expect(reopened.durable_completion == null);
+                    try std.testing.expectEqualStrings(if (commit) "committed" else "old", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "document"));
+                    try std.testing.expectEqualStrings("survives", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "independent"));
+                }
+            }
+        }
+
+        test "workload admission lsm durable slot interrupted pre-prepare reset preserves later acknowledged writes" {
+            const Hook = struct {
+                var target: wal_mod.ProtectedResetBoundary = undefined;
+                fn stop(boundary: wal_mod.ProtectedResetBoundary) bool {
+                    return boundary == target;
+                }
+            };
+            const alloc = std.testing.allocator;
+            for (std.enums.values(wal_mod.ProtectedResetBoundary)) |boundary| {
+                var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 256 * 1024 * 1024 } });
+                defer manager.deinit(alloc);
+                var path_buffer: [256]u8 = undefined;
+                const path = repository_mod.tmpPath(&path_buffer, "durable-completion-pre-reset");
+                defer repository_mod.cleanupTmp(path);
+                const options: Options = .{ .resource_manager = &manager, .flush_threshold = 10000, .wal_segment_bytes = 1 };
+                const encoded = try completion_slot_codec.encode(alloc, .{ .txn_id = @splat(75), .intent_revision = 1, .limits = Backend.durable_completion_limits, .profile_fence = "native-reset-test", .commit = &.{.{ .kind = .put, .key = "document", .value = "never-prepared" }}, .abort = &.{} }, .{});
+                defer alloc.free(encoded);
+                {
+                    var backend = try Backend.open(alloc, std.mem.span(path), options);
+                    defer backend.abandonAfterCrash();
+                    var seed = try backend.beginWrite();
+                    errdefer seed.abort();
+                    try seed.put(.{}, "document", "old");
+                    try seed.commit();
+                    Hook.target = boundary;
+                    wal_mod.test_protected_reset_hook = Hook.stop;
+                    defer wal_mod.test_protected_reset_hook = null;
+                    try std.testing.expectError(error.InjectedProtectedResetCrash, backend.reserveDurableCompletion(encoded));
+                    try std.testing.expect(backend.manifest_recovery_required);
+                    try std.testing.expect(backend.durable_completion == null);
+                }
+                {
+                    var recovered = try Backend.open(alloc, std.mem.span(path), options);
+                    defer recovered.abandonAfterCrash();
+                    try std.testing.expectEqualStrings("old", try recovered.getMergedWithMutable(&recovered.mutable, .{}, "document"));
+                    for ([_][]const u8{ "newer", "latest" }) |value| {
+                        var later = try recovered.beginWrite();
+                        errdefer later.abort();
+                        try later.put(.{}, "document", value);
+                        try later.commit();
+                    }
+                }
+                {
+                    var recovered = try Backend.open(alloc, std.mem.span(path), options);
+                    defer recovered.close();
+                    try std.testing.expectEqualStrings("latest", try recovered.getMergedWithMutable(&recovered.mutable, .{}, "document"));
+                }
+            }
+        }
+
+        test "workload admission lsm durable slot restores prepared and uncertain terminal ownership" {
+            const Hook = struct {
+                fn stop() bool {
+                    return true;
+                }
+            };
+            const alloc = std.testing.allocator;
+            for (0..3) |boundary| for ([_]bool{ false, true }) |commit| {
+                var pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 32);
+                defer pool.deinit();
+                var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 256 * 1024 * 1024 } });
+                defer manager.deinit(alloc);
+                var path_buffer: [256]u8 = undefined;
+                const path = repository_mod.tmpPath(&path_buffer, "durable-completion-restore");
+                defer repository_mod.cleanupTmp(path);
+                const options: Options = .{ .resource_manager = &manager, .native_storage_pool = &pool, .flush_threshold = 10000, .wal_segment_bytes = 1 };
+                const id: [16]u8 = @splat(73);
+                const record_key = "\x00\x00__txn_records__:".* ++ id;
+                var record: [53]u8 = @splat(0);
+                std.mem.writeInt(u64, record[33..41], 1, .little);
+                record[49] = 1;
+                var committed = record;
+                committed[0] = 1;
+                committed[52] = 1;
+                std.mem.writeInt(u64, committed[9..17], 200, .little);
+                std.mem.writeInt(u64, committed[25..33], 200, .little);
+                var aborted = record;
+                aborted[0] = 2;
+                aborted[52] = 1;
+                std.mem.writeInt(u64, aborted[25..33], 200, .little);
+                const encoded = try completion_slot_codec.encode(alloc, .{
+                    .txn_id = id,
+                    .intent_revision = 1,
+                    .limits = Backend.durable_completion_limits,
+                    .profile_fence = "native-restore-test",
+                    .commit = &.{ .{ .kind = .put, .key = "document", .value = "committed" }, .{ .kind = .put, .key = &record_key, .value = &committed } },
+                    .abort = &.{.{ .kind = .put, .key = &record_key, .value = &aborted }},
+                }, .{});
+                defer alloc.free(encoded);
+                {
+                    var backend = try Backend.open(alloc, std.mem.span(path), options);
+                    defer backend.abandonAfterCrash();
+                    {
+                        var seed = try backend.beginWrite();
+                        errdefer seed.abort();
+                        try seed.put(.{}, "document", "old");
+                        try seed.commit();
+                    }
+                    try backend.reserveDurableCompletion(encoded);
+                    {
+                        var prepare = try backend.beginWrite();
+                        errdefer prepare.abort();
+                        try prepare.put(.{}, &record_key, &record);
+                        try prepare.put(.{}, completion_runtime.storage_key, encoded);
+                        try prepare.commit();
+                    }
+                    try backend.confirmDurableCompletion(id);
+                    {
+                        var ordinary = try backend.beginWrite();
+                        errdefer ordinary.abort();
+                        try ordinary.put(.{}, "independent", "survives");
+                        try ordinary.commit();
+                    }
+                    if (boundary == 0 and commit) {
+                        // Every append rotates a tiny WAL segment. Repeated
+                        // versions consume the cumulative envelope even though
+                        // the visible mutable contains only a handful of keys.
+                        for (0..completion_runtime.recovery_wal_records - 2) |_| {
+                            var repeated = try backend.beginWrite();
+                            errdefer repeated.abort();
+                            try repeated.put(.{}, "independent", "survives");
+                            try repeated.commit();
+                        }
+                        var excess = try backend.beginWrite();
+                        errdefer excess.abort();
+                        try excess.put(.{}, "independent", "must-not-publish");
+                        try std.testing.expectError(error.CompletionForegroundCapacityExceeded, excess.commit());
+                    }
+                    if (boundary != 0) {
+                        completion_runtime.test_after_wal = if (boundary == 1) Hook.stop else null;
+                        completion_runtime.test_after_manifest = if (boundary == 2) Hook.stop else null;
+                        defer {
+                            completion_runtime.test_after_wal = null;
+                            completion_runtime.test_after_manifest = null;
+                        }
+                        try std.testing.expectError(error.RecoveryRequired, backend.completeDurableCompletion(id, commit, .{ .commit_timestamp = 200, .replay_sequence = 1, .shared_ledger_count = 0, .shared_ledger_bytes = 0 }));
+                        try std.testing.expect(backend.durable_completion != null);
+                    }
+                }
+                // A failed restart must preserve the certificate and its WAL.
+                try std.testing.expectError(error.UnsupportedCompletionBackend, Backend.open(alloc, std.mem.span(path), options));
+                manager.memory.budget.hard_limit_bytes = 32 * 1024 * 1024;
+                var insufficient: Backend = undefined;
+                if (insufficient.openInto(alloc, std.mem.span(path), options)) |_| {
+                    insufficient.abandonAfterCrash();
+                    return error.ExpectedCompletionRecoveryCapacityFailure;
+                } else |err| try std.testing.expect(err == error.CompletionRecoveryCapacityRequired or err == error.ResourceBudgetExceeded);
+                manager.memory.budget.hard_limit_bytes = 256 * 1024 * 1024;
+                {
+                    var restored: Backend = undefined;
+                    try restored.openInto(alloc, std.mem.span(path), options);
+                    defer restored.close();
+                    if (boundary == 0) {
+                        try std.testing.expect(restored.durable_completion != null);
+                        try std.testing.expectEqualStrings("old", try restored.getMergedWithMutable(&restored.mutable, .{}, "document"));
+                        try restored.completeDurableCompletion(id, commit, .{ .commit_timestamp = 200, .replay_sequence = 1, .shared_ledger_count = 0, .shared_ledger_bytes = 0 });
+                    }
+                    try std.testing.expect(restored.durable_completion == null);
+                    try std.testing.expectEqualStrings(if (commit) "committed" else "old", try restored.getMergedWithMutable(&restored.mutable, .{}, "document"));
+                    try std.testing.expectEqualStrings("survives", try restored.getMergedWithMutable(&restored.mutable, .{}, "independent"));
+                    const terminal = try restored.getMergedWithMutable(&restored.mutable, .{}, &record_key);
+                    try std.testing.expectEqual(@as(u8, if (commit) 1 else 2), terminal[0]);
+                    try std.testing.expectEqual(@as(u8, 1), terminal[52]);
+                    try std.testing.expectError(error.NotFound, restored.getMergedWithMutable(&restored.mutable, .{}, completion_runtime.storage_key));
+                    var later = try restored.beginWrite();
+                    errdefer later.abort();
+                    try later.put(.{}, "document", "newer");
+                    try later.commit();
+                }
+                {
+                    var reopened = try Backend.open(alloc, std.mem.span(path), options);
+                    defer reopened.close();
+                    try std.testing.expect(reopened.durable_completion == null);
+                    try std.testing.expectEqualStrings("newer", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "document"));
+                }
+            };
+        }
+
+        test "workload admission lsm durable slot bounds protect worst shape from foreground consumption" {
+            const alloc = std.testing.allocator;
+            for ([_]bool{ false, true }) |large_values| {
+                var failing = std.testing.FailingAllocator.init(alloc, .{});
+                var pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 32);
+                defer pool.deinit();
+                var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 256 * 1024 * 1024 } });
+                defer manager.deinit(alloc);
+                var path_buffer: [256]u8 = undefined;
+                const path = repository_mod.tmpPath(&path_buffer, "durable-completion-bounds");
+                defer repository_mod.cleanupTmp(path);
+                const options: Options = .{ .resource_manager = &manager, .native_storage_pool = &pool, .flush_threshold = 10000 };
+                var backend: Backend = undefined;
+                try backend.openInto(failing.allocator(), std.mem.span(path), options);
+                var backend_live = true;
+                defer if (backend_live) backend.close();
+                const id: [16]u8 = @splat(72);
+                const record_key = "\x00\x00__txn_records__:".* ++ id;
+                var record: [53]u8 = @splat(0);
+                std.mem.writeInt(u64, record[33..41], 1, .little);
+                record[49] = 1;
+                var terminal = record;
+                terminal[0] = 1;
+                terminal[52] = 1;
+                std.mem.writeInt(u64, terminal[9..17], 200, .little);
+                var keys: [255][8]u8 = undefined;
+                const payload: [800]u8 = @splat('v');
+                var operations: [256]completion_slot_codec.Operation = undefined;
+                for (&keys, 0..) |*key, i| {
+                    std.mem.writeInt(u64, key, i, .big);
+                    operations[i] = .{ .kind = .put, .key = key, .value = if (large_values) &payload else "v" };
+                }
+                operations[255] = .{ .kind = .put, .key = &record_key, .value = &terminal };
+                const encoded = try completion_slot_codec.encode(alloc, .{ .txn_id = id, .intent_revision = 1, .limits = Backend.durable_completion_limits, .profile_fence = "native-bound-test", .commit = &operations, .abort = &.{} }, .{});
+                defer alloc.free(encoded);
+                try backend.reserveDurableCompletion(encoded);
+                {
+                    var prepare = try backend.beginWrite();
+                    errdefer prepare.abort();
+                    try prepare.put(.{}, &record_key, &record);
+                    try prepare.put(.{}, completion_runtime.storage_key, encoded);
+                    try prepare.commit();
+                }
+                try backend.confirmDurableCompletion(id);
+                // Fill the entry envelope when values are small. These keys
+                // must survive completion in the same protected SST.
+                if (!large_values) {
+                    var ordinary = try backend.beginWrite();
+                    errdefer ordinary.abort();
+                    for (0..completion_runtime.foreground_entries - 2) |i| {
+                        var key: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &key, 10000 + i, .big);
+                        try ordinary.put(.{}, &key, "unrelated");
+                    }
+                    try ordinary.commit();
+                }
+                {
+                    var excess = try backend.beginWrite();
+                    errdefer excess.abort();
+                    const too_large = try alloc.alloc(u8, completion_runtime.foreground_bytes);
+                    defer alloc.free(too_large);
+                    @memset(too_large, 'x');
+                    try excess.put(.{}, "excess", too_large);
+                    try std.testing.expectError(error.CompletionForegroundCapacityExceeded, excess.commit());
+                }
+                // The same maximum envelope must be reconstructible, with
+                // replay and completion both fitting the prepaid slabs.
+                backend_live = false;
+                backend.abandonAfterCrash();
+                try backend.openInto(failing.allocator(), std.mem.span(path), options);
+                backend_live = true;
+                manager.memory.budget.hard_limit_bytes = 1;
+                pool.fd_cache.capacity = 1;
+                failing.fail_index = failing.alloc_index;
+                const completed = backend.completeDurableCompletion(id, true, .{ .commit_timestamp = 200, .replay_sequence = 1, .shared_ledger_count = 0, .shared_ledger_bytes = 0 });
+                failing.fail_index = std.math.maxInt(usize);
+                manager.memory.budget.hard_limit_bytes = 256 * 1024 * 1024;
+                pool.fd_cache.capacity = 32;
+                try completed;
+                try std.testing.expect(!failing.has_induced_failure);
+                for (&keys) |*key| try std.testing.expectEqualStrings(if (large_values) &payload else "v", try backend.getMergedWithMutable(&backend.mutable, .{}, key));
+                if (!large_values) {
+                    var last: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &last, 10000 + completion_runtime.foreground_entries - 3, .big);
+                    try std.testing.expectEqualStrings("unrelated", try backend.getMergedWithMutable(&backend.mutable, .{}, &last));
+                }
+                try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "excess"));
+            }
+        }
+
         test "workload admission lsm native prepaid point commit seals heap FD and admission demand before WAL publication" {
             const Fixture = struct {
                 var allocation: *std.testing.FailingAllocator = undefined;
@@ -24451,7 +24995,7 @@ fn implementationTests() type {
                 defer storage.deinit();
                 var backend = try Backend.open(alloc, "/bulk-admission-owned", .{ .storage = storage.storage(), .flush_threshold = 1, .direct_bulk_ingest_min_bytes = 1, .bulk_ingest_tiered_l0_fan_in = 4, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 128, .background_io_budget_bytes = 1, .background_io_allow_oversized_single_job = false });
                 defer backend.close();
-                backend.beginBatchMode(.{ .mode = .bulk_ingest });
+                try backend.beginBatchMode(.{ .mode = .bulk_ingest });
                 defer backend.finishBatchMode(.{ .mode = .bulk_ingest });
                 for (0..5) |i| {
                     var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
@@ -24569,7 +25113,7 @@ fn implementationTests() type {
                 defer manager.deinit(alloc);
                 var backend = try Backend.open(alloc, "/bulk-admission-scheduler", .{ .storage = storage.storage(), .resource_manager = &manager, .flush_threshold = 1, .direct_bulk_ingest_min_bytes = 1, .bulk_ingest_tiered_l0_fan_in = 4, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 128, .compaction_scheduler = .{ .max_in_flight_input_bytes = if (memory_denial) 1024 * 1024 else 1, .allow_oversized_single_job = false, .resource_reservation_bytes = if (memory_denial) 2048 else 0 } });
                 defer backend.close();
-                backend.beginBatchMode(.{ .mode = .bulk_ingest });
+                try backend.beginBatchMode(.{ .mode = .bulk_ingest });
                 defer backend.finishBatchMode(.{ .mode = .bulk_ingest });
                 for (0..5) |i| {
                     var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
@@ -24616,7 +25160,7 @@ fn implementationTests() type {
                     try backend.runs.append(alloc, .{ .id = i + 1, .visibility_id = count + i / (count / 4), .level = 0, .size_bytes = 1024, .path = @constCast("admission-bench.sst"), .smallest_namespace_name = null, .smallest_key = key, .largest_namespace_name = null, .largest_key = key, .entry_count = 1, .tombstone_count = 0, .bloom_filter = null, .owns_metadata = false, .owns_path = false, .state = null });
                 }
                 _ = try backend.planningDirectory();
-                backend.beginBatchMode(.{ .mode = .bulk_ingest });
+                try backend.beginBatchMode(.{ .mode = .bulk_ingest });
                 defer backend.finishBatchMode(.{ .mode = .bulk_ingest });
                 var max_ns: u64 = 0;
                 for (0..4096) |turn| {
@@ -24649,7 +25193,7 @@ fn implementationTests() type {
                 defer manager.deinit(alloc);
                 var backend = try Backend.open(alloc, "/bulk-continuation-retirement", .{ .storage = storage.storage(), .resource_manager = &manager, .flush_threshold = 1, .direct_bulk_ingest_min_bytes = 1, .bulk_ingest_tiered_l0_fan_in = 4, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 128, .obsolete_retention_ns = 0 });
                 defer backend.close();
-                backend.beginBatchMode(.{ .mode = .bulk_ingest });
+                try backend.beginBatchMode(.{ .mode = .bulk_ingest });
                 var bulk_active = true;
                 defer if (bulk_active) backend.finishBatchMode(.{ .mode = .bulk_ingest });
                 for (0..5) |i| {
