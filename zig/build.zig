@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
 }
 
 pub const Artifacts = struct {
+    inference_steps: @import("pkg/inference/build/integration.zig").Steps,
     runtime: antfly_runtime_build.AddRuntimeResult,
     inference: inference_runtime_build.Graph,
     wasm: *std.Build.Step.Compile,
@@ -1594,5 +1595,5 @@ pub fn create(b: *std.Build) ?Artifacts {
         &b.top_level_steps.get("inference-test").?.step,
         &b.top_level_steps.get("inference-finetune-test").?.step,
     });
-    return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact };
+    return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact, .inference_steps = inference_steps };
 }

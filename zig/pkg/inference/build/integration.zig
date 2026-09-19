@@ -20,6 +20,10 @@ const tests = @import("tests.zig");
 const finetune = @import("finetune/common.zig");
 
 pub const Steps = struct {
+    // Retain individual command identities for graph consumers without adding
+    // their compilations back to the consolidated test gate.
+    finetune_commands: []const finetune.Command,
+    finetune_workflows: []const finetune.Command,
     inference_test: *std.Build.Step,
     inference_finetune_test: *std.Build.Step,
 };
@@ -61,5 +65,5 @@ pub fn add(ctx: Context, wasm_jinja: *std.Build.Module, wasm_platform: *std.Buil
         .bge_benchmark = ctx.addRunArtifact(bge_tests),
     });
     _ = @import("wasm.zig").addWasm(ctx, wasm_jinja, wasm_platform);
-    return .{ .inference_test = test_step, .inference_finetune_test = finetune_step };
+    return .{ .inference_test = test_step, .inference_finetune_test = finetune_step, .finetune_commands = commands, .finetune_workflows = workflows };
 }
