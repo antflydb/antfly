@@ -424,12 +424,7 @@ pub const Handle = struct {
 
     pub fn embeddedRootHasUserDocuments(self: *Handle) !bool {
         if (self.engine != .native_single_file) return false;
-        const docs = try self.native_docstore.?.file.snapshotDocumentsAlloc(self.allocator);
-        defer native.NativeFile.freeSnapshotDocuments(self.allocator, docs);
-        for (docs) |doc| {
-            if (!std.mem.startsWith(u8, doc.key, "\x02db/")) return true;
-        }
-        return false;
+        return try self.native_docstore.?.hasLiveDocumentOutsidePrefix("\x02db/");
     }
 
     pub fn markEmbeddedArtifact(self: *Handle) !void {
@@ -551,12 +546,7 @@ pub const Handle = struct {
                 if (cancel) |token| try token.check();
                 break :blk toCheckReport(report);
             },
-            .native_single_file => blk: {
-                const store = self.native_docstore.?;
-                platform_sync.lockYielding(&store.mutex);
-                defer store.mutex.unlock();
-                break :blk try store.file.checkWithCancel(cancel);
-            },
+            .native_single_file => try self.native_docstore.?.checkWithCancel(cancel),
         };
     }
 
@@ -573,10 +563,9 @@ pub const Handle = struct {
             .engine = "lite",
             .format = status.format,
             .fsync = status.fsync,
-            // Native maintenance takes the file's exclusive maintenance gate.
-            // It is callable through the asynchronous admin surface, but is
-            // deliberately not advertised as availability-preserving.
-            .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = false },
+            // Native checks pin a snapshot; compaction copies outside the
+            // foreground gate and reserves writers only for publication.
+            .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = self.engine == .native_single_file },
         };
     }
 
@@ -597,12 +586,14 @@ pub const Handle = struct {
                 };
             },
             .compact => blk: {
-                platform_sync.lockYielding(&self.namespace_mutex);
-                defer self.namespace_mutex.unlock();
-                var runtimes = self.namespace_runtimes.valueIterator();
-                while (runtimes.next()) |runtime| {
-                    try cancel.check();
-                    try runtime.runtime_store.sync(true);
+                {
+                    platform_sync.lockYielding(&self.namespace_mutex);
+                    defer self.namespace_mutex.unlock();
+                    var runtimes = self.namespace_runtimes.valueIterator();
+                    while (runtimes.next()) |runtime| {
+                        try cancel.check();
+                        try runtime.runtime_store.sync(true);
+                    }
                 }
                 const report = try self.vacuumWithCancel(cancel);
                 break :blk vacuumMaintenanceResult(report);
@@ -1071,6 +1062,9 @@ test "lite backend native engine creates and checks aflite file" {
     defer handle.deinit();
 
     try handle.native_docstore.?.file.putDocument("doc:1", "value");
+    try std.testing.expect(handle.maintenanceSource().status().maintenance.online);
+    var cancel = maintenance.CancelToken{};
+    try std.testing.expect((try handle.maintenanceSource().run(.check, &cancel)).valid.?);
 
     const report = try handle.check();
     try std.testing.expect(report.valid);
@@ -1525,6 +1519,7 @@ test "lite backend adopts embedded root into a move-stable standalone namespace"
         var handle = try Handle.open(allocator, path, .{});
         defer handle.deinit();
         try std.testing.expect(try handle.isEmbeddedArtifact());
+        try std.testing.expect(try handle.embeddedRootHasUserDocuments());
         try handle.adoptEmbeddedRootAsNamespace("/var/lib/antfly/group-42/table-db");
         var opts = db_mod.OpenOptions{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false };
         try handle.configureDbOpenOptionsForNamespace(&opts, "/different/root/group-42/table-db");
@@ -1542,6 +1537,7 @@ test "lite backend adopts embedded root into a move-stable standalone namespace"
         var handle = try Handle.open(allocator, path, .{ .read_only = true });
         defer handle.deinit();
         try std.testing.expect(handle.hasStandaloneRootAdoption());
+        try std.testing.expect(try handle.embeddedRootHasUserDocuments());
         var opts = db_mod.OpenOptions{ .open_mode = .query_readonly, .start_index_workers = false, .start_optional_runtimes = false };
         try handle.configureDbOpenOptionsForNamespace(&opts, "/mnt/restored/group-42/table-db");
         var db = try db_mod.DB.open(allocator, logical_path, opts);

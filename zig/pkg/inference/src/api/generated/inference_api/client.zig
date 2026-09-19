@@ -10,11 +10,17 @@ pub fn ApiResponse(comptime T: type) type {
     return struct {
         status_code: u16,
         data: ?std.json.Parsed(T) = null,
+        /// Set instead of `data` when the server answered a negotiated
+        /// request in a format other than JSON; `content_type` says which.
+        bytes: ?[]const u8 = null,
+        content_type: ?[]const u8 = null,
         err_body: ?[]const u8 = null,
         allocator: std.mem.Allocator,
 
         pub fn deinit(self: *@This()) void {
             if (self.data) |*d| d.deinit();
+            if (self.bytes) |b| self.allocator.free(b);
+            if (self.content_type) |ct| self.allocator.free(ct);
             if (self.err_body) |b| self.allocator.free(b);
         }
 
@@ -32,7 +38,28 @@ pub fn ApiResponse(comptime T: type) type {
             }
             return .{ .status_code = resp.status.code, .err_body = if (resp.body) |b| try allocator.dupe(u8, b) else null, .allocator = allocator };
         }
+
+        /// Same as `fromResponse`, for an operation whose success response the
+        /// caller can negotiate: a JSON body is parsed into `data`, and any other
+        /// media type is kept verbatim in `bytes` with its `content_type`.
+        pub fn fromNegotiatedResponse(allocator: std.mem.Allocator, resp: *httpx.Response) !@This() {
+            const negotiated = resp.contentType();
+            // An empty or JSON body, and every failure, stay on the typed path.
+            if (!resp.ok() or resp.body == null or negotiated == null or isJsonContentType(negotiated.?)) return fromResponse(allocator, resp);
+            defer resp.deinit();
+            const owned = try allocator.dupe(u8, resp.body.?);
+            errdefer allocator.free(owned);
+            const owned_type = try allocator.dupe(u8, negotiated.?);
+            return .{ .status_code = resp.status.code, .bytes = owned, .content_type = owned_type, .allocator = allocator };
+        }
     };
+}
+
+/// Whether a response media type carries a JSON body.
+fn isJsonContentType(content_type: []const u8) bool {
+    const essence = std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t");
+    if (std.ascii.eqlIgnoreCase(essence, "application/json")) return true;
+    return std.ascii.endsWithIgnoreCase(essence, "+json");
 }
 
 pub const StreamTranscriptionAudioParams = struct {
@@ -113,24 +140,32 @@ pub const Client = struct {
 
     /// Create embeddings (alias of `/embeddings`)
     /// POST /embed
-    pub fn generateEmbeddings(self: *@This(), body: types.EmbedRequest) !ApiResponse(types.EmbedResponse) {
+    pub fn generateEmbeddings(self: *@This(), body: types.EmbedRequest, accept: ?[]const u8) !ApiResponse(types.EmbedResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/embed", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.EmbedResponse).fromResponse(self.allocator, &resp);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.EmbedResponse).fromNegotiatedResponse(self.allocator, &resp);
     }
 
     /// Create embeddings (OpenAI-compatible)
     /// POST /embeddings
-    pub fn createEmbedding(self: *@This(), body: types.EmbedRequest) !ApiResponse(types.EmbedResponse) {
+    pub fn createEmbedding(self: *@This(), body: types.EmbedRequest, accept: ?[]const u8) !ApiResponse(types.EmbedResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/embeddings", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.EmbedResponse).fromResponse(self.allocator, &resp);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.EmbedResponse).fromNegotiatedResponse(self.allocator, &resp);
     }
 
     /// Extract entities, relations, classifications, and structures
@@ -209,24 +244,32 @@ pub const Client = struct {
 
     /// Rerank prompts by relevance
     /// POST /rerank
-    pub fn rerankPrompts(self: *@This(), body: types.RerankRequest) !ApiResponse(types.RerankResponse) {
+    pub fn rerankPrompts(self: *@This(), body: types.RerankRequest, accept: ?[]const u8) !ApiResponse(types.RerankResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/rerank", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.RerankResponse).fromResponse(self.allocator, &resp);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.RerankResponse).fromNegotiatedResponse(self.allocator, &resp);
     }
 
     /// Rerank multimodal documents by relevance
     /// POST /rerank_multimodal
-    pub fn rerankMultimodalPrompts(self: *@This(), body: types.RerankMultimodalRequest) !ApiResponse(types.RerankResponse) {
+    pub fn rerankMultimodalPrompts(self: *@This(), body: types.RerankMultimodalRequest, accept: ?[]const u8) !ApiResponse(types.RerankResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/rerank_multimodal", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.RerankResponse).fromResponse(self.allocator, &resp);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.RerankResponse).fromNegotiatedResponse(self.allocator, &resp);
     }
 
     /// Rewrite text using Seq2Seq models

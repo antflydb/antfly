@@ -212,6 +212,7 @@ comptime {
     _ = @import("kernel_wal_wire.zig");
     _ = @import("index_manager_vopr.zig");
     _ = @import("lite/backend.zig");
+    _ = @import("lite/benchmark.zig");
     _ = @import("lite/bridge.zig");
     _ = @import("lite/conformance_test.zig");
     _ = @import("lite/connection.zig");
@@ -222,6 +223,7 @@ comptime {
     _ = @import("lite/paths.zig");
     _ = @import("lite/restore_staging.zig");
     _ = @import("lite/secret_store.zig");
+    _ = @import("lite/snapshot_test.zig");
     _ = @import("local_write.zig");
     _ = @import("lmdb.zig");
     _ = @import("lmdb_backend.zig");

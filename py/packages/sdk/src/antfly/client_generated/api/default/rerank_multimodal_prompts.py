@@ -9,14 +9,17 @@ from ...models.inference_error import InferenceError
 from ...models.inference_rerank_multimodal_request import InferenceRerankMultimodalRequest
 from ...models.inference_rerank_response import InferenceRerankResponse
 from ...models.inference_transient_capacity_error import InferenceTransientCapacityError
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     *,
     body: InferenceRerankMultimodalRequest,
+    accept: str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
+    if not isinstance(accept, Unset):
+        headers["Accept"] = accept
 
     _kwargs: dict[str, Any] = {
         "method": "post",
@@ -100,6 +103,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceRerankMultimodalRequest,
+    accept: str | Unset = UNSET,
 ) -> Response[InferenceError | InferenceRerankResponse | InferenceTransientCapacityError]:
     """Rerank multimodal documents by relevance
 
@@ -113,6 +117,7 @@ def sync_detailed(
     decoded pixels are admitted before model loading.
 
     Args:
+        accept (str | Unset):
         body (InferenceRerankMultimodalRequest):
 
     Raises:
@@ -125,6 +130,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         body=body,
+        accept=accept,
     )
 
     response = client.get_httpx_client().request(
@@ -138,6 +144,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceRerankMultimodalRequest,
+    accept: str | Unset = UNSET,
 ) -> InferenceError | InferenceRerankResponse | InferenceTransientCapacityError | None:
     """Rerank multimodal documents by relevance
 
@@ -151,6 +158,7 @@ def sync(
     decoded pixels are admitted before model loading.
 
     Args:
+        accept (str | Unset):
         body (InferenceRerankMultimodalRequest):
 
     Raises:
@@ -164,6 +172,7 @@ def sync(
     return sync_detailed(
         client=client,
         body=body,
+        accept=accept,
     ).parsed
 
 
@@ -171,6 +180,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceRerankMultimodalRequest,
+    accept: str | Unset = UNSET,
 ) -> Response[InferenceError | InferenceRerankResponse | InferenceTransientCapacityError]:
     """Rerank multimodal documents by relevance
 
@@ -184,6 +194,7 @@ async def asyncio_detailed(
     decoded pixels are admitted before model loading.
 
     Args:
+        accept (str | Unset):
         body (InferenceRerankMultimodalRequest):
 
     Raises:
@@ -196,6 +207,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         body=body,
+        accept=accept,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -207,6 +219,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceRerankMultimodalRequest,
+    accept: str | Unset = UNSET,
 ) -> InferenceError | InferenceRerankResponse | InferenceTransientCapacityError | None:
     """Rerank multimodal documents by relevance
 
@@ -220,6 +233,7 @@ async def asyncio(
     decoded pixels are admitted before model loading.
 
     Args:
+        accept (str | Unset):
         body (InferenceRerankMultimodalRequest):
 
     Raises:
@@ -234,5 +248,6 @@ async def asyncio(
         await asyncio_detailed(
             client=client,
             body=body,
+            accept=accept,
         )
     ).parsed

@@ -23649,7 +23649,14 @@ export interface operations {
     generateEmbeddings: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+                 *     frame instead of JSON, which avoids serializing every float as text. Any
+                 *     other value, or none, returns the JSON body.
+                 */
+                Accept?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -23666,6 +23673,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceEmbedResponse"];
+                    "application/vnd.antfly.numeric.v1": string;
                 };
             };
             /** @description Invalid request */
@@ -23791,7 +23799,14 @@ export interface operations {
     rerankMultimodalPrompts: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+                 *     frame instead of JSON, which avoids serializing every float as text. Any
+                 *     other value, or none, returns the JSON body.
+                 */
+                Accept?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -23808,6 +23823,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceRerankResponse"];
+                    "application/vnd.antfly.numeric.v1": string;
                 };
             };
             /** @description Invalid request or unsupported model */
@@ -23880,7 +23896,14 @@ export interface operations {
     rerankPrompts: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+                 *     frame instead of JSON, which avoids serializing every float as text. Any
+                 *     other value, or none, returns the JSON body.
+                 */
+                Accept?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -23897,6 +23920,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceRerankResponse"];
+                    "application/vnd.antfly.numeric.v1": string;
                 };
             };
             /** @description Invalid request */
@@ -25030,7 +25054,14 @@ export interface operations {
     createEmbedding: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+                 *     frame instead of JSON, which avoids serializing every float as text. Any
+                 *     other value, or none, returns the JSON body.
+                 */
+                Accept?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -25047,6 +25078,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceEmbedResponse"];
+                    "application/vnd.antfly.numeric.v1": string;
                 };
             };
             /** @description Invalid request */
