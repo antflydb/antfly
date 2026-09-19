@@ -56,39 +56,32 @@ func (r *closeTrackingReader) Close() error {
 	return nil
 }
 
-// serializeFloatArrays writes embeddings in binary format matching the inference server.
-// Format: uint64(numVectors) + uint64(dimension) + float32 values in little endian
-func serializeFloatArrays(embeddings [][]float32) []byte {
-	if len(embeddings) == 0 {
-		buf := make([]byte, 8)
-		binary.LittleEndian.PutUint64(buf, 0)
-		return buf
+// numericDenseFrame writes embeddings as the negotiated numeric frame the
+// inference server returns: magic "AFN1", uint32 kind, uint64 rows, uint64
+// columns, then the values.
+func numericDenseFrame(embeddings [][]float32) []byte {
+	dimension := 0
+	if len(embeddings) > 0 {
+		dimension = len(embeddings[0])
 	}
+	buf := make([]byte, numericFrameHeaderBytes+len(embeddings)*dimension*4)
+	copy(buf[0:4], numericFrameMagic[:])
+	binary.LittleEndian.PutUint32(buf[4:8], numericFrameKindDense)
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(len(embeddings)))
+	binary.LittleEndian.PutUint64(buf[16:24], uint64(dimension))
 
-	dimension := len(embeddings[0])
-	// 8 bytes for numVectors + 8 bytes for dimension + 4 bytes per float
-	totalSize := 8 + 8 + len(embeddings)*dimension*4
-	buf := make([]byte, totalSize)
-
-	binary.LittleEndian.PutUint64(buf[0:8], uint64(len(embeddings)))
-	binary.LittleEndian.PutUint64(buf[8:16], uint64(dimension))
-
-	offset := 16
+	offset := numericFrameHeaderBytes
 	for _, vec := range embeddings {
 		for _, val := range vec {
-			binary.LittleEndian.PutUint32(buf[offset:offset+4], uint32FromFloat32(val))
+			binary.LittleEndian.PutUint32(buf[offset:offset+4], math.Float32bits(val))
 			offset += 4
 		}
 	}
 	return buf
 }
 
-func uint32FromFloat32(f float32) uint32 {
-	return math.Float32bits(f)
-}
-
-func TestClient_Embed_Binary(t *testing.T) {
-	// Legacy servers may still return binary embeddings.
+func TestClient_Embed_NumericFrame(t *testing.T) {
+	// The server answers with the packed frame the request asked for.
 	expectedEmbeddings := [][]float32{
 		{0.1, 0.2, 0.3, 0.4},
 		{0.5, 0.6, 0.7, 0.8},
@@ -108,11 +101,13 @@ func TestClient_Embed_Binary(t *testing.T) {
 		err = json.Unmarshal(body, &req)
 		require.NoError(t, err)
 		assert.Equal(t, "test-model", req["model"])
+		// Without this header the server has no reason to send a frame, so the
+		// whole negotiated path would go untested.
+		assert.Equal(t, numericResponseAccept, r.Header.Get("Accept"))
 
-		// Return the legacy dense binary response.
-		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Type", numericResponseMediaType)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(serializeFloatArrays(expectedEmbeddings))
+		_, _ = w.Write(numericDenseFrame(expectedEmbeddings))
 	}))
 	defer server.Close()
 
@@ -156,7 +151,7 @@ func TestClient_Embed_CurrentJSONResponse(t *testing.T) {
 func TestClient_EmbedRejectsUnregisteredBinaryMediaType(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-streamx")
-		_, _ = w.Write(serializeFloatArrays([][]float32{{0.1}}))
+		_, _ = w.Write(numericDenseFrame([][]float32{{0.1}}))
 	}))
 	defer server.Close()
 
@@ -192,9 +187,8 @@ func TestClient_Embed_JSON(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(resp)
 		} else {
-			// Return binary response (default)
-			w.Header().Set("Content-Type", "application/octet-stream")
-			_, _ = w.Write(serializeFloatArrays(expectedEmbeddings))
+			w.Header().Set("Content-Type", numericResponseMediaType)
+			_, _ = w.Write(numericDenseFrame(expectedEmbeddings))
 		}
 	}))
 	defer server.Close()
@@ -216,10 +210,14 @@ func TestClient_Embed_JSON(t *testing.T) {
 
 func TestClient_Embed_EmptyInput(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Return empty binary response
-		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(serializeFloatArrays([][]float32{}))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"model":  "test-model",
+			"data":   []map[string]any{},
+			"usage":  map[string]any{"prompt_tokens": 0, "total_tokens": 0},
+		})
 	}))
 	defer server.Close()
 
@@ -838,10 +836,13 @@ func TestInferenceResponseLimitsApplyBeforeGeneratedParsing(t *testing.T) {
 
 	jsonReq, err := http.NewRequest(http.MethodPost, "http://inference.test/ai/v1/embed", nil)
 	require.NoError(t, err)
-	for _, contentType := range []string{"application/octet-stream", "application/x-sparse-vectors"} {
-		resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {contentType}}}
-		assert.Equal(t, maxInferenceBinaryResponseBytes, inferenceResponseLimit(jsonReq, resp), contentType)
-	}
+	binaryResp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/octet-stream"}}}
+	assert.Equal(t, maxInferenceBinaryResponseBytes, inferenceResponseLimit(jsonReq, binaryResp))
+	numericResp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {numericResponseMediaType}}}
+	assert.Equal(t, maxInferenceNumericResponseBytes, inferenceResponseLimit(jsonReq, numericResp))
+	// A media type nothing produces any more falls back to the JSON ceiling.
+	sparseResp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/x-sparse-vectors"}}}
+	assert.Equal(t, maxInferenceJSONResponseBytes, inferenceResponseLimit(jsonReq, sparseResp))
 	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream; charset=utf-8"}}}
 	assert.Equal(t, maxInferenceJSONResponseBytes, inferenceResponseLimit(jsonReq, resp))
 	sseReq := jsonReq.Clone(context.Background())
@@ -900,12 +901,12 @@ func TestInferenceJSONRequestCapsSuccessfulSSEMislabeledBody(t *testing.T) {
 	assert.True(t, body.closed, "generated response parser must close the rejected body")
 }
 
-func TestInferenceBinaryResponseLimitRejectsOversizedBody(t *testing.T) {
+func TestInferenceNumericResponseLimitRejectsOversizedBody(t *testing.T) {
 	httpClient := &http.Client{Transport: inferenceRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": {"application/octet-stream"}},
-			Body:       io.NopCloser(io.LimitReader(infiniteZeroReader{}, maxInferenceBinaryResponseBytes+1)),
+			Header:     http.Header{"Content-Type": {numericResponseMediaType}},
+			Body:       io.NopCloser(io.LimitReader(infiniteZeroReader{}, maxInferenceNumericResponseBytes+1)),
 			Request:    req,
 		}, nil
 	})}
@@ -913,87 +914,41 @@ func TestInferenceBinaryResponseLimitRejectsOversizedBody(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = client.Embed(context.Background(), "target", []string{"hello"})
-	require.ErrorContains(t, err, fmt.Sprintf("inference response exceeded %d bytes", maxInferenceBinaryResponseBytes))
+	require.ErrorContains(t, err, fmt.Sprintf("inference response exceeded %d bytes", maxInferenceNumericResponseBytes))
 }
 
-func TestDeserializeFloatArraysRejectsForgedHeaders(t *testing.T) {
+func TestDecodeNumericDenseFrameRejectsForgedHeaders(t *testing.T) {
+	frame := func(mutate func([]byte)) []byte {
+		body := numericDenseFrame([][]float32{{0.25, 0.5}})
+		mutate(body)
+		return body
+	}
 	for _, test := range []struct {
 		name string
 		body []byte
 	}{
-		{name: "missing count", body: make([]byte, 7)},
-		{name: "trailing empty payload", body: append(make([]byte, 8), 0)},
-		{name: "missing dimension", body: func() []byte {
-			body := make([]byte, 8)
-			binary.LittleEndian.PutUint64(body, 1)
-			return body
-		}()},
-		{name: "multiplication overflow", body: func() []byte {
-			body := make([]byte, 16)
-			binary.LittleEndian.PutUint64(body[0:8], ^uint64(0))
-			binary.LittleEndian.PutUint64(body[8:16], 2)
-			return body
-		}()},
-		{name: "declared payload mismatch", body: func() []byte {
-			body := make([]byte, 16)
-			binary.LittleEndian.PutUint64(body[0:8], 1)
-			binary.LittleEndian.PutUint64(body[8:16], 1)
-			return body
-		}()},
+		{name: "short header", body: make([]byte, numericFrameHeaderBytes-1)},
+		{name: "wrong magic", body: frame(func(b []byte) { b[3] = '2' })},
+		{name: "wrong kind", body: frame(func(b []byte) { binary.LittleEndian.PutUint32(b[4:8], 2) })},
+		{name: "zero dimension", body: frame(func(b []byte) { binary.LittleEndian.PutUint64(b[16:24], 0) })},
+		{name: "multiplication overflow", body: frame(func(b []byte) {
+			binary.LittleEndian.PutUint64(b[8:16], ^uint64(0))
+			binary.LittleEndian.PutUint64(b[16:24], 2)
+		})},
+		{name: "declared payload mismatch", body: frame(func(b []byte) { binary.LittleEndian.PutUint64(b[8:16], 2) })},
+		{name: "trailing data", body: append(numericDenseFrame([][]float32{{0.25}}), 0)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := deserializeFloatArrays(test.body)
+			_, err := decodeNumericDenseFrame(test.body)
 			require.Error(t, err)
 		})
 	}
-}
 
-func TestDeserializeSparseVectorsValidatesBeforeAllocation(t *testing.T) {
-	forgedCount := make([]byte, 8)
-	binary.LittleEndian.PutUint64(forgedCount, ^uint64(0))
-	_, err := deserializeSparseVectors(forgedCount)
-	require.Error(t, err)
-
-	forgedNNZ := make([]byte, 12)
-	binary.LittleEndian.PutUint64(forgedNNZ[0:8], 1)
-	binary.LittleEndian.PutUint32(forgedNNZ[8:12], ^uint32(0))
-	_, err = deserializeSparseVectors(forgedNNZ)
-	require.ErrorContains(t, err, "beyond payload")
-
-	valid := make([]byte, 28)
-	binary.LittleEndian.PutUint64(valid[0:8], 1)
-	binary.LittleEndian.PutUint32(valid[8:12], 2)
-	binary.LittleEndian.PutUint32(valid[12:16], uint32(3))
-	binary.LittleEndian.PutUint32(valid[16:20], uint32(7))
-	binary.LittleEndian.PutUint32(valid[20:24], math.Float32bits(0.25))
-	binary.LittleEndian.PutUint32(valid[24:28], math.Float32bits(0.75))
-	vectors, err := deserializeSparseVectors(valid)
+	embeddings, err := decodeNumericDenseFrame(numericDenseFrame([][]float32{{0.25, 0.5}, {-1, 0}}))
 	require.NoError(t, err)
-	require.Len(t, vectors, 1)
-	assert.Equal(t, []int32{3, 7}, vectors[0].Indices)
-	assert.InDeltaSlice(t, []float32{0.25, 0.75}, vectors[0].Values, 0.0001)
-}
-
-func TestClient_SparseEmbed_LegacyBinaryMediaType(t *testing.T) {
-	body := make([]byte, 20)
-	binary.LittleEndian.PutUint64(body[0:8], 1)
-	binary.LittleEndian.PutUint32(body[8:12], 1)
-	binary.LittleEndian.PutUint32(body[12:16], 7)
-	binary.LittleEndian.PutUint32(body[16:20], math.Float32bits(0.75))
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/x-sparse-vectors")
-		_, _ = w.Write(body)
-	}))
-	defer server.Close()
-
-	client, err := NewInferenceClient(server.URL, nil)
-	require.NoError(t, err)
-	vectors, err := client.SparseEmbed(context.Background(), "sparse-model", []string{"hello"})
-	require.NoError(t, err)
-	require.Len(t, vectors, 1)
-	assert.Equal(t, []int32{7}, vectors[0].Indices)
-	assert.InDeltaSlice(t, []float32{0.75}, vectors[0].Values, 0.0001)
+	require.Len(t, embeddings, 2)
+	assert.InDeltaSlice(t, []float32{0.25, 0.5}, embeddings[0], 0.0001)
+	assert.InDeltaSlice(t, []float32{-1, 0}, embeddings[1], 0.0001)
 }
 
 func TestClient_ContextCancellation(t *testing.T) {
