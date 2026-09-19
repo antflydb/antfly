@@ -5872,6 +5872,7 @@ pub const DataServer = struct {
         _ = owner_source.withRestoreDescriptorRecovery(.{ .ptr = self, .recover_fn = recoverRestoreDescriptor });
         _ = owner_source.withRemoteContent(self.api_server_cfg.remote_content);
         _ = owner_source.withCoordinatedTtl(.{ .ptr = self, .expire_fn = expireRelationalRows });
+        _ = owner_source.withSecretStore(self.api_server_cfg.secret_store);
         if (comptime linked_storage) {
             if (self.storageKernelContextHandle()) |handle|
                 _ = owner_source.withStorageContextHandle(handle);
@@ -21328,6 +21329,7 @@ pub const DataServer = struct {
                 );
                 defer alloc.free(security_json);
                 try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+                try storage_kernel_context.?.configureSecrets(cfg.api_server_cfg.secret_store);
             }
         }
 
@@ -27404,6 +27406,7 @@ pub fn runFromIterator(
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
         try process_storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+        try process_storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
     }
 
     var auth_backend: ?LegacyAuthBackend = null;
@@ -27461,6 +27464,13 @@ pub fn runFromIterator(
     );
     defer if (trusted_principal_issuer) |value| alloc.free(value);
 
+    var native_reader: @import("../common/secret_delivery.zig").Remote = undefined;
+    if (secret_store_initialized) {
+        if (secret_store.native_config) |native| {
+            if (native.value.backend != .distributed or native.value.reader == null) return error.InvalidConfig;
+        }
+    }
+
     var data_server = try DataServer.initFromMetadataApiUrls(alloc, .{
         .bind_host = cli.bind_host orelse "127.0.0.1",
         .bind_port = cli.bind_port orelse 0,
@@ -27512,6 +27522,20 @@ pub fn runFromIterator(
         },
     }, metadata_api_urls.urls);
     defer data_server.deinitWithDeadline(supervisor.deadline());
+    if (secret_store_initialized) {
+        if (secret_store.native_config) |native| {
+            const remote = data_server.remote_metadata orelse return error.InvalidConfig;
+            native_reader = .{
+                .alloc = alloc,
+                .io = setup_io.io(),
+                .scope = native.value.scope,
+                .config = native.value.reader.?,
+                .executor = remote.httpExecutor(),
+                .internal_service = if (internal_service_secret) |secret| .{ .secret = secret, .issuer = internal_service_issuer.? } else null,
+            };
+            secret_store.attachNative(native_reader.source(), null);
+        }
+    }
     const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
     std.log.info(
         "process memory policy operator_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} managed_hard_limit_bytes={d}",

@@ -34155,6 +34155,8 @@ pub const SecretEntry = struct {
     source: ?[]const u8 = null,
     /// Whether this key has an Antfly-managed override that can be deleted.
     managed: ?bool = null,
+    /// Committed native entry revision, when supported by the configured backend.
+    revision: ?u64 = null,
     /// Corresponding environment variable name (e.g., OPENAI_API_KEY)
     env_var: ?[]const u8 = null,
     created_at: ?[]const u8 = null,
@@ -34166,6 +34168,7 @@ pub const SecretEntry = struct {
         .{ "status", "status", false },
         .{ "source", "source", true },
         .{ "managed", "managed", true },
+        .{ "revision", "revision", true },
         .{ "env_var", "env_var", true },
         .{ "created_at", "created_at", true },
         .{ "updated_at", "updated_at", true },
@@ -34191,6 +34194,10 @@ pub const SecretEntry = struct {
         }
         if (self.managed) |value| {
             try jw.objectField("managed");
+            try jw.write(value);
+        }
+        if (self.revision) |value| {
+            try jw.objectField("revision");
             try jw.write(value);
         }
         if (self.env_var) |value| {

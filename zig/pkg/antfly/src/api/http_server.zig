@@ -24542,6 +24542,7 @@ pub fn makeSecretEntry(listed: common_secrets.ListedSecret) metadata_openapi.Sec
     return .{
         .source = listed.source orelse if (listed.status == .configured_env) "environment" else null,
         .managed = listed.managed,
+        .revision = listed.revision,
         .key = listed.key,
         .status = mapSecretStatus(listed.status),
         .env_var = listed.env_var,

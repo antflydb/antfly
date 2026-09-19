@@ -755,6 +755,14 @@ pub const RaftApplyStore = struct {
         return try self.projectionWithAllocator([]RestoreJobRow, alloc, .{ .kind = .restore_job_rows, .group_id = group_id });
     }
 
+    pub fn getSecretCollection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, scope: []const u8) !?[]u8 {
+        var response: abi.OwnedBytes = .{};
+        try statusToError(abi.antfly_metadata_apply_store_projection(self.handle, &.{ .kind = .secret_collection, .group_id = group_id, .key = .fromSlice(scope) }, &response));
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        if (response.len == 0) return null;
+        return try alloc.dupe(u8, response.slice());
+    }
+
     pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {
         return try self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_job_value, .group_id = group_id, .key = .fromSlice(key) });
     }

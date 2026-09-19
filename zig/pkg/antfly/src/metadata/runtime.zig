@@ -1157,6 +1157,7 @@ pub fn runFromIterator(
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
         try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+        try storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
     }
 
     var auth_backend: ?LegacyAuthBackend = null;
@@ -1218,6 +1219,17 @@ pub fn runFromIterator(
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
 
+    var native_keys: @import("../common/secret_keyring.zig").Keyring = undefined;
+    var native_secrets: ?@import("secret_store.zig").Store = null;
+    defer if (native_secrets) |*store| store.deinit();
+    if (secret_store_initialized) {
+        if (secret_store.native_config) |native| {
+            if (native.value.backend != .distributed or native.value.reader != null) return error.InvalidConfig;
+            native_keys = .{ .alloc = alloc, .io = setup_io.io(), .path = native.value.keyring_path.? };
+            try native_keys.validate();
+        }
+    }
+
     var server = try Server.init(alloc, .{
         .online_merge_enabled = cli.online_merge_enabled,
         .local_node_id = local_node_id,
@@ -1261,6 +1273,13 @@ pub fn runFromIterator(
         .storage_context = storageKernelContextHandle(storage_kernel_context),
     });
     defer server.deinitWithDeadline(supervisor.deadline());
+    if (secret_store_initialized) {
+        if (secret_store.native_config) |native| {
+            native_secrets = try @import("secret_store.zig").Store.init(alloc, setup_io.io(), native.value.scope, native_keys.provider(), .{ .service = server.server.svc });
+            const handle = native_secrets.?.nativeStore();
+            secret_store.attachNative(handle.source, handle.writer);
+        }
+    }
     try server.start();
     try server.bootstrapCluster(metadata_group_id, local_node_id, cluster_peers);
     const synced_extension_packages = try server.server.svc.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);

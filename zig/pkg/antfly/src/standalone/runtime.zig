@@ -3639,6 +3639,9 @@ pub fn runFromIterator(
     if (try antfly.common.secrets.initFromConfigPathWithIo(alloc, setup_io.io(), cli.config_path, cli.secret_store_paths.items)) |configured_store| {
         secret_store = configured_store;
         secret_store_initialized = true;
+        // Encrypted native stores are attached by metadata/serverless runtimes;
+        // embedding hosts use Lite's native handle directly.
+        if (secret_store.native_config != null) return error.InvalidConfig;
     } else {
         const default_secret_store_path = try resolveDefaultSecretStorePathBeforeConfig(alloc, cli);
         defer alloc.free(default_secret_store_path);
@@ -3730,6 +3733,7 @@ pub fn runFromIterator(
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
         try storage_kernel_context.configureRemoteContentSecurity(security_json);
+        try storage_kernel_context.configureSecrets(&secret_store);
     }
 
     var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});

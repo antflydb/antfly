@@ -175,6 +175,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ha_async_mirror: ?ha_contract.AsyncEffectMirror = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     remote_content_configured: bool = false,
+    secret_store: ?*anyopaque = null,
     context: client.Context = .{},
     owns_context: bool = true,
     mutex: std.atomic.Mutex = .unlocked,
@@ -386,6 +387,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self;
     }
 
+    pub fn withSecretStore(self: *ProvisionedKernelOwnerSource, store: ?*anyopaque) *ProvisionedKernelOwnerSource {
+        std.debug.assert(self.entries.items.len == 0);
+        self.secret_store = store;
+        self.remote_content_configured = false;
+        return self;
+    }
+
     pub fn withRemoteContent(
         self: *ProvisionedKernelOwnerSource,
         remote_content: ?*const scraping.RemoteContentConfig,
@@ -402,6 +410,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const security_json = try common_config.remoteContentSecurityJsonAlloc(self.alloc, self.remote_content);
         defer self.alloc.free(security_json);
         try self.context.configureRemoteContentSecurity(security_json);
+        try self.context.configureSecrets(self.secret_store);
         self.remote_content_configured = true;
     }
 

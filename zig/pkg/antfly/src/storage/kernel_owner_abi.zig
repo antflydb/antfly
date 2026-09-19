@@ -514,7 +514,7 @@ pub const MetadataProjectionKind = enum(u32) {
     table_restore_admission = 38,
     verify_table_create_projection = 39,
     system_catalog = 41,
-    backup_cohort = 42,
+    backup_cohort = 63,
     backup_cohort_progress = 43,
     backup_cohorts = 44,
     restore_staging_job = 45,
@@ -535,6 +535,8 @@ pub const MetadataProjectionKind = enum(u32) {
     migrate_standalone_restore_jobs = 60,
     restore_staging_authority_allowed = 61,
     merge_transition = 62,
+    /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
+    secret_collection = 42,
 };
 
 pub const MetadataHABindRequest = extern struct {
@@ -1555,6 +1557,10 @@ pub extern fn antfly_storage_context_attach_inference_provider(
     context: ?*anyopaque,
     inference_handle: ?*anyopaque,
 ) callconv(.c) Status;
+
+/// Borrows the runtime secret facade until context destruction. Configure before
+/// opening any table owner; the caller retains ownership and controls its lifetime.
+pub extern fn antfly_storage_context_configure_secrets(context: ?*anyopaque, store: ?*anyopaque) callconv(.c) Status;
 
 /// Replaces the context-owned remote-content security snapshot before any
 /// table owner opens. The payload is a ContentSecurityConfig JSON object.

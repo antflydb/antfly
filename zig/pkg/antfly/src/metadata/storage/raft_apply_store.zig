@@ -14,6 +14,8 @@
 
 const std = @import("std");
 const store_report_baseline = @import("../store_report_baseline.zig");
+const secret_store = @import("../secret_store.zig");
+const secret_collection = @import("../../common/secret_collection.zig");
 const metadata_store_observer = @import("../store_observer.zig");
 const store_report_update = @import("../store_report_update.zig");
 const system_catalog = @import("../../system_catalog/domain.zig");
@@ -217,6 +219,7 @@ pub const TransitionCommand = union(enum) {
     /// Versioned system catalog request, applied atomically with any table topology.
     activate_topology_protocol: []const u8,
     apply_system_catalog: []const u8,
+    publish_secret_collection: []const u8,
     initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
     upsert_node: metadata.NodeRecord,
     register_node: metadata.NodeRecord,
@@ -348,7 +351,7 @@ pub const TransitionCommand = union(enum) {
         switch (self.*) {
             .apply_restore_staging => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .activate_topology_protocol, .apply_system_catalog, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -8436,6 +8439,15 @@ pub const RaftApplyStore = struct {
         return try rows.toOwnedSlice(alloc);
     }
 
+    pub fn getSecretCollection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, scope: []const u8) !?[]u8 {
+        var key_buf: [256]u8 = undefined;
+        const key = try secret_store.keyForScope(&key_buf, group_id, scope);
+        return self.store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+
     pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
         var key_buf: [256]u8 = undefined;
         const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
@@ -8649,6 +8661,7 @@ pub const RaftApplyStore = struct {
 
     const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
     const MetadataSnapshotProjection = enum {
+        secret_collection,
         system_catalog,
         topology_activation,
         metadata_incarnation,
@@ -8691,6 +8704,7 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .secret_collection, .key = .{ .prefix = secret_store.prefixForGroup } },
         .{ .projection = .topology_activation, .key = .{ .point = topologyActivationKeyForGroup } },
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
         .{ .projection = .metadata_incarnation, .key = .{ .point = metadataIncarnationKeyForGroup } },
@@ -8725,17 +8739,20 @@ pub const RaftApplyStore = struct {
         .{ .projection = .catalog_revision, .key = .{ .point = catalogRevisionKeyForGroup } },
     };
 
-    fn metadataSnapshotProjectionBit(projection: MetadataSnapshotProjection) u32 {
-        return @as(u32, 1) << @intFromEnum(projection);
+    const MetadataSnapshotProjectionMask = std.meta.Int(.unsigned, @typeInfo(MetadataSnapshotProjection).@"enum".fields.len);
+
+    fn metadataSnapshotProjectionBit(projection: MetadataSnapshotProjection) MetadataSnapshotProjectionMask {
+        return @as(MetadataSnapshotProjectionMask, 1) << @intFromEnum(projection);
     }
 
     /// Exhaustively ties every durable transition command to the projection
     /// classes that must survive a metadata Raft snapshot. Adding a command
     /// without classifying its durable output is therefore a compile error.
-    fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) u32 {
+    fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) MetadataSnapshotProjectionMask {
         return switch (tag) {
             .apply_restore_staging => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.restore_staging) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.range) | metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
+            .publish_secret_collection => metadataSnapshotProjectionBit(.secret_collection),
             .activate_topology_protocol => metadataSnapshotProjectionBit(.topology_activation),
             .apply_store_report_baseline => metadataSnapshotProjectionBit(.store) | metadataSnapshotProjectionBit(.store_report_cursor) | metadataSnapshotProjectionBit(.store_report_baseline) | metadataSnapshotProjectionBit(.store_report_generation),
             .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) |
@@ -9230,6 +9247,20 @@ pub const RaftApplyStore = struct {
         try validateTransitionCommandDataGroupIds(command);
         switch (command) {
             .apply_restore_staging => |bytes| try self.applyRestoreStagingTxn(txn, group_id, bytes),
+            .publish_secret_collection => |bytes| {
+                const publication = try secret_store.decodePublication(self.alloc, bytes);
+                var key_buf: [256]u8 = undefined;
+                const key = try secret_store.keyForScope(&key_buf, group_id, publication.scope);
+                const old = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                var view = try secret_collection.decode(self.alloc, publication.scope, old);
+                defer view.deinit(self.alloc);
+                if (view.revision != publication.expected_revision) return;
+                try txn.put(key, publication.bytes);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
             .activate_topology_protocol => |bytes| {
                 var parsed = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, bytes, .{});
                 defer parsed.deinit();
@@ -13027,13 +13058,15 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    publish_secret_collection = 60,
     upsert_schema_progress_batch = 59,
     activate_topology_protocol = 57,
     apply_system_catalog = 54,
     upsert_store_heartbeat = 55,
     apply_store_report_update = 56,
     apply_store_report_baseline = 58,
-    apply_restore_staging = 60,
+    // Tag 60 is published on main for secrets; restore staging is new in this PR.
+    apply_restore_staging = 65,
     initialize_metadata_incarnation = 45,
     upsert_node = 1,
     remove_node = 2,
@@ -13100,6 +13133,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
     switch (command) {
         .apply_restore_staging => |bytes| {
             try out.append(alloc, @intFromEnum(TransitionTag.apply_restore_staging));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .publish_secret_collection => |bytes| {
+            _ = try secret_store.decodePublication(alloc, bytes);
+            try out.append(alloc, @intFromEnum(TransitionTag.publish_secret_collection));
             try appendRequiredString(alloc, &out, bytes);
         },
         .activate_topology_protocol => |bytes| {
@@ -13460,6 +13498,14 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
             errdefer alloc.free(bytes);
             if (pos != encoded.len or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidMetadataTransitionEncoding;
             break :blk .{ .apply_restore_staging = bytes };
+        },
+        .publish_secret_collection => blk: {
+            if (encoded.len > secret_store.max_command_bytes + 16) return error.CorruptInput;
+            const bytes = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(bytes);
+            if (pos != encoded.len) return error.CorruptInput;
+            _ = try secret_store.decodePublication(alloc, bytes);
+            break :blk .{ .publish_secret_collection = bytes };
         },
         .activate_topology_protocol => blk: {
             if (encoded.len > 1040) return error.InvalidMetadataTransitionEncoding;
@@ -17113,11 +17159,11 @@ test "metadata raft apply store snapshot key registry covers every durable proje
     }
     for (seen) |present| try std.testing.expect(present);
 
-    var descriptor_mask: u32 = 0;
+    var descriptor_mask: RaftApplyStore.MetadataSnapshotProjectionMask = 0;
     for (RaftApplyStore.metadata_snapshot_projections) |descriptor| {
         descriptor_mask |= RaftApplyStore.metadataSnapshotProjectionBit(descriptor.projection);
     }
-    var command_mask: u32 = 0;
+    var command_mask: RaftApplyStore.MetadataSnapshotProjectionMask = 0;
     inline for (std.meta.tags(std.meta.Tag(TransitionCommand))) |tag| {
         const mask = RaftApplyStore.transitionCommandProjectionMask(tag);
         try std.testing.expect(mask != 0);
@@ -21978,6 +22024,27 @@ test "metadata raft apply store fences exact cutover authority and retirement" {
         authority_b.cutover_authority_id,
         current.retired_cutover_authority_id,
     );
+}
+
+test "metadata raft apply store transition codec keeps published secrets distinct from restore staging" {
+    const alloc = std.testing.allocator;
+    const collection = try secret_collection.replace(alloc, std.testing.io, "default", .{ .revision = 0, .entries = &.{} }, "removed", null);
+    defer alloc.free(collection);
+    const publication = try secret_store.encodePublication(alloc, 0, collection);
+    defer alloc.free(publication);
+    const secret_wire = try encodeTransitionCommand(alloc, .{ .publish_secret_collection = publication });
+    defer alloc.free(secret_wire);
+    try std.testing.expectEqual(@as(u8, 60), secret_wire[transition_magic.len]);
+    var secret_command = (try decodeTransitionCommand(alloc, secret_wire)).?;
+    defer secret_command.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, publication, secret_command.publish_secret_collection);
+
+    const restore_wire = try encodeTransitionCommand(alloc, .{ .apply_restore_staging = "{}" });
+    defer alloc.free(restore_wire);
+    try std.testing.expectEqual(@as(u8, 65), restore_wire[transition_magic.len]);
+    var restore_command = (try decodeTransitionCommand(alloc, restore_wire)).?;
+    defer restore_command.deinit(alloc);
+    try std.testing.expectEqualStrings("{}", restore_command.apply_restore_staging);
 }
 
 test "metadata raft apply store transition codec preserves exact raft voter identity" {

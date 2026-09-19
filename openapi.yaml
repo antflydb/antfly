@@ -14708,6 +14708,10 @@ components:
         managed:
           type: boolean
           description: Whether this key has an Antfly-managed override that can be deleted.
+        revision:
+          type: integer
+          format: uint64
+          description: Committed native entry revision, when supported by the configured backend.
         env_var:
           type: string
           description: Corresponding environment variable name (e.g., OPENAI_API_KEY)

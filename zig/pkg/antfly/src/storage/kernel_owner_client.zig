@@ -72,6 +72,11 @@ pub const Context = struct {
         ));
     }
 
+    pub fn configureSecrets(self: *Context, store: ?*anyopaque) !void {
+        try self.ensure();
+        try statusToError(abi.antfly_storage_context_configure_secrets(self.handle, store));
+    }
+
     pub fn configureRemoteContentSecurity(self: *Context, security_json: []const u8) !void {
         try self.ensure();
         try statusToError(abi.antfly_storage_context_configure_remote_content_security(
