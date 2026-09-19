@@ -179,3 +179,116 @@ async def test_async_success_and_unknown_network_outcome():
         with pytest.raises(httpx.ReadError):
             await client.post(URL, content=b"{}")
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_async_stream_keeps_original_deadline_after_headers_and_backoff():
+    class DelayedBody(httpx.AsyncByteStream):
+        def __init__(self):
+            self.closed = 0
+
+        async def __aiter__(self):
+            yield b"first"
+            await asyncio.sleep(1)
+            yield b"late"
+
+        async def aclose(self):
+            self.closed += 1
+
+    body = DelayedBody()
+    calls = []
+
+    async def handle(request):
+        calls.append(request)
+        return httpx.Response(429, json=REJECTION) if len(calls) == 1 else httpx.Response(200, stream=body)
+
+    pool = AdmissionPool(ClientAdmission(1))
+    async with ReadRetryAsyncHTTPClient(
+        ReadRetryPolicy(3, 1, 0.03, 0.03), pool, transport=httpx.MockTransport(handle)
+    ) as client:
+        request = client.build_request("POST", URL, content=b'{"timeout_ms":100}')
+        response = await client.send(request, stream=True)
+        iterator = response.aiter_raw()
+        assert await anext(iterator) == b"first"
+        assert pool.stats["active"] == 1
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.5):
+                await anext(iterator)
+        # Deadline cleanup closes the actual transport and returns its admission.
+        # An enclosing timeout alone would leave a broken implementation running
+        # until the watchdog, so prove the original deadline was the cause.
+        assert time.monotonic() < calls[0].extensions["antfly_deadline"] + 0.15
+        await response.aclose()
+    assert len(calls) == 2
+    assert body.closed == 1
+    assert pool.stats == {"active": 0, "queued": 0}
+
+
+@pytest.mark.asyncio
+async def test_async_stream_consumer_pause_does_not_restart_deadline():
+    class ReadyBody(httpx.AsyncByteStream):
+        closed = 0
+
+        async def __aiter__(self):
+            yield b"first"
+            yield b"late"
+
+        async def aclose(self):
+            self.closed += 1
+
+    body = ReadyBody()
+    pool = AdmissionPool(ClientAdmission(1))
+    async with ReadRetryAsyncHTTPClient(
+        POLICY, pool, transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=body))
+    ) as client:
+        response = await client.send(client.build_request("POST", URL, content=b'{"timeout_ms":30}'), stream=True)
+        iterator = response.aiter_raw()
+        assert await anext(iterator) == b"first"
+        await asyncio.sleep(0.04)
+        with pytest.raises(TimeoutError):
+            await anext(iterator)
+        await response.aclose()
+    assert body.closed == 1
+    assert pool.stats["active"] == 0
+
+
+@pytest.mark.asyncio
+async def test_async_stream_cancel_retains_permit_until_transport_closes():
+    closing = asyncio.Event()
+    finish_close = asyncio.Event()
+    reading = asyncio.Event()
+
+    class BlockedBody(httpx.AsyncByteStream):
+        closed = 0
+
+        async def __aiter__(self):
+            reading.set()
+            await asyncio.Event().wait()
+            yield b"unreachable"
+
+        async def aclose(self):
+            self.closed += 1
+            closing.set()
+            await finish_close.wait()
+
+    body = BlockedBody()
+    pool = AdmissionPool(ClientAdmission(1))
+    async with ReadRetryAsyncHTTPClient(
+        POLICY, pool, transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=body))
+    ) as client:
+        response = await client.send(client.build_request("POST", URL, content=b"{}"), stream=True)
+        task = asyncio.create_task(response.aread())
+        await reading.wait()
+        task.cancel()
+        await closing.wait()
+        assert pool.stats["active"] == 1
+        task.cancel()  # Cleanup must survive a second cancellation too.
+        done, _ = await asyncio.wait({task}, timeout=0.1)
+        assert task in done  # Cancellation does not wait for the transport close.
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert pool.stats["active"] == 1
+        finish_close.set()
+        await response.aclose()
+    assert body.closed == 1
+    assert pool.stats == {"active": 0, "queued": 0}

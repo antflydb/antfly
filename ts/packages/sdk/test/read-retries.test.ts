@@ -116,3 +116,83 @@ describe("query read retries", () => {
     expect(base).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("query retry transport cancellation", () => {
+  it("rejects late successful headers and closes the underlying response", async () => {
+    let closed = 0;
+    const base = vi.fn<typeof fetch>().mockImplementation(async () => {
+      // A custom transport may finish even after its input signal was aborted.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return new Response(
+        new ReadableStream({
+          cancel: () => {
+            closed++;
+          },
+        }),
+        { status: 200 }
+      );
+    });
+    await expect(
+      readRetryFetch(base, { ...policy, maxElapsedMs: 20 })(url, { method: "POST", body: "{}" })
+    ).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(base).toHaveBeenCalledTimes(1);
+    expect(closed).toBe(1);
+  });
+
+  it("cancels both bounded-error tee branches when a reply stalls", async () => {
+    let closed = 0;
+    const base = vi.fn<typeof fetch>().mockImplementation(async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("{"));
+        },
+        cancel() {
+          closed++;
+        },
+      });
+      return new Response(body, { status: 429, headers: { "Content-Length": "100" } });
+    });
+    await expect(
+      readRetryFetch(base, { ...policy, maxElapsedMs: 20 })(url, { method: "POST", body: "{}" })
+    ).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(base).toHaveBeenCalledTimes(1);
+    expect(closed).toBe(1);
+  }, 500);
+});
+
+it("retains error-stream admission through asynchronous deadline cleanup", async () => {
+  let closed = 0;
+  let finishClose!: () => void;
+  const closing = new Promise<void>((resolve) => {
+    finishClose = resolve;
+  });
+  const base = vi.fn<typeof fetch>().mockImplementation(
+    async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("{"));
+          },
+          cancel() {
+            closed++;
+            return closing;
+          },
+        }),
+        { status: 429, headers: { "Content-Length": "100" } }
+      )
+  );
+  const pool = new AdmissionPool({ maxInFlight: 1, maxQueued: 0, maxWaitMs: 0 });
+  await expect(
+    readRetryFetch(pool.wrap(base), { ...policy, maxElapsedMs: 20 })(url, {
+      method: "POST",
+      body: "{}",
+    })
+  ).rejects.toMatchObject({ name: "TimeoutError" });
+  expect(closed).toBe(1);
+  expect(pool.stats.active).toBe(1);
+  finishClose();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(pool.stats.active).toBe(0);
+  expect(base).toHaveBeenCalledTimes(1);
+  expect(closed).toBe(1);
+});

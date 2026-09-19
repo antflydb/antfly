@@ -133,3 +133,31 @@ describe("client workload admission", () => {
     );
   });
 });
+
+it("does not mistake canceled pending reads for transport retirement", async () => {
+  const pool = new AdmissionPool({ maxInFlight: 1, maxQueued: 0, maxWaitMs: 0 });
+  let closeCount = 0;
+  let finishClose!: () => void;
+  const closing = new Promise<void>((resolve) => {
+    finishClose = resolve;
+  });
+  const raw = new ReadableStream<Uint8Array>({
+    cancel() {
+      closeCount++;
+      return closing;
+    },
+  });
+  const response = await pool.wrap(async () => new Response(raw))("http://test/stream");
+  if (!response.body) throw new Error("expected streaming body");
+  const reader = response.body.getReader();
+  const reading = reader.read();
+  await Promise.resolve();
+  const canceling = reader.cancel();
+  expect((await reading).done).toBe(true);
+  await Promise.resolve();
+  expect(closeCount).toBe(1);
+  expect(pool.stats.active).toBe(1);
+  finishClose();
+  await canceling;
+  expect(pool.stats.active).toBe(0);
+});

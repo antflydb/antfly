@@ -140,6 +140,10 @@ export function readRetryFetch(
     for (let attempt = 1; ; attempt++) {
       signal.throwIfAborted();
       const response = await base(new Request(request, { body, signal }));
+      if (signal.aborted) {
+        void response.body?.cancel(signal.reason).catch(() => {});
+        signal.throwIfAborted();
+      }
       if (attempt >= config.maxAttempts || response.status !== 429) return response;
       const length = response.headers.get("Content-Length");
       if (length === null || !/^\d+$/.test(length) || Number(length) > 16_384) return response;
@@ -150,9 +154,19 @@ export function readRetryFetch(
       if (!errorReader) return response;
       let errorSize = 0;
       const errors: Uint8Array[] = [];
+      const cancelError = (reason: unknown) => {
+        // Both tee branches must cancel together. Awaiting either first can
+        // deadlock behind its unread sibling, especially with custom fetch.
+        void errorReader.cancel(reason).catch(() => {});
+        void response.body?.cancel(reason).catch(() => {});
+      };
+      const abortError = () => cancelError(signal.reason);
+      signal.addEventListener("abort", abortError, { once: true });
       try {
         while (true) {
+          signal.throwIfAborted();
           const next = await errorReader.read();
+          signal.throwIfAborted();
           if (next.done) break;
           errorSize += next.value.byteLength;
           if (errorSize > 16_384) {
@@ -161,7 +175,11 @@ export function readRetryFetch(
           }
           errors.push(next.value);
         }
+      } catch (error) {
+        cancelError(error);
+        throw error;
       } finally {
+        signal.removeEventListener("abort", abortError);
         errorReader.releaseLock();
       }
       const encoded = new Uint8Array(errorSize);

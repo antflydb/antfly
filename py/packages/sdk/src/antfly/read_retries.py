@@ -24,6 +24,7 @@ class ReadRetryPolicy:
 
     The original caller deadline (antfly_deadline request extension, monotonic
     seconds) wins over max_elapsed. Async task cancellation interrupts backoff.
+    Async streamed response reads retain that absolute deadline after headers.
     Query timeout_ms also bounds the original operation; subsequent dispatches
     forward only the remaining body budget without reencoding other fields.
     Synchronous httpx I/O timeouts are capped by the remaining budget; as with
@@ -203,6 +204,58 @@ class _ReplayAsync(httpx.AsyncByteStream):
         await self.original.aclose()
 
 
+class _DeadlineAsync(httpx.AsyncByteStream):
+    """Keep the original operation budget after send returns response headers."""
+
+    _cleanup_tasks: set[asyncio.Task[None]] = set()
+
+    def __init__(self, original: httpx.AsyncByteStream, deadline: float):
+        self.original, self.deadline = original, deadline
+        self.closing: asyncio.Task[None] | None = None
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        iterator = self.original.__aiter__()
+        try:
+            while True:
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Antfly query response deadline expired")
+                try:
+                    # Scope cancellation to the transport read, never across a
+                    # yield into unrelated consumer work or a different task.
+                    async with asyncio.timeout(remaining):
+                        chunk = await anext(iterator)
+                except StopAsyncIteration:
+                    return
+                if time.monotonic() >= self.deadline:
+                    raise TimeoutError("Antfly query response deadline expired")
+                yield chunk
+        finally:
+            self._start_close()
+            task = asyncio.current_task()
+            if task is None or not task.cancelling():
+                await self.aclose()
+
+    def _start_close(self) -> None:
+        if self.closing is None:
+            self.closing = asyncio.create_task(self.original.aclose())
+            self._cleanup_tasks.add(self.closing)
+
+            def done(task: asyncio.Task[None]) -> None:
+                self._cleanup_tasks.discard(task)
+                if not task.cancelled():
+                    task.exception()
+
+            self.closing.add_done_callback(done)
+
+    async def aclose(self) -> None:
+        self._start_close()
+        assert self.closing is not None
+        # Repeated caller cancellation must not abandon transport cleanup or
+        # release the inner admission permit before that cleanup finishes.
+        await asyncio.shield(self.closing)
+
+
 class ReadRetryHTTPClient(AdmissionHTTPClient):
     def __init__(self, policy: ReadRetryPolicy, pool: AdmissionPool | None = None, **kwargs: Any):
         super().__init__(pool, **kwargs)
@@ -288,6 +341,9 @@ class ReadRetryAsyncHTTPClient(AdmissionAsyncHTTPClient):
                             body = b"".join(chunks) if size <= 16384 else b"x" * 16385
                         delay = _delay(policy, response, body, attempt, deadline)
                     if delay is None:
+                        if stream and not response.is_closed:
+                            assert isinstance(response.stream, httpx.AsyncByteStream)
+                            response.stream = _DeadlineAsync(response.stream, deadline)
                         if not stream:
                             await response.aread()
                             await response.aclose()

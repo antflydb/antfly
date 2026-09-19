@@ -134,12 +134,18 @@ export class AdmissionPool {
           reader.releaseLock();
           release();
         };
-        const cancel = async (reason?: unknown) => {
-          try {
-            await reader.cancel(reason);
-          } finally {
-            finish();
-          }
+        let closing: Promise<void> | undefined;
+        const cancel = (reason?: unknown): Promise<void> => {
+          // A second reader.cancel() can resolve before the first transport
+          // cancellation completes. Every path must join the same cleanup.
+          closing ??= (async () => {
+            try {
+              await reader.cancel(reason);
+            } finally {
+              finish();
+            }
+          })();
+          return closing;
         };
         const abort = () => {
           void cancel(signal?.reason).catch(() => {});
@@ -153,6 +159,7 @@ export class AdmissionPool {
                 const result = await reader.read();
                 signal?.throwIfAborted();
                 if (result.done) {
+                  if (closing) await closing;
                   controller.close();
                   finish();
                 } else controller.enqueue(result.value);
