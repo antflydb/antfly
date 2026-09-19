@@ -106,7 +106,7 @@ fn acknowledgeAndReclaim(host: anytype, table: []const u8, scope: source.Scope, 
 /// Snapshot and catchup remain writable. Only after an entire catchup pass
 /// completes do we fence/drain the full cohort, then consume exact final cuts.
 /// The ordinary shared validation/publication worker takes over afterward.
-pub fn step(host: anytype, job: *std.json.Parsed(stages.Job), worker: jobs.JobState, context: operation.RequestContext) !void {
+pub fn step(host: anytype, job: *std.json.Parsed(stages.Job), worker: *jobs.JobState, context: operation.RequestContext) !void {
     var arena = std.heap.ArenaAllocator.init(host.alloc);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -181,20 +181,34 @@ pub fn step(host: anytype, job: *std.json.Parsed(stages.Job), worker: jobs.JobSt
         .complete => unreachable,
     }
     if (job.value.state == .importing) {
-        const saved = try host.restore_job_store.recordRewriteProgress(host.alloc, worker.job_id, worker.attempt_id, try checkpointAfter(progress, pending, count));
+        const next = try checkpointAfter(progress, pending, count);
+        const saved = try host.restore_job_store.recordRewriteProgress(host.alloc, worker.job_id, worker.attempt_id, next);
         host.alloc.free(saved);
+        // Publish to the current scheduling burst only after durable success.
+        // A lost checkpoint reply leaves this cursor unchanged for replay.
+        worker.rewrite_progress = next;
     }
+}
+
+/// An unfinished complete pass must yield to asynchronous owner work. Within
+/// a pass, advance other owners without paying one job retry per owner RPC.
+pub fn completedPendingPass(before: jobs.RewriteProgress, after: jobs.RewriteProgress) bool {
+    return before.phase == after.phase and after.round > before.round;
 }
 
 test "rewrite shared job scheduler fences only after complete catchup pass" {
     var progress: jobs.RewriteProgress = .{ .phase = .catchup };
     progress = try checkpointAfter(progress, false, 2);
     try std.testing.expectEqual(.catchup, progress.phase);
+    const before_pending = progress;
     progress = try checkpointAfter(progress, true, 2);
+    try std.testing.expect(completedPendingPass(before_pending, progress));
     try std.testing.expectEqual(.catchup, progress.phase);
     try std.testing.expectEqual(@as(u64, 1), progress.round);
     progress = try checkpointAfter(progress, false, 2);
+    const before_fencing = progress;
     progress = try checkpointAfter(progress, false, 2);
+    try std.testing.expect(!completedPendingPass(before_fencing, progress));
     try std.testing.expectEqual(.fencing, progress.phase);
     try std.testing.expectEqual(@as(u32, 0), progress.owner);
 }
@@ -325,7 +339,12 @@ test "rewrite shared job driver resumes lost scheduling receipts and fences whol
     for (0..100) |iteration| {
         worker.rewrite_progress = fixture.restore_job_store.progress;
         fixture.restore_job_store.lose_checkpoint = iteration % 7 == 0;
-        step(&fixture, &job, worker, .{}) catch |err| if (err != error.RestoreStagingYield) return err;
+        const before = worker.rewrite_progress;
+        step(&fixture, &job, &worker, .{}) catch |err| {
+            if (err != error.RestoreStagingYield) return err;
+            try std.testing.expectEqualDeep(before, worker.rewrite_progress);
+        };
+        try std.testing.expectEqualDeep(fixture.restore_job_store.progress, worker.rewrite_progress);
         if (job.value.state == .validating) break;
     } else return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 2), fixture.final_cuts);

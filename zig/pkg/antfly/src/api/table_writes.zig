@@ -39729,6 +39729,20 @@ fn consumerTests() type {
             const Ownership = struct {
                 state: ProvisionedTableWriteSource.ReplicaRetirementOwnership.State = .retained,
                 source: ?*ProvisionedTableWriteSource = null,
+                drained: bool = false,
+
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                    return error.UnexpectedBatch;
+                }
+
+                fn retire(ptr: *anyopaque, group_id: u64, table_name: []const u8) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(.retired, self.state);
+                    try std.testing.expectEqual(@as(u64, 7001), group_id);
+                    try std.testing.expectEqualStrings("docs", table_name);
+                    self.drained = true;
+                    return {};
+                }
 
                 fn classify(ptr: *anyopaque, group_id: u64) !ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -39747,6 +39761,7 @@ fn consumerTests() type {
             var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
             defer source.deinit();
             ownership.source = &source;
+            _ = source.withLocalWriteSource(.{ .ptr = &ownership, .vtable = &.{ .batch = Ownership.batch, .retire_table_group_local = Ownership.retire } });
             _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
             var prepared = try source.prepareReplicaRetirements(alloc, &.{.{ .group_id = 7001, .table_name = "docs" }});
             defer prepared.deinit();
@@ -39780,6 +39795,7 @@ fn consumerTests() type {
             // Reattaching a now-authoritative host proof must rescan synchronously;
             // an earlier generic startup scan may have run before that proof existed.
             _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
+            try std.testing.expect(ownership.drained);
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), db_path, .{}));
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), raft_path, .{}));
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), prepared.batch_path.?, .{}));
@@ -39798,6 +39814,20 @@ fn consumerTests() type {
 
             const Ownership = struct {
                 state: ProvisionedTableWriteSource.ReplicaRetirementOwnership.State = .retiring,
+                drained: [3]bool = @splat(false),
+
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                    return error.UnexpectedBatch;
+                }
+
+                fn retire(ptr: *anyopaque, group_id: u64, table_name: []const u8) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(.retired, self.state);
+                    try std.testing.expect(group_id >= 7001 and group_id <= 7003);
+                    try std.testing.expectEqualStrings(if (group_id == 7003) "other" else "docs", table_name);
+                    self.drained[@intCast(group_id - 7001)] = true;
+                    return {};
+                }
 
                 fn classify(ptr: *anyopaque, _: u64) !ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -39814,6 +39844,7 @@ fn consumerTests() type {
             var ownership = Ownership{};
             var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
             defer source.deinit();
+            _ = source.withLocalWriteSource(.{ .ptr = &ownership, .vtable = &.{ .batch = Ownership.batch, .retire_table_group_local = Ownership.retire } });
             _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
             var prepared = try source.prepareReplicaRetirements(alloc, &targets);
             defer prepared.deinit();
@@ -39838,6 +39869,7 @@ fn consumerTests() type {
 
             ownership.state = .retired;
             try std.testing.expect(!try source.recoverReplicaRetirementIntents(alloc));
+            try std.testing.expect(std.mem.allEqual(bool, &ownership.drained, true));
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), prepared.batch_path.?, .{}));
         }
 

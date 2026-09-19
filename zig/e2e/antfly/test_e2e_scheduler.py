@@ -211,6 +211,19 @@ def test_reused_or_session_process_fixture_stays_module_grouped() -> None:
     )
 
 
+def test_catalog_cluster_consumes_process_budget() -> None:
+    from test_catalog_resilience import catalog_cluster
+
+    item = FakeItem(
+        "test_catalog_resilience.py::test_migration",
+        fixtures={"catalog_cluster": "function"},
+        fixture_functions={"catalog_cluster": catalog_cluster},
+    )
+    assert scheduling_group(item).startswith(  # type: ignore[arg-type]
+        f"{PROCESS_GROUP_PREFIX}test--"
+    )
+
+
 def test_class_scoped_process_fixture_stays_class_grouped() -> None:
     first = FakeItem(
         "test_custom.py::TestProcess::test_first",

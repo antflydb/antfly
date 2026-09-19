@@ -626,6 +626,8 @@ pub const Detail = enum(c_int) {
     invalid_response,
     relational_index_key_too_large,
     table_lifecycle_conflict,
+    http_connection_closing,
+    raft_batch_write_transport_outcome_unknown,
 };
 
 pub const Status = extern struct {
@@ -916,6 +918,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.CommittedPending => status(.retryable, .committed_pending),
         error.WriteOutcomeUnknown => status(.retryable, .write_outcome_unknown),
         error.RaftBatchWriteOutcomeUnknown => status(.retryable, .raft_batch_write_outcome_unknown),
+        error.RaftBatchWriteTransportOutcomeUnknown => status(.retryable, .raft_batch_write_transport_outcome_unknown),
+        error.HttpConnectionClosing => status(.unavailable, .http_connection_closing),
         error.RaftBatchWritePartialOutcome => status(.retryable, .raft_batch_write_partial_outcome),
         error.GraphMetricActionPartialOutcome => status(.retryable, .graph_metric_action_partial_outcome),
         error.DocIdentityUnavailable => status(.retryable, .doc_identity_unavailable),
@@ -1633,6 +1637,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .commit_visibility_not_satisfied => "CommitVisibilityNotSatisfied",
         .leader_unavailable => "LeaderUnavailable",
         .raft_batch_write_outcome_unknown => "RaftBatchWriteOutcomeUnknown",
+        .raft_batch_write_transport_outcome_unknown => "RaftBatchWriteTransportOutcomeUnknown",
+        .http_connection_closing => "HttpConnectionClosing",
         .raft_batch_write_partial_outcome => "RaftBatchWritePartialOutcome",
         .enrichment_retry_in_progress => "EnrichmentRetryInProgress",
         .resource_budget_exceeded => "ResourceBudgetExceeded",

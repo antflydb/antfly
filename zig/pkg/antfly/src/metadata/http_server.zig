@@ -3677,7 +3677,9 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataRequestTableSplit(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
-        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        const raw_table = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.allocator, raw_table) catch return ctx.status(400).text("invalid table name");
+        defer ctx.allocator.free(table_name);
         const split_request = parseSplitRequest(ctx.allocator, (try ctx.body()) orelse "") catch
             return ctx.status(400).text("invalid split request");
         defer ctx.allocator.free(split_request.split_key);
@@ -3693,7 +3695,9 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataRequestTableMerge(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
-        const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        const raw_table = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.allocator, raw_table) catch return ctx.status(400).text("invalid table name");
+        defer ctx.allocator.free(table_name);
         const merge_request = parseMergeRequest(ctx.allocator, (try ctx.body()) orelse "") catch
             return ctx.status(400).text("invalid merge request");
         self.tableOperations().requestMerge(ctx.allocator, requestContext(ctx), table_name, merge_request) catch |err| return switch (err) {
@@ -7140,13 +7144,31 @@ test "metadata http server accepts internal reallocate and split merge routes" {
     defer merge.deinit();
     try std.testing.expectEqual(@as(u16, 202), merge.status.code);
 
+    // Internal clients percent-encode physical catalog names (including the
+    // table: prefix). Resolve decoded names, and reject malformed escapes
+    // before reaching the topology mutation source.
+    const encoded_table_params = [_]httpx.RouteParam{.{ .name = "table_name", .value = "%64ocs" }};
+    var encoded_split = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/%64ocs/split", &encoded_table_params, "{\"split_key\":\"doc:m\"}", MetadataHttpServer.metadataRequestTableSplit);
+    defer encoded_split.deinit();
+    try std.testing.expectEqual(@as(u16, 202), encoded_split.status.code);
+    var encoded_merge = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/%64ocs/merge", &encoded_table_params, "{\"donor_group_id\":10,\"receiver_group_id\":9,\"allow_doc_identity_reassignment\":true}", MetadataHttpServer.metadataRequestTableMerge);
+    defer encoded_merge.deinit();
+    try std.testing.expectEqual(@as(u16, 202), encoded_merge.status.code);
+    const invalid_table_params = [_]httpx.RouteParam{.{ .name = "table_name", .value = "docs%ZZ" }};
+    var invalid_split = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs%ZZ/split", &invalid_table_params, "{\"split_key\":\"doc:m\"}", MetadataHttpServer.metadataRequestTableSplit);
+    defer invalid_split.deinit();
+    try std.testing.expectEqual(@as(u16, 400), invalid_split.status.code);
+    var invalid_merge = try server.executeTypedHandlerWithBodyForTest(.POST, "/internal/v1/tables/docs%ZZ/merge", &invalid_table_params, "{\"donor_group_id\":10,\"receiver_group_id\":9}", MetadataHttpServer.metadataRequestTableMerge);
+    defer invalid_merge.deinit();
+    try std.testing.expectEqual(@as(u16, 400), invalid_merge.status.code);
+
     try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
     try std.testing.expectEqual(@as(usize, 1), source.node_count);
     try std.testing.expectEqual(@as(usize, 1), source.store_count);
     try std.testing.expectEqual(@as(usize, 1), source.store_status_count);
     try std.testing.expectEqual(@as(usize, 1), source.restore_count);
-    try std.testing.expectEqual(@as(usize, 1), source.split_count);
-    try std.testing.expectEqual(@as(usize, 1), source.merge_count);
+    try std.testing.expectEqual(@as(usize, 2), source.split_count);
+    try std.testing.expectEqual(@as(usize, 2), source.merge_count);
 }
 
 test "metadata http server rejects split and merge during active doc identity reassignment before source mutation" {

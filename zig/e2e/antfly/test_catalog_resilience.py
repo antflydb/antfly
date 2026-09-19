@@ -30,10 +30,12 @@ from catalog_baseline import (
     post_baseline,
 )
 from conftest import DEFAULT_ANTFLY_BIN, internal_service_headers
+from e2e_scheduler import e2e_resource
 from test_scaling import MultiNodeScalingCluster, _insert_docs
 
 
 @pytest.fixture
+@e2e_resource("antfly_process")
 def catalog_cluster(request):
     binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
     if not binary.exists():

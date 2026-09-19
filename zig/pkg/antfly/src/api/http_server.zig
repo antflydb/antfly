@@ -11953,7 +11953,11 @@ pub const ApiHttpServer = struct {
             error.PortableImportPublicationInProgress,
             error.PortableImportRecoveryRequired,
             error.PortableRuntimeActivationPending,
-            => return error.WriteUnavailable,
+            => {
+                if (batch_conflict_diagnostic_gate.admit(platform_time.monotonicNs()))
+                    std.log.warn("public batch unavailable table={s} class={s}", .{ table_name, @errorName(err) });
+                return error.WriteUnavailable;
+            },
             error.CatalogRoutingSnapshotTimeout,
             error.CatalogRoutingUnavailable,
             error.CatalogProjectionRefreshRequired,
@@ -11966,7 +11970,11 @@ pub const ApiHttpServer = struct {
             error.ForeignKeyCoordinationRequired,
             error.IntegrityCatalogChanged,
             error.RestoreStagingInProgress,
-            => return error.WriteUnavailable,
+            => {
+                if (batch_conflict_diagnostic_gate.admit(platform_time.monotonicNs()))
+                    std.log.warn("public batch unavailable table={s} class={s}", .{ table_name, @errorName(err) });
+                return error.WriteUnavailable;
+            },
             error.CommitDecisionUnknown => return error.OutcomeUnknown,
             // Only the read-only planner emits this pre-decision marker.
             // A timeout from commit itself does not prove that nothing wrote.
@@ -15922,7 +15930,7 @@ pub const ApiHttpServer = struct {
         };
         const worker_json = (try self.restore_job_store.load(self.alloc, restore.job_id)) orelse return error.RestoreJobFenced;
         defer self.alloc.free(worker_json);
-        const worker_state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, worker_json, .{});
+        var worker_state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, worker_json, .{});
         defer worker_state.deinit();
         if (is_rewrite) rewrite_diagnostic = worker_state.value.rewrite_progress;
         const failed = worker_state.value.staging_failure.len != 0;
@@ -15946,6 +15954,7 @@ pub const ApiHttpServer = struct {
         var validation_session: ?*@import("restore_catalog.zig").ValidationSession = null;
         defer if (validation_session) |session| session.deinit();
         var slices: usize = 0;
+        const rewrite_slice_deadline = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms;
         while (slices < 64) : (slices += 1) {
             // Persist only verified prefix progress. The phase is that of the
             // receipt, even if its final acknowledgement advanced metadata.
@@ -15966,8 +15975,17 @@ pub const ApiHttpServer = struct {
                 owner_cursor = 0;
             }
             if (is_rewrite and (phase == .preparing_sources or phase == .importing)) {
-                try @import("relational_rewrite_driver.zig").step(self, &job, worker_state.value, context);
-                return error.RestoreStagingYield;
+                const driver = @import("relational_rewrite_driver.zig");
+                const before = worker_state.value.rewrite_progress;
+                driver.step(self, &job, &worker_state.value, context) catch |err| {
+                    if (restore_staging_diagnostic_gate.admit(platform_time.monotonicNs())) std.log.warn("restore rewrite retry staging={s} phase={s} owner={d} err={s}", .{ @tagName(phase), @tagName(worker_state.value.rewrite_progress.phase), worker_state.value.rewrite_progress.owner, @errorName(err) });
+                    return @as(anyerror![]u8, err);
+                };
+                rewrite_diagnostic = worker_state.value.rewrite_progress;
+                // Bound CPU/IO work and yield on a pending full owner pass,
+                // not after every successful, durably checkpointed owner step.
+                if (platform_time.monotonicNs() >= rewrite_slice_deadline or driver.completedPendingPass(before, worker_state.value.rewrite_progress)) return error.RestoreStagingYield;
+                continue;
             }
             if (is_rewrite and phase == .canceling and job.value.plan.preparing_sources) {
                 // A pre-pin draft has no target owner to contact. Cancellation

@@ -119,8 +119,6 @@ pub const JoinReadView = struct {
 };
 
 pub const TableReadSource = struct {
-    pub const integrity_catalog_lookup_key = "\x00relational_integrity_catalog";
-
     /// Read authoritative generations through the same routed ownership/read
     /// barrier as point reads. Empty is the exact first-range logical key;
     /// transport substitutes a path placeholder only after selecting its owner.

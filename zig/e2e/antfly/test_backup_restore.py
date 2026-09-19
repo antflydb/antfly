@@ -27,6 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 import requests
@@ -1736,11 +1737,13 @@ def _exercise_online_document_merge(
     leader = cluster.metadata_stable_leader_id(timeout_s=20.0)
     assert leader is not None, cluster.debug_logs()
     snapshot = cluster.metadata_snapshot(leader - 1)
-    table_id = next(
-        int(value["table_id"])
+    catalog_table = next(
+        value
         for value in snapshot["tables"]
-        if value["name"] == table_name
+        if value.get("logical_name", value["name"]) == table_name
     )
+    table_id = int(catalog_table["table_id"])
+    physical_name = quote(catalog_table["name"], safe="")
     ranges = sorted(
         (value for value in snapshot["ranges"] if int(value["table_id"]) == table_id),
         key=lambda value: value["start_key"],
@@ -1755,7 +1758,7 @@ def _exercise_online_document_merge(
         assert expected_range["start_key"] <= key
         assert expected_range["end_key"] is None or key < expected_range["end_key"]
     accepted = session.post(
-        f"{cluster.metadata_admin_urls[leader - 1]}/internal/v1/tables/{table_name}/merge",
+        f"{cluster.metadata_admin_urls[leader - 1]}/internal/v1/tables/{physical_name}/merge",
         headers=internal_service_headers(),
         json={
             "donor_group_id": donor,

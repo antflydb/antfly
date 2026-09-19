@@ -27,6 +27,7 @@ fn applyRestoreReplica(db: *db_mod.DB, request: @import("types.zig").BatchReques
 
 test "relational integrity restore follower repairs projection and CHECK debt before validated receipt" {
     const alloc = std.testing.allocator;
+    const row_count = 600;
     const restore = @import("restore_staging.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -42,7 +43,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
         var source = try db_mod.DB.open(alloc, source_path, source_options);
         defer source.close();
         try source.setSchemaJson(alloc, schema);
-        var rows: [600]@import("types.zig").BatchWrite = undefined;
+        var rows: [row_count]@import("types.zig").BatchWrite = undefined;
         for (&rows, 0..) |*row, n| row.* = .{ .key = try std.fmt.allocPrint(owned, "row-{d:0>4}", .{n}), .value = "{\"id\":1,\"text\":\"keyword\"}" };
         try source.batch(.{ .writes = &rows });
     }
@@ -100,6 +101,24 @@ test "relational integrity restore follower repairs projection and CHECK debt be
             if (page.phase == .imported) break;
         }
         try std.testing.expect(crashed);
+        // Model the coordinator's already-committed semantic CHECK coverage.
+        // This fixture exercises loss of replica-local projection proof, not
+        // the distributed activation protocol (covered separately below).
+        {
+            const activation = @import("relational_integrity_activation.zig");
+            var txn = try target.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            var compiled = try catalog.decode(alloc, try txn.get(catalog.key));
+            defer compiled.deinit();
+            var coverage = try activation.status(&txn, compiled);
+            try std.testing.expectEqual(.check, coverage.phase);
+            coverage.state = .enforced;
+            coverage.rows_scanned = row_count;
+            const encoded_coverage = try coverage.encode(alloc);
+            defer alloc.free(encoded_coverage);
+            try txn.put(activation.key, encoded_coverage);
+            try txn.commit();
+        }
         // CHECK coverage is disposable replica-local proof. Losing it must
         // make bounded progress on replay, never a semantic Raft rejection.
         try target.core.store.putBatch(&.{}, &.{@import("relational_constraint_jobs.zig").progress_key});
@@ -109,7 +128,10 @@ test "relational integrity restore follower repairs projection and CHECK debt be
         if (ha) try std.testing.expectEqual(index, try target.haAppliedReplicationLsn()) else try std.testing.expectEqual(index, (try target.raftAppliedEntry()).?.index);
         try std.testing.expectError(error.RestoreStagingInProgress, target.lookup(alloc, "row-0000", .{}));
         var validated = false;
-        for (0..32) |_| {
+        // CHECK repair is time-sliced: a loaded runner can process only one
+        // row per retry. Bound work by the input size plus exhaustion/receipt
+        // probes, not by assuming a fixed number of rows fits into 5ms.
+        for (0..row_count + 2) |_| {
             applyRestoreReplica(&target, validate, validate_index, ha) catch |err| switch (err) {
                 error.RestoreProjectionCatchUpPending => continue,
                 else => return err,
@@ -117,11 +139,25 @@ test "relational integrity restore follower repairs projection and CHECK debt be
             validated = true;
             break;
         }
+        if (!validated) {
+            var read = try target.core.store.beginReadTxn();
+            defer read.abort();
+            var view = target.core.acquireSchemaView().?;
+            defer view.release();
+            const status = try @import("relational_constraint_jobs.zig").status(&read, view);
+            std.debug.print("restore CHECK state={s} rows={d}/{d} cursor={s}\n", .{ @tagName(status.state), status.rows_scanned, row_count, status.cursor });
+            const debt = try target.listDerivedReplayDebt(alloc);
+            defer {
+                for (debt) |*entry| entry.deinit(alloc);
+                alloc.free(debt);
+            }
+            std.debug.print("restore projection debt: {any}\n", .{debt});
+        }
         try std.testing.expect(validated);
         try applyRestoreReplica(&target, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } } }, validate_index + 1, ha);
         var result = try target.search(alloc, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "text", .text = "keyword" } }, .limit = 1 });
         defer result.deinit();
-        try std.testing.expectEqual(@as(u32, 600), result.total_hits);
+        try std.testing.expectEqual(@as(u32, row_count), result.total_hits);
     }
 }
 
@@ -1108,7 +1144,12 @@ test "relational integrity DB activation backfills atomically gates writers and 
             defer oversized.deinit();
             try std.testing.expectEqual(.invalid, oversized.progress.state);
             try std.testing.expectEqualStrings("RelationalRowResultTooLarge", oversized.progress.failure);
-            try std.testing.expectEqual(@as(usize, 0), oversized.rows.rows.len);
+            // A failed row retains its exact primary observation for the
+            // failure CAS, without claiming any successful scan coverage.
+            try std.testing.expectEqual(@as(usize, 1), oversized.rows.rows.len);
+            try std.testing.expectEqualStrings("a", oversized.rows.rows[0].key);
+            try std.testing.expect(oversized.rows.rows[0].expected_content_digest != null);
+            try std.testing.expectEqual(@as(usize, 0), oversized.rows.records_examined);
             try std.testing.expectEqual(@as(usize, 0), oversized.progress.cursor.len);
             try std.testing.expectEqual(@as(u64, 0), oversized.progress.rows_scanned);
             const failure_txn = try db.beginTransactionWithId(@splat(50), 200);

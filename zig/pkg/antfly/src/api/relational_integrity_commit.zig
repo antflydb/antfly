@@ -675,7 +675,10 @@ const Builder = struct {
         validator_owned = false;
         var view: registry.SchemaView = .{ .epoch = epoch };
         errdefer view.release();
-        var response = (try self.lookup(name, reads.TableReadSource.integrity_catalog_lookup_key, .{ .relational_integrity_catalog = true })) orelse return error.IntegrityCatalogUnavailable;
+        // Route by the exact first-range boundary, like integrityCatalog().
+        // Private reads carry their operation in options, never a synthetic
+        // document key that can select a different owner or transport path.
+        var response = (try self.lookup(name, "", .{ .relational_integrity_catalog = true })) orelse return error.IntegrityCatalogUnavailable;
         defer response.deinit(self.alloc);
         var envelope = try std.json.parseFromSlice(struct { catalog: []const u8, schema_version: u32, table_id: []const u8 }, self.alloc, response.json, .{});
         defer envelope.deinit();
@@ -1502,9 +1505,12 @@ test "distributed txn activation projection validates selected fields without fu
     defer alloc.free(catalog_payload);
     const Fake = struct {
         catalog: []const u8,
-        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, opts: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (opts.relational_integrity_catalog) return .{ .json = try allocator.dupe(u8, self.catalog), .version = 0 };
+            if (opts.relational_integrity_catalog) {
+                try std.testing.expectEqualStrings("", key);
+                return .{ .json = try allocator.dupe(u8, self.catalog), .version = 0 };
+            }
             return error.UnexpectedCall;
         }
         fn scan(_: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, _: []const u8, opts: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.ScanResponse {
