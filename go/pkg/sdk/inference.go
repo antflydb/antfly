@@ -414,7 +414,9 @@ func (c *InferenceClient) Rerank(ctx context.Context, model string, query string
 		Prompts: prompts,
 	}
 
-	resp, err := c.client.RerankPromptsWithResponse(ctx, req)
+	// No Accept parameters: this client reads the JSON body, not the
+	// negotiated numeric frame.
+	resp, err := c.client.RerankPromptsWithResponse(ctx, nil, req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}

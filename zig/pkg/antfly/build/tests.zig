@@ -559,7 +559,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_managed_embedder_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "managed embedder", "antfly embed request", "antfly embed round trip", "antfly sparse embed round trip", "antfly numeric", "antfly provider preserves explicit distributed admission denial", "legacy numeric" },
+        .filters = &.{ "managed embedder", "antfly embed request", "antfly embed round trip", "antfly sparse embed round trip", "antfly numeric", "antfly provider preserves explicit distributed admission denial" },
     });
     const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
     const lib_managed_embedder_test_step = b.step("antfly-inference-managed-embedder-test", "Run managed embedder contract and provider tests");

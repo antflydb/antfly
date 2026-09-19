@@ -89,7 +89,10 @@ export function isTransientCapacityError(
 }
 
 export class InferenceClient {
-  private client: Client<paths>;
+  // The embedding and reranking operations also describe a negotiated binary
+  // response; naming the media type keeps each `data` typed as its JSON body,
+  // which is what the Accept header below asks for.
+  private client: Client<paths, "application/json">;
   private baseUrl: string;
   private headers: Record<string, string>;
   private maxBinaryResponseBytes: number;
@@ -106,7 +109,7 @@ export class InferenceClient {
       throw new Error("maxBinaryResponseBytes must be a positive safe integer");
     }
 
-    this.client = createClient<paths>({
+    this.client = createClient<paths, "application/json">({
       baseUrl: this.baseUrl,
       headers: {
         ...this.headers,
