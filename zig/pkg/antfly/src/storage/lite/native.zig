@@ -2474,7 +2474,13 @@ pub const NativeFile = struct {
     }
 
     pub fn getIndexCatalogRecordAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, key: []const u8, checkpoint: CheckpointSlot) !?[]u8 {
-        return try self.getCatalogRecordFromRootAtCheckpointAlloc(allocator, .index, key, checkpoint);
+        return try self.getIndexCatalogRecordLimitedAtCheckpointAlloc(allocator, key, std.math.maxInt(usize), checkpoint);
+    }
+
+    /// Enforce the caller's limit against catalog metadata before allocating
+    /// or reading any external payload, within the same pinned checkpoint.
+    pub fn getIndexCatalogRecordLimitedAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, key: []const u8, max_bytes: usize, checkpoint: CheckpointSlot) !?[]u8 {
+        return try self.getCatalogRecordFromRootAtCheckpointAlloc(allocator, .index, key, checkpoint, max_bytes);
     }
 
     pub fn getIndexCatalogRecordSize(self: *NativeFile, key: []const u8) !?usize {
@@ -2517,7 +2523,7 @@ pub const NativeFile = struct {
             if (entry.is_delete) return null;
             return try self.catalogEntryValueAtCheckpointAlloc(allocator, entry, self.activeCheckpoint());
         }
-        return try self.getCatalogRecordFromRootAtCheckpointAlloc(allocator, root, key, self.activeCheckpoint());
+        return try self.getCatalogRecordFromRootAtCheckpointAlloc(allocator, root, key, self.activeCheckpoint(), std.math.maxInt(usize));
     }
 
     fn getCatalogRecordFromRootAtCheckpointAlloc(
@@ -2526,6 +2532,7 @@ pub const NativeFile = struct {
         root: CatalogRoot,
         key: []const u8,
         checkpoint: CheckpointSlot,
+        max_bytes: usize,
     ) !?[]u8 {
         const page_id = (try self.lookupCatalogPage(checkpoint, root, key)) orelse return null;
         var scratch: [65536]u8 = undefined;
@@ -2533,6 +2540,8 @@ pub const NativeFile = struct {
         const entry = try decodeCatalogEntry(payload);
         if (!std.mem.eql(u8, entry.key, key)) return error.InvalidNativePageChain;
         if (entry.is_delete) return null;
+        const value_len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+        if (value_len > max_bytes) return error.FileTooBig;
         return try self.catalogEntryValueAtCheckpointAlloc(allocator, entry, checkpoint);
     }
 
@@ -8423,7 +8432,7 @@ test "lite native catalog point lookups skip history without allocating" {
         try std.testing.expectEqual(@as(?usize, 8), try file.getCatalogRecordSizeFromRootAtCheckpoint(.index, "target", file.activeCheckpoint()));
         try std.testing.expectEqual(@as(?usize, null), try file.getCatalogRecordSizeFromRootAtCheckpoint(.index, "missing", file.activeCheckpoint()));
         try std.testing.expectEqual(@as(?usize, null), try file.getCatalogRecordSizeFromRootAtCheckpoint(.index, "deleted", file.activeCheckpoint()));
-        const value = (try file.getCatalogRecordFromRootAtCheckpointAlloc(allocator, .index, "target", pinned)).?;
+        const value = (try file.getIndexCatalogRecordAtCheckpointAlloc(allocator, "target", pinned)).?;
         defer allocator.free(value);
         try std.testing.expectEqualStrings("original", value);
         try std.testing.expect(!failing.has_induced_failure);

@@ -127,7 +127,11 @@ The implementation now consists of:
   merging and redistribution. Historical records and older checkpoint roots
   remain intact, but retired filenames no longer accumulate directory-scan
   work. Directory listing and subtree deletion seek the live catalog tree at a
-  path prefix instead of replaying mutation history. Listing pins a checkpoint
+  path prefix instead of replaying mutation history. Subtree deletion scans one
+  immutable root and flushes private batches of at most 64 keys or 16 KiB of
+  key bytes (a larger individual key is processed alone). Keys and editor scratch
+  are released between batches; all batches publish atomically, and an error
+  rolls the whole deletion back. Listing pins a checkpoint
   and holds the generation read lock, allowing ordinary commits to continue.
   In validated namespaces, immediate-file listings seek past each nested
   directory's exclusive prefix bound before reading descendant catalog records.
@@ -135,6 +139,8 @@ The implementation now consists of:
   nested file count. The unscoped adapter retains its accepted repeated/trailing
   separators and uses a general prefix scan with dirname filtering, so existing
   logical keys keep their listing behavior without normalization or migration.
+  Size-limited file reads validate the value length in the pinned catalog record
+  before allocating or reading its payload, including external values.
   External catalog values use a 64-way immutable extent tree with byte lengths
   on each child. Appends retain one unfinished node per height, fill the partial
   tail leaf, and seal suffix subtrees once. Existing full subtrees remain
@@ -1062,6 +1068,11 @@ returns borrowed values. Sorted multi-reads visit each relevant index node once,
 then order record references by physical page so a packed page is read and
 checksummed once for all requested records on it. Result order remains the
 caller's key order; missing keys and duplicate requests retain their semantics.
+Single and sorted transaction reads share an owned cache of immutable snapshot
+hits and misses. Duplicate keys and overlapping batches reuse the same borrowed
+payload until transaction teardown; pending writes take precedence without
+invalidating previously borrowed values. Retained read memory depends on the
+unique read set, rather than the number of read calls.
 
 The page cache uses incremental CLOCK eviction. Incoming payload pages start
 cold; reads promote pages and navigation metadata gets additional chances.
@@ -1217,3 +1228,14 @@ disabled. Lazy resolution reduces a seek from 298 logical page reads and
 bound page writes and cursor scratch, and cover forward/reverse scans, pinned
 roots, complete integrity audits, append visibility barriers, extent boundaries,
 private spills, allocation failures, and streaming-write rollback.
+
+A 16,384-file subtree deletion with 128-byte filenames uses 408,723 bytes of
+extra peak heap with private batches, down from 9,150,685 bytes when retaining
+the entire key set and editor. Logical page reads rise from 2,953 to 4,373 as
+each bounded batch reopens its edit path. Sixteen transaction reads of one
+256 KiB value retain 262,435 bytes and perform 68 logical reads, compared with
+4,194,672 bytes and 1,088 reads before snapshot result sharing. A 1 KiB-limited
+read of a 4 MiB index file now rejects with three logical reads and no payload
+allocation; previously it allocated the whole payload and performed 1,053 reads.
+These measurements disable page caching; regressions enforce memory and I/O
+bounds, pinned snapshot semantics, and rollback after private deletion flushes.

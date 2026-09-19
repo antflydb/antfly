@@ -609,7 +609,9 @@ pub const Txn = struct {
     read_only: bool = true,
     writer_reserved: bool = false,
     prefix: []const u8 = "",
-    owned_reads: std.ArrayListUnmanaged([]u8) = .empty,
+    // Immutable snapshot hits and misses are owned once per transaction.
+    // Pending mutations take precedence without invalidating borrowed values.
+    snapshot_reads: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     read_generation: ?*ReadGeneration = null,
     checkpoint: native.CheckpointSlot = .{},
 
@@ -733,48 +735,65 @@ pub const Txn = struct {
         if (self.pending_tree.getEntryFor(lookup_key).node) |node| {
             return self.pending.items[pendingNode(node).ordinal].value orelse error.NotFound;
         }
-        const file = try self.readFile();
-        const value = try file.getDocumentAtCheckpointAlloc(self.allocator, self.checkpoint, lookup_key);
-        const owned = value orelse return error.NotFound;
-        errdefer self.allocator.free(owned);
-        try self.owned_reads.append(self.allocator, owned);
-        return owned;
+        if (self.snapshot_reads.get(lookup_key)) |cached| return cached orelse error.NotFound;
+        const value = blk: {
+            const owned_key = try self.allocator.dupe(u8, lookup_key);
+            errdefer self.allocator.free(owned_key);
+            try self.snapshot_reads.ensureUnusedCapacity(self.allocator, 1);
+            const loaded = try (try self.readFile()).getDocumentAtCheckpointAlloc(self.allocator, self.checkpoint, lookup_key);
+            self.snapshot_reads.putAssumeCapacity(owned_key, loaded);
+            break :blk loaded;
+        };
+        return value orelse error.NotFound;
     }
 
     pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
+        errdefer @memset(values, null);
         for (keys, 0..) |key, i| {
             if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
         }
-        const file = try self.readFile();
         const alloc = self.allocator;
         var misses: std.ArrayList([]const u8) = .empty;
         defer {
-            if (self.prefix.len > 0) for (misses.items) |key| alloc.free(key);
+            for (misses.items) |key| alloc.free(key);
             misses.deinit(alloc);
         }
         var positions: std.ArrayList(usize) = .empty;
         defer positions.deinit(alloc);
-        try misses.ensureTotalCapacity(alloc, keys.len);
-        try positions.ensureTotalCapacity(alloc, keys.len);
-        for (keys, 0..) |key, i| {
-            const full = try self.prefixedKey(key);
+        var i: usize = 0;
+        while (i < keys.len) {
+            var end = i + 1;
+            while (end < keys.len and std.mem.eql(u8, keys[i], keys[end])) : (end += 1) {}
+            const full = try self.prefixedKey(keys[i]);
+            defer if (self.prefix.len > 0) alloc.free(full);
             if (self.pending_tree.getEntryFor(full).node) |node| {
-                if (self.prefix.len > 0) alloc.free(full);
-                values[i] = self.pending.items[pendingNode(node).ordinal].value;
+                @memset(values[i..end], self.pending.items[pendingNode(node).ordinal].value);
+            } else if (self.snapshot_reads.get(full)) |cached| {
+                @memset(values[i..end], cached);
             } else {
-                misses.appendAssumeCapacity(full);
+                try misses.ensureUnusedCapacity(alloc, 1);
+                try positions.ensureUnusedCapacity(alloc, 1);
+                const owned_key = try alloc.dupe(u8, full);
+                misses.appendAssumeCapacity(owned_key);
                 positions.appendAssumeCapacity(i);
             }
+            i = end;
         }
+        if (misses.items.len == 0) return;
+        // Reserve all cache slots before acquiring payloads. Once the batch
+        // succeeds, transferring key/value ownership cannot fail.
+        try self.snapshot_reads.ensureUnusedCapacity(alloc, std.math.cast(u32, misses.items.len) orelse return error.RecordTooLarge);
         const loaded = try alloc.alloc(?[]const u8, misses.items.len);
         defer alloc.free(loaded);
-        try self.owned_reads.ensureUnusedCapacity(alloc, misses.items.len);
-        try file.getDocumentsAtCheckpointAlloc(alloc, self.checkpoint, misses.items, loaded);
-        for (loaded, positions.items) |value, i| {
-            values[i] = value;
-            if (value) |bytes| self.owned_reads.appendAssumeCapacity(@constCast(bytes));
+        try (try self.readFile()).getDocumentsAtCheckpointAlloc(alloc, self.checkpoint, misses.items, loaded);
+        for (misses.items, loaded, positions.items) |*key, value, position| {
+            self.snapshot_reads.putAssumeCapacity(key.*, value);
+            key.* = "";
+            var end = position + 1;
+            while (end < keys.len and std.mem.eql(u8, keys[position], keys[end])) : (end += 1) {}
+            @memset(values[position..end], value);
         }
     }
 
@@ -851,9 +870,13 @@ pub const Txn = struct {
     }
 
     fn freeOwnedReads(self: *Txn) void {
-        for (self.owned_reads.items) |value| self.allocator.free(value);
-        self.owned_reads.deinit(self.allocator);
-        self.owned_reads = .empty;
+        var entries = self.snapshot_reads.iterator();
+        while (entries.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            if (entry.value_ptr.*) |value| self.allocator.free(value);
+        }
+        self.snapshot_reads.deinit(self.allocator);
+        self.snapshot_reads = .empty;
     }
 
     fn readFile(self: *Txn) !*native.NativeFile {
@@ -2807,4 +2830,154 @@ test "lite replay readers propagate corruption malformed keys and callback error
     try store.file.putDocument(second ++ "bad", "malformed");
     ctx.stop = false;
     try std.testing.expectError(error.InvalidReplayEntryKey, store.forEachReplayLaneFrom(internal_keys.replay_all_kind, 1, 0, &ctx, Context.handle));
+}
+
+test "lite transaction snapshot cache shares hits misses and sorted duplicate reads" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "", "scope\x00" }) |prefix| {
+        var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "snapshot-read-cache.aflite");
+        defer a.free(path);
+        var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        defer store.close();
+        const value = try a.alloc(u8, 256 * 1024);
+        defer a.free(value);
+        @memset(value, 'v');
+        {
+            var writer = try Txn.openWriteWithPrefix(&store, prefix);
+            errdefer writer.abort();
+            try writer.put("hit", value);
+            try writer.put("other", "second");
+            try writer.commit();
+        }
+        var read = try Txn.openReadWithPrefix(&store, prefix);
+        defer read.abort();
+        const file = try read.readFile();
+        file.page_cache_enabled.store(false, .monotonic);
+        const baseline = budget.live;
+        budget.peak = baseline;
+        budget.limit = baseline + 512 * 1024;
+        defer budget.limit = std.math.maxInt(usize);
+        const before = file.test_page_reads.load(.monotonic);
+        const first = try read.get("hit");
+        for (0..16) |_| {
+            const again = try read.get("hit");
+            try std.testing.expect(first.ptr == again.ptr);
+        }
+        try std.testing.expectEqualSlices(u8, value, first);
+        try std.testing.expect(file.test_page_reads.load(.monotonic) - before < 80);
+        const keys = [_][]const u8{ "hit", "hit", "missing", "missing", "other", "other" };
+        var values: [keys.len]?[]const u8 = undefined;
+        try read.getManySorted(&keys, &values);
+        try std.testing.expect(values[0].?.ptr == first.ptr and values[1].?.ptr == first.ptr);
+        try std.testing.expect(values[2] == null and values[3] == null);
+        try std.testing.expectEqualStrings("second", values[4].?);
+        try std.testing.expect(values[4].?.ptr == values[5].?.ptr);
+        const cached_reads = file.test_page_reads.load(.monotonic);
+        try std.testing.expectError(error.NotFound, read.get("missing"));
+        try std.testing.expectError(error.NotFound, read.get("missing"));
+        try std.testing.expect((try read.get("other")).ptr == values[4].?.ptr);
+        try read.getManySorted(&keys, &values);
+        try std.testing.expectEqual(cached_reads, file.test_page_reads.load(.monotonic));
+        try std.testing.expect(budget.peak - baseline < 512 * 1024);
+    }
+}
+
+test "lite transaction snapshot cache preserves pending versions and pinned generations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "snapshot-cache-generations.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    try store.file.putDocument("key", "old");
+    try store.file.putDocument("uncached", "old-generation");
+    var pinned = try store.beginRead();
+    defer pinned.abort();
+    const old = try pinned.get("key");
+    try std.testing.expectError(error.NotFound, pinned.get("missing"));
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        const borrowed = try write.get("key");
+        try std.testing.expectError(error.NotFound, write.get("missing"));
+        try write.put("key", "new");
+        try write.put("missing", "created");
+        const pending = try write.get("key");
+        try write.put("key", "newest");
+        try std.testing.expectEqualStrings("old", borrowed);
+        try std.testing.expectEqualStrings("new", pending);
+        var values: [2]?[]const u8 = undefined;
+        try write.getManySorted(&.{ "key", "missing" }, &values);
+        try std.testing.expectEqualStrings("newest", values[0].?);
+        try std.testing.expectEqualStrings("created", values[1].?);
+        try write.delete("missing");
+        try write.getManySorted(&.{ "key", "missing" }, &values);
+        try std.testing.expect(values[1] == null);
+        try write.put("missing", "published");
+        try write.commit();
+    }
+    _ = try store.vacuum();
+    try std.testing.expectEqualStrings("old", old);
+    try std.testing.expect((try pinned.get("key")).ptr == old.ptr);
+    try std.testing.expectError(error.NotFound, pinned.get("missing"));
+    try std.testing.expectEqualStrings("old-generation", try pinned.get("uncached"));
+    var fresh = try store.beginRead();
+    defer fresh.abort();
+    try std.testing.expectEqualStrings("newest", try fresh.get("key"));
+    try std.testing.expectEqualStrings("published", try fresh.get("missing"));
+}
+
+test "lite transaction snapshot cache allocation failures release ownership and retry" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "snapshot-cache-failures.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    {
+        var setup = try Txn.openWriteWithPrefix(&store, "scope\x00");
+        errdefer setup.abort();
+        try setup.put("a", "first");
+        try setup.put("b", &([_]u8{'v'} ** 8192));
+        try setup.commit();
+    }
+    var exhausted = false;
+    for (0..128) |fail_index| {
+        var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+        var failing = std.testing.FailingAllocator.init(budget.allocator(), .{ .fail_index = fail_index });
+        {
+            var read = try Txn.openReadWithPrefix(&store, "scope\x00");
+            read.allocator = failing.allocator();
+            defer read.abort();
+            const Run = struct {
+                fn apply(txn: *Txn) !void {
+                    try std.testing.expectEqualStrings("first", try txn.get("a"));
+                    var values: [5]?[]const u8 = undefined;
+                    try txn.getManySorted(&.{ "a", "b", "b", "missing", "missing" }, &values);
+                    try std.testing.expectEqual(@as(usize, 8192), values[1].?.len);
+                    try std.testing.expect(values[1].?.ptr == values[2].?.ptr);
+                    try std.testing.expect(values[3] == null and values[4] == null);
+                    if (txn.get("missing")) |_| return error.TestUnexpectedResult else |err| {
+                        if (err != error.NotFound) return err;
+                    }
+                }
+            };
+            if (Run.apply(&read)) |_| {
+                exhausted = !failing.has_induced_failure;
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                failing.fail_index = std.math.maxInt(usize);
+                failing.resize_fail_index = std.math.maxInt(usize);
+                try Run.apply(&read);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        if (exhausted) break;
+    }
+    try std.testing.expect(exhausted);
 }
