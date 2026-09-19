@@ -29351,11 +29351,20 @@ pub const DB = struct {
         const started_ns = platform_time.monotonicNs();
         const before = self.enrichmentThroughputSnapshot();
         defer self.logRunUntilIdleSummary(started_ns, before);
-        try self.runUntilIdleWithReplayDrainOptions(.{
+        self.runUntilIdleWithReplayDrainOptions(.{
             .wait_for_enrichment_retries = true,
             .unbounded_enrichment_wait = true,
             .no_progress_timeout_ns = self.run_until_idle_no_progress_timeout_ns,
-        });
+        }) catch |err| {
+            // Embedded callers only see the mapped C ABI code (most of these
+            // collapse to ANTFLY_INTERNAL), so name the error here where the
+            // process log is the only diagnostic left.
+            std.log.warn("runUntilIdle failed after {d} ms: {s}", .{
+                (platform_time.monotonicNs() -| started_ns) / std.time.ns_per_ms,
+                @errorName(err),
+            });
+            return err;
+        };
     }
 
     const EnrichmentThroughputSnapshot = struct {

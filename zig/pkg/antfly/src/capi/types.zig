@@ -369,7 +369,12 @@ pub fn mapError(err: anyerror) ErrorCode {
         // matches `managed_embedder.isOperationalEmbeddingProbeError`'s
         // retryable classification.
         error.EmbeddingProbeUnavailable => .busy,
-        else => .internal,
+        else => {
+            // The generic code is indistinguishable from a bug on the caller's
+            // side of the ABI, so leave the concrete name in the process log.
+            std.log.warn("unmapped error crossing the C ABI as ANTFLY_INTERNAL: {s}", .{@errorName(err)});
+            return .internal;
+        },
     };
 }
 
