@@ -758,8 +758,8 @@ test "lite native index storage handles large files rename and delete tree" {
 
     const before_rename_page_count = docs.file.activeCheckpoint().page_count;
     try storage.renameAbsolute("/dense/a/blob", "/dense/a/blob2");
-    // Two records, one final tree node, descriptor and free map.
-    try std.testing.expectEqual(before_rename_page_count + 5, docs.file.activeCheckpoint().page_count);
+    // Two packed records share one page, plus tree node, descriptor and free map.
+    try std.testing.expectEqual(before_rename_page_count + 4, docs.file.activeCheckpoint().page_count);
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/blob", 8));
     const after_rename_check = try docs.file.check();
     try std.testing.expect(after_rename_check.valid);
