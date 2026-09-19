@@ -6,6 +6,8 @@
 //! foreground admission. Unsupported providers and resource shapes fail closed.
 const std = @import("std");
 const builtin = @import("builtin");
+pub const guard = @import("completion_guard.zig");
+pub const max_slots = guard.max_slots;
 const codec = @import("completion_slot.zig");
 const domains = @import("completion_allocator.zig");
 const storage_io = @import("storage_io.zig");
@@ -24,6 +26,9 @@ pub const guard_filename = "completion-slot.guard";
 pub var test_after_wal: ?*const fn () bool = null;
 pub var test_after_manifest: ?*const fn () bool = null;
 pub const storage_key = "\x00\x00__metadata__:completion_slot_v1";
+pub const guard_filenames = [_][]const u8{ guard_filename, "completion-slot-1.guard", "completion-slot-2.guard", "completion-slot-3.guard" };
+pub const storage_keys = [_][]const u8{ storage_key, storage_key ++ "_1", storage_key ++ "_2", storage_key ++ "_3" };
+pub const applied_keys = [_][]const u8{ applied_key, applied_key ++ "_1", applied_key ++ "_2", applied_key ++ "_3" };
 pub const foreground_bytes = 256 * 1024;
 pub const foreground_entries = 2048;
 pub const recovery_wal_bytes = 1024 * 1024;
@@ -44,6 +49,9 @@ pub const Values = struct {
     replay_sequence: u64,
     shared_ledger_count: u64,
     shared_ledger_bytes: u64,
+    /// Supplied only by the applying Raft runtime, never by transaction JSON.
+    raft_term: u64 = 0,
+    raft_index: u64 = 0,
 };
 
 pub fn Slot(comptime Backend: type) type {
@@ -54,10 +62,15 @@ pub fn Slot(comptime Backend: type) type {
         scratch: *domains.Arena,
         descriptor: codec.OwnedDescriptor,
         encoded: []u8,
+        guard_encoded: []u8,
+        cohort: guard.Info,
+        retired: bool = false,
+        run_paths: [max_slots]?[]u8 = @splat(null),
         io: *storage_io.NativeCompletionIo,
         wal_credit: u64 = 0,
         memory_pin: resources.ObserverMetadataPin,
         wal_pin: resources.ObserverMetadataPin,
+        owns_observer_pins: bool,
         guard_path: []u8,
         wal_append_start: u64,
         replayed_wal_bytes: u64 = 0,
@@ -102,19 +115,22 @@ pub fn Slot(comptime Backend: type) type {
             self.io.deinit() catch unreachable;
             const manager = self.wal_pin.manager;
             manager.observeUsage(.lsm_wal_retention, &self.wal_credit, 0);
-            self.wal_pin.release() catch unreachable;
-            self.memory_pin.release() catch unreachable;
+            if (self.owns_observer_pins) {
+                self.wal_pin.release() catch unreachable;
+                self.memory_pin.release() catch unreachable;
+            }
             alloc.free(self.guard_path);
             self.descriptor.deinit();
             alloc.free(self.encoded);
+            alloc.free(self.guard_encoded);
             alloc.free(self.journal_path);
-            alloc.free(self.run_path);
+            for (self.run_paths) |path| if (path) |owned| alloc.free(owned);
             alloc.destroy(self);
             scratch_domain.release();
             pub_domain.release();
         }
 
-        pub fn create(backend: *Backend, encoded: []const u8, restored: bool) !*Self {
+        pub fn create(backend: *Backend, encoded: []const u8, restored: bool, cohort: guard.Info) !*Self {
             const native = backend.storage_owner orelse return error.UnsupportedCompletionBackend;
             const root = backend.root_dir orelse return error.UnsupportedCompletionBackend;
             const manager = backend.options.resource_manager orelse return error.CompletionResourceManagerRequired;
@@ -133,7 +149,7 @@ pub fn Slot(comptime Backend: type) type {
             if (backend.manifest_recovery_required) return error.RecoveryRequired;
             if (backend.bulkIngestActive() or backend.activeImmutableMemtableCount() != 0 or
                 backend.immutable_flush_build_in_flight or backend.manifest_publish_in_flight or
-                backend.manifest_checkpoint_build_in_flight or backend.runs.count() > (if (restored) @as(usize, 65) else 64) or
+                backend.manifest_checkpoint_build_in_flight or backend.runs.count() > @as(usize, cohort.initial_runs) + cohort.capacity() or
                 backend.manifest_journal.sequence == null or backend.manifest_journal.active_segment == 0)
                 return error.CompletionReservationBusy;
             if (backend.mutable.estimatedLogicalBytes() > foreground_bytes or backend.mutable.entryCount() > foreground_entries)
@@ -148,19 +164,19 @@ pub fn Slot(comptime Backend: type) type {
             @memcpy(credit_key[0..credit_prefix.len], credit_prefix);
             @memcpy(credit_key[credit_prefix.len..], &txn_id);
             const sibling_namespace: ?[]const u8 = if (checked.descriptor.namespace == null) "docs" else null;
-            if (backend.getMergedWithMutable(&backend.mutable, .{ .name = sibling_namespace }, storage_key)) |_| return error.InvalidCompletionSlot else |err| {
+            if (backend.getMergedWithMutable(&backend.mutable, .{ .name = sibling_namespace }, storage_keys[cohort.index])) |_| return error.InvalidCompletionSlot else |err| {
                 if (err != error.NotFound) return err;
             }
-            const baseline_slot_present = if (backend.getMergedWithMutable(&backend.mutable, .{ .name = checked.descriptor.namespace }, storage_key)) |stored| blk: {
+            const baseline_slot_present = if (backend.getMergedWithMutable(&backend.mutable, .{ .name = checked.descriptor.namespace }, storage_keys[cohort.index])) |stored| blk: {
                 if (!std.mem.eql(u8, stored, encoded)) return error.InvalidCompletionSlot;
                 break :blk true;
             } else |err| switch (err) {
                 error.NotFound => false,
                 else => return err,
             };
-            const baseline_applied = try captureBaseline(backend, checked.descriptor.namespace, applied_key, 16);
+            const baseline_applied = try captureBaseline(backend, checked.descriptor.namespace, applied_keys[cohort.index], 16);
             const manifest_completed = !baseline_slot_present and if (baseline_applied) |marker| std.mem.eql(u8, &marker, &txn_id) else false;
-            if (backend.runs.count() > 64 and !manifest_completed) return error.CompletionReservationBusy;
+            if (cohort.legacy and backend.runs.count() > 64 and !manifest_completed) return error.CompletionReservationBusy;
             if (!restored and manifest_completed) return error.InvalidCompletionSlot;
             const baseline_record = try captureBaseline(backend, checked.descriptor.namespace, &record_key, 53);
             const baseline_credit = try captureBaseline(backend, checked.descriptor.namespace, &credit_key, 16);
@@ -176,14 +192,19 @@ pub fn Slot(comptime Backend: type) type {
             errdefer descriptor.deinit();
             const wire = try alloc.dupe(u8, encoded);
             errdefer alloc.free(wire);
-            var memory_pin = try manager.pinObserverMetadata(.lsm_in_memory_state, &backend.tracked_in_memory_state_bytes);
-            errdefer memory_pin.release() catch unreachable;
-            var wal_pin = try manager.pinObserverMetadata(.lsm_wal_retention, &backend.tracked_wal_retention_bytes);
-            errdefer wal_pin.release() catch unreachable;
+            const guard_wire = if (cohort.legacy) try alloc.dupe(u8, encoded) else try guard.encode(alloc, cohort, encoded);
+            errdefer alloc.free(guard_wire);
+            // The cohort anchor owns the stable backend observer pins. Siblings
+            // borrow their manager access and are destroyed before the anchor.
+            const owns_observer_pins = backend.durable_completion == null;
+            var memory_pin = if (backend.durable_completion) |first| first.memory_pin else try manager.pinObserverMetadata(.lsm_in_memory_state, &backend.tracked_in_memory_state_bytes);
+            errdefer if (owns_observer_pins) memory_pin.release() catch unreachable;
+            var wal_pin = if (backend.durable_completion) |first| first.wal_pin else try manager.pinObserverMetadata(.lsm_wal_retention, &backend.tracked_wal_retention_bytes);
+            errdefer if (owns_observer_pins) wal_pin.release() catch unreachable;
             self.wal_credit = 0;
             try manager.adjustUsage(.lsm_wal_retention, &self.wal_credit, limits.wal_bytes);
             errdefer manager.observeUsage(.lsm_wal_retention, &self.wal_credit, 0);
-            const guard_path = try std.fs.path.join(alloc, &.{ root, guard_filename });
+            const guard_path = try std.fs.path.join(alloc, &.{ root, guard_filenames[cohort.index] });
             errdefer alloc.free(guard_path);
             const legacy_path = try std.fs.path.join(alloc, &.{ root, "wal.log" });
             defer alloc.free(legacy_path);
@@ -196,28 +217,32 @@ pub fn Slot(comptime Backend: type) type {
                     if (err != error.FileNotFound) return err;
                 }
             }
-            const run_id = backend.next_run_id;
-            const next_run_id = try std.math.add(u64, run_id, 1);
-            const run_path = try repository.runPath(alloc, root, run_id);
-            errdefer alloc.free(run_path);
+            const run_id = cohort.base_run_id;
+            const next_run_id = try std.math.add(u64, run_id, cohort.capacity());
+            var run_paths: [max_slots]?[]u8 = @splat(null);
+            errdefer for (run_paths) |path| {
+                if (path) |owned| alloc.free(owned);
+            };
+            for (0..cohort.capacity()) |i| run_paths[i] = try repository.runPath(alloc, root, run_id + i);
+            const run_path = run_paths[0].?;
             const journal_path = try manifest_set.pathAlloc(alloc, root, backend.manifest_journal.active_segment, .journal);
             errdefer alloc.free(journal_path);
             const journal_size = try backend.storage.?.fileSize(journal_path);
             // A single output's metadata and namespace/key bounds must fit
             // without journal rotation after prepare.
-            if (journal_size > repository.maxManifestReadBytes() - limits.max_encoded_bytes - 64 * 1024)
+            if (journal_size > repository.maxManifestReadBytes() - cohort.capacity() * (limits.max_encoded_bytes + 64 * 1024))
                 return error.CompletionReservationBusy;
-            const io = try storage_io.NativeCompletionIo.createWithFilesAndHeadroom(alloc, native, root, &.{
-                .{ .path = guard_path, .max_bytes = limits.max_encoded_bytes, .allow_delete = true },
-                .{ .path = legacy_path, .max_bytes = limits.wal_bytes, .allow_delete = true },
-                .{ .path = replay_index, .max_bytes = 4096 },
-                .{ .path = replay_segments, .max_bytes = limits.wal_bytes },
-                .{ .path = run_path, .max_bytes = limits.flush_bytes, .allow_delete = true },
-                .{ .path = journal_path, .max_bytes = repository.maxManifestReadBytes(), .allow_append = true },
-            }, 2);
+            var files: [max_slots + 5]storage_io.NativeCompletionIo.FileSpec = undefined;
+            files[0] = .{ .path = guard_path, .max_bytes = limits.max_encoded_bytes + guard.header_bytes, .allow_delete = true };
+            files[1] = .{ .path = legacy_path, .max_bytes = limits.wal_bytes, .allow_delete = true };
+            files[2] = .{ .path = replay_index, .max_bytes = 4096 };
+            files[3] = .{ .path = replay_segments, .max_bytes = limits.wal_bytes };
+            files[4] = .{ .path = journal_path, .max_bytes = repository.maxManifestReadBytes(), .allow_append = true };
+            for (0..cohort.capacity()) |i| files[5 + i] = .{ .path = run_paths[i].?, .max_bytes = limits.flush_bytes, .allow_delete = true };
+            const io = try storage_io.NativeCompletionIo.createWithFilesAndHeadroom(alloc, native, root, files[0 .. 5 + cohort.capacity()], 2);
             errdefer io.deinit() catch unreachable;
             io.allow_wal_reset = true;
-            self.* = .{ .allocator = alloc, .publication = publication, .scratch = scratch, .descriptor = descriptor, .encoded = wire, .io = io, .wal_credit = self.wal_credit, .memory_pin = memory_pin, .wal_pin = wal_pin, .guard_path = guard_path, .wal_append_start = backend.write_stats.wal_append_bytes, .wal_entries_start = backend.write_stats.wal_append_entries, .wal_records_start = backend.write_stats.wal_append_records, .run_id = run_id, .journal_path = journal_path, .run_path = run_path, .durable = restored, .baseline_record = baseline_record, .baseline_credit = baseline_credit, .baseline_summary = baseline_summary, .baseline_applied = baseline_applied, .baseline_slot_present = baseline_slot_present };
+            self.* = .{ .allocator = alloc, .publication = publication, .scratch = scratch, .descriptor = descriptor, .encoded = wire, .guard_encoded = guard_wire, .cohort = cohort, .run_paths = run_paths, .io = io, .wal_credit = self.wal_credit, .memory_pin = memory_pin, .wal_pin = wal_pin, .owns_observer_pins = owns_observer_pins, .guard_path = guard_path, .wal_append_start = backend.write_stats.wal_append_bytes, .wal_entries_start = backend.write_stats.wal_append_entries, .wal_records_start = backend.write_stats.wal_append_records, .run_id = run_id, .journal_path = journal_path, .run_path = run_path, .durable = restored, .baseline_record = baseline_record, .baseline_credit = baseline_credit, .baseline_summary = baseline_summary, .baseline_applied = baseline_applied, .baseline_slot_present = baseline_slot_present };
             if (!restored) {
                 // Any storage failure may have published this durable anchor.
                 // Never let an uncertain create resume ordinary mutation.
@@ -226,15 +251,48 @@ pub fn Slot(comptime Backend: type) type {
                     return err;
                 };
             }
-            backend.next_run_id = next_run_id;
+            backend.next_run_id = @max(backend.next_run_id, next_run_id);
             return self;
+        }
+
+        pub fn storageKey(self: *const Self) []const u8 {
+            return storage_keys[self.cohort.index];
+        }
+        pub fn appliedKey(self: *const Self) []const u8 {
+            return applied_keys[self.cohort.index];
+        }
+
+        fn refreshField(self: *Self, backend: *Backend, delta: *const state.State, key: []const u8, comptime n: usize, baseline: *?[n]u8) !void {
+            const value = if (delta.findIndex(.{ .name = self.descriptor.descriptor.namespace }, key)) |index| blk: {
+                const entry = delta.entryAt(index);
+                break :blk if (entry.tombstone) null else entry.value;
+            } else self.currentMetadata(backend, key, if (baseline.*) |*bytes| bytes else null);
+            if (value) |bytes| {
+                if (bytes.len != n) return error.InvalidTxnRecord;
+                baseline.* = bytes[0..n].*;
+            } else baseline.* = null;
+        }
+
+        fn refreshCohortBaselines(backend: *Backend, delta: *const state.State) !void {
+            for (backend.durable_completion_members) |maybe| if (maybe) |member| {
+                const id = member.descriptor.descriptor.txn_id;
+                const record = "\x00\x00__txn_records__:".* ++ id;
+                const credit = "\x00\x00__txn_completion_v1__:".* ++ id;
+                try member.refreshField(backend, delta, &record, 53, &member.baseline_record);
+                try member.refreshField(backend, delta, &credit, 16, &member.baseline_credit);
+                try member.refreshField(backend, delta, "\x00\x00__metadata__:txn_completion_v1", 16, &member.baseline_summary);
+                try member.refreshField(backend, delta, member.appliedKey(), 16, &member.baseline_applied);
+                if (delta.findIndex(.{ .name = member.descriptor.descriptor.namespace }, member.storageKey())) |index| {
+                    member.baseline_slot_present = !delta.entryAt(index).tombstone;
+                } else member.baseline_slot_present = member.currentMetadata(backend, member.storageKey(), if (member.baseline_slot_present) member.encoded else null) != null;
+            };
         }
 
         fn writeGuard(self: *Self) !void {
             var writer = try self.io.storage().beginAtomicWrite(self.allocator, self.guard_path);
             var owned = true;
             errdefer if (owned) writer.abort();
-            try writer.appendSlice(self.encoded);
+            try writer.appendSlice(self.guard_encoded);
             owned = false;
             try writer.finish();
         }
@@ -252,7 +310,7 @@ pub fn Slot(comptime Backend: type) type {
         /// Shared by transaction admission and raw native WAL helpers. Direct
         /// callers cannot alter the anchor/marker or evade cumulative bounds.
         pub fn checkWalInput(self: *Self, backend: *Backend, incoming: anytype) !void {
-            if (self.attempted) return error.RecoveryRequired;
+            if (self.attempted and !self.retired) return error.RecoveryRequired;
             const append_bytes = backend.write_stats.wal_append_bytes -| self.wal_append_start;
             const incoming_bytes = wal.encodedStateRecordLen(incoming);
             if (self.replayed_wal_bytes +| append_bytes +| incoming_bytes > recovery_wal_bytes or
@@ -263,18 +321,69 @@ pub fn Slot(comptime Backend: type) type {
                 incoming.entryCount() > foreground_entries -| backend.mutable.entryCount()) return error.CompletionForegroundCapacityExceeded;
             for (0..incoming.entryCount()) |index| {
                 const entry = incoming.entryAt(index);
-                const reserved_namespace = if (entry.namespace_name) |name| std.mem.eql(u8, name, "docs") else true;
-                if (!reserved_namespace) continue;
-                if (std.mem.eql(u8, entry.key, applied_key)) return error.PreparedCompletionActive;
-                if (!std.mem.eql(u8, entry.key, storage_key)) continue;
-                const same_namespace = if (entry.namespace_name) |name|
-                    (if (self.descriptor.descriptor.namespace) |expected| std.mem.eql(u8, name, expected) else false)
-                else
-                    self.descriptor.descriptor.namespace == null;
-                // Only the original matching prepare may publish the anchor.
-                if (!same_namespace or self.durable or entry.tombstone or !std.mem.eql(u8, entry.value, self.encoded))
-                    return error.PreparedCompletionActive;
+                for (backend.durable_completion_members) |maybe| if (maybe) |member| {
+                    if (member.retired) continue;
+                    const ns = member.descriptor.descriptor.namespace;
+                    if (ns == null and entry.namespace_name != null or ns != null and entry.namespace_name == null) continue;
+                    if (ns != null and !std.mem.eql(u8, ns.?, entry.namespace_name.?)) continue;
+                    for ([_][]const codec.Operation{ member.descriptor.descriptor.commit, member.descriptor.descriptor.abort }) |ops| for (ops) |op| {
+                        if (std.mem.eql(u8, op.key, entry.key) and !codec.isSharedDynamicOperation(op) and !member.permitsFootprintWrite(backend, incoming, entry)) return error.PreparedCompletionActive;
+                    };
+                };
+                for (applied_keys) |key| if (std.mem.eql(u8, entry.key, key)) return error.PreparedCompletionActive;
+                for (storage_keys, 0..) |key, member_index| if (std.mem.eql(u8, entry.key, key)) {
+                    const member = backend.durable_completion_members[member_index] orelse return error.PreparedCompletionActive;
+                    const namespace = member.descriptor.descriptor.namespace;
+                    const same_namespace = if (namespace) |name| if (entry.namespace_name) |incoming_name| std.mem.eql(u8, name, incoming_name) else false else entry.namespace_name == null;
+                    if (!same_namespace or member.durable or member.retired or entry.tombstone or !std.mem.eql(u8, entry.value, member.encoded)) return error.PreparedCompletionActive;
+                };
             }
+        }
+
+        pub fn validateFootprint(backend: *Backend, descriptor: codec.Descriptor) !void {
+            for ([_][]const codec.Operation{ descriptor.commit, descriptor.abort }) |ops| for (ops) |op| {
+                for (storage_keys) |key| if (std.mem.eql(u8, op.key, key)) return error.UnsupportedCompletionTemplate;
+                for (applied_keys) |key| if (std.mem.eql(u8, op.key, key)) return error.UnsupportedCompletionTemplate;
+                const shared = codec.isSharedDynamicOperation(op);
+                for (op.bindings) |binding| if (binding.target == .key and !shared) return error.UnsupportedCompletionTemplate;
+                for (backend.durable_completion_members) |maybe| if (maybe) |member| {
+                    if (member.retired) continue;
+                    const a = descriptor.namespace;
+                    const b = member.descriptor.descriptor.namespace;
+                    if (a == null and b != null or a != null and b == null) continue;
+                    if (a != null and !std.mem.eql(u8, a.?, b.?)) continue;
+                    for ([_][]const codec.Operation{ member.descriptor.descriptor.commit, member.descriptor.descriptor.abort }) |other_ops| for (other_ops) |other| {
+                        if (std.mem.eql(u8, op.key, other.key) and !(shared and codec.isSharedDynamicOperation(other))) return error.PreparedCompletionActive;
+                    };
+                };
+            };
+        }
+
+        fn permitsFootprintWrite(self: *Self, backend: *Backend, incoming: anytype, entry: state.OwnedEntry) bool {
+            const txn_id = self.descriptor.descriptor.txn_id;
+            if (!self.durable) {
+                const descriptor_index = incoming.findIndex(.{ .name = self.descriptor.descriptor.namespace }, self.storageKey()) orelse return false;
+                const descriptor_entry = incoming.entryAt(descriptor_index);
+                if (descriptor_entry.tombstone or !std.mem.eql(u8, descriptor_entry.value, self.encoded)) return false;
+                const record_key = "\x00\x00__txn_records__:".* ++ txn_id;
+                const record_index = incoming.findIndex(.{ .name = self.descriptor.descriptor.namespace }, &record_key) orelse return false;
+                const record = incoming.entryAt(record_index);
+                if (record.tombstone or record.value.len != 53 or record.value[0] != 0 or record.value[49] != 1 or record.value[52] != 0 or
+                    std.mem.readInt(u64, record.value[33..41], .little) != self.descriptor.descriptor.intent_revision) return false;
+                if (codec.isPreparedTransactionMetadataKey(entry.key, txn_id)) return !entry.tombstone;
+                return std.mem.startsWith(u8, entry.key, "\x00\x00__txn_intent_locks__:") and !entry.tombstone and std.mem.eql(u8, entry.value, &txn_id);
+            }
+            const record_key = "\x00\x00__txn_records__:".* ++ txn_id;
+            if (!std.mem.eql(u8, entry.key, &record_key) or entry.tombstone or entry.value.len != 53) return false;
+            const before = self.currentMetadata(backend, &record_key, if (self.baseline_record) |*record| record else null) orelse return false;
+            if (before.len != 53 or before[0] > 2 or entry.value[0] > 2 or (before[0] != 0 and entry.value[0] != before[0])) return false;
+            // Ordinary decision persistence may bind decision timestamps, but
+            // cannot change intent revision, participants, profile or resolve phase.
+            for (0..53) |i| {
+                if (i == 0 or (i >= 9 and i < 17) or (i >= 25 and i < 33)) continue;
+                if (entry.value[i] != before[i]) return false;
+            }
+            return true;
         }
 
         /// Every heap allocation below partitions slabs physically obtained
@@ -303,6 +412,8 @@ pub fn Slot(comptime Backend: type) type {
                         .replay_next_sequence => try std.math.add(u64, values.replay_sequence, 1),
                         .shared_ledger_count => values.shared_ledger_count,
                         .shared_ledger_bytes => values.shared_ledger_bytes,
+                        .raft_term => if (values.raft_term != 0) values.raft_term else return error.InvalidCompletionSlot,
+                        .raft_index => if (values.raft_index != 0) values.raft_index else return error.InvalidCompletionSlot,
                     };
                     const bytes = if (binding.target == .key) key else value;
                     const field: *[8]u8 = bytes[binding.offset..][0..8];
@@ -311,10 +422,11 @@ pub fn Slot(comptime Backend: type) type {
                         .big => std.mem.writeInt(u64, field, number, .big),
                     }
                 }
+                if (op.kind == .put) try codec.finishBoundValue(op, value);
                 try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, key, value, op.kind == .delete);
             }
-            try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, storage_key, "", true);
-            try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, applied_key, &self.descriptor.descriptor.txn_id, false);
+            try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, self.storageKey(), "", true);
+            try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, self.appliedKey(), &self.descriptor.descriptor.txn_id, false);
             try self.drain(backend, &delta, true, true);
         }
 
@@ -328,7 +440,7 @@ pub fn Slot(comptime Backend: type) type {
             defer delta.deinit(self.scratch.allocator());
             // A tombstone keeps the drain nonempty even after a prior manifest
             // survived and WAL reset completed before guard unlink failed.
-            try delta.upsert(self.scratch.allocator(), .{ .name = self.descriptor.descriptor.namespace }, storage_key, "", true);
+            try delta.upsert(self.scratch.allocator(), .{ .name = self.descriptor.descriptor.namespace }, self.storageKey(), "", true);
             try self.drain(backend, &delta, false, true);
         }
 
@@ -356,6 +468,10 @@ pub fn Slot(comptime Backend: type) type {
         fn drain(self: *Self, backend: *Backend, delta: *state.ActiveMemTable, append_wal: bool, retire_guard: bool) !void {
             const alloc = self.scratch.allocator();
             const pub_alloc = self.publication.allocator();
+            const output_index = if (self.cohort.legacy) @as(usize, 0) else backend.runs.count() -| self.cohort.initial_runs;
+            if (output_index >= self.cohort.capacity()) return error.CompletionPlanCapacityExceeded;
+            self.run_id = self.cohort.base_run_id + output_index;
+            self.run_path = self.run_paths[output_index].?;
             var prepared_append = try wal.PreparedAppend.init(alloc, backend.root_dir.?, delta, true, .{ .segment_bytes = backend.options.wal_segment_bytes });
             defer prepared_append.deinit();
             var completion = try delta.toStateMove(alloc);
@@ -444,6 +560,7 @@ pub fn Slot(comptime Backend: type) type {
             manifest_attempted = true;
             try self.io.storage().appendFileAbsolute(alloc, self.journal_path, frame, true);
             if (builtin.is_test) if (test_after_manifest) |hook| if (hook()) return error.RecoveryRequired;
+            try refreshCohortBaselines(backend, &completion);
             // The full current mutable and completion delta are durable in
             // the same manifest edit. Publish their replacement atomically.
             backend.invalidateMutableReadSnapshot();
@@ -470,6 +587,12 @@ pub fn Slot(comptime Backend: type) type {
             try self.checkpointAndClearGuard(backend, retire_guard);
         }
 
+        pub fn finishCheckpointCut(self: *Self, backend: *Backend) !void {
+            var wal_lock = try backend.acquireWalOperationLock(.exclusive);
+            defer wal_lock.release();
+            try self.checkpointAndClearGuard(backend, false);
+        }
+
         fn checkpointAndClearGuard(self: *Self, backend: *Backend, retire_guard: bool) !void {
             const alloc = self.scratch.allocator();
             // Only the durable manifest authorizes retiring WAL recovery data.
@@ -479,7 +602,15 @@ pub fn Slot(comptime Backend: type) type {
             backend.wal_retention.primary_ns = backend.writeStatsNowNs();
             backend.wal_retention.replay_ns = backend.writeStatsNowNs();
             self.wal_pin.manager.observeUsage(.lsm_wal_retention, &backend.tracked_wal_retention_bytes, 0);
-            if (retire_guard) try self.clearGuard();
+            _ = retire_guard; // Cohort retirement clears all guards only when every member is terminal.
+            for (backend.durable_completion_members) |maybe| if (maybe) |member| {
+                member.wal_append_start = backend.write_stats.wal_append_bytes;
+                member.wal_entries_start = backend.write_stats.wal_append_entries;
+                member.wal_records_start = backend.write_stats.wal_append_records;
+                member.replayed_wal_bytes = 0;
+                member.replayed_wal_entries = 0;
+                member.replayed_wal_records = 0;
+            };
         }
     };
 }

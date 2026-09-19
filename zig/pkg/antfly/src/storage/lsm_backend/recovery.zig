@@ -122,10 +122,7 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
     }
     errdefer cleanup(BackendType, backend, false);
     errdefer if (@hasField(BackendType, "durable_completion")) {
-        if (backend.durable_completion) |slot| {
-            backend.durable_completion = null;
-            slot.destroy();
-        }
+        backend.releaseDurableCompletion();
     };
     errdefer finishOpenFailure(BackendType, backend);
     if (@hasDecl(BackendType, "initOutputCleanup")) try backend.initOutputCleanup();
@@ -142,10 +139,12 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
 
     if (comptime @hasField(BackendType, "durable_completion")) {
         if (!stable_address) {
-            const guard = try std.fs.path.join(allocator, &.{ root_dir, @import("completion_runtime.zig").guard_filename });
-            defer allocator.free(guard);
-            if (backend.storage.?.fileSize(guard)) |_| return error.UnsupportedCompletionBackend else |err| {
-                if (err != error.FileNotFound) return err;
+            for (@import("completion_runtime.zig").guard_filenames) |filename| {
+                const guard = try std.fs.path.join(allocator, &.{ root_dir, filename });
+                defer allocator.free(guard);
+                if (backend.storage.?.fileSize(guard)) |_| return error.UnsupportedCompletionBackend else |err| {
+                    if (err != error.FileNotFound) return err;
+                }
             }
         }
     }

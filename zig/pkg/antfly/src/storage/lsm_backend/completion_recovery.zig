@@ -10,24 +10,36 @@ const wal = @import("wal.zig");
 const codec = @import("completion_slot.zig");
 
 pub fn restoreBeforeReplay(comptime Backend: type, backend: *Backend) !bool {
-    const path = try std.fs.path.join(backend.allocator, &.{ backend.root_dir.?, completion.guard_filename });
-    defer backend.allocator.free(path);
-    const size = backend.storage.?.fileSize(path) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    if (size == 0 or size > completion.limits.max_encoded_bytes) return error.InvalidCompletionSlot;
-    const encoded = try backend.allocator.alloc(u8, @intCast(size));
-    defer backend.allocator.free(encoded);
-    try backend.storage.?.readFileRangeInto(backend.allocator, path, 0, encoded);
-    // Validate corruption before any requested reservation quantity is trusted.
-    var descriptor = try codec.decode(backend.allocator, encoded, .{});
-    descriptor.deinit();
-    backend.durable_completion = completion.Slot(Backend).create(backend, encoded, true) catch |err| switch (err) {
-        error.ResourceBudgetExceeded, error.DescriptorAdmissionExhausted, error.OutOfMemory => return error.CompletionRecoveryCapacityRequired,
-        else => return err,
-    };
-    return true;
+    var first_info: ?completion.guard.Info = null;
+    for (completion.guard_filenames, 0..) |filename, index| {
+        const path = try std.fs.path.join(backend.allocator, &.{ backend.root_dir.?, filename });
+        defer backend.allocator.free(path);
+        const size = backend.storage.?.fileSize(path) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (size == 0 or size > completion.limits.max_encoded_bytes + completion.guard.header_bytes) return error.InvalidCompletionSlot;
+        const encoded = try backend.allocator.alloc(u8, @intCast(size));
+        defer backend.allocator.free(encoded);
+        try backend.storage.?.readFileRangeInto(backend.allocator, path, 0, encoded);
+        const decoded = try completion.guard.decode(encoded, backend.next_run_id, backend.runs.count());
+        if (decoded.info.index != index or (index != 0 and first_info == null)) return error.InvalidCompletionSlot;
+        if (first_info) |first| {
+            if (first.legacy or decoded.info.legacy or first.base_run_id != decoded.info.base_run_id or first.initial_runs != decoded.info.initial_runs or !std.mem.eql(u8, &first.cohort_id, &decoded.info.cohort_id)) return error.InvalidCompletionSlot;
+        } else first_info = decoded.info;
+        var descriptor = try codec.decode(backend.allocator, decoded.descriptor, .{});
+        defer descriptor.deinit();
+        for (backend.durable_completion_members) |maybe| if (maybe) |member| {
+            if (std.mem.eql(u8, &member.descriptor.descriptor.txn_id, &descriptor.descriptor.txn_id)) return error.InvalidCompletionSlot;
+        };
+        const slot = completion.Slot(Backend).create(backend, decoded.descriptor, true, decoded.info) catch |err| switch (err) {
+            error.ResourceBudgetExceeded, error.DescriptorAdmissionExhausted, error.OutOfMemory => return error.CompletionRecoveryCapacityRequired,
+            else => return err,
+        };
+        backend.durable_completion_members[index] = slot;
+        if (index == 0) backend.durable_completion = slot;
+    }
+    return first_info != null;
 }
 
 pub fn replay(comptime Backend: type, backend: *Backend) !wal.ReplayStats {
@@ -99,34 +111,46 @@ pub fn replay(comptime Backend: type, backend: *Backend) !wal.ReplayStats {
 }
 
 pub fn finish(comptime Backend: type, backend: *Backend, stats: wal.ReplayStats) !void {
-    const slot = backend.durable_completion orelse return error.InvalidCompletionSlot;
-    const descriptor = slot.currentMetadata(backend, completion.storage_key, if (slot.baseline_slot_present) slot.encoded else null);
-    const marker = slot.currentMetadata(backend, completion.applied_key, if (slot.baseline_applied) |*value| value else null);
-    const applied = if (marker) |value| std.mem.eql(u8, value, &slot.descriptor.descriptor.txn_id) else false;
-    if (descriptor) |encoded| {
-        if (!std.mem.eql(u8, encoded, slot.encoded) or applied) return error.InvalidCompletionSlot;
-        slot.durable = true;
-        if (stats.truncated_tail_bytes != 0) try repairTail(Backend, backend, stats);
-        return;
-    }
-    if (applied) {
-        const manifested = !slot.baseline_slot_present and if (slot.baseline_applied) |value| std.mem.eql(u8, &value, &slot.descriptor.descriptor.txn_id) else false;
-        if (manifested) try slot.finishManifested(backend) else try slot.finishReplayed(backend);
-    } else {
-        // A guard may become durable before the first prepare byte. Absence
-        // of both the descriptor and completion marker after a full valid WAL
-        // replay is the only automatic unprepared cancellation proof.
-        if (stats.truncated_tail_bytes != 0) {
-            // Only whole CRC-validated records were applied. The missing
-            // descriptor proves that the partial prepare never became an
-            // atomic record; preserve unrelated prefix writes and truncate
-            // only the proven incomplete current tail before retiring the anchor.
-            try repairTail(Backend, backend, stats);
+    const first = backend.durable_completion orelse return error.InvalidCompletionSlot;
+    if (stats.truncated_tail_bytes != 0) try repairTail(Backend, backend, stats);
+    var needs_drain: ?*completion.Slot(Backend) = null;
+    var all_manifested_completed = true;
+    for (backend.durable_completion_members) |maybe| if (maybe) |slot| {
+        const descriptor = slot.currentMetadata(backend, slot.storageKey(), if (slot.baseline_slot_present) slot.encoded else null);
+        const marker = slot.currentMetadata(backend, slot.appliedKey(), if (slot.baseline_applied) |*value| value else null);
+        const applied = if (marker) |value| std.mem.eql(u8, value, &slot.descriptor.descriptor.txn_id) else false;
+        if (descriptor) |encoded| {
+            all_manifested_completed = false;
+            if (!std.mem.eql(u8, encoded, slot.encoded) or applied) return error.InvalidCompletionSlot;
+            slot.durable = true;
+        } else {
+            slot.retired = true;
+            if (applied) {
+                const manifested = !slot.baseline_slot_present and if (slot.baseline_applied) |value| std.mem.eql(u8, &value, &slot.descriptor.descriptor.txn_id) else false;
+                if (!manifested) {
+                    all_manifested_completed = false;
+                    if (needs_drain != null) return error.InvalidCompletionSlot;
+                    needs_drain = slot;
+                }
+            } else all_manifested_completed = false;
         }
-        try slot.clearGuard();
+    };
+    if (needs_drain) |slot| {
+        // One uncertain completion fences the entire backend. Its atomic WAL
+        // result and all sibling prepares are drained together, without rebinding.
+        try slot.finishReplayed(backend);
+    } else if (all_manifested_completed) {
+        // Every retained guard has a matching manifest outcome. The last
+        // completion covers the full WAL and fenced further foreground work.
+        try first.finishManifested(backend);
+    } else if (try wal.hasProtectedResetCut(first.io.storage(), first.scratch.allocator(), backend.root_dir.?)) {
+        // An exclusion cut itself proves a full durable manifest checkpoint.
+        // Finish it before admitting new WAL records, preserving sibling guards.
+        try first.finishCheckpointCut(backend);
     }
-    backend.durable_completion = null;
-    slot.destroy();
+    // A manifested sibling alone does not prove later WAL belongs to that
+    // manifest. Preserve replayed ordinary/sibling writes; never blindly drop it.
+    try backend.retireDurableCompletionCohort();
 }
 
 fn repairTail(comptime Backend: type, backend: *Backend, stats: wal.ReplayStats) !void {
@@ -150,13 +174,11 @@ fn repairTail(comptime Backend: type, backend: *Backend, stats: wal.ReplayStats)
 }
 
 pub fn rejectUnanchored(comptime Backend: type, backend: *Backend) !void {
-    for ([_]?[]const u8{ null, "docs" }) |name| {
-        if (backend.getMergedWithMutable(&backend.mutable, .{ .name = name }, completion.storage_key)) |_| {
-            // The private pre-sidecar format cannot silently acquire a weaker
-            // recovery contract. It needs explicit migration/reconciliation.
+    for ([_]?[]const u8{ null, "docs" }) |name| for (completion.storage_keys) |key| {
+        if (backend.getMergedWithMutable(&backend.mutable, .{ .name = name }, key)) |_| {
             return error.InvalidCompletionSlot;
         } else |err| if (err != error.NotFound) return err;
-    }
+    };
 }
 
 const GuardFixture = enum { clean, corrupt, torn_prepare };
@@ -471,4 +493,176 @@ test "workload admission lsm durable slot needs ordinary FD headroom beyond its 
         try backend.completeDurableCompletion(id, true, .{ .commit_timestamp = 200, .replay_sequence = 1, .shared_ledger_count = 0, .shared_ledger_bytes = 0 });
         try std.testing.expectEqualStrings("done", try backend.getMergedWithMutable(&backend.mutable, .{}, "document"));
     }
+}
+
+test "workload admission lsm durable cohort preserves siblings across reverse completion and restart" {
+    for (0..3) |boundary| try exerciseCohortRecovery(boundary);
+}
+
+fn exerciseCohortRecovery(boundary: usize) !void {
+    const native = @import("../lsm_backend.zig");
+    const repository = @import("repository.zig");
+    const storage_io = @import("storage_io.zig");
+    const resources = @import("../resource_manager.zig");
+    const alloc = std.testing.allocator;
+    var pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 32);
+    defer pool.deinit();
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 512 * 1024 * 1024 } });
+    defer manager.deinit(alloc);
+    var path_buffer: [256]u8 = undefined;
+    const path = repository.tmpPath(&path_buffer, "completion-cohort");
+    defer repository.cleanupTmp(path);
+    const options: native.Options = .{ .resource_manager = &manager, .native_storage_pool = &pool, .flush_threshold = 10000, .compact_threshold_runs = 1024, .l0_overlap_compact_threshold_runs = 1024 };
+    var ids: [4][16]u8 = undefined;
+    var wires: [4]?[]u8 = @splat(null);
+    defer for (wires) |wire| {
+        if (wire) |owned| alloc.free(owned);
+    };
+    var backend: native.Backend = undefined;
+    try native.Backend.openInto(&backend, alloc, std.mem.span(path), options);
+    var live = true;
+    defer if (live) backend.close();
+    for (0..64) |i| {
+        var key_buffer: [32]u8 = undefined;
+        const seed_key = try std.fmt.bufPrint(&key_buffer, "seed-{d:0>4}", .{i});
+        {
+            var seed = try backend.beginWrite();
+            errdefer seed.abort();
+            try seed.put(.{}, seed_key, "seed");
+            try seed.commit();
+        }
+        try backend.checkpointWalAfterDurableBoundary();
+    }
+    const summary_key = "\x00\x00__metadata__:txn_completion_v1";
+    const summary_bindings = [_]codec.Binding{
+        .{ .kind = .shared_ledger_count, .target = .value, .byte_order = .little, .offset = 0 },
+        .{ .kind = .shared_ledger_bytes, .target = .value, .byte_order = .little, .offset = 8 },
+    };
+    const zero_summary: [16]u8 = @splat(0);
+    for (0..4) |i| {
+        ids[i] = @splat(@as(u8, @intCast(110 + i)));
+        const record_key = "\x00\x00__txn_records__:".* ++ ids[i];
+        const credit_key = "\x00\x00__txn_completion_v1__:".* ++ ids[i];
+        var credit: [16]u8 = @splat(0);
+        std.mem.writeInt(u64, credit[0..8], 16, .little);
+        std.mem.writeInt(u64, credit[8..16], 32, .little);
+        var summary: [16]u8 = @splat(0);
+        std.mem.writeInt(u64, summary[0..8], i + 1, .little);
+        std.mem.writeInt(u64, summary[8..16], (i + 1) * 48, .little);
+        var record: [53]u8 = @splat(0);
+        std.mem.writeInt(u64, record[33..41], 1, .little);
+        record[49] = 1;
+        var committed = record;
+        committed[0] = 1;
+        committed[52] = 1;
+        std.mem.writeInt(u64, committed[9..17], 200, .little);
+        var aborted = record;
+        aborted[0] = 2;
+        aborted[52] = 1;
+        std.mem.writeInt(u64, aborted[25..33], 200, .little);
+        const key = [_]u8{ 'd', @as(u8, @intCast('0' + i)) };
+        wires[i] = try codec.encode(alloc, .{
+            .txn_id = ids[i],
+            .intent_revision = 1,
+            .limits = completion.limits,
+            .profile_fence = "cohort-native",
+            .commit = &.{ .{ .kind = .put, .key = &key, .value = "committed" }, .{ .kind = .put, .key = &record_key, .value = &committed }, .{ .kind = .delete, .key = &credit_key }, .{ .kind = .put, .key = summary_key, .value = &zero_summary, .bindings = &summary_bindings } },
+            .abort = &.{ .{ .kind = .put, .key = &record_key, .value = &aborted }, .{ .kind = .delete, .key = &credit_key }, .{ .kind = .put, .key = summary_key, .value = &zero_summary, .bindings = &summary_bindings } },
+        }, .{});
+        try backend.reserveDurableCompletion(wires[i].?);
+        const slot = backend.findDurableCompletion(ids[i]).?;
+        {
+            var prepare = try backend.beginWrite();
+            errdefer prepare.abort();
+            try prepare.put(.{}, &record_key, &record);
+            try prepare.put(.{}, &credit_key, &credit);
+            try prepare.put(.{}, summary_key, &summary);
+            try prepare.put(.{}, slot.storageKey(), wires[i].?);
+            try prepare.commit();
+        }
+        try backend.confirmDurableCompletion(ids[i]);
+        if (i == 0) {
+            const conflict = try codec.encode(alloc, .{ .txn_id = @splat(200), .intent_revision = 1, .limits = completion.limits, .profile_fence = "conflicting-static-key", .commit = &.{.{ .kind = .put, .key = &key, .value = "conflict" }}, .abort = &.{} }, .{});
+            defer alloc.free(conflict);
+            try std.testing.expectError(error.PreparedCompletionActive, backend.reserveDurableCompletion(conflict));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), blk: {
+        var count: usize = 0;
+        for (backend.durableCompletionSlots()) |slot| if (slot != null) {
+            count += 1;
+        };
+        break :blk count;
+    });
+    {
+        const extra = try codec.encode(alloc, .{ .txn_id = @splat(201), .intent_revision = 1, .limits = completion.limits, .profile_fence = "fifth", .commit = &.{.{ .kind = .put, .key = "fifth", .value = "never" }}, .abort = &.{} }, .{});
+        defer alloc.free(extra);
+        try std.testing.expectError(error.CompletionReservationBusy, backend.reserveDurableCompletion(extra));
+        var conflicting: @import("state.zig").State = .{};
+        defer conflicting.deinit(alloc);
+        try conflicting.upsert(alloc, .{}, "d0", "corrupt", false);
+        const runtime = @import("runtime.zig");
+        const locked = runtime.lockBackend(native.Backend, &backend);
+        defer runtime.unlockBackend(native.Backend, &backend, locked);
+        const records_before = backend.write_stats.wal_append_records;
+        try std.testing.expectError(error.PreparedCompletionActive, backend.appendWalForState(&conflicting));
+        try std.testing.expectEqual(records_before, backend.write_stats.wal_append_records);
+    }
+    const values: native.Backend.DurableCompletionValues = .{ .commit_timestamp = 200, .replay_sequence = 1, .shared_ledger_count = 0, .shared_ledger_bytes = 0 };
+    {
+        var old = try backend.beginRead();
+        defer old.abort();
+        try backend.completeDurableCompletion(ids[2], true, values);
+        {
+            var ordinary = try backend.beginWrite();
+            errdefer ordinary.abort();
+            try ordinary.put(.{}, "independent", "preserved");
+            try ordinary.commit();
+        }
+        const Hook = struct {
+            fn stop() bool {
+                return true;
+            }
+        };
+        if (boundary == 1) completion.test_after_wal = Hook.stop;
+        if (boundary == 2) completion.test_after_manifest = Hook.stop;
+        defer {
+            completion.test_after_wal = null;
+            completion.test_after_manifest = null;
+        }
+        if (boundary == 0) try backend.completeDurableCompletion(ids[0], false, values) else try std.testing.expectError(error.RecoveryRequired, backend.completeDurableCompletion(ids[0], false, values));
+        completion.test_after_wal = null;
+        completion.test_after_manifest = null;
+        try std.testing.expectError(error.NotFound, old.get(.{}, "d2"));
+        const old_summary = try old.get(.{}, summary_key);
+        try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, old_summary[0..8], .little));
+    }
+    backend.abandonAfterCrash();
+    live = false;
+    try native.Backend.openInto(&backend, alloc, std.mem.span(path), options);
+    live = true;
+    try std.testing.expect(backend.findDurableCompletion(ids[0]) == null);
+    try std.testing.expect(backend.findDurableCompletion(ids[2]) == null);
+    try std.testing.expect(backend.findDurableCompletion(ids[1]) != null);
+    try std.testing.expect(backend.findDurableCompletion(ids[3]) != null);
+    const current_summary = try backend.getMergedWithMutable(&backend.mutable, .{}, summary_key);
+    try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, current_summary[0..8], .little));
+    try std.testing.expect((try backend.durableCompletionDecision(ids[1])).status == .pending);
+    try std.testing.expectEqualStrings("committed", try backend.getMergedWithMutable(&backend.mutable, .{}, "d2"));
+    try std.testing.expectEqualStrings("preserved", try backend.getMergedWithMutable(&backend.mutable, .{}, "independent"));
+    manager.memory.budget.hard_limit_bytes = 1;
+    pool.fd_cache.capacity = 1;
+    try backend.completeDurableCompletion(ids[3], false, values);
+    try backend.completeDurableCompletion(ids[1], true, values);
+    manager.memory.budget.hard_limit_bytes = 512 * 1024 * 1024;
+    pool.fd_cache.capacity = 32;
+    try std.testing.expectEqual(@as(usize, 68), backend.runs.count());
+    const final_summary = try backend.getMergedWithMutable(&backend.mutable, .{}, summary_key);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, final_summary[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, final_summary[8..16], .little));
+    try std.testing.expect(!backend.hasDurableCompletions());
+    try std.testing.expect(backend.durable_completion == null);
+    try std.testing.expectEqualStrings("committed", try backend.getMergedWithMutable(&backend.mutable, .{}, "d1"));
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "d0"));
+    try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "d3"));
 }

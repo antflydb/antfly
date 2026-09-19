@@ -1600,6 +1600,7 @@ pub const Backend = struct {
     active_readers: usize = 0,
     completion_batches: ?*CompletionPointBatch = null,
     durable_completion: ?*DurableCompletionSlot = null,
+    durable_completion_members: [completion_runtime.max_slots]?*DurableCompletionSlot = @splat(null),
     active_readers_by_kind: [reader_pin_kind_count]usize = [_]usize{0} ** reader_pin_kind_count,
     manifest_dirty: bool = false,
     obsolete_paths: repository_mod.ObsoleteLedger = .empty,
@@ -4427,7 +4428,6 @@ pub const Backend = struct {
     pub fn reserveDurableCompletion(self: *Backend, encoded: []const u8) !void {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
-        if (self.durable_completion != null) return error.CompletionReservationBusy;
         if (self.closing.load(.acquire)) return error.LsmBackendClosed;
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         const native = self.storage_owner orelse return error.UnsupportedCompletionBackend;
@@ -4444,56 +4444,112 @@ pub const Backend = struct {
         defer checked.deinit();
         if ((if (checked.descriptor.namespace) |name| !std.mem.eql(u8, name, "docs") else false) or
             !std.meta.eql(checked.descriptor.limits, durable_completion_limits)) return error.UnsupportedCompletionProfile;
-        // The private local profile has no external replay-retention consumer.
-        // Do not reset a separate retained replay log as a side effect of
-        // attempting a completion reservation.
-        if ((try self.cachedWalReplayRetentionLocked()).bytes != 0) return error.UnsupportedCompletionProfile;
-        if (self.immutable_flush_build_in_flight or self.manifest_publish_in_flight or self.manifest_checkpoint_build_in_flight)
-            return error.CompletionReservationBusy;
-        try self.flushMutable();
-        try self.persistManifestLocked();
-        try self.prepareWalOperationLockFile();
-        // The reservation bounds replay of all subsequent ordinary writes.
-        // Establish an empty WAL before publishing its durable recovery guard.
-        {
-            var wal_lock = try self.acquireWalOperationLock(.exclusive);
-            defer wal_lock.release();
-            self.wal_retention.invalidateAll();
-            wal_mod.protectedReset(self.storage.?, self.allocator, self.root_dir.?) catch |err| {
-                self.fenceFailedBulkWal();
-                return err;
+        try DurableCompletionSlot.validateFootprint(self, checked.descriptor);
+        if (self.findDurableCompletion(checked.descriptor.txn_id) != null) return error.CompletionReservationBusy;
+        var index: usize = 0;
+        while (index < completion_runtime.max_slots and self.durable_completion_members[index] != null) : (index += 1) {}
+        if (index == completion_runtime.max_slots) return error.CompletionReservationBusy;
+        var cohort: completion_runtime.guard.Info = undefined;
+        if (self.durable_completion) |first| {
+            if (first.cohort.legacy or first.attempted and !first.retired) return error.CompletionReservationBusy;
+            if (!std.meta.eql(first.descriptor.descriptor.namespace, checked.descriptor.namespace)) {
+                const a = first.descriptor.descriptor.namespace;
+                const b = checked.descriptor.namespace;
+                if (a == null or b == null or !std.mem.eql(u8, a.?, b.?)) return error.UnsupportedCompletionProfile;
+            }
+            for (self.durable_completion_members) |maybe| if (maybe) |member| {
+                if (std.mem.eql(u8, &member.descriptor.descriptor.txn_id, &checked.descriptor.txn_id)) return error.CompletionReservationBusy;
             };
-            self.wal_retention.installReset(self.writeStatsNowNs());
-            self.syncTrackedWalRetentionUsageCurrentLocked();
-            self.clearPublishedWalLogicalDebtLocked();
+            cohort = first.cohort;
+            cohort.index = @intCast(index);
+        } else {
+            // The private local profile has no external replay-retention consumer.
+            // Do not reset a separate retained replay log as a side effect of
+            // attempting a completion reservation.
+            if ((try self.cachedWalReplayRetentionLocked()).bytes != 0) return error.UnsupportedCompletionProfile;
+            if (self.immutable_flush_build_in_flight or self.manifest_publish_in_flight or self.manifest_checkpoint_build_in_flight)
+                return error.CompletionReservationBusy;
+            try self.flushMutable();
+            try self.persistManifestLocked();
+            try self.prepareWalOperationLockFile();
+            // The reservation bounds replay of all subsequent ordinary writes.
+            // Establish an empty WAL before publishing its durable recovery guard.
+            {
+                var wal_lock = try self.acquireWalOperationLock(.exclusive);
+                defer wal_lock.release();
+                self.wal_retention.invalidateAll();
+                wal_mod.protectedReset(self.storage.?, self.allocator, self.root_dir.?) catch |err| {
+                    self.fenceFailedBulkWal();
+                    return err;
+                };
+                self.wal_retention.installReset(self.writeStatsNowNs());
+                self.syncTrackedWalRetentionUsageCurrentLocked();
+                self.clearPublishedWalLogicalDebtLocked();
+            }
+            cohort = .{ .index = 0, .base_run_id = self.next_run_id, .initial_runs = @intCast(self.runs.count()), .cohort_id = checked.descriptor.txn_id };
         }
-        self.durable_completion = try DurableCompletionSlot.create(self, encoded, false);
+        const slot = try DurableCompletionSlot.create(self, encoded, false, cohort);
+        self.durable_completion_members[index] = slot;
+        if (self.durable_completion == null) self.durable_completion = slot;
+    }
+
+    /// Borrowed snapshots require the caller's existing apply/backend serialization.
+    pub fn hasDurableCompletions(self: *const Backend) bool {
+        for (self.durable_completion_members) |maybe| if (maybe) |slot| {
+            if (!slot.retired) return true;
+        };
+        return false;
+    }
+
+    pub fn findDurableCompletion(self: *const Backend, txn_id: [16]u8) ?*DurableCompletionSlot {
+        for (self.durable_completion_members) |maybe| if (maybe) |slot| {
+            if (!slot.retired and std.mem.eql(u8, &slot.descriptor.descriptor.txn_id, &txn_id)) return slot;
+        };
+        return null;
+    }
+
+    pub fn durableCompletionSlots(self: *const Backend) [completion_runtime.max_slots]?*DurableCompletionSlot {
+        var result = self.durable_completion_members;
+        for (&result) |*maybe| if (maybe.*) |slot| {
+            if (slot.retired) maybe.* = null;
+        };
+        return result;
     }
 
     pub fn confirmDurableCompletion(self: *Backend, txn_id: [16]u8) !void {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
-        const slot = self.durable_completion orelse return error.CompletionNotPrepared;
+        const slot = self.findDurableCompletion(txn_id) orelse return error.CompletionNotPrepared;
         if (!std.mem.eql(u8, &slot.descriptor.descriptor.txn_id, &txn_id)) return error.InvalidCompletionSlot;
-        const stored = try self.getMergedWithMutable(&self.mutable, .{ .name = slot.descriptor.descriptor.namespace }, completion_runtime.storage_key);
+        const stored = try self.getMergedWithMutable(&self.mutable, .{ .name = slot.descriptor.descriptor.namespace }, slot.storageKey());
         if (!std.mem.eql(u8, stored, slot.encoded)) return error.InvalidCompletionSlot;
         slot.durable = true;
     }
 
     /// Clean failure before prepare may release ownership. Any ambiguous WAL
     /// outcome retains the slot and fences the backend until reopen.
-    pub fn cancelUnpreparedCompletion(self: *Backend) void {
+    pub fn cancelUnpreparedCompletion(self: *Backend, txn_id: [16]u8) void {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
-        const slot = self.durable_completion orelse return;
+        const slot = self.findDurableCompletion(txn_id) orelse return;
         if (slot.durable or self.manifest_recovery_required) return;
-        if (self.getMergedWithMutable(&self.mutable, .{ .name = slot.descriptor.descriptor.namespace }, completion_runtime.storage_key)) |_| return else |err| {
+        if (self.getMergedWithMutable(&self.mutable, .{ .name = slot.descriptor.descriptor.namespace }, slot.storageKey())) |_| return else |err| {
             if (err != error.NotFound) return;
         }
-        slot.clearGuard() catch {
-            self.fenceFailedBulkWal();
-            return;
-        };
+        slot.retired = true;
+        self.retireDurableCompletionCohort() catch self.fenceFailedBulkWal();
+    }
+
+    pub fn retireDurableCompletionCohort(self: *Backend) !void {
+        if (self.hasDurableCompletions()) return;
+        errdefer self.fenceFailedBulkWal();
+        // Index zero remains the generation-fencing anchor until every sibling
+        // guard is gone. Interrupted cleanup can only expose manifested outcomes.
+        var i: usize = completion_runtime.max_slots;
+        while (i != 0) {
+            i -= 1;
+            if (self.durable_completion_members[i]) |slot| try slot.clearGuard();
+        }
         self.releaseDurableCompletion();
     }
 
@@ -4504,7 +4560,7 @@ pub const Backend = struct {
     };
 
     fn durableCompletionDecisionLocked(self: *Backend, txn_id: [16]u8) !DurableCompletionDecision {
-        const slot = self.durable_completion orelse return error.CompletionNotPrepared;
+        const slot = self.findDurableCompletion(txn_id) orelse return error.CompletionNotPrepared;
         // After an uncertain attempt the baseline may precede a durable SST
         // publication. Only recovery may establish the authoritative outcome.
         if (slot.attempted or self.manifest_recovery_required) return error.RecoveryRequired;
@@ -4541,7 +4597,7 @@ pub const Backend = struct {
         defer self.serialized_write_mutex.unlock();
         const locked = runtime_mod.lockBackend(Backend, self);
         defer self.unlockCompletionBoundary(locked, false);
-        const slot = self.durable_completion orelse return error.CompletionNotPrepared;
+        const slot = self.findDurableCompletion(txn_id) orelse return error.CompletionNotPrepared;
         if (!std.mem.eql(u8, &slot.descriptor.descriptor.txn_id, &txn_id)) return error.InvalidCompletionSlot;
         const decision = try self.durableCompletionDecisionLocked(txn_id);
         if ((commit and decision.status == .aborted) or (!commit and decision.status == .committed)) return error.DecisionConflict;
@@ -4555,21 +4611,43 @@ pub const Backend = struct {
         @memcpy(credit_key[0..credit_prefix.len], credit_prefix);
         @memcpy(credit_key[credit_prefix.len..], &txn_id);
         const credit = slot.currentMetadata(self, &credit_key, if (slot.baseline_credit) |*saved| saved else null);
+        const selected_operations = if (commit) slot.descriptor.descriptor.commit else slot.descriptor.descriptor.abort;
+        var deletes_credit = false;
+        var writes_summary = false;
+        for (selected_operations) |op| {
+            if (op.kind == .delete and std.mem.eql(u8, op.key, &credit_key)) deletes_credit = true;
+            if (std.mem.eql(u8, op.key, summary_key)) {
+                if (!completion_slot_codec.isSharedDynamicOperation(op)) return error.UnsupportedCompletionTemplate;
+                writes_summary = true;
+            }
+        }
+        if (deletes_credit and !writes_summary) return error.UnsupportedCompletionTemplate;
         if (credit) |bytes| {
             const summary = slot.currentMetadata(self, summary_key, if (slot.baseline_summary) |*saved| saved else null) orelse return error.InvalidTxnRecord;
             if (bytes.len != 16 or summary.len != 16) return error.InvalidTxnRecord;
             const charge = try std.math.add(u64, std.mem.readInt(u64, bytes[0..8], .little), std.mem.readInt(u64, bytes[8..16], .little));
-            bound.shared_ledger_count = try std.math.sub(u64, std.mem.readInt(u64, summary[0..8], .little), 1);
-            bound.shared_ledger_bytes = try std.math.sub(u64, std.mem.readInt(u64, summary[8..16], .little), charge);
+            bound.shared_ledger_count = std.mem.readInt(u64, summary[0..8], .little);
+            bound.shared_ledger_bytes = std.mem.readInt(u64, summary[8..16], .little);
+            if (deletes_credit) {
+                bound.shared_ledger_count = try std.math.sub(u64, bound.shared_ledger_count, 1);
+                bound.shared_ledger_bytes = try std.math.sub(u64, bound.shared_ledger_bytes, charge);
+            }
         }
         try slot.complete(self, commit, bound);
-        self.releaseDurableCompletion();
+        slot.retired = true;
+        try self.retireDurableCompletionCohort();
     }
 
-    fn releaseDurableCompletion(self: *Backend) void {
-        const slot = self.durable_completion orelse return;
+    pub fn releaseDurableCompletion(self: *Backend) void {
         self.durable_completion = null;
-        slot.destroy();
+        var i: usize = completion_runtime.max_slots;
+        while (i != 0) {
+            i -= 1;
+            if (self.durable_completion_members[i]) |slot| {
+                self.durable_completion_members[i] = null;
+                slot.destroy();
+            }
+        }
     }
 
     pub var test_completion_wal_sealed_hook: ?*const fn (*Backend, *storage_io.NativeWalCompletionIo) ?storage_io.Storage = null;
