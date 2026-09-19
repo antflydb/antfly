@@ -402,6 +402,20 @@ The following gates remain:
   generation exhaustion/reuse, low-budget installation rejection, restart and
   physical output-file splitting. Output limits use the native 512 MiB file
   allowance, rather than the larger generic encoder format maximum.
+- **Fixed block workspaces and single-run drain metadata (implemented stage).**
+  Maintenance cursors retain two maximum-block buffers per input and borrow one
+  metadata buffer during initialization; block advancement no longer allocates.
+  Direct prefix encoding and two-buffer decoding preserve v11 bytes, including
+  prefix+Snappy and binary keys larger than a normal block. The bounded encoder
+  helper reserves precise arrays and a caller-owned compression workspace, and
+  rejects its metadata ceiling before flushing; integrating that helper and
+  retained output bounds into the complete maintenance scratch partition is
+  still pending. Cohort admission now also bounds its own future metadata below
+  the single protected SST's input-metadata limit. Existing immutable database
+  size is excluded from that cohort-only check. The owning Debug gate passed
+  18/18 with zero skips, failures, or leaks: byte differential/reuse tests,
+  actual oversized-key SST metadata, pre-sidecar cumulative-cohort rejection,
+  and all prior generation/capacity/restart regressions.
 - **Output-count and future-frontier certificate (implemented).** Qualification
   scans CRC-checked physical records and keeps additive encoded-data, metadata,
   and block costs. Admission adds canonical operations, both possible outcomes,

@@ -654,6 +654,9 @@ pub fn Pool(comptime Backend: type) type {
             const proof = try capacity.certify(total, .{ .metadata_bytes = self.config.shape.max_metadata_bytes, .additional_runs = self.cell_count });
             try metadataCapacity(proof.outputs, total.max_key_bytes);
             const future = try self.capacity_growth.plus(growth);
+            // A protected drain writes one run from mutable+delta. Its metadata
+            // must remain readable by the later bounded maintenance cursor.
+            try capacity.certifySingleDrain(future, self.config.shape.max_metadata_bytes);
             const added = try capacity.certify(future, .{ .metadata_bytes = self.config.shape.max_metadata_bytes, .additional_runs = self.cell_count });
             // Existing immutable cursors remain live while the newly generated
             // protected runs are merged. Certifying only the replacement run
@@ -2029,4 +2032,68 @@ test "workload admission physical completion record admission includes canonical
     const exact_private_size = 13 + "docs".len + completion.storage_keys[1].len + full_descriptor.len;
     try validateEntryRecordSizes(&private, exact_private_size);
     try std.testing.expectError(error.UnsupportedCompletionProfile, validateEntryRecordSizes(&private, exact_private_size - 1));
+}
+
+test "workload admission completion single drain rejects cumulative large keys before accepted ownership" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const runtime = @import("runtime.zig");
+    const alloc = std.testing.allocator;
+    var fd_pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 32);
+    defer fd_pool.deinit();
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 256 * 1024 * 1024 } });
+    defer manager.deinit(alloc);
+    var path_buffer: [256]u8 = undefined;
+    const path = repository.tmpPath(&path_buffer, "completion-single-drain-metadata");
+    defer repository.cleanupTmp(path);
+    var backend: Backend = undefined;
+    try backend.openInto(alloc, std.mem.span(path), .{ .resource_manager = &manager, .native_storage_pool = &fd_pool, .flush_threshold = 10000 });
+    defer backend.abandonAfterCrash();
+    {
+        var batch = try backend.beginWrite();
+        errdefer batch.abort();
+        try batch.put(.{}, "baseline", "preserved");
+        try batch.commit();
+    }
+    try backend.checkpointWalAfterDurableBoundary();
+    const identity: abi.Identity = .{ .capacity = 4, .group_id = 23, .node_id = 7, .incarnation = @splat(11), .policy_digest = @splat(12), .generation = 19 };
+    const locked = runtime.lockBackend(Backend, &backend);
+    defer runtime.unlockBackend(Backend, &backend, locked);
+    try backend.installCompletionPoolLocked(.{ .identity = identity, .schema_catalog_digest = @splat(13), .namespace = .root });
+    const pool = backend.completion_pool.?;
+    try pool.qualifyFresh(&backend);
+    const storage = try alloc.alloc(u8, 6 * 40000);
+    defer alloc.free(storage);
+    var keys: [6][]const u8 = undefined;
+    var prepare: [3]slot_codec.Operation = undefined;
+    var commit: [3]slot_codec.Operation = undefined;
+    for (0..3) |i| {
+        var hash = entry_codec.BaselineHasher.init();
+        for (&keys, 0..) |*key, j| {
+            const bytes = storage[j * 40000 ..][0..40000];
+            @memset(bytes, 0x91);
+            std.mem.writeInt(u64, bytes[0..8], i * 6 + j, .big);
+            key.* = bytes;
+            try hash.add(bytes, null);
+            if (j < 3) prepare[j] = .{ .kind = .put, .key = bytes, .value = "v" } else commit[j - 3] = .{ .kind = .put, .key = bytes, .value = "done" };
+        }
+        const id: [16]u8 = @splat(@intCast(100 + i));
+        const descriptor = try slot_codec.encode(alloc, .{ .txn_id = id, .intent_revision = 1, .limits = completion.limits, .profile_fence = "replicated-profile", .commit = &commit, .abort = &.{} }, .{});
+        defer alloc.free(descriptor);
+        const wire = try entry_codec.encode(alloc, .{ .group_id = identity.group_id, .group_incarnation = identity.incarnation, .policy_digest = identity.policy_digest, .schema_catalog_digest = @splat(13), .txn_id = id, .original_input_digest = @splat(14), .baseline_digest = hash.finish(), .previous_term = if (i == 0) 0 else 3, .previous_index = i, .baseline_keys = &keys, .descriptor = descriptor, .prepare_operations = &prepare });
+        defer alloc.free(wire);
+        if (i == 2) {
+            const before = pool.capacity_growth;
+            try std.testing.expectError(error.UnsupportedCompletionProfile, pool.accept(&backend, 3, i + 1, 3, i, wire));
+            try std.testing.expectEqual(Pool(Backend).Phase.free, pool.cells[i].phase);
+            try std.testing.expect(std.meta.eql(before, pool.capacity_growth));
+            try std.testing.expectError(error.FileNotFound, backend.storage.?.fileSize(pool.accepted_paths[i]));
+        } else {
+            try std.testing.expectEqual(i, try pool.accept(&backend, 3, i + 1, if (i == 0) 0 else 3, i, wire));
+            const slot = try pool.adopt(&backend, i);
+            backend.durable_completion_members[i] = slot;
+            if (backend.durable_completion == null) backend.durable_completion = slot;
+            try slot.applyCanonicalPrepare(&backend, pool.cells[i].entry.?.entry.prepare_operations);
+            pool.notifyApplied(i);
+        }
+    }
 }

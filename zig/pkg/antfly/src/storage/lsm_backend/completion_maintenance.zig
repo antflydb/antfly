@@ -41,11 +41,13 @@ const Cursor = struct {
     entry_in_block: usize = 0,
     advanced_entries: usize = 0,
     offset: usize = 0,
+    first: []u8,
+    second: []u8,
     loaded: ?[]u8 = null,
     entry: ?table.Entry = null,
     frontier_bytes: usize,
 
-    fn init(allocator: Allocator, io: io_mod.Storage, path: []const u8, limits: Limits) !Cursor {
+    fn init(allocator: Allocator, io: io_mod.Storage, path: []const u8, limits: Limits, metadata_workspace: []u8) !Cursor {
         const size = try io.fileSize(path);
         if (size < table.header_len + table.footer_len) return error.InvalidTableFile;
         var footer_bytes: [table.footer_len]u8 = undefined;
@@ -53,8 +55,8 @@ const Cursor = struct {
         const footer = try table.decodeFooterBytes(&footer_bytes);
         if (footer.metadata_len > limits.max_metadata_bytes or footer.metadata_offset > size - table.footer_len or
             footer.metadata_len != size - table.footer_len - footer.metadata_offset) return error.UnsupportedCompletionProfile;
-        const metadata = try allocator.alloc(u8, footer.metadata_len);
-        defer allocator.free(metadata);
+        if (footer.metadata_len > metadata_workspace.len) return error.UnsupportedCompletionProfile;
+        const metadata = metadata_workspace[0..footer.metadata_len];
         try io.readFileRangeInto(allocator, path, footer.metadata_offset, metadata);
         var index = try table.decodeSequentialIndexFromFooterAlloc(allocator, footer, metadata);
         errdefer index.deinit(allocator);
@@ -62,12 +64,16 @@ const Cursor = struct {
         for (index.blocks) |block| {
             if (block.window.len > limits.max_block_bytes or block.window.physicalLen() > limits.max_block_bytes)
                 return error.UnsupportedCompletionProfile;
-            largest = @max(largest, block.window.len +| block.window.physicalLen());
+            largest = @max(largest, @max(block.window.len, block.window.physicalLen()));
         }
-        return .{ .allocator = allocator, .io = io, .path = path, .index = index, .limits = limits, .frontier_bytes = index.blocks.len *| @sizeOf(table.SequentialTableIndex.Block) +| largest };
+        const first = try allocator.alloc(u8, largest);
+        errdefer allocator.free(first);
+        const second = try allocator.alloc(u8, largest);
+        return .{ .allocator = allocator, .io = io, .path = path, .index = index, .limits = limits, .first = first, .second = second, .frontier_bytes = index.blocks.len *| @sizeOf(table.SequentialTableIndex.Block) +| (2 *| largest) };
     }
     fn deinit(self: *Cursor) void {
-        if (self.loaded) |bytes| self.allocator.free(bytes);
+        self.allocator.free(self.first);
+        self.allocator.free(self.second);
         self.index.deinit(self.allocator);
     }
     fn current(self: *Cursor) !?table.Entry {
@@ -78,10 +84,9 @@ const Cursor = struct {
         if (self.entry) |entry| return entry;
         if (self.loaded == null) {
             const window = self.index.blocks[self.block].window;
-            const physical = try self.allocator.alloc(u8, window.physicalLen());
-            defer self.allocator.free(physical);
+            const physical = self.first[0..window.physicalLen()];
             try self.io.readFileRangeInto(self.allocator, self.path, self.index.entry_data_start + window.physicalRelativeOffset(), physical);
-            self.loaded = try table.decodeBlockPayloadAlloc(self.allocator, window.compression, physical, window.len, window.checksum);
+            self.loaded = try table.decodeBlockPayloadInto(window.compression, self.first, physical.len, self.second, window.len, window.checksum);
         }
         const entry = try table.parseEntryAt(self.loaded.?, self.offset);
         if (encodedEntryLen(entry) > self.limits.max_record_bytes) return error.UnsupportedCompletionProfile;
@@ -99,7 +104,6 @@ const Cursor = struct {
         if (self.entry_in_block > self.index.blocks[self.block].entry_count) return error.InvalidTableFile;
         if (self.entry_in_block == self.index.blocks[self.block].entry_count) {
             if (self.offset != self.loaded.?.len) return error.InvalidTableFile;
-            self.allocator.free(self.loaded.?);
             self.loaded = null;
             self.offset = 0;
             self.entry_in_block = 0;
@@ -131,10 +135,12 @@ pub const Measurement = struct { cost: capacity.Cost, frontier_bytes: usize };
 /// a merge emits a subset. No data-sized vector or set is needed for the proof.
 pub fn measure(allocator: Allocator, io: io_mod.Storage, paths: []const []const u8, limits: Limits) !Measurement {
     if (paths.len > limits.max_inputs) return error.UnsupportedCompletionProfile;
+    const metadata = try allocator.alloc(u8, limits.max_metadata_bytes);
+    defer allocator.free(metadata);
     var frontier: usize = 0;
     var cost: capacity.Cost = .{};
     for (paths) |path| {
-        var cursor = try Cursor.init(allocator, io, path, limits);
+        var cursor = try Cursor.init(allocator, io, path, limits, metadata);
         defer cursor.deinit();
         frontier +|= cursor.frontier_bytes;
         if (frontier > limits.max_frontier_bytes) return error.UnsupportedCompletionProfile;
@@ -208,12 +214,14 @@ const Output = struct {
 pub fn build(allocator: Allocator, io: io_mod.Storage, root: []const u8, paths: []const []const u8, mutable: *const state.State, output_base: u64, limits: Limits) !std.ArrayListUnmanaged(repository.Run) {
     if (!domains.isPrepaid(allocator) or paths.len > 68 or paths.len > limits.max_inputs or limits.max_outputs > 64)
         return error.UnsupportedCompletionProfile;
+    const metadata = try allocator.alloc(u8, limits.max_metadata_bytes);
+    defer allocator.free(metadata);
     var cursors: [68]Cursor = undefined;
     var cursor_count: usize = 0;
     defer for (cursors[0..cursor_count]) |*cursor| cursor.deinit();
     var frontier: usize = 0;
     for (paths) |path| {
-        cursors[cursor_count] = try Cursor.init(allocator, io, path, limits);
+        cursors[cursor_count] = try Cursor.init(allocator, io, path, limits, metadata);
         frontier +|= cursors[cursor_count].frontier_bytes;
         cursor_count += 1;
         if (frontier > limits.max_frontier_bytes) return error.UnsupportedCompletionProfile;
@@ -382,9 +390,11 @@ test "workload admission completion maintenance streams bounded blocks with exha
     try std.testing.expect(output.items.len > 1 and output.items.len <= 16);
     var total: usize = 0;
     var found = false;
+    const metadata_workspace = try scratch.allocator().alloc(u8, limits.max_metadata_bytes);
+    defer scratch.allocator().free(metadata_workspace);
     for (output.items) |run| {
         total += run.entry_count;
-        var cursor = try Cursor.init(scratch.allocator(), scope.storage(), run.path.?, limits);
+        var cursor = try Cursor.init(scratch.allocator(), scope.storage(), run.path.?, limits, metadata_workspace);
         defer cursor.deinit();
         var seen: usize = 0;
         while (try cursor.current()) |entry| {
@@ -426,4 +436,30 @@ test "workload admission completion maintenance streams bounded blocks with exha
     }
     try std.testing.expect(physical.items.len > 1);
     for (physical.items) |run| try std.testing.expect(run.size_bytes <= 8192);
+}
+
+test "workload admission completion single drain certificate matches actual oversized-key SST metadata" {
+    const alloc = std.testing.allocator;
+    const metadata_limit = 1024 * 1024;
+    var sink_impl = table.MemoryTableSink.init(alloc);
+    defer sink_impl.deinit();
+    var sink = sink_impl.sink();
+    var encoder = try table.StreamingEncoder.init(alloc, &sink, 1, .{ .bloom_config = .{ .bits_per_key = 1, .min_bits = 64, .max_hash_count = 1 }, .block_compression = .snappy_adaptive, .prefix_extractor = .none });
+    defer encoder.deinit();
+    var key: [40000]u8 = @splat(0x91);
+    var cost: capacity.Cost = .{};
+    for (0..12) |i| {
+        std.mem.writeInt(u64, key[0..8], i, .big);
+        const entry: table.Entry = .{ .namespace_name = null, .key = &key, .value = "v" };
+        cost = try cost.plus(try capacity.Cost.record(0, key.len, 1));
+        try capacity.certifySingleDrain(cost, metadata_limit);
+        try encoder.appendEntry(entry);
+    }
+    var result = try encoder.finish();
+    defer result.filter.deinit(alloc);
+    const footer = try table.decodeFooterBytes(sink_impl.out.items[sink_impl.out.items.len - table.footer_len ..]);
+    try std.testing.expect(footer.metadata_len <= cost.metadata_bytes + capacity.fixed_file_bytes);
+    try std.testing.expect(footer.metadata_len <= metadata_limit);
+    const grown = try cost.plus(try (try capacity.Cost.record(0, key.len, 1)).repeated(6));
+    try std.testing.expectError(error.UnsupportedCompletionProfile, capacity.certifySingleDrain(grown, metadata_limit));
 }

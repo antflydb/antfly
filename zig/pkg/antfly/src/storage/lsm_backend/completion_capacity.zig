@@ -97,6 +97,13 @@ pub fn sharedCounterHeadroom(value: u64, increment: u64, cells: u64) !void {
     _ = try add(value, try mul(increment, cells));
 }
 
+/// Protected cohort drains currently emit one SST. This bound covers only
+/// mutable/cohort growth, not the immutable database already stored in runs.
+pub fn certifySingleDrain(cost: Cost, metadata_limit: u64) !void {
+    if (cost.metadata_bytes > metadata_limit or fixed_file_bytes > metadata_limit - cost.metadata_bytes)
+        return error.UnsupportedCompletionProfile;
+}
+
 pub fn certify(cost: Cost, limits: Limits) !Certificate {
     if (cost.records == 0) return .{ .outputs = 0, .blocks = 0, .frontier_bytes = 0, .retained_boundary_bytes = 0 };
     const largest_metadata = try add(record_metadata_bytes, try mul(2, cost.max_key_bytes));
