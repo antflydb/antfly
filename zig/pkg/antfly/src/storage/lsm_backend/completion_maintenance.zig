@@ -260,6 +260,58 @@ pub fn buildCertified(allocator: Allocator, io: io_mod.Storage, root: []const u8
     return buildInternal(allocator, io, root, paths, mutable, output_base, limits, true);
 }
 
+/// One protected drain has at most two sorted in-memory inputs and exactly
+/// one output. It excludes immutable baseline SSTs from the cost, and borrows
+/// an empty compiler domain so retained replay/readers cannot fragment it.
+pub fn drainWorkspaceRequirement(cost: capacity.Cost, limits: Limits) !Workspace {
+    try capacity.certifySingleDrain(cost, @min(limits.max_metadata_bytes, limits.max_output_metadata_bytes));
+    const wire = try std.math.add(u64, try std.math.add(u64, cost.encoded_bytes, cost.metadata_bytes), capacity.fixed_file_bytes);
+    if (wire > @min(limits.max_output_file_bytes, repository.maxRunFileReadBytes())) return error.UnsupportedCompletionProfile;
+    return workspaceRequirement(cost, 0, 1, limits);
+}
+
+pub fn buildStateDrain(allocator: Allocator, io: io_mod.Storage, root: []const u8, states: []const *const state.State, output_id: u64, limits: Limits) !repository.Run {
+    if (!domains.isPrepaid(allocator) or root.len > 512 or states.len == 0 or states.len > 2)
+        return error.UnsupportedCompletionProfile;
+    var cost: capacity.Cost = .{};
+    for (states) |input| for (0..input.entryCount()) |i| {
+        const entry = input.entryAt(i);
+        cost = try cost.plus(try capacity.Cost.record(if (entry.namespace_name) |ns| ns.len else 0, entry.key.len, entry.value.len));
+    };
+    if (cost.records == 0) return error.CompletionDrainShapeChanged;
+    const shape = try drainWorkspaceRequirement(cost, limits);
+    const writer_buffer = try allocator.alloc(u8, shape.writer);
+    defer allocator.free(writer_buffer);
+    const compression = try allocator.alloc(u8, shape.compression);
+    defer allocator.free(compression);
+    var output: Output = undefined;
+    try output.init(allocator, io, root, output_id, limits, shape, writer_buffer, compression);
+    defer output.deinit();
+    // Preserve the ordinary flush's L0 ordering over the immutable baseline.
+    output.run.level = 0;
+    output.run.visibility_id = output_id;
+    var cursors: [2]state.State.EntryCursor = .{ .{}, .{} };
+    var positions: [2]usize = @splat(0);
+    while (true) {
+        var entries: [2]?table.Entry = @splat(null);
+        var selected: ?table.Entry = null;
+        for (states, 0..) |input, i| {
+            if (positions[i] == input.entryCount()) continue;
+            const entry = stateEntry(cursors[i].at(input, positions[i]));
+            entries[i] = entry;
+            // Earlier inputs win ties, including tombstones.
+            if (selected == null or order(entry, selected.?) == .lt) selected = entry;
+        }
+        const winner = selected orelse break;
+        if (!output.fits(winner, limits)) return error.CompletionDrainShapeChanged;
+        try output.append(winner);
+        for (entries[0..states.len], 0..) |maybe, i| if (maybe) |entry| {
+            if (order(entry, winner) == .eq) positions[i] += 1;
+        };
+    }
+    return output.finish();
+}
+
 fn buildInternal(allocator: Allocator, io: io_mod.Storage, root: []const u8, paths: []const []const u8, mutable: *const state.State, output_base: u64, limits: Limits, certified: bool) !std.ArrayListUnmanaged(repository.Run) {
     if (!domains.isPrepaid(allocator) or root.len > 512 or paths.len > 68 or paths.len > limits.max_inputs or limits.max_outputs > 64)
         return error.UnsupportedCompletionProfile;
@@ -617,4 +669,70 @@ test "workload admission completion aggregate workspace builds split binary runs
     try std.testing.expectEqualStrings("ns\x00\xff", output.items[0].smallest_namespace_name.?);
     try std.testing.expectEqual(@as(usize, 40000), output.items[1].largest_key.len);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "workload admission completion fixed drain merges binary duplicate and tombstone keys with exact workspace" {
+    const alloc = std.testing.allocator;
+    const resources = @import("../resource_manager.zig");
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var fd_pool = io_mod.NativeStoragePool.initWithCapacityForTest(alloc, 16);
+    defer fd_pool.deinit();
+    var native = try io_mod.NativeStorage.initWithPool(alloc, .threaded, &fd_pool);
+    defer native.deinit();
+    var root_buffer: [256]u8 = undefined;
+    const root_z = repository.tmpPath(&root_buffer, "completion-fixed-drain");
+    defer repository.cleanupTmp(root_z);
+    const root = std.mem.span(root_z);
+    const path = try repository.runPath(alloc, root, 1);
+    defer alloc.free(path);
+    const scope = try io_mod.NativeCompletionIo.createWithFiles(alloc, &native, root, &.{.{ .path = path, .max_bytes = 16 * 1024 * 1024, .allow_delete = true }});
+    defer scope.deinit() catch unreachable;
+    scope.allow_sequential_input = true;
+    var old: state.State = .{};
+    defer old.deinit(alloc);
+    var delta: state.State = .{};
+    defer delta.deinit(alloc);
+    const ns = @import("../backend_types.zig").Namespace{ .name = "ns\x00" };
+    var large_key: [40000]u8 = @splat(0xff);
+    large_key[0] = 'z';
+    try old.upsert(alloc, ns, "a\x00", "old", false);
+    try old.upsert(alloc, ns, "b\xff", "deleted", false);
+    try old.upsert(alloc, ns, &large_key, "large", false);
+    try delta.upsert(alloc, ns, "a\x00", "new", false);
+    try delta.upsert(alloc, ns, "b\xff", "", true);
+    const states = [_]*const state.State{ &delta, &old };
+    var cost: capacity.Cost = .{};
+    for (states) |input| for (0..input.entryCount()) |i| {
+        const item = input.entryAt(i);
+        cost = try cost.plus(try capacity.Cost.record(item.namespace_name.?.len, item.key.len, item.value.len));
+    };
+    const limits: Limits = .{ .max_output_file_bytes = 16 * 1024 * 1024 };
+    const shape = try drainWorkspaceRequirement(cost, limits);
+    const scratch = try domains.RecyclingScratch.create(failing.allocator(), &manager, shape.total);
+    defer scratch.destroy() catch unreachable;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    fd_pool.fd_cache.capacity = 1;
+    manager.memory.budget.hard_limit_bytes = 1;
+    var output = try buildStateDrain(scratch.allocator(), scope.storage(), root, &states, 1, limits);
+    defer output.deinit(scratch.allocator());
+    try std.testing.expectEqual(@as(usize, 3), output.entry_count);
+    try std.testing.expectEqual(@as(?u32, 1), output.tombstone_count);
+    try std.testing.expectEqual(@as(u32, 0), output.level);
+    try std.testing.expectEqual(@as(u64, 1), output.visibility_id);
+    const metadata = try alloc.alloc(u8, limits.max_metadata_bytes);
+    defer alloc.free(metadata);
+    var cursor = try Cursor.init(alloc, scope.storage(), path, limits, metadata);
+    defer cursor.deinit();
+    try std.testing.expectEqualStrings("new", (try cursor.current()).?.value);
+    try cursor.advance();
+    try std.testing.expect((try cursor.current()).?.tombstone);
+    try cursor.advance();
+    try std.testing.expectEqualSlices(u8, &large_key, (try cursor.current()).?.key);
+    try cursor.advance();
+    try std.testing.expectEqual(@as(?table.Entry, null), try cursor.current());
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectError(error.UnsupportedCompletionProfile, drainWorkspaceRequirement(cost, .{ .max_output_file_bytes = 4096 }));
 }

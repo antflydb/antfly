@@ -121,6 +121,8 @@ pub fn Slot(comptime Backend: type) type {
         publication: PublicationDomain,
         scratch: ScratchDomain,
         pooled_owner: ?PooledOwner = null,
+        drain_workspace: ?*domains.CompilerWorkspace = null,
+        drain_limits: @import("completion_maintenance.zig").Limits = .{},
         accepted_identity: ?AcceptedIdentity = null,
         descriptor: codec.OwnedDescriptor,
         encoded: []u8,
@@ -164,6 +166,8 @@ pub fn Slot(comptime Backend: type) type {
             self_storage: *Self,
             publication: *domains.PublicationReservation,
             scratch: *domains.RecyclingScratch,
+            drain_workspace: *domains.CompilerWorkspace,
+            drain_limits: @import("completion_maintenance.zig").Limits,
             io: *storage_io.NativeCompletionIo,
             memory_pin: resources.ObserverMetadataPin,
             wal_pin: resources.ObserverMetadataPin,
@@ -209,6 +213,8 @@ pub fn Slot(comptime Backend: type) type {
                 .publication = .{ .reservation = input.publication },
                 .scratch = .{ .borrowed = input.scratch },
                 .pooled_owner = input.owner,
+                .drain_workspace = input.drain_workspace,
+                .drain_limits = input.drain_limits,
                 .accepted_identity = input.accepted_identity,
                 .descriptor = descriptor,
                 .encoded = wire,
@@ -269,7 +275,7 @@ pub fn Slot(comptime Backend: type) type {
             const owner = self.pooled_owner.?;
             const progress = try owner.prepare_progress(owner.context, self, identity, null);
             try incoming.upsert(alloc, namespace, @import("completion_entry.zig").group_progress_key, &progress, false);
-            var candidate = try backend.mutable.preparePublication(publication_alloc, &incoming);
+            var candidate = try backend.mutable.preparePublicationOwned(publication_alloc, &incoming);
             defer candidate.deinit(publication_alloc);
             var append = try wal.PreparedAppend.init(alloc, backend.root_dir.?, &incoming, true, .{ .segment_bytes = backend.options.wal_segment_bytes });
             defer append.deinit();
@@ -790,13 +796,24 @@ pub fn Slot(comptime Backend: type) type {
                 backend.write_stats.wal_append_bytes += result.bytes;
                 if (builtin.is_test) if (test_after_wal) |hook| if (hook()) return error.RecoveryRequired;
             }
-            var built = try compaction.buildRunsFromStatesBorrowedWithReservedIds(Build, &build, states[0..if (current.entryCount() == 0) @as(usize, 1) else 2], self.run_id, self.run_id + 1);
-            defer {
-                for (built.items) |*run| run.deinit(alloc);
-                built.deinit(alloc);
-            }
-            if (built.items.len != 1) return error.CompletionDrainShapeChanged;
-            var run = try repository.cloneRunCompactionSnapshot(pub_alloc, built.items[0]);
+            var run = if (self.drain_workspace) |workspace| bounded: {
+                var borrow = try workspace.tryBorrow();
+                defer borrow.release() catch unreachable;
+                const writer_alloc = try borrow.allocator();
+                var output = try @import("completion_maintenance.zig").buildStateDrain(writer_alloc, self.io.storage(), backend.root_dir.?, &states, self.run_id, self.drain_limits);
+                defer output.deinit(writer_alloc);
+                break :bounded try repository.cloneRunCompactionSnapshot(pub_alloc, output);
+            } else legacy: {
+                // Standalone reservations retain their existing generic writer;
+                // the fixed pooled-workspace certificate does not cover it.
+                var built = try compaction.buildRunsFromStatesBorrowedWithReservedIds(Build, &build, states[0..if (current.entryCount() == 0) @as(usize, 1) else 2], self.run_id, self.run_id + 1);
+                defer {
+                    for (built.items) |*item| item.deinit(alloc);
+                    built.deinit(alloc);
+                }
+                if (built.items.len != 1) return error.CompletionDrainShapeChanged;
+                break :legacy try repository.cloneRunCompactionSnapshot(pub_alloc, built.items[0]);
+            };
             run.metadata_allocator = pub_alloc;
             var run_owned = true;
             defer if (run_owned) run.deinit(backend.allocator);

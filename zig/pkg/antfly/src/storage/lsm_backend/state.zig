@@ -694,6 +694,17 @@ pub const ActiveMemTable = struct {
     /// through them. Provenance is preserved; this does not retain the context
     /// or exempt these allocations from the shared memory Account.
     pub fn preparePublication(self: *ActiveMemTable, allocator: Allocator, incoming: *const ActiveMemTable) !ActiveMemTable {
+        return self.preparePublicationInternal(allocator, incoming, false);
+    }
+
+    /// Copy payloads into the publication domain as well as the index nodes.
+    /// This keeps temporary incoming scratch independently reclaimable while
+    /// mutable/readers retain their exact publication allocation provenance.
+    pub fn preparePublicationOwned(self: *ActiveMemTable, allocator: Allocator, incoming: *const ActiveMemTable) !ActiveMemTable {
+        return self.preparePublicationInternal(allocator, incoming, true);
+    }
+
+    fn preparePublicationInternal(self: *ActiveMemTable, allocator: Allocator, incoming: *const ActiveMemTable, copy_payloads: bool) !ActiveMemTable {
         std.debug.assert(self.ordered_enabled);
         var candidate = ActiveMemTable{ .ordered = self.ordered.fork(), .logical_bytes = self.logical_bytes };
         if (self.ordered.spare_allocator) |spare_allocator| {
@@ -704,7 +715,11 @@ pub const ActiveMemTable = struct {
         }
         errdefer candidate.deinit(allocator);
         for (0..incoming.entryCount()) |i| {
-            var entry = try cloneEntry(allocator, incoming.entryAt(i));
+            const source = incoming.entryAt(i);
+            var entry = if (copy_payloads)
+                try initSharedEntry(allocator, namespaceOf(source), source.key, source.value, source.tombstone)
+            else
+                try cloneEntry(allocator, source);
             errdefer entry.deinit(allocator);
             try candidate.upsertMove(allocator, entry);
         }
@@ -1738,4 +1753,33 @@ test "EntryIndex stores unique hashes inline and preserves collision lookup" {
     try std.testing.expectEqual(@as(?usize, 0), index.find(entries.items, forced_hash, .{}, "alpha"));
     try std.testing.expectEqual(@as(?usize, 1), index.find(entries.items, forced_hash, .{}, "beta"));
     try std.testing.expectEqual(@as(?usize, null), index.find(entries.items, forced_hash, .{}, "missing"));
+}
+
+test "workload admission completion publication copies payloads out of scratch while readers retain provenance" {
+    const alloc = std.testing.allocator;
+    const domains = @import("completion_allocator.zig");
+    const resources = @import("../resource_manager.zig");
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    const scratch = try domains.RecyclingScratch.create(alloc, &manager, 64 * 1024);
+    defer scratch.destroy() catch unreachable;
+    var published = std.testing.FailingAllocator.init(alloc, .{});
+    var live: ActiveMemTable = .{};
+    defer live.deinit(alloc);
+    {
+        var incoming: ActiveMemTable = .{ .ordered_enabled = false };
+        defer incoming.deinit(scratch.allocator());
+        try incoming.upsert(scratch.allocator(), .{ .name = "ns\x00" }, "binary\xff", "retained value", false);
+        var candidate = try live.preparePublicationOwned(published.allocator(), &incoming);
+        defer candidate.deinit(alloc);
+        live.publishPrepared(&candidate);
+    }
+    try std.testing.expect(scratch.isEmpty());
+    var reader = try live.snapshot(alloc);
+    live.deinit(alloc);
+    live = .{};
+    try std.testing.expectEqualStrings("retained value", try reader.get(.{ .name = "ns\x00" }, "binary\xff"));
+    try std.testing.expect(published.allocated_bytes > published.freed_bytes);
+    reader.deinit(alloc);
+    try std.testing.expectEqual(published.allocated_bytes, published.freed_bytes);
 }

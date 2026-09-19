@@ -432,6 +432,20 @@ The following gates remain:
   while backing allocation and ordinary FD admission were disabled. This
   certificate covers no-debt maintenance; Slot.drain's shared scratch and
   retained canonical-prepare payloads still require their separate proof.
+- **Fixed pooled completion drain (implemented stage).** Pooled Slot drains
+  merge their two sorted memory snapshots using the fixed maintenance encoder
+  in an exclusive compiler workspace. Admission checks the entire cohort's
+  possible mutable data, metadata and framing against the single 16 MiB output
+  and configured record/metadata limits. The output remains L0 with its reserved
+  visibility ID. Startup releases lookup temporaries before borrowing this
+  writer workspace. Canonical prepare copies SharedEntry payloads into the
+  already-accounted cell publication span, so reader-held data no longer pins
+  temporary incoming scratch. The owning Debug gate passed 22/22 with zero
+  skips, failures, or leaks, including exact-budget binary-key/tombstone merge,
+  file-cap rejection, payload provenance after scratch release, and prior
+  four-cell/restart/generation tests. This does not cover the standalone Slot's
+  generic writer, shared scratch used by WAL/delta/replay work, or mandatory
+  compiler-borrow counter headroom; those remain explicit capacity gates.
 - **Output-count and future-frontier certificate (implemented).** Qualification
   scans CRC-checked physical records and keeps additive encoded-data, metadata,
   and block costs. Admission adds canonical operations, both possible outcomes,

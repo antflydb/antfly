@@ -660,7 +660,12 @@ pub fn Pool(comptime Backend: type) type {
             const future = try self.capacity_growth.plus(growth);
             // A protected drain writes one run from mutable+delta. Its metadata
             // must remain readable by the later bounded maintenance cursor.
-            try capacity.certifySingleDrain(future, self.config.shape.max_metadata_bytes);
+            _ = try maintenance.drainWorkspaceRequirement(future, .{
+                .max_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_output_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_record_bytes = self.config.shape.max_record_bytes,
+                .max_output_file_bytes = completion.limits.flush_bytes,
+            });
             const added = try capacity.certify(future, .{ .metadata_bytes = self.config.shape.max_metadata_bytes, .additional_runs = self.cell_count });
             // Existing immutable cursors remain live while the newly generated
             // protected runs are merged. Certifying only the replacement run
@@ -981,6 +986,13 @@ pub fn Pool(comptime Backend: type) type {
                 .self_storage = cell.slot,
                 .publication = cell.publication.?,
                 .scratch = self.scratch,
+                .drain_workspace = &self.compiler,
+                .drain_limits = .{
+                    .max_metadata_bytes = self.config.shape.max_metadata_bytes,
+                    .max_output_metadata_bytes = self.config.shape.max_metadata_bytes,
+                    .max_record_bytes = self.config.shape.max_record_bytes,
+                    .max_output_file_bytes = completion.limits.flush_bytes,
+                },
                 .io = self.io,
                 .memory_pin = self.memory_pin,
                 .wal_pin = self.wal_pin,
@@ -1075,38 +1087,42 @@ pub fn Pool(comptime Backend: type) type {
         /// Matches only actual persisted native control records. An accepted
         /// sidecar alone is never a prepared transaction or a decision to abort.
         pub fn restoreMaterialized(self: *Self, backend: *Backend) !void {
-            var borrow = try self.compiler.tryBorrow();
-            defer borrow.release() catch unreachable;
-            const alloc = try borrow.allocator();
-            try self.restoreProgress(backend, alloc);
             var completed: [max_slots]bool = @splat(false);
             var needs_drain: ?*Slot = null;
-            // Materialize all siblings before any drain refreshes their shared
-            // baselines. A manifested sibling is not authority to discard WAL
-            // containing later ordinary writes or another accepted prepare.
-            for (self.cells[0..self.cell_count], 0..) |*cell, i| {
-                if (cell.phase != .accepted) continue;
-                const ns = cell.entry.?.decoded_descriptor.descriptor.namespace;
-                const id = cell.entry.?.entry.txn_id;
-                const manifested = !cell.baseline.slot_present and if (cell.baseline.applied) |marker| std.mem.eql(u8, &marker, &id) else false;
-                const baseline = try self.captureBaseline(backend, alloc, cell, i);
-                const receipt_key = entry_codec.receiptKey(id);
-                const receipt = try self.capture(backend, alloc, ns, &receipt_key, 48);
-                const expected = completion.AcceptedIdentity{ .term = cell.term, .index = cell.index, .digest = cell.entry.?.digest };
-                completed[i] = !baseline.slot_present and if (baseline.applied) |marker| std.mem.eql(u8, &marker, &id) else false;
-                if (baseline.slot_present) {
-                    if (receipt == null or !std.mem.eql(u8, &receipt.?, &expected.encode())) return error.InvalidCompletionSlot;
-                    cell.baseline = baseline;
-                    cell.restored_prepared = true;
-                } else if (receipt != null) return error.InvalidCompletionSlot else if (!completed[i]) continue;
-                const slot = try self.adopt(backend, i);
-                backend.durable_completion_members[i] = slot;
-                if (backend.durable_completion == null) backend.durable_completion = slot;
-                if (completed[i] and !manifested) {
-                    if (needs_drain != null) return error.InvalidCompletionSlot;
-                    needs_drain = slot;
+            {
+                var borrow = try self.compiler.tryBorrow();
+                defer borrow.release() catch unreachable;
+                const alloc = try borrow.allocator();
+                try self.restoreProgress(backend, alloc);
+                // Materialize all siblings before any drain refreshes their shared
+                // baselines. A manifested sibling is not authority to discard WAL
+                // containing later ordinary writes or another accepted prepare.
+                for (self.cells[0..self.cell_count], 0..) |*cell, i| {
+                    if (cell.phase != .accepted) continue;
+                    const ns = cell.entry.?.decoded_descriptor.descriptor.namespace;
+                    const id = cell.entry.?.entry.txn_id;
+                    const manifested = !cell.baseline.slot_present and if (cell.baseline.applied) |marker| std.mem.eql(u8, &marker, &id) else false;
+                    const baseline = try self.captureBaseline(backend, alloc, cell, i);
+                    const receipt_key = entry_codec.receiptKey(id);
+                    const receipt = try self.capture(backend, alloc, ns, &receipt_key, 48);
+                    const expected = completion.AcceptedIdentity{ .term = cell.term, .index = cell.index, .digest = cell.entry.?.digest };
+                    completed[i] = !baseline.slot_present and if (baseline.applied) |marker| std.mem.eql(u8, &marker, &id) else false;
+                    if (baseline.slot_present) {
+                        if (receipt == null or !std.mem.eql(u8, &receipt.?, &expected.encode())) return error.InvalidCompletionSlot;
+                        cell.baseline = baseline;
+                        cell.restored_prepared = true;
+                    } else if (receipt != null) return error.InvalidCompletionSlot else if (!completed[i]) continue;
+                    const slot = try self.adopt(backend, i);
+                    backend.durable_completion_members[i] = slot;
+                    if (backend.durable_completion == null) backend.durable_completion = slot;
+                    if (completed[i] and !manifested) {
+                        if (needs_drain != null) return error.InvalidCompletionSlot;
+                        needs_drain = slot;
+                    }
                 }
             }
+            // The drain independently borrows the now-empty writer workspace.
+            // No lookup temporary may survive into output construction.
             if (needs_drain) |slot| try slot.finishReplayed(backend);
             for (self.cells[0..self.cell_count], 0..) |*cell, i| if (completed[i]) {
                 cell.slot.retired = true;
