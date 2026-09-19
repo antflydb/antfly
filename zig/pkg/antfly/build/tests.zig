@@ -1561,6 +1561,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const introducer_test_step = b.step("introducer-test", "Run segment introducer unit tests");
     introducer_test_step.dependOn(&run_introducer_tests.step);
 
+    const secret_backend_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/secret_backends_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, secret_backend_test_mod, true, true);
+    secret_backend_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const secret_backend_tests = b.addTest(.{
+        .root_module = secret_backend_test_mod,
+        .filters = &.{"secret backend"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_secret_backend_tests = addFilteredTestRunArtifact(b, secret_backend_tests);
+    b.step("secret-backends-test", "Run distributed and serverless encrypted persistence tests").dependOn(&run_secret_backend_tests.step);
+
     const lite_native_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_native_test.zig"),
         .target = target,
@@ -1966,6 +1981,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
 
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
+    unit_test_step.dependOn(&run_secret_backend_tests.step);
 
     const serverless_default_filters = [_][]const u8{"serverless"};
     const serverless_tests = b.addTest(.{

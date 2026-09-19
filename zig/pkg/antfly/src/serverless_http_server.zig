@@ -18,7 +18,13 @@ const http_common = @import("raft/transport/http_common.zig");
 const serverless_http_routes = @import("serverless/api/http_routes.zig");
 const serverless_http_types = @import("serverless/api/http_types.zig");
 
-pub const ServerlessHttpServerConfig = struct {};
+const secrets = @import("common/secrets.zig");
+pub const ServerlessHttpServerConfig = struct {
+    secret_store: ?*secrets.FileStore = null,
+    // Explicit credential required even on otherwise unauthenticated serverless
+    // deployments. TLS terminates at the deployment's trusted ingress.
+    secret_admin_token: ?[]const u8 = null,
+};
 
 pub const Handler = struct {
     ptr: *anyopaque,
@@ -89,7 +95,7 @@ pub const ServerlessHttpServer = struct {
     }
 
     pub fn handle(self: *ServerlessHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
-        _ = self.cfg;
+        if (isSecretPath(req.uri)) return self.handleSecrets(req);
         const method: serverless_http_routes.HttpMethod = switch (req.method) {
             .GET => .get,
             .POST => .post,
@@ -130,11 +136,77 @@ pub const ServerlessHttpServer = struct {
         return response;
     }
 
+    fn isSecretPath(uri: []const u8) bool {
+        const path = if (std.mem.indexOfScalar(u8, uri, '?')) |i| uri[0..i] else uri;
+        return std.mem.eql(u8, path, "/secrets") or std.mem.startsWith(u8, path, "/secrets/") or std.mem.eql(u8, path, "/db/v1/secrets") or std.mem.startsWith(u8, path, "/db/v1/secrets/");
+    }
+    fn secretResponse(self: *ServerlessHttpServer, status: u16, body: []const u8) !http_common.HttpResponse {
+        const out = try self.alloc.dupe(u8, body);
+        errdefer self.alloc.free(out);
+        return .{ .status = status, .owner_allocator = self.alloc, .body = out, .content_type = try self.alloc.dupe(u8, "application/json") };
+    }
+    fn handleSecrets(self: *ServerlessHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const token = self.cfg.secret_admin_token orelse return self.secretResponse(503, "{\"error\":\"secret administration disabled\"}");
+        if (token.len < 32) return self.secretResponse(503, "{\"error\":\"secret administration disabled\"}");
+        const header = req.authorization orelse req.header("Authorization") orelse return self.secretResponse(401, "{\"error\":\"unauthorized\"}");
+        if (!std.mem.startsWith(u8, header, "Bearer ")) return self.secretResponse(401, "{\"error\":\"unauthorized\"}");
+        var expected: [32]u8 = undefined;
+        var supplied: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(token, &expected, .{});
+        std.crypto.hash.sha2.Sha256.hash(header[7..], &supplied, .{});
+        if (!std.crypto.timing_safe.eql([32]u8, expected, supplied)) return self.secretResponse(401, "{\"error\":\"unauthorized\"}");
+        return self.secretOperation(req) catch |err| switch (err) {
+            error.InvalidSecretKey, error.InvalidArgument, error.InvalidRequest => self.secretResponse(400, "{\"error\":\"invalid secret request\"}"),
+            error.Conflict => self.secretResponse(409, "{\"error\":\"secret revision conflict\"}"),
+            error.ResourceRequestTooLarge => self.secretResponse(413, "{\"error\":\"native secret collection limit exceeded\"}"),
+            else => self.secretResponse(503, "{\"error\":\"secret source unavailable\"}"),
+        };
+    }
+    fn secretOperation(self: *ServerlessHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
+        const store = self.cfg.secret_store orelse return error.Unavailable;
+        var path = if (std.mem.indexOfScalar(u8, req.uri, '?')) |i| req.uri[0..i] else req.uri;
+        if (std.mem.startsWith(u8, path, "/db/v1")) path = path[6..];
+        if (std.mem.eql(u8, path, "/secrets")) {
+            if (req.method != .GET) return self.secretResponse(405, "{}");
+            const listed = try store.list(self.alloc);
+            defer secrets.freeListedSecrets(self.alloc, listed);
+            const body = try std.json.Stringify.valueAlloc(self.alloc, .{ .secrets = listed, .writable = store.writable }, .{});
+            defer self.alloc.free(body);
+            return self.secretResponse(200, body);
+        }
+        const key = path["/secrets/".len..];
+        if (req.method == .PUT) {
+            if (req.body.len > 6 * @import("common/secret_contract.zig").max_value_bytes + 1024) return error.InvalidRequest;
+            var parsed = std.json.parseFromSlice(struct { value: []const u8 }, self.alloc, req.body, .{}) catch return error.InvalidRequest;
+            defer parsed.deinit();
+            var result = try store.put(self.alloc, key, parsed.value.value);
+            defer result.deinit(self.alloc);
+            const body = try std.json.Stringify.valueAlloc(self.alloc, result, .{});
+            defer self.alloc.free(body);
+            return self.secretResponse(200, body);
+        }
+        if (req.method == .DELETE) return self.secretResponse(if (try store.delete(key)) 204 else 404, "");
+        return self.secretResponse(405, "{}");
+    }
+
     /// Native httpx adapter. Request decoding and response encoding remain at
     /// the transport edge; the serverless handler receives its canonical
     /// transport-neutral request exactly once.
     pub fn handleHttpx(self: *ServerlessHttpServer, ctx: *httpx.Context) !httpx.Response {
-        _ = self.cfg;
+        if (isSecretPath(ctx.request.uri.path)) {
+            const method: http_common.Method = switch (ctx.request.method) {
+                .GET => .GET,
+                .PUT => .PUT,
+                .DELETE => .DELETE,
+                else => return ctx.status(405).text("method not allowed"),
+            };
+            var response = try self.handleSecrets(.{ .method = method, .uri = ctx.request.uri.path, .authorization = ctx.header("Authorization"), .body = (try ctx.body()) orelse "" });
+            defer response.deinit(self.alloc);
+            _ = ctx.status(response.status);
+            try ctx.setHeader("Cache-Control", "no-store");
+            try ctx.setHeader("Content-Type", response.content_type orelse "application/json");
+            return ctx.text(response.body);
+        }
         const method: serverless_http_routes.HttpMethod = switch (ctx.request.method) {
             .GET => .get,
             .POST => .post,

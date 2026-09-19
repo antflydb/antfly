@@ -64,6 +64,7 @@ pub const MetadataHttpServerConfig = struct {
     /// that every upgraded metadata process is actually enforcing the
     /// configured internal-service authentication rollout mode.
     internal_service_auth_capability: ?[]const u8 = null,
+    secret_store: ?*@import("../common/secrets.zig").FileStore = null,
 };
 
 pub const SplitRequest = table_operations.SplitRequest;
@@ -1707,12 +1708,14 @@ pub const MetadataHttpServer = struct {
     transfers: snapshot_transfer.Transfers = .{},
     source: AdminSource,
     internal_service_auth_capability: ?[]const u8 = null,
+    secret_store: ?*@import("../common/secrets.zig").FileStore = null,
 
     pub fn init(alloc: std.mem.Allocator, cfg: MetadataHttpServerConfig, source: AdminSource) MetadataHttpServer {
         return .{
             .alloc = alloc,
             .source = source,
             .internal_service_auth_capability = cfg.internal_service_auth_capability,
+            .secret_store = cfg.secret_store,
         };
     }
 
@@ -1763,6 +1766,7 @@ pub const MetadataHttpServer = struct {
         try server.post(node_path ++ routes.Routes.internal_node_status_suffix ++ "/heartbeat", httpx.Handler.bind(self, metadataReportNodeHeartbeat));
         try server.post(node_path ++ routes.Routes.internal_node_status_suffix ++ "/baseline", httpx.Handler.bind(self, metadataReportNodeBaseline));
         try server.post(node_path ++ routes.Routes.internal_node_status_suffix ++ "/update", httpx.Handler.bind(self, metadataReportNodeUpdate));
+        try server.postWithBodyLimit(@import("../common/secret_delivery.zig").path, @import("../common/secret_delivery.zig").max_request_bytes, httpx.Handler.bind(self, metadataSecretRead));
         try server.post("/internal/v1/system-catalog", httpx.Handler.bind(self, metadataSystemCatalog));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
@@ -1812,6 +1816,21 @@ pub const MetadataHttpServer = struct {
         try server.post(table_path ++ routes.Routes.internal_table_replication_sources_infix ++ ":source_ordinal" ++ routes.Routes.internal_table_reseed_exact_cutover_suffix, httpx.Handler.bind(self, metadataReseedReplicationSourceExactCutover));
         try server.post(table_path ++ routes.Routes.internal_split_suffix, httpx.Handler.bind(self, metadataRequestTableSplit));
         try server.post(table_path ++ routes.Routes.internal_merge_suffix, httpx.Handler.bind(self, metadataRequestTableMerge));
+    }
+
+    fn metadataSecretRead(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const store = self.secret_store orelse return ctx.status(503).text("secret source unavailable");
+        const grant = ctx.header("X-Antfly-Secret-Grant") orelse return ctx.status(403).text("forbidden");
+        const body = (try ctx.body()) orelse return ctx.status(400).text("invalid request");
+        const encrypted = @import("../common/secret_delivery.zig").serve(ctx.allocator, store, grant, body) catch |err| switch (err) {
+            error.Unauthorized => return ctx.status(403).text("forbidden"),
+            error.InvalidArgument => return ctx.status(400).text("invalid request"),
+            else => return ctx.status(503).text("secret source unavailable"),
+        };
+        defer ctx.allocator.free(encrypted);
+        try ctx.setHeader("Cache-Control", "no-store");
+        try ctx.setHeader("Content-Type", "application/octet-stream");
+        return ctx.text(encrypted);
     }
 
     fn metadataSystemCatalog(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
