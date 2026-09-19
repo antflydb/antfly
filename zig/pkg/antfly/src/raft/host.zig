@@ -1138,6 +1138,10 @@ pub const Host = struct {
         self.runtime_host.proposeWithReceipt(group_id, data, accepted_index) catch |err| return mapGroupActivityError(err);
     }
 
+    pub fn proposeWithReceiptAndAdmission(self: *Host, group_id: u64, data: []const u8, accepted_index: *?u64, admission: ?raft_engine.runtime.MultiRaft.ProposalAdmission) !void {
+        self.runtime_host.proposeWithReceiptAndAdmission(group_id, data, accepted_index, admission) catch |err| return mapGroupActivityError(err);
+    }
+
     pub fn proposeBatchWithReceipt(
         self: *Host,
         group_id: u64,
@@ -1721,6 +1725,10 @@ pub const HttpHost = struct {
 
     pub fn proposeWithReceipt(self: *HttpHost, group_id: u64, data: []const u8, accepted_index: *?u64) !void {
         try self.host.proposeWithReceipt(group_id, data, accepted_index);
+    }
+
+    pub fn proposeWithReceiptAndAdmission(self: *HttpHost, group_id: u64, data: []const u8, accepted_index: *?u64, admission: ?raft_engine.runtime.MultiRaft.ProposalAdmission) !void {
+        try self.host.proposeWithReceiptAndAdmission(group_id, data, accepted_index, admission);
     }
 
     pub fn proposeBatchWithReceipt(

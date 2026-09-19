@@ -3858,7 +3858,30 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn prepareCompletionCompiler(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest) !CompletionCompiler {
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         errdefer alloc.free(request_json);
-        return .{ .lease = try self.acquire(group_id, table_name), .alloc = alloc, .request_json = request_json, .table_name = table_name };
+        var lease = try self.acquire(group_id, table_name);
+        errdefer lease.deinit();
+        // A rejected provisional proposal leaves a spent native generation.
+        // Revisit the trusted installation outside DATA proposal ordering so
+        // its idle checkpoint/rearm can finish before the next capture. The
+        // retained guard itself must never run streaming maintenance.
+        const installation = blk: {
+            if (!self.mutex.tryLock()) return error.CompletionAdmissionUnavailable;
+            defer self.mutex.unlock();
+            const record = self.completion_installations.get(group_id) orelse return error.CompletionAdmissionUnavailable;
+            if (self.quiescing or record.state != .backed or !record.active or
+                !record.metadata_authorized or record.identity_mismatch) return error.CompletionAdmissionUnavailable;
+            // Identity and these owned slices are immutable after publication;
+            // the owner lease pins SourceOwner teardown across the C call.
+            break :blk abi.InstallCompletionRequest{
+                .binding = record.binding,
+                .schema_json = .fromSlice(lease.entry.schema_json),
+                .read_schema_json = .fromSlice(record.read_schema_json),
+                .indexes_json = .fromSlice(lease.entry.indexes_json),
+                .settings_json = .fromSlice(record.settings_json),
+            };
+        };
+        try lease.owner().installCompletion(installation);
+        return .{ .lease = lease, .alloc = alloc, .request_json = request_json, .table_name = table_name };
     }
 
     pub fn compileReplicatedCompletionGroupLocal(

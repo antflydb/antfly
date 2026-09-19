@@ -1128,7 +1128,26 @@ pub const MultiRaft = struct {
         data: []const u8,
         accepted_index: *?core.types.Index,
     ) !void {
+        return self.proposeWithReceiptAndAdmission(group_id, data, accepted_index, null);
+    }
+
+    pub const ProposalAdmission = struct {
+        context: *const anyopaque,
+        check: *const fn (*const anyopaque) anyerror!void,
+    };
+
+    /// Admission is borrowed synchronously and is never called after RawNode
+    /// accepts the proposal. Failure after physical reservation invokes the
+    /// ordinary null-receipt cancellation path before returning.
+    pub fn proposeWithReceiptAndAdmission(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        data: []const u8,
+        accepted_index: *?core.types.Index,
+        admission: ?ProposalAdmission,
+    ) !void {
         accepted_index.* = null;
+        if (admission) |check| try check.check(check.context);
         try self.resumeOnActivity(group_id);
         const grp = self.group(group_id) orelse return error.UnknownGroup;
         try self.checkCompletion(group_id, .{ .proposal = &.{data} });
@@ -1137,6 +1156,7 @@ pub const MultiRaft = struct {
             .first_index = accepted_index.*,
             .last_index = accepted_index.*,
         });
+        if (admission) |check| try check.check(check.context);
         try grp.proposeWithReceipt(data, accepted_index);
     }
 

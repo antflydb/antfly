@@ -126,6 +126,18 @@ prerequisites are implemented and verified.
   in-process; this does not certify a real peer's durable acknowledgement or a
   multi-process quorum fault. Fresh production activation remains disabled.
   Evidence: `/tmp/workload-completion-proposal-wal3.log`, actual exit0.
+- Original public admission deadlines now reach DATA with their borrowed clock
+  and cancellation intact. A synchronous Raft admission callback checks again
+  after the native reservation and before RawNode assigns an index; rejection
+  invokes the null-receipt cancellation path. The owning DATA gate passed all
+  three tests with zero skips, failures or leaks, including expiry after an
+  actual accepted sidecar is reserved, unchanged Raft log and zero retained
+  accepted cells, then successful retry after production idle maintenance/rearm.
+  SourceOwner invokes that existing trusted installation path before taking
+  DATA's lock, so cancellation cannot permanently strand a spent generation.
+  Expiry after index assignment leaves the accepted result unchanged; the same
+  write survives disabled-admission WAL restart. Evidence:
+  `/tmp/workload-completion-original-deadline-data2.log`, actual exit0.
 - The current single-phase candidate profile rejects external payload stores,
   generated-enrichment producers, graph-index catalogs, child-range dispatch,
   HA mirrors, split/shadow/bulk state, and structural commands. In particular,

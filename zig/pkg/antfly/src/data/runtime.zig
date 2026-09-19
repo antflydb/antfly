@@ -390,6 +390,9 @@ const DataRaftMutationDiscovery = enum {
 
 const DataRaftBatchRoute = struct {
     admission_deadline_ns: ?u64 = null,
+    /// Original caller clock and cancellation are checked only before Raft
+    /// acceptance. Durable completion never borrows this admission deadline.
+    pre_decision_context: ?antfly.public_api.distributed_txn.PreDecisionContext = null,
     /// Local structural commands must not be forwarded into a successor term.
     required_local_term: ?u64 = null,
     allow_remote_forward: bool = true,
@@ -8885,6 +8888,7 @@ pub const DataServer = struct {
                 .batch_group = localRaftBatchGroup,
                 .batch_group_with_cancellation = localRaftBatchGroupWithCancellation,
                 .batch_group_routed_with_cancellation = localRaftBatchGroupRoutedWithCancellation,
+                .batch_group_routed_with_pre_decision_context = localRaftBatchGroupRoutedWithPreDecisionContext,
                 .batch_group_local = localRaftBatchGroupLocal,
                 .batch_group_local_with_cancellation = localRaftBatchGroupLocalWithCancellation,
                 .batch_group_local_with_pre_decision_context = localRaftBatchGroupLocalWithPreDecisionContext,
@@ -9371,6 +9375,40 @@ pub const DataServer = struct {
         });
     }
 
+    fn preDecisionAdmissionDeadline(self: *DataServer, context: antfly.public_api.distributed_txn.PreDecisionContext) !?u64 {
+        try antfly.public_api.distributed_txn.ensurePreDecisionContextActive(context);
+        const deadline = context.deadline_ns orelse return null;
+        const received_at = self.dataRaftMonotonicNs();
+        const caller_now: u64 = if (context.deadline_io) |borrow| blk: {
+            var receiver = try borrow.receive();
+            break :blk @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
+        } else platform_time.monotonicNs();
+        if (caller_now >= deadline) return error.PreDecisionDeadlineExceeded;
+        return received_at +| (deadline - caller_now);
+    }
+
+    fn localRaftBatchGroupRoutedWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: antfly.metadata_api.CatalogRouteFence,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+        context: antfly.public_api.distributed_txn.PreDecisionContext,
+    ) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const deadline = try self.preDecisionAdmissionDeadline(context);
+        try fence.validate();
+        var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
+        try self.proposeRaftBatchGroupWithLeaderWait(alloc, fence.route.group_id, table_name, req, .{
+            .admission_deadline_ns = deadline,
+            .pre_decision_context = context,
+            .discovery = .catalog,
+            .cancellation = if (context.cancellation.ptr != null) &cancellation else null,
+            .visibility_cancellation = context.cancellation,
+            .write_route_fence = fence,
+        }, if (deadline) |value| value -| self.dataRaftMonotonicNs() else data_raft_batch_leader_wait_ns);
+    }
+
     fn localRaftBatchGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -9406,10 +9444,10 @@ pub const DataServer = struct {
         context: antfly.public_api.distributed_txn.PreDecisionContext,
     ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const deadline_ns = context.deadline_ns orelse
+        const deadline_ns = (try self.preDecisionAdmissionDeadline(context)) orelse
             return try localRaftBatchGroupLocalWithCancellation(ptr, alloc, group_id, table_name, req, context.cancellation);
         const leader_wait_ns = preDecisionLeaderWaitNsAt(
-            platform_time.monotonicNs(),
+            self.dataRaftMonotonicNs(),
             deadline_ns,
         ) orelse return error.PreDecisionDeadlineExceeded;
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
@@ -9419,6 +9457,8 @@ pub const DataServer = struct {
             table_name,
             req,
             .{
+                .admission_deadline_ns = deadline_ns,
+                .pre_decision_context = context,
                 // This is public 2PC ingress, not an already-forwarded hop.
                 // Use the same leader-aware catalog discovery as ordinary
                 // table writes; topology_epoch still fences the participant.
@@ -10195,12 +10235,14 @@ pub const DataServer = struct {
         var proposal_req = req;
         var required_protocol_version = requiredRaftBatchProtocolVersion(req);
         const deadline_ns = @min(route.admission_deadline_ns orelse std.math.maxInt(u64), self.dataRaftMonotonicNs() +| leader_wait_ns);
+        const proposal_admission: DataRaftProposalAdmission = .{ .server = self, .route = route, .deadline_ns = deadline_ns };
         try ensureDataRaftBatchRouteActive(route);
         try self.reachDataRequestLifecycle(.{
             .phase = .routing_started,
             .group_id = group_id,
             .table_name = table_name,
         });
+        try ensureDataRaftBatchRouteActive(route);
         if (route.discovery.mayRefreshCatalog()) {
             self.refreshDataRaftMetadataForBatchWithBudget(deadline_ns, route.cancellation) catch |err| switch (err) {
                 error.Timeout => return error.LeaderUnavailable,
@@ -10362,6 +10404,8 @@ pub const DataServer = struct {
                 lockAtomic(&self.data_raft_mutex);
                 defer self.data_raft_mutex.unlock();
 
+                try ensureDataRaftBatchRouteActive(route);
+                if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 local_node_id = raft.host.http_host.host.cfg.local_node_id;
                 if (route.required_local_term) |expected| {
                     const status = raft.host.http_host.host.raftStatus(group_id) orelse
@@ -10403,7 +10447,7 @@ pub const DataServer = struct {
                             );
                             defer alloc.free(barrier);
                             var barrier_index: ?u64 = null;
-                            raft.host.http_host.proposeWithReceipt(group_id, barrier, &barrier_index) catch |err| {
+                            raft.host.http_host.proposeWithReceiptAndAdmission(group_id, barrier, &barrier_index, proposal_admission.callback()) catch |err| {
                                 if (barrier_index == null) {
                                     // Activation is an optimization for this
                                     // request. Preserve write availability by
@@ -10466,8 +10510,13 @@ pub const DataServer = struct {
                             } else break :encoded try data_raft_batch.encode(alloc, table_name, proposal_req);
                         };
                         defer if (candidate == null) alloc.free(encoded);
+                        // Compilation may perform bounded admission work. Check
+                        // the original caller clock again before any log entry
+                        // receives an index; do not check it after acceptance.
+                        try ensureDataRaftBatchRouteActive(route);
+                        if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                         var accepted_index: ?u64 = null;
-                        raft.host.http_host.proposeWithReceipt(group_id, encoded, &accepted_index) catch |err| {
+                        raft.host.http_host.proposeWithReceiptAndAdmission(group_id, encoded, &accepted_index, proposal_admission.callback()) catch |err| {
                             if (accepted_index) |index| {
                                 // Once the entry has an index, replication
                                 // dispatch failures cannot turn this into a
@@ -11065,10 +11114,28 @@ pub const DataServer = struct {
     }
 
     fn ensureDataRaftBatchRouteActive(route: DataRaftBatchRoute) !void {
+        if (route.pre_decision_context) |context|
+            try antfly.public_api.distributed_txn.ensurePreDecisionContextActive(context);
         if (route.cancellation) |cancellation| {
             if (cancellation.isCancelled()) return error.Cancelled;
         }
     }
+
+    const DataRaftProposalAdmission = struct {
+        server: *DataServer,
+        route: DataRaftBatchRoute,
+        deadline_ns: u64,
+
+        fn callback(self: *const @This()) raft_engine.runtime.MultiRaft.ProposalAdmission {
+            return .{ .context = self, .check = check };
+        }
+
+        fn check(ptr: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            try ensureDataRaftBatchRouteActive(self.route);
+            if (self.server.dataRaftMonotonicNs() >= self.deadline_ns) return error.LeaderUnavailable;
+        }
+    };
 
     fn dataRaftLocalCampaignGraceNs(leader_wait_ns: u64) u64 {
         // Reserve at least three quarters of short transition deadlines for
@@ -29460,7 +29527,106 @@ fn consumerTests() type {
                 try authenticated.begin();
                 try authenticated.finish();
                 remote.cached_snapshot.?.tables[0].storage = settings;
-                try server.proposeRaftBatchGroupWithLeaderWait(alloc, 2, "docs", request, .{ .discovery = .cached, .allow_remote_forward = false, .campaign_allowed = false }, 5 * std.time.ns_per_s);
+                {
+                    // Expire the original borrowed clock only after the real
+                    // native guard has reserved a sidecar. The final Raft
+                    // admission check must cancel it before assigning an index.
+                    const VoprIo = @import("vopr").vopr_io.VoprIo;
+                    var caller_clock = try VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+                    defer caller_clock.deinit();
+                    var caller_io = caller_clock.io();
+                    const DeadlineHook = struct {
+                        clock: *VoprIo,
+                        phase: DataRequestLifecyclePhase,
+                        deadline: u64,
+                        fn reach(ptr: *anyopaque, event: DataRequestLifecycleEvent) !void {
+                            const self: *@This() = @ptrCast(@alignCast(ptr));
+                            if (event.phase == self.phase) self.clock.monotonic_ns = self.deadline;
+                        }
+                    };
+                    var deadline_hook: DeadlineHook = .{ .clock = &caller_clock, .phase = .routing_started, .deadline = 12 * std.time.ns_per_s };
+                    const previous_hook = server.data_request_lifecycle_hook;
+                    defer server.data_request_lifecycle_hook = previous_hook;
+                    server.data_request_lifecycle_hook = .{ .ptr = &deadline_hook, .reach_fn = DeadlineHook.reach };
+                    const fence: antfly.metadata_api.CatalogRouteFence = .{
+                        .metadata_group_id = 9,
+                        .catalog_revision = 1,
+                        .table_id = 1,
+                        .topology_epoch = 1,
+                        .route = .{ .group_id = 2, .range_id = 3, .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 } },
+                    };
+                    const routed_context: antfly.public_api.distributed_txn.PreDecisionContext = .{
+                        .deadline_ns = deadline_hook.deadline,
+                        .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&caller_io),
+                    };
+                    const before_routing = host.raftStatus(2).?.last_index;
+                    try std.testing.expectError(error.PreDecisionDeadlineExceeded, server.localRaftBatcher().batchGroupRoutedWithPreDecisionContext(alloc, fence, "docs", request, routed_context));
+                    try std.testing.expectEqual(before_routing, host.raftStatus(2).?.last_index);
+                    server.data_request_lifecycle_hook = previous_hook;
+                    caller_clock.monotonic_ns = 10 * std.time.ns_per_s;
+                    const provider = server.kernel_owner_source.?.completionProvider();
+                    var admission_lease: completion_pool_abi.Lease = undefined;
+                    try std.testing.expectEqual(abi.Status.ok, provider.acquire(provider.context, 2, 1, &admission_lease));
+                    defer admission_lease.vtable.release(admission_lease.context);
+                    const ExpireAfterReservation = struct {
+                        lease: *const completion_pool_abi.Lease,
+                        clock: *VoprIo,
+                        saw_reserved: bool = false,
+                        failed: bool = false,
+                        fn check(ptr: *const anyopaque) bool {
+                            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+                            var cells: completion_pool_abi.DurableCells = .{};
+                            if (self.lease.vtable.durable_cells.?(self.lease.context, &cells) != .ok) {
+                                self.failed = true;
+                                return true;
+                            }
+                            if (!self.saw_reserved and cells.count != 0) {
+                                self.saw_reserved = true;
+                                self.clock.advance(21 * std.time.ns_per_s) catch {
+                                    self.failed = true;
+                                    return true;
+                                };
+                            }
+                            return false;
+                        }
+                    };
+                    var expire: ExpireAfterReservation = .{ .lease = &admission_lease, .clock = &caller_clock };
+                    const original: antfly.public_api.distributed_txn.PreDecisionContext = .{
+                        .deadline_ns = 30 * std.time.ns_per_s,
+                        .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&caller_io),
+                        .cancellation = .{ .ptr = &expire, .is_cancelled_fn = ExpireAfterReservation.check },
+                    };
+                    const before = host.raftStatus(2).?.last_index;
+                    try std.testing.expectError(error.PreDecisionDeadlineExceeded, server.proposeRaftBatchGroupWithLeaderWait(alloc, 2, "docs", request, .{
+                        .discovery = .cached,
+                        .allow_remote_forward = false,
+                        .campaign_allowed = false,
+                        .admission_deadline_ns = try server.preDecisionAdmissionDeadline(original),
+                        .pre_decision_context = original,
+                    }, 5 * std.time.ns_per_s));
+                    try std.testing.expect(expire.saw_reserved and !expire.failed);
+                    try std.testing.expectEqual(before, host.raftStatus(2).?.last_index);
+                    var cells: completion_pool_abi.DurableCells = .{};
+                    try std.testing.expectEqual(abi.Status.ok, admission_lease.vtable.durable_cells.?(admission_lease.context, &cells));
+                    try std.testing.expectEqual(@as(u32, 0), cells.count);
+                    // Expiry after index assignment does not turn a durably
+                    // owned proposal into a pre-admission rejection.
+                    deadline_hook.phase = .proposal_accepted;
+                    deadline_hook.deadline = 40 * std.time.ns_per_s;
+                    server.data_request_lifecycle_hook = .{ .ptr = &deadline_hook, .reach_fn = DeadlineHook.reach };
+                    const accepted_context: antfly.public_api.distributed_txn.PreDecisionContext = .{
+                        .deadline_ns = deadline_hook.deadline,
+                        .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&caller_io),
+                    };
+                    try server.proposeRaftBatchGroupWithLeaderWait(alloc, 2, "docs", request, .{
+                        .discovery = .cached,
+                        .allow_remote_forward = false,
+                        .campaign_allowed = false,
+                        .admission_deadline_ns = try server.preDecisionAdmissionDeadline(accepted_context),
+                        .pre_decision_context = accepted_context,
+                    }, 5 * std.time.ns_per_s);
+                    try std.testing.expectEqual(deadline_hook.deadline, caller_clock.monotonic_ns);
+                }
                 const accepted = host.raftStatus(2).?;
                 accepted_index = accepted.last_index;
                 accepted_term = accepted.hard.current_term;
