@@ -94,6 +94,7 @@ const StorageOwnerContext = struct {
     inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
     remote_content_security: ?std.json.Parsed(scraping.ContentSecurityConfig) = null,
     remote_content: scraping.RemoteContentConfig = .{},
+    secret_store: ?*common_secrets.FileStore = null,
     lite_backend: ?lite_backend.Handle = null,
     auth_backend: ?antfly.lsm_backend.BackendHandle = null,
     auth_users_store: ?antfly.storage_backend_erased.Store = null,
@@ -2370,6 +2371,16 @@ pub fn storageContextAttachInferenceProvider(
     return .ok;
 }
 
+/// The resolver is a borrowed process capability and must outlive all owners.
+pub fn storageOwnerContextConfigureSecrets(context: ?*anyopaque, store: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    owner_context.lock();
+    defer owner_context.mutex.unlock();
+    if (owner_context.active_owners != 0) return .busy;
+    owner_context.secret_store = if (store) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    return .ok;
+}
+
 pub fn storageOwnerContextConfigureRemoteContentSecurity(
     context: ?*anyopaque,
     security_json: kernel_owner_abi.BorrowedBytes,
@@ -3489,6 +3500,14 @@ pub fn metadataApplyStoreProjection(
             defer handle.store.freeRestoreJobRows(alloc, value);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .secret_collection => blk: {
+            const value = handle.store.getSecretCollection(alloc, request.group_id, request.key.slice()) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            // This projection is opaque binary, never a JSON UTF-8 string.
+            // Empty means absent; a persisted collection always has a header.
+            out_json.* = if (value) |bytes| .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) } else .{};
+            break :blk .ok;
+        },
         .restore_job_value => blk: {
             const value = handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice()) catch |err|
                 break :blk storageOwnerStatusFromError(err);
@@ -4512,6 +4531,7 @@ pub fn storageOwnerOpen(
         // replay can hold its catalog fence or invoke distributed callbacks.
         .start_resolver_workers = false,
         .index_backends = .{ .dense_native_migration_policy_source = if (runtime_hooks) |value| value.nativeMigrationPolicy() else null },
+        .secret_store = if (owner_context) |context| context.secret_store else null,
         .remote_content = if (owner_context) |context| context.remoteContent() else null,
     };
     if (owner_context) |context| if (context.lite_backend) |*backend|
@@ -4557,6 +4577,7 @@ pub fn storageOwnerOpen(
         request.indexes_json.slice(),
         if (owner_context) |context| context.backend_runtime.ptr() else null,
         if (owner_context) |context| context.antflyProvider() else null,
+        if (owner_context) |context| context.secret_store else null,
         if (owner_context) |context| context.remoteContent() else null,
         &handle.storage_owner_managed_config,
     ) catch |err| return storageOwnerStatusFromError(err);
@@ -4590,6 +4611,7 @@ pub fn storageOwnerConfigure(
         request.indexes_json.slice(),
         if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
         if (handle.storage_owner_context) |context| context.antflyProvider() else null,
+        if (handle.storage_owner_context) |context| context.secret_store else null,
         if (handle.storage_owner_context) |context| context.remoteContent() else null,
         &handle.storage_owner_managed_config,
     ) catch |err| {
@@ -5520,6 +5542,7 @@ fn prepareStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareReques
         table_name,
         request.schema_json.slice(),
         request.indexes_json.slice(),
+        null,
         null,
         null,
         null,
@@ -12683,10 +12706,17 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(concurrent_status_handle, &concurrent_status));
     defer antfly_db_buffer_free(concurrent_status.ptr, concurrent_status.len);
     try std.testing.expect(std.mem.indexOf(u8, concurrent_status.ptr.?[0..concurrent_status.len], "\"doc_count\":") != null);
-    var blocked_vacuum: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
-    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_lite_vacuum_json(src_handle, &blocked_vacuum));
-    try std.testing.expect(blocked_vacuum.ptr == null);
-    try std.testing.expectEqual(@as(usize, 0), blocked_vacuum.len);
+    var online_vacuum: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_vacuum_json(src_handle, &online_vacuum));
+    defer antfly_db_buffer_free(online_vacuum.ptr, online_vacuum.len);
+    try std.testing.expect(online_vacuum.len > 0);
+    var retired_reader_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(concurrent_readonly_handle, .{
+        .ptr = "doc:capi-pinned",
+        .len = "doc:capi-pinned".len,
+    }, &retired_reader_lookup));
+    defer antfly_db_buffer_free(retired_reader_lookup.ptr, retired_reader_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, retired_reader_lookup.ptr.?[0..retired_reader_lookup.len], "\"pinned-before\"") != null);
     antfly_db_close(concurrent_status_handle);
     concurrent_status_handle = null;
     antfly_db_close(concurrent_readonly_handle);

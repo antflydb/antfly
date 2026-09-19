@@ -1193,6 +1193,18 @@ class RuntimeCacheTest(unittest.TestCase):
             succeeds=False,
         )
         self.assertIn("unbudgeted VOPR work", failure)
+        project.write_text(contents)
+        tests = self.own("zig/pkg/antfly/build/tests.zig")
+        source = tests.read_text()
+        selection = '.filters = &.{"VOPR command entrypoint"},'
+        self.assertIn(selection, source)
+        tests.write_text(source.replace(selection, ".filters = &.{},"))
+        failure = self.build(
+            "cache-vopr-memory",
+            settings=("-Dtarget=x86_64-linux-gnu", "-Doptimize=ReleaseSafe"),
+            succeeds=False,
+        )
+        self.assertIn("VOPR command build includes unrelated unit tests", failure)
 
     def test_wasm_profile_cache_contracts(self):
         for source in ("zig/lib/httpx/src/httpx.zig", "zig/lib/json/src/mod.zig"):

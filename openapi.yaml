@@ -8370,6 +8370,18 @@ paths:
 
         URL byte potential is reserved before fetch; inline sources use their actual encoded size.
       operationId: generateEmbeddings
+      parameters:
+        - name: Accept
+          in: header
+          required: false
+          schema:
+            type: string
+          description: >-
+            Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+
+            frame instead of JSON, which avoids serializing every float as text. Any
+
+            other value, or none, returns the JSON body.
       requestBody:
         required: true
         content:
@@ -8383,6 +8395,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceEmbedResponse'
+            application/vnd.antfly.numeric.v1:
+              schema:
+                type: string
+                format: binary
+                description: >-
+                  The same vectors as the JSON body, as one little-endian binary frame:
+
+                  a 24-byte header (magic `AFN1`, u32 kind 1, u64 rows, u64 columns)
+
+                  followed by `rows * columns` f32 values, one row per input in request
+
+                  order. Returned only when the request's `Accept` header names this
+
+                  media type and the model's vectors are dense; anything else, a sparse
+
+                  model included, gets the JSON body. Frames are capped at 4 MiB.
         '400':
           description: Invalid request
           content:
@@ -8517,6 +8545,18 @@ paths:
 
         decoded pixels are admitted before model loading.
       operationId: rerankMultimodalPrompts
+      parameters:
+        - name: Accept
+          in: header
+          required: false
+          schema:
+            type: string
+          description: >-
+            Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+
+            frame instead of JSON, which avoids serializing every float as text. Any
+
+            other value, or none, returns the JSON body.
       requestBody:
         required: true
         content:
@@ -8530,6 +8570,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceRerankResponse'
+            application/vnd.antfly.numeric.v1:
+              schema:
+                type: string
+                format: binary
+                description: >-
+                  The same scores as the JSON body, as one little-endian binary frame:
+
+                  a 24-byte header (magic `AFN1`, u32 kind 2, u64 rows, u64 columns,
+
+                  always 1) followed by one f32 score per document, in request order.
+
+                  Returned only when the request's `Accept` header names this media
+
+                  type; anything else gets the JSON body. Frames are capped at 4 MiB.
         '400':
           description: Invalid request or unsupported model
           content:
@@ -8623,6 +8677,18 @@ paths:
 
         `lib/reranking` package which handles rendering before calling this endpoint.
       operationId: rerankPrompts
+      parameters:
+        - name: Accept
+          in: header
+          required: false
+          schema:
+            type: string
+          description: >-
+            Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+
+            frame instead of JSON, which avoids serializing every float as text. Any
+
+            other value, or none, returns the JSON body.
       requestBody:
         required: true
         content:
@@ -8636,6 +8702,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceRerankResponse'
+            application/vnd.antfly.numeric.v1:
+              schema:
+                type: string
+                format: binary
+                description: >-
+                  The same scores as the JSON body, as one little-endian binary frame:
+
+                  a 24-byte header (magic `AFN1`, u32 kind 2, u64 rows, u64 columns,
+
+                  always 1) followed by one f32 score per document, in request order.
+
+                  Returned only when the request's `Accept` header names this media
+
+                  type; anything else gets the JSON body. Frames are capped at 4 MiB.
         '400':
           description: Invalid request
           content:
@@ -9993,6 +10073,18 @@ paths:
 
         drop-in compatibility with OpenAI SDKs.
       operationId: createEmbedding
+      parameters:
+        - name: Accept
+          in: header
+          required: false
+          schema:
+            type: string
+          description: >-
+            Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+
+            frame instead of JSON, which avoids serializing every float as text. Any
+
+            other value, or none, returns the JSON body.
       requestBody:
         required: true
         content:
@@ -10006,6 +10098,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceEmbedResponse'
+            application/vnd.antfly.numeric.v1:
+              schema:
+                type: string
+                format: binary
+                description: >-
+                  The same vectors as the JSON body, as one little-endian binary frame:
+
+                  a 24-byte header (magic `AFN1`, u32 kind 1, u64 rows, u64 columns)
+
+                  followed by `rows * columns` f32 values, one row per input in request
+
+                  order. Returned only when the request's `Accept` header names this
+
+                  media type and the model's vectors are dense; anything else, a sparse
+
+                  model included, gets the JSON body. Frames are capped at 4 MiB.
         '400':
           description: Invalid request
           content:
@@ -13719,6 +13827,10 @@ components:
         managed:
           type: boolean
           description: Whether this key has an Antfly-managed override that can be deleted.
+        revision:
+          type: integer
+          format: uint64
+          description: Committed native entry revision, when supported by the configured backend.
         env_var:
           type: string
           description: Corresponding environment variable name (e.g., OPENAI_API_KEY)

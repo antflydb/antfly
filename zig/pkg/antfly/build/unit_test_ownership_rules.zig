@@ -511,6 +511,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "common.http.peer_disconnect_observer.test.",
             "common.http.std_http_executor.test.",
             "common.http.std_http_listener.test.",
+            "common.secret_contract.test.",
             "common.threaded_connect_io.test.",
             "common.threaded_io_limits.test.",
             "raft.transport.http_driver.test.",

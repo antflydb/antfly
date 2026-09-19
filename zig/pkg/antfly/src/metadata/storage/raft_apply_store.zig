@@ -14,6 +14,8 @@
 
 const std = @import("std");
 const store_report_baseline = @import("../store_report_baseline.zig");
+const secret_store = @import("../secret_store.zig");
+const secret_collection = @import("../../common/secret_collection.zig");
 const metadata_store_observer = @import("../store_observer.zig");
 const store_report_update = @import("../store_report_update.zig");
 const system_catalog = @import("../../system_catalog/domain.zig");
@@ -144,6 +146,7 @@ pub const TransitionCommand = union(enum) {
     /// Versioned system catalog request, applied atomically with any table topology.
     activate_topology_protocol: []const u8,
     apply_system_catalog: []const u8,
+    publish_secret_collection: []const u8,
     initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
     upsert_node: metadata.NodeRecord,
     register_node: metadata.NodeRecord,
@@ -270,7 +273,7 @@ pub const TransitionCommand = union(enum) {
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .activate_topology_protocol, .apply_system_catalog, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -5861,6 +5864,15 @@ pub const RaftApplyStore = struct {
         return try rows.toOwnedSlice(alloc);
     }
 
+    pub fn getSecretCollection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, scope: []const u8) !?[]u8 {
+        var key_buf: [256]u8 = undefined;
+        const key = try secret_store.keyForScope(&key_buf, group_id, scope);
+        return self.store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+
     pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
         var key_buf: [256]u8 = undefined;
         const key = try restoreJobKeyForGroup(&key_buf, group_id, logical_key);
@@ -5883,6 +5895,7 @@ pub const RaftApplyStore = struct {
 
     const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
     const MetadataSnapshotProjection = enum {
+        secret_collection,
         system_catalog,
         topology_activation,
         metadata_incarnation,
@@ -5921,6 +5934,7 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .secret_collection, .key = .{ .prefix = secret_store.prefixForGroup } },
         .{ .projection = .topology_activation, .key = .{ .point = topologyActivationKeyForGroup } },
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
         .{ .projection = .metadata_incarnation, .key = .{ .point = metadataIncarnationKeyForGroup } },
@@ -5960,6 +5974,7 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) u32 {
         return switch (tag) {
+            .publish_secret_collection => metadataSnapshotProjectionBit(.secret_collection),
             .activate_topology_protocol => metadataSnapshotProjectionBit(.topology_activation),
             .apply_store_report_baseline => metadataSnapshotProjectionBit(.store) | metadataSnapshotProjectionBit(.store_report_cursor) | metadataSnapshotProjectionBit(.store_report_baseline) | metadataSnapshotProjectionBit(.store_report_generation),
             .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) |
@@ -6447,6 +6462,20 @@ pub const RaftApplyStore = struct {
     fn applyTransitionCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand) !void {
         try validateTransitionCommandDataGroupIds(command);
         switch (command) {
+            .publish_secret_collection => |bytes| {
+                const publication = try secret_store.decodePublication(self.alloc, bytes);
+                var key_buf: [256]u8 = undefined;
+                const key = try secret_store.keyForScope(&key_buf, group_id, publication.scope);
+                const old = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                var view = try secret_collection.decode(self.alloc, publication.scope, old);
+                defer view.deinit(self.alloc);
+                if (view.revision != publication.expected_revision) return;
+                try txn.put(key, publication.bytes);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
             .activate_topology_protocol => |bytes| {
                 var parsed = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, bytes, .{});
                 defer parsed.deinit();
@@ -9204,6 +9233,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    publish_secret_collection = 60,
     upsert_schema_progress_batch = 59,
     activate_topology_protocol = 57,
     apply_system_catalog = 54,
@@ -9270,6 +9300,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
 
     try out.appendSlice(alloc, transition_magic);
     switch (command) {
+        .publish_secret_collection => |bytes| {
+            _ = try secret_store.decodePublication(alloc, bytes);
+            try out.append(alloc, @intFromEnum(TransitionTag.publish_secret_collection));
+            try appendRequiredString(alloc, &out, bytes);
+        },
         .activate_topology_protocol => |bytes| {
             if (bytes.len > 1024) return error.InvalidMetadataTransitionEncoding;
             try out.append(alloc, @intFromEnum(TransitionTag.activate_topology_protocol));
@@ -9597,6 +9632,14 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
     pos += 1;
 
     return switch (tag) {
+        .publish_secret_collection => blk: {
+            if (encoded.len > secret_store.max_command_bytes + 16) return error.CorruptInput;
+            const bytes = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(bytes);
+            if (pos != encoded.len) return error.CorruptInput;
+            _ = try secret_store.decodePublication(alloc, bytes);
+            break :blk .{ .publish_secret_collection = bytes };
+        },
         .activate_topology_protocol => blk: {
             if (encoded.len > 1040) return error.InvalidMetadataTransitionEncoding;
             break :blk .{ .activate_topology_protocol = try readRequiredString(alloc, encoded, &pos) };

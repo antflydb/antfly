@@ -9,6 +9,13 @@ Use product-area names for test files. Do not use migration labels like `*_parit
 
 ## Current Coverage
 
+- `test_secrets.py`
+  - standalone, distributed metadata/data, and serverless native secrets through real background embedding requests
+  - live rotation, restart, file/environment fallback, unavailable keys, and metadata-only administration
+  - metadata follower writes, leader failover/catch-up, grant revocation, and native outage rejection
+  - serverless admin authentication and concurrent writers across two processes
+  - opt-in real S3/GCS conditional publication; see [secret-store qualification](../../SECRETS.md#secret-store-qualification) for commands and CI setup
+
 - `test_aggregations.py`
   - exact terms and stats over 11,000 synthetic documents
   - read-only control followed by three trials with ten readers and two concurrent writers inserting documents without the aggregated field

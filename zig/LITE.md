@@ -69,14 +69,17 @@ The implementation now consists of:
   document pages atomically. Normal commits remain append-only; explicit vacuum
   reclaims superseded pages without putting a reachability walk on the write
   path. Each checkpoint also pins a copy-on-write ordered B+ tree mapping every
-  logical document key to its newest document page. Initial loads and vacuum
+  live logical document key to its newest document page. Deletes remove keys
+  through copy-on-write merging and redistribution; tombstones remain in history
+  and older pinned index roots remain readable. Initial loads and vacuum
   build packed trees with one unfinished node per level. The builder retains
   encoded record references for long keys and materializes only the last input
   key for order validation. Counting compact pages uses the same builder.
   Integrity checks validate
   every tree page, separator range, and checkpoint/free-map reachability, then
-  prove that the index contains exactly the newest document page for every key
-  in history. Missing, stale, duplicate, or cross-key document pointers and
+  prove that every live key points to its newest document page. Deleted keys
+  may be absent or point to their latest tombstone in existing revision-3 files.
+  Missing live keys, stale, duplicate, or cross-key document pointers and
   missing directory or namespace-link metadata are treated as corruption.
 - `storage/lite/docstore.zig` provides ordered document transactions, pinned
   snapshots, replay lanes, and prefix-bounded logical namespaces. Point reads
@@ -84,13 +87,27 @@ The implementation now consists of:
   `O(log N)` pages. A cursor retains one decoded root-to-leaf path, its current
   key, and its current value, so sequential next/previous traversal is
   amortized `O(1)` and cold-scan memory remains bounded by tree height and the
-  page cache rather than live-key count or document payload volume. Tombstones
-  remain indexed until vacuum and are skipped during iteration. Write cursors
+  page cache rather than live-key count or document payload volume. Overflow
+  keys remain encoded until a comparison or returned entry needs them; resolved
+  comparison keys are released immediately. Full integrity checks still resolve
+  every key and validate ordering and references. Legacy
+  indexed tombstones are skipped during iteration; new deletes prune the active
+  index immediately. Key-only cursors share snapshot, prefix, seek, and overlay
+  behavior, validating record metadata without loading external values. Replay
+  truncation uses these cursors in transactions limited to 512 keys or a 256 KiB
+  prefixed-key target (a single key may exceed that target). Each chunk reserves
+  the writer from scan through commit, then releases it so other writers can
+  proceed. The cutoff is exclusive. Errors propagate; earlier completed chunks
+  remain committed and retries safely process the remaining entries. Replay
+  readers share one traversal that treats only not-found as end-of-lane; allocation,
+  I/O, corruption, malformed-key, and callback errors propagate. Materialized replay
+  results reserve list capacity before taking payload ownership and release all
+  collected payloads on failure. Write cursors
   merge a sorted, latest-write-wins overlay containing only that transaction's
   pending mutations; this provides read-your-writes without materializing the
-  durable namespace. Pinned reads use concurrent positional I/O. A
-  `std.Io.RwLock` allows normal append-only commits while readers pin roots and
-  blocks vacuum before it can reclaim those roots.
+  durable namespace. Pinned reads use concurrent positional I/O and retain
+  their file generation across vacuum. Short index reads use a generation
+  lock during publication; old document readers continue on their original inode.
 - `storage/lite/index_storage.zig` stores Antfly index logical files in the
   native index catalog inside the same `.aflite` file.
   Each catalog checkpoint owns an immutable descriptor containing its history
@@ -110,7 +127,11 @@ The implementation now consists of:
   merging and redistribution. Historical records and older checkpoint roots
   remain intact, but retired filenames no longer accumulate directory-scan
   work. Directory listing and subtree deletion seek the live catalog tree at a
-  path prefix instead of replaying mutation history. Listing pins a checkpoint
+  path prefix instead of replaying mutation history. Subtree deletion scans one
+  immutable root and flushes private batches of at most 64 keys or 16 KiB of
+  key bytes (a larger individual key is processed alone). Keys and editor scratch
+  are released between batches; all batches publish atomically, and an error
+  rolls the whole deletion back. Listing pins a checkpoint
   and holds the generation read lock, allowing ordinary commits to continue.
   In validated namespaces, immediate-file listings seek past each nested
   directory's exclusive prefix bound before reading descendant catalog records.
@@ -118,11 +139,15 @@ The implementation now consists of:
   nested file count. The unscoped adapter retains its accepted repeated/trailing
   separators and uses a general prefix scan with dirname filtering, so existing
   logical keys keep their listing behavior without normalization or migration.
+  Size-limited file reads validate the value length in the pinned catalog record
+  before allocating or reading its payload, including external values.
   External catalog values use a 64-way immutable extent tree with byte lengths
   on each child. Appends retain one unfinished node per height, fill the partial
   tail leaf, and seal suffix subtrees once. Existing full subtrees remain
   shared, so large appends no longer rewrite the ancestor path per leaf and
-  temporary memory depends on tree height rather than suffix length.
+  temporary memory depends on tree height rather than suffix length. Within a
+  native transaction, repeated appends share that frontier and partial tail,
+  so small calls write the same suffix pages as one combined append.
   Range reads seek directly to the requested extents. Vacuum builds packed
   catalog indexes and extent trees; integrity checks validate both structures.
   Atomic index writes use a fixed 64 KiB buffer and a private staging file.
@@ -356,12 +381,14 @@ checks the token at safe page and record boundaries, including during shutdown.
 Only one maintenance job runs at a time; a
 conflicting request returns `409`, and an engine that does not support an
 operation returns `422`. Completed jobs are retained in a bounded in-memory
-history. Lite reports `online: false`: check, compaction, and vacuum acquire the
-exclusive maintenance gate. Readiness becomes false and new database requests
-receive `503` while admin status and cancellation remain available. This avoids
-unbounded request queues and does not call a stop-the-world rewrite "online".
+history. Native Lite reports `online: true`: integrity checks pin a header and
+file length, while compaction and vacuum copy a pinned generation and catch up
+foreground mutations before publication. Readiness stays available during these
+jobs. The compatibility bridge still uses the exclusive maintenance gate.
 Native checkpoint publication and generation replacement serialize under the
-Lite store mutex. Document writes and maintenance also use FIFO writer admission.
+Lite store mutex. Document writers use FIFO admission; vacuum reserves the writer
+slot for its short publication window and returns `FileBusy` if bounded catch-up
+cannot finish.
 Private staged index output enters the store mutex only for final publication.
 Vacuum walks the current checkpoint's catalog and document indexes, skips
 tombstones, and streams values into replacement pages without a temporary LSM
@@ -1015,3 +1042,200 @@ The naming recommendation is:
 - Live single-file Lite database: `*.aflite`
 - Portable backup archive: `*.afb`
 - CLI/internal workspace: `~/.antfly/lite/`
+
+
+## Native throughput and online compaction
+
+Native v3 now has two explicit signatures: `AFLITE\x03N` for the original
+unpacked encoding and `AFLITE\x03P` for packed records. New files use the packed
+encoding. Existing unpacked v3 files remain readable and writable without
+conversion; explicit vacuum writes a packed replacement. Revision 2 remains
+unsupported. Older binaries reject the packed signature before checkpoint
+selection, preventing an older reader from silently selecting a pre-packing
+fallback checkpoint. A packed file requires a binary supporting this encoding.
+
+Small records in multi-key transactions share immutable record pages. A tagged
+reference identifies a physical page and a validated record offset; large
+records keep individual pages and external values keep their extent/chain
+representation. Checks validate physical checksums, record boundaries, and
+checkpoint ownership. Vacuum uses the same packing rules as compact-size
+accounting. Record and index writes coalesce in bounded page-write buffers.
+
+Write transactions maintain one ordered pending-key index. Point reads and
+cursors use that index directly, and commit emits only each key's final mutation.
+Earlier value versions remain alive until transaction teardown because `get`
+returns borrowed values. Sorted multi-reads visit each relevant index node once,
+then order record references by physical page so a packed page is read and
+checksummed once for all requested records on it. Result order remains the
+caller's key order; missing keys and duplicate requests retain their semantics.
+Single and sorted transaction reads share an owned cache of immutable snapshot
+hits and misses. Duplicate keys and overlapping batches reuse the same borrowed
+payload until transaction teardown; pending writes take precedence without
+invalidating previously borrowed values. Retained read memory depends on the
+unique read set, rather than the number of read calls.
+
+The page cache uses incremental CLOCK eviction. Incoming payload pages start
+cold; reads promote pages and navigation metadata gets additional chances.
+Capacity pressure evicts only enough pages to admit the next page. Oversized
+pages bypass admission, and reused page IDs invalidate previous contents.
+Resource-manager pressure still controls cache memory.
+
+Document commits and index-file mutations enter a synchronous commit queue.
+Up to 64 queued requests share one native transaction and one durable checkpoint
+publication. The leader hands off after each group, so an unending producer
+cannot prevent a completed caller from returning. A failed group fails all its
+members; publication failures fence subsequent coordinated writes until reopen.
+
+The native transaction owns a final-key write set across all three roots,
+bounded by 1,024 keys and 1 MiB of retained key/inline-value bytes. Each flush
+shares page allocation and record packing and edits each touched index once;
+the group publishes one free map per flush and one durable checkpoint at commit.
+Large values and file imports stream directly to private extents. Append and
+rename reuse these extent references, and point/range reads see earlier staged
+writes. Writer-side scans explicitly materialize the pending batch before
+pinning cursor roots. Pinned reader APIs only consult immutable roots and never
+access the mutable write set.
+In addition to the key/value staging budget, a transaction retains at most four
+append frontiers across the metadata and index catalogs. Each owns a partial
+value page, a 64 KiB write buffer, and one bounded extent node per tree height.
+Full leaves stream once; commit, spill, and snapshot materialization seal the
+frontiers. Active full/range reads and rename seal only the source file they
+need, while size reads use its buffered length. Overwrite, delete, and abort
+discard obsolete buffers without flushing. Appending to another file when all
+four frontier slots are occupied flushes private state without publishing or
+ending the transaction. These changes retain
+the revision-3 encoding and immutable checkpoint semantics.
+An already assembled large batch is consumed synchronously from the caller's
+buffers with one index edit, avoiding another owned staging copy. Its existing
+batch editor uses scratch proportional to the supplied batch; the 1,024-key /
+1 MiB bounds apply to mutations retained across calls.
+Reaching either staging limit flushes privately without ending the transaction;
+abort discards all flushed and pending changes together.
+
+An index append with `sync=false` advances this handle's visible roots while
+retaining the last durable on-disk checkpoint slots. A subsequent durable
+mutation or explicit sync publishes those accumulated changes with the normal
+sync barriers. A separate open observes the last published checkpoint until
+that barrier. `no_sync` remains the explicit handle-level durability opt-out.
+Callers requiring durable completion must request a barrier and handle its
+errors; completion of an asynchronous append is not a durability promise.
+
+Store-level vacuum prepares its replacement from a pinned snapshot while
+foreground reads and mutations continue. It captures changed keys across the
+document, index, and private metadata catalogs and streams their final values
+into the replacement. Catch-up holds at most 65,536 keys / 4 MiB of key bytes
+and makes at most eight rounds. If it cannot catch up, it returns `FileBusy`,
+discards the unpublished replacement, and leaves foreground commits intact.
+Cancellation is checked during copying and catch-up. The final publication
+reserves the writer slot and briefly fences checkpoint acquisition and logical
+index-file reads while publishing the final header and atomic rename.
+
+Document read transactions own references to their original file generation.
+Vacuum can publish without waiting for those transactions; retired descriptors
+and caches are released after their last reader. Physical reclamation occurs by
+replacing and retiring whole file generations, rather than reusing pages that
+might still belong to a reader. Compaction is explicitly requested through the
+existing maintenance API; this change does not add an automatic vacuum policy.
+
+The embedded-root adoption probe pins a read generation and inspects only index
+and record metadata. It skips the internal `\x02db/` range with an index seek,
+ignores tombstones, and stops at the first live user document. It never loads
+external document values, so startup memory does not grow with their size.
+
+The server maintenance coordinator advertises native maintenance as online.
+Integrity checks pin both the header and observed file length under the mutation
+mutex, then validate that snapshot outside it. Later appends do not create false
+tail-corruption reports; a tail already present when pinned remains an error.
+Compaction releases the namespace registry lock after its initial sync barrier.
+
+Secret metadata enumeration also uses a scope-bounded catalog cursor. It does
+not materialize unrelated private metadata or encrypted values from other scopes.
+
+Run `zig build lite-native-benchmark -Doptimize=ReleaseSafe` for the reproducible
+transaction-assembly, commit, and sorted-read workloads. Timings are observations;
+structural tests enforce page-read, write-call, memory, and correctness bounds.
+
+### Throughput baseline
+
+Measured against `1debc3d03d` with the same benchmark source, Zig 0.16.0,
+ReleaseSafe, and the C allocator. Values are medians of three alternating runs
+on the same development machine. Each run creates a file, assembles one sorted
+batch with a missing-key read before each insert, commits small document values,
+and reads all keys in order. The build step compiles the benchmark separately.
+
+| Records | Assembly before / after | Commit before / after | Sorted reads before / after | Page accesses before / after | File bytes before / after |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 1.62 / 0.70 ms | 3.94 / 0.29 ms | 3.06 / 0.23 ms | 3,000 / 24 | 4,136,960 / 110,592 |
+| 4,000 | 19.12 / 2.68 ms | 16.29 / 0.91 ms | 13.31 / 0.87 ms | 12,000 / 92 | 16,498,688 / 389,120 |
+| 16,000 | 274.66 / 10.85 ms | 65.52 / 3.60 ms | 67.97 / 3.85 ms | 48,000 / 363 | 65,941,504 / 1,499,136 |
+
+This workload uses `no_sync`, warm filesystem caches, and small values. Page
+accesses include cache lookups; they are not physical disk I/O counts. Other
+builds ran on the host during measurement. Durable fsync throughput, vector
+index construction, and sustained concurrent compaction need separate workload
+qualification. Timing thresholds are intentionally absent from the tests.
+
+Vacuum catch-up sorts each root's changed keys and applies batches of at most
+1,024 keys, with a 1 MiB target for retained inline values and key bytes (at most
+one record can cross that target). Each batch shares its index editor and page
+allocator. External values stream to the private image before batch publication.
+A catch-up round remains one native transaction: failure or cancellation restores
+its checkpoint, file length, and report. Rollback also invalidates cached bytes
+and links in the discarded tail, preserving the restored checkpoint’s cache;
+streamed retry writes can safely reuse those page IDs. The regression workload replays changes
+to all three roots and separately bounds heap usage while copying 12 MiB of inline
+values, including cancellation after earlier batches have written.
+
+Maintenance snapshots and prepared images share the live store's resource
+manager. Their page caches admit only navigation pages; sequential payload scans
+use cursor-local storage. Accounting belongs to each handle until it closes,
+including private images and retired descriptors after publication. The regression
+suite exercises a shared 32 KiB soft / 64 KiB hard page-cache budget and verifies
+that cleanup releases both page-cache and link-cache usage.
+
+Document, catalog, vacuum, and sorted multi-read paths share a record-page reader.
+It validates each physical page's checksum and packed-record boundaries once per load,
+then borrows payload slices until it loads another page. Reverse scans and seeks
+use the same validated offsets; returned document and catalog values retain their
+existing ownership contracts. Cursor storage is bounded by one physical page and
+its record-offset directory.
+
+The benchmark target also includes vacuum catch-up under a 64 KiB shared cache
+budget and forward document scans. In the review diagnostic with 4,096 newly
+inserted small documents, the catch-up image shrank from 83,275,776 to 507,904 bytes
+(the source was 450,560 bytes). Catch-up fell from approximately 121 ms to 18 ms;
+16,000-record scans fell from approximately 20 ms to 1.7–2.1 ms. These are local
+`no_sync` observations, not latency guarantees. Tests enforce bounded image growth,
+cache accounting, heap usage, and physical-page accesses instead of elapsed time.
+
+The grouped-callback regression compares 1,024 small index mutations in 16
+transactions of 64 callbacks with the same mutations submitted as explicit
+batches. Both now write 89 pages in 48 write calls and produce a 368,640-byte
+file. Before transaction staging, individual callbacks wrote 4,962 pages in
+2,048 calls and produced a 20,328,448-byte file. These are structural counts,
+independent of fsync timing. Regression tests also cover mixed-root groups,
+streamed imports and appends, rename ordering, spill/abort, allocation failure,
+and adoption probes over large values and excluded internal key ranges.
+
+The append-frontier regression compares 1,024 64-byte appends to a 1 MiB file
+inside one transaction with one combined 64 KiB append. Both now write 23 pages
+in five write calls and add 94,208 bytes to the file; the individual calls
+previously wrote 3,090 pages in 1,027 calls and added 12,656,640 bytes. With 64
+small calls, both forms write eight pages in four calls and add 32,768 bytes.
+The long-key seek diagnostic uses 16,000 keys of 1,000 bytes with page caching
+disabled. Lazy resolution reduces a seek from 298 logical page reads and
+313,848 bytes of peak scratch to 17 reads and 14,768 bytes. Permanent regressions
+bound page writes and cursor scratch, and cover forward/reverse scans, pinned
+roots, complete integrity audits, append visibility barriers, extent boundaries,
+private spills, allocation failures, and streaming-write rollback.
+
+A 16,384-file subtree deletion with 128-byte filenames uses 408,723 bytes of
+extra peak heap with private batches, down from 9,150,685 bytes when retaining
+the entire key set and editor. Logical page reads rise from 2,953 to 4,373 as
+each bounded batch reopens its edit path. Sixteen transaction reads of one
+256 KiB value retain 262,435 bytes and perform 68 logical reads, compared with
+4,194,672 bytes and 1,088 reads before snapshot result sharing. A 1 KiB-limited
+read of a 4 MiB index file now rejects with three logical reads and no payload
+allocation; previously it allocated the whole payload and performed 1,053 reads.
+These measurements disable page caching; regressions enforce memory and I/O
+bounds, pinned snapshot semantics, and rollback after private deletion flushes.

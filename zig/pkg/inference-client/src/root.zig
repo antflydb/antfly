@@ -14,12 +14,9 @@
 
 const client = @import("client.zig");
 
-pub const Binary = client.Binary;
 pub const Client = client.Client;
 pub const DenseEmbeddings = client.DenseEmbeddings;
 pub const RawClient = client.RawClient;
-pub const SparseEmbeddings = client.SparseEmbeddings;
-pub const SparseVector = client.SparseVector;
 pub const Transcription = client.Transcription;
 pub const Types = client.Types;
 
