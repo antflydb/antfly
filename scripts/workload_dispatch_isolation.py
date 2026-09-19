@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import secrets
 import shutil
 import threading
@@ -322,6 +323,29 @@ class DispatchCluster(frontend.FrontendCluster):
         }
 
 
+def receipt_manifest(output, node_names):
+    """Seal evidence while pruning only actual node storage roots."""
+    files = []
+    for directory, children, names in os.walk(output):
+        relative = Path(directory).relative_to(output)
+        if relative == Path("."):
+            children[:] = [name for name in children if name != "artifacts"]
+        elif len(relative.parts) == 1 and relative.name in node_names:
+            children[:] = [
+                name
+                for name in children
+                if name not in {"data", "replicas", "snapshots"}
+            ]
+        for name in names:
+            path = Path(directory) / name
+            if path == output / "checksums.json":
+                continue
+            files.append(path)
+    return {
+        str(path.relative_to(output)): runner.q.checksum(path) for path in sorted(files)
+    }
+
+
 def run(binary, revision, optimization, output):
     plan = make_plan(binary, revision, optimization)
     runner.validate(plan)
@@ -387,19 +411,9 @@ def run(binary, revision, optimization, output):
             "scope": "H1 task partitions only; no connection exhaustion claim",
         }
         runner.q.save(output / "receipt.json", receipt)
-        paths = [
-            path
-            for path in output.rglob("*")
-            if path.is_file()
-            and path.suffix in (".py", ".json", ".jsonl", ".log")
-            and not any(
-                part in {"data", "replicas", "snapshots", "artifacts"}
-                for part in path.relative_to(output).parts
-            )
-        ]
         runner.q.save(
             output / "checksums.json",
-            {str(path.relative_to(output)): runner.q.checksum(path) for path in paths},
+            receipt_manifest(output, {node["name"] for node in plan["nodes"]}),
         )
     print(json.dumps(receipt, indent=2))
     return 0 if receipt["passed"] else 2 if invalid else 1

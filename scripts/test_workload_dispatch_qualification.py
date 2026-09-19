@@ -183,6 +183,53 @@ class DispatchQualificationTests(unittest.TestCase):
                 cluster.protected_probes()
         self.assertEqual(len(captured), 1)
 
+    def test_manifest_includes_data_node_logs_but_prunes_node_storage(self):
+        included = {
+            "plan.json",
+            "receipt.json",
+            "events.jsonl",
+            "runner.py",
+            "data/server-1.log",
+            "data/server-2.log",
+            "data/config.json",
+            "data/catalog.txt",
+            "api/server-1.log",
+            "metadata/config.json",
+            "evidence/data/diagnostic.log",
+        }
+        excluded = {
+            "checksums.json",
+            "artifacts/candidate",
+            "artifacts/build.json",
+            "data/data/wal/huge.log",
+            "data/replicas/group/huge.log",
+            "data/snapshots/state.json",
+            "api/data/huge.log",
+            "metadata/data/wal/huge.log",
+            "metadata/replicas/config.json",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for name in included | excluded:
+                path = output / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(name)
+            hashed = []
+
+            def checksum(path):
+                name = str(path.relative_to(output))
+                self.assertNotIn(name, excluded)
+                hashed.append(name)
+                return "digest:" + name
+
+            with patch.object(runner.q, "checksum", checksum):
+                manifest = dispatch.receipt_manifest(
+                    output, {"data", "api", "metadata"}
+                )
+            self.assertEqual(set(manifest), included)
+            self.assertEqual(set(hashed), included)
+            self.assertEqual(manifest["data/server-1.log"], "digest:data/server-1.log")
+
     def test_receipts_do_not_retain_signing_secret(self):
         secret = "synthetic-secret-" * 4
         with tempfile.TemporaryDirectory() as directory:
