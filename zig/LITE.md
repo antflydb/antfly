@@ -1056,6 +1056,18 @@ publication. The leader hands off after each group, so an unending producer
 cannot prevent a completed caller from returning. A failed group fails all its
 members; publication failures fence subsequent coordinated writes until reopen.
 
+The native transaction owns a final-key write set across all three roots,
+bounded by 1,024 keys and 1 MiB of retained key/inline-value bytes. Each flush
+shares page allocation and record packing and edits each touched index once;
+the group publishes one free map per flush and one durable checkpoint at commit.
+Large values and file imports stream directly to private extents. Append and
+rename reuse these extent references, and point/range reads see earlier staged
+writes. Writer-side scans explicitly materialize the pending batch before
+pinning cursor roots. Pinned reader APIs only consult immutable roots and never
+access the mutable write set.
+Reaching either staging limit flushes privately without ending the transaction;
+abort discards all flushed and pending changes together.
+
 An index append with `sync=false` advances this handle's visible roots while
 retaining the last durable on-disk checkpoint slots. A subsequent durable
 mutation or explicit sync publishes those accumulated changes with the normal
@@ -1080,6 +1092,11 @@ and caches are released after their last reader. Physical reclamation occurs by
 replacing and retiring whole file generations, rather than reusing pages that
 might still belong to a reader. Compaction is explicitly requested through the
 existing maintenance API; this change does not add an automatic vacuum policy.
+
+The embedded-root adoption probe pins a read generation and inspects only index
+and record metadata. It skips the internal `\x02db/` range with an index seek,
+ignores tombstones, and stops at the first live user document. It never loads
+external document values, so startup memory does not grow with their size.
 
 The server maintenance coordinator advertises native maintenance as online.
 Integrity checks pin both the header and observed file length under the mutation
@@ -1146,3 +1163,12 @@ inserted small documents, the catch-up image shrank from 83,275,776 to 507,904 b
 16,000-record scans fell from approximately 20 ms to 1.7–2.1 ms. These are local
 `no_sync` observations, not latency guarantees. Tests enforce bounded image growth,
 cache accounting, heap usage, and physical-page accesses instead of elapsed time.
+
+The grouped-callback regression compares 1,024 small index mutations in 16
+transactions of 64 callbacks with the same mutations submitted as explicit
+batches. Both now write 89 pages in 48 write calls and produce a 368,640-byte
+file. Before transaction staging, individual callbacks wrote 4,962 pages in
+2,048 calls and produced a 20,328,448-byte file. These are structural counts,
+independent of fsync timing. Regression tests also cover mixed-root groups,
+streamed imports and appends, rename ordering, spill/abort, allocation failure,
+and adoption probes over large values and excluded internal key ranges.

@@ -426,6 +426,14 @@ pub const Store = struct {
         return try Txn.openRead(self);
     }
 
+    /// Pin both checkpoint and file generation while inspecting metadata.
+    /// Online vacuum may replace the writer's inode during the probe.
+    pub fn hasLiveDocumentOutsidePrefix(self: *Store, excluded_prefix: []const u8) !bool {
+        var txn = try self.beginRead();
+        defer txn.abort();
+        return try (try txn.readFile()).hasLiveDocumentOutsidePrefix(txn.checkpoint, excluded_prefix);
+    }
+
     pub fn beginWrite(self: *Store) !Txn {
         if (self.read_only) return error.ReadOnly;
         return try Txn.openWrite(self);

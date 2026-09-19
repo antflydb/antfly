@@ -424,12 +424,7 @@ pub const Handle = struct {
 
     pub fn embeddedRootHasUserDocuments(self: *Handle) !bool {
         if (self.engine != .native_single_file) return false;
-        const docs = try self.native_docstore.?.file.snapshotDocumentsAlloc(self.allocator);
-        defer native.NativeFile.freeSnapshotDocuments(self.allocator, docs);
-        for (docs) |doc| {
-            if (!std.mem.startsWith(u8, doc.key, "\x02db/")) return true;
-        }
-        return false;
+        return try self.native_docstore.?.hasLiveDocumentOutsidePrefix("\x02db/");
     }
 
     pub fn markEmbeddedArtifact(self: *Handle) !void {
@@ -1516,6 +1511,7 @@ test "lite backend adopts embedded root into a move-stable standalone namespace"
         var handle = try Handle.open(allocator, path, .{});
         defer handle.deinit();
         try std.testing.expect(try handle.isEmbeddedArtifact());
+        try std.testing.expect(try handle.embeddedRootHasUserDocuments());
         try handle.adoptEmbeddedRootAsNamespace("/var/lib/antfly/group-42/table-db");
         var opts = db_mod.OpenOptions{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false };
         try handle.configureDbOpenOptionsForNamespace(&opts, "/different/root/group-42/table-db");
@@ -1533,6 +1529,7 @@ test "lite backend adopts embedded root into a move-stable standalone namespace"
         var handle = try Handle.open(allocator, path, .{ .read_only = true });
         defer handle.deinit();
         try std.testing.expect(handle.hasStandaloneRootAdoption());
+        try std.testing.expect(try handle.embeddedRootHasUserDocuments());
         var opts = db_mod.OpenOptions{ .open_mode = .query_readonly, .start_index_workers = false, .start_optional_runtimes = false };
         try handle.configureDbOpenOptionsForNamespace(&opts, "/mnt/restored/group-42/table-db");
         var db = try db_mod.DB.open(allocator, logical_path, opts);

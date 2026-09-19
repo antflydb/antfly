@@ -259,7 +259,7 @@ fn deleteTreeLocked(self: *Store, path: []const u8) !void {
     else
         try std.fmt.allocPrint(self.allocator, "{s}/", .{directory});
     defer self.allocator.free(prefix);
-    var cursor = try self.docs.file.indexCatalogCursor(self.docs.file.activeCheckpoint(), prefix);
+    var cursor = try self.docs.file.indexCatalogCursor(try self.docs.file.materializeTransactionCheckpoint(), prefix);
     defer cursor.deinit();
     while (try cursor.next()) |record| {
         defer self.docs.file.allocator.free(record.key);
