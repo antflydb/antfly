@@ -61,12 +61,17 @@ The implementation now consists of:
   and atomic vacuum replacement. Document commits publish a namespace-head
   directory and per-namespace page links in the same checkpoint, so a cold
   table snapshot walks that table's history rather than the global document
-  log. Namespace-head updates are append-only deltas backed by an in-memory
-  materialized directory; a full directory snapshot is emitted every 256
-  deltas. This makes the normal commit cost proportional to the namespaces
-  touched by the transaction instead of every namespace in the database while
-  bounding cold-open replay. The checkpoint links the directory delta and
-  document pages atomically. Normal commits remain append-only; explicit vacuum
+  log. Namespace heads use a copy-on-write catalog B+ tree, so updates and
+  cold writes touch only the requested namespaces and their tree paths. Tiny
+  directories (at most 32 namespaces fitting one page) retain the existing
+  inline snapshot encoding without extra tree pages. Larger legacy snapshot/
+  delta directories migrate atomically on their next document mutation; new
+  large directories and vacuum output build the index directly. Old pinned
+  checkpoints retain their original layout. Both layouts use existing v3 page
+  kinds; this binary reads packed and unpacked v3 files without an offline
+  conversion. Older binaries that lack indexed namespace-directory support
+  may reject namespace operations on promoted files. The checkpoint publishes
+  namespace heads and document pages atomically. Normal commits remain append-only; explicit vacuum
   reclaims superseded pages without putting a reachability walk on the write
   path. Each checkpoint also pins a copy-on-write ordered B+ tree mapping every
   live logical document key to its newest document page. Deletes remove keys
@@ -1063,8 +1068,9 @@ accounting. Record and index writes coalesce in bounded page-write buffers.
 
 Write transactions maintain one ordered pending-key index. Point reads and
 cursors use that index directly, and commit emits only each key's final mutation.
-Earlier value versions remain alive until transaction teardown because `get`
-returns borrowed values. Sorted multi-reads visit each relevant index node once,
+Each pending key has one active value. Replacements release unborrowed values
+immediately; versions returned by `get` or `getManySorted` remain owned until
+transaction teardown. Cursor copies have their own lifetime. Sorted multi-reads visit each relevant index node once,
 then order record references by physical page so a packed page is read and
 checksummed once for all requested records on it. Result order remains the
 caller's key order; missing keys and duplicate requests retain their semantics.
@@ -1239,3 +1245,20 @@ read of a 4 MiB index file now rejects with three logical reads and no payload
 allocation; previously it allocated the whole payload and performed 1,053 reads.
 These measurements disable page caching; regressions enforce memory and I/O
 bounds, pinned snapshot semantics, and rollback after private deletion flushes.
+
+Large document and index values share a checksum-checked chunk reader for
+linked chains and extent trees. A 64 KiB positional-read window coalesces nearby
+value pages; metadata and small ranges request one page. Full reads allocate
+the returned value once and retain only bounded traversal state. Read windows
+remain tied to their pinned checkpoint and never cross its page-count bound.
+
+Follow-up measurements with page caching disabled: 64 blind overwrites of a
+256 KiB transaction value retain 262,363 bytes rather than 16,779,704 bytes.
+An 8 MiB document read uses three allocations and an index-file read uses two,
+down from 4,127 and 4,193 respectively. At 16,384 namespaces, updating one
+namespace uses 108,756 bytes of temporary heap and eight page writes rather
+than the previous periodic 1,627,634-byte / 102-page snapshot. Ordinary indexed
+updates trade the former five-page delta for eight pages to remove snapshot
+spikes and whole-directory cold loads. Tiny directories keep their original
+page layout. Regression tests bound allocation counts, physical value-read
+calls, hot/cold mutation heap, and page writes; timings are not assertions.
