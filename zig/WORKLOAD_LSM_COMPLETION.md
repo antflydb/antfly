@@ -535,6 +535,28 @@ The following gates remain:
   and exhausted fresh rearm fails before readiness. Restored counter baselines
   and standalone durable/cohort/crash regressions also pass. The named phase
   budgets exclude the separately pending retained transaction-control lifetime.
+- **Control-lifetime sizing prerequisite (implemented, not admission wiring).**
+  A cycle-free projection of the actual transaction control budget combines
+  public begin/decision/unique-ACK traffic with codec-sized immutable owner and
+  latest-receipt rows, group progress and applied markers. The four-owner
+  certificate retains all cumulative publication allocations, using a fresh
+  AVL spare/vector/account bound per edit so alternating owners and readers
+  cannot borrow each other's spans. It includes one final checkpoint's native
+  run/directory metadata per owner, append and identifier successors, the
+  current physical input frontier plus future runs, and expanded replay tree,
+  pending-buffer, segment-path and operation-workspace bounds. Checkpoints do
+  not refund any lifetime obligation. The owning compiled native artifact
+  passed 11/11 with zero skips, failures or leaks
+  (`/tmp/workload-native-control-capacity2.log`), including four exact reserved
+  spans, 32 retained readers, denied backing allocation, measured WAL equality,
+  and independent record/frontier/metadata/counter/resource-limit rejection.
+  A smaller workload with a nonempty persisted baseline fits current 1 MiB
+  metadata and 68-input bounds. A 64-run baseline plus four document and four
+  control terminal outputs requires 72 inputs and is rejected with 68-input
+  backing; the larger test supplies explicit hypothetical backing limits. The
+  current production builder still has 68 cursor slots. This certificate does
+  not install the extra paths, issue consensus authority, or complete the
+  separate durable control-owner protocol.
 - **Actual I/O fault coverage.** Maintenance crash hooks verify the selected
   publication boundaries. Partial writes, fsync failures, and failures after
   pointer rename still need direct injected-I/O coverage, including durable

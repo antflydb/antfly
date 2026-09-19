@@ -734,6 +734,15 @@ pub const ActiveMemTable = struct {
         return std.math.add(usize, records, try OrderedIndex.insertionAllocationBound(max_entries, edits));
     }
 
+    /// A control lifetime can alternate allocators with other owners and keep
+    /// a reader after every publication. Charge a fresh spare/vector/account
+    /// pool per edit; no continuous spare-pool reuse is assumed across batches.
+    pub fn cumulativePublicationAllocationBound(max_entries: usize, edits: usize, record_bytes: usize) !usize {
+        const footprint = @import("completion_allocator.zig").RecyclingScratch.allocationFootprint;
+        const records = try std.math.add(usize, record_bytes, try std.math.mul(usize, edits, try footprint(@sizeOf(SharedEntry), @alignOf(SharedEntry))));
+        return std.math.add(usize, records, try OrderedIndex.sequentialAllocationBound(max_entries, edits));
+    }
+
     /// Only for replay into an initially empty ordered table, before any
     /// reader/root snapshot can share nodes. Payload bytes count every version,
     /// even replacements, and the index bound counts all cumulative allocations.

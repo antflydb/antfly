@@ -2354,3 +2354,7 @@ test "workload admission completion replay workspace covers unique and replaced 
         try std.testing.expectEqual(@as(usize, 0), rejected.entryCount());
     }
 }
+
+test {
+    _ = @import("completion_control_capacity.zig");
+}
