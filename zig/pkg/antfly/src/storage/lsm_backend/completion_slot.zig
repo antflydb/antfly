@@ -36,7 +36,7 @@ pub const Bounds = struct {
     max_fd_count: u32 = 64,
 };
 pub const Binding = struct {
-    kind: enum(u8) { commit_timestamp, replay_sequence, shared_ledger_count, shared_ledger_bytes, replay_next_sequence },
+    kind: enum(u8) { commit_timestamp, replay_sequence, shared_ledger_count, shared_ledger_bytes, replay_next_sequence, raft_term, raft_index },
     target: enum(u8) { key, value },
     byte_order: enum(u8) { little, big },
     offset: u32,
@@ -56,6 +56,65 @@ pub const Descriptor = struct {
     commit: []const Operation,
     abort: []const Operation,
 };
+
+fn exactBinding(binding: Binding, kind: @TypeOf(binding.kind), target: @TypeOf(binding.target), order: @TypeOf(binding.byte_order), offset: u32) bool {
+    return binding.kind == kind and binding.target == target and binding.byte_order == order and binding.offset == offset;
+}
+
+/// Only these shared keys are rebound by the completion publisher. A binding
+/// on a document's timestamp does not make its document key shareable.
+pub fn isSharedDynamicOperation(op: Operation) bool {
+    const keys = @import("../internal_keys.zig");
+    if (op.kind != .put) return false;
+    if (std.mem.eql(u8, op.key, &keys.raft_document_applied_entry_key))
+        return op.value.len == 16 and op.bindings.len == 2 and
+            exactBinding(op.bindings[0], .raft_term, .value, .little, 0) and
+            exactBinding(op.bindings[1], .raft_index, .value, .little, 8);
+    if (std.mem.eql(u8, op.key, "\x00\x00__metadata__:txn_completion_v1")) {
+        return op.value.len == 16 and op.bindings.len == 2 and
+            exactBinding(op.bindings[0], .shared_ledger_count, .value, .little, 0) and
+            exactBinding(op.bindings[1], .shared_ledger_bytes, .value, .little, 8);
+    }
+    if (std.mem.eql(u8, op.key, &keys.replay_meta_init_key))
+        return op.value.len == 0 and op.bindings.len == 0;
+    if (std.mem.eql(u8, op.key, &keys.replay_meta_next_sequence_key))
+        return op.value.len == 8 and op.bindings.len == 1 and
+            exactBinding(op.bindings[0], .replay_next_sequence, .value, .little, 0);
+    if (op.key.len == 4 and op.key[0] == keys.replay_namespace and op.key[1] == 0xff and op.key[2] == keys.replay_meta_latest_sequence_kind)
+        return op.value.len == 8 and op.bindings.len == 1 and
+            exactBinding(op.bindings[0], .replay_sequence, .value, .little, 0);
+    if (op.key.len == keys.replay_key_len and op.key[0] == keys.replay_namespace and op.key[1] != 0xff)
+        return op.value.len >= 14 and std.mem.eql(u8, op.value[0..4], "CJ2\x00") and op.bindings.len == 2 and
+            exactBinding(op.bindings[0], .replay_sequence, .key, .big, 2) and
+            exactBinding(op.bindings[1], .replay_sequence, .value, .little, 6);
+    return false;
+}
+
+/// Classification only: the native owner must still validate that these writes
+/// belong to its initial prepare or an allowed decision transition.
+pub fn isPreparedTransactionMetadataKey(key: []const u8, txn_id: [16]u8) bool {
+    inline for (.{ "\x00\x00__txn_records__:", "\x00\x00__txn_schema_leases__:", "\x00\x00__txn_participants__:", "\x00\x00__txn_resolved_participants__:", "\x00\x00__txn_intent_keys__:", "\x00\x00__txn_intent_admission__:", "\x00\x00__txn_completion_v1__:" }) |prefix| {
+        if (key.len == prefix.len + txn_id.len and std.mem.startsWith(u8, key, prefix) and std.mem.eql(u8, key[prefix.len..], &txn_id)) return true;
+    }
+    inline for (.{ "\x00\x00__txn_intents__:", "\x00\x00__txn_intent_members__:" }) |prefix| {
+        if (key.len > prefix.len + txn_id.len + 1 and std.mem.startsWith(u8, key, prefix) and
+            std.mem.eql(u8, key[prefix.len..][0..txn_id.len], &txn_id) and key[prefix.len + txn_id.len] == ':') return true;
+    }
+    return false;
+}
+
+/// Physical rows authenticate their mutable timestamp header. Recompute the
+/// existing row checksum after binding, without allocating or consulting the DB.
+pub fn finishBoundValue(op: Operation, value: []u8) !void {
+    if (op.kind != .put or !@import("../internal_keys.zig").isRelationalRowKey(op.key)) return;
+    const rows = @import("../db/algebraic/relational_row_codec.zig");
+    for (op.bindings) |binding| if (binding.kind == .commit_timestamp) {
+        if (binding.target != .value or binding.byte_order != .little or binding.offset != rows.completion_timestamp_offset)
+            return error.InvalidCompletionSlot;
+        try rows.setOrdinalWriteTimestampNs(value, std.mem.readInt(u64, value[binding.offset..][0..8], .little));
+        return;
+    };
+}
 const alignment = std.mem.Alignment.of(Operation);
 pub const OwnedDescriptor = struct {
     allocator: Allocator,
@@ -393,4 +452,17 @@ test "workload admission completion slot next replay binding roundtrips distinct
     var owned = try decode(std.testing.allocator, wire, .{});
     defer owned.deinit();
     try std.testing.expectEqual(.replay_next_sequence, owned.descriptor.commit[0].bindings[0].kind);
+}
+
+test "workload admission completion slot raft marker bindings preserve exact offsets" {
+    var input = fixture();
+    input.commit = &.{.{ .kind = .put, .key = "raft-marker", .value = "0000000000000000", .bindings = &.{
+        .{ .kind = .raft_term, .target = .value, .byte_order = .little, .offset = 0 },
+        .{ .kind = .raft_index, .target = .value, .byte_order = .little, .offset = 8 },
+    } }};
+    const wire = try encode(std.testing.allocator, input, .{});
+    defer std.testing.allocator.free(wire);
+    var owned = try decode(std.testing.allocator, wire, .{});
+    defer owned.deinit();
+    try std.testing.expectEqualDeep(input.commit[0].bindings, owned.descriptor.commit[0].bindings);
 }
