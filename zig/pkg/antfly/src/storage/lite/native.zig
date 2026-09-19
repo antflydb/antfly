@@ -2042,7 +2042,7 @@ pub const NativeFile = struct {
         }
     }
 
-    fn putCatalogBatchForRoot(self: *NativeFile, root: CatalogRoot, mutations: []const CatalogMutation, options: WriteOptions) !void {
+    fn putCatalogBatchForRoot(self: *NativeFile, root: CatalogRoot, mutations: []const CatalogMutation, options: WriteOptions) anyerror!void {
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
         for (mutations) |mutation| try self.validateCatalogMutation(mutation);
@@ -2065,6 +2065,22 @@ pub const NativeFile = struct {
             }
         }
 
+        if (self.stagingTransaction() and mutations.len >= TransactionWrites.max_keys) {
+            // The caller already owns a complete batch until this call returns.
+            // Consume it directly instead of copying it into bounded staging
+            // and rebuilding the same index for every staging-sized chunk.
+            try self.flushTransactionWrites();
+            const writes = try self.transactionWrites();
+            self.flushing_transaction = true;
+            self.transaction_pages = &writes.pages;
+            defer {
+                self.transaction_pages = null;
+                self.flushing_transaction = false;
+            }
+            try self.putCatalogBatchForRoot(root, mutations, options);
+            try writes.pages.flush();
+            return;
+        }
         if (self.stagingTransaction()) {
             for (mutations) |m| try self.stageMutation(if (root == .metadata) .metadata else .index, .{ .key = m.key, .value = m.value, .is_delete = m.is_delete, .external_value_root_page = m.external_value_root_page, .external_value_len = m.external_value_len }, options);
             return;
@@ -2904,12 +2920,28 @@ pub const NativeFile = struct {
         try self.putDocumentBatch(&.{.{ .key = key, .is_delete = true }});
     }
 
-    pub fn putDocumentBatch(self: *NativeFile, mutations: []const DocumentMutation) !void {
+    pub fn putDocumentBatch(self: *NativeFile, mutations: []const DocumentMutation) anyerror!void {
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
         for (mutations) |mutation| try self.validateDocumentMutation(mutation);
         if (self.change_capture) |capture| for (mutations) |mutation| capture.record(self.allocator, .documents, mutation.key);
 
+        if (self.stagingTransaction() and mutations.len >= TransactionWrites.max_keys) {
+            // The caller already owns a complete batch until this call returns.
+            // Consume it directly instead of copying it into bounded staging
+            // and rebuilding the same index for every staging-sized chunk.
+            try self.flushTransactionWrites();
+            const writes = try self.transactionWrites();
+            self.flushing_transaction = true;
+            self.transaction_pages = &writes.pages;
+            defer {
+                self.transaction_pages = null;
+                self.flushing_transaction = false;
+            }
+            try self.putDocumentBatch(mutations);
+            try writes.pages.flush();
+            return;
+        }
         if (self.stagingTransaction()) {
             for (mutations) |m| try self.stageMutation(.documents, .{ .key = m.key, .value = m.value, .is_delete = m.is_delete, .external_value_root_page = m.external_value_root_page, .external_value_len = m.external_value_len }, .{});
             return;
@@ -10473,4 +10505,43 @@ test "lite grouped pinned readers never inspect private staging during mutation"
     joined = true;
     try reader.result;
     try std.testing.expect((try file.check()).valid);
+}
+
+test "lite grouped large borrowed batches retain one index edit per supplied batch" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var keys: [4096][24]u8 = undefined;
+    var docs: [4096]DocumentMutation = undefined;
+    var catalog: [4096]CatalogMutation = undefined;
+    for (&keys, &docs, &catalog, 0..) |*key, *doc, *entry, i| {
+        const name = try std.fmt.bufPrint(key, "key-{d:0>8}", .{i});
+        doc.* = .{ .key = name, .value = "small" };
+        entry.* = .{ .key = name, .value = "small" };
+    }
+    var baseline_pages: u64 = 0;
+    for ([_]bool{ false, true }) |grouped| {
+        const path = try testPath(alloc, tmp, if (grouped) "borrowed-group.aflite" else "borrowed-baseline.aflite");
+        defer alloc.free(path);
+        var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        if (grouped) try file.beginTransaction();
+        errdefer if (grouped) file.abortTransaction();
+        try file.putCatalogRecord("metadata", "before");
+        try file.putDocumentBatch(&docs);
+        try file.putIndexCatalogBatch(&catalog);
+        if (grouped) {
+            try std.testing.expectEqual(@as(usize, 0), file.transaction_writes.?.count);
+            try file.putCatalogRecord("metadata", "after");
+            try file.putDocument(docs[0].key, "last");
+            try file.commitTransaction();
+            const value = (try file.getDocumentAlloc(alloc, docs[0].key)).?;
+            defer alloc.free(value);
+            try std.testing.expectEqualStrings("last", value);
+            // One trailing small mutation may copy its index path, but a
+            // complete borrowed batch must not rebuild paths per 1,024 rows.
+            try std.testing.expect(file.test_page_writes.load(.monotonic) <= baseline_pages + 16);
+        } else baseline_pages = file.test_page_writes.load(.monotonic);
+        try std.testing.expect((try file.check()).valid);
+    }
 }

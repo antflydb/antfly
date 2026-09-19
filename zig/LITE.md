@@ -1065,6 +1065,10 @@ rename reuse these extent references, and point/range reads see earlier staged
 writes. Writer-side scans explicitly materialize the pending batch before
 pinning cursor roots. Pinned reader APIs only consult immutable roots and never
 access the mutable write set.
+An already assembled large batch is consumed synchronously from the caller's
+buffers with one index edit, avoiding another owned staging copy. Its existing
+batch editor uses scratch proportional to the supplied batch; the 1,024-key /
+1 MiB bounds apply to mutations retained across calls.
 Reaching either staging limit flushes privately without ending the transaction;
 abort discards all flushed and pending changes together.
 
