@@ -1366,6 +1366,83 @@ func TestLiteCAPILocalEmbeddedInferenceVariant(t *testing.T) {
 	}
 }
 
+// TestLiteOpenOptionsResourceBudgetPlumbing confirms the OpenOptions
+// resource-budget fields (HostBudgetMB, BackendBudgetMB, CombinedBudgetMB,
+// KVBudgetMB, ScratchBudgetMB, ProcessMemoryBudgetMB) round-trip through the
+// C ABI (antfly_lite_open_options) to the embedded node and back out through
+// Status().Inference, and that a handle opened with LocalRuntimeConfigured
+// but no override does not fall back to the previous zero-bytes/automatic
+// generation-budget policy that could not admit even one
+// boundary-architecture extraction window regardless of request size (see
+// GLINER25.md's "Memory budget" section and this task's
+// gliner25-longdoc-handoff.md).
+func TestLiteOpenOptionsResourceBudgetPlumbing(t *testing.T) {
+	explicitPath := filepath.Join(t.TempDir(), "go-inference-budget-explicit.aflite")
+	explicitDB, err := CreateWithOptions(explicitPath, OpenOptions{
+		Mode:                   OpenModeWriter,
+		Profile:                ProfileNative,
+		LocalRuntimeConfigured: true,
+		HostBudgetMB:           256,
+		BackendBudgetMB:        128,
+		CombinedBudgetMB:       384,
+		KVBudgetMB:             64,
+		ScratchBudgetMB:        32,
+		ProcessMemoryBudgetMB:  512,
+	})
+	if err != nil {
+		t.Fatalf("create native Lite database with explicit resource budgets: %v", err)
+	}
+	defer explicitDB.Close()
+
+	explicitStatus, err := explicitDB.Status()
+	if err != nil {
+		t.Fatalf("explicit budget status: %v", err)
+	}
+	inf := explicitStatus.Inference
+	if inf.HostBudgetMB != 256 || inf.BackendBudgetMB != 128 || inf.CombinedBudgetMB != 384 ||
+		inf.KVBudgetMB != 64 || inf.ScratchBudgetMB != 32 || inf.ProcessMemoryBudgetMB != 512 {
+		t.Fatalf("explicit resource budgets not reported back: %#v", inf)
+	}
+	if inf.LocalRuntimeAvailable {
+		// The node actually started against the explicit override: its
+		// resolved process-memory envelope is exactly the requested 512 MiB
+		// (never clamped -- no test runner has less than 512 MiB) and its
+		// provenance is "explicit", not a host/cgroup guess.
+		if inf.ProcessMemoryLimitBytes != 512*1024*1024 {
+			t.Fatalf("resolved process memory limit = %d, want 512 MiB", inf.ProcessMemoryLimitBytes)
+		}
+		if inf.ProcessMemoryLimitSource != "explicit" {
+			t.Fatalf("resolved process memory limit source = %q, want \"explicit\"", inf.ProcessMemoryLimitSource)
+		}
+	}
+
+	defaultPath := filepath.Join(t.TempDir(), "go-inference-budget-default.aflite")
+	defaultDB, err := CreateWithOptions(defaultPath, OpenOptions{
+		Mode:                   OpenModeWriter,
+		Profile:                ProfileNative,
+		LocalRuntimeConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("create native Lite database with default resource budgets: %v", err)
+	}
+	defer defaultDB.Close()
+
+	defaultStatus, err := defaultDB.Status()
+	if err != nil {
+		t.Fatalf("default budget status: %v", err)
+	}
+	defInf := defaultStatus.Inference
+	if defInf.LocalRuntimeAvailable {
+		t.Logf("default embedded generation budgets on this machine: host=%d backend=%d combined=%d kv=%d scratch=%d process_memory_limit_bytes=%d process_memory_limit_source=%s",
+			defInf.HostBudgetMB, defInf.BackendBudgetMB, defInf.CombinedBudgetMB, defInf.KVBudgetMB, defInf.ScratchBudgetMB,
+			defInf.ProcessMemoryLimitBytes, defInf.ProcessMemoryLimitSource)
+		if defInf.HostBudgetMB == 0 || defInf.BackendBudgetMB == 0 || defInf.CombinedBudgetMB == 0 ||
+			defInf.KVBudgetMB == 0 || defInf.ScratchBudgetMB == 0 {
+			t.Fatalf("default embedded generation budgets fell back to the automatic/zero-bytes policy: %#v", defInf)
+		}
+	}
+}
+
 // TestLiteNativeRemoteProviderSemanticSearchEmbedsQuery reproduces the other
 // half of the runtime gap this change fixes: a public query's
 // "semantic_search" text must be embedded through the index's own
@@ -1742,4 +1819,558 @@ func TestLiteNativeGraphEdgesFromExtractionArtifact(t *testing.T) {
 		t.Fatalf("execute graph queries json: %v", err)
 	}
 	t.Logf("graph queries: %s", graphQueries)
+}
+
+// newFakeAntflyExtractServerBoundaryV2 starts an httptest server answering
+// every /extract call with the schema_version=2 "boundary-architecture"
+// envelope shape fastino/gliner2.5-base-v1 produces (see zig/EXTRACT.md's
+// "Model support" section and GLINER25.md), as opposed to
+// newFakeAntflyExtractServer's plain schema_version-1-shaped envelope.
+//
+// The item shape below is not copied from a live capture: repeated attempts
+// to capture one from `antfly inference run` against fastino/gliner2.5-base-v1
+// during this work were refused with MEMORY_BUDGET_EXCEEDED even after
+// passing generous explicit --process-memory-budget-mb/--host-budget-mb/
+// --backend-budget-mb overrides, because concurrent sibling agents on this
+// shared machine had already committed nearly all physical memory (observed
+// via `top`/`vm_stat`: ~35 of 38.6 GiB used, well under 100 MiB unused) --
+// see the scratchpad's inference-run*.log and boundary-response.json (the
+// literal MEMORY_BUDGET_EXCEEDED body) for that record. Absent a live
+// capture, this reconstructs the shape from three first-party sources that
+// agree with each other: (1) zig/EXTRACT.md's response envelope plus its
+// "Model support" note that fastino/gliner2.5-base-v1 answers the same
+// endpoint/shape family; (2) zig/pkg/antfly/src/asset_producer_runtime.zig's
+// own `extraction_v2_response_fixture` test fixture, which is the
+// schema_version=2 shape the antfly-side response validator
+// (validateExtractionResult, v2=true) already accepts -- entities/relations
+// still at the top level of each `data[]` item, plus the v2-only
+// "long_document" window-merge metadata; and (3) the inference side's actual
+// wire writer for this exact request shape,
+// zig/pkg/inference/src/extractors/extraction_v2.zig's `endpoint()`, which
+// unconditionally writes "text" on every relation endpoint (source and
+// target) in addition to "entity_index"/"label" whenever the endpoint
+// resolves unambiguously to a recognized entity -- i.e. a real boundary
+// relation endpoint is not exclusively one shape or the other; it can carry
+// both. This fixture exercises that combined shape plus the window-merge
+// metadata schema_version=1 responses never carry, on both relation
+// endpoints, so it stresses `runtimeResolveGraphEndpointEntity`'s
+// entity_index path (zig/pkg/antfly/src/storage/db/enrichment/
+// enrichment_runtime.zig) rather than only its inline-text fallback.
+func newFakeAntflyExtractServerBoundaryV2(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/extract") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var req struct {
+			Model  string `json:"model"`
+			Inputs []struct {
+				ID      string `json:"id"`
+				Content string `json:"content"`
+			} `json:"inputs"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		data := make([]map[string]any, len(req.Inputs))
+		for i, in := range req.Inputs {
+			item := map[string]any{
+				"offset_unit": "utf8_bytes",
+				"entities": []map[string]any{
+					{"label": "component", "text": "VOPR", "start": 0, "end": 4, "score": 0.95},
+					{"label": "component", "text": "antfly-core", "start": 10, "end": 21, "score": 0.9},
+				},
+				"relations": []map[string]any{
+					{
+						"type": "depends_on",
+						"source": map[string]any{
+							"entity_index": 0,
+							"label":        "component",
+							"text":         "VOPR",
+							"start":        0,
+							"end":          4,
+							"score":        0.95,
+						},
+						"target": map[string]any{
+							"entity_index": 1,
+							"label":        "component",
+							"text":         "antfly-core",
+							"start":        10,
+							"end":          21,
+							"score":        0.9,
+						},
+						"score":   0.88,
+						"derived": false,
+					},
+				},
+				"long_document": map[string]any{
+					"version":                    1,
+					"window_count":               2,
+					"window_policy":              "source_words_midpoint_ownership",
+					"classification_aggregation": "owned_word_weighted_mean_raw_logits",
+					"duplicate_score":            "maximum_calibrated_score",
+					"natural_record_identity":    "exact_source_anchor",
+					"other_record_identity":      "occurrence",
+					"solver_optimality_scope":    "retained_candidate_graph",
+				},
+			}
+			if in.ID != "" {
+				item["id"] = in.ID
+			}
+			data[i] = item
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object":         "extraction",
+			"model":          req.Model,
+			"schema_version": 2,
+			"data":           data,
+		})
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// TestLiteNativeGraphEdgesFromExtractionArtifactBoundaryV2 is
+// TestLiteNativeGraphEdgesFromExtractionArtifact's counterpart for the
+// schema_version=2 "boundary" envelope shape (see
+// newFakeAntflyExtractServerBoundaryV2). The dogfood ingest report that
+// prompted this test observed ~289 successful GLiNER2.5
+// (fastino/gliner2.5-base-v1, schema_version 2) extraction calls yet zero
+// graph edges for every `entity`/`query` name tried, even though an earlier
+// run against antflydb/gliner2-base-v1 (the plain schema_version-1 shape
+// TestLiteNativeGraphEdgesFromExtractionArtifact already covers) produced
+// edges. This asserts the same knowledge-graph mapping
+// (knowledgeGraphIndexJSONForTest, matching examples/dogfood/index_config.go)
+// produces edges from the v2/boundary shape exactly as it does from the v1
+// shape: both the asset producer's stored artifact (the normalized `data[0]`
+// record, not the raw wire envelope -- see asset_producer_runtime.zig's
+// extractionResultJsonAlloc call site, which strips the "data" wrapper
+// whenever the artifact's content_type is JSON, as dogfood's is) and
+// `$.relations[*]`'s entity_index resolution
+// (runtimeResolveGraphEndpointEntity) are exercised identically regardless
+// of schema_version.
+func TestLiteNativeGraphEdgesFromExtractionArtifactBoundaryV2(t *testing.T) {
+	server := newFakeAntflyExtractServerBoundaryV2(t)
+
+	path := filepath.Join(t.TempDir(), "graph-extraction-edges-boundary-v2.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:                     OpenModeWriter,
+		Profile:                  ProfileNative,
+		RemoteProviderConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("create native remote-provider Lite database: %v", err)
+	}
+	defer db.Close()
+
+	const indexName = "knowledge"
+	const artifactName = "relations_v1"
+	graphIndex, err := knowledgeGraphIndexJSONForTest(indexName, artifactName, server.URL)
+	if err != nil {
+		t.Fatalf("build knowledge graph index config: %v", err)
+	}
+	if err := db.AddIndexJSON(graphIndex); err != nil {
+		t.Fatalf("add knowledge graph index: %v", err)
+	}
+
+	if err := db.Batch([]WriteIntent{
+		{Key: "doc:vopr-design", Value: []byte(`{"title":"VOPR design","body":"VOPR depends on antfly-core for storage."}`)},
+		{Key: "doc:vopr-tests", Value: []byte(`{"title":"VOPR tests","body":"VOPR test harness also depends on antfly-core."}`)},
+	}, 2); err != nil {
+		t.Fatalf("batch write documents: %v", err)
+	}
+
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatalf("run until idle: %v", err)
+	}
+
+	edges, err := db.EdgesJSON(indexName, "doc:vopr-design", "", 2 /* both */)
+	if err != nil {
+		t.Fatalf("edges json: %v", err)
+	}
+	if !bytes.Contains(edges, []byte("depends_on")) {
+		t.Fatalf("edges JSON %q did not contain the extracted depends_on edge from the boundary v2 shape", edges)
+	}
+	if !bytes.Contains(edges, []byte("antfly-core")) {
+		t.Fatalf("edges JSON %q did not resolve the entity_index-addressed target text \"antfly-core\"", edges)
+	}
+
+	neighbors, err := db.NeighborsJSON(indexName, "doc:vopr-design", "", 2 /* both */)
+	if err != nil {
+		t.Fatalf("neighbors json: %v", err)
+	}
+	t.Logf("boundary v2 neighbors: %s", neighbors)
+}
+
+// TestLiteNativeArtifactSourcedDenseVectorChunkPipeline reproduces the
+// server's chunk-artifact pattern go/pkg/docsaf/cmd/docsaf/main.go's
+// createHierarchyIndexes and antfly.NewArtifactEmbeddingIndexConfig build --
+// a `chunk` enrichment producing an artifact (here "document_chunks_v1"),
+// consumed by an embeddings index via
+// `"sources":[{"artifact":"document_chunk_dense_v1"}]`, with the producing
+// `embedding` enrichment nested in that same index's own config and pointed
+// at the chunk artifact through `source_artifact_name` -- against a native
+// Lite handle through nothing but AddIndexJSON. Before
+// `registerLiteIndexEnrichments` (capi/db.zig), a native Lite handle
+// silently dropped every nested "enrichments" declaration (db.addIndex has
+// no such field), so this exact shape returned a generic ANTFLY_INTERNAL:
+// the "sources" artifact reference could never resolve because the
+// enrichment that produces it was never registered. It asserts: (1) both
+// AddIndexJSON calls succeed, (2) the chunk artifact is independently
+// queryable through its own full_text index with a hit whose
+// `hierarchy.parent_doc_key` resolves to the parent document, and (3) a
+// hybrid full-text + semantic query against the artifact-sourced dense
+// index returns a hit with the same hierarchy resolution, proving real
+// vectors were published for the generated chunk artifact (not just an
+// index that silently never received any data).
+func TestLiteNativeArtifactSourcedDenseVectorChunkPipeline(t *testing.T) {
+	const dims = 4
+	server, embedCalls := newFakeAntflyEmbedServer(t, dims)
+
+	path := filepath.Join(t.TempDir(), "artifact-sourced-dense.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:                     OpenModeWriter,
+		Profile:                  ProfileNative,
+		RemoteProviderConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("create native remote-provider Lite database: %v", err)
+	}
+	defer db.Close()
+
+	// Producer: a full_text index over the generated chunk artifact stream,
+	// with the `chunk` enrichment nested in its own config -- docsaf's
+	// "document_text" index.
+	chunkIndex, err := json.Marshal(map[string]any{
+		"name": "document_text_chunks",
+		"kind": "full_text",
+		"config_json": mustMarshalJSONString(t, map[string]any{
+			"chunk_name": "document_chunks_v1",
+			"enrichments": []map[string]any{{
+				"name":       "document_chunks_v1",
+				"kind":       "chunk",
+				"field":      "body",
+				"chunk_size": 256,
+			}},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("marshal chunk index envelope: %v", err)
+	}
+	if err := db.AddIndexJSON(chunkIndex); err != nil {
+		t.Fatalf("add chunk-producing full_text index: %v", err)
+	}
+
+	// Consumer: docsaf's exact two-stage NewArtifactEmbeddingIndexConfig
+	// shape -- "sources" naming a generated embedding artifact, whose
+	// producing "embedding" enrichment is nested in this index's own config
+	// and references the chunk artifact above.
+	vectorIndex, err := json.Marshal(map[string]any{
+		"name": "document_vectors",
+		"kind": "dense_vector",
+		"config_json": mustMarshalJSONString(t, map[string]any{
+			"type":      "embeddings",
+			"sources":   []map[string]any{{"artifact": "document_chunk_dense_v1"}},
+			"dimension": dims,
+			"embedder": map[string]any{
+				"provider": "antfly",
+				"model":    "fake-embedder",
+				"api_url":  server.URL,
+			},
+			"distance_metric": "cosine",
+			"enrichments": []map[string]any{{
+				"name": "document_chunk_dense_v1",
+				"kind": "embedding",
+				// The chunk producer stores chunked content under the same
+				// field name its `chunk` enrichment read from ("body" here,
+				// not a fixed "text" key), so the consuming `embedding`
+				// enrichment's `field` must match it.
+				"field":                "body",
+				"source_artifact_name": "document_chunks_v1",
+				"expected_dims":        dims,
+			}},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("marshal vector index envelope: %v", err)
+	}
+	if err := db.AddIndexJSON(vectorIndex); err != nil {
+		t.Fatalf("add artifact-sourced dense_vector index: %v", err)
+	}
+
+	enrichments, err := db.EnrichmentsJSON()
+	if err != nil {
+		t.Fatalf("enrichments json: %v", err)
+	}
+	if !bytes.Contains(enrichments, []byte("document_chunks_v1")) || !bytes.Contains(enrichments, []byte("document_chunk_dense_v1")) {
+		t.Fatalf("enrichments %q missing the chunk/embedding producers nested in the index configs", enrichments)
+	}
+
+	const bodyA = "alpha beta gamma antfly chunk pipeline testing text"
+	const bodyB = "a totally different unrelated sentence about databases"
+	if err := db.Batch([]WriteIntent{
+		{Key: "doc:a", Value: []byte(fmt.Sprintf(`{"title":"a","body":%q}`, bodyA))},
+		{Key: "doc:b", Value: []byte(fmt.Sprintf(`{"title":"b","body":%q}`, bodyB))},
+	}, 2); err != nil {
+		t.Fatalf("batch write documents: %v", err)
+	}
+
+	pending, err := db.RunUntilIdleStatus()
+	if err != nil {
+		t.Fatalf("run until idle: %v", err)
+	}
+	var enrichment enrichmentPendingWorkStatus
+	if err := json.Unmarshal(pending.Enrichment, &enrichment); err != nil {
+		t.Fatalf("decode enrichment pending work: %v; raw=%s", err, pending.Enrichment)
+	}
+	if enrichment.ErrorCount != 0 || enrichment.FatalErrorCount != 0 || enrichment.Stalled ||
+		enrichment.TargetSequence != enrichment.AppliedSequence {
+		t.Fatalf("chunk+embedding artifact pipeline did not drain cleanly: %#v", enrichment)
+	}
+	if atomic.LoadInt32(embedCalls) == 0 {
+		t.Fatalf("fake inference server received no /ai/v1/embed requests; the embedding artifact enrichment never ran")
+	}
+
+	// The chunk artifact is independently queryable through its own
+	// full_text index, and hierarchy projection resolves the chunk hit back
+	// to its parent document.
+	chunkQuery, err := json.Marshal(map[string]any{
+		"full_text_search": map[string]any{"match": map[string]any{"field": "body", "text": "gamma"}},
+		"full_text_index":  "document_text_chunks",
+		"hierarchy":        map[string]any{"return_level": "chunk"},
+		"limit":            5,
+	})
+	if err != nil {
+		t.Fatalf("marshal chunk-artifact query: %v", err)
+	}
+	chunkResult, err := db.SearchJSON(chunkQuery)
+	if err != nil {
+		t.Fatalf("chunk-artifact full_text query: %v result=%s", err, chunkResult)
+	}
+	assertHierarchyParentDocKey(t, chunkResult, "doc:a")
+
+	// A hybrid full-text + semantic query against the artifact-sourced dense
+	// index resolves to the same parent document, proving the generated
+	// chunk's vector was actually published (an index that silently
+	// received no vectors would return zero hits here, not a wrong one --
+	// the chunk full_text index above vets that document_chunks_v1 exists).
+	hybridQuery, err := json.Marshal(map[string]any{
+		"full_text_search": map[string]any{"match": map[string]any{"field": "body", "text": "gamma"}},
+		"full_text_index":  "document_text_chunks",
+		"semantic_search":  bodyA,
+		"indexes":          []string{"document_vectors"},
+		"merge_config":     map[string]any{"strategy": "rrf"},
+		"hierarchy":        map[string]any{"return_level": "chunk"},
+		"limit":            5,
+	})
+	if err != nil {
+		t.Fatalf("marshal hybrid query: %v", err)
+	}
+	hybridResult, err := db.SearchJSON(hybridQuery)
+	if err != nil {
+		t.Fatalf("hybrid full-text + semantic query: %v result=%s", err, hybridResult)
+	}
+	assertHierarchyParentDocKey(t, hybridResult, "doc:a")
+}
+
+// mustMarshalJSONString marshals v to JSON and returns it as a string, for
+// building the nested `config_json` string field AddIndexJSON expects.
+func mustMarshalJSONString(t *testing.T, v any) string {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal nested config_json: %v", err)
+	}
+	return string(data)
+}
+
+// assertHierarchyParentDocKey fails the test unless result contains at least
+// one hit whose "hierarchy" object's "parent_doc_key" equals wantParentKey.
+func assertHierarchyParentDocKey(t *testing.T, result []byte, wantParentKey string) {
+	t.Helper()
+	type hit struct {
+		ID        string `json:"_id"`
+		Hierarchy struct {
+			ParentDocKey string `json:"parent_doc_key"`
+		} `json:"hierarchy"`
+	}
+	var parsed struct {
+		Responses []struct {
+			Hits struct {
+				Hits []hit `json:"hits"`
+			} `json:"hits"`
+		} `json:"responses"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("decode search result: %v; raw=%s", err, result)
+	}
+	for _, response := range parsed.Responses {
+		for _, h := range response.Hits.Hits {
+			if h.Hierarchy.ParentDocKey == wantParentKey {
+				return
+			}
+		}
+	}
+	t.Fatalf("no hit with hierarchy.parent_doc_key=%q in result: %s", wantParentKey, result)
+}
+
+// TestLiteNativeDogfoodShapedChunkVectorsAndKnowledgeGraphConverge is a
+// regression test for the dogfood in-process ingest livelock: a dense_vector
+// index that consumes a two-stage chunk-then-embed pipeline entirely through
+// its own nested `enrichments` (a `chunk` producer plus an `embedding`
+// producer referenced by the dense index's plural `sources` config, exactly
+// examples/dogfood/index_config.go's `chunk_vectors` shape) alongside a
+// `knowledge` graph index fed by an extractor asset producer never converged:
+// `RunUntilIdleStatus` spun forever because the durable dense-artifact target
+// counter never advanced (see storage/db/enrichment/enrichment_runtime.zig's
+// denseArtifactTargetsForArtifact, which matched only the singular
+// `embedding_name` and not the plural `embedding_names` populated by
+// `sources`). This exercises that exact combination end to end through fake
+// `/ai/v1/embed` and `/ai/v1/extract` servers (no real model) across enough
+// documents (50) to make a livelock-vs-slow-drain distinction meaningful, and
+// asserts both a semantic hit and graph edges are actually present once
+// RunUntilIdleStatus returns.
+func TestLiteNativeDogfoodShapedChunkVectorsAndKnowledgeGraphConverge(t *testing.T) {
+	const dims = 4
+	const docCount = 50
+
+	embedServer, embedCalls := newFakeAntflyEmbedServer(t, dims)
+	extractServer := newFakeAntflyExtractServer(t)
+
+	path := filepath.Join(t.TempDir(), "dogfood-shaped-chunk-vectors-and-knowledge.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:                     OpenModeWriter,
+		Profile:                  ProfileNative,
+		RemoteProviderConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("create native remote-provider Lite database: %v", err)
+	}
+	defer db.Close()
+
+	// dogfood's `chunk_vectors`: one dense_vector index nesting both the
+	// `chunk` producer ("doc_chunks_v1") and the `embedding` producer
+	// ("doc_chunk_dense_v1") in its own config, consuming the embedding
+	// artifact through the plural `sources` array -- the exact shape that
+	// hit the missing-match bug (a singular `embedding_name` config never
+	// did).
+	chunkVectorsIndex, err := json.Marshal(map[string]any{
+		"name": "chunk_vectors",
+		"kind": "dense_vector",
+		"config_json": mustMarshalJSONString(t, map[string]any{
+			"type":            "embeddings",
+			"sources":         []map[string]any{{"artifact": "doc_chunk_dense_v1"}},
+			"dimension":       dims,
+			"distance_metric": "cosine",
+			"embedder": map[string]any{
+				"provider": "antfly",
+				"model":    "fake-embedder",
+				"api_url":  embedServer.URL,
+			},
+			"enrichments": []map[string]any{
+				{
+					"name":       "doc_chunks_v1",
+					"kind":       "chunk",
+					"field":      "body",
+					"chunk_size": 256,
+				},
+				{
+					"name":                 "doc_chunk_dense_v1",
+					"kind":                 "embedding",
+					"field":                "body",
+					"source_artifact_name": "doc_chunks_v1",
+					"expected_dims":        dims,
+				},
+			},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("marshal chunk_vectors index envelope: %v", err)
+	}
+	if err := db.AddIndexJSON(chunkVectorsIndex); err != nil {
+		t.Fatalf("add chunk_vectors dense_vector index: %v", err)
+	}
+
+	// dogfood's `knowledge`: a graph index fed by a `relations_v1` extractor
+	// asset producer.
+	const graphIndexName = "knowledge"
+	const graphArtifactName = "relations_v1"
+	knowledgeIndex, err := knowledgeGraphIndexJSONForTest(graphIndexName, graphArtifactName, extractServer.URL)
+	if err != nil {
+		t.Fatalf("build knowledge graph index config: %v", err)
+	}
+	if err := db.AddIndexJSON(knowledgeIndex); err != nil {
+		t.Fatalf("add knowledge graph index: %v", err)
+	}
+
+	const targetBody = "the antfly VOPR harness fences strong reads during a leadership transition"
+	writes := make([]WriteIntent, docCount)
+	targetKey := fmt.Sprintf("doc:%03d", docCount/2)
+	for i := 0; i < docCount; i++ {
+		key := fmt.Sprintf("doc:%03d", i)
+		body := targetBody
+		if key != targetKey {
+			body = fmt.Sprintf("unrelated filler document number %d about databases and storage engines", i)
+		}
+		writes[i] = WriteIntent{
+			Key:   key,
+			Value: []byte(fmt.Sprintf(`{"title":"doc %d","body":%q}`, i, body)),
+		}
+	}
+	if err := db.Batch(writes, 2 /* sync_level: full_index */); err != nil {
+		t.Fatalf("batch write %d documents: %v", docCount, err)
+	}
+
+	pending, err := db.RunUntilIdleStatus()
+	if err != nil {
+		t.Fatalf("run until idle: %v", err)
+	}
+	var enrichment enrichmentPendingWorkStatus
+	if err := json.Unmarshal(pending.Enrichment, &enrichment); err != nil {
+		t.Fatalf("decode enrichment pending work: %v; raw=%s", err, pending.Enrichment)
+	}
+	if enrichment.ErrorCount != 0 || enrichment.FatalErrorCount != 0 || enrichment.Stalled ||
+		enrichment.TargetSequence != enrichment.AppliedSequence {
+		t.Fatalf("chunk_vectors + knowledge did not drain cleanly: %#v", enrichment)
+	}
+	if atomic.LoadInt32(embedCalls) == 0 {
+		t.Fatalf("fake inference server received no /ai/v1/embed requests; the embedding artifact enrichment never ran")
+	}
+
+	// A semantic hit against chunk_vectors resolves to the target document,
+	// proving the two-stage chunk-then-embed pipeline actually published a
+	// searchable vector (a silently-empty index returns zero hits here, not
+	// a wrong one).
+	semanticQuery, err := json.Marshal(map[string]any{
+		"semantic_search": targetBody,
+		"indexes":         []string{"chunk_vectors"},
+		"hierarchy":       map[string]any{"return_level": "chunk"},
+		"limit":           5,
+	})
+	if err != nil {
+		t.Fatalf("marshal semantic query: %v", err)
+	}
+	semanticResult, err := db.SearchJSON(semanticQuery)
+	if err != nil {
+		t.Fatalf("semantic query: %v result=%s", err, semanticResult)
+	}
+	assertHierarchyParentDocKey(t, semanticResult, targetKey)
+
+	// The knowledge graph index produced edges from every document's
+	// extracted relation.
+	edges, err := db.EdgesJSON(graphIndexName, targetKey, "", 2 /* both */)
+	if err != nil {
+		t.Fatalf("edges json: %v", err)
+	}
+	if !bytes.Contains(edges, []byte("depends_on")) {
+		t.Fatalf("edges JSON %q did not contain the extracted depends_on edge for %s", edges, targetKey)
+	}
 }

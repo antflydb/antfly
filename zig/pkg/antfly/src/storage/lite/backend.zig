@@ -989,6 +989,14 @@ test "lite backend inference status reports disabled as clean state" {
         "local_runtime_available",
         "caller_supplied_artifacts",
         "no_inference_configured_ok",
+        "host_budget_mb",
+        "backend_budget_mb",
+        "combined_budget_mb",
+        "kv_budget_mb",
+        "scratch_budget_mb",
+        "process_memory_budget_mb",
+        "process_memory_limit_bytes",
+        "process_memory_limit_source",
     };
 
     const fields = @typeInfo(InferenceStatus).@"struct".fields;

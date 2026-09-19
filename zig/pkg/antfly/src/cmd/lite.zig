@@ -33,6 +33,7 @@ const portable_backup = antfly.portable_backup;
 const lite_paths = antfly.lite.paths;
 const lite_restore_staging = antfly.lite.restore_staging;
 const LiteDb = antfly.lite.connection.Connection;
+const full_text_index_defaults = @import("../common/full_text_index_defaults.zig");
 
 const CompactReport = struct {
     compacted: bool,
@@ -1279,6 +1280,17 @@ fn writeFileAtomically(allocator: Allocator, io: std.Io, path: []const u8, conte
     };
 }
 
+/// Finds an index by name in a `listIndexes` result, order-independent.
+/// Every freshly created Lite database now also carries the default
+/// full-text index (see `full_text_index_defaults.zig`), so tests assert
+/// specific names are present instead of relying on a fixed slice order.
+fn indexNamed(indexes: []const db_types.IndexConfig, name: []const u8) ?db_types.IndexConfig {
+    for (indexes) |index| {
+        if (std.mem.eql(u8, index.name, name)) return index;
+    }
+    return null;
+}
+
 fn restoreTempPathAlloc(allocator: Allocator, out_path: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, "{s}.restore-tmp.aflite", .{out_path});
 }
@@ -1609,8 +1621,11 @@ test "lite schema index and enrichment commands round trip catalogs" {
 
         const indexes = try lite.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 1), indexes.len);
-        try std.testing.expectEqualStrings("cmd_ft_body", indexes[0].name);
+        // `init` also provisions the default full-text index alongside the
+        // one explicitly created by `lite index create` above.
+        try std.testing.expectEqual(@as(usize, 2), indexes.len);
+        try std.testing.expect(indexNamed(indexes, "cmd_ft_body") != null);
+        try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 
         const enrichments = try lite.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
@@ -1634,9 +1649,12 @@ test "lite schema index and enrichment commands round trip catalogs" {
         var lite = try LiteDb.open(allocator, path, .status_only);
         defer lite.close();
 
+        // Dropping the explicitly created index must not touch the default
+        // full-text index `init` provisioned.
         const indexes = try lite.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 0), indexes.len);
+        try std.testing.expectEqual(@as(usize, 1), indexes.len);
+        try std.testing.expectEqualStrings(full_text_index_defaults.default_full_text_index_name, indexes[0].name);
 
         const enrichments = try lite.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
@@ -2091,11 +2109,15 @@ test "lite backup output restores schema indexes enrichments and documents" {
 
         const indexes = try restored.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 4), indexes.len);
+        // `source` also carries the default full-text index `LiteDb.create`
+        // provisions, alongside its 4 explicit indexes; both travel through
+        // the backup/restore round trip.
+        try std.testing.expectEqual(@as(usize, 5), indexes.len);
         var saw_direct_index = false;
         var saw_dense_index = false;
         var saw_sparse_index = false;
         var saw_graph_index = false;
+        var saw_default_index = false;
         for (indexes) |index| {
             if (std.mem.eql(u8, index.name, "ft_direct_v1")) {
                 saw_direct_index = true;
@@ -2109,12 +2131,15 @@ test "lite backup output restores schema indexes enrichments and documents" {
             } else if (std.mem.eql(u8, index.name, "graph_links_v1")) {
                 saw_graph_index = true;
                 try std.testing.expectEqual(db_types.IndexKind.graph, index.kind);
+            } else if (std.mem.eql(u8, index.name, full_text_index_defaults.default_full_text_index_name)) {
+                saw_default_index = true;
             }
         }
         try std.testing.expect(saw_direct_index);
         try std.testing.expect(saw_dense_index);
         try std.testing.expect(saw_sparse_index);
         try std.testing.expect(saw_graph_index);
+        try std.testing.expect(saw_default_index);
 
         const enrichments = try restored.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
@@ -2180,7 +2205,10 @@ test "lite backup output restores schema indexes enrichments and documents" {
 
         const indexes = try imported.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 4), indexes.len);
+        // The import replaces the target's catalog wholesale with source's,
+        // which includes source's own default full-text index.
+        try std.testing.expectEqual(@as(usize, 5), indexes.len);
+        try std.testing.expect(indexNamed(indexes, full_text_index_defaults.default_full_text_index_name) != null);
 
         const enrichments = try imported.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
@@ -2514,8 +2542,10 @@ test "lite status json includes pending work" {
     var lite = try LiteDb.create(allocator, path, true);
     defer lite.close();
 
+    // `create` already provisions the default full-text index, so this uses
+    // a distinct name to add a second one and exercise pending-work status.
     const index_json =
-        \\{"name":"full_text_index_v0","kind":"full_text","config_json":"{}"}
+        \\{"name":"status_pending_ft_v1","kind":"full_text","config_json":"{}"}
     ;
     var parsed = try std.json.parseFromSlice(db_types.IndexConfig, allocator, index_json, .{
         .ignore_unknown_fields = true,
@@ -2716,13 +2746,23 @@ test "lite snapshot copies stable aflite prefix without source tail" {
     const snapshot_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/snapshot-copy.aflite", .{tmp.sub_path});
     defer allocator.free(snapshot_path);
 
-    const source_size = blk: {
+    {
         var source = try LiteDb.create(allocator, src_path, true);
-        defer source.close();
         const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:lite-snapshot\":{\"title\":\"stable snapshot\"}}}");
         defer allocator.free(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
-        break :blk (try source.backend.native_docstore.?.file.file.stat(source.backend.native_docstore.?.file.io_impl.io())).size;
+        // Close (and sync) before measuring the file so the default
+        // full-text index's own indexing work for this insert -- which
+        // `close` flushes -- is already durable. Otherwise the size
+        // captured here undercounts the final checkpoint's prefix and the
+        // "tail" bytes appended below land on live pages instead of past
+        // them, corrupting the file instead of appending harmless tail data.
+        source.close();
+    }
+    const source_size = blk: {
+        var source_file = try std.Io.Dir.cwd().openFile(io, src_path, .{ .mode = .read_only });
+        defer source_file.close(io);
+        break :blk (try source_file.stat(io)).size;
     };
 
     {

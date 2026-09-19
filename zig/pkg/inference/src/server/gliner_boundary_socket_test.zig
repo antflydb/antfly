@@ -359,7 +359,9 @@ test "gliner boundary socket transport gate disconnect retry metrics and shutdow
     try std.testing.expectEqual(@as(u64, 2), transport.server.runtimeStats().request_cancellations_total);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
     try std.testing.expectEqual(@as(usize, 0), (try shared.idle(&node)).hostTotalBytes());
-    try std.testing.expect(!model.runtime_available);
+    // Rejected on the coarse UNSUPPORTED_EXTRACTION_FEATURE gate above, not
+    // on the family-wide runtime flag: this "without model" fixture has no
+    // reviewed identity regardless of that flag's state.
 }
 
 test "gliner boundary socket pinned small real HTTP success atomic recovery and metrics" {
@@ -472,7 +474,6 @@ test "gliner boundary socket pinned small real HTTP success atomic recovery and 
         try std.testing.expectEqual(cached, try shared.cachedModel(&node, directory, pins));
         try transport.finish();
         _ = try shared.idle(&node);
-        try std.testing.expect(!model.runtime_available);
     }
     // Both network executors, listener, request owners and managed model are
     // destroyed before rehashing all five immutable source artifacts.

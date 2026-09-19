@@ -30,6 +30,18 @@ pub const Limits = struct {
     max_total_attention_work: u64 = 8 * 1024 * 1024 * 1024,
     max_retained_evidence_bytes: usize = 128 * 1024 * 1024,
     max_request_windows: usize = 256,
+    /// A document's windows are executed in groups of up to this many per
+    /// forward pass (the encoder/head/scorer APIs already accept a
+    /// multi-sample PreparedBatch; see request_device.zig's
+    /// runWindowsWithOutputAllocator and pipeline.zig's runScoredWindows),
+    /// instead of one window per call. Bounded and independent of document
+    /// length by construction: peak per-call device/host memory scales with
+    /// this constant group size, never with the document's total window
+    /// count. 1 reproduces the original strictly-serial behavior. Only
+    /// windows for a schema with no classification, records, or JointIE task
+    /// are grouped (see the batchable check in executeChecked); those task
+    /// families keep the original one-window-per-call path unchanged.
+    window_batch_size: usize = 4,
 };
 pub const Options = struct {
     identity: artifact.Identity,
@@ -167,26 +179,40 @@ fn profile(a: Allocator, config: *const model.Config, item: *const wire.Item, op
 }
 
 const Window = struct {
-    result: pipeline.WindowResult,
+    /// Non-null only when this window ran its own single-sample forward pass
+    /// (the unbatched/JointIE path, where document_mod's global JointIE
+    /// solve still needs the raw retained candidate graph via
+    /// `result.joint_candidates[0]`). A batched window's shared
+    /// WindowResult -- one per executed group, covering several windows --
+    /// is owned separately by executeChecked's `batch_results` list, so
+    /// `relations` below (a plain borrowed view, valid for either path) is
+    /// how mergeAll reads ordinary relations without needing `.result`.
+    result: ?pipeline.WindowResult,
+    relations: []const pipeline.Relation,
     logits: []const []const f64,
     mentions: []const document_mod.MentionCandidate,
     mention_values: []const pipeline.Value,
     records: []const document_mod.RecordCandidate,
 };
 
-fn collectWindow(a: Allocator, result: pipeline.WindowResult, prepared: *const processor.PreparedBatch, item: *const wire.Item) !Window {
-    if (result.outputs.samples.len != 1 or result.joint_candidates.len != 1) return error.InvalidExtractionOutput;
-    const sample = result.outputs.samples[0];
+/// `result`/`prepared` may cover several windows at once (a batched group);
+/// `index` selects this window's entry within them. `owns_result` controls
+/// whether this Window becomes responsible for `result`'s lifetime (the
+/// unbatched path, one Window per WindowResult) or not (the batched path,
+/// where the caller retains one shared WindowResult per group instead).
+fn collectWindow(a: Allocator, result: pipeline.WindowResult, index: usize, prepared: *const processor.PreparedBatch, item: *const wire.Item, owns_result: bool) !Window {
+    if (index >= result.outputs.samples.len or index >= result.joint_candidates.len or index >= prepared.samples.len) return error.InvalidExtractionOutput;
+    const sample = result.outputs.samples[index];
     const classes = item.compiled.schema.classifications;
     const rows = try a.alloc([]const f64, classes.len);
     for (classes, rows, 0..) |classification, *row, task_index| {
         const values = try a.alloc(f64, classification.task.labels.len);
         @memset(values, std.math.nan(f64));
         const scores = result.classification_scores orelse return error.InvalidBoundaryScorerOutput;
-        for (prepared.samples[0].classification_labels, 0..) |label, index| {
+        for (prepared.samples[index].classification_labels, 0..) |label, li| {
             if (label.schema_index != task_index) continue;
-            if (label.label_index >= values.len or index >= scores.logits.len or !std.math.isNan(values[label.label_index])) return error.InvalidBoundaryPipelineRouting;
-            values[label.label_index] = scores.logits[index];
+            if (label.label_index >= values.len or li >= scores.logits.len or !std.math.isNan(values[label.label_index])) return error.InvalidBoundaryPipelineRouting;
+            values[label.label_index] = scores.logits[li];
         }
         for (values) |value| if (!std.math.isFinite(value)) return error.InvalidBoundaryPipelineRouting;
         row.* = values;
@@ -206,13 +232,13 @@ fn collectWindow(a: Allocator, result: pipeline.WindowResult, prepared: *const p
     var records = std.ArrayListUnmanaged(document_mod.RecordCandidate).empty;
     for (sample.structures) |group| {
         var structure_index: ?usize = null;
-        for (item.compiled.schema.structures, 0..) |spec, index| if (std.mem.eql(u8, spec.name, group.name)) {
+        for (item.compiled.schema.structures, 0..) |spec, index2| if (std.mem.eql(u8, spec.name, group.name)) {
             if (structure_index != null) return error.InvalidBoundaryPipelineRouting;
-            structure_index = index;
+            structure_index = index2;
         };
         for (group.instances, 0..) |record, record_index| try records.append(a, .{ .structure_index = structure_index orelse return error.InvalidBoundaryPipelineRouting, .record_index = record_index, .record = record });
     }
-    return .{ .result = result, .logits = rows, .mentions = try mentions.toOwnedSlice(a), .mention_values = try values.toOwnedSlice(a), .records = try records.toOwnedSlice(a) };
+    return .{ .result = if (owns_result) result else null, .relations = sample.relations, .logits = rows, .mentions = try mentions.toOwnedSlice(a), .mention_values = try values.toOwnedSlice(a), .records = try records.toOwnedSlice(a) };
 }
 
 const Copier = struct {
@@ -281,7 +307,11 @@ fn mergeAll(allocator: Allocator, result_allocator: Allocator, document: documen
     if (item.compiled.schema.joint_ie) |joint_schema| {
         const inputs = try a.alloc(document_mod.WindowJointCandidates, windows.len);
         for (windows, inputs, 0..) |window, *input, index| {
-            const candidates = window.result.joint_candidates[0] orelse return error.InvalidBoundaryPipelineRouting;
+            // JointIE never takes the batched path (see the batchable check
+            // in executeChecked), so every JointIE window still owns its own
+            // single-sample WindowResult here.
+            const owned = window.result orelse return error.InvalidBoundaryPipelineRouting;
+            const candidates = owned.joint_candidates[0] orelse return error.InvalidBoundaryPipelineRouting;
             input.* = .{ .identity = try document.identity(index), .nodes = candidates.nodes, .edges = candidates.edges };
         }
         var global = try document_mod.solveJoint(allocator, document, &item.compiled, inputs, .{ .merge = merge_options, .solver = options.pipeline.joint_solver, .best_effort = options.pipeline.best_effort });
@@ -321,7 +351,7 @@ fn mergeAll(allocator: Allocator, result_allocator: Allocator, document: documen
         const identity = try document.identity(index);
         mention_windows[index] = .{ .identity = identity, .pre_overlap_candidates = window.mentions };
         class_windows[index] = .{ .identity = identity, .logits = window.logits };
-        relation_windows[index] = .{ .identity = identity, .relations = window.result.outputs.samples[0].relations };
+        relation_windows[index] = .{ .identity = identity, .relations = window.relations };
         record_windows[index] = .{ .identity = identity, .records = window.records };
     }
     var mentions = try document_mod.mergeMentions(allocator, document, &item.compiled, mention_windows, options.pipeline.overlap, options.pipeline.offset_unit, merge_options);
@@ -546,6 +576,36 @@ const WindowGate = struct {
     }
 };
 
+/// One forward pass (encode, optional head, score) over `schemas.len`
+/// windows, sharing one WindowResult. Callers own retry-on-OutOfMemory with a
+/// smaller group; this always attempts exactly the group it is given.
+fn encodeGroup(
+    cb: *const compute.ComputeBackend,
+    allocator: Allocator,
+    config: *const model.Config,
+    prepared: *const processor.PreparedBatch,
+    engine_options: engine.Options,
+    device_options: device_request.Options,
+    schemas: anytype,
+    output_allocator: Allocator,
+    pipeline_options: pipeline.Options,
+    control: ?Control,
+    head_limits: head.Limits,
+) !pipeline.WindowResult {
+    return switch (cb.kind()) {
+        .native => native: {
+            var encoded = try engine.encodeNative(cb, allocator, config, prepared, engine_options);
+            defer encoded.deinit();
+            var headed: ?head.Result = if (prepared.query_width > 0) try head.forwardNative(cb, allocator, config, encoded.asHeadInput(control), head_limits) else null;
+            defer if (headed) |*value| value.deinit();
+            var scorer = pipeline.scoring.NativeContext{ .cb = cb, .config = config, .prepared = prepared, .core = .{ .text_states = encoded.text_states, .query_states = encoded.query_states, .classification_states = encoded.classification_states, .text_lengths = encoded.text_lengths }, .scores = if (headed) |*value| value else null };
+            break :native try pipeline.runScoredWindows(output_allocator, config, prepared, schemas, if (headed) |*value| pipeline.scoring.CandidateScoreView.fromNative(value) else null, scorer.scorer(), pipeline_options, &.{});
+        },
+        .metal => (try device_request.runWindowsWithOutputAllocator(cb, allocator, output_allocator, config, prepared, schemas, device_options)).outputs,
+        else => return error.UnsupportedGlinerBoundaryBackend,
+    };
+}
+
 fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options, gate: ?*qualification.Gate) !Result {
     var planned = try prepareDocument(cb.kind(), allocator, config, item, supplied);
     defer planned.document.deinit();
@@ -566,35 +626,89 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
     defer metadata.deinit();
     const windows = metadata.allocator().alloc(Window, document.windows.len) catch |err| return evidenceAllocationError(terminal, err);
     var completed: usize = 0;
-    defer for (windows[0..completed]) |*window| window.result.deinit();
-    for (document.windows, windows) |window, *out| {
+    defer for (windows[0..completed]) |*window| if (window.result) |*r| r.deinit();
+    // Groups share one WindowResult (one forward pass) across up to
+    // window_batch_size windows; each group's shared result is retained here
+    // until merge finishes, independent of `windows[i].result` (see Window's
+    // doc comment). The unbatched path (below) still gives each window its
+    // own WindowResult directly, exactly as before.
+    var batch_results = std.ArrayListUnmanaged(pipeline.WindowResult).empty;
+    defer for (batch_results.items) |*br| br.deinit();
+
+    // Only ordinary entities/relations/legacy-structures windows are grouped
+    // into one forward pass (pipeline.runScoredWindows and
+    // request_device.runWindowsWithOutputAllocator already accept a
+    // multi-sample PreparedBatch): classification and JointIE keep the
+    // original one-window-per-call path, since their scoring/candidate
+    // shapes have not been measured or reviewed batched (see
+    // Limits.window_batch_size's doc comment and GLINER25.md's
+    // long-document throughput section).
+    const batchable = item.compiled.schema.classifications.len == 0 and item.compiled.schema.joint_ie == null;
+
+    var start: usize = 0;
+    while (start < document.windows.len) {
         try check(options);
-        observation.emit(options.observer, .{ .phase = .tokenizing });
-        var prepared = try processor.prepare(allocator, tokenizer, &.{.{ .text = try document.windowText(window.index), .schema = &item.compiled }}, process_options);
-        defer prepared.deinit();
-        if (gate) |active| try active.observe(item.text.len, document.words.len, document.windows.len, &prepared);
-        var pipeline_options = options.pipeline;
-        pipeline_options.control = options.control;
-        // Retained candidates and final presented outputs have different
-        // budgets: a scalar output may need many alternatives for merging.
-        pipeline_options.max_output_values = options.limits.merge.max_input_candidates;
-        observation.emit(options.observer, .{ .phase = .execution });
-        var result = switch (cb.kind()) {
-            .native => native: {
-                var encoded = try engine.encodeNative(cb, allocator, config, &prepared, engine_options);
-                defer encoded.deinit();
-                var headed: ?head.Result = if (prepared.query_width > 0) try head.forwardNative(cb, allocator, config, encoded.asHeadInput(options.control), options.pipeline.head_limits) else null;
-                defer if (headed) |*value| value.deinit();
-                var scorer = pipeline.scoring.NativeContext{ .cb = cb, .config = config, .prepared = &prepared, .core = .{ .text_states = encoded.text_states, .query_states = encoded.query_states, .classification_states = encoded.classification_states, .text_lengths = encoded.text_lengths }, .scores = if (headed) |*value| value else null };
-                break :native pipeline.runScoredWindows(budget.allocator(), config, &prepared, &.{&item.compiled}, if (headed) |*value| pipeline.scoring.CandidateScoreView.fromNative(value) else null, scorer.scorer(), pipeline_options, &.{}) catch |err| return evidenceAllocationError(terminal, err);
-            },
-            .metal => (device_request.runWindowsWithOutputAllocator(cb, allocator, budget.allocator(), config, &prepared, &.{&item.compiled}, device_options) catch |err| return evidenceAllocationError(terminal, err)).outputs,
-            else => return error.UnsupportedGlinerBoundaryBackend,
+        // The configured group size is a starting point, not a fixed shape:
+        // a genuine allocation failure while encoding/scoring this exact
+        // group (host or device memory pressure -- never a declared-limit
+        // rejection, which a smaller group would not relieve; see
+        // evidenceAllocationError) retries the SAME starting position with a
+        // strictly smaller group, down to one window, instead of failing the
+        // whole document or repeating the identical shape. Every window's
+        // admission already ran through admitWindows above one window at a
+        // time, independent of how windows get grouped for execution, so a
+        // smaller runtime group needs no re-admission.
+        var n: usize = if (batchable) @max(1, @min(options.limits.window_batch_size, document.windows.len - start)) else 1;
+        var prepared: processor.PreparedBatch = undefined;
+        var result: pipeline.WindowResult = attempt: while (true) {
+            const end = start + n;
+            observation.emit(options.observer, .{ .phase = .tokenizing });
+            const window_items = allocator.alloc(processor.Item, n) catch |err| return evidenceAllocationError(terminal, err);
+            defer allocator.free(window_items);
+            for (document.windows[start..end], window_items) |window, *wi| {
+                wi.* = .{ .text = try document.windowText(window.index), .schema = &item.compiled };
+            }
+            prepared = try processor.prepare(allocator, tokenizer, window_items, process_options);
+            errdefer prepared.deinit();
+            var pipeline_options = options.pipeline;
+            pipeline_options.control = options.control;
+            // Retained candidates and final presented outputs have different
+            // budgets: a scalar output may need many alternatives for merging.
+            pipeline_options.max_output_values = options.limits.merge.max_input_candidates;
+            observation.emit(options.observer, .{ .phase = .execution });
+            const SchemaPtr = @TypeOf(&item.compiled);
+            const schemas = allocator.alloc(SchemaPtr, n) catch |err| return evidenceAllocationError(terminal, err);
+            defer allocator.free(schemas);
+            for (schemas) |*s| s.* = &item.compiled;
+            if (encodeGroup(cb, allocator, config, &prepared, engine_options, device_options, schemas, budget.allocator(), pipeline_options, options.control, options.pipeline.head_limits)) |value| {
+                break :attempt value;
+            } else |err| {
+                if (err == error.OutOfMemory and n > 1) {
+                    prepared.deinit();
+                    n = (n + 1) / 2;
+                    continue :attempt;
+                }
+                return evidenceAllocationError(terminal, err);
+            }
         };
-        errdefer result.deinit();
-        out.* = collectWindow(metadata.allocator(), result, &prepared, item) catch |err| return evidenceAllocationError(terminal, err);
-        completed += 1;
-        observation.emit(options.observer, .window_completed);
+        defer prepared.deinit();
+        if (batchable) {
+            batch_results.append(metadata.allocator(), result) catch |err| {
+                result.deinit();
+                return evidenceAllocationError(terminal, err);
+            };
+            for (0..n) |i| {
+                windows[start + i] = collectWindow(metadata.allocator(), result, i, &prepared, item, false) catch |err| return evidenceAllocationError(terminal, err);
+                completed += 1;
+                observation.emit(options.observer, .window_completed);
+            }
+        } else {
+            errdefer result.deinit();
+            windows[start] = collectWindow(metadata.allocator(), result, 0, &prepared, item, true) catch |err| return evidenceAllocationError(terminal, err);
+            completed += 1;
+            observation.emit(options.observer, .window_completed);
+        }
+        start += n;
     }
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -774,7 +888,7 @@ fn fakeWindow(a: Allocator, sample: pipeline.Sample, rows: []const []const f64, 
     samples[0] = sample;
     const joints = try a.alloc(?@import("../pipelines/gliner_boundary_joint.zig").Candidates, 1);
     joints[0] = null;
-    return .{ .result = .{ .allocator = a, .outputs = .{ .arena = arena, .samples = samples }, .classification_scores = null, .joint_candidates = joints }, .logits = rows, .mentions = mentions, .mention_values = values, .records = records };
+    return .{ .result = .{ .allocator = a, .outputs = .{ .arena = arena, .samples = samples }, .classification_scores = null, .joint_candidates = joints }, .relations = sample.relations, .logits = rows, .mentions = mentions, .mention_values = values, .records = records };
 }
 
 /// All packets below are synthetic post-score evidence. No tokenizer, encoder,
@@ -813,7 +927,7 @@ fn exerciseFakeMerge(a: Allocator, mode: FakeMergeMode) !void {
     };
     var windows: [2]Window = undefined;
     var completed: usize = 0;
-    defer for (windows[0..completed]) |*window| window.result.deinit();
+    defer for (windows[0..completed]) |*window| window.result.?.deinit();
     windows[0] = try fakeWindow(a, .{ .relations = &.{.{ .name = "connects", .schema_index = 0, .head = fakeSourceValue(left_text, 3, 4, 0.7), .tail = fakeSourceValue(left_text, 10, 11, 0.7), .confidence = 0.7 }} }, &.{&.{ -2, 2 }}, &.{.{ .entity_type = 0, .source = left_entity.source.?, .probability = left_entity.confidence }}, &.{left_entity}, &left_records);
     completed = 1;
     windows[1] = try fakeWindow(a, .{ .relations = &.{.{ .name = "connects", .schema_index = 0, .head = fakeSourceValue(right_text, 0, 1, 0.9), .tail = fakeSourceValue(right_text, 7, 8, 0.9), .confidence = 0.9 }} }, &.{&.{ 6, -6 }}, &.{.{ .entity_type = 0, .source = right_entity.source.?, .probability = right_entity.confidence }}, &.{right_entity}, &right_records);
@@ -856,7 +970,7 @@ fn exerciseFakeMerge(a: Allocator, mode: FakeMergeMode) !void {
     }
     const output = try mergeAll(a, output_arena.allocator(), document, &windows, item, &config, options);
     // Destroy every source owner before inspecting the assembled response.
-    for (&windows) |*window| window.result.deinit();
+    for (&windows) |*window| window.result.?.deinit();
     completed = 0;
     document.deinit();
     document_live = false;
@@ -913,6 +1027,89 @@ test "gliner boundary long executor evidence terminal allocation preserves backi
     try std.testing.expect(observed.requested_bytes <= observed.limit_bytes - observed.live_bytes);
     try std.testing.expectEqual(error.OutOfMemory, evidenceAllocationError(terminal, actual));
     try std.testing.expectEqual(error.Cancelled, evidenceAllocationError(terminal, error.Cancelled));
+}
+
+// Real memory pressure -- not a fake/synthetic backend -- against the pinned
+// base checkpoint: a bounded host allocator sized so the configured
+// window_batch_size=4 group's encode/head/score forward pass genuinely
+// cannot allocate, but a smaller group (down to one window) can. Calibrated
+// empirically (see this task's report) against this exact document/schema:
+// 6 MiB reliably forces at least one 4->2 shrink (and some positions shrink
+// further to 1) while still completing the whole document; 8 MiB and above
+// never needs to shrink at all. Picked comfortably inside that window so the
+// test exercises the retry path deterministically without being so tight it
+// fails even at group size 1 (which would make this a resource-exhaustion
+// test instead of a recovery test).
+test "gliner boundary long executor adaptive group shrink recovers from real encode-phase OutOfMemory pressure" {
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const factory = @import("../architectures/session_factory.zig");
+    const session = try factory.createNativeSession(a, directory);
+    defer session.close();
+    const identity = try factory.getGlinerBoundaryIdentity(session);
+    const config = try factory.getGlinerBoundaryConfig(session);
+    const path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(path);
+    const tokenizer_bytes = try @import("../util/c_file.zig").readFileMax(a, path, 32 * 1024 * 1024);
+    defer a.free(tokenizer_bytes);
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tokenizer.tokenizer().deinitTokenizer();
+    var managed = try factory.getManagedComputeBackend(session, a, null, null);
+    defer managed.deinit();
+
+    // 12 repeats of an 11-word sentence, windowed at word_words=20/overlap=2,
+    // produces exactly 10 windows -- several full window_batch_size=4 groups,
+    // so the retry path is exercised more than once.
+    var words = std.ArrayListUnmanaged(u8).empty;
+    defer words.deinit(a);
+    for (0..12) |_| try words.appendSlice(a, "Alice met Bob at the Antfly office to discuss the metadata server. ");
+    const raw = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = "boundary",
+        .schema = .{ .entities = &[_][]const u8{"person"}, .relations = &[_]struct { type: []const u8 }{.{ .type = "depends_on" }} },
+        .inputs = &.{.{ .content = words.items }},
+        .options = .{ .long_document = .{ .mode = "window", .window_words = @as(u32, 20), .overlap_words = @as(u32, 2) } },
+    }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    const item = &request.items[0];
+    const options = Options{ .identity = identity, .pipeline = item.options.native(.{}) };
+
+    // Unbounded control: proves 10 windows is the real shape this document
+    // produces, independent of the pressure below.
+    var unbounded = try execute(&managed.backend, a, &config, tokenizer.tokenizer(), item, options);
+    defer unbounded.deinit();
+    try std.testing.expectEqual(@as(usize, 10), unbounded.window_count);
+
+    var pressure = BoundedAllocator{ .backing = a, .limit = 6 * 1024 * 1024 };
+    var result = try execute(&managed.backend, pressure.allocator(), &config, tokenizer.tokenizer(), item, options);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 10), result.window_count);
+    try std.testing.expect(result.sample.entities.len > 0);
+    var mentions: usize = 0;
+    for (result.sample.entities) |group| mentions += group.values.len;
+    try std.testing.expect(mentions > 0);
+}
+
+test "gliner boundary long executor adaptive group shrink strictly decreases and always reaches one" {
+    // The core correctness property of the OutOfMemory retry in the group
+    // execution loop: starting from any group size, repeatedly halving
+    // (rounding up) strictly decreases the group and reaches exactly 1 in a
+    // bounded number of steps, so a caller can never retry the identical
+    // shape and can never loop indefinitely.
+    for ([_]usize{ 1, 2, 3, 4, 5, 7, 16, 128, 4096 }) |start_n| {
+        var n = start_n;
+        var steps: usize = 0;
+        while (n > 1) {
+            const next = (n + 1) / 2;
+            try std.testing.expect(next < n);
+            n = next;
+            steps += 1;
+            try std.testing.expect(steps <= 64);
+        }
+        try std.testing.expectEqual(@as(usize, 1), n);
+    }
 }
 
 test "gliner boundary long executor evidence terminal allocation retains declared memory limit" {

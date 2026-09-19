@@ -18,7 +18,6 @@ const db_mod = support.db;
 const db_core = support.db_core;
 const lite_restore_staging = support.lite.restore_staging;
 const template_remote_host = support.template_remote_host;
-const full_text_index_defaults = support.full_text_index_defaults;
 
 pub const lsm_storage = support.lsm_storage;
 pub const enrichment_runtime = support.enrichment_runtime;
@@ -125,6 +124,14 @@ pub const DB = struct {
         errdefer lite_backend.deinit();
 
         var db_opts = toDbOpenOptions(opts, profile);
+        // Every Lite creation path (CLI, C ABI, and this native embedded
+        // facade) shares the same deterministic root identity and mismatch
+        // policy -- see `storage/lite/connection.zig`'s `identityOpenOptions`
+        // -- so a `.aflite` file produced by one surface stays fully
+        // openable by the others instead of tripping IdentityNamespaceMismatch.
+        const identity = support.lite.connection.identityOpenOptions(create);
+        db_opts.identity_namespace = identity.identity_namespace;
+        db_opts.prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace;
         try lite_backend.configureDbOpenOptions(&db_opts);
 
         const inner = db_mod.DB.openOwned(alloc, path, db_opts) catch |err| {
@@ -137,11 +144,7 @@ pub const DB = struct {
             // index the server provisions on every table create, so text
             // search works out of the box without a separate index-create
             // step. Opening an existing database must not add anything.
-            try inner.addIndex(.{
-                .name = full_text_index_defaults.default_full_text_index_name,
-                .kind = .full_text,
-                .config_json = "{}",
-            });
+            try support.lite.connection.provisionDefaultFullTextIndex(inner);
         }
 
         const moved_lite_backend = lite_backend.*;
@@ -309,7 +312,7 @@ pub const DB = struct {
 
     pub fn importPortable(self: *DB, alloc: Allocator, backup: []const u8) !void {
         if (self.owned_lite_backend) |*lite_backend| {
-            try lite_restore_staging.importPortableIntoLiteDb(alloc, &self.inner, lite_backend, backup);
+            try lite_restore_staging.importPortableIntoLiteDb(alloc, self.inner, lite_backend, backup);
             return;
         }
         const target_identity = self.inner.core.identity_namespace;
@@ -366,10 +369,16 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
         .index_backends = opts.index_backends,
         .ttl_cleanup = opts.ttl_cleanup,
         .backend_runtime = opts.backend_runtime,
+        // Caller-supplied enrichment config (embedders, `enable_without_producers`
+        // for resuming generated enrichment against a paused/hosted-produced
+        // backlog, etc.) applies to every profile, not just hosted -- a native
+        // reopen that resumes work a hosted session left pending needs this
+        // too, or `replayGeneratedEnrichmentsFromStoredDocs` silently no-ops
+        // because `self.enrichment_runtime` never gets constructed.
+        .enrichment = opts.enrichment,
     };
     if (profile == .hosted) {
         resolved.executor = .{ .backend = .manual };
-        resolved.enrichment = opts.enrichment;
         resolved.ttl_cleanup = .{ .enabled = false };
         resolved.transaction_recovery = .{ .enabled = false };
         resolved.text_merge = .{ .enabled = false };
@@ -566,6 +575,9 @@ test "embedded db liteStatus exposes storage stats work and capabilities" {
         }},
         .sync_level = .write,
     });
+    // Drain the default full-text index's background indexing of the write
+    // above so the stats and pending-work snapshot below are deterministic.
+    try db.runUntilIdle();
 
     var status = try db.liteStatus(alloc);
     defer status.deinit(alloc);
@@ -574,11 +586,15 @@ test "embedded db liteStatus exposes storage stats work and capabilities" {
     try std.testing.expectEqualStrings("native_single_file", status.storage.engine);
     try std.testing.expectEqualStrings("native_replay_lanes_in_document_catalog", status.storage.replay_layout);
     try std.testing.expectEqualStrings("__antfly_lite", status.storage.index_namespace.?);
-    try std.testing.expectEqual(@as(?u32, 1), status.storage.format_version);
+    try std.testing.expectEqual(@as(?u32, support.lite.native.format_version), status.storage.format_version);
     try std.testing.expectEqual(@as(?u32, 4096), status.storage.page_size);
     try std.testing.expect(status.storage.active_checkpoint != null);
     try std.testing.expectEqual(@as(u64, 1), status.stats.doc_count);
-    try std.testing.expect(!status.pending_work.has_async_indexes);
+    // Every fresh Lite database now has the default full-text index, which
+    // registers a persistent derived-executor worker for the life of the DB
+    // -- `has_async_indexes` reports that a worker exists, not that work is
+    // currently pending, so this is true even once idle.
+    try std.testing.expect(status.pending_work.has_async_indexes);
     try std.testing.expect(status.capabilities.text_search);
     try std.testing.expect(status.capabilities.dense_vector_search);
     try std.testing.expect(status.capabilities.sparse_vector_search);
@@ -813,6 +829,10 @@ test "embedded db openLite persists schema json in aflite file" {
         defer db.close();
 
         try db.setSchemaJson(alloc, schema_json);
+        // Let the default full-text index's own background provisioning
+        // settle before vacuuming; otherwise the vacuum's exclusive writer
+        // reservation can race that still-in-flight catalog work.
+        try db.runUntilIdle();
         _ = try db.vacuumLite();
     }
 
@@ -903,10 +923,23 @@ test "embedded db openLite persists index and enrichment catalogs in aflite file
 
         const indexes = try reopened.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, indexes);
-        try std.testing.expectEqual(@as(usize, 1), indexes.len);
-        try std.testing.expectEqualStrings("ft_body", indexes[0].name);
-        try std.testing.expectEqual(types.IndexKind.full_text, indexes[0].kind);
-        try std.testing.expectEqualStrings("{\"chunk_name\":\"body_chunks_v1\"}", indexes[0].config_json);
+        // createLite also provisions the default full-text index, so a
+        // freshly created Lite database always carries it alongside
+        // whatever the caller explicitly adds.
+        try std.testing.expectEqual(@as(usize, 2), indexes.len);
+        var found_ft_body = false;
+        var found_default = false;
+        for (indexes) |index| {
+            if (std.mem.eql(u8, index.name, "ft_body")) {
+                found_ft_body = true;
+                try std.testing.expectEqual(types.IndexKind.full_text, index.kind);
+                try std.testing.expectEqualStrings("{\"chunk_name\":\"body_chunks_v1\"}", index.config_json);
+            } else if (std.mem.eql(u8, index.name, support.full_text_index_defaults.default_full_text_index_name)) {
+                found_default = true;
+            }
+        }
+        try std.testing.expect(found_ft_body);
+        try std.testing.expect(found_default);
 
         const enrichments = try reopened.listEnrichments(alloc);
         defer types.freeEnrichmentConfigs(alloc, enrichments);
@@ -916,5 +949,69 @@ test "embedded db openLite persists index and enrichment catalogs in aflite file
         try std.testing.expectEqualStrings("body", enrichments[0].field);
         try std.testing.expectEqual(@as(u32, 128), enrichments[0].chunk_size);
         try std.testing.expectEqual(@as(u32, 16), enrichments[0].chunk_overlap);
+    }
+}
+
+test "embedded db createLite files are openable through the CLI's lite Connection and vice versa" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Created through this native embedded facade, opened through the CLI's
+    // storage/lite/connection.zig Connection: both must agree on the same
+    // deterministic identity namespace and default full-text index, or the
+    // CLI path fails with IdentityNamespaceMismatch (see LITE.md: one file
+    // format, no per-surface variants).
+    {
+        const path = try testLitePath(alloc, tmp, "embedded-created-cli-opened.aflite");
+        defer alloc.free(path);
+
+        {
+            var db = try DB.createLite(alloc, path, .{});
+            defer db.close();
+            try db.batch(.{
+                .writes = &.{.{ .key = "doc:from-embedded", .value = "{\"title\":\"from embedded\"}" }},
+                .sync_level = .write,
+            });
+        }
+
+        var opened = try support.lite.connection.Connection.open(alloc, path, .query_readonly);
+        defer opened.close();
+
+        var result = (try opened.db.lookup(alloc, "doc:from-embedded", .{})) orelse return error.MissingDocument;
+        defer result.deinit(alloc);
+
+        const indexes = try opened.db.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, indexes);
+        try std.testing.expectEqual(@as(usize, 1), indexes.len);
+        try std.testing.expectEqualStrings(support.full_text_index_defaults.default_full_text_index_name, indexes[0].name);
+    }
+
+    // Created through the CLI's Connection, opened through this native
+    // embedded facade.
+    {
+        const path = try testLitePath(alloc, tmp, "cli-created-embedded-opened.aflite");
+        defer alloc.free(path);
+
+        {
+            var created = try support.lite.connection.Connection.create(alloc, path, true);
+            defer created.close();
+            try created.db.batch(.{
+                .writes = &.{.{ .key = "doc:from-cli", .value = "{\"title\":\"from cli\"}" }},
+                .sync_level = .write,
+            });
+        }
+
+        var reopened = try DB.openLite(alloc, path, .{ .open_mode = .query_readonly });
+        defer reopened.close();
+
+        var result = (try reopened.lookup(alloc, "doc:from-cli", .{})) orelse return error.MissingDocument;
+        defer result.deinit(alloc);
+
+        const indexes = try reopened.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, indexes);
+        try std.testing.expectEqual(@as(usize, 1), indexes.len);
+        try std.testing.expectEqualStrings(support.full_text_index_defaults.default_full_text_index_name, indexes[0].name);
     }
 }

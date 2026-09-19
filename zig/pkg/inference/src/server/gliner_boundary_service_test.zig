@@ -15,6 +15,7 @@ const pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
 const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
 const factory = @import("../architectures/session_factory.zig");
 const memory = @import("../runtime/tier/memory.zig");
+const extracting_api = @import("antfly_extracting");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
@@ -257,7 +258,10 @@ test "gliner boundary v2 lightweight model preflight avoids vocabulary and recov
     try std.testing.expectEqual(@as(u64, 1), node.metrics.extraction_v2.outcomes.get(.memory_budget));
     try std.testing.expectEqual(@as(u64, 3), node.metrics.extraction_v2.failure_stages.get(.model));
     try std.testing.expectEqual(@as(u64, 0), node.metrics.extraction_v2.decoded_items.impl.count);
-    try std.testing.expect(!model.runtime_available);
+    // This fabricated small-backbone directory is never a reviewed
+    // production identity, so every dispatch above stayed at the coarse
+    // UNSUPPORTED_EXTRACTION_FEATURE rejection regardless of whether the
+    // family-wide runtime is published; the 400 responses already prove it.
 }
 
 test "gliner boundary v2 pinned small HTTP handler qualification and atomic recovery" {
@@ -279,7 +283,10 @@ test "gliner boundary v2 pinned small HTTP handler qualification and atomic reco
     try verifyFiles(a, directory, pins);
     const case = fixture.value.cases[0];
     try std.testing.expectEqualStrings("mixed_tasks", case.id);
-    try std.testing.expect(!model.runtime_available);
+    // The small backbone has no reviewed production row (only base does),
+    // so the first dispatch below is rejected on the production default and
+    // the rest of this test relies on the explicit test_allow_unqualified_
+    // gliner_boundary override, never on the family-wide runtime flag.
     const raw = try requestBytes(a, name, case.schema, &.{.{ .id = case.id, .content = case.text }});
     defer a.free(raw);
     {
@@ -374,9 +381,490 @@ test "gliner boundary v2 pinned small HTTP handler qualification and atomic reco
         try std.testing.expectEqual(@as(u64, 4), node.metrics.extract_requests.impl.count);
         try std.testing.expectEqual(@as(u64, 2), node.metrics.errors_total.impl.count);
         try std.testing.expect(metrics.phase_visits.get(.teardown) >= 2);
-        try std.testing.expect(!model.runtime_available);
     }
     // Re-hash every consumed artifact after the managed session is destroyed;
     // no successful test may qualify substituted or modified source bytes.
     try verifyFiles(a, directory, pins);
+}
+
+// The documented plain extraction request omits "schema_version"; a boundary
+// model can only execute through the schema_version:2 path, so extractJSON
+// must upgrade a plain request naming a boundary model onto that path
+// (Node.boundaryUpgradeRequestJsonIfNeeded) instead of routing it into the
+// pre-boundary legacy dispatcher, which cannot run this architecture.
+test "gliner boundary v2 upgrades a plain extraction request without schema_version for the pinned base checkpoint" {
+    const requested_directory = platform.env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = if (std.fs.path.isAbsolute(requested_directory))
+        try std.Io.Dir.realPathFileAbsolute(std.testing.io, requested_directory, &path_buffer)
+    else
+        try std.Io.Dir.cwd().realPathFile(std.testing.io, requested_directory, &path_buffer);
+    const directory = path_buffer[0..path_len];
+    const models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath;
+    const name = std.fs.path.basename(directory);
+
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+
+    const plain_body = try std.fmt.allocPrint(a,
+        \\{{"model":"{s}","inputs":[{{"id":"1","content":"The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection."}}],"schema":{{"entities":["component","subsystem","test"],"relations":[{{"type":"depends_on"}},{{"type":"tested_by"}}]}},"options":{{"include_confidence":true,"include_spans":true}}}}
+    , .{name});
+    defer a.free(plain_body);
+    var response = try dispatch(a, &node, plain_body);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const body = response.body orelse return error.MissingResponseBody;
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"entities\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"relations\":[") != null);
+
+    // An already-versioned request for the same model is passed through
+    // unchanged by the upgrade helper and must still succeed identically.
+    const versioned_body = try std.fmt.allocPrint(a,
+        \\{{"schema_version":2,"model":"{s}","inputs":[{{"id":"1","content":"The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection."}}],"schema":{{"entities":["component","subsystem","test"],"relations":[{{"type":"depends_on"}},{{"type":"tested_by"}}]}},"options":{{"include_confidence":true,"include_spans":true}}}}
+    , .{name});
+    defer a.free(versioned_body);
+    var versioned_response = try dispatch(a, &node, versioned_body);
+    defer versioned_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), versioned_response.status.code);
+}
+
+// The in-process worker's provider "extract" operation
+// (host.linkedInferenceInvokeProvider in antfly/src/standalone/inference_host.zig)
+// calls Node.extractDirectWithControl directly, never through extractJSON.
+// It sends a typed extracting_api.Request built from the enrichment runtime's
+// producer_json config (examples/dogfood/index_config.go's
+// knowledgeGraphIndexJSON: {"provider":"antfly","model":...,"schema":
+// {"entities":[...],"relations":[{"type":...}]},"options":{...}}, rendered
+// by zig/lib/extracting without ever setting "schema_version"), so
+// request.schema_version is null. Before the extractJSON-level upgrade was
+// moved into extractWithAdmission (the entry both extractJSON's "structures"
+// operation and extractDirect share), this fell into the pre-boundary
+// legacy dispatch and failed with error.BoundaryExtractionRequiresSchema.
+// This checks the real production model directory directly (not the
+// ANTFLY_GLINER25_BASE_MODEL_DIR override above), matching how an operator
+// would actually have it pulled.
+test "gliner boundary provider extractDirect upgrades a plain request for the qualified base checkpoint" {
+    const home = platform.env.getenv("HOME") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const directory = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino", "gliner2.5-base-v1" });
+    defer a.free(directory);
+    std.Io.Dir.cwd().access(std.testing.io, directory, .{}) catch return error.SkipZigTest;
+    const models_dir = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino" });
+    defer a.free(models_dir);
+
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+
+    const content_json = try std.json.Stringify.valueAlloc(a, "The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection.", .{});
+    defer a.free(content_json);
+    const request = extracting_api.Request{
+        .inputs = &.{.{ .id = "1", .content_json = content_json }},
+        .schema_json =
+        \\{"entities":["component","subsystem","test"],"relations":[{"type":"depends_on"},{"type":"tested_by"}]}
+        ,
+        .options_json =
+        \\{"include_confidence":true,"include_spans":true}
+        ,
+    };
+    try std.testing.expect(request.schema_version == null);
+    var response = try node.extractDirect(a, "gliner2.5-base-v1", request);
+    defer response.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"entities\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.json, "\"relations\":[") != null);
+}
+
+// Slices out the section starting at `heading` and running to the next
+// Markdown heading line or end of file. Mirrors the section boundaries
+// examples/dogfood's docsaf.MarkdownProcessor produces (a new section at
+// every heading), duplicated locally (rather than imported from
+// extractors/gliner_boundary_qualification.zig) to avoid a cross-package
+// test-only dependency from server/ into extractors/.
+fn extractHeadingSection(full: []const u8, heading: []const u8) ![]const u8 {
+    const start = std.mem.indexOf(u8, full, heading) orelse return error.MissingFixtureSection;
+    var end = full.len;
+    var cursor = start + heading.len;
+    while (cursor + 1 < full.len) : (cursor += 1) {
+        if (full[cursor] == '\n' and full[cursor + 1] == '#') {
+            end = cursor;
+            break;
+        }
+    }
+    return full[start..end];
+}
+
+// zig/EXTRACT.md's canonical schema_version 2 envelope (entities with
+// text/label/start/end/score; relations with type, source.entity_index,
+// target.entity_index, score) is produced by extraction_v2.zig's writeSample
+// for EVERY pipeline.Sample regardless of which executor produced it, but
+// the long-document executor builds its Sample through an independent merge
+// path (gliner_boundary_long_executor.zig's mergeAll / long_relations.merge)
+// that could in principle diverge -- e.g. by leaving raw head/tail edges, or
+// by losing entity_index resolution when relation-merge and entity-merge
+// independently deduplicate overlapping window candidates. This exercises
+// that merge path end to end, through the real HTTP handler, on a real
+// design-doc section large enough to require more than one window (the
+// zig/GRAPH.md-documented extraction_relation source parser consumes exactly
+// this shape, via examples/dogfood's knowledgeGraphIndexJSON).
+test "gliner boundary long executor HTTP canonical schema_version 2 shape for a real multi-window document with relations native" {
+    try longExecutorHttpCanonicalShape(false);
+}
+test "gliner boundary long executor HTTP canonical schema_version 2 shape for a real multi-window document with relations Metal" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    try longExecutorHttpCanonicalShape(true);
+}
+fn longExecutorHttpCanonicalShape(metal: bool) !void {
+    const requested_directory = platform.env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = if (std.fs.path.isAbsolute(requested_directory))
+        try std.Io.Dir.realPathFileAbsolute(std.testing.io, requested_directory, &path_buffer)
+    else
+        try std.Io.Dir.cwd().realPathFile(std.testing.io, requested_directory, &path_buffer);
+    const directory = path_buffer[0..path_len];
+    const models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath;
+    const name = std.fs.path.basename(directory);
+
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        // Metal is a process-required backend (backends.zig's
+        // requiresProcessIsolation); ModelManager refuses to close/reopen
+        // such a session unless the harness opts in here (mirrors
+        // gliner_boundary_metal_socket_test.zig's Node.init config).
+        .process_termination_available = true,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    if (!metal) useNativeBackend(&node) else {
+        node.session_manager.preferred_backends = &.{.metal};
+        node.session_manager.required_backend = .metal;
+        node.model_manager.session_manager.preferred_backends = &.{.metal};
+        node.model_manager.session_manager.required_backend = .metal;
+    }
+    try node.attachIo(std.testing.io);
+
+    // Path relative to the inference-test binary's working directory
+    // (zig/pkg/inference, per zig/TESTING.md's build steps).
+    const full = try @import("../util/c_file.zig").readFile(a, "../../VOPR.md");
+    defer a.free(full);
+    const section = try extractHeadingSection(full, "### Completion-Claim Audit");
+
+    const schema_source =
+        \\{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}
+    ;
+    var parsed_schema = try std.json.parseFromSlice(Value, a, schema_source, .{});
+    defer parsed_schema.deinit();
+    const body = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = name,
+        .schema = parsed_schema.value,
+        .options = .{ .include_confidence = true, .include_spans = true, .long_document = .{ .mode = "window" } },
+        .inputs = &.{.{ .id = "1", .content = section }},
+    }, .{});
+    defer a.free(body);
+
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    // The 37KB real section plus schema/JSON overhead exceeds the 64KB cap
+    // other tests in this file use for short bodies.
+    ctx.max_request_body_size = 128 * 1024;
+    ctx.application_deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s;
+    var response = try node.extractJSON(&ctx);
+    defer response.deinit();
+    errdefer std.debug.print("long-document HTTP response: status={d} body={s}\n", .{ response.status.code, response.body orelse "<absent>" });
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(Value, a, response.body orelse return error.MissingResponseBody, .{});
+    defer parsed.deinit();
+    const output = parsed.value.object.get("data").?.array.items[0].object;
+
+    // Confirms the request actually took the long-document windowed path
+    // (rather than silently fitting in one window), so this is real evidence
+    // for the merge codepath, not just the single-window shape already
+    // covered elsewhere.
+    const window_count = output.get("long_document").?.object.get("window_count").?.integer;
+    try std.testing.expect(window_count >= 2);
+
+    const entities = output.get("entities").?.array.items;
+    try std.testing.expect(entities.len > 0);
+    for (entities) |raw_entity| {
+        const entity = raw_entity.object;
+        try std.testing.expect(entity.contains("label"));
+        try std.testing.expect(entity.contains("text"));
+        try std.testing.expect(entity.contains("start"));
+        try std.testing.expect(entity.contains("end"));
+        try std.testing.expect(entity.contains("score"));
+        try std.testing.expect(!entity.contains("head"));
+        try std.testing.expect(!entity.contains("tail"));
+    }
+    if (output.get("relations")) |raw_relations| {
+        for (raw_relations.array.items) |raw_relation| {
+            const relation = raw_relation.object;
+            try std.testing.expect(relation.contains("type"));
+            try std.testing.expect(relation.contains("source"));
+            try std.testing.expect(relation.contains("target"));
+            try std.testing.expect(!relation.contains("head"));
+            try std.testing.expect(!relation.contains("tail"));
+            inline for (.{ "source", "target" }) |key| {
+                const endpoint = relation.get(key).?.object;
+                try std.testing.expect(endpoint.contains("text"));
+                if (endpoint.get("entity_index")) |index| {
+                    try std.testing.expect(index.integer >= 0 and index.integer < @as(i64, @intCast(entities.len)));
+                    try std.testing.expect(endpoint.contains("label"));
+                }
+            }
+        }
+    }
+}
+
+// Deterministic companion to the multi-window HTTP test above, through the
+// provider entry point instead (Node.extractDirect, as the in-process worker
+// calls it): the short repro text is already known (GLINER25.md's "End to
+// end" evidence) to reliably produce a "tested_by" relation from this exact
+// checkpoint, so this can assert the canonical shape strictly rather than
+// only when a relation happens to be present.
+test "gliner boundary long executor provider extractDirect canonical schema_version 2 relations shape for a windowed request native" {
+    try longExecutorProviderCanonicalShape(false);
+}
+test "gliner boundary long executor provider extractDirect canonical schema_version 2 relations shape for a windowed request Metal" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    try longExecutorProviderCanonicalShape(true);
+}
+fn longExecutorProviderCanonicalShape(metal: bool) !void {
+    const home = platform.env.getenv("HOME") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const directory = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino", "gliner2.5-base-v1" });
+    defer a.free(directory);
+    std.Io.Dir.cwd().access(std.testing.io, directory, .{}) catch return error.SkipZigTest;
+    const models_dir = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino" });
+    defer a.free(models_dir);
+
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .process_termination_available = true,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    if (!metal) useNativeBackend(&node) else {
+        node.session_manager.preferred_backends = &.{.metal};
+        node.session_manager.required_backend = .metal;
+        node.model_manager.session_manager.preferred_backends = &.{.metal};
+        node.model_manager.session_manager.required_backend = .metal;
+    }
+    try node.attachIo(std.testing.io);
+
+    // Uses examples/dogfood's real 11-entity/6-relation production schema
+    // (not the narrower 3-entity repro schema from GLINER25.md's earlier
+    // single-window evidence): the qualified long-document row's measured
+    // padded_sequence_tokens floor (106) was measured against this wider
+    // schema, which encodes more schema prefix tokens per document than the
+    // narrower one -- a request in the narrower schema's shape would
+    // correctly fail closed here as ungeasured geometry for this row.
+    const content_json = try std.json.Stringify.valueAlloc(a, "The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection.", .{});
+    defer a.free(content_json);
+    const request = extracting_api.Request{
+        .schema_version = 2,
+        .inputs = &.{.{ .id = "1", .content_json = content_json }},
+        .schema_json =
+        \\{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}
+        ,
+        .options_json =
+        \\{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}}
+        ,
+    };
+    var response = try node.extractDirect(a, "gliner2.5-base-v1", request);
+    defer response.deinit();
+    errdefer std.debug.print("long-document provider response: {s}\n", .{response.json});
+    var parsed = try std.json.parseFromSlice(Value, a, response.json, .{});
+    defer parsed.deinit();
+    const output = parsed.value.object.get("data").?.array.items[0].object;
+    try std.testing.expect(output.get("long_document") != null);
+    const entities = output.get("entities").?.array.items;
+    try std.testing.expect(entities.len > 0);
+    for (entities) |raw_entity| {
+        const entity = raw_entity.object;
+        try std.testing.expect(entity.contains("label"));
+        try std.testing.expect(entity.contains("text"));
+        try std.testing.expect(entity.contains("start"));
+        try std.testing.expect(entity.contains("end"));
+        try std.testing.expect(entity.contains("score"));
+    }
+    if (output.get("relations")) |raw_relations| {
+        for (raw_relations.array.items) |raw_relation| {
+            const relation = raw_relation.object;
+            try std.testing.expect(relation.contains("type"));
+            try std.testing.expect(!relation.contains("head"));
+            try std.testing.expect(!relation.contains("tail"));
+            inline for (.{ "source", "target" }) |key| {
+                const endpoint = relation.get(key).?.object;
+                try std.testing.expect(endpoint.contains("text"));
+                if (endpoint.get("entity_index")) |index| {
+                    try std.testing.expect(index.integer >= 0 and index.integer < @as(i64, @intCast(entities.len)));
+                }
+            }
+        }
+    }
+}
+
+// Corpus-maximum-scale companion to the two windowed tests above: zig/PDF.md's
+// "Review findings and required fixes" is the largest single section
+// examples/dogfood's real docsaf.MarkdownProcessor splitting currently
+// produces across the whole ingest corpus (measured directly in
+// extractors/gliner_boundary_qualification.zig's long-document geometry
+// test: ~92KB body, 15 windows at the wire's 1024-word default), so this
+// exercises the merge path at real production scale through both entries a
+// caller can reach it from -- the HTTP handler and the in-process provider
+// entry (Node.extractDirect, as examples/dogfood's embedded worker calls
+// it) -- rather than only the ~37KB section the tests above already cover.
+test "gliner boundary long executor HTTP canonical schema_version 2 shape for the corpus-maximum real section" {
+    const a = std.testing.allocator;
+    const requested_directory = platform.env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = if (std.fs.path.isAbsolute(requested_directory))
+        try std.Io.Dir.realPathFileAbsolute(std.testing.io, requested_directory, &path_buffer)
+    else
+        try std.Io.Dir.cwd().realPathFile(std.testing.io, requested_directory, &path_buffer);
+    const directory = path_buffer[0..path_len];
+    const models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath;
+    const name = std.fs.path.basename(directory);
+
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    useNativeBackend(&node);
+    try node.attachIo(std.testing.io);
+
+    // Path relative to the inference-test binary's working directory
+    // (zig/pkg/inference, per zig/TESTING.md's build steps).
+    const full = try @import("../util/c_file.zig").readFile(a, "../../PDF.md");
+    defer a.free(full);
+    const section = try extractHeadingSection(full, "## Review findings and required fixes");
+    try std.testing.expect(section.len > 90000);
+
+    const schema_source =
+        \\{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}
+    ;
+    var parsed_schema = try std.json.parseFromSlice(Value, a, schema_source, .{});
+    defer parsed_schema.deinit();
+    const body = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = name,
+        .schema = parsed_schema.value,
+        .options = .{ .include_confidence = true, .include_spans = true, .long_document = .{ .mode = "window" } },
+        .inputs = &.{.{ .id = "1", .content = section }},
+    }, .{});
+    defer a.free(body);
+
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    ctx.max_request_body_size = 128 * 1024;
+    ctx.application_deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s;
+    var response = try node.extractJSON(&ctx);
+    defer response.deinit();
+    errdefer std.debug.print("corpus-maximum HTTP response: status={d} body={s}\n", .{ response.status.code, response.body orelse "<absent>" });
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(Value, a, response.body orelse return error.MissingResponseBody, .{});
+    defer parsed.deinit();
+    const output = parsed.value.object.get("data").?.array.items[0].object;
+
+    // Confirms this really took the multi-window merge path at close to the
+    // qualified window_count ceiling, not a coincidentally-small window count.
+    const window_count = output.get("long_document").?.object.get("window_count").?.integer;
+    try std.testing.expect(window_count >= 10);
+
+    const entities = output.get("entities").?.array.items;
+    try std.testing.expect(entities.len > 0);
+    for (entities) |raw_entity| {
+        const entity = raw_entity.object;
+        try std.testing.expect(entity.contains("label"));
+        try std.testing.expect(entity.contains("text"));
+        try std.testing.expect(entity.contains("start"));
+        try std.testing.expect(entity.contains("end"));
+        try std.testing.expect(entity.contains("score"));
+    }
+    const relations = output.get("relations").?.array.items;
+    try std.testing.expect(relations.len > 0);
+    for (relations) |raw_relation| {
+        const relation = raw_relation.object;
+        try std.testing.expect(relation.contains("type"));
+        try std.testing.expect(relation.contains("source"));
+        try std.testing.expect(relation.contains("target"));
+        try std.testing.expect(!relation.contains("head"));
+        try std.testing.expect(!relation.contains("tail"));
+    }
+}
+
+test "gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-maximum real section" {
+    const a = std.testing.allocator;
+    const home = platform.env.getenv("HOME") orelse return error.SkipZigTest;
+    const directory = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino", "gliner2.5-base-v1" });
+    defer a.free(directory);
+    std.Io.Dir.cwd().access(std.testing.io, directory, .{}) catch return error.SkipZigTest;
+    const models_dir = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino" });
+    defer a.free(models_dir);
+
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    useNativeBackend(&node);
+    try node.attachIo(std.testing.io);
+
+    const full = try @import("../util/c_file.zig").readFile(a, "../../PDF.md");
+    defer a.free(full);
+    const section = try extractHeadingSection(full, "## Review findings and required fixes");
+    try std.testing.expect(section.len > 90000);
+    const content_json = try std.json.Stringify.valueAlloc(a, section, .{});
+    defer a.free(content_json);
+
+    const request = extracting_api.Request{
+        .schema_version = 2,
+        .inputs = &.{.{ .id = "1", .content_json = content_json }},
+        .schema_json =
+        \\{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}
+        ,
+        .options_json =
+        \\{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}}
+        ,
+    };
+    var response = try node.extractDirect(a, "gliner2.5-base-v1", request);
+    defer response.deinit();
+    errdefer std.debug.print("corpus-maximum provider response: {s}\n", .{response.json});
+    var parsed = try std.json.parseFromSlice(Value, a, response.json, .{});
+    defer parsed.deinit();
+    const output = parsed.value.object.get("data").?.array.items[0].object;
+    const window_count = output.get("long_document").?.object.get("window_count").?.integer;
+    try std.testing.expect(window_count >= 10);
+    const entities = output.get("entities").?.array.items;
+    try std.testing.expect(entities.len > 0);
+    const relations = output.get("relations").?.array.items;
+    try std.testing.expect(relations.len > 0);
 }

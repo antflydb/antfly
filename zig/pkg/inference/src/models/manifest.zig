@@ -487,9 +487,20 @@ pub const ModelManifest = struct {
     /// Coarse V2 load-candidate check ONLY. A true result is not advertisement
     /// or execution permission; the managed session still requires the exact
     /// closed policy and complete prepared request geometry after loading.
+    /// It additionally consults only the cheap, already-parsed backbone and
+    /// precision (never the weight or sidecar digests, which would require
+    /// reading the artifact) so an obviously unreviewed backbone/precision
+    /// combination -- e.g. small or multi while only base is reviewed --
+    /// still fails fast here instead of reaching a real (and much noisier)
+    /// model-load failure. A matching backbone/precision is still only a
+    /// load candidate: hasQualifiedIdentity (pull-time) and require() (every
+    /// request) independently gate the exact weight/sidecar bytes.
     pub fn mayLoadQualifiedGlinerBoundaryRuntime(self: *const ModelManifest) bool {
         const boundary = self.gliner_architecture == .boundary or std.mem.eql(u8, self.gliner_model_type, gliner_boundary.model_type);
-        return boundary and gliner_boundary.runtime_available and gliner_qualification.hasPublishedProfiles();
+        if (!boundary or !gliner_boundary.runtime_available or !gliner_qualification.hasPublishedProfiles()) return false;
+        const config = self.gliner_boundary_config orelse return false;
+        const precision = if (self.gliner_boundary_bundle) |receipt| receipt.value.precision else .fp32;
+        return gliner_qualification.hasQualifiedBackbonePrecision(config.backbone, precision);
     }
 
     pub fn requireSupportedGlinerRuntime(self: *const ModelManifest) !void {
@@ -6953,11 +6964,34 @@ test "boundary qualification listings cannot substitute for consumed identity an
     var tasks = [_][]const u8{"extract"};
     var caps = [_][]const u8{ "extraction", "classification", "relations" };
     var manifest = ModelManifest{ .allocator = std.testing.allocator, .tasks = &tasks, .capabilities = &caps, .gliner_architecture = .boundary };
+    // hasSupportedGlinerRuntime/hasTask/hasCapability/requireSupportedGlinerRuntime
+    // never inherit qualification from the family-wide flag, even after a
+    // real production row is reviewed and published: a bare listing built
+    // from a manifest's own declared strings has no consumed content
+    // identity to check against that row, so it must stay closed. Pull-time
+    // manifest synthesis (registry.zig) is the one place permitted to
+    // advertise a boundary task, and only after independently hashing the
+    // actual downloaded artifact and matching it against a production row.
     try std.testing.expect(!manifest.hasSupportedGlinerRuntime());
     try std.testing.expect(!manifest.hasTask("extract"));
     for (caps) |cap| try std.testing.expect(!manifest.hasCapability(cap));
-    try std.testing.expect(!manifest.mayLoadQualifiedGlinerBoundaryRuntime());
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, manifest.requireSupportedGlinerRuntime());
+    // mayLoadQualifiedGlinerBoundaryRuntime is a coarse load-CANDIDATE check
+    // only (server.zig's pre-load gate before the real per-request
+    // Gate.init/require() runs against the live session's exact consumed
+    // bytes). It still cannot substitute for even the cheap, already-parsed
+    // backbone/precision: with no gliner_boundary_config at all, it stays
+    // false even though a reviewed row is published.
+    try std.testing.expect(!manifest.mayLoadQualifiedGlinerBoundaryRuntime());
+    // An unreviewed backbone (small; only base is reviewed) still fails
+    // fast without reading any weight bytes.
+    manifest.gliner_boundary_config = .{ .version = gliner_boundary.config_version, .architecture_version = gliner_boundary.architecture_version, .max_len = 4096, .backbone = .small, .head = .{}, .encoder = undefined };
+    try std.testing.expect(!manifest.mayLoadQualifiedGlinerBoundaryRuntime());
+    // The reviewed backbone/precision is a load candidate -- still not
+    // advertisement or an execution permit; require() independently checks
+    // the exact weight/sidecar bytes once a session actually loads.
+    manifest.gliner_boundary_config.?.backbone = .base;
+    try std.testing.expect(manifest.mayLoadQualifiedGlinerBoundaryRuntime());
     manifest.gliner_architecture = .span;
     try std.testing.expect(manifest.hasSupportedGlinerRuntime());
     try std.testing.expect(manifest.hasTask("extract"));

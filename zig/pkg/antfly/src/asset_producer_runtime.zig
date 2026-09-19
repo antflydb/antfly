@@ -1667,7 +1667,18 @@ pub const Runtime = struct {
 
         const extract_request = extracting.Request{
             .inputs = inputs,
-            .schema_version = cfg.schema_version,
+            // `extracting.Request.schema_version` is `?u32`; leaving this an
+            // implicit-default `cfg.schema_version` (always a concrete `u32`,
+            // never itself null) would silently wrap it into `Some(1)`,
+            // erasing exactly the explicit-vs-defaulted distinction
+            // `schema_version_explicit` exists to preserve. `extract()`'s
+            // HTTP transport (`HttpExtractorState.extract` in
+            // lib/extracting/src/mod.zig) reads this same field back via
+            // `req.schema_version orelse ...` to decide whether to enforce
+            // the response's schema_version -- an always-concrete `Some(1)`
+            // here would make that check fire unconditionally regardless of
+            // whether the caller ever asked for v1, defeating the fix there.
+            .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null,
             .schema_json = cfg.schema_json,
             .options_json = cfg.options_json,
             .attachments = attachments,
@@ -1709,7 +1720,12 @@ pub const Runtime = struct {
         return try extractionResultsJsonAllocExpected(alloc, response.json, .{
             .model = cfg.model,
             .item_count = input_ids.len,
-            .schema_version = cfg.schema_version,
+            // See the single-item extract() call site's comment: only pin
+            // the response to a specific schema_version when the caller's
+            // config asked for one explicitly, so a boundary model's
+            // provider-side auto-upgrade to v2 is not rejected as a mismatch
+            // when nothing pinned the request to v1.
+            .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null,
             .max_response_bytes = extract_request.max_response_bytes,
         }, input_ids, output_ids);
     }
@@ -2903,7 +2919,18 @@ pub const Runtime = struct {
         };
         const extract_request = extracting.Request{
             .inputs = &.{input},
-            .schema_version = cfg.schema_version,
+            // `extracting.Request.schema_version` is `?u32`; leaving this an
+            // implicit-default `cfg.schema_version` (always a concrete `u32`,
+            // never itself null) would silently wrap it into `Some(1)`,
+            // erasing exactly the explicit-vs-defaulted distinction
+            // `schema_version_explicit` exists to preserve. `extract()`'s
+            // HTTP transport (`HttpExtractorState.extract` in
+            // lib/extracting/src/mod.zig) reads this same field back via
+            // `req.schema_version orelse ...` to decide whether to enforce
+            // the response's schema_version -- an always-concrete `Some(1)`
+            // here would make that check fire unconditionally regardless of
+            // whether the caller ever asked for v1, defeating the fix there.
+            .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null,
             .schema_json = cfg.schema_json,
             .options_json = cfg.options_json,
             .attachments = attachments,
@@ -2946,7 +2973,25 @@ pub const Runtime = struct {
         return try extractionResultJsonAlloc(alloc, response.json, .{
             .model = cfg.model,
             .item_count = 1,
-            .schema_version = cfg.schema_version,
+            // Only pin the response to a specific schema_version when the
+            // producer config asked for one explicitly. A boundary-
+            // architecture model (fastino/gliner2.5-base-v1) auto-upgrades a
+            // plain, schema-version-less wire request to v2 on the provider
+            // side (see zig/pkg/inference's extractWithAdmission); a caller
+            // that left schema_version unset -- as
+            // examples/dogfood/index_config.go's knowledgeGraphIndexJSON and
+            // GRAPH.md's shorthand extractor config both do -- has no basis
+            // to reject that upgraded response as a schema_version mismatch.
+            // parseExtractionResponse still derives the actual `v2` parsing
+            // flag from the response body itself, independent of this
+            // expectation, so relations/entities validate correctly either
+            // way; this only controls whether an unrequested upgrade is
+            // treated as an error. Previously every extraction call against
+            // such a model failed downstream with InvalidExtractorResponse
+            // (logged as "enrichment request failed ... InvalidExtractorResponse"),
+            // silently producing zero relations/edges for graph indexes fed
+            // by the extractor asset producer.
+            .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null,
             .max_response_bytes = extract_request.max_response_bytes,
         }, input.id, !(isJsonContentType(request.content_type) or request.content_type.len == 0));
     }
@@ -4765,7 +4810,24 @@ fn extractionResultsJsonAllocExpected(
         const index = expected_by_id.get(id_value.string) orelse return error.InvalidExtractorResponse;
         if (seen[index]) return error.InvalidExtractorResponse;
         if (output_ids[index].len > 0) {
-            try item.object.put(alloc, "id", .{ .string = output_ids[index] });
+            // `item.object` is a `std.json.Value.Object` (ArrayHashMapUnmanaged)
+            // built by `parseExtractionResponse`'s `std.json.parseFromSlice`
+            // using `raw.arena.allocator()` (see std/json/static.zig's
+            // `Parsed(T)`: parsed values are always leaked into the arena,
+            // never the base allocator passed to `parseFromSlice`). Growing
+            // the map with a *different* allocator -- `alloc` here, which for
+            // a real caller is `std.heap.c_allocator` and in tests is
+            // `std.testing.allocator` -- frees the old backing storage
+            // through an allocator that never allocated it the moment `put`
+            // needs to grow capacity: a canary-detected "Invalid free" panic
+            // under the testing allocator, and silent heap corruption under
+            // `c_allocator` in production, which manifested as extraction
+            // batch responses failing validation
+            // (`error.InvalidExtractorResponse`) as soon as a multi-document
+            // batch's response items grew a JSON object past its initial
+            // parsed capacity -- exactly what a real GLiNER2.5 boundary
+            // response's richer per-relation fields do.
+            try item.object.put(raw.arena.allocator(), "id", .{ .string = output_ids[index] });
         } else {
             _ = item.object.orderedRemove("id");
         }
@@ -4974,6 +5036,117 @@ test "asset producer runtime single extractor response preserves legacy optional
     try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, named, expected, "wire-2", false));
     try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, expected, "wire-1", false));
     try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, .{ .model = "m", .item_count = 1, .schema_version = 2 }, null, false));
+}
+
+// A boundary-architecture model (fastino/gliner2.5-base-v1; see GLINER25.md
+// and zig/pkg/inference's extractWithAdmission) auto-upgrades a plain,
+// schema-version-less wire request to a schema_version=2 response. A
+// producer config that never asked for a specific schema_version -- as
+// examples/dogfood/index_config.go's knowledgeGraphIndexJSON and GRAPH.md's
+// shorthand extractor config both do -- has no basis to reject that upgrade
+// as a mismatch: before Config.schema_version_explicit existed, `extract()`
+// (asset_producer_runtime.zig) pinned `expected.schema_version` to
+// `cfg.schema_version`'s implicit-default value of 1 regardless of whether
+// the caller actually requested it, so every such response failed
+// parseResponse's strict equality check with InvalidExtractorResponse --
+// logged only as a warning by the enrichment runtime, so the extraction call
+// itself was reported as having "succeeded" while silently producing zero
+// relations/entities and therefore zero graph edges for any index whose
+// extractor asset producer omits schema_version. This test exercises the
+// same derivation `extract()` and its batch counterpart now use directly
+// against `extracting.parseConfigFromSlice`, so a regression in either call
+// site's `if (cfg.schema_version_explicit) cfg.schema_version else null`
+// expression would be caught here even though it lives past this file's own
+// unit-test boundary.
+test "asset producer runtime accepts an unrequested boundary-model schema_version upgrade" {
+    const a = std.testing.allocator;
+    const response = "{\"object\":\"extraction\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema_version\":2,\"data\":[{\"entities\":[{\"label\":\"component\",\"text\":\"VOPR\",\"start\":0,\"end\":4}],\"relations\":[{\"type\":\"depends_on\",\"source\":{\"entity_index\":0},\"target\":{\"text\":\"antfly-core\",\"start\":10,\"end\":21}}]}]}";
+
+    // Config JSON with no "schema_version" field, matching dogfood's real
+    // producer config shape exactly (examples/dogfood/index_config.go's
+    // knowledgeGraphIndexJSON never sets one).
+    var implicit_cfg = try extracting.parseConfigFromSlice(
+        a,
+        "{\"provider\":\"antfly\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema\":{\"entities\":[\"component\"],\"relations\":[{\"type\":\"depends_on\"}]}}",
+    );
+    defer implicit_cfg.deinit(a);
+    try std.testing.expect(!implicit_cfg.schema_version_explicit);
+    try std.testing.expectEqual(@as(u32, 1), implicit_cfg.schema_version);
+
+    const accepted = try extractionResultJsonAlloc(a, response, .{
+        .model = implicit_cfg.model,
+        .item_count = 1,
+        .schema_version = if (implicit_cfg.schema_version_explicit) implicit_cfg.schema_version else null,
+    }, null, false);
+    defer a.free(accepted);
+    try std.testing.expect(std.mem.indexOf(u8, accepted, "\"depends_on\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted, "\"antfly-core\"") != null);
+
+    // An explicit v1 request must still reject an upgraded v2 response: the
+    // caller pinned a version this time, so serving a different one is a
+    // real mismatch, not a sanctioned upgrade.
+    var explicit_cfg = try extracting.parseConfigFromSlice(
+        a,
+        "{\"provider\":\"antfly\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema_version\":1,\"schema\":{\"entities\":[\"component\"],\"relations\":[{\"type\":\"depends_on\"}]}}",
+    );
+    defer explicit_cfg.deinit(a);
+    try std.testing.expect(explicit_cfg.schema_version_explicit);
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, response, .{
+        .model = explicit_cfg.model,
+        .item_count = 1,
+        .schema_version = if (explicit_cfg.schema_version_explicit) explicit_cfg.schema_version else null,
+    }, null, false));
+}
+
+// Batch-path counterpart of the previous test: Lite's graph-fed extractor
+// asset producer runs multiple documents through
+// `extractionResultsJsonAllocExpected` (the "extract_batches=1
+// extract_items=2" runUntilIdle summary line), not the single-item
+// `extractionResultJsonAlloc` path, whenever more than one document changes
+// in the same replay pass -- exactly what
+// TestLiteNativeGraphEdgesFromExtractionArtifactBoundaryV2
+// (go/pkg/antflylite/lite_cgo_test.go) exercises with its two documents.
+test "asset producer runtime batch path accepts an unrequested boundary-model schema_version upgrade" {
+    const a = std.testing.allocator;
+    const item_shape =
+        "\"entities\":[{\"label\":\"component\",\"text\":\"VOPR\",\"start\":0,\"end\":4,\"score\":0.95}," ++
+        "{\"label\":\"component\",\"text\":\"antfly-core\",\"start\":10,\"end\":21,\"score\":0.9}]," ++
+        "\"relations\":[{\"type\":\"depends_on\"," ++
+        "\"source\":{\"entity_index\":0,\"label\":\"component\",\"text\":\"VOPR\",\"start\":0,\"end\":4,\"score\":0.95}," ++
+        "\"target\":{\"entity_index\":1,\"label\":\"component\",\"text\":\"antfly-core\",\"start\":10,\"end\":21,\"score\":0.9}," ++
+        "\"score\":0.88,\"derived\":false}]," ++
+        "\"long_document\":{\"version\":1,\"window_count\":2,\"window_policy\":\"source_words_midpoint_ownership\"," ++
+        "\"classification_aggregation\":\"owned_word_weighted_mean_raw_logits\"," ++
+        "\"duplicate_score\":\"maximum_calibrated_score\",\"natural_record_identity\":\"exact_source_anchor\"," ++
+        "\"other_record_identity\":\"occurrence\",\"solver_optimality_scope\":\"retained_candidate_graph\"}";
+    const response = "{\"object\":\"extraction\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema_version\":2,\"data\":[" ++
+        "{\"id\":\"antfly-batch-item-0\"," ++ item_shape ++ "}," ++
+        "{\"id\":\"antfly-batch-item-1\"," ++ item_shape ++ "}" ++
+        "]}";
+
+    var implicit_cfg = try extracting.parseConfigFromSlice(
+        a,
+        "{\"provider\":\"antfly\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema\":{\"entities\":[\"component\"],\"relations\":[{\"type\":\"depends_on\"}]}}",
+    );
+    defer implicit_cfg.deinit(a);
+    try std.testing.expect(!implicit_cfg.schema_version_explicit);
+
+    const wire_ids = [_][]const u8{ "antfly-batch-item-0", "antfly-batch-item-1" };
+    const output_ids = [_][]const u8{ "doc:vopr-design", "doc:vopr-tests" };
+    const results = try extractionResultsJsonAllocExpected(a, response, .{
+        .model = implicit_cfg.model,
+        .item_count = wire_ids.len,
+        .schema_version = if (implicit_cfg.schema_version_explicit) implicit_cfg.schema_version else null,
+    }, &wire_ids, &output_ids);
+    defer {
+        for (results) |item| a.free(item);
+        a.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    for (results) |item| {
+        try std.testing.expect(std.mem.indexOf(u8, item, "\"depends_on\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, item, "\"antfly-core\"") != null);
+    }
 }
 
 fn antflyGenerateBatchUrlAlloc(alloc: Allocator, base_url: []const u8) ![]u8 {

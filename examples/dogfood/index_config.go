@@ -109,54 +109,68 @@ func fullTextIndexJSON() ([]byte, error) {
 	return addIndexEnvelope(fullTextIndexName, "full_text", config)
 }
 
-// chunkVectorsIndexJSON returns the dense_vector index that embeds fixed-size
-// chunks of each section's body with Qwen3.
-//
-// The raw Lite dense_vector config uses its own low-level field names, which
-// differ from the public EmbeddingsIndexConfig OpenAPI schema: "dims" (not
-// "dimension") and "metric" (not "distance_metric"). These were confirmed
-// empirically against a real libantfly build (antfly_db_add_index_json
-// accepts them; the OpenAPI-named equivalents return a generic internal
-// error).
-//
-// dogfood originally tried the artifact-indirection pattern the coordinator
-// asked for -- an inline "enrichments" chunk producer (doc_chunks_v1) plus a
-// "sources": [{"artifact": "doc_chunks_v1"}] on the dense_vector index, mirroring
-// go/pkg/docsaf/cmd/docsaf's document_vectors index. That shape parses cleanly
-// (zig/pkg/antfly/src/storage/db/catalog/index_manager.zig's parseDenseConfig
-// unit tests accept the same "sources" shape) but antfly_db_add_index_json
-// fails with a generic ANTFLY_INTERNAL error for every "sources"-based
-// dense_vector config tried against this build, including the two-stage
-// chunk-enrichment + embedding-enrichment form docsaf uses on full Antfly
-// (source_artifact_name pointing an "embedding" kind enrichment at the chunk
-// artifact). This reproduces regardless of field/embedder/enrichment
-// combination, so it looks like artifact-sourced dense_vector indexes are not
-// yet wired up for Lite's native profile rather than a config mistake; see the
-// dogfood README for the full repro.
-//
-// The reliable, empirically-verified alternative is the older inline-chunker
-// form used by examples/epstein/main.go's createEmbeddingIndexConfig: the
-// chunker lives directly on the embeddings index next to the embedder, and
-// Lite chunks each document at write time before embedding every chunk. This
-// still delivers "Qwen3 embeddings over fixed-size chunks" -- it just does not
-// expose the intermediate chunks as a separately queryable artifact.
+// Artifact names for the two-stage chunk pipeline: a chunk enrichment
+// produces chunkArtifact rows from each section body, and an embedding
+// enrichment consumes them into denseArtifact, which chunk_vectors indexes.
+// This is the server's chunk-artifact pattern (go/pkg/docsaf,
+// antfly.NewArtifactEmbeddingIndexConfig), so chunks are a queryable
+// artifact and semantic hits carry hierarchy.parent_doc_key back to the
+// section document.
+const (
+	chunkArtifact = "doc_chunks_v1"
+	denseArtifact = "doc_chunk_dense_v1"
+)
+
+// chunkVectorsIndexJSON returns the artifact-sourced embeddings index over
+// fixed-size chunks of each section body, embedded with Qwen3. Both
+// enrichments travel inline on the index that owns them; Lite registers them
+// in dependency order before admitting the index. With no inference URL the
+// producers run on libantfly's embedded runtime.
 func chunkVectorsIndexJSON(embedModel, inferenceURL string, targetTokens, overlapTokens int) ([]byte, error) {
+	// chunk_size/chunk_overlap on a chunk enrichment are byte counts (the
+	// runtime's fixed byte slicer, storage/db/enrichment/chunker.zig); the
+	// token-aware "fixed" chunker is selected through chunker_json. Keep both
+	// consistent at roughly four bytes per token so a build without the
+	// tokenizer-backed chunker produces comparably sized chunks.
+	const bytesPerToken = 4
+	chunker, err := json.Marshal(withProviderURL(map[string]any{
+		"provider": "antfly",
+		"model":    "fixed",
+		"text": map[string]any{
+			"target_tokens":  targetTokens,
+			"overlap_tokens": overlapTokens,
+		},
+	}, inferenceURL))
+	if err != nil {
+		return nil, fmt.Errorf("marshal chunker config: %w", err)
+	}
+	chunkEnrichment := map[string]any{
+		"name":          chunkArtifact,
+		"kind":          "chunk",
+		"field":         "body",
+		"chunk_size":    targetTokens * bytesPerToken,
+		"chunk_overlap": overlapTokens * bytesPerToken,
+		"chunker_json":  string(chunker),
+	}
 	config := map[string]any{
-		"field":  "body",
-		"dims":   qwen3EmbeddingDims,
-		"metric": "cosine",
+		"type":      "embeddings",
+		"sources":   []map[string]any{{"artifact": denseArtifact}},
+		"dimension": qwen3EmbeddingDims,
 		"embedder": withProviderURL(map[string]any{
 			"provider": "antfly",
 			"model":    embedModel,
 		}, inferenceURL),
-		"chunker": withProviderURL(map[string]any{
-			"provider": "antfly",
-			"model":    "fixed",
-			"text": map[string]any{
-				"target_tokens":  targetTokens,
-				"overlap_tokens": overlapTokens,
+		"distance_metric": "cosine",
+		"enrichments": []map[string]any{
+			chunkEnrichment,
+			{
+				"name":                 denseArtifact,
+				"kind":                 "embedding",
+				"field":                "body",
+				"source_artifact_name": chunkArtifact,
+				"expected_dims":        qwen3EmbeddingDims,
 			},
-		}, inferenceURL),
+		},
 	}
 	return addIndexEnvelope(chunkVectorsIndex, "dense_vector", config)
 }
@@ -184,6 +198,15 @@ func knowledgeGraphIndexJSON(extractModel, inferenceURL string, includeMetrics b
 			"options": map[string]any{
 				"include_confidence": true,
 				"include_spans":      true,
+				// Real design-doc/work-log sections routinely exceed the
+				// qualified single-window LengthContract (see
+				// zig/pkg/inference/models/gliner2/GLINER25.md); request
+				// windowed long-document execution so those sections are
+				// served instead of failing closed with
+				// UnsupportedGlinerBoundaryRuntime/BoundaryTextLimitExceeded.
+				"long_document": map[string]any{
+					"mode": "window",
+				},
 			},
 		}, inferenceURL),
 	}

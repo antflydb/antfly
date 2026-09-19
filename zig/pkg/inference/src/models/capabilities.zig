@@ -31,8 +31,16 @@ pub fn modelSupportsCapability(
     capability: []const u8,
 ) bool {
     // String-only listings do not carry a consumed artifact identity or an
-    // actual backend; even a future family flag/table cannot qualify them.
-    if (std.mem.eql(u8, gliner_model_type, gliner_boundary.model_type)) return false;
+    // actual backend, so while the family has no reviewed production row at
+    // all, withhold every gliner2.5 capability outright regardless of what
+    // strings are passed in. Once a row exists, a declared capability is
+    // trusted here exactly like any other model's: registry.zig's pull-time
+    // boundaryIdentityIsQualified check is the only place that ever writes a
+    // non-empty capabilities list for a specific gliner2.5 artifact, and the
+    // live session still independently re-checks the exact weight/sidecar
+    // identity, backend, feature set, and geometry via
+    // gliner_boundary_qualification.require() before any request executes.
+    if (std.mem.eql(u8, gliner_model_type, gliner_boundary.model_type) and !gliner_boundary.runtime_available) return false;
     if (hasCapability(capabilities, capability)) return true;
     if (std.mem.eql(u8, model_kind, "classifier")) {
         return std.mem.eql(u8, capability, "classification");
@@ -135,13 +143,29 @@ pub fn modelClassCompatibility(man: *const manifest_mod.ModelManifest) Compatibi
     return compatibility_mod.assess(man, man.config_model_arch).level;
 }
 
-test "gliner boundary capabilities wait for an implemented runtime" {
+test "gliner boundary capability trust follows the reviewed family runtime, never model-class dispatch" {
+    // modelClassCompatibility is a separate, still-permanently-closed gate
+    // (ModelManifest.hasSupportedGlinerRuntime never inherits qualification
+    // from the family-wide flag; see its doc comment) from
+    // modelSupportsCapability's declared-capability trust below.
     var boundary = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     boundary.gliner_architecture = .boundary;
     try std.testing.expectEqual(CompatibilityLevel.incompatible, modelClassCompatibility(&boundary));
-    for ([_][]const u8{ "classification", "relations", "extraction", "labels" }) |capability| {
-        try std.testing.expect(!modelSupportsCapability("recognizer", "gliner2.5", &.{capability}, capability));
+
+    try std.testing.expect(gliner_boundary.runtime_available);
+    // A reviewed family trusts a gliner2.5 model's own declared capabilities
+    // exactly like any other model kind's -- registry.zig's pull-time
+    // boundaryIdentityIsQualified check is what limits which specific
+    // artifacts ever get a non-empty capabilities list in the first place.
+    for ([_][]const u8{ "classification", "relations", "extraction" }) |capability| {
+        try std.testing.expect(modelSupportsCapability("recognizer", "gliner2.5", &.{capability}, capability));
     }
+    // An undeclared capability, or an artifact with none declared (the
+    // correct on-disk state for an unqualified digest/variant), is still
+    // denied -- there is no inference bonus for gliner2.5 the way there is
+    // for the legacy "gliner2" span family below.
+    try std.testing.expect(!modelSupportsCapability("recognizer", "gliner2.5", &.{}, "extraction"));
+    try std.testing.expect(!modelSupportsCapability("recognizer", "gliner2.5", &.{"extraction"}, "relations"));
 }
 
 test "clipclap stays compatible while standalone clip and clap do not" {

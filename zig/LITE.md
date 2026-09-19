@@ -137,11 +137,12 @@ antfly lite vacuum app.aflite
 antfly lite serve app.aflite --addr 127.0.0.1:8080 --config production.json
 ```
 
-A Lite database created through the embedding surfaces (the C ABI and the
-native Go/Zig `embedded` package) is provisioned with the default
-`full_text_index_v0` full-text index, matching the server's table-create
-behavior, so `antfly lite index create` is only needed for indexes beyond
-that default.
+A Lite database is provisioned with the default `full_text_index_v0`
+full-text index on creation, matching the server's table-create behavior,
+regardless of which surface creates it -- the CLI (`antfly lite init` /
+`antfly lite create`), the C ABI, and the native Go/Zig `embedded` package all
+share the same creation routine, so `antfly lite index create` is only needed
+for indexes beyond that default.
 
 `antfly lite init` should be non-destructive: it creates a new `.aflite` file
 and rejects an existing database path. Destructive replacement should stay on
@@ -841,8 +842,9 @@ antfly lite serve
 The CLI should accept JSON request files that match the public API contracts.
 This keeps Lite compatible with normal Antfly examples, tests, and SDKs.
 `antfly lite index create` adds indexes beyond the default `full_text_index_v0`
-full-text index that embedding-surface creation already provisions, matching
-the server; it does not need to be run just to make text search work.
+full-text index that every creation surface (CLI, C ABI, and embedded)
+already provisions, matching the server; it does not need to be run just to
+make text search work.
 
 ## Packaging
 
