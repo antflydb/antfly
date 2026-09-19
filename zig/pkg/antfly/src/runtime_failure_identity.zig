@@ -29,6 +29,31 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .local_completion_authority_required, .err = error.LocalCompletionAuthorityRequired },
+    .{ .status = .unsupported_completion_backend, .err = error.UnsupportedCompletionBackend },
+    .{ .status = .unsupported_completion_profile, .err = error.UnsupportedCompletionProfile },
+    .{ .status = .unsupported_completion_slot_version, .err = error.UnsupportedCompletionSlotVersion },
+    .{ .status = .unsupported_completion_template, .err = error.UnsupportedCompletionTemplate },
+    .{ .status = .unsupported_completion_template_nesting, .err = error.UnsupportedCompletionTemplateNesting },
+    .{ .status = .unsupported_completion_template_scan, .err = error.UnsupportedCompletionTemplateScan },
+    .{ .status = .unsupported_completion_template_write, .err = error.UnsupportedCompletionTemplateWrite },
+    .{ .status = .unsupported_completion_operation, .err = error.UnsupportedCompletionOperation },
+    .{ .status = .unsupported_completion_path, .err = error.UnsupportedCompletionPath },
+    .{ .status = .unsupported_completion_provider, .err = error.UnsupportedCompletionProvider },
+    .{ .status = .completion_recovery_capacity_required, .err = error.CompletionRecoveryCapacityRequired },
+    .{ .status = .completion_resource_manager_required, .err = error.CompletionResourceManagerRequired },
+    .{ .status = .completion_profile_changed, .err = error.CompletionProfileChanged },
+    .{ .status = .completion_drain_shape_changed, .err = error.CompletionDrainShapeChanged },
+    .{ .status = .completion_not_prepared, .err = error.CompletionNotPrepared },
+    .{ .status = .invalid_completion_slot, .err = error.InvalidCompletionSlot },
+    .{ .status = .completion_slot_checksum_mismatch, .err = error.CompletionSlotChecksumMismatch },
+    .{ .status = .completion_slot_too_large, .err = error.CompletionSlotTooLarge },
+    .{ .status = .completion_plan_capacity_exceeded, .err = error.CompletionPlanCapacityExceeded },
+    .{ .status = .completion_reservation_busy, .err = error.CompletionReservationBusy },
+    .{ .status = .completion_foreground_capacity_exceeded, .err = error.CompletionForegroundCapacityExceeded },
+    .{ .status = .completion_file_capacity_exceeded, .err = error.CompletionFileCapacityExceeded },
+    .{ .status = .completion_writer_closed, .err = error.CompletionWriterClosed },
+    .{ .status = .completion_writer_live, .err = error.CompletionWriterLive },
     .{ .status = .prepared_completion_active, .err = error.PreparedCompletionActive },
     .{ .status = .completion_transition_in_progress, .err = error.CompletionTransitionInProgress },
     .{ .status = .completion_transition_capacity_exceeded, .err = error.CompletionTransitionCapacityExceeded },
@@ -774,6 +799,18 @@ test "workload admission completion eligibility survives compiled storage failur
         const restored = blk: {
             statusToError(failure.status) catch |err| break :blk err;
             return error.ExpectedEligibilityFailure;
+        };
+        try std.testing.expectEqual(expected, restored);
+    }
+}
+
+test "workload admission native completion startup failures survive storage envelopes" {
+    for ([_]anyerror{ error.LocalCompletionAuthorityRequired, error.UnsupportedCompletionBackend, error.UnsupportedCompletionProfile, error.UnsupportedCompletionSlotVersion, error.UnsupportedCompletionTemplate, error.UnsupportedCompletionTemplateNesting, error.UnsupportedCompletionTemplateScan, error.UnsupportedCompletionTemplateWrite, error.UnsupportedCompletionOperation, error.UnsupportedCompletionPath, error.UnsupportedCompletionProvider, error.CompletionRecoveryCapacityRequired, error.CompletionResourceManagerRequired, error.CompletionProfileChanged, error.CompletionDrainShapeChanged, error.CompletionNotPrepared, error.InvalidCompletionSlot, error.CompletionSlotChecksumMismatch, error.CompletionSlotTooLarge, error.CompletionPlanCapacityExceeded, error.CompletionReservationBusy, error.CompletionForegroundCapacityExceeded, error.CompletionFileCapacityExceeded, error.CompletionWriterClosed, error.CompletionWriterLive }) |expected| {
+        const failure = failureFromError(expected, .local_query, abi.abi_version, 1);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        const restored = blk: {
+            statusToError(failure.status) catch |err| break :blk err;
+            return error.ExpectedCompletionFailure;
         };
         try std.testing.expectEqual(expected, restored);
     }

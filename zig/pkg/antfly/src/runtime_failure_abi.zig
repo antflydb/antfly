@@ -15,7 +15,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 55;
+pub const abi_version: u32 = 56;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -499,6 +499,32 @@ pub const Status = enum(u32) {
     completion_transition_in_progress = 540,
     completion_transition_capacity_exceeded = 541,
     completion_fence_identity_mismatch = 542,
+    // Native durable completion; append-only stable startup diagnostics.
+    local_completion_authority_required = 543,
+    unsupported_completion_backend = 544,
+    unsupported_completion_profile = 545,
+    unsupported_completion_slot_version = 546,
+    unsupported_completion_template = 547,
+    unsupported_completion_template_nesting = 548,
+    unsupported_completion_template_scan = 549,
+    unsupported_completion_template_write = 550,
+    unsupported_completion_operation = 551,
+    unsupported_completion_path = 552,
+    unsupported_completion_provider = 553,
+    completion_recovery_capacity_required = 554,
+    completion_resource_manager_required = 555,
+    completion_profile_changed = 556,
+    completion_drain_shape_changed = 557,
+    completion_not_prepared = 558,
+    invalid_completion_slot = 559,
+    completion_slot_checksum_mismatch = 560,
+    completion_slot_too_large = 561,
+    completion_plan_capacity_exceeded = 562,
+    completion_reservation_busy = 563,
+    completion_foreground_capacity_exceeded = 564,
+    completion_file_capacity_exceeded = 565,
+    completion_writer_closed = 566,
+    completion_writer_live = 567,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

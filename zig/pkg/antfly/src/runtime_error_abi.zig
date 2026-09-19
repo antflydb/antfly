@@ -447,6 +447,32 @@ pub const Detail = enum(c_int) {
     completion_transition_in_progress,
     completion_transition_capacity_exceeded,
     completion_fence_identity_mismatch,
+    // Native durable completion startup and execution failures.
+    local_completion_authority_required,
+    unsupported_completion_backend,
+    unsupported_completion_profile,
+    unsupported_completion_slot_version,
+    unsupported_completion_template,
+    unsupported_completion_template_nesting,
+    unsupported_completion_template_scan,
+    unsupported_completion_template_write,
+    unsupported_completion_operation,
+    unsupported_completion_path,
+    unsupported_completion_provider,
+    completion_recovery_capacity_required,
+    completion_resource_manager_required,
+    completion_profile_changed,
+    completion_drain_shape_changed,
+    completion_not_prepared,
+    invalid_completion_slot,
+    completion_slot_checksum_mismatch,
+    completion_slot_too_large,
+    completion_plan_capacity_exceeded,
+    completion_reservation_busy,
+    completion_foreground_capacity_exceeded,
+    completion_file_capacity_exceeded,
+    completion_writer_closed,
+    completion_writer_live,
 };
 
 pub const Status = extern struct {
@@ -537,6 +563,31 @@ pub fn statusFromError(err: anyerror) Status {
         error.CompletionTransitionInProgress => status(.retryable, .completion_transition_in_progress),
         error.CompletionTransitionCapacityExceeded => status(.retryable, .completion_transition_capacity_exceeded),
         error.CompletionFenceIdentityMismatch => status(.conflict, .completion_fence_identity_mismatch),
+        error.LocalCompletionAuthorityRequired => status(.unsupported, .local_completion_authority_required),
+        error.UnsupportedCompletionBackend => status(.unsupported, .unsupported_completion_backend),
+        error.UnsupportedCompletionProfile => status(.unsupported, .unsupported_completion_profile),
+        error.UnsupportedCompletionSlotVersion => status(.unsupported, .unsupported_completion_slot_version),
+        error.UnsupportedCompletionTemplate => status(.unsupported, .unsupported_completion_template),
+        error.UnsupportedCompletionTemplateNesting => status(.unsupported, .unsupported_completion_template_nesting),
+        error.UnsupportedCompletionTemplateScan => status(.unsupported, .unsupported_completion_template_scan),
+        error.UnsupportedCompletionTemplateWrite => status(.unsupported, .unsupported_completion_template_write),
+        error.UnsupportedCompletionOperation => status(.unsupported, .unsupported_completion_operation),
+        error.UnsupportedCompletionPath => status(.unsupported, .unsupported_completion_path),
+        error.UnsupportedCompletionProvider => status(.unsupported, .unsupported_completion_provider),
+        error.CompletionRecoveryCapacityRequired => status(.unavailable, .completion_recovery_capacity_required),
+        error.CompletionResourceManagerRequired => status(.unavailable, .completion_resource_manager_required),
+        error.CompletionProfileChanged => status(.conflict, .completion_profile_changed),
+        error.CompletionDrainShapeChanged => status(.conflict, .completion_drain_shape_changed),
+        error.CompletionNotPrepared => status(.conflict, .completion_not_prepared),
+        error.InvalidCompletionSlot => status(.corrupt, .invalid_completion_slot),
+        error.CompletionSlotChecksumMismatch => status(.corrupt, .completion_slot_checksum_mismatch),
+        error.CompletionSlotTooLarge => status(.invalid_argument, .completion_slot_too_large),
+        error.CompletionPlanCapacityExceeded => status(.invalid_argument, .completion_plan_capacity_exceeded),
+        error.CompletionReservationBusy => status(.retryable, .completion_reservation_busy),
+        error.CompletionForegroundCapacityExceeded => status(.retryable, .completion_foreground_capacity_exceeded),
+        error.CompletionFileCapacityExceeded => status(.retryable, .completion_file_capacity_exceeded),
+        error.CompletionWriterClosed => status(.internal, .completion_writer_closed),
+        error.CompletionWriterLive => status(.internal, .completion_writer_live),
         error.ExtensionOwnedObject => status(.conflict, .extension_owned_object),
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
@@ -1012,6 +1063,31 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .completion_transition_in_progress => "CompletionTransitionInProgress",
         .completion_transition_capacity_exceeded => "CompletionTransitionCapacityExceeded",
         .completion_fence_identity_mismatch => "CompletionFenceIdentityMismatch",
+        .local_completion_authority_required => "LocalCompletionAuthorityRequired",
+        .unsupported_completion_backend => "UnsupportedCompletionBackend",
+        .unsupported_completion_profile => "UnsupportedCompletionProfile",
+        .unsupported_completion_slot_version => "UnsupportedCompletionSlotVersion",
+        .unsupported_completion_template => "UnsupportedCompletionTemplate",
+        .unsupported_completion_template_nesting => "UnsupportedCompletionTemplateNesting",
+        .unsupported_completion_template_scan => "UnsupportedCompletionTemplateScan",
+        .unsupported_completion_template_write => "UnsupportedCompletionTemplateWrite",
+        .unsupported_completion_operation => "UnsupportedCompletionOperation",
+        .unsupported_completion_path => "UnsupportedCompletionPath",
+        .unsupported_completion_provider => "UnsupportedCompletionProvider",
+        .completion_recovery_capacity_required => "CompletionRecoveryCapacityRequired",
+        .completion_resource_manager_required => "CompletionResourceManagerRequired",
+        .completion_profile_changed => "CompletionProfileChanged",
+        .completion_drain_shape_changed => "CompletionDrainShapeChanged",
+        .completion_not_prepared => "CompletionNotPrepared",
+        .invalid_completion_slot => "InvalidCompletionSlot",
+        .completion_slot_checksum_mismatch => "CompletionSlotChecksumMismatch",
+        .completion_slot_too_large => "CompletionSlotTooLarge",
+        .completion_plan_capacity_exceeded => "CompletionPlanCapacityExceeded",
+        .completion_reservation_busy => "CompletionReservationBusy",
+        .completion_foreground_capacity_exceeded => "CompletionForegroundCapacityExceeded",
+        .completion_file_capacity_exceeded => "CompletionFileCapacityExceeded",
+        .completion_writer_closed => "CompletionWriterClosed",
+        .completion_writer_live => "CompletionWriterLive",
         .extension_owned_object => "ExtensionOwnedObject",
         .restore_intent_conflict => "RestoreIntentConflict",
         .unauthorized => "Unauthorized",
@@ -1488,4 +1564,57 @@ test "workload admission completion eligibility failures preserve exact boundary
     try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionTransitionCapacityExceeded).code);
     try std.testing.expectEqual(error.CompletionFenceIdentityMismatch, errorFromStatus(statusFromError(error.CompletionFenceIdentityMismatch)));
     try std.testing.expectEqual(@intFromEnum(Code.conflict), statusFromError(error.CompletionFenceIdentityMismatch).code);
+}
+
+test "workload admission native completion startup preserves domain failure identities" {
+    try std.testing.expectEqual(error.LocalCompletionAuthorityRequired, errorFromStatus(statusFromError(error.LocalCompletionAuthorityRequired)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.LocalCompletionAuthorityRequired).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionBackend, errorFromStatus(statusFromError(error.UnsupportedCompletionBackend)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionBackend).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionProfile, errorFromStatus(statusFromError(error.UnsupportedCompletionProfile)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionProfile).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionSlotVersion, errorFromStatus(statusFromError(error.UnsupportedCompletionSlotVersion)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionSlotVersion).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionTemplate, errorFromStatus(statusFromError(error.UnsupportedCompletionTemplate)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionTemplate).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionTemplateNesting, errorFromStatus(statusFromError(error.UnsupportedCompletionTemplateNesting)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionTemplateNesting).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionTemplateScan, errorFromStatus(statusFromError(error.UnsupportedCompletionTemplateScan)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionTemplateScan).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionTemplateWrite, errorFromStatus(statusFromError(error.UnsupportedCompletionTemplateWrite)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionTemplateWrite).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionOperation, errorFromStatus(statusFromError(error.UnsupportedCompletionOperation)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionOperation).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionPath, errorFromStatus(statusFromError(error.UnsupportedCompletionPath)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionPath).code);
+    try std.testing.expectEqual(error.UnsupportedCompletionProvider, errorFromStatus(statusFromError(error.UnsupportedCompletionProvider)));
+    try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.UnsupportedCompletionProvider).code);
+    try std.testing.expectEqual(error.CompletionRecoveryCapacityRequired, errorFromStatus(statusFromError(error.CompletionRecoveryCapacityRequired)));
+    try std.testing.expectEqual(@intFromEnum(Code.unavailable), statusFromError(error.CompletionRecoveryCapacityRequired).code);
+    try std.testing.expectEqual(error.CompletionResourceManagerRequired, errorFromStatus(statusFromError(error.CompletionResourceManagerRequired)));
+    try std.testing.expectEqual(@intFromEnum(Code.unavailable), statusFromError(error.CompletionResourceManagerRequired).code);
+    try std.testing.expectEqual(error.CompletionProfileChanged, errorFromStatus(statusFromError(error.CompletionProfileChanged)));
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), statusFromError(error.CompletionProfileChanged).code);
+    try std.testing.expectEqual(error.CompletionDrainShapeChanged, errorFromStatus(statusFromError(error.CompletionDrainShapeChanged)));
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), statusFromError(error.CompletionDrainShapeChanged).code);
+    try std.testing.expectEqual(error.CompletionNotPrepared, errorFromStatus(statusFromError(error.CompletionNotPrepared)));
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), statusFromError(error.CompletionNotPrepared).code);
+    try std.testing.expectEqual(error.InvalidCompletionSlot, errorFromStatus(statusFromError(error.InvalidCompletionSlot)));
+    try std.testing.expectEqual(@intFromEnum(Code.corrupt), statusFromError(error.InvalidCompletionSlot).code);
+    try std.testing.expectEqual(error.CompletionSlotChecksumMismatch, errorFromStatus(statusFromError(error.CompletionSlotChecksumMismatch)));
+    try std.testing.expectEqual(@intFromEnum(Code.corrupt), statusFromError(error.CompletionSlotChecksumMismatch).code);
+    try std.testing.expectEqual(error.CompletionSlotTooLarge, errorFromStatus(statusFromError(error.CompletionSlotTooLarge)));
+    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), statusFromError(error.CompletionSlotTooLarge).code);
+    try std.testing.expectEqual(error.CompletionPlanCapacityExceeded, errorFromStatus(statusFromError(error.CompletionPlanCapacityExceeded)));
+    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), statusFromError(error.CompletionPlanCapacityExceeded).code);
+    try std.testing.expectEqual(error.CompletionReservationBusy, errorFromStatus(statusFromError(error.CompletionReservationBusy)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionReservationBusy).code);
+    try std.testing.expectEqual(error.CompletionForegroundCapacityExceeded, errorFromStatus(statusFromError(error.CompletionForegroundCapacityExceeded)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionForegroundCapacityExceeded).code);
+    try std.testing.expectEqual(error.CompletionFileCapacityExceeded, errorFromStatus(statusFromError(error.CompletionFileCapacityExceeded)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionFileCapacityExceeded).code);
+    try std.testing.expectEqual(error.CompletionWriterClosed, errorFromStatus(statusFromError(error.CompletionWriterClosed)));
+    try std.testing.expectEqual(@intFromEnum(Code.internal), statusFromError(error.CompletionWriterClosed).code);
+    try std.testing.expectEqual(error.CompletionWriterLive, errorFromStatus(statusFromError(error.CompletionWriterLive)));
+    try std.testing.expectEqual(@intFromEnum(Code.internal), statusFromError(error.CompletionWriterLive).code);
 }
