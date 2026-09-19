@@ -2056,6 +2056,24 @@ pub const NativeFdPermit = struct {
 /// remove another attempt's temp or recover an uncertain prior append.
 pub const NativeCompletionIo = NativeWalCompletionIo;
 
+/// Faults at the actual protected POSIX I/O boundary. Test callbacks select an
+/// owned path; production builds erase every call site. A partial append writes
+/// and syncs a real prefix before reporting failure, rather than merely skipping
+/// the operation or returning an error after a complete record.
+pub const CompletionIoFault = enum {
+    partial_append,
+    append_sync,
+    atomic_file_sync,
+    atomic_rename,
+    atomic_directory_sync,
+};
+pub var test_completion_io_fault: ?*const fn (CompletionIoFault, []const u8) bool = null;
+
+inline fn completionIoFault(point: CompletionIoFault, path_value: []const u8) bool {
+    if (builtin.is_test) if (test_completion_io_fault) |hook| return hook(point, path_value);
+    return false;
+}
+
 pub const NativeWalCompletionIo = struct {
     pub const max_prepared_files = 768;
     /// Exact, slot-owned files in addition to the standard WAL paths. The
@@ -2328,8 +2346,17 @@ pub const NativeWalCompletionIo = struct {
         defer closeFd(fd);
         const current = try fileSizeFromFd(fd);
         if (current > limit or bytes.len > limit - current) return error.CompletionFileCapacityExceeded;
+        if (completionIoFault(.partial_append, value)) {
+            if (bytes.len < 2) return error.InvalidArgument;
+            try writeAllAtOffset(fd, bytes[0 .. bytes.len / 2], current);
+            try fs_paths.syncFileFdPortable(fd);
+            return error.InputOutput;
+        }
         try writeAllAtOffset(fd, bytes, current);
-        if (sync) try fs_paths.syncFileFdPortable(fd);
+        if (sync) {
+            if (completionIoFault(.append_sync, value)) return error.InputOutput;
+            try fs_paths.syncFileFdPortable(fd);
+        }
     }
 
     fn syncParent(raw: *anyopaque, value: []const u8) !void {
@@ -2381,12 +2408,15 @@ pub const NativeWalCompletionIo = struct {
         defer self.permit.state.invalidateRename(self.writer_temp, self.writer_final);
         self.permit.state.invalidateRename(self.writer_temp, self.writer_final);
         errdefer unlinkPrepared(self.writer_temp) catch {};
+        if (completionIoFault(.atomic_file_sync, self.writer_final)) return error.InputOutput;
         try fs_paths.syncFileFdPortable(fd);
         closeFd(fd);
         open = false;
+        if (completionIoFault(.atomic_rename, self.writer_final)) return error.InputOutput;
         try renamePrepared(self.writer_temp, self.writer_final);
         const parent = try std.posix.openatZ(std.posix.AT.FDCWD, self.writer_parent, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
         defer closeFd(parent);
+        if (completionIoFault(.atomic_directory_sync, self.writer_final)) return error.InputOutput;
         try fs_paths.syncDirectoryFdPortable(parent);
     }
     fn writerAbort(raw: *anyopaque) void {

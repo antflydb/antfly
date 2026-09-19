@@ -93,6 +93,19 @@ prerequisites are implemented and verified.
   exact applied identity and duplicate application. These prove native storage
   process-death recovery at those boundaries; they do not prove quorum failure,
   partial-write/fsync faults, or transaction-control completion ownership.
+- Native I/O fault qualification subsequently passed the 29-test owning gate
+  with 20 child-process cases. Both ordinary documents and transaction begin
+  now cover real, synced partial WAL and manifest-journal appends, injected
+  append fsync failures, and injected SST file-sync, rename, and directory-sync
+  failures, in addition to the six earlier completed-write crash boundaries.
+  Each failed apply fences same-process retry and preserves the exact accepted
+  sidecar before the parent kills the process. Recovery with admission disabled
+  verifies every final physical mutation and its applied identity; a second
+  reopen verifies durable progress with no pending accepted cell, then repeats
+  the physical-state and idempotent-apply checks. The low-level callbacks are
+  test-only. These are actual native filesystem/process tests with injected
+  syscall errors, not power-loss durability tests or live-quorum qualification;
+  accepted-only reconciliation still uses a test-supplied durable-log proof.
 - Trusted local installation capsules now restore actual accepted ordinary
   debt with empty metadata/catalog access, no service keys, and new admission
   disabled. Five owning SourceOwner tests passed, including immutable identity,

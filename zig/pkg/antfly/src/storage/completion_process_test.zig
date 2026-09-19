@@ -1,8 +1,9 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Actual process death at native storage boundaries. This intentionally does
-//! not claim a quorum: DATA/leader/log-replacement qualification is separate.
+//! Actual process death at native storage boundaries, including real torn
+//! records and injected syscall failures. Process restart cannot simulate a
+//! power loss; DATA/quorum/log-replacement qualification is also separate.
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
@@ -13,7 +14,26 @@ const abi = @import("kernel_owner_abi").completion_pool;
 const Status = @import("runtime_failure_abi").Status;
 const codec = @import("lsm_backend/completion_entry.zig");
 const native = @import("lsm_backend/completion_runtime.zig");
-const Stage = enum { accepted, wal, manifest };
+const storage_io = @import("lsm_backend/storage_io.zig");
+const Stage = enum {
+    accepted,
+    wal,
+    manifest,
+    partial_wal,
+    wal_sync,
+    partial_manifest,
+    manifest_sync,
+    sst_sync,
+    sst_rename,
+    sst_directory_sync,
+
+    fn isFault(self: Stage) bool {
+        return switch (self) {
+            .accepted, .wal, .manifest => false,
+            else => true,
+        };
+    }
+};
 const settings: @import("../common/table_storage.zig").Settings = .{ .transaction_recovery = .{
     .protocol_version = 1,
     .max_count = 4,
@@ -55,6 +75,24 @@ fn binding(alloc: std.mem.Allocator) !abi.InstallBinding {
 
 const CrashPoint = struct {
     var ready_path: []const u8 = "";
+    var stage: Stage = .accepted;
+    var fault_hit: bool = false;
+
+    fn fault(point: storage_io.CompletionIoFault, path: []const u8) bool {
+        if (fault_hit) return false;
+        const matches = switch (stage) {
+            .partial_wal => point == .partial_append and std.mem.endsWith(u8, path, ".log"),
+            .wal_sync => point == .append_sync and std.mem.endsWith(u8, path, ".log"),
+            .partial_manifest => point == .partial_append and std.mem.endsWith(u8, path, ".journal"),
+            .manifest_sync => point == .append_sync and std.mem.endsWith(u8, path, ".journal"),
+            .sst_sync => point == .atomic_file_sync and std.mem.endsWith(u8, path, ".tbl"),
+            .sst_rename => point == .atomic_rename and std.mem.endsWith(u8, path, ".tbl"),
+            .sst_directory_sync => point == .atomic_directory_sync and std.mem.endsWith(u8, path, ".tbl"),
+            else => false,
+        };
+        fault_hit = matches;
+        return matches;
+    }
 
     fn hold() noreturn {
         std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = ready_path, .data = "ready" }) catch std.process.exit(17);
@@ -106,16 +144,44 @@ fn child(root: []const u8, stage: Stage, begin: bool) !void {
     var result: abi.CheckResult = undefined;
     try std.testing.expectEqual(Status.ok, lease.vtable.check(lease.context, &proposal, &result));
     lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals });
+    const pool = db.core.primary_store_owner.lsmBackend().?.completion_pool.?;
+    const accepted_before = if (stage.isFault()) try std.Io.Dir.cwd().readFileAlloc(std.testing.io, pool.accepted_paths[0], alloc, .limited(1024 * 1024)) else null;
+    defer if (accepted_before) |bytes| alloc.free(bytes);
     switch (stage) {
         .accepted => CrashPoint.hold(),
         .wal => native.test_after_wal = CrashPoint.stop,
         .manifest => native.test_after_manifest = CrashPoint.stop,
+        else => {
+            CrashPoint.stage = stage;
+            CrashPoint.fault_hit = false;
+            storage_io.test_completion_io_fault = CrashPoint.fault;
+        },
     }
     defer {
         native.test_after_wal = null;
         native.test_after_manifest = null;
+        storage_io.test_completion_io_fault = null;
     }
-    _ = lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]);
+    const applied = lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]);
+    if (stage.isFault()) {
+        try std.testing.expect(CrashPoint.fault_hit);
+        try std.testing.expect(applied != .ok);
+        // A failed attempt must fence same-process retries and must not consume
+        // the accepted sidecar. Restart, not a fresh ordinary allocation, owns
+        // repair of a torn record or uncertain publication.
+        storage_io.test_completion_io_fault = null;
+        try std.testing.expect(lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]) != .ok);
+        try std.testing.expect(pool.failed);
+        // Pool adoption names its live Slot phase "prepared" even for a
+        // single-phase mutation; it is not a transaction prepare or durability
+        // claim. The failed slot and exact accepted sidecar must both survive.
+        try std.testing.expectEqual(.prepared, pool.cells[0].phase);
+        try std.testing.expect(pool.cells[0].slot.attempted and !pool.cells[0].slot.durable);
+        const accepted_after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, pool.accepted_paths[0], alloc, .limited(1024 * 1024));
+        defer alloc.free(accepted_after);
+        try std.testing.expectEqualSlices(u8, accepted_before.?, accepted_after);
+        CrashPoint.hold();
+    }
     return error.CrashBoundaryNotReached;
 }
 
@@ -131,7 +197,8 @@ test "workload admission physical completion process kill preserves accepted doc
     const exe = try std.process.executablePathAlloc(io, alloc);
     defer alloc.free(exe);
     for ([_]bool{ false, true }) |begin| {
-        for ([_]Stage{ .accepted, .wal, .manifest }) |stage| {
+        for (std.enums.values(Stage)) |stage| {
+            errdefer std.debug.print("completion process recovery failed: kind={s}, stage={s}\n", .{ if (begin) "begin" else "document", @tagName(stage) });
             var tmp = try @import("../common/test_directory.zig").TestDirectory.init("completion-process-kill");
             defer tmp.cleanup();
             const root = tmp.path();
@@ -163,60 +230,74 @@ test "workload admission physical completion process kill preserves accepted doc
             }
             try std.testing.expect(ready);
             process.kill(io);
-            // The process has terminated and released its kernel locks. Open
-            // solely from trusted local installation state, with admission off.
-            var resources = resource_manager.ResourceManager.init(.{ .identity_allocator = alloc });
-            defer resources.deinit(alloc);
-            try resources.configureTransactionCompletion(1024 * 1024);
-            const identity = try binding(alloc);
-            var config = options(&resources);
-            config.durable_completion_authority = .raft_apply;
-            config.durable_completion_enabled = false;
-            config.completion_pool_config = (try DB.completionInstallationPreflight(alloc, io, root, identity, "", "", "{}")).?;
-            var db = try DB.open(alloc, root, config);
-            defer db.close();
-            try db.installCompletionBinding(identity, "", "", "{}", settings);
-            const lease = try db.acquireCompletionLease(2, 7);
-            defer lease.vtable.release(lease.context);
             const wire = try std.Io.Dir.cwd().readFileAlloc(io, wire_path, alloc, .limited(codec.max_wire_bytes + 1));
             defer alloc.free(wire);
             var entry = try codec.decode(alloc, wire);
             defer entry.deinit();
-            if (stage == .accepted) {
+            // The process has terminated and released its kernel locks. Open
+            // solely from trusted local installation state, with admission off.
+            // Reopen a second time after recovery has checkpointed: a repaired
+            // torn journal must not hide later publication on the next restart.
+            for (0..2) |restart| {
+                var resources = resource_manager.ResourceManager.init(.{ .identity_allocator = alloc });
+                defer resources.deinit(alloc);
+                try resources.configureTransactionCompletion(1024 * 1024);
+                const identity = try binding(alloc);
+                var config = options(&resources);
+                config.durable_completion_authority = .raft_apply;
+                config.durable_completion_enabled = false;
+                config.completion_pool_config = (try DB.completionInstallationPreflight(alloc, io, root, identity, "", "", "{}")).?;
+                var db = try DB.open(alloc, root, config);
+                defer db.close();
+                try db.installCompletionBinding(identity, "", "", "{}", settings);
+                const lease = try db.acquireCompletionLease(2, 7);
+                defer lease.vtable.release(lease.context);
                 var cells: abi.DurableCells = undefined;
                 try std.testing.expectEqual(Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
-                try std.testing.expectEqual(@as(u32, 1), cells.count);
-                var proof: abi.DurableLog = .{ .mode = .startup_complete, .last_index = 1, .commit_index = 1, .count = 1 };
-                proof.observations[0] = .{ .expected = cells.cells[0].identity, .present = 1, .observed_term = 1, .observed_digest = entry.digest };
-                try std.testing.expectEqual(Status.ok, lease.vtable.reconcile_durable.?(lease.context, &proof));
+                if (restart == 0 and (stage == .accepted or stage == .partial_wal))
+                    try std.testing.expectEqual(@as(u32, 1), cells.count);
+                if (restart == 1) {
+                    try std.testing.expectEqual(@as(u32, 0), cells.count);
+                    var persisted: abi.Progress = undefined;
+                    try std.testing.expectEqual(Status.ok, lease.vtable.progress.?(lease.context, &persisted));
+                    try std.testing.expectEqual(@as(u64, 1), persisted.term);
+                    try std.testing.expectEqual(@as(u64, 1), persisted.index);
+                    try std.testing.expectEqualSlices(u8, &entry.digest, &persisted.payload_digest);
+                }
+                if (cells.count != 0) {
+                    try std.testing.expectEqual(@as(u32, 1), cells.count);
+                    var proof: abi.DurableLog = .{ .mode = .startup_complete, .last_index = 1, .commit_index = 1, .count = 1 };
+                    proof.observations[0] = .{ .expected = cells.cells[0].identity, .present = 1, .observed_term = 1, .observed_digest = entry.digest };
+                    try std.testing.expectEqual(Status.ok, lease.vtable.reconcile_durable.?(lease.context, &proof));
+                }
+                const payload: abi.Bytes = .{ .ptr = wire.ptr, .len = wire.len };
+                try std.testing.expectEqual(Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payload));
+                try std.testing.expectEqual(Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payload));
+                for (entry.entry.prepare_operations, 0..) |op, i| {
+                    const overwritten = for (entry.entry.prepare_operations[i + 1 ..]) |later| {
+                        if (std.mem.eql(u8, op.key, later.key)) break true;
+                    } else false;
+                    if (overwritten) continue;
+                    const actual = try db.core.getStoreValue(alloc, op.key);
+                    defer if (actual) |value| alloc.free(value);
+                    if (op.kind == .put) {
+                        try std.testing.expectEqualSlices(u8, op.value, actual orelse return error.TestUnexpectedResult);
+                    } else try std.testing.expect(actual == null);
+                }
+                try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(entry.entry.txn_id));
+                if (begin) {
+                    try std.testing.expectEqual(@import("transactions.zig").TxnStatus.pending, try db.getTransactionStatus(logical_id));
+                } else {
+                    const value = (try db.get(alloc, "doc")).?;
+                    defer alloc.free(value);
+                    try std.testing.expectEqualStrings("{\"value\":7}", value);
+                }
+                var progress: abi.Progress = undefined;
+                try std.testing.expectEqual(Status.ok, lease.vtable.progress.?(lease.context, &progress));
+                try std.testing.expectEqual(@as(u64, 1), progress.term);
+                try std.testing.expectEqual(@as(u64, 1), progress.index);
+                try std.testing.expectEqualSlices(u8, &entry.digest, &progress.payload_digest);
             }
-            const payload: abi.Bytes = .{ .ptr = wire.ptr, .len = wire.len };
-            try std.testing.expectEqual(Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payload));
-            try std.testing.expectEqual(Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payload));
-            for (entry.entry.prepare_operations, 0..) |op, i| {
-                const overwritten = for (entry.entry.prepare_operations[i + 1 ..]) |later| {
-                    if (std.mem.eql(u8, op.key, later.key)) break true;
-                } else false;
-                if (overwritten) continue;
-                const actual = try db.core.getStoreValue(alloc, op.key);
-                defer if (actual) |value| alloc.free(value);
-                if (op.kind == .put) {
-                    try std.testing.expectEqualSlices(u8, op.value, actual orelse return error.TestUnexpectedResult);
-                } else try std.testing.expect(actual == null);
-            }
-            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(entry.entry.txn_id));
-            if (begin) {
-                try std.testing.expectEqual(@import("transactions.zig").TxnStatus.pending, try db.getTransactionStatus(logical_id));
-            } else {
-                const value = (try db.get(alloc, "doc")).?;
-                defer alloc.free(value);
-                try std.testing.expectEqualStrings("{\"value\":7}", value);
-            }
-            var progress: abi.Progress = undefined;
-            try std.testing.expectEqual(Status.ok, lease.vtable.progress.?(lease.context, &progress));
-            try std.testing.expectEqual(@as(u64, 1), progress.term);
-            try std.testing.expectEqual(@as(u64, 1), progress.index);
-            try std.testing.expectEqualSlices(u8, &entry.digest, &progress.payload_digest);
         }
     }
 }
