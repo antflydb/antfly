@@ -52,8 +52,29 @@ def make_plan(binary, revision, optimization):
 
 
 def require_success(result):
-    if frontend.classify(result) != "success":
-        raise AssertionError("held lookup did not complete with the exact document")
+    body = result.get("body")
+    try:
+        exact = json.loads(body) == {"marker": "durable-a"}
+    except (TypeError, ValueError):
+        exact = False
+    if (
+        result.get("status") == 200
+        and not result.get("error")
+        and not result.get("unknown_write_outcome")
+        and exact
+    ):
+        return
+    diagnostic = {
+        "status": result.get("status"),
+        "error": str(result["error"])[:512] if result.get("error") else None,
+        "unknown_write_outcome": bool(result.get("unknown_write_outcome")),
+        "body_prefix": body[:512] if isinstance(body, str) else None,
+        "body_truncated": isinstance(body, str) and len(body) > 512,
+    }
+    raise AssertionError(
+        "held lookup did not complete with the exact document: "
+        + json.dumps(diagnostic, ensure_ascii=True)
+    )
 
 
 def require_denial(result):

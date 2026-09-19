@@ -78,6 +78,28 @@ class DispatchQualificationTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             dispatch.require_success(denial())
 
+    def test_failed_lookup_preserves_status_and_bounded_non_json_body(self):
+        dispatch.require_success({"status": 200, "body": '{"marker":"durable-a"}'})
+        for result in (
+            {"status": 404, "body": "not found"},
+            {"status": 200, "body": '{"marker":'},
+            {"status": 200, "body": "{}"},
+            {"status": 200, "body": '{"marker":"durable-a"}', "error": "socket failed"},
+            {
+                "status": 200,
+                "body": '{"marker":"durable-a"}',
+                "unknown_write_outcome": True,
+            },
+            {"status": 500, "body": "x" * 1024},
+        ):
+            with self.assertRaises(AssertionError) as raised:
+                dispatch.require_success(result)
+            diagnostic = json.loads(str(raised.exception).split(": ", 1)[1])
+            self.assertEqual(diagnostic["status"], result["status"])
+            self.assertEqual(diagnostic["body_prefix"], result["body"][:512])
+            self.assertEqual(diagnostic["body_truncated"], len(result["body"]) > 512)
+            self.assertEqual(diagnostic["error"], result.get("error"))
+
     def test_head_requires_success_and_empty_client_body(self):
         dispatch.require_head_success(
             {"status": 200, "body": "", "headers": {"Content-Length": "20"}}
