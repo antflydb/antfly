@@ -135,6 +135,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn beginShutdown(_: *@This()) void {}
 
+    pub fn quiesceWorkers(_: *@This()) void {}
+
     pub fn hasWorkers(_: *@This()) bool {
         return false;
     }
@@ -365,7 +367,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         if (self.scheduler) |scheduler| for (self.workers.items) |worker| scheduler.wake(worker);
     }
 
-    pub fn deinit(self: *DerivedRuntime) void {
+    pub fn quiesceWorkers(self: *DerivedRuntime) void {
         const io = self.ioContext();
         self.beginShutdown();
 
@@ -383,6 +385,11 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             self.alloc.free(worker.name);
             self.alloc.destroy(worker);
         }
+        self.workers.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *DerivedRuntime) void {
+        self.quiesceWorkers();
         self.workers.deinit(self.alloc);
         self.backlog.deinit(self.alloc);
         if (self.owns_scheduler) if (self.scheduler) |scheduler| scheduler.destroy();

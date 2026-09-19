@@ -1457,6 +1457,35 @@ test "opaque storage owner transaction recovery crosses callback ABI" {
     try std.testing.expect(cleaned);
 }
 
+test "opaque storage context validates durable completion authority and reports disabled recovery policy" {
+    var context: ?*anyopaque = null;
+    for ([_]abi.ContextRequest{
+        .{ .durable_completion_enabled = 2 },
+        .{ .durable_completion_authority = 255 },
+        .{ .durable_completion_authority = 2 },
+        .{ ._completion_reserved = .{ 1, 0, 0, 0, 0, 0 } },
+    }) |request| {
+        try std.testing.expectEqual(abi.Status.invalid_config, abi.antfly_storage_context_create(&request, &context));
+        try std.testing.expect(context == null);
+    }
+    for ([_]abi.ContextRequest{
+        .{ .durable_completion_authority = 1, .no_sync = 1 },
+        .{ .durable_completion_authority = 1, .storage_kind = .lite },
+    }) |request| {
+        try std.testing.expectEqual(abi.Status.unsupported_completion_backend, abi.antfly_storage_context_create(&request, &context));
+        try std.testing.expect(context == null);
+    }
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{
+        .durable_completion_authority = 1,
+        .durable_completion_enabled = 0,
+    }, &context));
+    defer _ = abi.antfly_storage_context_destroy(context);
+    var metrics: abi.ContextMetricsResult = .{};
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
+    try std.testing.expectEqual(@as(u8, 0), metrics.durable_completion_enabled);
+    try std.testing.expectEqual(@as(u8, 1), metrics.durable_completion_authority);
+}
+
 test "opaque storage context activates and validates dense execution policy" {
     var context: ?*anyopaque = null;
     try std.testing.expectEqual(abi.Status.invalid_config, abi.antfly_storage_context_create(&.{
@@ -2323,4 +2352,85 @@ test "compiled backend replay visitors preserve consumer errors" {
     try std.testing.expectError(error.ConsumerPrivateStop, nested.forEachReplayFromMatchingHintMask(1, 1, &consumer, Consumer.consume));
     try std.testing.expectError(error.ConsumerPrivateStop, nested.forEachReplayLaneFrom(1, 1, 0, &consumer, Consumer.consume));
     try std.testing.expectEqual(@as(usize, 3), consumer.calls);
+}
+
+test "opaque storage owner canonical completion compilation requires actual pool without mutating documents" {
+    const path = "/tmp/antfly-storage-owner-canonical-candidate";
+    cleanup(path);
+    defer cleanup(path);
+    var owner = try client.Owner.open(.{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001 });
+    defer owner.deinit();
+    const prepare =
+        \\{"inserts":{"doc:txn":{"title":"candidate"}},"_transaction":{"phase":"prepare","txn_id":"000102030405060708090a0b0c0d0e0f","topology_epoch":"7"},"sync_level":"write"}
+    ;
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, owner.compileReplicatedCompletion("docs", prepare, 2, 9));
+    try std.testing.expectError(error.InvalidBatchRequest, owner.compileReplicatedCompletion("docs", "{\"inserts\":{\"doc:txn\":{}}}", 2, 9));
+    try std.testing.expectError(error.InvalidArgument, owner.compileReplicatedCompletion("docs", prepare, 0, 9));
+    try std.testing.expectError(error.NotFound, owner.lookupJson("docs", "{\"key\":\"doc:txn\",\"include_all_fields\":true}"));
+    var output: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_compile_replicated_completion(owner.handle, &.{
+        .reserved = 1,
+        .table_name = .fromSlice("docs"),
+        .request_json = .fromSlice(prepare),
+        .previous_term = 2,
+        .previous_index = 9,
+    }, &output));
+    try std.testing.expectEqual(@as(u64, 0), output.len);
+    try std.testing.expect(output.ptr == null);
+}
+
+test "opaque storage owner retained completion lease survives worker quiesce and owner close" {
+    const path = "/tmp/antfly-storage-owner-retained-completion";
+    cleanup(path);
+    defer cleanup(path);
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{
+        .transaction_completion_bytes = 1024 * 1024,
+        .durable_completion_enabled = 1,
+    }, &context));
+    defer _ = abi.antfly_storage_context_destroy(context);
+    const settings = @import("../common/table_storage.zig").Settings{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    const settings_json = try std.json.Stringify.valueAlloc(std.testing.allocator, settings, .{});
+    defer std.testing.allocator.free(settings_json);
+    var binding: abi.completion_pool.InstallBinding = .{
+        .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(15), .policy_digest = @import("../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) },
+        .table_id = 1,
+        .range_id = 3,
+    };
+    binding.schema_catalog_digest = try @import("../common/completion_catalog_digest.zig").digest(std.testing.allocator, "", "", "{}");
+    var owner = try client.Owner.open(.{
+        .context = context,
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("docs"),
+        .group_id = 2,
+        .has_identity_namespace = 1,
+        .identity_table_id = 1,
+        .identity_shard_id = 2,
+        .identity_range_id = 3,
+        .indexes_json = .fromSlice("{}"),
+        .completion_installation = &binding,
+        .completion_settings_json = .fromSlice(settings_json),
+    });
+    var owner_live = true;
+    defer if (owner_live) owner.deinit();
+    const lease = try owner.acquireCompletionLease(2, 7);
+    defer lease.vtable.release(lease.context);
+    try owner.quiesce();
+    try owner.quiesce();
+    owner.deinit();
+    owner_live = false;
+    // The compiled owner and its context must remain pinned after cache close.
+    // This callback reads real native ownership, not an API-side stand-in.
+    var cells: abi.completion_pool.DurableCells = undefined;
+    try std.testing.expectEqual(abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
+    try std.testing.expectEqual(@as(u32, 0), cells.count);
+    var progress: abi.completion_pool.Progress = undefined;
+    try std.testing.expectEqual(abi.Status.not_found, lease.vtable.progress.?(lease.context, &progress));
 }

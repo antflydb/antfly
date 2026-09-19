@@ -279,6 +279,26 @@ pub const Owner = struct {
         return .{ .handle = handle orelse return error.StorageKernelFailure };
     }
 
+    pub fn quiesce(self: *Owner) !void {
+        try statusToError(abi.antfly_storage_owner_quiesce(self.handle));
+    }
+
+    pub fn installCompletion(self: *Owner, request: abi.InstallCompletionRequest) !void {
+        try statusToError(abi.antfly_storage_owner_install_completion(self.handle, &request));
+    }
+
+    pub fn acquireCompletionLease(self: *Owner, group_id: u64, node_id: u64) !abi.completion_pool.Lease {
+        var result: abi.completion_pool.Lease = undefined;
+        try statusToError(abi.antfly_storage_owner_acquire_completion_lease(self.handle, group_id, node_id, &result));
+        return result;
+    }
+
+    pub fn attestCompletionBacking(self: *Owner, group_id: u64, node_id: u64) !abi.completion_pool.NativeAttestation {
+        var result: abi.completion_pool.NativeAttestation = .{};
+        try statusToError(abi.antfly_storage_owner_attest_completion_backing(self.handle, group_id, node_id, &result));
+        return result;
+    }
+
     /// Runs one complete local split/merge phase while both opaque owners are
     /// borrowed by the caller. `apply_store` is optional; a null handle asks
     /// the provider to open the phase-local projection store itself.
@@ -483,6 +503,24 @@ pub const Owner = struct {
             },
             &response.buffer,
         ));
+        return response;
+    }
+
+    pub fn compileReplicatedCompletion(
+        self: *Owner,
+        table_name: []const u8,
+        request_json: []const u8,
+        previous_term: u64,
+        previous_index: u64,
+    ) !Response {
+        if ((previous_term == 0) != (previous_index == 0)) return error.InvalidArgument;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_compile_replicated_completion(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(request_json),
+            .previous_term = previous_term,
+            .previous_index = previous_index,
+        }, &response.buffer));
         return response;
     }
 

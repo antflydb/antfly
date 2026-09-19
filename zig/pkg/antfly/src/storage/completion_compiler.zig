@@ -25,6 +25,9 @@ pub const Options = struct {
     /// DocStore columnar metadata into point operations before sealing them.
     physical_mutations: bool = false,
     allow_named_participants: bool = false,
+    /// Retained consensus completion binds its own authoritative term/index.
+    /// This does not enable participant acknowledgement or outbox mutations.
+    allow_raft_marker: bool = false,
     /// Null preserves the legacy timestamp binding. Physical plans enumerate
     /// only rows whose TTL timestamp came from the future commit clock.
     timestamp_keys: ?[]const []const u8 = null,

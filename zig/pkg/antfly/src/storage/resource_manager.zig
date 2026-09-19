@@ -826,6 +826,11 @@ test "dense aggregate resource manager bounds callers and helpers together" {
 }
 
 pub const ResourceManager = struct {
+    /// Immutable runtime bootstrap policy. These are never request fields;
+    /// restored obligations consult authority independently from new admission.
+    durable_completion_enabled: bool = false,
+    durable_completion_authority: @import("../common/durable_completion_policy.zig").Authority = .none,
+    durable_completion_configured: bool = false,
     transaction_completion_mutex: std.atomic.Mutex = .unlocked,
     transaction_completion: ?struct {
         workspace: *@import("../common/workload_completion.zig").Workspace,
@@ -2253,6 +2258,19 @@ pub const ResourceManager = struct {
         errdefer workspace.destroy();
         const metadata = try Workspace.create(self.identity_allocator, metadata_capacity);
         self.transaction_completion = .{ .workspace = workspace, .metadata = metadata, .capacity = capacity, .host_reservation = reservation };
+    }
+
+    pub fn configureDurableCompletion(self: *ResourceManager, enabled: bool, authority: @import("../common/durable_completion_policy.zig").Authority) !void {
+        if (authority == .raft_apply) return error.InvalidConfig;
+        lockAtomic(&self.transaction_completion_mutex);
+        defer self.transaction_completion_mutex.unlock();
+        if (self.durable_completion_configured) {
+            if (self.durable_completion_enabled != enabled or self.durable_completion_authority != authority) return error.InvalidConfig;
+            return;
+        }
+        self.durable_completion_enabled = enabled;
+        self.durable_completion_authority = authority;
+        self.durable_completion_configured = true;
     }
 
     pub fn transactionCompletion(self: *ResourceManager) ?*@import("../common/workload_completion.zig").Workspace {
@@ -6187,4 +6205,19 @@ test "workload admission observer metadata pin allocation failure rolls back boo
     manager.next_observer_metadata_pin_identity = std.math.maxInt(u64);
     try std.testing.expectError(error.ObserverMetadataIdentityExhausted, manager.pinObserverMetadata(.lsm_wal_retention, &current));
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "workload admission durable completion bootstrap is immutable and recovery authority survives disabled admission" {
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    try manager.configureDurableCompletion(false, .standalone_local);
+    try manager.configureDurableCompletion(false, .standalone_local);
+    try std.testing.expect(!manager.durable_completion_enabled);
+    try std.testing.expectEqual(@import("../common/durable_completion_policy.zig").Authority.standalone_local, manager.durable_completion_authority);
+    try std.testing.expectError(error.InvalidConfig, manager.configureDurableCompletion(true, .standalone_local));
+    try std.testing.expectError(error.InvalidConfig, manager.configureDurableCompletion(false, .none));
+    var untrusted = ResourceManager.init(.{});
+    defer untrusted.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidConfig, untrusted.configureDurableCompletion(true, .raft_apply));
+    try std.testing.expect(!untrusted.durable_completion_configured);
 }

@@ -308,6 +308,28 @@ pub fn applyStorageKernelReplicatedBatch(
         try db.batchReplicatedApply(req);
 }
 
+/// Compile only a transaction prepare; do not silently discard another batch
+/// operation or publish any of its mutations while producing the candidate.
+pub fn compileStorageKernelReplicatedCompletion(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    req: db_mod.types.BatchRequest,
+    expected_previous: db_mod.RaftAppliedEntryIdentity,
+) ![]u8 {
+    const mutation = req.transaction orelse return error.InvalidBatchRequest;
+    if (mutation != .prepare or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
+        req.reject_graph_transform_projections or req.split_checkpoint != null or req.split_replication != null or
+        req.split_transition != null or req.merge_source_transition != null or req.merge_checkpoint != null or
+        req.merge_replication != null or req.merge_artifacts.len != 0) return error.InvalidBatchRequest;
+    try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+    return db.compileReplicatedTransaction(alloc, mutation.prepare.txn_id, .{
+        .writes = batchWritesAsTransactionWrites(req.writes),
+        .deletes = req.deletes,
+        .transforms = req.transforms,
+        .predicates = req.predicates,
+    }, expected_previous);
+}
+
 pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -806,6 +828,12 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
             namespace: ?doc_identity.Namespace,
             open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
+            // Staged/repair owners may not inherit live-root completion
+            // authority from the process. Promotion installs its own proof;
+            // a staged prepared descriptor must fail closed until then.
+            const completion_staged = open_mode == .restore_repair or open_options.staged_generation != null;
+            const completion_enabled = !completion_staged and (if (manager) |value| value.durable_completion_enabled else false);
+            const completion_authority: @import("../common/durable_completion_policy.zig").Authority = if (completion_staged) .none else if (manager) |value| value.durable_completion_authority else .none;
             const schema_before_index_load = try prepareManagedSchemaBeforeIndexLoad(allocator, open_mode, open_options.schema_json_before_index_load);
             defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema.runtime_schema);
 
@@ -833,6 +861,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                 resolved.start_optional_runtime_workers = false;
                 resolved.ttl_cleanup = .{ .enabled = false };
                 resolved.transaction_recovery = .{ .enabled = false };
+                resolved.durable_completion_enabled = false;
+                resolved.durable_completion_authority = .none;
                 resolved.text_merge = .{ .enabled = false };
                 resolved.index_backends.dense_native_migration_policy_source = open_options.dense_native_migration_policy_source;
                 return try db_mod.DB.open(allocator, db_path, resolved);
@@ -844,6 +874,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                 .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                 .lsm_root_generation = root_generation,
                 .resource_manager = manager,
+                .durable_completion_enabled = completion_enabled,
+                .durable_completion_authority = completion_authority,
                 .backend_runtime = runtime,
                 .secret_store = store,
                 .remote_content = remote,
@@ -868,6 +900,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -888,6 +922,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -915,6 +951,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -936,6 +974,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                     .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                     .lsm_root_generation = root_generation,
                     .resource_manager = manager,
+                    .durable_completion_enabled = completion_enabled,
+                    .durable_completion_authority = completion_authority,
                     .backend_runtime = runtime,
                     .secret_store = store,
                     .remote_content = remote,
@@ -979,6 +1019,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -1003,6 +1045,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -1026,6 +1070,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -1046,6 +1092,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -1065,6 +1113,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,
@@ -1085,6 +1135,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                         .index_backends = managedIndexBackends(open_options.dense_native_migration_policy_source),
                         .lsm_root_generation = root_generation,
                         .resource_manager = manager,
+                        .durable_completion_enabled = completion_enabled,
+                        .durable_completion_authority = completion_authority,
                         .backend_runtime = runtime,
                         .secret_store = store,
                         .remote_content = remote,

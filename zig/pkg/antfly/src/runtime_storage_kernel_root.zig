@@ -122,6 +122,7 @@ comptime {
     exportInternal(&storage_kernel_exports.dataApplyStoreDestroyGroupTransition, "antfly_data_apply_store_destroy_group_transition");
     exportInternal(&storage_kernel_exports.storageOwnerLocalTransition, "antfly_storage_owner_local_transition");
     exportInternal(&storage_kernel_exports.storageOwnerOpen, "antfly_storage_owner_open");
+    exportInternal(&storage_kernel_exports.storageOwnerQuiesce, "antfly_storage_owner_quiesce");
     exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
     exportInternal(&storage_kernel_exports.storageHASeedActivateJson, "antfly_storage_hot_standby_seed_activate_json");
     exportInternal(&storage_kernel_exports.storageHASeedValidateJson, "antfly_storage_hot_standby_seed_validate_json");
@@ -136,6 +137,10 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerBatchJson, "antfly_storage_owner_batch_json");
     exportInternal(&storage_kernel_exports.storageOwnerReplicatedBatchJson, "antfly_storage_owner_replicated_batch_json");
     exportInternal(&storage_kernel_exports.storageOwnerReplicatedBatchAtRaftEntryJson, "antfly_storage_owner_replicated_batch_at_raft_entry_json");
+    exportInternal(&storage_kernel_exports.storageOwnerCompileReplicatedCompletion, "antfly_storage_owner_compile_replicated_completion");
+    exportInternal(&storage_kernel_exports.storageOwnerAcquireCompletionLease, "antfly_storage_owner_acquire_completion_lease");
+    exportInternal(&storage_kernel_exports.storageOwnerInstallCompletion, "antfly_storage_owner_install_completion");
+    exportInternal(&storage_kernel_exports.storageOwnerAttestCompletionBacking, "antfly_storage_owner_attest_completion_backing");
     exportInternal(&storage_kernel_exports.storageOwnerTransactionStatus, "antfly_storage_owner_transaction_status");
     exportInternal(&storage_kernel_exports.storageOwnerWaitForSync, "antfly_storage_owner_wait_for_sync");
     exportInternal(&storage_kernel_exports.storageOwnerApplyHAReplicationRecord, "antfly_storage_owner_apply_ha_replication_record");

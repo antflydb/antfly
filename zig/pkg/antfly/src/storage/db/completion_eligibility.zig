@@ -13,6 +13,9 @@ pub const Fence = struct {
     mutex: std.atomic.Mutex = .unlocked,
     owners: [4]?TxnId = @splat(null),
     transitions: usize = 0,
+    /// Installed replicated backing also pins the catalog between transactions.
+    /// This excludes structural changes; it does not grant admission capacity.
+    installed_pool: bool = false,
 
     fn lock(self: *Fence) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -39,6 +42,15 @@ pub const Fence = struct {
         try self.begin(txn_id);
     }
 
+    /// The DB invokes this only after installing/restoring an actual native
+    /// pool. The pool and this exclusion share the physical owner's lifetime.
+    pub fn retainInstalledPool(self: *Fence) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.transitions != 0) return error.CompletionTransitionInProgress;
+        self.installed_pool = true;
+    }
+
     pub fn retire(self: *Fence, txn_id: TxnId) !void {
         self.lock();
         defer self.mutex.unlock();
@@ -56,6 +68,7 @@ pub const Fence = struct {
     pub fn checkTransition(self: *Fence) !void {
         self.lock();
         defer self.mutex.unlock();
+        if (self.installed_pool) return error.PreparedCompletionActive;
         for (self.owners) |owner| if (owner != null) return error.PreparedCompletionActive;
     }
 
@@ -65,6 +78,7 @@ pub const Fence = struct {
     pub fn beginTransition(self: *Fence) !Transition {
         self.lock();
         defer self.mutex.unlock();
+        if (self.installed_pool) return error.PreparedCompletionActive;
         for (self.owners) |owner| if (owner != null) return error.PreparedCompletionActive;
         self.transitions = std.math.add(usize, self.transitions, 1) catch
             return error.CompletionTransitionCapacityExceeded;
@@ -132,4 +146,16 @@ test "workload admission completion eligibility permits four independent obligat
     }
     try fence.retire(@splat(3));
     try fence.checkTransition();
+}
+
+test "workload admission physical completion installed pool retains structural exclusion while idle" {
+    var fence: Fence = .{};
+    var transition = try fence.beginTransition();
+    try std.testing.expectError(error.CompletionTransitionInProgress, fence.retainInstalledPool());
+    transition.deinit();
+    try fence.retainInstalledPool();
+    try std.testing.expectError(error.PreparedCompletionActive, fence.beginTransition());
+    for (0..4) |i| try fence.begin(@splat(@as(u8, @intCast(i))));
+    for (0..4) |i| try fence.retire(@splat(@as(u8, @intCast(i))));
+    try std.testing.expectError(error.PreparedCompletionActive, fence.checkTransition());
 }

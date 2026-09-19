@@ -1126,7 +1126,7 @@ pub const TxnManager = struct {
                 if (@import("completion_physical.zig").bindTimestampKey(options.timestamp_keys, op.key))
                     try template.bind(i, .{ .kind = .commit_timestamp, .target = .value, .byte_order = .little, .offset = 0 });
             } else if (std.mem.eql(u8, op.key, &internal_keys.raft_document_applied_entry_key)) {
-                if (!options.allow_named_participants or op.value.len != 16) return error.UnsupportedCompletionTemplate;
+                if (!options.allow_raft_marker or op.value.len != 16) return error.UnsupportedCompletionTemplate;
                 try template.bind(i, .{ .kind = .raft_term, .target = .value, .byte_order = .little, .offset = 0 });
                 try template.bind(i, .{ .kind = .raft_index, .target = .value, .byte_order = .little, .offset = 8 });
             } else if (op.key.len != 0 and op.key[0] == internal_keys.replay_namespace) {

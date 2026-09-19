@@ -17,6 +17,17 @@ pub const publication_marker_name = ".antfly-generation-publication-v2";
 /// Native completion publishes this guard durably before its descriptor.
 /// Only the native recovery/completion owner may remove it after proven absence.
 pub const completion_guard_name = "completion-slot.guard";
+/// Accepted Raft envelopes own physical resources before a prepared descriptor
+/// exists. Every marker fences generation replacement, including corrupt or
+/// empty files; only the native reconciliation owner can prove retirement.
+pub const completion_guard_names = [_][]const u8{
+    completion_guard_name,
+    "completion-installation.guard",
+    "completion-accepted-0.guard",
+    "completion-accepted-1.guard",
+    "completion-accepted-2.guard",
+    "completion-accepted-3.guard",
+};
 const publication_marker_tmp_name = ".antfly-generation-publication-v2.tmp";
 const max_publication_marker_bytes = 4096;
 const publication_lock_suffix = ".antfly-generation.lock";
@@ -1186,14 +1197,17 @@ pub const StagedGeneration = struct {
 };
 
 fn requireNoPreparedCompletion(alloc: Allocator, io: std.Io, root: []const u8) !void {
-    const path = try std.fs.path.join(alloc, &.{ root, completion_guard_name });
-    defer alloc.free(path);
-    _ = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        // File-backed Lite roots cannot contain native LSM obligations.
-        error.FileNotFound, error.NotDir => return,
-        else => return err,
-    };
-    return error.PreparedCompletionActive;
+    for (completion_guard_names) |name| {
+        const path = try std.fs.path.join(alloc, &.{ root, name });
+        defer alloc.free(path);
+        _ = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            // File-backed Lite roots cannot contain native LSM obligations.
+            error.NotDir => return,
+            else => return err,
+        };
+        return error.PreparedCompletionActive;
+    }
 }
 
 fn pathExists(io: std.Io, path: []const u8) bool {
@@ -2892,45 +2906,47 @@ test "atomic exchange failure leaves live and staged generations unchanged" {
 
 test "workload admission completion guard prevents live and incoming generation publication" {
     const alloc = std.testing.allocator;
-    for ([_]bool{ false, true }) |incoming| {
-        var tmp = std.testing.tmpDir(.{});
-        defer tmp.cleanup();
-        const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-live", .{tmp.sub_path});
-        defer alloc.free(live_path);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        try fs_paths.createDirPathPortable(io, live_path);
-        const old_path = try std.fs.path.join(alloc, &.{ live_path, "value" });
-        defer alloc.free(old_path);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = old_path, .data = "old" });
-        var manager = Manager.init(alloc);
-        defer manager.deinit();
-        var transition = try manager.beginExclusive(live_path);
-        defer transition.deinit();
-        var staged = try transition.beginStaging();
-        defer staged.deinit();
-        const new_path = try std.fs.path.join(alloc, &.{ staged.path(), "value" });
-        defer alloc.free(new_path);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = new_path, .data = "new" });
-        const guard_path = try std.fs.path.join(alloc, &.{ if (incoming) staged.path() else live_path, completion_guard_name });
-        defer alloc.free(guard_path);
-        // Even a stale/empty marker is a denial until native recovery proves
-        // absence. No descriptor parsing or inferred terminal state here.
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = guard_path, .data = "" });
-        try std.testing.expectError(error.PreparedCompletionActive, staged.publishPrepared());
-        try std.testing.expect(!staged.published);
-        const marker_path = try publicationMarkerPathAlloc(alloc, staged.path());
-        defer alloc.free(marker_path);
-        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, marker_path, .{}));
-        const old = try std.Io.Dir.cwd().readFileAlloc(io, old_path, alloc, .limited(16));
-        defer alloc.free(old);
-        const new = try std.Io.Dir.cwd().readFileAlloc(io, new_path, alloc, .limited(16));
-        defer alloc.free(new);
-        try std.testing.expectEqualStrings("old", old);
-        try std.testing.expectEqualStrings("new", new);
-        try std.Io.Dir.cwd().deleteFile(io, guard_path);
-        try std.testing.expectEqual(PublicationOutcome.durable, try staged.publish());
+    for (completion_guard_names) |guard_name| {
+        for ([_]bool{ false, true }) |incoming| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-live", .{tmp.sub_path});
+            defer alloc.free(live_path);
+            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io_impl.deinit();
+            const io = io_impl.io();
+            try fs_paths.createDirPathPortable(io, live_path);
+            const old_path = try std.fs.path.join(alloc, &.{ live_path, "value" });
+            defer alloc.free(old_path);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = old_path, .data = "old" });
+            var manager = Manager.init(alloc);
+            defer manager.deinit();
+            var transition = try manager.beginExclusive(live_path);
+            defer transition.deinit();
+            var staged = try transition.beginStaging();
+            defer staged.deinit();
+            const new_path = try std.fs.path.join(alloc, &.{ staged.path(), "value" });
+            defer alloc.free(new_path);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = new_path, .data = "new" });
+            const guard_path = try std.fs.path.join(alloc, &.{ if (incoming) staged.path() else live_path, guard_name });
+            defer alloc.free(guard_path);
+            // Even a stale/empty marker is a denial until native recovery proves
+            // absence. No descriptor parsing or inferred terminal state here.
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = guard_path, .data = "" });
+            try std.testing.expectError(error.PreparedCompletionActive, staged.publishPrepared());
+            try std.testing.expect(!staged.published);
+            const marker_path = try publicationMarkerPathAlloc(alloc, staged.path());
+            defer alloc.free(marker_path);
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, marker_path, .{}));
+            const old = try std.Io.Dir.cwd().readFileAlloc(io, old_path, alloc, .limited(16));
+            defer alloc.free(old);
+            const new = try std.Io.Dir.cwd().readFileAlloc(io, new_path, alloc, .limited(16));
+            defer alloc.free(new);
+            try std.testing.expectEqualStrings("old", old);
+            try std.testing.expectEqualStrings("new", new);
+            try std.Io.Dir.cwd().deleteFile(io, guard_path);
+            try std.testing.expectEqual(PublicationOutcome.durable, try staged.publish());
+        }
     }
 }
 
@@ -2947,10 +2963,13 @@ test "workload admission completion guard treats dangling marker symlinks as obl
     try requireNoPreparedCompletion(alloc, io, root);
     try fs_paths.createDirPathPortable(io, root);
     try requireNoPreparedCompletion(alloc, io, root);
-    const marker = try std.fs.path.join(alloc, &.{ root, completion_guard_name });
-    defer alloc.free(marker);
-    try std.Io.Dir.cwd().symLink(io, "missing-descriptor", marker, .{});
-    // stat must not follow the marker: a dangling link is not proof that
-    // native recovery removed the guard after a durable terminal result.
-    try std.testing.expectError(error.PreparedCompletionActive, requireNoPreparedCompletion(alloc, io, root));
+    for (completion_guard_names) |name| {
+        const marker = try std.fs.path.join(alloc, &.{ root, name });
+        defer alloc.free(marker);
+        try std.Io.Dir.cwd().symLink(io, "missing-descriptor", marker, .{});
+        // A dangling link cannot prove native reconciliation retired ownership.
+        try std.testing.expectError(error.PreparedCompletionActive, requireNoPreparedCompletion(alloc, io, root));
+        try std.Io.Dir.cwd().deleteFile(io, marker);
+        try requireNoPreparedCompletion(alloc, io, root);
+    }
 }
