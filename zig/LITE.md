@@ -64,7 +64,10 @@ The implementation now consists of:
   log. Namespace heads use a copy-on-write catalog B+ tree, so updates and
   cold writes touch only the requested namespaces and their tree paths. Tiny
   directories (at most 32 namespaces fitting one page) retain the existing
-  inline snapshot encoding without extra tree pages. Larger legacy snapshot/
+  inline snapshot encoding without extra tree pages. Their bounded cache retains
+  namespace keys across mutations, reserving new ownership before checkpoint
+  publication and updating heads without allocation afterward. Promotion and
+  rollback invalidate the cache. Larger legacy snapshot/
   delta directories migrate atomically on their next document mutation; new
   large directories and vacuum output build the index directly. Old pinned
   checkpoints retain their original layout. Both layouts use existing v3 page
@@ -1248,7 +1251,11 @@ bounds, pinned snapshot semantics, and rollback after private deletion flushes.
 
 Large document and index values share a checksum-checked chunk reader for
 linked chains and extent trees. A 64 KiB positional-read window coalesces nearby
-value pages; metadata and small ranges request one page. Full reads allocate
+value pages. Extent reads coalesce only physically contiguous references within
+the requested range; linked chains grow read-ahead while page adjacency holds
+and reset it at gaps. Requested pages enter the shared cache according to its
+normal or metadata-only policy; unused prefetched pages are never admitted.
+Full reads allocate
 the returned value once and retain only bounded traversal state. Read windows
 remain tied to their pinned checkpoint and never cross its page-count bound.
 
@@ -1262,3 +1269,14 @@ updates trade the former five-page delta for eight pages to remove snapshot
 spikes and whole-directory cold loads. Tiny directories keep their original
 page layout. Regression tests bound allocation counts, physical value-read
 calls, hot/cold mutation heap, and page writes; timings are not assertions.
+
+Read regressions also bound bytes transferred for values assembled by small
+appends, not just the number of calls. A fragmented 1 MiB value now reads
+1,081,344 bytes through the value-page reader (including extent metadata,
+excluding catalog lookup and the root probe). Repeated small range reads need
+no value-page I/O after warming under the normal cache policy; metadata-only
+readers retain extent metadata while leaving payloads uncached. Across 200
+small document commits, retaining the inline directory cache restores the
+single-namespace path to 3,821 allocations and reduces the 32-namespace path
+from 11,821 to 4,421. Failure sweeps cover directory-loading ownership and
+inline-cache preparation, including private publication followed by rollback.
