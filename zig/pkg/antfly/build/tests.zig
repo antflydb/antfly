@@ -1651,6 +1651,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const secret_backend_tests = b.addTest(.{
         .root_module = secret_backend_test_mod,
         .filters = &.{"secret backend"},
+        // This integration artifact links metadata and storage together; the
+        // merged macOS Debug compile peaks around 11.3 GB.
+        .max_rss = if (target.result.os.tag == .macos) 13 * 1024 * 1024 * 1024 else 0,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_secret_backend_tests = addFilteredTestRunArtifact(b, secret_backend_tests);
