@@ -21,6 +21,21 @@ const wal = @import("wal.zig");
 const runtime = @import("runtime.zig");
 const Directory = @import("run_directory.zig").Directory;
 
+pub const receipt_prefix = @import("completion_entry.zig").receipt_prefix;
+pub const receiptKey = @import("completion_entry.zig").receiptKey;
+pub const AcceptedIdentity = struct {
+    term: u64,
+    index: u64,
+    digest: [32]u8,
+    pub fn encode(self: AcceptedIdentity) [48]u8 {
+        var value: [48]u8 = undefined;
+        std.mem.writeInt(u64, value[0..8], self.term, .little);
+        std.mem.writeInt(u64, value[8..16], self.index, .little);
+        @memcpy(value[16..48], &self.digest);
+        return value;
+    }
+};
+
 pub const applied_key = "\x00\x00__metadata__:completion_applied_v1";
 pub const guard_filename = "completion-slot.guard";
 pub var test_after_wal: ?*const fn () bool = null;
@@ -54,12 +69,58 @@ pub const Values = struct {
     raft_index: u64 = 0,
 };
 
+pub const PooledBaseline = struct {
+    record: ?[53]u8 = null,
+    credit: ?[16]u8 = null,
+    summary: ?[16]u8 = null,
+    applied: ?[16]u8 = null,
+    slot_present: bool = false,
+};
+
+pub const PublicationDomain = union(enum) {
+    arena: *domains.Arena,
+    reservation: *domains.PublicationReservation,
+
+    pub fn allocator(self: PublicationDomain) std.mem.Allocator {
+        return switch (self) {
+            .arena => |value| value.allocator(),
+            .reservation => |value| value.allocator(),
+        };
+    }
+    fn release(self: PublicationDomain) void {
+        switch (self) {
+            .arena => |value| value.release(),
+            .reservation => |value| value.finish(),
+        }
+    }
+};
+
+pub const ScratchDomain = union(enum) {
+    arena: *domains.Arena,
+    borrowed: *domains.RecyclingScratch,
+
+    pub fn allocator(self: ScratchDomain) std.mem.Allocator {
+        return switch (self) {
+            .arena => |value| value.allocator(),
+            .borrowed => |value| value.allocator(),
+        };
+    }
+    fn release(self: ScratchDomain) void {
+        switch (self) {
+            .arena => |value| value.release(),
+            .borrowed => {},
+        }
+    }
+};
+
 pub fn Slot(comptime Backend: type) type {
     return struct {
         const Self = @This();
         allocator: std.mem.Allocator,
-        publication: *domains.Arena,
-        scratch: *domains.Arena,
+        publication: PublicationDomain,
+        scratch: ScratchDomain,
+        pooled_owner: ?PooledOwner = null,
+        accepted_identity: ?AcceptedIdentity = null,
         descriptor: codec.OwnedDescriptor,
         encoded: []u8,
         guard_encoded: []u8,
@@ -89,6 +150,148 @@ pub fn Slot(comptime Backend: type) type {
         baseline_applied: ?[16]u8 = null,
         baseline_slot_present: bool = false,
 
+        pub const PooledOwner = struct {
+            context: *anyopaque,
+            release_cell: *const fn (*anyopaque, *Self) void,
+            restore_wal_credits_after_checkpoint: *const fn (*anyopaque, *Backend) anyerror!void,
+        };
+
+        pub const PooledInput = struct {
+            self_storage: *Self,
+            publication: *domains.PublicationReservation,
+            scratch: *domains.RecyclingScratch,
+            io: *storage_io.NativeCompletionIo,
+            memory_pin: resources.ObserverMetadataPin,
+            wal_pin: resources.ObserverMetadataPin,
+            owner: PooledOwner,
+            baseline: PooledBaseline,
+            /// Set only after the pool has matched the persisted prepare and
+            /// receipt to this accepted identity during startup reconciliation.
+            durable_restored: bool = false,
+            accepted_identity: AcceptedIdentity,
+            encoded: []const u8,
+            cohort: guard.Info,
+            guard_path: []const u8,
+            journal_path: []const u8,
+            run_paths: [max_slots]?[]const u8,
+        };
+
+        /// All backing, WAL credit, observer identities and paths were installed
+        /// before consensus acceptance. This constructor uses only the cell's
+        /// concrete publication span and performs no baseline storage reads.
+        pub fn createFromPool(backend: *Backend, input: PooledInput) !*Self {
+            const alloc = input.publication.allocator();
+            const self = input.self_storage;
+            var descriptor = try codec.decode(alloc, input.encoded, .{});
+            errdefer descriptor.deinit();
+            if ((if (descriptor.descriptor.namespace) |name| !std.mem.eql(u8, name, "docs") else false) or
+                !std.meta.eql(descriptor.descriptor.limits, limits) or input.cohort.capacity() > max_slots or input.cohort.index >= input.cohort.capacity())
+                return error.InvalidCompletionSlot;
+            if (input.durable_restored and !input.baseline.slot_present) return error.InvalidCompletionSlot;
+            const wire = try alloc.dupe(u8, input.encoded);
+            errdefer alloc.free(wire);
+            const guard_wire = try guard.encode(alloc, input.cohort, input.encoded);
+            errdefer alloc.free(guard_wire);
+            const guard_path = try alloc.dupe(u8, input.guard_path);
+            errdefer alloc.free(guard_path);
+            const journal_path = try alloc.dupe(u8, input.journal_path);
+            errdefer alloc.free(journal_path);
+            var paths: [max_slots]?[]u8 = @splat(null);
+            errdefer for (paths) |path| if (path) |owned| alloc.free(owned);
+            for (0..input.cohort.capacity()) |i| paths[i] = try alloc.dupe(u8, input.run_paths[i] orelse return error.InvalidCompletionSlot);
+            const wal_credit = self.wal_credit;
+            self.* = .{
+                .allocator = alloc,
+                .publication = .{ .reservation = input.publication },
+                .scratch = .{ .borrowed = input.scratch },
+                .pooled_owner = input.owner,
+                .accepted_identity = input.accepted_identity,
+                .descriptor = descriptor,
+                .encoded = wire,
+                .guard_encoded = guard_wire,
+                .cohort = input.cohort,
+                .run_paths = paths,
+                .io = input.io,
+                .wal_credit = wal_credit,
+                .memory_pin = input.memory_pin,
+                .wal_pin = input.wal_pin,
+                .owns_observer_pins = false,
+                .guard_path = guard_path,
+                .journal_path = journal_path,
+                .run_path = paths[0].?,
+                .run_id = input.cohort.base_run_id,
+                .wal_append_start = backend.write_stats.wal_append_bytes,
+                .wal_entries_start = backend.write_stats.wal_append_entries,
+                .wal_records_start = backend.write_stats.wal_append_records,
+                .baseline_record = input.baseline.record,
+                .baseline_credit = input.baseline.credit,
+                .baseline_summary = input.baseline.summary,
+                .baseline_applied = input.baseline.applied,
+                .baseline_slot_present = input.baseline.slot_present,
+                .durable = input.durable_restored,
+            };
+            return self;
+        }
+
+        /// Publish the leader's canonical prepare using held native capacity.
+        /// The caller holds backend serialization and has installed this cell
+        /// in the pending cohort. No logical planner/provider is invoked here.
+        pub fn applyCanonicalPrepare(self: *Self, backend: *Backend, operations: []const codec.Operation) !void {
+            const identity = self.accepted_identity orelse return error.InvalidCompletionSlot;
+            if (identity.term == 0 or identity.index == 0 or operations.len == 0 or operations.len > 256)
+                return error.InvalidCompletionSlot;
+            if (self.pooled_owner == null or self.attempted or backend.manifest_recovery_required)
+                return error.RecoveryRequired;
+            if (self.durable) return;
+            const alloc = self.scratch.allocator();
+            const publication_alloc = self.publication.allocator();
+            const namespace = @import("../backend_types.zig").Namespace{ .name = self.descriptor.descriptor.namespace };
+            var incoming: state.ActiveMemTable = .{ .ordered_enabled = false };
+            defer incoming.deinit(alloc);
+            for (operations) |op| {
+                if (op.bindings.len != 0) return error.InvalidCompletionSlot;
+                for (storage_keys) |key| if (std.mem.eql(u8, op.key, key)) return error.InvalidCompletionSlot;
+                for (applied_keys) |key| if (std.mem.eql(u8, op.key, key)) return error.InvalidCompletionSlot;
+                if (std.mem.startsWith(u8, op.key, receipt_prefix)) return error.InvalidCompletionSlot;
+                if (std.mem.eql(u8, op.key, &@import("../internal_keys.zig").raft_document_applied_entry_key)) return error.InvalidCompletionSlot;
+                try incoming.upsert(alloc, namespace, op.key, op.value, op.kind == .delete);
+            }
+            const marker_key = @import("../internal_keys.zig").raft_document_applied_entry_key;
+            const receipt_key = receiptKey(self.descriptor.descriptor.txn_id);
+            const receipt = identity.encode();
+            try incoming.upsert(alloc, namespace, self.storageKey(), self.encoded, false);
+            try incoming.upsert(alloc, namespace, &marker_key, receipt[0..16], false);
+            try incoming.upsert(alloc, namespace, &receipt_key, &receipt, false);
+            var candidate = try backend.mutable.preparePublication(publication_alloc, &incoming);
+            defer candidate.deinit(publication_alloc);
+            var append = try wal.PreparedAppend.init(alloc, backend.root_dir.?, &incoming, true, .{ .segment_bytes = backend.options.wal_segment_bytes });
+            defer append.deinit();
+            const charge: u64 = @intCast(append.record.len);
+            if (charge > self.wal_credit) return error.CompletionPlanCapacityExceeded;
+            var wal_lock = try backend.acquireWalOperationLock(.exclusive);
+            defer wal_lock.release();
+            self.attempted = true;
+            errdefer backend.fenceFailedBulkWal();
+            try self.writeGuard();
+            try self.wal_pin.manager.transferUsage(.lsm_wal_retention, &self.wal_credit, self.wal_credit - charge, &backend.tracked_wal_retention_bytes, backend.tracked_wal_retention_bytes + charge);
+            const outcome = try backend.wal_retention.appendPrepared(self.io.storage(), alloc, &append, backend.writeStatsNowNs());
+            const result = switch (outcome) {
+                .appended => |result| result,
+                .uncertain => |err| return err,
+            };
+            backend.write_stats.wal_append_records += 1;
+            backend.write_stats.wal_append_entries += incoming.entryCount();
+            backend.write_stats.wal_append_bytes += result.bytes;
+            backend.noteMutableWalSegment(result.segment);
+            try refreshCohortBaselines(backend, &incoming);
+            backend.invalidateMutableReadSnapshot();
+            backend.mutable.publishPrepared(&candidate);
+            backend.syncTrackedInMemoryStateUsageCurrentLocked();
+            self.baseline_slot_present = true;
+            self.durable = true;
+            self.attempted = false;
+        }
+
         fn captureBaseline(backend: *Backend, namespace: ?[]const u8, key: []const u8, comptime size: usize) !?[size]u8 {
             const raw = backend.getMergedWithMutable(&backend.mutable, .{ .name = namespace }, key) catch |err| switch (err) {
                 error.NotFound => return null,
@@ -112,9 +315,10 @@ pub fn Slot(comptime Backend: type) type {
             const alloc = self.allocator;
             const pub_domain = self.publication;
             const scratch_domain = self.scratch;
-            self.io.deinit() catch unreachable;
+            const pooled_owner = self.pooled_owner;
+            if (pooled_owner == null) self.io.deinit() catch unreachable;
             const manager = self.wal_pin.manager;
-            manager.observeUsage(.lsm_wal_retention, &self.wal_credit, 0);
+            if (pooled_owner == null) manager.observeUsage(.lsm_wal_retention, &self.wal_credit, 0);
             if (self.owns_observer_pins) {
                 self.wal_pin.release() catch unreachable;
                 self.memory_pin.release() catch unreachable;
@@ -125,9 +329,10 @@ pub fn Slot(comptime Backend: type) type {
             alloc.free(self.guard_encoded);
             alloc.free(self.journal_path);
             for (self.run_paths) |path| if (path) |owned| alloc.free(owned);
-            alloc.destroy(self);
+            if (pooled_owner == null) alloc.destroy(self);
             scratch_domain.release();
             pub_domain.release();
+            if (pooled_owner) |owner| owner.release_cell(owner.context, self);
         }
 
         pub fn create(backend: *Backend, encoded: []const u8, restored: bool, cohort: guard.Info) !*Self {
@@ -242,7 +447,7 @@ pub fn Slot(comptime Backend: type) type {
             const io = try storage_io.NativeCompletionIo.createWithFilesAndHeadroom(alloc, native, root, files[0 .. 5 + cohort.capacity()], 2);
             errdefer io.deinit() catch unreachable;
             io.allow_wal_reset = true;
-            self.* = .{ .allocator = alloc, .publication = publication, .scratch = scratch, .descriptor = descriptor, .encoded = wire, .guard_encoded = guard_wire, .cohort = cohort, .run_paths = run_paths, .io = io, .wal_credit = self.wal_credit, .memory_pin = memory_pin, .wal_pin = wal_pin, .owns_observer_pins = owns_observer_pins, .guard_path = guard_path, .wal_append_start = backend.write_stats.wal_append_bytes, .wal_entries_start = backend.write_stats.wal_append_entries, .wal_records_start = backend.write_stats.wal_append_records, .run_id = run_id, .journal_path = journal_path, .run_path = run_path, .durable = restored, .baseline_record = baseline_record, .baseline_credit = baseline_credit, .baseline_summary = baseline_summary, .baseline_applied = baseline_applied, .baseline_slot_present = baseline_slot_present };
+            self.* = .{ .allocator = alloc, .publication = .{ .arena = publication }, .scratch = .{ .arena = scratch }, .descriptor = descriptor, .encoded = wire, .guard_encoded = guard_wire, .cohort = cohort, .run_paths = run_paths, .io = io, .wal_credit = self.wal_credit, .memory_pin = memory_pin, .wal_pin = wal_pin, .owns_observer_pins = owns_observer_pins, .guard_path = guard_path, .wal_append_start = backend.write_stats.wal_append_bytes, .wal_entries_start = backend.write_stats.wal_append_entries, .wal_records_start = backend.write_stats.wal_append_records, .run_id = run_id, .journal_path = journal_path, .run_path = run_path, .durable = restored, .baseline_record = baseline_record, .baseline_credit = baseline_credit, .baseline_summary = baseline_summary, .baseline_applied = baseline_applied, .baseline_slot_present = baseline_slot_present };
             if (!restored) {
                 // Any storage failure may have published this durable anchor.
                 // Never let an uncertain create resume ordinary mutation.
@@ -262,7 +467,7 @@ pub fn Slot(comptime Backend: type) type {
             return applied_keys[self.cohort.index];
         }
 
-        fn refreshField(self: *Self, backend: *Backend, delta: *const state.State, key: []const u8, comptime n: usize, baseline: *?[n]u8) !void {
+        fn refreshField(self: *Self, backend: *Backend, delta: anytype, key: []const u8, comptime n: usize, baseline: *?[n]u8) !void {
             const value = if (delta.findIndex(.{ .name = self.descriptor.descriptor.namespace }, key)) |index| blk: {
                 const entry = delta.entryAt(index);
                 break :blk if (entry.tombstone) null else entry.value;
@@ -273,7 +478,7 @@ pub fn Slot(comptime Backend: type) type {
             } else baseline.* = null;
         }
 
-        fn refreshCohortBaselines(backend: *Backend, delta: *const state.State) !void {
+        fn refreshCohortBaselines(backend: *Backend, delta: anytype) !void {
             for (backend.durable_completion_members) |maybe| if (maybe) |member| {
                 const id = member.descriptor.descriptor.txn_id;
                 const record = "\x00\x00__txn_records__:".* ++ id;
@@ -425,8 +630,13 @@ pub fn Slot(comptime Backend: type) type {
                 if (op.kind == .put) try codec.finishBoundValue(op, value);
                 try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, key, value, op.kind == .delete);
             }
+            if (self.pooled_owner != null) {
+                const receipt_key = receiptKey(self.descriptor.descriptor.txn_id);
+                try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, &receipt_key, "", true);
+            }
             try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, self.storageKey(), "", true);
             try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, self.appliedKey(), &self.descriptor.descriptor.txn_id, false);
+            try backend.checkCompletionPoolFootprint(&delta);
             try self.drain(backend, &delta, true, true);
         }
 
@@ -601,6 +811,7 @@ pub fn Slot(comptime Backend: type) type {
             backend.wal_retention.replay = .{ .current_segment = 1 };
             backend.wal_retention.primary_ns = backend.writeStatsNowNs();
             backend.wal_retention.replay_ns = backend.writeStatsNowNs();
+            if (self.pooled_owner) |owner| try owner.restore_wal_credits_after_checkpoint(owner.context, backend);
             self.wal_pin.manager.observeUsage(.lsm_wal_retention, &backend.tracked_wal_retention_bytes, 0);
             _ = retire_guard; // Cohort retirement clears all guards only when every member is terminal.
             for (backend.durable_completion_members) |maybe| if (maybe) |member| {

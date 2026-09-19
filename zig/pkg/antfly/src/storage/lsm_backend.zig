@@ -25,6 +25,7 @@ const lsm_manifest = @import("lsm/manifest.zig");
 const lsm_table_file = @import("lsm/table_file.zig");
 const state_mod = @import("lsm_backend/state.zig");
 const completion_allocator = @import("lsm_backend/completion_allocator.zig");
+pub const completion_pool_mod = @import("lsm_backend/completion_pool.zig");
 const completion_runtime = @import("lsm_backend/completion_runtime.zig");
 pub const completion_slot_codec = @import("lsm_backend/completion_slot.zig");
 const repository_mod = @import("lsm_backend/repository.zig");
@@ -347,6 +348,8 @@ fn atomicMaxCounter(counter: *CounterU64, candidate: u64) void {
 }
 
 pub const Options = struct {
+    /// Trusted persisted group activation binding, supplied before guarded replay.
+    completion_pool_config: ?completion_pool_mod.Config = null,
     /// Backend-owned internal cleanup sink; reset on every open/init.
     unpublished_outputs: ?*output_cleanup.Queue = null,
     backend: backend_types.OpenOptions = .{},
@@ -1599,6 +1602,7 @@ pub const Backend = struct {
     next_run_id: u64 = 1,
     active_readers: usize = 0,
     completion_batches: ?*CompletionPointBatch = null,
+    completion_pool: ?*CompletionPool = null,
     durable_completion: ?*DurableCompletionSlot = null,
     durable_completion_members: [completion_runtime.max_slots]?*DurableCompletionSlot = @splat(null),
     active_readers_by_kind: [reader_pin_kind_count]usize = [_]usize{0} ** reader_pin_kind_count,
@@ -1892,8 +1896,9 @@ pub const Backend = struct {
         // A pending/uncertain slot already has a durable WAL/guard handoff.
         // Closing must not attempt an ordinary flush after dropping its
         // protected resources, nor turn expected recovery into an error log.
-        const guarded = self.durable_completion != null;
+        const guarded = self.durable_completion != null or self.completion_pool != null;
         self.releaseDurableCompletion();
+        self.releaseCompletionPool();
         self.releaseTrackedResourceUsage();
         if (guarded) recovery_mod.abandon(Backend, self) else recovery_mod.close(Backend, self);
     }
@@ -1902,6 +1907,7 @@ pub const Backend = struct {
         self.closing.store(true, .release);
         self.background_executor.drain();
         self.releaseDurableCompletion();
+        self.releaseCompletionPool();
         self.releaseTrackedResourceUsage();
         recovery_mod.abandon(Backend, self);
     }
@@ -2094,7 +2100,7 @@ pub const Backend = struct {
     pub fn requestValueReclamation(self: *Backend) !void {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         if (self.options.backend.read_only) return error.ReadOnly;
         const current = try self.planningDirectory();
         var wire: u64 = 128;
@@ -3206,7 +3212,7 @@ pub const Backend = struct {
     }
 
     fn runMaintenanceStepLocked(self: *Backend, required_gc: bool) !bool {
-        if (self.durable_completion != null) return false;
+        if (self.durable_completion != null or self.completion_pool != null) return false;
         // Cleanup is safe even after a durability fence or under pressure.
         // The unlock path executes one bounded FIFO reclamation turn.
         if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return true;
@@ -4131,7 +4137,7 @@ pub const Backend = struct {
         self.immutable_head = 0;
     }
 
-    fn noteMutableWalSegment(self: *Backend, segment: u64) void {
+    pub fn noteMutableWalSegment(self: *Backend, segment: u64) void {
         if (segment == 0) return;
         if (!self.mutable_wal_range.isSet()) {
             self.mutable_wal_range = .{ .first = segment, .last = segment };
@@ -4418,6 +4424,7 @@ pub const Backend = struct {
         } else if (locked) self.mu.unlock();
     }
 
+    pub const CompletionPool = completion_pool_mod.Pool(Backend);
     pub const DurableCompletionSlot = completion_runtime.Slot(Backend);
     pub const durable_completion_limits = completion_runtime.limits;
     pub const DurableCompletionValues = completion_runtime.Values;
@@ -4429,6 +4436,7 @@ pub const Backend = struct {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
         if (self.closing.load(.acquire)) return error.LsmBackendClosed;
+        if (self.completion_pool != null) return error.PreparedCompletionActive;
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         const native = self.storage_owner orelse return error.UnsupportedCompletionBackend;
         if (self.root_dir == null or self.storage == null or self.options.backend.read_only or
@@ -4542,6 +4550,7 @@ pub const Backend = struct {
 
     pub fn retireDurableCompletionCohort(self: *Backend) !void {
         if (self.hasDurableCompletions()) return;
+        if (self.completion_pool) |pool| if (pool.hasAcceptedDebt()) return;
         errdefer self.fenceFailedBulkWal();
         // Index zero remains the generation-fencing anchor until every sibling
         // guard is gone. Interrupted cleanup can only expose manifested outcomes.
@@ -4550,6 +4559,7 @@ pub const Backend = struct {
             i -= 1;
             if (self.durable_completion_members[i]) |slot| try slot.clearGuard();
         }
+        if (self.completion_pool) |pool| try pool.clearTerminalAccepted();
         self.releaseDurableCompletion();
     }
 
@@ -4636,6 +4646,49 @@ pub const Backend = struct {
         try slot.complete(self, commit, bound);
         slot.retired = true;
         try self.retireDurableCompletionCohort();
+    }
+
+    /// Install physical backing only after trusted group policy/identity binding.
+    /// Readiness and Raft leases remain unavailable until native restoration and
+    /// shape qualification succeed. Caller holds backend serialization.
+    pub fn installCompletionPoolLocked(self: *Backend, config: completion_pool_mod.Config) !void {
+        if (self.completion_pool != null) return error.CompletionReservationBusy;
+        if (self.closing.load(.acquire)) return error.LsmBackendClosed;
+        const pool = try CompletionPool.create(self, config);
+        errdefer pool.destroy();
+        try pool.restoreAccepted(self);
+        self.completion_pool = pool;
+    }
+
+    pub fn checkCompletionPoolFootprint(self: *Backend, incoming: anytype) !void {
+        if (self.completion_pool) |pool| try pool.checkAcceptedFootprint(incoming);
+    }
+
+    /// Apply exactly the preowned envelope identified by consensus. No ordinary
+    /// planner, allocator or callback discovery may run at this boundary.
+    pub fn applyAcceptedCompletion(self: *Backend, term: u64, index: u64, digest: [32]u8) !void {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        const pool = self.completion_pool orelse return error.CompletionRecoveryCapacityRequired;
+        const cell_index = for (pool.cells[0..pool.cell_count], 0..) |cell, i| {
+            if (cell.index != index or cell.term != term or cell.entry == null) continue;
+            if (!std.mem.eql(u8, &cell.entry.?.digest, &digest)) return error.InvalidCompletionSlot;
+            break i;
+        } else return error.InvalidCompletionSlot;
+        const slot = try pool.adopt(self, cell_index);
+        if (self.durable_completion_members[cell_index]) |existing| {
+            if (existing != slot) return error.InvalidCompletionSlot;
+        } else self.durable_completion_members[cell_index] = slot;
+        if (self.durable_completion == null) self.durable_completion = slot;
+        try slot.applyCanonicalPrepare(self, pool.cells[cell_index].entry.?.entry.prepare_operations);
+        pool.notifyApplied(cell_index);
+    }
+
+    pub fn releaseCompletionPool(self: *Backend) void {
+        const pool = self.completion_pool orelse return;
+        self.completion_pool = null;
+        pool.destroy();
     }
 
     pub fn releaseDurableCompletion(self: *Backend) void {
@@ -4819,7 +4872,7 @@ pub const Backend = struct {
     }
 
     pub fn maybeFlushMutable(self: *Backend) !void {
-        if (self.durable_completion != null) return;
+        if (self.durable_completion != null or self.completion_pool != null) return;
         if (self.shouldFlushMutable()) {
             if (self.shouldDeferCommitFlush()) {
                 try self.rotateMutableToImmutable();
@@ -5255,7 +5308,7 @@ pub const Backend = struct {
     }
 
     pub fn flushMutable(self: *Backend) !void {
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         if (self.mutable.entryCount() > 0) {
             try self.rotateMutableToImmutable();
         }
@@ -5263,7 +5316,7 @@ pub const Backend = struct {
     }
 
     fn directIngestMutableAtBulkFinishIfPossible(self: *Backend) !bool {
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         if (!self.options.direct_bulk_ingest) return false;
         if (self.mutable.entryCount() == 0) return false;
         if (self.activeImmutableMemtableCount() != 0) return false;
@@ -5278,7 +5331,7 @@ pub const Backend = struct {
     }
 
     pub fn drainMutableBeforeBulkAppendDirectIngest(self: *Backend) !bool {
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         if (!self.options.direct_bulk_ingest) return false;
         if (self.canQueueDirectBulkStateWithPendingImmutable()) {
             // The queued epochs remain older than the incoming sorted state.
@@ -5316,7 +5369,7 @@ pub const Backend = struct {
     /// preserves last-write-wins without manufacturing a small run for the old
     /// mutable state followed immediately by another run for the new batch.
     pub fn directIngestCombinedMutable(self: *Backend, incoming: *ActiveMemTable) !bool {
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         if (!self.options.direct_bulk_ingest) return false;
 
         if (self.canQueueDirectBulkStateWithPendingImmutable()) {
@@ -5342,7 +5395,7 @@ pub const Backend = struct {
     }
 
     fn rotateMutableToImmutable(self: *Backend) !void {
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         if (self.mutable.entryCount() == 0) return;
         self.invalidateMutableReadSnapshot();
         const rotated_logical_bytes = self.mutable.logical_bytes;
@@ -5781,7 +5834,7 @@ pub const Backend = struct {
     }
 
     pub fn ingestSortedTableEntries(self: *Backend, entries: []const TableEntry) !void {
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         if (self.options.backend.read_only) return error.ReadOnly;
         if (entries.len == 0) return;
 
@@ -5817,7 +5870,7 @@ pub const Backend = struct {
     }
 
     pub fn ingestSortedState(self: *Backend, state: *const State) !void {
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         if (self.options.backend.read_only) return error.ReadOnly;
         if (state.entryCount() == 0) return;
 
@@ -5859,7 +5912,7 @@ pub const Backend = struct {
     }
 
     pub fn ingestOwnedSortedState(self: *Backend, state: *State) !void {
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         if (self.options.backend.read_only) return error.ReadOnly;
         if (state.entryCount() == 0) return;
         if (self.root_dir != null) {
@@ -5914,7 +5967,7 @@ pub const Backend = struct {
     /// the mutable WAL range belongs to the moved state and is transferred at
     /// the same lock-held visibility boundary.
     pub fn enqueueOwnedSortedStateForFlush(self: *Backend, state: *State) !bool {
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         if (self.options.immutable_flush_window_bytes == 0 or
             self.root_dir == null or
             self.storage == null or
@@ -5979,7 +6032,7 @@ pub const Backend = struct {
 
     /// Caller owns the backend mutex; publication may temporarily release it.
     pub fn persistManifestLocked(self: *Backend) !void {
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         const root_dir = self.root_dir orelse return;
         // A flush may have already installed its SSTs and retired the mutable
         // generation. Keep publication debt visible even when append/sync
@@ -6314,6 +6367,7 @@ pub const Backend = struct {
 
     fn appendWalWithPreparation(self: *Backend, state: anytype, prepared: ?*ActiveMemTable) !void {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
+        if (self.completion_pool) |pool| try pool.checkOrdinary(self, state);
         if (self.durable_completion) |slot| try slot.checkWalInput(self, state);
         const wal_enabled = self.options.wal_enabled and self.root_dir != null and !self.options.backend.read_only and state.entryCount() != 0;
 
@@ -6321,6 +6375,7 @@ pub const Backend = struct {
         if (wal_enabled) try self.prepareWalAppendForPressureLocked(encoded_bytes);
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         // Pressure relief may release the mutex and let another writer append.
+        if (self.completion_pool) |pool| try pool.checkOrdinary(self, state);
         if (self.durable_completion) |slot| try slot.checkWalInput(self, state);
         // Pressure relief can flush and unlock the backend. Pin/build the
         // successor only after that work, at the final serialized boundary.
@@ -6565,7 +6620,7 @@ pub const Backend = struct {
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return;
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
 
         const saved_budget = self.maintenance_io_budget_remaining;
         self.maintenance_io_budget_remaining = null;
@@ -7708,7 +7763,7 @@ pub const Backend = struct {
 
     pub fn finalizeWriteReaderReleaseKind(self: *Backend, kind: ReaderPinKind) !void {
         self.releaseReaderKind(kind);
-        if (self.durable_completion != null) return;
+        if (self.durable_completion != null or self.completion_pool != null) return;
         const reclaimable_obsolete_paths = self.hasReclaimableObsoletePathsLocked();
         if ((!self.manifest_dirty and !self.obsolete_manifest_dirty and !reclaimable_obsolete_paths) or
             self.bulkIngestActive() or
@@ -7737,7 +7792,7 @@ pub const Backend = struct {
 
     pub fn beginBatchMode(self: *Backend, options: backend_types.BatchOptions) !void {
         if (options.mode != .bulk_ingest) return;
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         self.active_bulk_ingest_batches += 1;
     }
 
@@ -8427,7 +8482,7 @@ pub const Backend = struct {
     }
 
     fn beginBulkIngestSessionLocked(self: *Backend) !void {
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         if (self.options.backend.read_only) return error.ReadOnly;
         if (self.active_bulk_ingest_batches == 0) {
             self.bulk_ingest_window_first_sequence = self.next_run_id;
@@ -8466,7 +8521,7 @@ pub const Backend = struct {
     }
 
     fn finishBulkIngestSessionWithOptionsLocked(self: *Backend, options: BulkIngestFinishOptions) !void {
-        if (self.durable_completion != null) return error.PreparedCompletionActive;
+        if (self.durable_completion != null or self.completion_pool != null) return error.PreparedCompletionActive;
         std.debug.assert(self.active_bulk_ingest_batches > 0);
         if (!options.compact and self.active_bulk_ingest_batches == 1) {
             if ((options.flush or self.shouldFlushMemtablesOnLastBulkIngestFinish()) and

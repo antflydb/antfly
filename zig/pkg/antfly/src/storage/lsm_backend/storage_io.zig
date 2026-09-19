@@ -2057,6 +2057,7 @@ pub const NativeFdPermit = struct {
 pub const NativeCompletionIo = NativeWalCompletionIo;
 
 pub const NativeWalCompletionIo = struct {
+    pub const max_prepared_files = 96;
     /// Exact, slot-owned files in addition to the standard WAL paths. The
     /// caller reserves these names before sealing; this is no authority to
     /// overwrite, delete or recover another slot's files.
@@ -2118,7 +2119,7 @@ pub const NativeWalCompletionIo = struct {
     /// Durable scopes leave ordinary transient capacity for prepare/recovery.
     /// Admission is nonblocking and tests the retained pair and headroom together.
     pub fn createWithFilesAndHeadroom(allocator: Allocator, native: *NativeStorage, root_dir: []const u8, specs: []const FileSpec, headroom: usize) !*NativeCompletionIo {
-        if (specs.len > 64) return error.CompletionFileCapacityExceeded;
+        if (specs.len > max_prepared_files) return error.CompletionFileCapacityExceeded;
         const self = try createWithHeadroom(allocator, native, root_dir, headroom);
         errdefer self.deinit() catch unreachable;
         try self.replacePreparedFiles(allocator, specs);
@@ -2132,7 +2133,7 @@ pub const NativeWalCompletionIo = struct {
     /// Failure preserves the prior allowlist and its allocation provenance.
     pub fn replacePreparedFiles(self: *NativeCompletionIo, allocator: Allocator, specs: []const FileSpec) !void {
         try self.idle();
-        if (specs.len > 64) return error.CompletionFileCapacityExceeded;
+        if (specs.len > max_prepared_files) return error.CompletionFileCapacityExceeded;
         const root_dir = self.root;
         const files = try allocator.alloc(PreparedFile, specs.len);
         var initialized: usize = 0;
@@ -6499,4 +6500,23 @@ test "workload admission native completion scope streams distinct input with ret
     try std.testing.expectEqualStrings("streaming-source", &data);
     try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "workload admission completion native scope certifies bounded cohort path capacity" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var pool = NativeStoragePool.initWithCapacityForTest(alloc, 2);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(alloc, .threaded, &pool);
+    defer native.deinit();
+    var buffers: [NativeCompletionIo.max_prepared_files + 1][64]u8 = undefined;
+    var specs: [buffers.len]NativeCompletionIo.FileSpec = undefined;
+    for (&buffers, &specs, 0..) |*buffer, *spec, i| {
+        spec.* = .{ .path = try std.fmt.bufPrint(buffer, "/bounded-pool-paths/file-{d}", .{i}), .max_bytes = 1024 };
+    }
+    const scope = try NativeCompletionIo.createWithFiles(alloc, &native, "/bounded-pool-paths", specs[0..NativeCompletionIo.max_prepared_files]);
+    defer scope.deinit() catch unreachable;
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+    try std.testing.expectError(error.CompletionFileCapacityExceeded, scope.replacePreparedFiles(alloc, &specs));
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
 }

@@ -123,6 +123,7 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
     errdefer cleanup(BackendType, backend, false);
     errdefer if (@hasField(BackendType, "durable_completion")) {
         backend.releaseDurableCompletion();
+        if (@hasDecl(BackendType, "releaseCompletionPool")) backend.releaseCompletionPool();
     };
     errdefer finishOpenFailure(BackendType, backend);
     if (@hasDecl(BackendType, "initOutputCleanup")) try backend.initOutputCleanup();
@@ -147,6 +148,14 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
                 }
             }
         }
+    }
+    const accepted_pool_guarded = if (comptime @hasField(BackendType, "completion_pool"))
+        try @import("completion_pool.zig").hasAcceptedGuards(backend.storage.?, allocator, root_dir)
+    else
+        false;
+    if (accepted_pool_guarded) {
+        if (!stable_address) return error.UnsupportedCompletionBackend;
+        if (backend.options.completion_pool_config == null) return error.CompletionRecoveryCapacityRequired;
     }
     cleanupRecoveredRunFiles(BackendType, backend, "before_manifest", true);
 
@@ -242,8 +251,11 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
             if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
             if (@hasDecl(BackendType, "mountRunDirectory")) try backend.mountRunDirectory();
         }
+        if (comptime @hasField(BackendType, "completion_pool")) {
+            if (accepted_pool_guarded) try backend.installCompletionPoolLocked(backend.options.completion_pool_config.?);
+        }
         const guarded = if (comptime @hasField(BackendType, "durable_completion"))
-            try completion_recovery.restoreBeforeReplay(BackendType, backend)
+            if (accepted_pool_guarded) false else try completion_recovery.restoreBeforeReplay(BackendType, backend)
         else
             false;
         if (@hasDecl(BackendType, "replayWalIntoMutable")) {
@@ -251,7 +263,11 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
             const phase_start = beginOpenPhase(BackendType, backend, .replaying_wal);
             defer finishOpenPhase(BackendType, backend, .replaying_wal, phase_start);
             if (comptime @hasField(BackendType, "durable_completion")) {
-                if (guarded) {
+                if (accepted_pool_guarded) {
+                    const pool = backend.completion_pool.?;
+                    try pool.replayBeforePublication(backend);
+                    try pool.restoreMaterialized(backend);
+                } else if (guarded) {
                     const replay_stats = try completion_recovery.replay(BackendType, backend);
                     try completion_recovery.finish(BackendType, backend, replay_stats);
                 } else {

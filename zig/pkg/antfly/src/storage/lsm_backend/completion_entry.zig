@@ -8,13 +8,21 @@
 const std = @import("std");
 const slot = @import("completion_slot.zig");
 const Allocator = std.mem.Allocator;
-const magic = "AFCENTRY";
-pub const version: u16 = 1;
-pub const profile: u16 = 1;
-pub const max_wire_bytes = 512 * 1024;
+pub const protocol = @import("../../common/completion_entry_protocol.zig");
+const magic = protocol.magic;
+pub const version: u16 = protocol.version;
+pub const profile: u16 = protocol.profile;
+pub const max_wire_bytes = protocol.max_wire_bytes;
 pub const max_descriptor_bytes = 256 * 1024;
 pub const max_operations = 256;
 pub const max_baseline_keys = 512;
+pub const receipt_prefix = "\x00\x00__metadata__:completion_entry_v1:";
+pub fn receiptKey(txn_id: [16]u8) [receipt_prefix.len + 16]u8 {
+    var key: [receipt_prefix.len + 16]u8 = undefined;
+    @memcpy(key[0..receipt_prefix.len], receipt_prefix);
+    @memcpy(key[receipt_prefix.len..], &txn_id);
+    return key;
+}
 const header_bytes = 256;
 const operation_header_bytes = 12;
 
@@ -26,6 +34,8 @@ pub const Entry = struct {
     txn_id: [16]u8,
     original_input_digest: [32]u8,
     baseline_digest: [32]u8,
+    previous_term: u64 = 0,
+    previous_index: u64 = 0,
     baseline_keys: []const []const u8,
     descriptor: []const u8,
     prepare_operations: []const slot.Operation,
@@ -59,6 +69,11 @@ fn checksum(bytes: []const u8) [32]u8 {
 fn validateOperation(op: slot.Operation) !void {
     if (op.key.len == 0 or op.bindings.len != 0 or (op.kind == .delete and op.value.len != 0))
         return error.InvalidCompletionSlot;
+    // Native ownership records cannot be selected or overwritten by a leader's
+    // canonical operation list. Accepted apply appends its own indexed records.
+    inline for (.{ "\x00\x00__metadata__:completion_slot_v1", "\x00\x00__metadata__:completion_applied_v1", receipt_prefix }) |prefix| {
+        if (std.mem.startsWith(u8, op.key, prefix)) return error.InvalidCompletionSlot;
+    }
     // The authoritative marker is appended exactly once by accepted apply.
     if (std.mem.eql(u8, op.key, &@import("../internal_keys.zig").raft_document_applied_entry_key))
         return error.InvalidCompletionSlot;
@@ -118,6 +133,8 @@ pub fn encode(allocator: Allocator, entry: Entry) ![]u8 {
         @memcpy(bytes[offset..][0..key.len], key);
         offset += key.len;
     }
+    std.mem.writeInt(u64, bytes[200..208], entry.previous_term, .little);
+    std.mem.writeInt(u64, bytes[208..216], entry.previous_index, .little);
     @memcpy(bytes[224..256], &checksum(bytes));
     return bytes;
 }
@@ -226,7 +243,7 @@ pub fn decode(allocator: Allocator, encoded: []const u8) !OwnedEntry {
     if (std.mem.readInt(u16, encoded[8..10], .little) != version or
         std.mem.readInt(u16, encoded[10..12], .little) != profile) return error.UnsupportedCompletionSlotVersion;
     if (std.mem.readInt(u32, encoded[12..16], .little) != encoded.len or
-        !std.mem.allEqual(u8, encoded[196..224], 0)) return error.InvalidCompletionSlot;
+        !std.mem.allEqual(u8, encoded[196..200], 0) or !std.mem.allEqual(u8, encoded[216..224], 0)) return error.InvalidCompletionSlot;
     const digest = checksum(encoded);
     if (!std.mem.eql(u8, encoded[224..256], &digest)) return error.CompletionSlotChecksumMismatch;
     const group_id = std.mem.readInt(u64, encoded[16..24], .little);
@@ -262,6 +279,8 @@ pub fn decode(allocator: Allocator, encoded: []const u8) !OwnedEntry {
         .txn_id = wire[24..40].*,
         .original_input_digest = wire[104..136].*,
         .baseline_digest = wire[144..176].*,
+        .previous_term = std.mem.readInt(u64, wire[200..208], .little),
+        .previous_index = std.mem.readInt(u64, wire[208..216], .little),
         .descriptor = wire[header_bytes..][0..descriptor_len],
         .prepare_operations = operations,
     } };
@@ -356,6 +375,8 @@ test "workload admission completion entry allocation failures and descriptor ide
     try std.testing.expectError(error.InvalidCompletionSlot, encode(allocator, entry));
     entry = fixture(descriptor);
     entry.prepare_operations = &.{.{ .kind = .put, .key = &@import("../internal_keys.zig").raft_document_applied_entry_key, .value = "arbitrarymarker" }};
+    try std.testing.expectError(error.InvalidCompletionSlot, encode(allocator, entry));
+    entry.prepare_operations = &.{.{ .kind = .put, .key = "\x00\x00__metadata__:completion_slot_v1_3", .value = "forged" }};
     try std.testing.expectError(error.InvalidCompletionSlot, encode(allocator, entry));
     entry.prepare_operations = &.{.{ .kind = .put, .key = "row", .value = "00000000", .bindings = &.{.{ .kind = .raft_term, .target = .value, .byte_order = .little, .offset = 0 }} }};
     try std.testing.expectError(error.InvalidCompletionSlot, encode(allocator, entry));
