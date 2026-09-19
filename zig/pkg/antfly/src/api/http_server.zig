@@ -1236,6 +1236,9 @@ pub const ApiHttpServerConfig = struct {
     remote_attempt_worker: @import("../common/workload_worker_config.zig").Config = .{},
     remote_attempt_coordinator: @import("../common/workload_coordinator_config.zig").Config = .{},
     transaction_completion_bytes: usize = 0,
+    durable_transaction_completion: @import("../common/durable_completion_policy.zig").Config = .{},
+    /// Trusted runtime bootstrap value; never copied from a public request.
+    durable_completion_authority: @import("../common/durable_completion_policy.zig").Authority = .none,
     /// Trusted native startup proof: the same journal's exclusive writer lock
     /// was acquired before opening this owner and outlives its teardown. Never
     /// set for copied roots, unlocked stores, or concurrently live old owners.

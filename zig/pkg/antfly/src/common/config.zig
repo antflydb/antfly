@@ -97,6 +97,7 @@ pub const Config = struct {
         ingress: @import("workload_ingress.zig").Config = .{},
         session_max_retained_bytes: usize = 64 * 1024 * 1024,
         transaction_completion_bytes: usize = 0,
+        durable_transaction_completion: @import("durable_completion_policy.zig").Config = .{},
         remote_attempt_worker: @import("workload_worker_config.zig").Config = .{},
         remote_attempt_coordinator: @import("workload_coordinator_config.zig").Config = .{},
         dense_execution: @import("../storage/dense_execution.zig").Config = .{},
@@ -726,12 +727,13 @@ pub const Config = struct {
         };
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("admission")) |admission_value| {
-            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "dense_execution", "read_execution", "remote_attempt_worker", "remote_attempt_coordinator", "session_max_retained_bytes", "transaction_completion_bytes", "ingress" });
+            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "dense_execution", "read_execution", "remote_attempt_worker", "remote_attempt_coordinator", "session_max_retained_bytes", "transaction_completion_bytes", "durable_transaction_completion", "ingress" });
             const admission_object = switch (admission_value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
             };
             if (admission_object.get("ingress") != null) try validateObjectMemberFields(admission_object, "ingress", &.{ "max_requests", "max_retained_bytes", "control_requests", "control_retained_bytes", "recovery_requests", "recovery_retained_bytes" });
+            if (admission_object.get("durable_transaction_completion") != null) try validateObjectMemberFields(admission_object, "durable_transaction_completion", &.{"enabled"});
             inline for (.{ "query", "write" }) |class| {
                 if (admission_object.get(class)) |value| {
                     try validateObjectMemberFields(admission_object, class, &.{ "max_concurrent_requests", "waiting" });
@@ -863,6 +865,10 @@ pub const Config = struct {
                 .ingress = try ingressFromOpenApi(if (validated.value.admission) |admission| admission.ingress else null),
                 .session_max_retained_bytes = try boundedPositiveInt(usize, if (validated.value.admission) |admission| admission.session_max_retained_bytes else null, 4096, 1099511627776, 64 * 1024 * 1024),
                 .transaction_completion_bytes = try boundedPositiveInt(usize, if (validated.value.admission) |admission| admission.transaction_completion_bytes else null, 0, 1099511627776, 0),
+                .durable_transaction_completion = .{ .enabled = if (validated.value.admission) |admission| if (admission.durable_transaction_completion) |policy| try optionalBoolField(switch (policy) {
+                    .object => |object| object,
+                    else => return error.InvalidConfig,
+                }, "enabled") orelse false else false else false },
                 .remote_attempt_worker = try remoteAttemptWorkerFromOpenApi(if (validated.value.admission) |admission| admission.remote_attempt_worker else null),
                 .remote_attempt_coordinator = try remoteAttemptCoordinatorFromOpenApi(if (validated.value.admission) |admission| admission.remote_attempt_coordinator else null),
                 .dense_execution = dense_execution,
@@ -2727,6 +2733,21 @@ test "workload admission completion reserve is explicit and independent of reque
     try std.testing.expectEqual(@as(usize, 0), (Config.AdmissionConfig{}).transaction_completion_bytes);
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
         \\{"admission":{"transaction_completion_bytes":1099511627777}}
+    ));
+}
+
+test "common config durable completion admits new work without accepting authority" {
+    var defaults = try Config.parseFromSlice(std.testing.allocator, "{}");
+    defer defaults.deinit();
+    try std.testing.expect(!defaults.admission.durable_transaction_completion.enabled);
+    var enabled = try Config.parseFromSlice(std.testing.allocator,
+        \\{"admission":{"durable_transaction_completion":{"enabled":true}}}
+    );
+    defer enabled.deinit();
+    try std.testing.expect(enabled.admission.durable_transaction_completion.enabled);
+    try std.testing.expectEqual(@as(usize, 0), enabled.admission.transaction_completion_bytes);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator,
+        \\{"admission":{"durable_transaction_completion":{"enabled":true,"authority":"standalone_local"}}}
     ));
 }
 

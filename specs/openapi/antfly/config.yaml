@@ -817,6 +817,14 @@ components:
           maximum: 1099511627776
           default: 0
           description: Node-wide prepaid scratch memory for completing durable storage transactions. Zero preserves legacy allocation. Reserve this before foreground admission; this setting is independent of replicated limits on outstanding recovery obligations.
+        durable_transaction_completion:
+          type: object
+          additionalProperties: false
+          description: Permit new reserved transaction prepares for tables with a supported persisted completion policy. Disabling admission does not release existing obligations or disable recovery. Runtime ownership and storage support are verified separately.
+          properties:
+            enabled:
+              type: boolean
+              default: false
         remote_attempt_worker:
           $ref: "#/components/schemas/RemoteAttemptWorkerConfig"
         remote_attempt_coordinator:

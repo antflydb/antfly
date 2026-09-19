@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 68;
+pub const abi_version: u32 = 69;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -318,6 +318,10 @@ pub const ContextRequest = extern struct {
     read_transition_tasks: u32 = 0,
     read_transition_bytes: u64 = 0,
     transaction_completion_bytes: u64 = 0,
+    durable_completion_enabled: u8 = 0,
+    /// Trusted runtime bootstrap tag, not a client-supplied authority claim.
+    durable_completion_authority: u8 = 0,
+    _completion_reserved: [6]u8 = @splat(0),
 };
 
 /// One low-volume engine namespace used by control-plane metadata or durable
@@ -420,6 +424,9 @@ pub const ContextCacheKindStats = extern struct {
 pub const ContextMetricsResult = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
+    durable_completion_enabled: u8 = 0,
+    durable_completion_authority: u8 = 0,
+    _completion_reserved: [6]u8 = @splat(0),
     lsm_cache_used_bytes: u64 = 0,
     lsm_cache_entry_count: u64 = 0,
     lsm_run_state: ContextCacheKindStats = .{},

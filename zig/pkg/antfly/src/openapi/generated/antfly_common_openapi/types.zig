@@ -19,6 +19,8 @@ pub const AdmissionConfig = struct {
     session_max_retained_bytes: ?u64 = null,
     /// Node-wide prepaid scratch memory for completing durable storage transactions. Zero preserves legacy allocation. Reserve this before foreground admission; this setting is independent of replicated limits on outstanding recovery obligations.
     transaction_completion_bytes: ?u64 = null,
+    /// Permit new reserved transaction prepares for tables with a supported persisted completion policy. Disabling admission does not release existing obligations or disable recovery. Runtime ownership and storage support are verified separately.
+    durable_transaction_completion: ?std.json.Value = null,
     remote_attempt_worker: ?RemoteAttemptWorkerConfig = null,
     remote_attempt_coordinator: ?RemoteAttemptCoordinatorConfig = null,
     dense_execution: ?DenseExecutionConfig = null,
@@ -32,6 +34,7 @@ pub const AdmissionConfig = struct {
         .{ "ingress", "ingress", true },
         .{ "session_max_retained_bytes", "session_max_retained_bytes", true },
         .{ "transaction_completion_bytes", "transaction_completion_bytes", true },
+        .{ "durable_transaction_completion", "durable_transaction_completion", true },
         .{ "remote_attempt_worker", "remote_attempt_worker", true },
         .{ "remote_attempt_coordinator", "remote_attempt_coordinator", true },
         .{ "dense_execution", "dense_execution", true },
@@ -61,6 +64,10 @@ pub const AdmissionConfig = struct {
         }
         if (self.transaction_completion_bytes) |value| {
             try jw.objectField("transaction_completion_bytes");
+            try jw.write(value);
+        }
+        if (self.durable_transaction_completion) |value| {
+            try jw.objectField("durable_transaction_completion");
             try jw.write(value);
         }
         if (self.remote_attempt_worker) |value| {

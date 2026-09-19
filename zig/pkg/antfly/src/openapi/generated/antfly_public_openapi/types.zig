@@ -13074,10 +13074,53 @@ pub const TransactionReadItem = struct {
 /// Immutable, creation-only transaction completion policy. Enable only after every replica is upgraded to support protocol version 1. Existing tables require a separate migration; this setting does not fence older live peers. The node transaction completion reserve must accommodate this policy.
 pub const TransactionRecoveryStoragePolicy = struct {
     protocol_version: u32,
+    /// Physical completion protocol. Zero retains logical recovery accounting only; version 1 requires reserved completion and matching profile version 1. Requires compatible metadata and storage owners; no legacy prepare fallback is permitted.
+    completion_protocol_version: ?u32 = null,
+    /// Version of the bounded point-plan profile. Must be zero with completion protocol zero, or one with completion protocol one.
+    profile_version: ?u32 = null,
     max_count: u64,
     max_bytes: u64,
     /// Total deterministic metadata and intent completion credits per transaction; cannot exceed max_bytes.
     max_transaction_bytes: u64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "protocol_version", "protocol_version", false },
+        .{ "completion_protocol_version", "completion_protocol_version", true },
+        .{ "profile_version", "profile_version", true },
+        .{ "max_count", "max_count", false },
+        .{ "max_bytes", "max_bytes", false },
+        .{ "max_transaction_bytes", "max_transaction_bytes", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("protocol_version");
+        try jw.write(self.protocol_version);
+        if (self.completion_protocol_version) |value| {
+            try jw.objectField("completion_protocol_version");
+            try jw.write(value);
+        }
+        if (self.profile_version) |value| {
+            try jw.objectField("profile_version");
+            try jw.write(value);
+        }
+        try jw.objectField("max_count");
+        try jw.write(self.max_count);
+        try jw.objectField("max_bytes");
+        try jw.write(self.max_bytes);
+        try jw.objectField("max_transaction_bytes");
+        try jw.write(self.max_transaction_bytes);
+        try jw.endObject();
+    }
 };
 
 pub const TransactionSavepointResponse = struct {

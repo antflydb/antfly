@@ -13793,6 +13793,25 @@ components:
           format: uint32
           enum:
             - 1
+        completion_protocol_version:
+          type: integer
+          format: uint32
+          enum:
+            - 0
+            - 1
+          default: 0
+          description: Physical completion protocol. Zero retains logical recovery accounting only; version
+            1 requires reserved completion and matching profile version 1. Requires compatible metadata
+            and storage owners; no legacy prepare fallback is permitted.
+        profile_version:
+          type: integer
+          format: uint32
+          enum:
+            - 0
+            - 1
+          default: 0
+          description: Version of the bounded point-plan profile. Must be zero with completion protocol
+            zero, or one with completion protocol one.
         max_count:
           type: integer
           format: uint64
