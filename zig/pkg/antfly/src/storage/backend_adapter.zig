@@ -64,6 +64,12 @@ pub fn Store(
             return try ops.begin_batch(self.impl);
         }
 
+        pub fn writeSerialization(self: *@This()) !backend_types.WriteSerialization {
+            if (comptime @hasField(@TypeOf(ops), "write_serialization"))
+                return try ops.write_serialization(self.impl);
+            return error.Unsupported;
+        }
+
         pub fn beginBatchWithOptions(self: *@This(), options: backend_types.BatchOptions) !BatchHandle {
             if (comptime @hasField(@TypeOf(ops), "begin_batch_with_options")) {
                 return try ops.begin_batch_with_options(self.impl, options);

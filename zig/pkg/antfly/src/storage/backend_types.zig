@@ -119,6 +119,15 @@ pub const BatchOptions = struct {
     block_cache_admission: Namespace.BlockCacheAdmission = .retain,
 };
 
+/// Shared opt-in read/modify/write serialization. This excludes only other
+/// participating writers, not ordinary batches or readers. A null gate is
+/// valid only when beginBatch already provides intrinsic single-writer
+/// serialization (for example LMDB).
+pub const WriteSerialization = struct {
+    gate: ?*std.atomic.Mutex = null,
+    acquired_by_begin: bool = false,
+};
+
 pub const BulkIngestFinishOptions = struct {
     pub const ProgressPhase = enum(u8) {
         begin,

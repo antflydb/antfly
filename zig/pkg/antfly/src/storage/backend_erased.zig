@@ -829,6 +829,7 @@ pub const Store = struct {
         begin_write: *const fn (Allocator, *anyopaque) anyerror!WriteTxn,
         begin_batch: *const fn (Allocator, *anyopaque) anyerror!Batch,
         begin_batch_with_options: ?*const fn (Allocator, *anyopaque, backend_types.BatchOptions) anyerror!Batch = null,
+        write_serialization: ?*const fn (*anyopaque) anyerror!backend_types.WriteSerialization = null,
         sync: ?*const fn (*anyopaque, bool) anyerror!void = null,
         sync_replay_state: ?*const fn (*anyopaque) anyerror!void = null,
         begin_bulk_ingest_session: ?*const fn (*anyopaque) anyerror!void = null,
@@ -931,6 +932,47 @@ pub const Store = struct {
             return batch;
         }
         return try self.beginBatch();
+    }
+
+    fn providerWriteSerialization(self: *Store) !backend_types.WriteSerialization {
+        const callback = self.vtable.write_serialization orelse return error.Unsupported;
+        const capability = try BoundaryAbi.call("write_serialization", self.boundary_dispatch, callback, .{self.ptr});
+        if (capability.gate == null and !capability.acquired_by_begin) return error.Unsupported;
+        if (self.write_gate) |gate| if (capability.gate) |shared| {
+            if (gate != shared) return error.Unsupported;
+        };
+        return capability;
+    }
+
+    /// Effective behavior of this view's ordinary beginBatch, for forwarding
+    /// adapters. Unknown providers never imply serialization from capabilities
+    /// such as atomic batches or single_writer alone.
+    pub fn writeSerialization(self: *Store) !backend_types.WriteSerialization {
+        var capability = try self.providerWriteSerialization();
+        if (self.write_gate) |gate| {
+            capability.gate = gate;
+            capability.acquired_by_begin = true;
+        }
+        return capability;
+    }
+
+    /// Serialize participating read/modify/write batches using the provider's
+    /// shared gate. Ordinary writers remain independent. Acquisition uses the
+    /// existing yielding lock and has no cancellation/progress guarantee.
+    /// On commit failure the batch remains abortable and keeps its gate until
+    /// abort, exactly as beginBatch; callers must arrange failure cleanup.
+    pub fn beginSerializedBatch(self: *Store) !Batch {
+        const capability = try self.providerWriteSerialization();
+        var view = self.*;
+        if (capability.acquired_by_begin) {
+            // A nested adapter already takes this exact gate. Taking it again
+            // in the outer erased view would deadlock.
+            if (capability.gate != null and view.write_gate == capability.gate)
+                view.write_gate = null;
+        } else {
+            view.write_gate = capability.gate;
+        }
+        return view.beginBatch();
     }
 
     pub fn sync(self: *Store, force: bool) !void {
@@ -1811,18 +1853,28 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
         }
 
         fn beginWrite(alloc: Allocator, ptr: *anyopaque) anyerror!WriteTxn {
-            return try writeTxnFrom(alloc, try unbox(ptr).handle.beginWrite());
+            var opened = try unbox(ptr).handle.beginWrite();
+            errdefer opened.abort();
+            return try writeTxnFrom(alloc, opened);
         }
 
         fn beginBatch(alloc: Allocator, ptr: *anyopaque) anyerror!Batch {
-            return try batchFrom(alloc, try unbox(ptr).handle.beginBatch());
+            var opened = try unbox(ptr).handle.beginBatch();
+            errdefer opened.abort();
+            return try batchFrom(alloc, opened);
         }
 
         fn beginBatchWithOptions(alloc: Allocator, ptr: *anyopaque, options: backend_types.BatchOptions) anyerror!Batch {
             if (@hasDecl(Handle, "beginBatchWithOptions")) {
-                return try batchFrom(alloc, try unbox(ptr).handle.beginBatchWithOptions(options));
+                var opened = try unbox(ptr).handle.beginBatchWithOptions(options);
+                errdefer opened.abort();
+                return try batchFrom(alloc, opened);
             }
-            return try batchFrom(alloc, try unbox(ptr).handle.beginBatch());
+            return try beginBatch(alloc, ptr);
+        }
+
+        fn writeSerialization(ptr: *anyopaque) anyerror!backend_types.WriteSerialization {
+            return try unbox(ptr).handle.writeSerialization();
         }
 
         fn sync(ptr: *anyopaque, force: bool) anyerror!void {
@@ -2003,6 +2055,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             .begin_write = vt.beginWrite,
             .begin_batch = vt.beginBatch,
             .begin_batch_with_options = vt.beginBatchWithOptions,
+            .write_serialization = if (@hasDecl(Handle, "writeSerialization")) vt.writeSerialization else null,
             .sync = vt.sync,
             .sync_replay_state = vt.syncReplayState,
             .begin_bulk_ingest_session = vt.beginBulkIngestSession,
@@ -2172,6 +2225,10 @@ test "runtime store erases concrete single-namespace store handles" {
 
     const MockStore = struct {
         fail_open: *bool,
+        serialization: *?backend_types.WriteSerialization,
+        pub fn writeSerialization(self: *@This()) !backend_types.WriteSerialization {
+            return self.serialization.* orelse error.Unsupported;
+        }
         pub fn capabilities(_: *@This()) backend_types.Capabilities {
             return .{ .cursors = true };
         }
@@ -2192,10 +2249,38 @@ test "runtime store erases concrete single-namespace store handles" {
     };
 
     var fail_open = false;
-    const mock = MockStore{ .fail_open = &fail_open };
+    var serialization: ?backend_types.WriteSerialization = null;
+    const mock = MockStore{ .fail_open = &fail_open, .serialization = &serialization };
     var store = try storeFrom(std.testing.allocator, mock);
     defer store.deinit();
     var gate: std.atomic.Mutex = .unlocked;
+    store.write_gate = &gate;
+    try std.testing.expectError(error.Unsupported, store.beginSerializedBatch());
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    serialization = .{ .gate = &gate };
+    var other_gate: std.atomic.Mutex = .unlocked;
+    store.write_gate = &other_gate;
+    try std.testing.expectError(error.Unsupported, store.beginSerializedBatch());
+    try std.testing.expect(other_gate.tryLock());
+    other_gate.unlock();
+    store.write_gate = &gate;
+    var serialized = try store.beginSerializedBatch();
+    try std.testing.expect(!gate.tryLock());
+    serialized.abort();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    store.write_gate = null;
+    serialized = try store.beginSerializedBatch();
+    try std.testing.expect(!gate.tryLock());
+    try serialized.commit();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    // The capability does not change ordinary batch behavior.
+    var ordinary = try store.beginBatch();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    ordinary.abort();
     store.write_gate = &gate;
     try std.testing.expect(store.capabilities().cursors);
 
@@ -2237,6 +2322,9 @@ test "runtime store erases concrete single-namespace store handles" {
     try std.testing.expect(gate.tryLock());
     gate.unlock();
     fail_open = true;
+    try std.testing.expectError(error.OpenFailed, store.beginSerializedBatch());
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
     try std.testing.expectError(error.OpenFailed, store.beginWrite());
     try std.testing.expect(gate.tryLock());
     gate.unlock();
@@ -2296,7 +2384,43 @@ test "failed commit keeps erased write handle abortable" {
         }
     };
 
+    const MockStore = struct {
+        shared: *Shared,
+        gate: *std.atomic.Mutex,
+        pub fn capabilities(_: *@This()) backend_types.Capabilities {
+            return .{};
+        }
+        pub fn writeSerialization(self: *@This()) !backend_types.WriteSerialization {
+            return .{ .gate = self.gate };
+        }
+        pub fn beginRead(self: *@This()) !MockWrite {
+            return .{ .shared = self.shared };
+        }
+        pub fn beginWrite(self: *@This()) !MockWrite {
+            return .{ .shared = self.shared };
+        }
+        pub fn beginBatch(self: *@This()) !MockWrite {
+            return .{ .shared = self.shared };
+        }
+    };
     var shared = Shared{};
+    var serialized_gate: std.atomic.Mutex = .unlocked;
+    var store = try storeFrom(std.testing.allocator, MockStore{ .shared = &shared, .gate = &serialized_gate });
+    defer store.deinit();
+    var unknown_vtable = store.vtable.*;
+    unknown_vtable.write_serialization = null;
+    var unknown = store;
+    unknown.vtable = &unknown_vtable;
+    try std.testing.expectError(error.Unsupported, unknown.beginSerializedBatch());
+    try std.testing.expectEqual(@as(usize, 0), shared.commits);
+    var serialized = try store.beginSerializedBatch();
+    try std.testing.expectError(error.CommitFailed, serialized.commit());
+    try std.testing.expect(!serialized_gate.tryLock());
+    serialized.abort();
+    try std.testing.expect(serialized_gate.tryLock());
+    serialized_gate.unlock();
+    try std.testing.expect(shared.aborted);
+    shared = .{};
     var txn = try writeTxnFrom(std.testing.allocator, MockWrite{ .shared = &shared });
     var gate: std.atomic.Mutex = .unlocked;
     try std.testing.expect(gate.tryLock());

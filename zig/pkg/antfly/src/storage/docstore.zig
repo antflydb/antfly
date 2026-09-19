@@ -436,6 +436,7 @@ pub const DocStore = struct {
         .begin_current_scan = beginCurrentScanTxn,
         .begin_write = beginWriteTxn,
         .begin_batch = beginWriteBatch,
+        .write_serialization = writeSerialization,
     });
 
     pub const Txn = struct {
@@ -1449,6 +1450,13 @@ pub const DocStore = struct {
 
     pub fn beginWriteBatch(self: *DocStore) !Batch {
         return try self.beginWriteBatchWithOptions(.{});
+    }
+
+    pub fn writeSerialization(self: *DocStore) !backend_types.WriteSerialization {
+        return switch (self.kind) {
+            .lmdb => .{ .acquired_by_begin = true },
+            .runtime => try self.runtime_store.writeSerialization(),
+        };
     }
 
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
@@ -4165,4 +4173,138 @@ test "docstore runtime lsm persists replay rows across namespace reopen" {
     }
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqualStrings("replay:1", entries[0].payload);
+}
+
+test "workload admission docstore serialized batches forward native shared gates without nesting" {
+    const alloc = std.testing.allocator;
+    {
+        var backend = lsm_backend.Backend.init(alloc, .{});
+        defer backend.close();
+        for ([_]bool{ false, true }) |already_gated| {
+            var inner = try backend.runtimeStore(alloc, .{});
+            if (already_gated) inner.write_gate = &backend.serialized_write_mutex;
+            var docs = try DocStore.openRuntime(alloc, inner);
+            defer docs.close();
+            var outer = try backend_erased.storeFrom(alloc, docs.backendStore());
+            defer outer.deinit();
+            // Same explicit gate on the outer graph-style view must not relock
+            // the inner gate. The ungated variant obtains the same native gate.
+            outer.write_gate = &backend.serialized_write_mutex;
+            var batch = try outer.beginSerializedBatch();
+            errdefer batch.abort();
+            try std.testing.expect(!backend.serialized_write_mutex.tryLock());
+            try batch.put("serialized-key", "committed");
+            // Snapshot readers remain usable while the participating writer is held.
+            var reader = try outer.beginRead();
+            reader.abort();
+            try batch.commit();
+            try std.testing.expect(backend.serialized_write_mutex.tryLock());
+            backend.serialized_write_mutex.unlock();
+            var read = try outer.beginRead();
+            try std.testing.expectEqualStrings("committed", try read.get("serialized-key"));
+            read.abort();
+            batch = try outer.beginSerializedBatch();
+            try batch.put("serialized-key", "aborted");
+            batch.abort();
+            try std.testing.expect(backend.serialized_write_mutex.tryLock());
+            backend.serialized_write_mutex.unlock();
+            read = try outer.beginRead();
+            try std.testing.expectEqualStrings("committed", try read.get("serialized-key"));
+            read.abort();
+        }
+    }
+}
+
+test "workload admission native serialized batches prevent independent view lost updates" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var first = try backend.runtimeStore(alloc, .{});
+    defer first.deinit();
+    var second = try backend.runtimeStore(alloc, .{});
+    defer second.deinit();
+    {
+        var seed = try first.beginBatch();
+        errdefer seed.abort();
+        try seed.put("counter", "0");
+        try seed.commit();
+    }
+    // Atomic publication alone does not serialize a read/modify/write lifetime.
+    {
+        var a = try first.beginBatch();
+        var b = try second.beginBatch();
+        try std.testing.expectEqualStrings("0", try a.get("counter"));
+        try std.testing.expectEqualStrings("0", try b.get("counter"));
+        try a.put("counter", "1");
+        try b.put("counter", "1");
+        try a.commit();
+        try b.commit();
+        var read = try first.beginRead();
+        try std.testing.expectEqualStrings("1", try read.get("counter"));
+        read.abort();
+    }
+    const Worker = struct {
+        store: *backend_erased.Store,
+        ready: *std.atomic.Value(u32),
+        start: *std.atomic.Value(bool),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            _ = self.ready.fetchAdd(1, .release);
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            self.increment() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn increment(self: *@This()) !void {
+            var batch = try self.store.beginSerializedBatch();
+            errdefer batch.abort();
+            const old = try std.fmt.parseInt(u32, try batch.get("counter"), 10);
+            var buffer: [16]u8 = undefined;
+            try batch.put("counter", try std.fmt.bufPrint(&buffer, "{d}", .{old + 1}));
+            try batch.commit();
+        }
+    };
+    var ready: std.atomic.Value(u32) = .init(0);
+    var start: std.atomic.Value(bool) = .init(false);
+    var a: Worker = .{ .store = &first, .ready = &ready, .start = &start };
+    var b: Worker = .{ .store = &second, .ready = &ready, .start = &start };
+    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{&a});
+    const thread_b = std.Thread.spawn(.{}, Worker.run, .{&b}) catch |err| {
+        start.store(true, .release);
+        thread_a.join();
+        return err;
+    };
+    while (ready.load(.acquire) != 2) std.atomic.spinLoopHint();
+    start.store(true, .release);
+    thread_a.join();
+    thread_b.join();
+    if (a.failure) |err| return err;
+    if (b.failure) |err| return err;
+    var read = try first.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("3", try read.get("counter"));
+}
+
+test "workload admission serialized batches reject whole-state replacement memory provider" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    // A participating gate cannot prevent an unrelated ordinary snapshot
+    // writer from later replacing the whole store, including the ledger.
+    // Do not advertise native LSM's merge-safe serialization for this provider.
+    try std.testing.expectError(error.Unsupported, runtime.beginSerializedBatch());
+    var docs = try DocStore.openRuntime(alloc, &runtime);
+    defer docs.close();
+    var outer = try backend_erased.storeFrom(alloc, docs.backendStore());
+    defer outer.deinit();
+    try std.testing.expectError(error.Unsupported, outer.beginSerializedBatch());
+    outer.write_gate = &backend.serialized_write_mutex;
+    try std.testing.expectError(error.Unsupported, outer.beginSerializedBatch());
+    try std.testing.expect(backend.serialized_write_mutex.tryLock());
+    backend.serialized_write_mutex.unlock();
+    var ordinary = try outer.beginBatch();
+    try ordinary.put("ordinary", "still-supported");
+    try ordinary.commit();
 }

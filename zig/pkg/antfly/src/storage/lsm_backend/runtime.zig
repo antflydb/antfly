@@ -525,6 +525,12 @@ pub fn BoundStore(comptime BackendType: type) type {
             return try LocalWriteTxn.openWithOptions(self.backend, namespace, options);
         }
 
+        pub fn writeSerialization(self: *@This()) !backend_types.WriteSerialization {
+            if (comptime @hasField(BackendType, "serialized_write_mutex"))
+                return .{ .gate = &self.backend.serialized_write_mutex };
+            return error.Unsupported;
+        }
+
         pub fn sync(self: *@This(), force: bool) !void {
             if (@hasDecl(BackendType, "sync")) {
                 try self.backend.sync(force);
