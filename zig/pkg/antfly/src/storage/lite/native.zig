@@ -365,6 +365,14 @@ pub const RecordPageReader = struct {
         return record.bytes;
     }
 
+    /// Validate the record and its key without touching external value pages.
+    /// Legacy v3 indexes may still reference tombstones.
+    pub fn documentIsLive(self: *RecordPageReader, file: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, indexed: DocumentIndexEntry) !bool {
+        const entry = try decodeDocumentEntry(try self.read(file, allocator, checkpoint, indexed.document_page_id, .document));
+        if (!std.mem.eql(u8, entry.key, indexed.key)) return error.InvalidDocumentIndex;
+        return !entry.is_delete;
+    }
+
     pub fn documentValueAlloc(self: *RecordPageReader, file: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, indexed: DocumentIndexEntry) !?[]u8 {
         const entry = try decodeDocumentEntry(try self.read(file, allocator, checkpoint, indexed.document_page_id, .document));
         if (!std.mem.eql(u8, entry.key, indexed.key)) return error.InvalidDocumentIndex;
@@ -1760,7 +1768,7 @@ pub const NativeFile = struct {
         const document_records = self.countReachableChainPagesWithCancel(.document, checkpoint.document_root_page, &reachable_pages, cancel) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
-        if ((checkpoint.document_root_page == 0) != (checkpoint.document_index_root_page == 0))
+        if (checkpoint.document_root_page == 0 and checkpoint.document_index_root_page != 0)
             return invalidCheck(report, "invalid_document_index");
         const document_index_pages = self.collectDocumentIndexPages(checkpoint, &reachable_pages, true, true, cancel) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
@@ -2999,6 +3007,10 @@ pub const NativeFile = struct {
                     .document_page_id = page_id,
                     .ordinal = ordinal,
                 });
+            } else if (mutation.is_delete) {
+                // History retains the tombstone; immutable older index roots
+                // retain their values. The current index contains only live keys.
+                try editor.remove(mutation.key);
             } else {
                 try editor.put(mutation.key, page_id);
             }
@@ -3027,7 +3039,8 @@ pub const NativeFile = struct {
                     std.mem.eql(u8, initial_index_entries.items[index].key, initial_index_entries.items[end].key)) : (end += 1)
                 {}
                 const latest = initial_index_entries.items[end - 1];
-                try builder.add(latest.key, latest.document_page_id);
+                if (!mutations[latest.ordinal].is_delete)
+                    try builder.add(latest.key, latest.document_page_id);
                 index = end;
             }
             next_index_root_page = try builder.finish();
@@ -4681,13 +4694,19 @@ pub const NativeFile = struct {
         }
     }
 
-    /// Proves that the ordered index contains exactly the newest page for every
-    /// key in document history. The unresolved set stores only page IDs, not
-    /// keys or values, keeping integrity-check memory proportional to eight
-    /// bytes plus hash overhead per live key.
+    /// Proves that every live key points to its newest history record. Deleted
+    /// keys may be absent or reference their latest tombstone (legacy v3).
+    /// Track page IDs for indexed keys and own only absent deleted keys, whose
+    /// older live records must not be mistaken for missing index entries.
     fn validateDocumentIndexCoverage(self: *NativeFile, checkpoint: CheckpointSlot, cancel: ?*const maintenance.CancelToken) !void {
         var unresolved = std.AutoHashMapUnmanaged(u64, void){};
         defer unresolved.deinit(self.allocator);
+        var deleted = std.StringHashMapUnmanaged(void){};
+        defer {
+            var keys = deleted.keyIterator();
+            while (keys.next()) |key| self.allocator.free(key.*);
+            deleted.deinit(self.allocator);
+        }
 
         var cursor = DocumentIndexCursor.init(self, checkpoint);
         defer cursor.deinit();
@@ -4708,10 +4727,16 @@ pub const NativeFile = struct {
             const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .document, checkpoint);
             defer self.allocator.free(payload);
             const entry = try decodeDocumentEntry(payload);
-            const indexed_page = (try self.lookupDocumentIndexPage(checkpoint, entry.key)) orelse return error.InvalidDocumentIndex;
-            if (unresolved.contains(indexed_page)) {
-                if (indexed_page != page_id) return error.InvalidDocumentIndex;
-                _ = unresolved.remove(indexed_page);
+            if (try self.lookupDocumentIndexPage(checkpoint, entry.key)) |indexed_page| {
+                if (unresolved.contains(indexed_page)) {
+                    if (indexed_page != page_id) return error.InvalidDocumentIndex;
+                    _ = unresolved.remove(indexed_page);
+                }
+            } else if (!deleted.contains(entry.key)) {
+                if (!entry.is_delete) return error.InvalidDocumentIndex;
+                const key = try self.allocator.dupe(u8, entry.key);
+                errdefer self.allocator.free(key);
+                try deleted.put(self.allocator, key, {});
             }
             page_id = entry.previous_page;
             walked += 1;
@@ -10544,4 +10569,156 @@ test "lite grouped large borrowed batches retain one index edit per supplied bat
         } else baseline_pages = file.test_page_writes.load(.monotonic);
         try std.testing.expect((try file.check()).valid);
     }
+}
+
+test "lite document deletes prune the active index and preserve pinned roots" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "pruned-documents.aflite");
+    defer a.free(path);
+    {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        file.page_cache_enabled.store(false, .monotonic);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const batch = try arena.allocator().alloc(DocumentMutation, 2048);
+        for (batch, 0..) |*m, i| m.* = .{
+            .key = try std.fmt.allocPrint(arena.allocator(), "doc:{d:0>6}", .{i}),
+            .value = "original",
+        };
+        try file.putDocumentBatch(batch);
+        const pinned = file.activeCheckpoint();
+        for (batch) |*m| m.* = .{ .key = m.key, .is_delete = true };
+        // Exercise partial-leaf rebalancing and removal of whole subtrees.
+        try file.putDocumentBatch(batch[0..1000]);
+        var current = DocumentIndexCursor.init(&file, file.activeCheckpoint());
+        defer current.deinit();
+        var first = (try current.first()).?;
+        defer first.deinit(a);
+        try std.testing.expectEqualStrings("doc:001000", first.key);
+        try std.testing.expect((try file.check()).valid);
+        try file.putDocumentBatch(batch[1000..]);
+        try std.testing.expectEqual(@as(u64, 0), file.activeCheckpoint().document_index_root_page);
+        const reads = file.test_page_reads.load(.monotonic);
+        try std.testing.expect(!try file.hasLiveDocumentOutsidePrefix(file.activeCheckpoint(), "\x02db/"));
+        try std.testing.expectEqual(reads, file.test_page_reads.load(.monotonic));
+        var old = DocumentIndexCursor.init(&file, pinned);
+        defer old.deinit();
+        var entry = try old.first();
+        var count: usize = 0;
+        while (entry) |e| {
+            var owned = e;
+            owned.deinit(a);
+            count += 1;
+            entry = try old.next();
+        }
+        try std.testing.expectEqual(batch.len, count);
+        const value = (try file.getDocumentAtCheckpointAlloc(a, pinned, batch[0].key)).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("original", value);
+        try std.testing.expect((try file.check()).valid);
+    }
+    var reopened = try NativeFile.open(a, path, false);
+    defer reopened.close();
+    try std.testing.expect((try reopened.check()).valid);
+    try reopened.putDocument("doc:reborn", "new");
+    try std.testing.expect((try reopened.check()).valid);
+    try reopened.deleteDocument("doc:reborn");
+    _ = try reopened.vacuum();
+    try std.testing.expect((try reopened.check()).valid);
+    try std.testing.expectEqual(@as(u64, 0), reopened.activeCheckpoint().document_index_root_page);
+}
+
+test "lite document bulk and edited indexes retain only latest live mutations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "delete-duplicates.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    const mutations = [_]DocumentMutation{
+        .{ .key = "gone", .value = "old" },
+        .{ .key = "gone", .is_delete = true },
+        .{ .key = "live", .value = "old" },
+        .{ .key = "live", .is_delete = true },
+        .{ .key = "live", .value = "new" },
+        .{ .key = "absent", .is_delete = true },
+    };
+    for (0..2) |_| {
+        try file.putDocumentBatch(&mutations);
+        try std.testing.expect((try file.lookupDocumentIndexPage(file.activeCheckpoint(), "gone")) == null);
+        try std.testing.expect((try file.lookupDocumentIndexPage(file.activeCheckpoint(), "absent")) == null);
+        const value = (try file.getDocumentAlloc(a, "live")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("new", value);
+        try std.testing.expect((try file.check()).valid);
+    }
+    const before = file.activeCheckpoint();
+    try file.beginTransaction();
+    errdefer file.abortTransaction();
+    try file.deleteDocument("live");
+    const private = try file.materializeTransactionCheckpoint();
+    try std.testing.expectEqual(@as(u64, 0), private.document_index_root_page);
+    file.abortTransaction();
+    try std.testing.expectEqual(before.document_index_root_page, file.activeCheckpoint().document_index_root_page);
+    try std.testing.expect((try file.check()).valid);
+    try file.deleteDocument("live");
+    try file.putDocumentBatch(&.{.{ .key = "absent", .is_delete = true }});
+    try std.testing.expectEqual(@as(u64, 0), file.activeCheckpoint().document_index_root_page);
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite document index coverage accepts legacy tombstones and rejects missing live keys" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "legacy-tombstone-index.aflite");
+    defer a.free(path);
+    {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        try file.putDocument("doc", "old");
+        const live = file.activeCheckpoint();
+        var missing = live;
+        missing.document_index_root_page = 0;
+        try std.testing.expectError(error.InvalidDocumentIndex, file.validateDocumentIndexCoverage(missing, null));
+        try file.deleteDocument("doc");
+        var deleted = file.activeCheckpoint();
+        // A valid old index root must still be rejected if it resurrects a
+        // value superseded by a tombstone in the current history.
+        deleted.document_index_root_page = live.document_index_root_page;
+        try std.testing.expectError(error.InvalidDocumentIndex, file.validateDocumentIndexCoverage(deleted, null));
+        // Construct the legacy v3 layout: its index retained the newest
+        // tombstone. Reuse the old leaf solely to build this test fixture.
+        var node = try file.readDocumentIndexNode(live.document_index_root_page, live);
+        defer node.deinit(a);
+        node.pointers[0] = deleted.document_root_page;
+        const encoded = try encodeDocumentIndexNode(a, node);
+        defer a.free(encoded);
+        var page: [default_page_size]u8 = undefined;
+        encodePage(&page, .document_index, encoded);
+        try file.file.writePositionalAll(std.testing.io, &page, live.document_index_root_page * default_page_size);
+        file.page_cache.clear(a);
+        deleted.commit_sequence += 1;
+        try file.publishCheckpoint(deleted);
+        try std.testing.expect((try file.check()).valid);
+    }
+    var file = try NativeFile.open(a, path, false);
+    defer file.close();
+    try std.testing.expect((try file.check()).valid);
+    var cursor = DocumentIndexCursor.init(&file, file.activeCheckpoint());
+    defer cursor.deinit();
+    var indexed = (try cursor.first()).?;
+    defer indexed.deinit(a);
+    var records = RecordPageReader{};
+    defer records.deinit(a);
+    try std.testing.expect(!try records.documentIsLive(&file, a, file.activeCheckpoint(), indexed));
+    try std.testing.expect((try file.getDocumentAlloc(a, "doc")) == null);
+    try file.deleteDocument("doc");
+    try std.testing.expectEqual(@as(u64, 0), file.activeCheckpoint().document_index_root_page);
+    try file.putDocument("doc", "reborn");
+    try std.testing.expect((try file.check()).valid);
 }

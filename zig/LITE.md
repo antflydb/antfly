@@ -69,14 +69,17 @@ The implementation now consists of:
   document pages atomically. Normal commits remain append-only; explicit vacuum
   reclaims superseded pages without putting a reachability walk on the write
   path. Each checkpoint also pins a copy-on-write ordered B+ tree mapping every
-  logical document key to its newest document page. Initial loads and vacuum
+  live logical document key to its newest document page. Deletes remove keys
+  through copy-on-write merging and redistribution; tombstones remain in history
+  and older pinned index roots remain readable. Initial loads and vacuum
   build packed trees with one unfinished node per level. The builder retains
   encoded record references for long keys and materializes only the last input
   key for order validation. Counting compact pages uses the same builder.
   Integrity checks validate
   every tree page, separator range, and checkpoint/free-map reachability, then
-  prove that the index contains exactly the newest document page for every key
-  in history. Missing, stale, duplicate, or cross-key document pointers and
+  prove that every live key points to its newest document page. Deleted keys
+  may be absent or point to their latest tombstone in existing revision-3 files.
+  Missing live keys, stale, duplicate, or cross-key document pointers and
   missing directory or namespace-link metadata are treated as corruption.
 - `storage/lite/docstore.zig` provides ordered document transactions, pinned
   snapshots, replay lanes, and prefix-bounded logical namespaces. Point reads
@@ -84,8 +87,15 @@ The implementation now consists of:
   `O(log N)` pages. A cursor retains one decoded root-to-leaf path, its current
   key, and its current value, so sequential next/previous traversal is
   amortized `O(1)` and cold-scan memory remains bounded by tree height and the
-  page cache rather than live-key count or document payload volume. Tombstones
-  remain indexed until vacuum and are skipped during iteration. Write cursors
+  page cache rather than live-key count or document payload volume. Legacy
+  indexed tombstones are skipped during iteration; new deletes prune the active
+  index immediately. Key-only cursors share snapshot, prefix, seek, and overlay
+  behavior, validating record metadata without loading external values. Replay
+  truncation uses these cursors in transactions limited to 512 keys or a 256 KiB
+  prefixed-key target (a single key may exceed that target). Each chunk reserves
+  the writer from scan through commit, then releases it so other writers can
+  proceed. The cutoff is exclusive. Errors propagate; earlier completed chunks
+  remain committed and retries safely process the remaining entries. Write cursors
   merge a sorted, latest-write-wins overlay containing only that transaction's
   pending mutations; this provides read-your-writes without materializing the
   durable namespace. Pinned reads use concurrent positional I/O and retain

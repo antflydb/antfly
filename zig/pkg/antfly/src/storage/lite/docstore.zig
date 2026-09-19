@@ -559,57 +559,13 @@ pub const Store = struct {
     }
 
     pub fn truncateReplayUpTo(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {
-        if (up_to_sequence == 0) return;
-
-        var deletes = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (deletes.items) |key| alloc.free(key);
-            deletes.deinit(alloc);
-        }
-
-        {
-            var read = try self.beginRead();
-            defer read.abort();
-            _ = read.get(internal_keys.replay_meta_init_key[0..]) catch return;
-
-            try collectReplayDeletes(alloc, &read, internal_keys.replay_all_kind, up_to_sequence, &deletes);
-            for (replay_hints) |hint| {
-                try collectReplayDeletes(alloc, &read, replayHintOrdinal(hint), up_to_sequence, &deletes);
-            }
-        }
-
-        if (deletes.items.len == 0) return;
-        var write = try self.beginWrite();
-        errdefer write.abort();
-        for (deletes.items) |key| try write.delete(key);
-        try write.commit();
+        _ = alloc;
+        try truncateReplay(self, "", false, up_to_sequence);
     }
 
     pub fn truncateReplayUpToYielding(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {
-        if (up_to_sequence == 0) return;
-
-        var deletes = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (deletes.items) |key| alloc.free(key);
-            deletes.deinit(alloc);
-        }
-
-        {
-            var read = try self.beginRead();
-            defer read.abort();
-            _ = read.get(internal_keys.replay_meta_init_key[0..]) catch return;
-
-            try collectReplayDeletes(alloc, &read, internal_keys.replay_all_kind, up_to_sequence, &deletes);
-            for (replay_hints) |hint| {
-                try collectReplayDeletes(alloc, &read, replayHintOrdinal(hint), up_to_sequence, &deletes);
-            }
-        }
-
-        if (deletes.items.len == 0) return;
-        var write = try self.beginWriteYielding();
-        errdefer write.abort();
-        for (deletes.items) |key| try write.delete(key);
-        try write.commit();
+        _ = alloc;
+        try truncateReplay(self, "", true, up_to_sequence);
     }
 };
 
@@ -713,26 +669,8 @@ const RuntimeStore = struct {
     }
 
     pub fn truncateReplayUpTo(self: *RuntimeStore, alloc: Allocator, up_to_sequence: u64) !void {
-        if (up_to_sequence == 0) return;
-        var deletes = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (deletes.items) |key| alloc.free(key);
-            deletes.deinit(alloc);
-        }
-        {
-            var read = try self.beginRead();
-            defer read.abort();
-            _ = read.get(internal_keys.replay_meta_init_key[0..]) catch return;
-            try collectReplayDeletes(alloc, &read, internal_keys.replay_all_kind, up_to_sequence, &deletes);
-            for (replay_hints) |hint| {
-                try collectReplayDeletes(alloc, &read, replayHintOrdinal(hint), up_to_sequence, &deletes);
-            }
-        }
-        if (deletes.items.len == 0) return;
-        var write = try self.beginWrite();
-        errdefer write.abort();
-        for (deletes.items) |key| try write.delete(key);
-        try write.commit();
+        _ = alloc;
+        try truncateReplay(self.store, self.prefix, true, up_to_sequence);
     }
 };
 
@@ -981,6 +919,12 @@ pub const Txn = struct {
         };
     }
 
+    pub fn openKeyCursor(self: *Txn) !KeyCursor {
+        var cursor = try self.openCursor();
+        cursor.load_values = false;
+        return .{ .inner = cursor };
+    }
+
     fn freePending(self: *Txn) void {
         while (self.pending_tree.getMin()) |node| {
             var entry = self.pending_tree.getEntryForExisting(node);
@@ -1032,12 +976,52 @@ fn validatePrefix(prefix: []const u8) !void {
     if (prefix.len > 0 and prefix[prefix.len - 1] != 0) return error.InvalidArgument;
 }
 
+/// Keys borrow cursor storage until the next move or close, just like Cursor.
+/// Uses the same pinned snapshot, prefix bounds, and pending-write overlay,
+/// but never allocates or reads external document values.
+pub const KeyCursor = struct {
+    inner: Cursor,
+
+    pub fn close(self: *KeyCursor) void {
+        self.inner.close();
+    }
+
+    pub fn setUpperBound(self: *KeyCursor, upper: ?[]const u8) void {
+        self.inner.setUpperBound(upper);
+    }
+
+    pub fn first(self: *KeyCursor) ![]const u8 {
+        return (try self.inner.first()).key;
+    }
+
+    pub fn last(self: *KeyCursor) ![]const u8 {
+        return (try self.inner.last()).key;
+    }
+
+    pub fn next(self: *KeyCursor) ![]const u8 {
+        return (try self.inner.next()).key;
+    }
+
+    pub fn prev(self: *KeyCursor) ![]const u8 {
+        return (try self.inner.prev()).key;
+    }
+
+    pub fn seekAtOrAfter(self: *KeyCursor, key: []const u8) ![]const u8 {
+        return (try self.inner.seekAtOrAfter(key)).key;
+    }
+
+    pub fn seekAtOrBefore(self: *KeyCursor, key: []const u8) ![]const u8 {
+        return (try self.inner.seekAtOrBefore(key)).key;
+    }
+};
+
 pub const Cursor = struct {
     const Direction = enum { forward, backward };
 
     txn: *Txn,
     index_cursor: native.DocumentIndexCursor,
     records: native.RecordPageReader = .{},
+    load_values: bool = true,
     current_key: ?[]u8 = null,
     upper_bound: ?[]const u8 = null,
     owned_value: ?[]u8 = null,
@@ -1210,7 +1194,7 @@ pub const Cursor = struct {
             if (disk) |indexed| {
                 var consumed = indexed;
                 disk = null;
-                const value = self.records.documentValueAlloc(file, self.txn.allocator, self.txn.checkpoint, consumed) catch |err| {
+                const value = self.readValue(file, consumed) catch |err| {
                     consumed.deinit(self.txn.allocator);
                     return err;
                 };
@@ -1221,6 +1205,13 @@ pub const Cursor = struct {
             }
             return error.NotFound;
         }
+    }
+
+    fn readValue(self: *Cursor, file: *native.NativeFile, indexed: native.DocumentIndexEntry) !?[]u8 {
+        if (self.load_values)
+            return try self.records.documentValueAlloc(file, self.txn.allocator, self.txn.checkpoint, indexed);
+        if (!try self.records.documentIsLive(file, self.txn.allocator, self.txn.checkpoint, indexed)) return null;
+        return try self.txn.allocator.alloc(u8, 0);
     }
 
     fn overlayAtOrAfter(self: *const Cursor, key: []const u8, strict: bool) ?*PendingTree.Node {
@@ -1282,7 +1273,7 @@ pub const Cursor = struct {
         errdefer if (disk) |*candidate| candidate.deinit(self.txn.allocator);
         const owned_key = try self.txn.allocator.dupe(u8, full_key);
         errdefer self.txn.allocator.free(owned_key);
-        const owned_value = try self.txn.allocator.dupe(u8, value);
+        const owned_value = try self.txn.allocator.dupe(u8, if (self.load_values) value else "");
         errdefer self.txn.allocator.free(owned_value);
         self.clearCurrent();
         self.current_key = owned_key;
@@ -1452,27 +1443,61 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     }
 }
 
-fn collectReplayDeletes(
-    alloc: Allocator,
-    read: *Txn,
-    kind_ordinal: u8,
-    up_to_sequence: u64,
-    deletes: *std.ArrayListUnmanaged([]u8),
-) !void {
-    var cursor = try read.openCursor();
-    defer cursor.close();
+const replay_cleanup_max_keys = 512;
+const replay_cleanup_max_key_bytes = 256 * 1024;
 
-    const lower = internal_keys.replayRangeLower(kind_ordinal, 0);
-    const upper = internal_keys.replayRangeUpper(kind_ordinal);
-    cursor.setUpperBound(upper[0..]);
+/// Cleanup is resumable: each bounded chunk commits atomically, and any later
+/// error is returned to the caller. A retry safely continues the remaining work.
+/// Reserve the writer while scanning and deleting, so no concurrent replacement
+/// can be deleted using an older read snapshot. Release it between chunks.
+fn truncateReplay(store: *Store, prefix: []const u8, yielding: bool, up_to_sequence: u64) !void {
+    if (up_to_sequence == 0) return;
+    try truncateReplayLane(store, prefix, yielding, internal_keys.replay_all_kind, up_to_sequence);
+    for (replay_hints) |hint|
+        try truncateReplayLane(store, prefix, yielding, replayHintOrdinal(hint), up_to_sequence);
+}
 
-    var entry = cursor.seekAtOrAfter(lower[0..]) catch return;
-    while (true) {
-        if (std.mem.order(u8, entry.key, upper[0..]) != .lt) break;
-        const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind_ordinal) orelse break;
-        if (sequence >= up_to_sequence) break;
-        try deletes.append(alloc, try alloc.dupe(u8, entry.key));
-        entry = cursor.next() catch break;
+fn truncateReplayLane(store: *Store, prefix: []const u8, yielding: bool, kind: u8, up_to_sequence: u64) !void {
+    var resume_sequence: u64 = 0;
+    while (resume_sequence < up_to_sequence) {
+        var write = if (yielding)
+            try Txn.openWriteYieldingWithPrefix(store, prefix)
+        else
+            try Txn.openWriteWithPrefix(store, prefix);
+        var committed = false;
+        defer if (!committed) write.abort();
+        _ = write.get(internal_keys.replay_meta_init_key[0..]) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        var count: usize = 0;
+        var bytes: usize = 0;
+        {
+            var cursor = try write.openKeyCursor();
+            defer cursor.close();
+            const lower = internal_keys.replayRangeLower(kind, resume_sequence);
+            const upper = internal_keys.replayEntryKey(kind, up_to_sequence);
+            cursor.setUpperBound(&upper);
+            var key = cursor.seekAtOrAfter(&lower) catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+            while (true) {
+                const sequence = internal_keys.parseReplayEntrySequence(key, kind) orelse return error.InvalidReplayEntryKey;
+                try write.delete(key);
+                count += 1;
+                bytes += prefix.len + key.len;
+                resume_sequence = sequence + 1; // Exclusive bound prevents overflow.
+                if (count >= replay_cleanup_max_keys or bytes >= replay_cleanup_max_key_bytes) break;
+                key = cursor.next() catch |err| switch (err) {
+                    error.NotFound => break,
+                    else => return err,
+                };
+            }
+        }
+        try write.commit();
+        committed = true;
+        if (count < replay_cleanup_max_keys and bytes < replay_cleanup_max_key_bytes) return;
     }
 }
 
@@ -2487,4 +2512,203 @@ test "lite maintenance snapshots release shared cache accounting on cancellation
     }
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_link_cache).used_bytes);
+}
+
+test "lite key-only cursor preserves prefix overlay bounds and pinned snapshots" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "key-cursor.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        for ([_][]const u8{ "a\x00a", "a\x00c", "a\x00e", "b\x00b" }) |key| try write.put(key, "value");
+        try write.commit();
+    }
+    var pinned = try Txn.openReadWithPrefix(&store, "a\x00");
+    defer pinned.abort();
+    {
+        var write = try Txn.openWriteWithPrefix(&store, "a\x00");
+        errdefer write.abort();
+        try write.delete("a");
+        try write.put("b", "new");
+        try write.put("c", "updated");
+        var cursor = try write.openKeyCursor();
+        {
+            defer cursor.close();
+            cursor.setUpperBound("e");
+            try std.testing.expectEqualStrings("b", try cursor.first());
+            try std.testing.expectEqualStrings("c", try cursor.next());
+            try std.testing.expectEqualStrings("b", try cursor.prev());
+            try std.testing.expectEqualStrings("c", try cursor.last());
+            try std.testing.expectError(error.NotFound, cursor.next());
+            try std.testing.expectEqualStrings("b", try cursor.seekAtOrAfter("a"));
+            try std.testing.expectEqualStrings("c", try cursor.seekAtOrBefore("d"));
+            cursor.setUpperBound(null);
+            try std.testing.expectEqualStrings("e", try cursor.last());
+            try std.testing.expectEqualStrings("c", try cursor.prev());
+        }
+        try write.commit();
+    }
+    var cursor = try pinned.openKeyCursor();
+    defer cursor.close();
+    try std.testing.expectEqualStrings("a", try cursor.first());
+    try std.testing.expectEqualStrings("c", try cursor.next());
+    try std.testing.expectEqualStrings("e", try cursor.next());
+    try std.testing.expectError(error.NotFound, cursor.next());
+    try std.testing.expectEqualStrings("value", try pinned.get("a"));
+}
+
+test "lite replay cleanup avoids external values and propagates allocation errors" {
+    const a = std.testing.allocator;
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "replay-key-only.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    store.file.page_cache_enabled.store(false, .monotonic);
+    const value = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(value);
+    @memset(value, 'x');
+    const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    try store.file.putDocumentBatch(&.{
+        .{ .key = &internal_keys.replay_meta_init_key, .value = "" },
+        .{ .key = &key, .value = value },
+    });
+    budget.limit = budget.live;
+    try std.testing.expectError(error.OutOfMemory, store.truncateReplayUpTo(a, 2));
+    budget.limit = std.math.maxInt(usize);
+    // A failed cleanup must release the writer and retain the entry for retry.
+    const checkpoint = store.file.activeCheckpoint();
+    budget.peak = budget.live;
+    const baseline = budget.live;
+    const reads = store.file.test_page_reads.load(.monotonic);
+    budget.limit = baseline + 1024 * 1024;
+    try store.truncateReplayUpTo(a, 2);
+    budget.limit = std.math.maxInt(usize);
+    try std.testing.expect(budget.peak - baseline < 1024 * 1024);
+    try std.testing.expect(store.file.test_page_reads.load(.monotonic) - reads < 64);
+    try std.testing.expect((try store.file.getDocumentAlloc(a, &key)) == null);
+    // Removal from the new root leaves the previous value intact.
+    const old = (try store.file.getDocumentAtCheckpointAlloc(a, checkpoint, &key)).?;
+    defer a.free(old);
+    try std.testing.expectEqualSlices(u8, value, old);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite replay cleanup commits bounded chunks isolates namespaces and retries" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "replay-chunks.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    const count = replay_cleanup_max_keys * 2 + 3;
+    const kind = internal_keys.replay_all_kind;
+    // Include a malformed key in chunk two to prove chunk one is durable,
+    // chunk two aborts, and a retry finishes after the bad key is repaired.
+    const bad_base = internal_keys.replayEntryKey(kind, replay_cleanup_max_keys + 2);
+    const bad_key = bad_base ++ "bad";
+    {
+        var write = try Txn.openWriteWithPrefix(&store, "a\x00");
+        errdefer write.abort();
+        try write.put(&internal_keys.replay_meta_init_key, "");
+        for (0..count + 1) |i| {
+            const key = internal_keys.replayEntryKey(kind, i);
+            try write.put(&key, "payload");
+        }
+        for (replay_hints) |hint| {
+            const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), 1);
+            try write.put(&key, "lane");
+        }
+        try write.put(bad_key, "malformed");
+        try write.commit();
+    }
+    var other = RuntimeStore{ .store = &store, .prefix = "b\x00" };
+    try other.appendReplayOpaque(a, 1, "other");
+    var scoped = RuntimeStore{ .store = &store, .prefix = "a\x00" };
+    try std.testing.expectError(error.InvalidReplayEntryKey, scoped.truncateReplayUpTo(a, count));
+    {
+        var read = try scoped.beginRead();
+        defer read.abort();
+        const first = internal_keys.replayEntryKey(kind, 0);
+        const second_chunk = internal_keys.replayEntryKey(kind, replay_cleanup_max_keys);
+        try std.testing.expectError(error.NotFound, read.get(&first));
+        try std.testing.expectEqualStrings("payload", try read.get(&second_chunk));
+    }
+    {
+        var write = try scoped.beginWrite();
+        errdefer write.abort();
+        try write.delete(bad_key);
+        try write.commit();
+    }
+    try scoped.truncateReplayUpTo(a, count);
+    {
+        var read = try scoped.beginRead();
+        defer read.abort();
+        var cursor = try read.openKeyCursor();
+        defer cursor.close();
+        const first = internal_keys.replayEntryKey(kind, 0);
+        const remaining = internal_keys.replayEntryKey(kind, count);
+        try std.testing.expectEqualSlices(u8, &remaining, try cursor.seekAtOrAfter(&first));
+        for (replay_hints) |hint| {
+            const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), 1);
+            try std.testing.expectError(error.NotFound, read.get(&key));
+        }
+    }
+    {
+        var read = try other.beginRead();
+        defer read.abort();
+        const key = internal_keys.replayEntryKey(kind, 1);
+        try std.testing.expectEqualStrings("other", try read.get(&key));
+    }
+    // The unscoped yielding entry point shares the same exclusive cutoff.
+    try store.appendReplayOpaque(a, 0, "zero");
+    try store.appendReplayOpaque(a, std.math.maxInt(u64) - 1, "penultimate");
+    // Avoid appendReplayOpaque's next-sequence metadata overflow at u64 max.
+    const last = internal_keys.replayEntryKey(kind, std.math.maxInt(u64));
+    try store.file.putDocument(&last, "last");
+    try store.truncateReplayUpToYielding(a, std.math.maxInt(u64));
+    const retained = (try store.file.getDocumentAlloc(a, &last)).?;
+    defer a.free(retained);
+    try std.testing.expectEqualStrings("last", retained);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite replay cleanup propagates record corruption without deleting a partial chunk" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "replay-corrupt.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    store.file.page_cache_enabled.store(false, .monotonic);
+    const first = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    const second = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
+    // Individual native writes keep these record pages separate.
+    try store.file.putDocument(&internal_keys.replay_meta_init_key, "");
+    try store.file.putDocument(&first, "first");
+    try store.file.putDocument(&second, "second");
+    const checkpoint = store.file.activeCheckpoint();
+    const offset = checkpoint.document_root_page * native.default_page_size + native.page_header_size;
+    var original: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try store.file.file.readPositionalAll(std.testing.io, &original, offset));
+    try store.file.file.writePositionalAll(std.testing.io, &.{original[0] ^ 1}, offset);
+    try std.testing.expectError(error.NativePageChecksumMismatch, store.truncateReplayUpTo(a, 3));
+    try std.testing.expectEqual(checkpoint.commit_sequence, store.file.activeCheckpoint().commit_sequence);
+    const retained = (try store.file.getDocumentAlloc(a, &first)).?;
+    defer a.free(retained);
+    try std.testing.expectEqualStrings("first", retained);
+    try store.file.file.writePositionalAll(std.testing.io, &original, offset);
+    try store.truncateReplayUpTo(a, 3);
+    try std.testing.expect((try store.file.getDocumentAlloc(a, &first)) == null);
+    try std.testing.expect((try store.file.getDocumentAlloc(a, &second)) == null);
+    try std.testing.expect((try store.file.check()).valid);
 }
