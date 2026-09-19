@@ -66,6 +66,12 @@ prerequisites are implemented and verified.
   and visibility ownership before cohort retirement. DATA routing is connected;
   its full proposal/fault qualification and transaction-control reservations
   remain open.
+- The subsequent owning durable-completion gate passed 27 tests, including
+  single-phase failure cuts after the actual primary WAL and manifest
+  publication. Reopening with admission disabled restores the document and
+  exact applied identity, creates no prepared transaction, and tolerates
+  duplicate application. These are storage component cuts, not process/quorum
+  qualification.
 - Trusted local installation capsules now restore actual accepted ordinary
   debt with empty metadata/catalog access, no service keys, and new admission
   disabled. Five owning SourceOwner tests passed, including immutable identity,

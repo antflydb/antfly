@@ -134203,6 +134203,95 @@ test "workload admission physical completion single-phase compiler captures actu
     }
 }
 
+test "workload admission physical completion single-phase restart after WAL and manifest publication" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const native = @import("../lsm_backend/completion_runtime.zig");
+    const Cut = struct {
+        fn stop() bool {
+            return true;
+        }
+    };
+    for ([_]bool{ false, true }) |after_manifest| {
+        var tmp = try TestDirectory.init("completion-single-phase-restart");
+        defer tmp.cleanup();
+        const path = std.mem.span(tmp.path().ptr);
+        var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+        defer resources.deinit(alloc);
+        try resources.configureTransactionCompletion(1024 * 1024);
+        const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 1024 * 1024,
+            .max_transaction_bytes = 64 * 1024,
+            .completion_protocol_version = 1,
+            .profile_version = 1,
+        } };
+        var options: OpenOptions = .{
+            .resource_manager = &resources,
+            .durable_completion_enabled = true,
+            .durable_completion_authority = .standalone_local,
+            .table_storage = settings,
+            .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        };
+        var binding: abi.InstallBinding = .{ .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(23), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) }, .table_id = 1, .range_id = 3 };
+        binding.schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}");
+        var wire: ?[]u8 = null;
+        defer if (wire) |value| alloc.free(value);
+        var mutation_id: transactions_mod.TxnId = undefined;
+        {
+            var db = try DB.open(alloc, path, options);
+            defer db.close();
+            try db.installCompletionBinding(binding, "", "", "{}", settings);
+            const lease = try db.acquireCompletionLease(2, 7);
+            defer lease.vtable.release(lease.context);
+            const startup: abi.DurableLog = .{ .mode = .startup_complete };
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &startup));
+            wire = try db.compileReplicatedMutation(alloc, .{ .writes = &.{.{ .key = "doc", .value = "{\"value\":7}" }}, .timestamp_ns = 100 }, .{ .term = 0, .index = 0 });
+            var decoded = try @import("../lsm_backend/completion_entry.zig").decode(alloc, wire.?);
+            defer decoded.deinit();
+            mutation_id = decoded.entry.txn_id;
+            const payloads = [_]abi.Bytes{.{ .ptr = wire.?.ptr, .len = wire.?.len }};
+            const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{ .term = 1, .applied_term_known = 1 }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+            var result: abi.CheckResult = undefined;
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+            const accepted: abi.ProposalResult = .{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals };
+            lease.vtable.proposal_result(lease.context, &accepted);
+            if (after_manifest) native.test_after_manifest = Cut.stop else native.test_after_wal = Cut.stop;
+            defer {
+                native.test_after_manifest = null;
+                native.test_after_wal = null;
+            }
+            try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
+        }
+        // Restore actual primary WAL/manifest state with admission disabled.
+        // This is a component crash cut; quorum/process failures are separate.
+        options.durable_completion_authority = .raft_apply;
+        options.durable_completion_enabled = false;
+        options.completion_pool_config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
+        var db = try DB.open(alloc, path, options);
+        defer db.close();
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const value = (try db.get(alloc, "doc")).?;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"value\":7}", value);
+        try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(mutation_id));
+        var progress: abi.Progress = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.progress.?(lease.context, &progress));
+        try std.testing.expectEqual(@as(u64, 1), progress.term);
+        try std.testing.expectEqual(@as(u64, 1), progress.index);
+        try std.testing.expectEqualSlices(u8, &@import("../../common/completion_entry_protocol.zig").payloadDigest(wire.?), &progress.payload_digest);
+        const payload: abi.Bytes = .{ .ptr = wire.?.ptr, .len = wire.?.len };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payload));
+        try std.testing.expectEqual(@as(u64, 1), db.core.identity_visibility.summary.?.live_ordinals);
+    }
+}
+
 test "workload admission physical completion normal APIs cover multi-document insert delete retry and disabled restart" {
     const alloc = std.testing.allocator;
     var tmp = try TestDirectory.init("physical-completion-api");
