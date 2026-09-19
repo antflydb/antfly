@@ -128,6 +128,7 @@ pub fn Slot(comptime Backend: type) type {
         cohort: guard.Info,
         retired: bool = false,
         run_paths: [max_slots]?[]u8 = @splat(null),
+        run_path_pins: [max_slots]?Backend.CompletionRunPathPin = @splat(null),
         io: *storage_io.NativeCompletionIo,
         wal_credit: u64 = 0,
         memory_pin: resources.ObserverMetadataPin,
@@ -335,6 +336,7 @@ pub fn Slot(comptime Backend: type) type {
             alloc.free(self.encoded);
             alloc.free(self.guard_encoded);
             alloc.free(self.journal_path);
+            for (&self.run_path_pins) |*pin| if (pin.*) |*held| held.release();
             for (self.run_paths) |path| if (path) |owned| alloc.free(owned);
             if (pooled_owner == null) alloc.destroy(self);
             scratch_domain.release();
@@ -436,6 +438,9 @@ pub fn Slot(comptime Backend: type) type {
                 if (path) |owned| alloc.free(owned);
             };
             for (0..cohort.capacity()) |i| run_paths[i] = try repository.runPath(alloc, root, run_id + i);
+            var run_path_pins: [max_slots]?Backend.CompletionRunPathPin = @splat(null);
+            errdefer for (&run_path_pins) |*pin| if (pin.*) |*held| held.release();
+            for (0..cohort.capacity()) |i| run_path_pins[i] = try Backend.pinCompletionRunPath(alloc, run_paths[i].?);
             const run_path = run_paths[0].?;
             const journal_path = try manifest_set.pathAlloc(alloc, root, backend.manifest_journal.active_segment, .journal);
             errdefer alloc.free(journal_path);
@@ -454,7 +459,7 @@ pub fn Slot(comptime Backend: type) type {
             const io = try storage_io.NativeCompletionIo.createWithFilesAndHeadroom(alloc, native, root, files[0 .. 5 + cohort.capacity()], 2);
             errdefer io.deinit() catch unreachable;
             io.allow_wal_reset = true;
-            self.* = .{ .allocator = alloc, .publication = .{ .arena = publication }, .scratch = .{ .arena = scratch }, .descriptor = descriptor, .encoded = wire, .guard_encoded = guard_wire, .cohort = cohort, .run_paths = run_paths, .io = io, .wal_credit = self.wal_credit, .memory_pin = memory_pin, .wal_pin = wal_pin, .owns_observer_pins = owns_observer_pins, .guard_path = guard_path, .wal_append_start = backend.write_stats.wal_append_bytes, .wal_entries_start = backend.write_stats.wal_append_entries, .wal_records_start = backend.write_stats.wal_append_records, .run_id = run_id, .journal_path = journal_path, .run_path = run_path, .durable = restored, .baseline_record = baseline_record, .baseline_credit = baseline_credit, .baseline_summary = baseline_summary, .baseline_applied = baseline_applied, .baseline_slot_present = baseline_slot_present };
+            self.* = .{ .allocator = alloc, .publication = .{ .arena = publication }, .scratch = .{ .arena = scratch }, .descriptor = descriptor, .encoded = wire, .guard_encoded = guard_wire, .cohort = cohort, .run_paths = run_paths, .run_path_pins = run_path_pins, .io = io, .wal_credit = self.wal_credit, .memory_pin = memory_pin, .wal_pin = wal_pin, .owns_observer_pins = owns_observer_pins, .guard_path = guard_path, .wal_append_start = backend.write_stats.wal_append_bytes, .wal_entries_start = backend.write_stats.wal_append_entries, .wal_records_start = backend.write_stats.wal_append_records, .run_id = run_id, .journal_path = journal_path, .run_path = run_path, .durable = restored, .baseline_record = baseline_record, .baseline_credit = baseline_credit, .baseline_summary = baseline_summary, .baseline_applied = baseline_applied, .baseline_slot_present = baseline_slot_present };
             if (!restored) {
                 // Any storage failure may have published this durable anchor.
                 // Never let an uncertain create resume ordinary mutation.

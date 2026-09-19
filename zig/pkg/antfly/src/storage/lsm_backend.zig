@@ -170,17 +170,59 @@ var obsolete_path_refs = ObsoletePathRefRegistry{};
 // borrows separately from open-manifest ownership so compaction can retire
 // each generation as soon as its own last reader exits, without waiting for a
 // backend-wide reader-free instant.
+var reject_new_run_snapshot_refs_for_test: bool = false;
+
 const RunSnapshotRefRegistry = struct {
+    const ReservedPath = struct {
+        allocator: Allocator,
+        path: []u8,
+        references: u64 = 1,
+        next: ?*ReservedPath = null,
+    };
     mutex: std.atomic.Mutex = .unlocked,
     refs: std.StringHashMapUnmanaged(u64) = .empty,
+    reserved: [256]?*ReservedPath = @splat(null),
+
+    fn bucket(path: []const u8) usize {
+        return @intCast(std.hash.Wyhash.hash(0, path) % 256);
+    }
+    fn findReserved(self: *RunSnapshotRefRegistry, path: []const u8) ?*ReservedPath {
+        var node = self.reserved[bucket(path)];
+        while (node) |entry| : (node = entry.next) if (std.mem.eql(u8, entry.path, path)) return entry;
+        return null;
+    }
+    fn retainPrepaid(self: *RunSnapshotRefRegistry, allocator: Allocator, path: []const u8) ![]const u8 {
+        lockWorkerMutex(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.findReserved(path)) |entry| {
+            entry.references += 1;
+            return entry.path;
+        }
+        if (self.refs.getPtr(path)) |count| {
+            count.* += 1;
+            return self.refs.getKey(path).?;
+        }
+        const entry = try allocator.create(ReservedPath);
+        errdefer allocator.destroy(entry);
+        const owned = try allocator.dupe(u8, path);
+        const index = bucket(path);
+        entry.* = .{ .allocator = allocator, .path = owned, .next = self.reserved[index] };
+        self.reserved[index] = entry;
+        return owned;
+    }
 
     fn retain(self: *RunSnapshotRefRegistry, path: []const u8) !void {
         lockWorkerMutex(&self.mutex);
         defer self.mutex.unlock();
+        if (self.findReserved(path)) |entry| {
+            entry.references += 1;
+            return;
+        }
         if (self.refs.getPtr(path)) |count| {
             count.* +|= 1;
             return;
         }
+        if (builtin.is_test) if (reject_new_run_snapshot_refs_for_test) return error.OutOfMemory;
         // Cache one stable path allocation for the run generation rather than
         // allocating a path for every read transaction.
         const owned = try std.heap.page_allocator.dupe(u8, path);
@@ -191,6 +233,23 @@ const RunSnapshotRefRegistry = struct {
     fn release(self: *RunSnapshotRefRegistry, path: []const u8) void {
         lockWorkerMutex(&self.mutex);
         defer self.mutex.unlock();
+        const index = bucket(path);
+        var link = &self.reserved[index];
+        while (link.*) |entry| {
+            if (!std.mem.eql(u8, entry.path, path)) {
+                link = &entry.next;
+                continue;
+            }
+            std.debug.assert(entry.references > 0);
+            entry.references -= 1;
+            if (entry.references == 0) {
+                link.* = entry.next;
+                entry.allocator.free(entry.path);
+                entry.allocator.destroy(entry);
+                _ = file_pin_release_epoch.fetchAdd(1, .release);
+            }
+            return;
+        }
         const count = self.refs.getPtr(path) orelse return;
         if (count.* > 0) {
             count.* -= 1;
@@ -201,6 +260,7 @@ const RunSnapshotRefRegistry = struct {
     fn isRetained(self: *RunSnapshotRefRegistry, path: []const u8) bool {
         lockWorkerMutex(&self.mutex);
         defer self.mutex.unlock();
+        if (self.findReserved(path)) |entry| return entry.references > 0;
         return if (self.refs.get(path)) |count| count > 0 else false;
     }
 
@@ -215,6 +275,26 @@ const RunSnapshotRefRegistry = struct {
 };
 
 var run_snapshot_refs = RunSnapshotRefRegistry{};
+
+test "workload admission completion run registry uses prepaid path storage through final reader" {
+    const alloc = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    const arena = try @import("lsm_backend/completion_allocator.zig").Arena.create(alloc, &manager, 4096);
+    var registry: RunSnapshotRefRegistry = .{};
+    _ = try registry.retainPrepaid(arena.allocator(), "planned-output.sst");
+    reject_new_run_snapshot_refs_for_test = true;
+    defer reject_new_run_snapshot_refs_for_test = false;
+    try std.testing.expectError(error.OutOfMemory, registry.retain("unplanned-output.sst"));
+    try registry.retain("planned-output.sst");
+    arena.release();
+    registry.release("planned-output.sst");
+    try std.testing.expect(registry.isRetained("planned-output.sst"));
+    try std.testing.expect(manager.snapshot().memory.used_bytes > 0);
+    registry.release("planned-output.sst");
+    try std.testing.expect(!registry.isRetained("planned-output.sst"));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
 
 fn writeCheckpointBytes(io: std.Io, path: []const u8, bytes: []const u8, sink: ?native_artifact_sink.Sink) !u64 {
     if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
@@ -7095,6 +7175,27 @@ pub const Backend = struct {
     pub fn planningDirectory(self: *Backend) !*const RunDirectory {
         try self.ensureRunDirectory();
         return self.run_directory.?;
+    }
+
+    /// Prepaid registry storage survives the owner while any published
+    /// directory/read snapshot retains the path. No fallback heap insertion is
+    /// needed when the reserved output is published after prepare.
+    pub const CompletionRunPathPin = struct {
+        path: ?[]const u8,
+        pub fn release(self: *CompletionRunPathPin) void {
+            const path = self.path orelse return;
+            self.path = null;
+            run_snapshot_refs.release(path);
+            // Reserved entries free on their final reference. Ordinary entries
+            // remain cached for their owning run's usual forget path.
+        }
+    };
+    pub fn pinCompletionRunPath(allocator: Allocator, path: []const u8) !CompletionRunPathPin {
+        return .{ .path = try run_snapshot_refs.retainPrepaid(allocator, path) };
+    }
+    pub fn rejectNewRunSnapshotRefsForTest(reject: bool) void {
+        if (!builtin.is_test) unreachable;
+        reject_new_run_snapshot_refs_for_test = reject;
     }
 
     pub fn retainRunSnapshotRef(_: *Backend, run: *Run) !void {
@@ -23479,7 +23580,10 @@ fn implementationTests() type {
                     pool.fd_cache.capacity = 1;
                     failing.fail_index = failing.alloc_index;
                     identity.fail_index = identity.alloc_index;
+                    Backend.rejectNewRunSnapshotRefsForTest(true);
+                    defer Backend.rejectNewRunSnapshotRefsForTest(false);
                     const outcome = backend.completeDurableCompletion(id, commit, .{ .commit_timestamp = 200, .replay_sequence = 1, .shared_ledger_count = 0, .shared_ledger_bytes = 0 });
+                    Backend.rejectNewRunSnapshotRefsForTest(false);
                     failing.fail_index = std.math.maxInt(usize);
                     identity.fail_index = std.math.maxInt(usize);
                     manager.memory.budget.hard_limit_bytes = 256 * 1024 * 1024;

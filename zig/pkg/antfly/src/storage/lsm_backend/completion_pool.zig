@@ -294,6 +294,7 @@ pub fn Pool(comptime Backend: type) type {
         guard_paths: [max_slots][]u8,
         accepted_paths: [max_slots][]u8,
         run_paths: [max_slots]?[]const u8,
+        run_path_pins: [max_slots]?Backend.CompletionRunPathPin = @splat(null),
         journal_path: []u8,
         restored: bool = false,
         startup_reconciliation_pending: bool = false,
@@ -371,6 +372,9 @@ pub fn Pool(comptime Backend: type) type {
                 specs[spec_count] = .{ .path = rp, .max_bytes = completion.limits.flush_bytes, .allow_delete = true };
                 spec_count += 1;
             }
+            var run_path_pins: [max_slots]?Backend.CompletionRunPathPin = @splat(null);
+            errdefer for (&run_path_pins) |*pin| if (pin.*) |*held| held.release();
+            for (0..max_slots) |i| run_path_pins[i] = try Backend.pinCompletionRunPath(alloc, run_paths[i].?);
             const journal_path = try manifest_set.pathAlloc(alloc, root, backend.manifest_journal.active_segment, .journal);
             errdefer alloc.free(journal_path);
             specs[spec_count] = .{ .path = journal_path, .max_bytes = repository.maxManifestReadBytes(), .allow_append = true };
@@ -413,6 +417,7 @@ pub fn Pool(comptime Backend: type) type {
                 .guard_paths = guard_paths,
                 .accepted_paths = accepted_paths,
                 .run_paths = run_paths,
+                .run_path_pins = run_path_pins,
                 .journal_path = journal_path,
                 .wal_bytes_start = backend.write_stats.wal_append_bytes,
                 .wal_entries_start = backend.write_stats.wal_append_entries,
@@ -460,6 +465,7 @@ pub fn Pool(comptime Backend: type) type {
             self.io.deinit() catch unreachable;
             self.memory_pin.release() catch unreachable;
             self.wal_pin.release() catch unreachable;
+            for (&self.run_path_pins) |*pin| if (pin.*) |*held| held.release();
             for (0..max_slots) |i| {
                 self.control.allocator().free(self.guard_paths[i]);
                 self.control.allocator().free(self.accepted_paths[i]);
@@ -985,10 +991,12 @@ pub fn Pool(comptime Backend: type) type {
             const cell = &self.cells[i];
             std.debug.assert(cell.phase == .accepted);
             self.io.storage().deleteFileAbsolute(self.accepted_paths[i]) catch |err| {
+                self.failed = true;
                 backend.fenceFailedBulkWal();
                 return err;
             };
             self.io.storage().syncParentAbsolute(self.accepted_paths[i]) catch |err| {
+                self.failed = true;
                 backend.fenceFailedBulkWal();
                 return err;
             };
@@ -1219,6 +1227,11 @@ test "workload admission physical completion pool accepts through native prepaid
     try hash.add("row", null);
     const envelope = try entry_codec.encode(alloc, .{ .group_id = identity.group_id, .group_incarnation = identity.incarnation, .policy_digest = identity.policy_digest, .schema_catalog_digest = @splat(13), .txn_id = id, .original_input_digest = @splat(14), .baseline_digest = hash.finish(), .previous_term = 3, .previous_index = 8, .baseline_keys = &.{ "intent", "read-only", "row" }, .descriptor = descriptor, .prepare_operations = &.{.{ .kind = .put, .key = "intent", .value = "prepared" }} });
     defer alloc.free(envelope);
+    Backend.rejectNewRunSnapshotRefsForTest(true);
+    defer Backend.rejectNewRunSnapshotRefsForTest(false);
+    var unreserved_run: repository.Run = undefined;
+    unreserved_run.path = @constCast("unreserved-completion-output");
+    try std.testing.expectError(error.OutOfMemory, backend.retainRunSnapshotRef(&unreserved_run));
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
     fd_pool.fd_cache.capacity = 1;
