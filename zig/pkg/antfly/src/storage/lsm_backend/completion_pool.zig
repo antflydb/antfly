@@ -261,6 +261,31 @@ pub const DurableLog = struct {
     observations: []const DurableObservation,
 };
 
+/// Match the SST record framing used by the maintenance reader. Bindings
+/// patch fixed eight-byte fields and never change these lengths.
+fn validateRecordSize(namespace: ?[]const u8, key: []const u8, value_len: usize, limit: usize) !void {
+    var size = std.math.add(usize, 13, if (namespace) |name| name.len else 0) catch return error.UnsupportedCompletionProfile;
+    size = std.math.add(usize, size, key.len) catch return error.UnsupportedCompletionProfile;
+    size = std.math.add(usize, size, value_len) catch return error.UnsupportedCompletionProfile;
+    if (size > limit) return error.UnsupportedCompletionProfile;
+}
+
+fn validateEntryRecordSizes(entry: *const entry_codec.OwnedEntry, limit: usize) !void {
+    const descriptor = entry.decoded_descriptor.descriptor;
+    for ([_][]const slot_codec.Operation{ entry.entry.prepare_operations, descriptor.commit, descriptor.abort }) |operations| {
+        for (operations) |op| try validateRecordSize(descriptor.namespace, op.key, op.value.len, limit);
+    }
+    // Include native-only records which are deliberately absent from the
+    // leader's wire operations. Validate every possible cell before selecting
+    // one, so a later cohort position cannot have a longer unchecked key.
+    for (completion.storage_keys) |key| try validateRecordSize(descriptor.namespace, key, entry.entry.descriptor.len, limit);
+    for (completion.applied_keys) |key| try validateRecordSize(descriptor.namespace, key, 16, limit);
+    const receipt_key = entry_codec.receiptKey(descriptor.txn_id);
+    try validateRecordSize(descriptor.namespace, &receipt_key, 48, limit);
+    try validateRecordSize(descriptor.namespace, entry_codec.group_progress_key, 112, limit);
+    try validateRecordSize(descriptor.namespace, &@import("../internal_keys.zig").raft_document_applied_entry_key, 16, limit);
+}
+
 pub fn Pool(comptime Backend: type) type {
     return struct {
         const Self = @This();
@@ -496,6 +521,7 @@ pub fn Pool(comptime Backend: type) type {
             if (self.config.namespace == .root) {
                 if (namespace != null) return error.UnsupportedCompletionProfile;
             } else if (namespace == null or !std.mem.eql(u8, namespace.?, "docs")) return error.UnsupportedCompletionProfile;
+            try validateEntryRecordSizes(entry, self.config.shape.max_record_bytes);
         }
 
         fn point(self: *Self, backend: *Backend, alloc: Allocator, namespace: ?[]const u8, key: []const u8) !Point {
@@ -532,7 +558,9 @@ pub fn Pool(comptime Backend: type) type {
                 self.replayed_wal_records +| (backend.write_stats.wal_append_records -| self.wal_records_start) >= completion.recovery_wal_records)
                 return error.CompletionForegroundCapacityExceeded;
             for (0..incoming.entryCount()) |i| {
-                const key = incoming.entryAt(i).key;
+                const item = incoming.entryAt(i);
+                try validateRecordSize(item.namespace_name, item.key, item.value.len, self.config.shape.max_record_bytes);
+                const key = item.key;
                 if (std.mem.eql(u8, key, entry_codec.group_progress_key) or
                     std.mem.startsWith(u8, key, entry_codec.receipt_prefix) or
                     std.mem.startsWith(u8, key, completion.storage_key) or
@@ -1252,6 +1280,11 @@ test "workload admission physical completion pool accepts through native prepaid
     try hash.add("row", null);
     const envelope = try entry_codec.encode(alloc, .{ .group_id = identity.group_id, .group_incarnation = identity.incarnation, .policy_digest = identity.policy_digest, .schema_catalog_digest = @splat(13), .txn_id = id, .original_input_digest = @splat(14), .baseline_digest = hash.finish(), .previous_term = 3, .previous_index = 8, .baseline_keys = &.{ "intent", "read-only", "row" }, .descriptor = descriptor, .prepare_operations = &.{.{ .kind = .put, .key = "intent", .value = "prepared" }} });
     defer alloc.free(envelope);
+    pool.config.shape.max_record_bytes = 32;
+    try std.testing.expectError(error.UnsupportedCompletionProfile, pool.accept(&backend, 3, 9, 3, 8, envelope));
+    try std.testing.expectEqual(Pool(Backend).Phase.free, pool.cells[0].phase);
+    try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
+    pool.config.shape.max_record_bytes = (Shape{}).max_record_bytes;
     Backend.rejectNewRunSnapshotRefsForTest(true);
     defer Backend.rejectNewRunSnapshotRefsForTest(false);
     var unreserved_run: repository.Run = undefined;
@@ -1657,4 +1690,63 @@ test "workload admission physical completion pool bounds reader-retained mainten
         try std.testing.expectEqualStrings("version2", try latest.get(.{}, "row"));
     }
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "workload admission physical completion record admission includes canonical outcome and private framing" {
+    const alloc = std.testing.allocator;
+    const id: [16]u8 = @splat(31);
+    const Fixture = struct {
+        fn decode(allocator: Allocator, descriptor: []const u8, prepare: []const slot_codec.Operation) !entry_codec.OwnedEntry {
+            const wire = try entry_codec.encode(allocator, .{
+                .group_id = 7,
+                .group_incarnation = @splat(1),
+                .policy_digest = @splat(2),
+                .schema_catalog_digest = @splat(3),
+                .txn_id = @splat(31),
+                .original_input_digest = @splat(4),
+                .baseline_digest = @splat(5),
+                .baseline_keys = &.{ "prep", "row" },
+                .descriptor = descriptor,
+                .prepare_operations = prepare,
+            });
+            defer allocator.free(wire);
+            return entry_codec.decode(allocator, wire);
+        }
+    };
+    const small_descriptor = try slot_codec.encode(alloc, .{ .txn_id = id, .intent_revision = 1, .namespace = "docs", .limits = completion.limits, .profile_fence = "profile", .commit = &.{.{ .kind = .put, .key = "row", .value = "complete" }}, .abort = &.{.{ .kind = .delete, .key = "row" }} }, .{});
+    defer alloc.free(small_descriptor);
+    const payload = try alloc.alloc(u8, 1024 - 13 - "docs".len - "prep".len + 1);
+    defer alloc.free(payload);
+    @memset(payload, 'v');
+    {
+        var exact = try Fixture.decode(alloc, small_descriptor, &.{.{ .kind = .put, .key = "prep", .value = payload[0 .. payload.len - 1] }});
+        defer exact.deinit();
+        try validateEntryRecordSizes(&exact, 1024);
+    }
+    {
+        var too_large = try Fixture.decode(alloc, small_descriptor, &.{.{ .kind = .put, .key = "prep", .value = payload }});
+        defer too_large.deinit();
+        try std.testing.expectError(error.UnsupportedCompletionProfile, validateEntryRecordSizes(&too_large, 1024));
+    }
+    // Tombstones still serialize namespace and key; fixed-size bindings cannot
+    // make an otherwise oversized key acceptable.
+    try validateRecordSize("docs", "row", 0, 20);
+    try std.testing.expectError(error.UnsupportedCompletionProfile, validateRecordSize("docs", "row", 0, 19));
+    const empty_descriptor = try slot_codec.encode(alloc, .{ .txn_id = id, .intent_revision = 1, .namespace = "docs", .limits = completion.limits, .profile_fence = "profile", .commit = &.{.{ .kind = .put, .key = "row", .value = "" }}, .abort = &.{} }, .{});
+    defer alloc.free(empty_descriptor);
+    const outcome = try alloc.alloc(u8, completion.limits.max_encoded_bytes - empty_descriptor.len);
+    defer alloc.free(outcome);
+    @memset(outcome, 'x');
+    const full_descriptor = try slot_codec.encode(alloc, .{ .txn_id = id, .intent_revision = 1, .namespace = "docs", .limits = completion.limits, .profile_fence = "profile", .commit = &.{.{ .kind = .put, .key = "row", .value = outcome }}, .abort = &.{} }, .{});
+    defer alloc.free(full_descriptor);
+    try std.testing.expectEqual(@as(usize, completion.limits.max_encoded_bytes), full_descriptor.len);
+    var private = try Fixture.decode(alloc, full_descriptor, &.{.{ .kind = .put, .key = "prep", .value = "v" }});
+    defer private.deinit();
+    // The actual outcome fits; the private descriptor record needs additional
+    // SST framing and the longest cohort storage key, and must reject pre-ACK.
+    try validateRecordSize("docs", "row", outcome.len, (Shape{}).max_record_bytes);
+    try std.testing.expectError(error.UnsupportedCompletionProfile, validateEntryRecordSizes(&private, (Shape{}).max_record_bytes));
+    const exact_private_size = 13 + "docs".len + completion.storage_keys[1].len + full_descriptor.len;
+    try validateEntryRecordSizes(&private, exact_private_size);
+    try std.testing.expectError(error.UnsupportedCompletionProfile, validateEntryRecordSizes(&private, exact_private_size - 1));
 }

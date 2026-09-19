@@ -361,3 +361,55 @@ ordinary postcommit visibility callbacks retain their existing behavior.
 The broader mandatory-completion policy remains disabled. Multi-participant
 coordination, replicated admission compatibility, other document/index profiles,
 and optimized workload qualification remain separate work.
+
+## Current replicated-pool release gates
+
+The native four-cell pool now has prepaid checkpoint/rearm maintenance and
+bounded retention of two obsolete file generations. Its focused tests cover
+repeated maintenance under denied ordinary allocation/FD admission, idle and
+65-run restoration, publication-boundary crash hooks, and real pinned readers.
+These mechanisms do not yet qualify production pre-ACK completion admission.
+The following gates remain:
+
+- **Exact record shape.** Canonical prepare, both outcome templates, and native
+  descriptor/receipt/progress records must fit the maintenance record limit,
+  including the 13-byte SST header, namespace, key, and value. A 256 KiB encoded
+  descriptor alone does not fit a 256 KiB SST-record limit. The exact admission
+  check and boundary tests passed the owning Debug gate (7/7 total, including
+  pool and generation-guard regressions; no failures or leaks).
+- **Aggregate scratch and publication headroom.** A 16 MiB input cursor frontier
+  is not the full working set. At 64 output runs, two 256 KiB boundary keys per
+  run alone consume 32 MiB while the builder retains its results. Publication
+  copies those bounds into both writer metadata and the reader directory; its
+  durable directory fork shares payloads. Candidate/current/reader-retained
+  generations coexist with four concrete 8 MiB cell spans. Admission needs an
+  aggregate bound covering these bytes, decoder/encoder transients, allocator
+  overhead and retained replay state, together with actual contiguous spans.
+  Total free bytes in the shared recycling allocator are insufficient evidence.
+  Tighter boundary-key profiles or separately reserved domains are design
+  alternatives, not implemented proofs.
+- **Output-count and future-frontier certificate.** At most 68 input runs and
+  1 MiB metadata per input do not imply at most 64 rewritten outputs. Admission
+  must certify the resulting stream, including all accepted plans. After exact
+  record validation, four protected SSTs add at most 2,525,696 bytes to the
+  current 64-bit sequential cursor bound: each has at most 3,348 entries/blocks,
+  a 32-byte block descriptor, and at most two 256 KiB block buffers. A baseline
+  frontier of at most 12 MiB would leave sufficient room within the current
+  16 MiB cursor gate; this does not certify the other allocations above and is
+  not yet an enforced admission bound.
+- **Counter headroom.** Reserve checked manifest sequence increments for every
+  outstanding drain and the subsequent checkpoint/segment transition. Validate
+  replay-next-sequence and shared-credit arithmetic before accepting resolution,
+  rather than discovering overflow after starting a durable attempt.
+- **Actual I/O fault coverage.** Maintenance crash hooks verify the selected
+  publication boundaries. Partial writes, fsync failures, and failures after
+  pointer rename still need direct injected-I/O coverage, including durable
+  obsolete-path ownership, orphan-output recovery, and unchanged data/progress.
+
+The physical pool can guarantee retained memory and participation in native FD
+admission; lowering those ordinary limits cannot revoke already owned capacity.
+It does not reserve filesystem free space, device success, process-wide OS file
+handles, or completion time. Those I/O failures must retain uncertain ownership
+and fence further mutation. Pinned readers may delay rearm of a fully completed
+cohort; they must never cause resources for an already accepted obligation to be
+released or replaced by a fresh ordinary admission request.
