@@ -54,6 +54,8 @@ const mappings = [_]Mapping{
     .{ .status = .completion_file_capacity_exceeded, .err = error.CompletionFileCapacityExceeded },
     .{ .status = .completion_writer_closed, .err = error.CompletionWriterClosed },
     .{ .status = .completion_writer_live, .err = error.CompletionWriterLive },
+    .{ .status = .recovery_required, .err = error.RecoveryRequired },
+    .{ .status = .invalid_txn_record, .err = error.InvalidTxnRecord },
     .{ .status = .prepared_completion_active, .err = error.PreparedCompletionActive },
     .{ .status = .completion_transition_in_progress, .err = error.CompletionTransitionInProgress },
     .{ .status = .completion_transition_capacity_exceeded, .err = error.CompletionTransitionCapacityExceeded },
@@ -811,6 +813,19 @@ test "workload admission native completion startup failures survive storage enve
         const restored = blk: {
             statusToError(failure.status) catch |err| break :blk err;
             return error.ExpectedCompletionFailure;
+        };
+        try std.testing.expectEqual(expected, restored);
+    }
+}
+
+test "workload admission uncertain completion recovery preserves exact storage failure" {
+    for ([_]anyerror{ error.RecoveryRequired, error.InvalidTxnRecord }) |expected| {
+        const failure = failureFromError(expected, .local_query, abi.abi_version, 1);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expect(failure.status != .internal);
+        const restored = blk: {
+            statusToError(failure.status) catch |err| break :blk err;
+            return error.ExpectedRecoveryFailure;
         };
         try std.testing.expectEqual(expected, restored);
     }

@@ -473,6 +473,7 @@ pub const Detail = enum(c_int) {
     completion_file_capacity_exceeded,
     completion_writer_closed,
     completion_writer_live,
+    recovery_required,
 };
 
 pub const Status = extern struct {
@@ -588,6 +589,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.CompletionFileCapacityExceeded => status(.retryable, .completion_file_capacity_exceeded),
         error.CompletionWriterClosed => status(.internal, .completion_writer_closed),
         error.CompletionWriterLive => status(.internal, .completion_writer_live),
+        error.RecoveryRequired => status(.unavailable, .recovery_required),
         error.ExtensionOwnedObject => status(.conflict, .extension_owned_object),
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
@@ -1088,6 +1090,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .completion_file_capacity_exceeded => "CompletionFileCapacityExceeded",
         .completion_writer_closed => "CompletionWriterClosed",
         .completion_writer_live => "CompletionWriterLive",
+        .recovery_required => "RecoveryRequired",
         .extension_owned_object => "ExtensionOwnedObject",
         .restore_intent_conflict => "RestoreIntentConflict",
         .unauthorized => "Unauthorized",
@@ -1567,6 +1570,11 @@ test "workload admission completion eligibility failures preserve exact boundary
 }
 
 test "workload admission native completion startup preserves domain failure identities" {
+    // This reports a fenced backend, not a known-aborted write. Recovery must
+    // inspect durable state before retrying any uncertain mutation.
+    try std.testing.expectEqual(error.RecoveryRequired, errorFromStatus(statusFromError(error.RecoveryRequired)));
+    try std.testing.expectEqual(@intFromEnum(Code.unavailable), statusFromError(error.RecoveryRequired).code);
+    try std.testing.expectEqual(error.InvalidTxnRecord, errorFromStatus(statusFromError(error.InvalidTxnRecord)));
     try std.testing.expectEqual(error.LocalCompletionAuthorityRequired, errorFromStatus(statusFromError(error.LocalCompletionAuthorityRequired)));
     try std.testing.expectEqual(@intFromEnum(Code.unsupported), statusFromError(error.LocalCompletionAuthorityRequired).code);
     try std.testing.expectEqual(error.UnsupportedCompletionBackend, errorFromStatus(statusFromError(error.UnsupportedCompletionBackend)));
