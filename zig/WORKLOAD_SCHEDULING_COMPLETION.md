@@ -72,6 +72,19 @@ prerequisites are implemented and verified.
   exact applied identity, creates no prepared transaction, and tolerates
   duplicate application. These are storage component cuts, not process/quorum
   qualification.
+- Canonical begin compilation now runs the real transaction manager against a
+  read-only overlay, preserving coordinator/follower participant selection and
+  completion-ledger accounting. The C owner accepts the resulting single-phase
+  metadata write without inventing a document replay event. The owning gate
+  passed 28 tests: exact physical comparison with independently applied begin,
+  application with ordinary memory admission denied, and document/begin restart
+  after acceptance, WAL append and manifest publication (six restart cases).
+  This exposed and fixed a lazy replay-cache lock re-entry during accepted-only
+  restoration; installation also reconciles the ledger before creating a pool.
+  These results cover the initial begin write, not its future control debt:
+  abort-before-prepare, metadata-only coordinator decisions, and named ACKs
+  after local resolution still need retained control ownership. Named prepares
+  remain restricted and production activation remains disabled.
 - Trusted local installation capsules now restore actual accepted ordinary
   debt with empty metadata/catalog access, no service keys, and new admission
   disabled. Five owning SourceOwner tests passed, including immutable identity,

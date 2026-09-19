@@ -70,6 +70,23 @@ pub fn encodePhysicalMutation(
     for (deletes) |key| try writer.delete(key);
     for (writes) |write| try writer.put(write.key, write.value);
     if (replay) |entry| try writer.setReplayOpaque(entry.sequence, entry.payload);
+    return encodeMutationPlan(alloc, authority, input_digest, profile_fence, limits, snapshot, &plan, overlay.baseline_reads.items, additional_dependencies);
+}
+
+/// Seal an already physical, bounded plan. Transaction metadata compilation
+/// uses the real manager against a read-only overlay, so it needs no document
+/// writer expansion or synthetic derived replay event.
+pub fn encodeMutationPlan(
+    alloc: Allocator,
+    authority: Authority,
+    input_digest: [32]u8,
+    profile_fence: []const u8,
+    limits: slot.Limits,
+    snapshot: *erased.ReadTxn,
+    plan: *const mutations.Plan,
+    baseline_reads: []const []const u8,
+    additional_dependencies: []const []const u8,
+) ![]u8 {
     const operations = try alloc.alloc(slot.Operation, plan.count);
     defer alloc.free(operations);
     for (plan.operations(), operations) |op, *out| out.* = .{
@@ -79,7 +96,7 @@ pub fn encodePhysicalMutation(
     };
     var keys: std.ArrayListUnmanaged([]const u8) = .empty;
     defer keys.deinit(alloc);
-    for (overlay.baseline_reads.items) |key| try addKey(alloc, &keys, key);
+    for (baseline_reads) |key| try addKey(alloc, &keys, key);
     for (additional_dependencies) |key| try addKey(alloc, &keys, key);
     for (operations) |op| try addKey(alloc, &keys, op.key);
     std.mem.sort([]const u8, keys.items, {}, lessThan);

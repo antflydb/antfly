@@ -418,6 +418,34 @@ const txn_record_v4_size = 51;
 const txn_record_v5_size = 52;
 const txn_record_v6_size = 53;
 
+/// Only begin metadata may omit derived replay publication. Never grant this
+/// exemption to document mutations, decisions, acknowledgements or intents.
+pub fn isBeginCompletionMutation(operations: []const completion_compiler.slot.Operation) bool {
+    var id: ?TxnId = null;
+    for (operations) |op| {
+        if (op.bindings.len != 0) return false;
+        if (op.key.len != records_prefix.len + 16 or !std.mem.startsWith(u8, op.key, records_prefix)) continue;
+        if (id != null or op.kind != .put or op.value.len != txn_record_v6_size or op.value[0] != @intFromEnum(TxnStatus.pending)) return false;
+        const record = decodeRecord(op.value) catch return false;
+        if (record.status != .pending or record.prepared or record.intent_revision != 0 or record.replay_sequence != 0 or record.intents_resolved)
+            return false;
+        id = op.key[records_prefix.len..][0..16].*;
+    }
+    const txn_id = id orelse return false;
+    for (operations) |op| {
+        if (std.mem.eql(u8, op.key, completion_summary_key)) {
+            if (op.kind != .put or op.value.len != 16) return false;
+            continue;
+        }
+        const allowed = inline for (.{ records_prefix, participants_prefix, resolved_participants_prefix, completion_prefix }) |prefix| {
+            if (op.key.len == prefix.len + 16 and std.mem.startsWith(u8, op.key, prefix) and
+                std.mem.eql(u8, op.key[prefix.len..], &txn_id)) break true;
+        } else false;
+        if (!allowed) return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // TxnManager
 // ============================================================================
@@ -629,6 +657,47 @@ pub const TxnManager = struct {
     /// Create a new pending transaction record.
     pub fn initTransaction(self: *TxnManager, txn_id: TxnId, timestamp: u64) !void {
         try self.initTransactionWithParticipants(txn_id, timestamp, &.{});
+    }
+
+    pub const BeginInput = struct {
+        txn_id: TxnId,
+        timestamp: u64,
+        created_at: u64,
+        topology_epoch: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+    };
+
+    /// Run the actual begin and completion-ledger logic on a private overlay.
+    /// The caller holds the DB apply fence and owns the immutable snapshot.
+    /// Returning a plan grants no acceptance authority or completion backing.
+    pub fn compileBeginMutation(
+        self: *TxnManager,
+        alloc: Allocator,
+        snapshot: *backend_erased.ReadTxn,
+        input: BeginInput,
+        authority: @import("completion_candidate.zig").Authority,
+        input_digest: [32]u8,
+        profile_fence: []const u8,
+        additional_dependencies: []const []const u8,
+    ) ![]u8 {
+        var overlay = try completion_compiler.Overlay.init(alloc, snapshot, .{ .max_operations = 256, .max_bytes = 256 * 1024 });
+        defer overlay.deinit();
+        var private: TxnManager = .{ .store = overlay.store(), .owns_store = false, .alloc = alloc, .completion_limits = self.completion_limits };
+        // Never let first-use reconciliation scan or initialize backing state
+        // while compiling a point-certified consensus candidate.
+        if (private.completion_limits.enabled() and try private.completionUsage() == null)
+            return error.TransactionRecoveryReconciliationRequired;
+        try private.initTransactionWithParticipantsCreatedAtRoleAndRetention(input.txn_id, input.timestamp, input.created_at, input.participants, input.coordinator, input.retain_terminal);
+        if (overlay.log.count == 0) {
+            // An idempotent begin still carries its Raft progress. Retain an
+            // exact record rewrite rather than creating a fake document event.
+            const key = makeRecordKey(input.txn_id);
+            const record = try snapshot.get(&key);
+            try overlay.log.put(&key, record);
+        }
+        return @import("completion_candidate.zig").encodeMutationPlan(alloc, authority, input_digest, profile_fence, lsm_backend.Backend.durable_completion_limits, snapshot, &overlay.log, overlay.baseline_reads.items, additional_dependencies);
     }
 
     pub fn initTransactionWithParticipants(self: *TxnManager, txn_id: TxnId, timestamp: u64, participants: []const []const u8) !void {

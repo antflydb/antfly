@@ -308,16 +308,37 @@ pub fn applyStorageKernelReplicatedBatch(
         try db.batchReplicatedApply(req);
 }
 
-/// Compile only a transaction prepare; do not silently discard another batch
+/// Compile ordinary writes, begin or prepare; do not discard another batch
 /// operation or publish any of its mutations while producing the candidate.
 pub fn compileStorageKernelReplicatedCompletion(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
+    table_name: []const u8,
+    group_id: u64,
     req: db_mod.types.BatchRequest,
     expected_previous: db_mod.RaftAppliedEntryIdentity,
 ) ![]u8 {
     try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
     const mutation = req.transaction orelse return db.compileReplicatedMutation(alloc, req, expected_previous);
+    if (mutation == .begin) {
+        if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.merge_artifacts.len != 0 or
+            req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or
+            req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null)
+            return error.InvalidBatchRequest;
+        const begin = mutation.begin;
+        var selection = try selectBeginParticipants(alloc, table_name, group_id, begin.participants);
+        defer selection.deinit(alloc);
+        return db.compileReplicatedBegin(alloc, .{
+            .txn_id = begin.txn_id,
+            .timestamp = begin.begin_timestamp,
+            .created_at = begin.created_at_ns,
+            .topology_epoch = begin.topology_epoch,
+            .participants = selection.durableParticipants(begin.participants),
+            .coordinator = selection.coordinator,
+            .retain_terminal = begin.retain_terminal,
+        }, expected_previous);
+    }
     if (mutation != .prepare or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
         req.reject_graph_transform_projections or req.split_checkpoint != null or req.split_replication != null or
         req.split_transition != null or req.merge_source_transition != null or req.merge_checkpoint != null or
@@ -367,6 +388,35 @@ pub fn applyReplicatedTransactionMutationAtRaftEntry(
     try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry);
 }
 
+const BeginParticipantSelection = struct {
+    local: [1][]const u8,
+    coordinator: bool,
+
+    fn durableParticipants(self: *const @This(), all: []const []const u8) []const []const u8 {
+        return if (self.coordinator) all else &self.local;
+    }
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.local[0]);
+    }
+};
+
+fn selectBeginParticipants(alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, participants: []const []const u8) !BeginParticipantSelection {
+    if (participants.len == 0) return error.InvalidBatchRequest;
+    const local = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
+    errdefer alloc.free(local);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    var local_present = false;
+    for (participants) |participant| {
+        if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidBatchRequest;
+        const entry = try seen.getOrPut(alloc, participant);
+        if (entry.found_existing) return error.InvalidBatchRequest;
+        if (std.mem.eql(u8, participant, local)) local_present = true;
+    }
+    if (!local_present) return error.InvalidBatchRequest;
+    return .{ .local = .{local}, .coordinator = std.mem.eql(u8, participants[0], local) };
+}
+
 pub fn applyReplicatedTransactionMutationInternal(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -379,32 +429,19 @@ pub fn applyReplicatedTransactionMutationInternal(
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
     switch (mutation) {
         .begin => |begin| {
-            const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
-            defer alloc.free(local_participant);
-            if (begin.participants.len == 0) return error.InvalidBatchRequest;
-            var seen = std.StringHashMapUnmanaged(void).empty;
-            defer seen.deinit(alloc);
-            var local_present = false;
-            for (begin.participants) |participant| {
-                if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidBatchRequest;
-                const entry = try seen.getOrPut(alloc, participant);
-                if (entry.found_existing) return error.InvalidBatchRequest;
-                if (std.mem.eql(u8, participant, local_participant)) local_present = true;
-            }
-            if (!local_present) return error.InvalidBatchRequest;
-            const coordinator = std.mem.eql(u8, begin.participants[0], local_participant);
-            const local_only = [_][]const u8{local_participant};
+            var selection = try selectBeginParticipants(alloc, table_name, group_id, begin.participants);
+            defer selection.deinit(alloc);
             // Only the coordinator owns the full participant fan-out. A
             // follower tracks itself, making successful cleanup O(N) rather
             // than every participant retrying every other participant.
-            const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
+            const durable_participants = selection.durableParticipants(begin.participants);
             if (raft_entry) |entry|
                 _ = try db.beginReplicatedTransactionAtRaftEntry(
                     begin.txn_id,
                     begin.begin_timestamp,
                     begin.created_at_ns,
                     durable_participants,
-                    coordinator,
+                    selection.coordinator,
                     begin.retain_terminal,
                     entry,
                 )
@@ -414,7 +451,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                     begin.begin_timestamp,
                     begin.created_at_ns,
                     durable_participants,
-                    coordinator,
+                    selection.coordinator,
                     begin.retain_terminal,
                 );
         },

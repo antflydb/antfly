@@ -25280,6 +25280,32 @@ pub const DB = struct {
         return capture.envelope orelse error.CompletionAdmissionUnavailable;
     }
 
+    /// Compile begin metadata without creating a transaction or a document
+    /// replay event. Named participant selection/validation belongs to the
+    /// trusted local-write adapter; prepare/decision/ACK ownership is separate.
+    pub fn compileReplicatedBegin(self: *DB, alloc: Allocator, input: transactions_mod.TxnManager.BeginInput, expected_previous: RaftAppliedEntryIdentity) ![]u8 {
+        const authority = try self.replicatedCompletionAuthority(expected_previous);
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.validateSinglePhaseCompletionProfile();
+        try self.core.validateTransactionCompletionPolicy();
+        var manager = try transactions_mod.TxnManager.init(alloc, self.core.store);
+        defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = self.core.table_catalog.transaction_admission_bytes,
+            .max_count = self.core.table_catalog.transaction_recovery_max_count,
+            .max_bytes = self.core.table_catalog.transaction_recovery_max_bytes,
+        };
+        var read = try manager.store.beginRead();
+        defer read.abort();
+        const original = try std.json.Stringify.valueAlloc(alloc, input, .{});
+        defer alloc.free(original);
+        var input_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(original, &input_digest, .{});
+        const fence = replicatedCompletionFence(authority, input_digest);
+        return manager.compileBeginMutation(alloc, &read, input, authority, input_digest, &fence, &.{&internal_keys.table_storage_settings_key});
+    }
+
     /// Builds a proposal candidate against a stable DB snapshot. This does not
     /// prepare the transaction or acquire accepted ownership. DATA must hold
     /// or revalidate its full Raft frontier before submitting the candidate;
@@ -25929,6 +25955,18 @@ pub const DB = struct {
                     self.table_storage = desired_settings;
                     self.core.table_catalog = next_catalog;
                 }
+                // The first canonical begin cannot perform a prefix scan or
+                // invent an empty ledger. Reconcile authoritative records in
+                // this fenced, pre-pool migration, then checkpoint the ledger
+                // with the rest of installation before any accepted promise.
+                var completion_manager = try transactions_mod.TxnManager.init(self.alloc, self.core.store);
+                defer completion_manager.deinit();
+                completion_manager.completion_limits = .{
+                    .max_transaction_bytes = policy.max_transaction_bytes,
+                    .max_count = policy.max_count,
+                    .max_bytes = policy.max_bytes,
+                };
+                try completion_manager.reconcileCompletionAdmission();
                 try self.core.index_manager.prepareCompletionBackends();
                 {
                     const locked = @import("../lsm_backend/runtime.zig").lockBackend(lsm_backend_mod.Backend, backend);
@@ -26008,6 +26046,11 @@ pub const DB = struct {
         defer self.core.unlockApply();
         if (self.async_context.completion_pool_owner != null) return;
         const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+        // Restored accepted entries can need publication ownership before any
+        // ordinary replay reader has run. Warm the lazy cache while only the
+        // outer DB apply fence is held: its first read acquires backend.mu,
+        // which attachPublicationOwner's callbacks already hold below.
+        _ = self.core.nextDerivedAppendSequence();
         const locked = @import("../lsm_backend/runtime.zig").lockBackend(lsm_backend_mod.Backend, backend);
         defer @import("../lsm_backend/runtime.zig").unlockBackend(lsm_backend_mod.Backend, backend, locked);
         const pool = backend.completion_pool orelse return error.CompletionAdmissionUnavailable;
@@ -26049,6 +26092,13 @@ pub const DB = struct {
         const operations = if (entry.entry.kind == .mutation) entry.entry.prepare_operations else entry.decoded_descriptor.descriptor.commit;
         const token = try alloc.create(CompletionPublicationToken);
         errdefer alloc.destroy(token);
+        if (entry.entry.kind == .mutation and transactions_mod.isBeginCompletionMutation(operations)) {
+            // The native accepted cell owns this metadata-only write through
+            // apply/restart. It has no derived event, visibility target or
+            // replay sequence to reserve. The installed pool fences structure.
+            token.* = .{ .allocator = alloc, .txn_id = id, .owns_admission = false };
+            return token;
+        }
         const new_admission = self.findDurableCompletionBacklog(id) == null;
         token.* = .{ .allocator = alloc, .txn_id = id, .owns_admission = new_admission };
         if (new_admission) {
@@ -134203,19 +134253,16 @@ test "workload admission physical completion single-phase compiler captures actu
     }
 }
 
-test "workload admission physical completion single-phase restart after WAL and manifest publication" {
+test "workload admission physical completion begin captures real coordinator and follower metadata without replay" {
     const alloc = std.testing.allocator;
     const abi = @import("kernel_owner_abi").completion_pool;
-    const native = @import("../lsm_backend/completion_runtime.zig");
-    const Cut = struct {
-        fn stop() bool {
-            return true;
-        }
-    };
-    for ([_]bool{ false, true }) |after_manifest| {
-        var tmp = try TestDirectory.init("completion-single-phase-restart");
+    const local = @import("../local_write.zig");
+    const codec = @import("../lsm_backend/completion_entry.zig");
+    for ([_]bool{ false, true }) |coordinator| {
+        var tmp = try TestDirectory.init("completion-begin");
         defer tmp.cleanup();
-        const path = std.mem.span(tmp.path().ptr);
+        var reference_tmp = try TestDirectory.init("completion-begin-reference");
+        defer reference_tmp.cleanup();
         var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
         defer resources.deinit(alloc);
         try resources.configureTransactionCompletion(1024 * 1024);
@@ -134227,7 +134274,7 @@ test "workload admission physical completion single-phase restart after WAL and 
             .completion_protocol_version = 1,
             .profile_version = 1,
         } };
-        var options: OpenOptions = .{
+        const options: OpenOptions = .{
             .resource_manager = &resources,
             .durable_completion_enabled = true,
             .durable_completion_authority = .standalone_local,
@@ -134237,58 +134284,193 @@ test "workload admission physical completion single-phase restart after WAL and 
             .start_optional_runtimes = false,
             .ttl_cleanup = .{ .enabled = false },
         };
-        var binding: abi.InstallBinding = .{ .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(23), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) }, .table_id = 1, .range_id = 3 };
+        var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), options);
+        defer db.close();
+        var reference = try DB.open(alloc, std.mem.span(reference_tmp.path().ptr), options);
+        defer reference.close();
+        var binding: abi.InstallBinding = .{ .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(27), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) }, .table_id = 1, .range_id = 3 };
         binding.schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}");
-        var wire: ?[]u8 = null;
-        defer if (wire) |value| alloc.free(value);
-        var mutation_id: transactions_mod.TxnId = undefined;
-        {
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const startup: abi.DurableLog = .{ .mode = .startup_complete };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &startup));
+        const id: transactions_mod.TxnId = @splat(209);
+        const participant2 = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 2);
+        defer alloc.free(participant2);
+        const participant3 = try @import("../../api/distributed_txn.zig").participantIdForGroup(alloc, "docs", 3);
+        defer alloc.free(participant3);
+        const request: types.BatchRequest = .{ .transaction = .{ .begin = .{
+            .txn_id = id,
+            .begin_timestamp = 100,
+            .created_at_ns = 90,
+            .topology_epoch = 1,
+            .retain_terminal = true,
+            .participants = if (coordinator) &.{ participant2, participant3 } else &.{ participant3, participant2 },
+        } } };
+        const before = try reference.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, before);
+        const sequence = db.core.nextDerivedAppendSequence();
+        const wire = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = 0, .index = 0 });
+        defer alloc.free(wire);
+        const retry = try local.compileStorageKernelReplicatedCompletion(alloc, &db, "docs", 2, request, .{ .term = 0, .index = 0 });
+        defer alloc.free(retry);
+        try std.testing.expectEqualSlices(u8, wire, retry);
+        try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(id));
+        try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
+        var entry = try codec.decode(alloc, wire);
+        defer entry.deinit();
+        try std.testing.expect(transactions_mod.isBeginCompletionMutation(entry.entry.prepare_operations));
+        try std.testing.expect(!std.mem.eql(u8, &id, &entry.entry.txn_id));
+        // Independent legacy begin must produce exactly the candidate delta,
+        // including coordinator selection, participants and completion credit.
+        try local.applyReplicatedTransactionMutationInternal(alloc, &reference, "docs", 2, request, .{}, null);
+        const after = try reference.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, after);
+        var projected = std.StringHashMapUnmanaged([]const u8).empty;
+        defer projected.deinit(alloc);
+        for (before) |row| try projected.put(alloc, row.key, row.value);
+        for (entry.entry.prepare_operations) |op| switch (op.kind) {
+            .put => try projected.put(alloc, op.key, op.value),
+            .delete => {
+                _ = projected.remove(op.key);
+            },
+        };
+        try std.testing.expectEqual(after.len, projected.count());
+        for (after) |row| try std.testing.expectEqualSlices(u8, row.value, projected.get(row.key) orelse return error.TestUnexpectedResult);
+        const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+        const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{ .term = 1, .applied_term_known = 1 }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+        lease.vtable.proposal_result(lease.context, &.{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals });
+        const ordinary_limit = resources.memory.budget.hard_limit_bytes;
+        resources.memory.budget.hard_limit_bytes = 1;
+        defer resources.memory.budget.hard_limit_bytes = ordinary_limit;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+        try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
+        try std.testing.expect(db.findDurableCompletionBacklog(entry.entry.txn_id) == null);
+        for (after) |row| {
+            const actual = (try db.core.getStoreValue(alloc, row.key)).?;
+            defer alloc.free(actual);
+            try std.testing.expectEqualSlices(u8, row.value, actual);
+        }
+    }
+}
+
+test "workload admission physical completion single-phase restart after WAL and manifest publication" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const native = @import("../lsm_backend/completion_runtime.zig");
+    const Cut = struct {
+        fn stop() bool {
+            return true;
+        }
+    };
+    const Stage = enum { accepted, wal, manifest };
+    for ([_]bool{ false, true }) |begin| {
+        for ([_]Stage{ .accepted, .wal, .manifest }) |stage| {
+            var tmp = try TestDirectory.init("completion-single-phase-restart");
+            defer tmp.cleanup();
+            const path = std.mem.span(tmp.path().ptr);
+            var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+            defer resources.deinit(alloc);
+            try resources.configureTransactionCompletion(1024 * 1024);
+            const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+                .protocol_version = 1,
+                .max_count = 4,
+                .max_bytes = 1024 * 1024,
+                .max_transaction_bytes = 64 * 1024,
+                .completion_protocol_version = 1,
+                .profile_version = 1,
+            } };
+            var options: OpenOptions = .{
+                .resource_manager = &resources,
+                .durable_completion_enabled = true,
+                .durable_completion_authority = .standalone_local,
+                .table_storage = settings,
+                .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+                .start_index_workers = false,
+                .start_optional_runtimes = false,
+                .ttl_cleanup = .{ .enabled = false },
+            };
+            var binding: abi.InstallBinding = .{ .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(23), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) }, .table_id = 1, .range_id = 3 };
+            binding.schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}");
+            var wire: ?[]u8 = null;
+            defer if (wire) |value| alloc.free(value);
+            var mutation_id: transactions_mod.TxnId = undefined;
+            {
+                var db = try DB.open(alloc, path, options);
+                defer db.close();
+                try db.installCompletionBinding(binding, "", "", "{}", settings);
+                const lease = try db.acquireCompletionLease(2, 7);
+                defer lease.vtable.release(lease.context);
+                const startup: abi.DurableLog = .{ .mode = .startup_complete };
+                try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &startup));
+                wire = if (begin) try db.compileReplicatedBegin(alloc, .{
+                    .txn_id = @splat(210),
+                    .timestamp = 100,
+                    .created_at = 90,
+                    .topology_epoch = 1,
+                    .participants = &.{},
+                    .coordinator = true,
+                    .retain_terminal = true,
+                }, .{ .term = 0, .index = 0 }) else try db.compileReplicatedMutation(alloc, .{ .writes = &.{.{ .key = "doc", .value = "{\"value\":7}" }}, .timestamp_ns = 100 }, .{ .term = 0, .index = 0 });
+                var decoded = try @import("../lsm_backend/completion_entry.zig").decode(alloc, wire.?);
+                defer decoded.deinit();
+                mutation_id = decoded.entry.txn_id;
+                const payloads = [_]abi.Bytes{.{ .ptr = wire.?.ptr, .len = wire.?.len }};
+                const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{ .term = 1, .applied_term_known = 1 }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+                var result: abi.CheckResult = undefined;
+                try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+                const accepted: abi.ProposalResult = .{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals };
+                lease.vtable.proposal_result(lease.context, &accepted);
+                if (stage == .manifest) native.test_after_manifest = Cut.stop;
+                if (stage == .wal) native.test_after_wal = Cut.stop;
+                defer {
+                    native.test_after_manifest = null;
+                    native.test_after_wal = null;
+                }
+                if (stage != .accepted) try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
+            }
+            // Restore actual primary WAL/manifest state with admission disabled.
+            // This is a component crash cut; quorum/process failures are separate.
+            options.durable_completion_authority = .raft_apply;
+            options.durable_completion_enabled = false;
+            options.completion_pool_config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
             var db = try DB.open(alloc, path, options);
             defer db.close();
             try db.installCompletionBinding(binding, "", "", "{}", settings);
             const lease = try db.acquireCompletionLease(2, 7);
             defer lease.vtable.release(lease.context);
-            const startup: abi.DurableLog = .{ .mode = .startup_complete };
-            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &startup));
-            wire = try db.compileReplicatedMutation(alloc, .{ .writes = &.{.{ .key = "doc", .value = "{\"value\":7}" }}, .timestamp_ns = 100 }, .{ .term = 0, .index = 0 });
-            var decoded = try @import("../lsm_backend/completion_entry.zig").decode(alloc, wire.?);
-            defer decoded.deinit();
-            mutation_id = decoded.entry.txn_id;
-            const payloads = [_]abi.Bytes{.{ .ptr = wire.?.ptr, .len = wire.?.len }};
-            const proposal: abi.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{ .term = 1, .applied_term_known = 1 }, .proposals = .{ .ptr = &payloads, .len = 1 } };
-            var result: abi.CheckResult = undefined;
-            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
-            const accepted: abi.ProposalResult = .{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals };
-            lease.vtable.proposal_result(lease.context, &accepted);
-            if (after_manifest) native.test_after_manifest = Cut.stop else native.test_after_wal = Cut.stop;
-            defer {
-                native.test_after_manifest = null;
-                native.test_after_wal = null;
+            if (stage == .accepted) {
+                var cells: abi.DurableCells = undefined;
+                try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
+                var proof: abi.DurableLog = .{ .mode = .startup_complete, .last_index = 1, .commit_index = 1, .count = cells.count };
+                for (cells.cells[0..cells.count], proof.observations[0..cells.count]) |cell, *observation| {
+                    observation.* = .{ .expected = cell.identity, .present = 1, .observed_term = cell.identity.term, .observed_digest = cell.identity.payload_digest };
+                }
+                try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &proof));
+                try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, .{ .ptr = wire.?.ptr, .len = wire.?.len }));
             }
-            try std.testing.expectEqual(runtime_failure_abi.Status.recovery_required, lease.vtable.apply_accepted.?(lease.context, 1, 1, payloads[0]));
+            if (begin) {
+                try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(@splat(210)));
+            } else {
+                const value = (try db.get(alloc, "doc")).?;
+                defer alloc.free(value);
+                try std.testing.expectEqualStrings("{\"value\":7}", value);
+            }
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(mutation_id));
+            var progress: abi.Progress = undefined;
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.progress.?(lease.context, &progress));
+            try std.testing.expectEqual(@as(u64, 1), progress.term);
+            try std.testing.expectEqual(@as(u64, 1), progress.index);
+            try std.testing.expectEqualSlices(u8, &@import("../../common/completion_entry_protocol.zig").payloadDigest(wire.?), &progress.payload_digest);
+            const payload: abi.Bytes = .{ .ptr = wire.?.ptr, .len = wire.?.len };
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payload));
+            if (!begin) try std.testing.expectEqual(@as(u64, 1), db.core.identity_visibility.summary.?.live_ordinals);
         }
-        // Restore actual primary WAL/manifest state with admission disabled.
-        // This is a component crash cut; quorum/process failures are separate.
-        options.durable_completion_authority = .raft_apply;
-        options.durable_completion_enabled = false;
-        options.completion_pool_config = (try DB.completionInstallationPreflight(alloc, std.Options.debug_io, path, binding, "", "", "{}")).?;
-        var db = try DB.open(alloc, path, options);
-        defer db.close();
-        try db.installCompletionBinding(binding, "", "", "{}", settings);
-        const lease = try db.acquireCompletionLease(2, 7);
-        defer lease.vtable.release(lease.context);
-        const value = (try db.get(alloc, "doc")).?;
-        defer alloc.free(value);
-        try std.testing.expectEqualStrings("{\"value\":7}", value);
-        try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(mutation_id));
-        var progress: abi.Progress = undefined;
-        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.progress.?(lease.context, &progress));
-        try std.testing.expectEqual(@as(u64, 1), progress.term);
-        try std.testing.expectEqual(@as(u64, 1), progress.index);
-        try std.testing.expectEqualSlices(u8, &@import("../../common/completion_entry_protocol.zig").payloadDigest(wire.?), &progress.payload_digest);
-        const payload: abi.Bytes = .{ .ptr = wire.?.ptr, .len = wire.?.len };
-        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, payload));
-        try std.testing.expectEqual(@as(u64, 1), db.core.identity_visibility.summary.?.live_ordinals);
     }
 }
 

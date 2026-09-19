@@ -5279,7 +5279,7 @@ pub fn storageOwnerCompileReplicatedCompletion(
     var owned = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err|
         return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
-    const compiled = local_write.compileStorageKernelReplicatedCompletion(std.heap.c_allocator, &handle.db, owned.req, .{
+    const compiled = local_write.compileStorageKernelReplicatedCompletion(std.heap.c_allocator, &handle.db, request.table_name.slice(), handle.storage_owner_group_id, owned.req, .{
         .term = request.previous_term,
         .index = request.previous_index,
     }) catch |err| return storageOwnerStatusFromError(err);
