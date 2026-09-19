@@ -70,7 +70,10 @@ The implementation now consists of:
   reclaims superseded pages without putting a reachability walk on the write
   path. Each checkpoint also pins a copy-on-write ordered B+ tree mapping every
   logical document key to its newest document page. Initial loads and vacuum
-  build packed trees as bounded streaming operations. Integrity checks validate
+  build packed trees with one unfinished node per level. The builder retains
+  encoded record references for long keys and materializes only the last input
+  key for order validation. Counting compact pages uses the same builder.
+  Integrity checks validate
   every tree page, separator range, and checkpoint/free-map reachability, then
   prove that the index contains exactly the newest document page for every key
   in history. Missing, stale, duplicate, or cross-key document pointers and
@@ -116,6 +119,15 @@ The implementation now consists of:
   temporary memory depends on tree height rather than suffix length.
   Range reads seek directly to the requested extents. Vacuum builds packed
   catalog indexes and extent trees; integrity checks validate both structures.
+  Atomic index writes use a fixed 64 KiB buffer and a private staging file.
+  Header patches and range checksums operate on the buffered tail and positional
+  file I/O. POSIX staging files are unlinked while open so abort and process
+  death reclaim them. Staging holds neither a document writer slot nor a
+  generation pin; unrelated commits and vacuum can proceed. Finish streams the
+  staged bytes into native extents and publishes one checkpoint under the store
+  mutex. This adds a staging I/O pass in exchange for bounded payload heap use;
+  it does not eliminate the final copy or its publication lock. I/O failures
+  poison the sink, and finish consumes it on success or error.
   Positional page writes extend the file directly, without per-page stat or
   resize calls; data, checkpoint-slot, and active-slot sync barriers remain.
   Revision 2 and other unsupported headers are rejected without mutation;
@@ -325,18 +337,17 @@ history. Lite reports `online: false`: check, compaction, and vacuum acquire the
 exclusive maintenance gate. Readiness becomes false and new database requests
 receive `503` while admin status and cancellation remain available. This avoids
 unbounded request queues and does not call a stop-the-world rewrite "online".
-Checkpoint inspection, index writes, document commits, compaction, and vacuum
-share the Lite store mutex and FIFO writer admission gate, so blocked writers
-sleep without polling and resume in arrival order. Maintenance cannot
-race checkpoint publication or file replacement. Vacuum builds a temporary,
-disk-backed LSM live-key index for one logical record class at a time. The
-newest record wins, tombstones suppress older values, and a bounded mutable
-batch is flushed to sorted runs. It then streams the ordered live references,
-values, and replacement pages, so heap use does not scale with the number of
-distinct keys. Temporary index directories are removed on success and error.
-This also avoids a
-second whole-database value snapshot and a whole-file output image in memory;
-the replacement is fsynced, atomically renamed, and adopted through its
+Native checkpoint publication and generation replacement serialize under the
+Lite store mutex. Document writes and maintenance also use FIFO writer admission.
+Private staged index output enters the store mutex only for final publication.
+Vacuum walks the current checkpoint's catalog and document indexes, skips
+tombstones, and streams values into replacement pages without a temporary LSM
+index or history deduplication. Its key-tree builder and extent builder each
+retain one unfinished node per level; payload buffers do not grow with logical
+file size. Namespace metadata still scales with namespace count. Integrity
+checking continues to validate reachable pages, while compact-layout statistics
+use record lengths and ordered keys instead of loading payloads again.
+The replacement is fsynced, atomically renamed, and adopted through its
 already-open read/write handle before the parent directory is fsynced. A
 post-rename sync error therefore cannot leave the process writing an unlinked
 old inode.

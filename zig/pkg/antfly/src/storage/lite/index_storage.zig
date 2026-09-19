@@ -21,9 +21,9 @@
 //! native catalog-page layout; this adapter is not a user-visible file format.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Crc32 = @import("antfly_hash").Crc32;
 const platform_sync = @import("antfly_platform").sync;
-const byte_copy = @import("../../common/byte_copy.zig");
 const docstore = @import("docstore.zig");
 const native = @import("native.zig");
 const storage_io = @import("../lsm_backend/storage_io.zig");
@@ -320,11 +320,21 @@ fn rootIdentityAlloc(
     );
 }
 
+/// A fixed write buffer backed by a private staging file. Builders may patch
+/// headers and checksum any range without keeping their output in memory.
+/// Staging never reserves the document writer slot or pins a file generation;
+/// finish imports it into the current generation under the publication mutex.
 const NativeAtomicWriteSink = struct {
+    const buffer_size = 64 * 1024;
     allocator: Allocator,
     storage: *Store,
     path: []u8,
-    out: std.ArrayListUnmanaged(u8) = .empty,
+    file: ?std.Io.File = null,
+    tmp_path: ?[]u8 = null,
+    persisted: usize = 0,
+    buffered: usize = 0,
+    buffer: [buffer_size]u8 = undefined,
+    failure: ?anyerror = null,
 
     const vtable: AtomicWriteSink.VTable = .{
         .len = len,
@@ -339,55 +349,112 @@ const NativeAtomicWriteSink = struct {
     fn create(allocator: Allocator, storage: *Store, path: []const u8) !AtomicWriteSink {
         const self = try allocator.create(NativeAtomicWriteSink);
         errdefer allocator.destroy(self);
-        self.* = .{
-            .allocator = allocator,
-            .storage = storage,
-            .path = try allocator.dupe(u8, path),
-        };
-        return .{
-            .ptr = self,
-            .vtable = &vtable,
-        };
+        self.* = .{ .allocator = allocator, .storage = storage, .path = try allocator.dupe(u8, path) };
+        return .{ .ptr = self, .vtable = &vtable };
     }
 
     fn deinit(self: *NativeAtomicWriteSink) void {
-        self.out.deinit(self.allocator);
+        const io = self.storage.docs.file.runtime();
+        if (self.file) |file| file.close(io);
+        if (self.tmp_path) |path| {
+            std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            self.allocator.free(path);
+        }
         self.allocator.free(self.path);
         self.allocator.destroy(self);
     }
 
+    fn ensureFile(self: *NativeAtomicWriteSink) !std.Io.File {
+        if (self.file) |file| return file;
+        const io = self.storage.docs.file.runtime();
+        var random: [16]u8 = undefined;
+        try io.randomSecure(&random);
+        const path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-write-{x}", .{ self.storage.docs.file.path, random });
+        errdefer self.allocator.free(path);
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        self.file = file;
+        self.tmp_path = path;
+        // On POSIX the descriptor owns the staging file after unlink. Abort,
+        // cancellation, and process death then reclaim it without a scavenger.
+        if (comptime builtin.os.tag != .windows) {
+            std.Io.Dir.cwd().deleteFile(io, path) catch return file;
+            self.allocator.free(path);
+            self.tmp_path = null;
+        }
+        return file;
+    }
+
+    fn flush(self: *NativeAtomicWriteSink) !void {
+        if (self.buffered == 0) return;
+        const file = try self.ensureFile();
+        try file.writePositionalAll(self.storage.docs.file.runtime(), self.buffer[0..self.buffered], self.persisted);
+        self.persisted += self.buffered;
+        self.buffered = 0;
+    }
+
     fn len(ptr: *anyopaque) usize {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        return self.out.items.len;
+        return self.persisted + self.buffered;
     }
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        try byte_copy.appendSlicePossiblyAliased(&self.out, self.allocator, bytes);
+        if (self.failure) |err| return err;
+        if (bytes.len > std.math.maxInt(u32) - len(ptr)) return error.RecordTooLarge;
+        errdefer |err| self.failure = err;
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const n = @min(self.buffer.len - self.buffered, bytes.len - offset);
+            @memcpy(self.buffer[self.buffered..][0..n], bytes[offset..][0..n]);
+            self.buffered += n;
+            offset += n;
+            if (self.buffered == self.buffer.len) try self.flush();
+        }
     }
 
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (offset > self.out.items.len or bytes.len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        byte_copy.copyPossiblyAliased(self.out.items[offset..][0..bytes.len], bytes);
+        if (self.failure) |err| return err;
+        if (offset > len(ptr) or bytes.len > len(ptr) - offset) return error.InvalidAtomicWriteOffset;
+        errdefer |err| self.failure = err;
+        const on_disk = if (offset < self.persisted) @min(bytes.len, self.persisted - offset) else 0;
+        if (on_disk > 0) try self.file.?.writePositionalAll(self.storage.docs.file.runtime(), bytes[0..on_disk], offset);
+        if (on_disk < bytes.len) @memcpy(self.buffer[offset + on_disk - self.persisted ..][0 .. bytes.len - on_disk], bytes[on_disk..]);
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
-        const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
-        return Crc32.hash(self.out.items[0..len_prefix]);
+        return try crc32Range(ptr, 0, len_prefix);
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        return Crc32.hash(self.out.items[offset..][0..range_len]);
+        if (self.failure) |err| return err;
+        if (offset > len(ptr) or range_len > len(ptr) - offset) return error.InvalidAtomicWriteOffset;
+        errdefer |err| self.failure = err;
+        var crc = Crc32.init();
+        var scratch: [buffer_size]u8 = undefined;
+        var pos = offset;
+        const end = offset + range_len;
+        while (pos < @min(end, self.persisted)) {
+            const n = @min(scratch.len, @min(end, self.persisted) - pos);
+            if (try self.file.?.readPositionalAll(self.storage.docs.file.runtime(), scratch[0..n], pos) != n)
+                return error.EndOfStream;
+            crc.update(scratch[0..n]);
+            pos += n;
+        }
+        if (pos < end) crc.update(self.buffer[pos - self.persisted .. end - self.persisted]);
+        return crc.final();
     }
 
     fn finish(ptr: *anyopaque) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
-        try writeFileReserved(self.storage, self.path, self.out.items);
+        if (self.failure) |err| return err;
+        if (self.file == null) return try writeFileReserved(self.storage, self.path, self.buffer[0..self.buffered]);
+        try self.flush();
+        lockStore(self.storage.docs);
+        defer self.storage.docs.mutex.unlock();
+        try self.storage.docs.file.putIndexCatalogRecordFromFile(self.path, self.file.?, self.persisted);
     }
 
     fn abort(ptr: *anyopaque) void {
@@ -869,5 +936,126 @@ test "lite native directory operations seek bounded prefixes independent of cata
     try std.testing.expectError(error.FileNotFound, storage.fileSize("/a/sub/two"));
     try std.testing.expectEqual(@as(u64, 8), try storage.fileSize("/a-other/keep"));
     try std.testing.expectEqual(@as(u64, 1), try storage.fileSize("/unrelated/00000000"));
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite native staged atomic writes bound heap and survive concurrent commits and vacuum" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "staged-atomic.aflite");
+    defer alloc.free(path);
+    const expected = try alloc.alloc(u8, 8 * 1024 * 1024 + 137);
+    defer alloc.free(expected);
+    for (expected, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = alloc, .limit = 512 * 1024 };
+    {
+        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        docs.file.page_cache_enabled.store(false, .monotonic);
+        var indexes = Store.init(budget.allocator(), &docs);
+        const storage = indexes.storage();
+        try storage.writeFileAbsolute("/block", "old");
+        var writer = try storage.beginAtomicWrite(budget.allocator(), "/block");
+        var active = true;
+        defer if (active) writer.abort();
+        try writer.appendSlice(expected[0..33]);
+        try writer.appendSlice(expected[33..]);
+        try std.testing.expectEqual(expected.len, writer.len());
+        const impl: *NativeAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
+        try std.testing.expect(impl.file != null);
+        if (comptime builtin.os.tag != .windows) try std.testing.expect(impl.tmp_path == null);
+        const patch_offsets = [_]usize{ 3, 65530, impl.persisted - 3, expected.len - 8 };
+        for (patch_offsets) |offset| {
+            const patch = "PATCHED!";
+            try writer.writeAt(offset, patch);
+            @memcpy(expected[offset..][0..patch.len], patch);
+        }
+        try std.testing.expectEqual(Crc32.hash(expected), try writer.crc32Prefix(expected.len));
+        try std.testing.expectEqual(Crc32.hash(expected[65530..66530]), try writer.crc32Range(65530, 1000));
+        try std.testing.expectEqual(Crc32.hash(expected[expected.len - 10 ..]), try writer.crc32Range(expected.len - 10, 10));
+        try std.testing.expectEqual(Crc32.hash(""), try writer.crc32Range(expected.len, 0));
+        try std.testing.expectError(error.InvalidAtomicWriteOffset, writer.writeAt(expected.len, "x"));
+        try std.testing.expectError(error.InvalidAtomicWriteOffset, writer.crc32Range(expected.len, 1));
+        const old = try storage.readFileAlloc(alloc, "/block", 10);
+        defer alloc.free(old);
+        try std.testing.expectEqualStrings("old", old);
+
+        // A second staged writer and a document transaction can coexist. The
+        // first sink is private and must not depend on the original generation.
+        {
+            var txn = try docs.beginWrite();
+            errdefer txn.abort();
+            try txn.put("doc", "committed");
+            var other = try storage.beginAtomicWrite(budget.allocator(), "/other");
+            try other.appendSlice(expected[0..70000]);
+            try other.finish();
+            try txn.commit();
+        }
+        _ = try docs.vacuum();
+        const before = docs.file.activeCheckpoint();
+        active = false;
+        try writer.finish();
+        try std.testing.expectEqual(before.commit_sequence + 1, docs.file.activeCheckpoint().commit_sequence);
+        try std.testing.expect(budget.peak <= budget.limit);
+        const actual = try storage.readFileAlloc(alloc, "/block", expected.len);
+        defer alloc.free(actual);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+        // Full integrity checking maintains a separate page reachability set.
+        budget.limit = std.math.maxInt(usize);
+        try std.testing.expect((try docs.file.check()).valid);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    const value = (try reopened.file.getIndexCatalogRecordAlloc(alloc, "/block")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualSlices(u8, expected, value);
+    const document = (try reopened.file.getDocumentAlloc(alloc, "doc")).?;
+    defer alloc.free(document);
+    try std.testing.expectEqualStrings("committed", document);
+}
+
+test "lite native staged atomic writes discard failed imports and poisoned sources" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "failed-staging.aflite");
+    defer alloc.free(path);
+    var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    var indexes = Store.init(alloc, &docs);
+    const storage = indexes.storage();
+    try storage.writeFileAbsolute("/stable", "old");
+    const checkpoint = docs.file.activeCheckpoint();
+    const bytes: [128 * 1024]u8 = @splat('v');
+    for ([_]bool{ false, true }) |checksum_first| {
+        var writer = try storage.beginAtomicWrite(alloc, "/stable");
+        try writer.appendSlice(&bytes);
+        const impl: *NativeAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
+        try impl.file.?.setLength(std.testing.io, 65536);
+        if (checksum_first) {
+            try std.testing.expectError(error.EndOfStream, writer.crc32Prefix(bytes.len));
+            try std.testing.expectError(error.EndOfStream, writer.appendSlice("must not recover silently"));
+        }
+        try std.testing.expectError(error.EndOfStream, writer.finish());
+        try std.testing.expect(std.meta.eql(checkpoint, docs.file.activeCheckpoint()));
+        const value = try storage.readFileAlloc(alloc, "/stable", 10);
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("old", value);
+    }
+    var aborted = try storage.beginAtomicWrite(alloc, "/stable");
+    try aborted.appendSlice(&bytes);
+    aborted.abort();
+    try std.testing.expect(std.meta.eql(checkpoint, docs.file.activeCheckpoint()));
+    var empty = try storage.beginAtomicWrite(alloc, "/empty");
+    try empty.finish();
+    try std.testing.expectEqual(@as(u64, 0), try storage.fileSize("/empty"));
+    var retry = try storage.beginAtomicWrite(alloc, "/stable");
+    try retry.appendSlice(&bytes);
+    try retry.finish();
+    const value = try storage.readFileAlloc(alloc, "/stable", bytes.len);
+    defer alloc.free(value);
+    try std.testing.expectEqualSlices(u8, &bytes, value);
     try std.testing.expect((try docs.file.check()).valid);
 }

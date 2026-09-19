@@ -1503,6 +1503,61 @@ pub const NativeFile = struct {
         try self.putIndexCatalogBatch(&.{.{ .key = key, .value = value }});
     }
 
+    /// Import a private, seekable staging file using bounded buffers. The
+    /// caller serializes publication with other native mutations and keeps the
+    /// source alive and unchanged throughout this call. No staged data enters
+    /// the committed catalog until the final checkpoint publication.
+    pub fn putIndexCatalogRecordFromFile(self: *NativeFile, key: []const u8, source: std.Io.File, len: usize) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (key.len > catalog_key_len_mask or len > std.math.maxInt(u32)) return error.RecordTooLarge;
+        const fixed_len = 16 + key.len;
+        if (fixed_len > self.maxPagePayloadBytes()) return error.PageTooLarge;
+        var buffer: [65536]u8 = undefined;
+        if (len <= self.maxPagePayloadBytes() - fixed_len) {
+            try readExactAt(source, self.runtimeIo(), buffer[0..len], 0);
+            return try self.putIndexCatalogRecord(key, buffer[0..len]);
+        }
+        if (fixed_len + 8 > self.maxPagePayloadBytes()) return error.PageTooLarge;
+        const previous = self.activeCheckpoint();
+        const roots = try self.readCatalogRoots(previous.index_catalog_root_page, previous);
+        var pages = try self.pageAllocatorFromFreeMap(previous);
+        defer pages.deinit();
+        var builder = ExtentAppender{ .file = self, .pages = &pages, .tail = undefined };
+        defer builder.deinit();
+        const chunk_size = self.maxValuePagePayloadBytes();
+        const read_size = buffer.len / chunk_size * chunk_size;
+        var offset: usize = 0;
+        while (offset < len) {
+            const n = @min(read_size, len - offset);
+            try readExactAt(source, self.runtimeIo(), buffer[0..n], offset);
+            var pos: usize = 0;
+            while (pos < n) {
+                const end = @min(n, pos + chunk_size);
+                try builder.push(try self.writeExtentLeaf(&pages, buffer[pos..end]));
+                pos = end;
+            }
+            offset += n;
+        }
+        const value = try builder.finish();
+        var payload = std.ArrayListUnmanaged(u8).empty;
+        defer payload.deinit(self.allocator);
+        try encodeCatalogEntryRaw(self.allocator, &payload, .{ .previous_page = roots.history, .key = key, .external_value_root_page = value.page, .external_value_len = len });
+        const record = try pages.allocate();
+        try self.writePage(record, .catalog, payload.items);
+        var editor = IndexEditor.init(self, previous, roots.index);
+        defer editor.deinit();
+        try editor.put(key, record);
+        const index = try editor.finish(&pages);
+        var next = previous;
+        next.commit_sequence += 1;
+        next.index_catalog_root_page = try self.writeCatalogRoot(&pages, record, index);
+        next.free_map_root_page = try pages.allocate();
+        next.page_count = pages.next_page_id;
+        try self.writeFreeMapPage(next.free_map_root_page, next.page_count, pages.remainingFreePages());
+        try self.syncIfRequired();
+        try self.publishCheckpoint(next);
+    }
+
     pub fn appendIndexCatalogRecord(self: *NativeFile, key: []const u8, suffix: []const u8) !void {
         try self.appendCatalogRecordForRoot(.index, key, suffix);
     }
@@ -4318,27 +4373,38 @@ const DocumentIndexChild = struct {
     page_id: u64,
 };
 
-/// Streaming bulk loader used by vacuum. It retains at most one leaf's keys
-/// plus one separator per output page, rather than materializing all keys.
+/// Packed B+ tree builder with one unfinished node per level. Long keys
+/// remain record references, including separators; only the last input key is
+/// materialized for order validation. Counting uses exactly the same frontier.
 const DocumentIndexBulkBuilder = struct {
+    const Level = struct {
+        children: std.ArrayListUnmanaged(DocumentIndexChild) = .empty,
+        bytes: usize = document_index_header_size + @sizeOf(u64),
+    };
+
     owner: *NativeFile,
     file: std.Io.File,
     next_page_id: *u64,
     count_only: bool = false,
     leaf_keys: std.ArrayListUnmanaged([]u8) = .empty,
     leaf_pointers: std.ArrayListUnmanaged(u64) = .empty,
-    children: std.ArrayListUnmanaged(DocumentIndexChild) = .empty,
+    leaf_key_pages: std.ArrayListUnmanaged(u64) = .empty,
+    leaf_bytes: usize = document_index_header_size,
+    last_key: std.ArrayListUnmanaged(u8) = .empty,
+    has_last_key: bool = false,
+    levels: std.ArrayListUnmanaged(Level) = .empty,
 
     fn deinit(self: *DocumentIndexBulkBuilder) void {
         for (self.leaf_keys.items) |key| self.owner.allocator.free(key);
         self.leaf_keys.deinit(self.owner.allocator);
         self.leaf_pointers.deinit(self.owner.allocator);
-        freeDocumentIndexChildren(self.owner.allocator, &self.children);
-    }
-
-    fn nodeFits(self: *DocumentIndexBulkBuilder, node: DocumentIndexNode) bool {
-        const size = encodedDocumentIndexNodeSize(node) catch return false;
-        return size <= self.owner.maxPagePayloadBytes();
+        self.leaf_key_pages.deinit(self.owner.allocator);
+        self.last_key.deinit(self.owner.allocator);
+        for (self.levels.items) |*level| {
+            for (level.children.items) |child| self.owner.allocator.free(child.first_key);
+            level.children.deinit(self.owner.allocator);
+        }
+        self.levels.deinit(self.owner.allocator);
     }
 
     fn appendNode(self: *DocumentIndexBulkBuilder, node: DocumentIndexNode) !u64 {
@@ -4349,127 +4415,118 @@ const DocumentIndexBulkBuilder = struct {
         }
         const encoded = try encodeDocumentIndexNode(self.owner.allocator, node);
         defer self.owner.allocator.free(encoded);
-        return try appendPageToFile(
-            self.owner.allocator,
-            self.file,
-            self.owner.runtimeIo(),
-            @intCast(self.owner.header.page_size),
-            self.next_page_id,
-            .document_index,
-            encoded,
-        );
+        return try appendPageToFile(self.owner.allocator, self.file, self.owner.runtimeIo(), self.owner.header.page_size, self.next_page_id, .document_index, encoded);
     }
 
     fn add(self: *DocumentIndexBulkBuilder, key: []const u8, document_page_id: u64) !void {
-        if (self.leaf_keys.items.len > 0 and std.mem.order(u8, self.leaf_keys.items[self.leaf_keys.items.len - 1], key) != .lt)
+        if (self.has_last_key and std.mem.order(u8, self.last_key.items, key) != .lt)
             return error.InvalidDocumentIndexOrder;
-        const owned = try self.owner.allocator.dupe(u8, key);
-        self.leaf_keys.append(self.owner.allocator, owned) catch |err| {
-            self.owner.allocator.free(owned);
-            return err;
-        };
-        self.leaf_pointers.append(self.owner.allocator, document_page_id) catch |err| {
-            _ = self.leaf_keys.pop();
-            self.owner.allocator.free(owned);
-            return err;
-        };
-        const node = DocumentIndexNode{ .kind = .leaf, .keys = self.leaf_keys.items, .pointers = self.leaf_pointers.items };
-        if (self.nodeFits(node)) return;
-        if (self.leaf_keys.items.len == 1) return error.DocumentIndexNodeTooLarge;
-
-        const last_key = self.leaf_keys.pop().?;
-        const last_pointer = self.leaf_pointers.pop().?;
-        self.flushLeaf() catch |err| {
-            self.owner.allocator.free(last_key);
-            return err;
-        };
-        self.leaf_keys.append(self.owner.allocator, last_key) catch |err| {
-            self.owner.allocator.free(last_key);
-            return err;
-        };
-        self.leaf_pointers.append(self.owner.allocator, last_pointer) catch |err| {
-            _ = self.leaf_keys.pop();
-            self.owner.allocator.free(last_key);
-            return err;
-        };
+        if (key.len > std.math.maxInt(u16)) return error.RecordTooLarge;
+        const external = key.len > index_inline_key_limit;
+        const slot_size = 10 + (if (external) @as(usize, 8) else key.len);
+        if (document_index_header_size + slot_size > self.owner.maxPagePayloadBytes()) return error.DocumentIndexNodeTooLarge;
+        if (self.leaf_bytes + slot_size > self.owner.maxPagePayloadBytes()) try self.flushLeaf();
+        const alloc = self.owner.allocator;
+        try self.leaf_keys.ensureUnusedCapacity(alloc, 1);
+        try self.leaf_pointers.ensureUnusedCapacity(alloc, 1);
+        try self.leaf_key_pages.ensureUnusedCapacity(alloc, 1);
+        try self.last_key.ensureTotalCapacity(alloc, key.len);
+        const owned = try alloc.dupe(u8, if (external) "" else key);
+        self.leaf_keys.appendAssumeCapacity(owned);
+        self.leaf_pointers.appendAssumeCapacity(document_page_id);
+        self.leaf_key_pages.appendAssumeCapacity(if (external) document_page_id else 0);
+        self.leaf_bytes += slot_size;
+        self.last_key.clearRetainingCapacity();
+        self.last_key.appendSliceAssumeCapacity(key);
+        self.has_last_key = true;
     }
 
     fn flushLeaf(self: *DocumentIndexBulkBuilder) !void {
         if (self.leaf_keys.items.len == 0) return;
-        const first_key = try self.owner.allocator.dupe(u8, self.leaf_keys.items[0]);
-        errdefer self.owner.allocator.free(first_key);
-        const key_pages = try self.owner.allocator.alloc(u64, self.leaf_keys.items.len);
-        defer self.owner.allocator.free(key_pages);
-        for (self.leaf_keys.items, self.leaf_pointers.items, key_pages) |key, page, *key_page| key_page.* = if (key.len > index_inline_key_limit) page else 0;
-        const page_id = try self.appendNode(.{ .kind = .leaf, .keys = self.leaf_keys.items, .pointers = self.leaf_pointers.items, .key_pages = key_pages });
-        try self.children.append(self.owner.allocator, .{ .first_key = first_key, .key_page = self.leaf_pointers.items[0], .page_id = page_id });
+        const page = try self.appendNode(.{ .kind = .leaf, .keys = self.leaf_keys.items, .pointers = self.leaf_pointers.items, .key_pages = self.leaf_key_pages.items });
+        const child = DocumentIndexChild{
+            .first_key = try self.owner.allocator.dupe(u8, self.leaf_keys.items[0]),
+            .key_page = self.leaf_key_pages.items[0],
+            .page_id = page,
+        };
+        // pushChild consumes the separator even on failure.
+        try self.pushChild(0, child);
         for (self.leaf_keys.items) |key| self.owner.allocator.free(key);
         self.leaf_keys.clearRetainingCapacity();
         self.leaf_pointers.clearRetainingCapacity();
+        self.leaf_key_pages.clearRetainingCapacity();
+        self.leaf_bytes = document_index_header_size;
+    }
+
+    fn pushChild(self: *DocumentIndexBulkBuilder, height: usize, child: DocumentIndexChild) anyerror!void {
+        errdefer self.owner.allocator.free(child.first_key);
+        if (height >= 64) return error.InvalidDocumentIndex;
+        if (height >= self.levels.items.len) {
+            const old = self.levels.items.len;
+            try self.levels.resize(self.owner.allocator, height + 1);
+            @memset(self.levels.items[old..], .{});
+        }
+        const slot_size = 10 + (if (child.key_page != 0) @as(usize, 8) else child.first_key.len);
+        if (self.levels.items[height].children.items.len > 0 and
+            self.levels.items[height].bytes + slot_size > self.owner.maxPagePayloadBytes())
+        {
+            if (self.levels.items[height].children.items.len < 2) return error.DocumentIndexNodeTooLarge;
+            const parent = try self.sealLevel(height);
+            try self.pushChild(height + 1, parent);
+        }
+        // Recursion can relocate levels, so reacquire this pointer afterward.
+        const level = &self.levels.items[height];
+        const extra = if (level.children.items.len == 0) 0 else slot_size;
+        try level.children.append(self.owner.allocator, child);
+        level.bytes += extra;
+    }
+
+    fn sealLevel(self: *DocumentIndexBulkBuilder, height: usize) !DocumentIndexChild {
+        const level = &self.levels.items[height];
+        const group = level.children.items;
+        const page = try self.appendInternalGroup(group);
+        const parent = DocumentIndexChild{ .first_key = group[0].first_key, .key_page = group[0].key_page, .page_id = page };
+        for (group[1..]) |child| self.owner.allocator.free(child.first_key);
+        level.children.clearRetainingCapacity();
+        level.bytes = document_index_header_size + @sizeOf(u64);
+        return parent;
     }
 
     fn finish(self: *DocumentIndexBulkBuilder) !u64 {
         try self.flushLeaf();
-        if (self.children.items.len == 0) return 0;
-
-        while (self.children.items.len > 1) {
-            var next = std.ArrayListUnmanaged(DocumentIndexChild).empty;
-            errdefer freeDocumentIndexChildren(self.owner.allocator, &next);
-            var start: usize = 0;
-            while (start < self.children.items.len) {
-                var end = start + 1;
-                if (end < self.children.items.len) end += 1;
-                while (end <= self.children.items.len) : (end += 1) {
-                    if (!try self.internalGroupFits(self.children.items[start..end])) break;
-                }
-                end -= 1;
-                if (end <= start + 1 and start + 1 < self.children.items.len)
-                    return error.DocumentIndexNodeTooLarge;
-                const group = self.children.items[start..end];
-                const first_key = try self.owner.allocator.dupe(u8, group[0].first_key);
-                errdefer self.owner.allocator.free(first_key);
-                const page_id = try self.appendInternalGroup(group);
-                try next.append(self.owner.allocator, .{ .first_key = first_key, .key_page = group[0].key_page, .page_id = page_id });
-                start = end;
+        var height: usize = 0;
+        while (height < self.levels.items.len) : (height += 1) {
+            const count = self.levels.items[height].children.items.len;
+            if (count == 0) continue;
+            var higher_pending = false;
+            for (self.levels.items[height + 1 ..]) |level| {
+                if (level.children.items.len != 0) higher_pending = true;
             }
-            freeDocumentIndexChildren(self.owner.allocator, &self.children);
-            self.children = next;
+            if (count == 1 and !higher_pending) return self.levels.items[height].children.items[0].page_id;
+            const parent = try self.sealLevel(height);
+            try self.pushChild(height + 1, parent);
         }
-        return self.children.items[0].page_id;
-    }
-
-    fn internalGroupFits(self: *DocumentIndexBulkBuilder, children: []const DocumentIndexChild) !bool {
-        if (children.len == 0) return false;
-        var size: usize = document_index_header_size + @sizeOf(u64);
-        for (children[1..]) |child| {
-            size = try std.math.add(usize, size, @sizeOf(u16) + @sizeOf(u64) + (if (child.first_key.len > index_inline_key_limit) @as(usize, 8) else child.first_key.len));
-        }
-        return size <= self.owner.maxPagePayloadBytes() and children.len - 1 <= std.math.maxInt(u16);
+        return 0;
     }
 
     fn appendInternalGroup(self: *DocumentIndexBulkBuilder, children: []const DocumentIndexChild) !u64 {
-        const keys = try self.owner.allocator.alloc([]u8, children.len - 1);
-        defer self.owner.allocator.free(keys);
-        const pointers = try self.owner.allocator.alloc(u64, children.len);
-        defer self.owner.allocator.free(pointers);
-        const key_pages = try self.owner.allocator.alloc(u64, children.len - 1);
-        defer self.owner.allocator.free(key_pages);
+        const alloc = self.owner.allocator;
+        const keys = try alloc.alloc([]u8, children.len - 1);
+        defer alloc.free(keys);
+        const pointers = try alloc.alloc(u64, children.len);
+        defer alloc.free(pointers);
+        const key_pages = try alloc.alloc(u64, children.len - 1);
+        defer alloc.free(key_pages);
         for (children, 0..) |child, i| {
             pointers[i] = child.page_id;
             if (i > 0) {
                 keys[i - 1] = child.first_key;
-                key_pages[i - 1] = if (child.first_key.len > index_inline_key_limit) child.key_page else 0;
+                key_pages[i - 1] = child.key_page;
             }
         }
         return try self.appendNode(.{ .kind = .internal, .keys = keys, .pointers = pointers, .key_pages = key_pages });
     }
 };
-
-fn freeDocumentIndexChildren(allocator: Allocator, children: *std.ArrayListUnmanaged(DocumentIndexChild)) void {
-    for (children.items) |child| allocator.free(child.first_key);
-    children.deinit(allocator);
-    children.* = .empty;
-}
 
 fn appendValuePagesToFile(
     allocator: Allocator,
@@ -8358,58 +8415,7 @@ test "lite native catalog editor mixed batches match a reference map" {
     }
 }
 
-/// Test allocator that bounds total live heap usage, and can request cancellation
-/// after allocations have started. Uses a caller-owned I/O runtime in these tests.
-const MaintenanceTestAllocator = struct {
-    backing: Allocator,
-    live: usize = 0,
-    peak: usize = 0,
-    limit: usize = std.math.maxInt(usize),
-    cancel: ?*maintenance.CancelToken = null,
-    cancel_after: usize = std.math.maxInt(usize),
-
-    fn allocator(self: *@This()) Allocator {
-        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
-    }
-
-    fn account(self: *@This(), old: usize, new: usize) void {
-        self.live = self.live - old + new;
-        self.peak = @max(self.peak, self.live);
-    }
-
-    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (self.cancel_after == 0) {
-            if (self.cancel) |token| token.request();
-        } else self.cancel_after -= 1;
-        if (len > self.limit -| self.live) return null;
-        const result = self.backing.rawAlloc(len, alignment, ra) orelse return null;
-        self.account(0, len);
-        return result;
-    }
-
-    fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
-        const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (len > (self.limit -| self.live) + buf.len) return false;
-        if (!self.backing.rawResize(buf, alignment, len, ra)) return false;
-        self.account(buf.len, len);
-        return true;
-    }
-
-    fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
-        const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (len > (self.limit -| self.live) + buf.len) return null;
-        const result = self.backing.rawRemap(buf, alignment, len, ra) orelse return null;
-        self.account(buf.len, len);
-        return result;
-    }
-
-    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
-        const self: *@This() = @ptrCast(@alignCast(ctx));
-        self.backing.rawFree(buf, alignment, ra);
-        self.account(buf.len, 0);
-    }
-};
+const MaintenanceTestAllocator = @import("test_allocator.zig").BudgetAllocator;
 
 test "lite native maintenance streams large values under a bounded heap budget" {
     const alloc = std.testing.allocator;
@@ -8590,4 +8596,99 @@ test "lite native streaming vacuum rejects corrupt values before publication" {
     try file.file.writePositionalAll(file.runtimeIo(), raw, next * default_page_size);
     _ = try file.vacuum();
     try std.testing.expect((try file.check()).valid);
+}
+
+test "lite native bulk index frontier counts a million long keys with bounded heap" {
+    var budget = MaintenanceTestAllocator{ .backing = std.testing.allocator, .limit = 256 * 1024 };
+    {
+        var file = NativeFile{ .allocator = budget.allocator(), .io_impl = undefined, .borrowed_io = std.testing.io, .path = @constCast(""), .file = undefined, .header = .{} };
+        var pages: u64 = 1;
+        var builder = DocumentIndexBulkBuilder{ .owner = &file, .file = undefined, .next_page_id = &pages, .count_only = true };
+        defer builder.deinit();
+        for (0..1_000_000) |i| {
+            var key: [4000]u8 = @splat('k');
+            _ = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+            try builder.add(&key, 1);
+        }
+        try std.testing.expect(try builder.finish() != 0);
+        try std.testing.expect(pages > 4000);
+        try std.testing.expect(builder.levels.items.len >= 3);
+        try std.testing.expect(budget.peak <= budget.limit);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+}
+
+test "lite native bulk index frontier preserves mixed keys and exact page counts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "bulk-frontier.aflite");
+    defer alloc.free(path);
+    var budget = MaintenanceTestAllocator{ .backing = alloc, .limit = 256 * 1024 };
+    {
+        var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        file.page_cache_enabled.store(false, .monotonic);
+        const count = 16384;
+        var next: u64 = 1;
+        var counted: u64 = 1;
+        var builder = DocumentIndexBulkBuilder{ .owner = &file, .file = file.file, .next_page_id = &next };
+        defer builder.deinit();
+        var counter = DocumentIndexBulkBuilder{ .owner = &file, .file = undefined, .next_page_id = &counted, .count_only = true };
+        defer counter.deinit();
+        var history: u64 = 0;
+        for (0..count) |i| {
+            var key: [4000]u8 = @splat('k');
+            _ = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+            const widths = [_]usize{ 16, 512, 4000 };
+            const bytes = key[0..if (i == 0) 0 else widths[i % widths.len]];
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(budget.allocator());
+            try encodeCatalogEntry(budget.allocator(), &payload, .{ .previous_page = history, .key = bytes, .value = "v" });
+            history = try appendPageToFile(budget.allocator(), file.file, std.testing.io, default_page_size, &next, .catalog, payload.items);
+            try builder.add(bytes, history);
+            try counter.add(bytes, history);
+        }
+        const root = try builder.finish();
+        _ = try counter.finish();
+        try std.testing.expectEqual(next - count, counted);
+        try std.testing.expect(builder.levels.items.len >= 2);
+        try std.testing.expect(budget.peak <= budget.limit);
+        // Decoding a cursor's long keys has its own path-sized memory bound;
+        // the cap above isolates the builder and its counting mode.
+        budget.limit = std.math.maxInt(usize);
+        var cursor = DocumentIndexCursor.init(&file, .{ .page_count = next, .document_index_root_page = root });
+        defer cursor.deinit();
+        var entry = try cursor.first();
+        var seen: usize = 0;
+        while (entry) |value| : (entry = try cursor.next()) {
+            var owned = value;
+            defer owned.deinit(budget.allocator());
+            var key: [4000]u8 = @splat('k');
+            _ = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{seen});
+            const widths = [_]usize{ 16, 512, 4000 };
+            try std.testing.expectEqualSlices(u8, key[0..if (seen == 0) 0 else widths[seen % widths.len]], value.key);
+            seen += 1;
+        }
+        try std.testing.expectEqual(@as(usize, count), seen);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+}
+
+test "lite native bulk index frontier releases ownership on allocation failures" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var file = NativeFile{ .allocator = alloc, .io_impl = undefined, .borrowed_io = std.testing.io, .path = @constCast(""), .file = undefined, .header = .{} };
+            var pages: u64 = 1;
+            var builder = DocumentIndexBulkBuilder{ .owner = &file, .file = undefined, .next_page_id = &pages, .count_only = true };
+            defer builder.deinit();
+            for (0..80) |i| {
+                var key: [512]u8 = @splat('k');
+                _ = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+                try builder.add(&key, 1);
+            }
+            try std.testing.expect(try builder.finish() != 0);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
