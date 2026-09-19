@@ -3492,7 +3492,7 @@ pub const ChatToolsConfig = struct {
     /// List of tools to enable. If empty, retrieval agents default to all retrieval tools available for the request.
     enabled_tools: ?[]const ChatToolName = null,
     /// Inline web search provider configuration. Prefer web_search_connection for configured production agents; inline config remains useful for CLI/dev requests. See specs/openapi/antfly/websearch.yaml for provider-specific options.
-    web_search_config: ?WebSearchConfig = null,
+    web_search_config: ?WebSearchProviderConfig = null,
     /// Name of a configured connections.<id> resource with kind web_search. Request-level tool options may reduce scope, but cannot expand the connection's configured capabilities or policy.
     web_search_connection: ?[]const u8 = null,
     /// URL fetching configuration. See specs/openapi/antfly/websearch.yaml for available options and security controls.
@@ -37975,6 +37975,109 @@ pub const WebSearchProvider = enum {
             .{ "vertex", .vertex },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Provider-specific inline web search configuration.
+pub const WebSearchProviderConfig = union(enum) {
+    exa_search_config: ExaSearchConfig,
+    serper_search_config: SerperSearchConfig,
+    tavily_search_config: TavilySearchConfig,
+    brave_search_config: BraveSearchConfig,
+    you_search_config: YouSearchConfig,
+    linkup_search_config: LinkupSearchConfig,
+    vertex_search_config: VertexSearchConfig,
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { provider: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.provider) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "exa")) {
+            return .{ .exa_search_config = try std.json.parseFromSliceLeaky(ExaSearchConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "serper")) {
+            return .{ .serper_search_config = try std.json.parseFromSliceLeaky(SerperSearchConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "tavily")) {
+            return .{ .tavily_search_config = try std.json.parseFromSliceLeaky(TavilySearchConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "brave")) {
+            return .{ .brave_search_config = try std.json.parseFromSliceLeaky(BraveSearchConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "you")) {
+            return .{ .you_search_config = try std.json.parseFromSliceLeaky(YouSearchConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "linkup")) {
+            return .{ .linkup_search_config = try std.json.parseFromSliceLeaky(LinkupSearchConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "vertex")) {
+            return .{ .vertex_search_config = try std.json.parseFromSliceLeaky(VertexSearchConfig, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("provider") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "exa")) {
+            return .{ .exa_search_config = try std.json.parseFromValueLeaky(ExaSearchConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "serper")) {
+            return .{ .serper_search_config = try std.json.parseFromValueLeaky(SerperSearchConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "tavily")) {
+            return .{ .tavily_search_config = try std.json.parseFromValueLeaky(TavilySearchConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "brave")) {
+            return .{ .brave_search_config = try std.json.parseFromValueLeaky(BraveSearchConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "you")) {
+            return .{ .you_search_config = try std.json.parseFromValueLeaky(YouSearchConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "linkup")) {
+            return .{ .linkup_search_config = try std.json.parseFromValueLeaky(LinkupSearchConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "vertex")) {
+            return .{ .vertex_search_config = try std.json.parseFromValueLeaky(VertexSearchConfig, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .exa_search_config => |v| try jw.write(v),
+            .serper_search_config => |v| try jw.write(v),
+            .tavily_search_config => |v| try jw.write(v),
+            .brave_search_config => |v| try jw.write(v),
+            .you_search_config => |v| try jw.write(v),
+            .linkup_search_config => |v| try jw.write(v),
+            .vertex_search_config => |v| try jw.write(v),
+        }
     }
 };
 

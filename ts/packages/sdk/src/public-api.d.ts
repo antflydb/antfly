@@ -13467,44 +13467,6 @@ export interface components {
          */
         WebSearchProvider: "exa" | "serper" | "tavily" | "brave" | "you" | "linkup" | "vertex";
         /**
-         * @description Configuration for Exa neural/semantic web search.
-         *
-         *     Exa is optimized for semantic web search, highlights, and retrieved page
-         *     contents for RAG and agent workflows.
-         *
-         *     **Setup:**
-         *     1. Sign up at https://exa.ai
-         *     2. Get API key from dashboard
-         *
-         *     **Docs:** https://docs.exa.ai
-         */
-        ExaSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
-            /** @description Exa API key (or set EXA_API_KEY env var) */
-            api_key?: string;
-            /**
-             * @description Search mode to request from Exa
-             * @default auto
-             * @enum {string}
-             */
-            search_type?: "auto" | "neural" | "keyword";
-            /** @description Provider-specific result count override */
-            num_results?: number;
-            /** @description ISO date/time lower bound for published date filtering */
-            start_published_date?: string;
-            /** @description ISO date/time upper bound for published date filtering */
-            end_published_date?: string;
-            /** @description Only include results from these domains */
-            include_domains?: string[];
-            /** @description Exclude results from these domains */
-            exclude_domains?: string[];
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            provider: "exa";
-        };
-        /**
          * @description Configuration for Serper.dev Google Search API.
          *
          *     Serper provides a simpler alternative to Google Custom Search with
@@ -13530,6 +13492,12 @@ export interface components {
              * @enum {string}
              */
             time_period?: "d" | "w" | "m" | "y";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "serper";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13580,6 +13548,12 @@ export interface components {
              * @enum {string}
              */
             provider: "tavily";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "tavily";
         };
         /**
          * @description Configuration for Brave Search API.
@@ -13616,6 +13590,12 @@ export interface components {
              * @enum {string}
              */
             provider: "brave";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "brave";
         };
         /**
          * @description Configuration for You.com Search API.
@@ -13637,6 +13617,12 @@ export interface components {
              * @description You.com API endpoint URL
              */
             endpoint?: string;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "you";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13671,6 +13657,12 @@ export interface components {
              * @enum {string}
              */
             output_type?: "searchResults" | "sourcedAnswer";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "linkup";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13715,6 +13707,12 @@ export interface components {
             serving_config?: string;
             /** @description Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS. */
             credentials_path?: string;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "vertex";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13789,6 +13787,52 @@ export interface components {
              */
             include_highlights?: boolean;
         };
+        /**
+         * @description Configuration for Exa neural/semantic web search.
+         *
+         *     Exa is optimized for semantic web search, highlights, and retrieved page
+         *     contents for RAG and agent workflows.
+         *
+         *     **Setup:**
+         *     1. Sign up at https://exa.ai
+         *     2. Get API key from dashboard
+         *
+         *     **Docs:** https://docs.exa.ai
+         */
+        ExaSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @description Exa API key (or set EXA_API_KEY env var) */
+            api_key?: string;
+            /**
+             * @description Search mode to request from Exa
+             * @default auto
+             * @enum {string}
+             */
+            search_type?: "auto" | "neural" | "keyword";
+            /** @description Provider-specific result count override */
+            num_results?: number;
+            /** @description ISO date/time lower bound for published date filtering */
+            start_published_date?: string;
+            /** @description ISO date/time upper bound for published date filtering */
+            end_published_date?: string;
+            /** @description Only include results from these domains */
+            include_domains?: string[];
+            /** @description Exclude results from these domains */
+            exclude_domains?: string[];
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "exa";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "exa";
+        };
+        /** @description Provider-specific inline web search configuration. */
+        WebSearchProviderConfig: components["schemas"]["ExaSearchConfig"] | components["schemas"]["SerperSearchConfig"] | components["schemas"]["TavilySearchConfig"] | components["schemas"]["BraveSearchConfig"] | components["schemas"]["YouSearchConfig"] | components["schemas"]["LinkupSearchConfig"] | components["schemas"]["VertexSearchConfig"];
         Credentials: {
             /**
              * @description S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
@@ -13891,7 +13935,7 @@ export interface components {
              *     requests. See specs/openapi/antfly/websearch.yaml for provider-specific
              *     options.
              */
-            web_search_config?: components["schemas"]["WebSearchConfig"];
+            web_search_config?: components["schemas"]["WebSearchProviderConfig"];
             /**
              * @description Name of a configured connections.<id> resource with kind web_search.
              *     Request-level tool options may reduce scope, but cannot expand the

@@ -7,6 +7,94 @@ Web search is a first-class external capability. It should not be modeled as
 plain HTTP access because it has query semantics, ranking, freshness, snippets,
 citations, provider display rules, and agent-tool behavior.
 
+## Retrieval Agent: Exa
+
+The Zig retrieval agent executes Exa searches in agentic mode. Configure a named
+connection on the server:
+
+```json
+{
+  "connections": {
+    "agent-web": {
+      "kind": "web_search",
+      "provider": "exa",
+      "capabilities": ["web.search", "agents.use"],
+      "web_search": {
+        "api_key": "${secret:exa.api_key}",
+        "max_results": 5,
+        "timeout_ms": 10000,
+        "include_content": true,
+        "include_highlights": true
+      }
+    }
+  }
+}
+```
+
+Use the secret store or `EXA_API_KEY` environment fallback. Secret references
+are resolved through Antfly's existing secret handling. Send this request to
+`POST /db/v1/agents/retrieval` (supply the OpenAI key or secret reference in the
+generator's `api_key`):
+
+```json
+{
+  "query": "Find Antfly hybrid-search documentation on the web and cite the source URLs.",
+  "queries": [],
+  "stream": false,
+  "max_internal_iterations": 4,
+  "generator": {
+    "provider": "openai",
+    "model": "gpt-4.1-mini",
+    "url": "https://api.openai.com/v1",
+    "api_key": "${secret:openai.api_key}"
+  },
+  "tools": {
+    "enabled_tools": ["web_search"],
+    "web_search_connection": "agent-web"
+  },
+  "steps": {"generation": {}}
+}
+```
+
+An empty `queries` array is supported for web-only requests. To combine web and
+database retrieval, supply the table queries and enable the corresponding
+retrieval tools too (or omit `enabled_tools`). Web search requires a generator
+and positive `max_internal_iterations`; pipeline mode does not perform web calls.
+The same limits apply to web calls and database tools. A failed provider call
+produces an error step and repair feedback, and does not qualify as evidence for
+an answer. Search results are returned in `hits`, with IDs prefixed `web:`, and
+`_source.provider`, `url`, `title`, and configured `text`/`highlights`. They use the
+existing `hit` and step events when `stream` is true. The database-only
+`strategy_used` field is omitted for web-only retrieval.
+
+The CLI also accepts a named connection:
+
+```sh
+antfly agents retrieval --web-search-connection agent-web \
+  --intent 'Find Antfly hybrid-search documentation and cite URLs' \
+  --generator '{"provider":"openai","model":"gpt-4.1-mini","url":"https://api.openai.com/v1","api_key":"${secret:openai.api_key}"}'
+```
+
+For development, replace `web_search_connection` with
+`web_search_config: {"provider":"exa","api_key":"...","include_content":true}`.
+Inline Exa options include `max_results`/`num_results` (1–20), `timeout_ms`,
+`safe_search` (sent as Exa `moderation`), `search_type`, published-date bounds,
+`include_domains`, `exclude_domains`, `region` (two-letter country code), and
+content/highlight switches. Domain filters accept domain names, including their
+subdomains. Language filtering is unsupported and rejected. The wire format
+follows the [Exa search API](https://exa.ai/docs/reference/search).
+
+A request may supply a named connection plus inline options to narrow its
+result limit, timeout, domains, or content settings. It cannot replace the
+connection's provider, endpoint, credentials, or expand content/domain access.
+Configure custom endpoints on the server's named connection; inline requests
+are restricted to `https://api.exa.ai/search`. Redirects are disabled. Provider
+responses are capped at 1 MiB and text/highlights at 4,000 bytes each per result;
+model history also respects the agent's context budget. Configuration belongs
+in either top-level `tools` or `steps.retrieval.tools`, not both. Both tool
+allowlists still apply. Other provider tokens describe the shared connection
+contract below; this retrieval adapter currently implements Exa only.
+
 ## Goals
 
 - Give agents a configured, inspectable set of web-search providers.

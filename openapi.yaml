@@ -26167,61 +26167,6 @@ components:
         - **linkup**: Linkup Search API for web search and content retrieval
 
         - **vertex**: Google Cloud Agent Search / Vertex AI Search
-    ExaSearchConfig:
-      type: object
-      description: >
-        Configuration for Exa neural/semantic web search.
-
-
-        Exa is optimized for semantic web search, highlights, and retrieved page
-
-        contents for RAG and agent workflows.
-
-
-        **Setup:**
-
-        1. Sign up at https://exa.ai
-
-        2. Get API key from dashboard
-
-
-        **Docs:** https://docs.exa.ai
-      allOf:
-        - $ref: '#/components/schemas/WebSearchConfig'
-        - type: object
-          properties:
-            api_key:
-              type: string
-              description: Exa API key (or set EXA_API_KEY env var)
-            search_type:
-              type: string
-              enum:
-                - auto
-                - neural
-                - keyword
-              default: auto
-              description: Search mode to request from Exa
-            num_results:
-              type: integer
-              minimum: 1
-              maximum: 20
-              description: Provider-specific result count override
-            start_published_date:
-              type: string
-              description: ISO date/time lower bound for published date filtering
-            end_published_date:
-              type: string
-              description: ISO date/time upper bound for published date filtering
-            include_domains:
-              type: array
-              items:
-                type: string
-              description: Only include results from these domains
-            exclude_domains:
-              type: array
-              items:
-                type: string
-              description: Exclude results from these domains
     SerperSearchConfig:
       type: object
       description: >
@@ -26581,6 +26526,81 @@ components:
           you: '#/components/schemas/YouSearchConfig'
           linkup: '#/components/schemas/LinkupSearchConfig'
           vertex: '#/components/schemas/VertexSearchConfig'
+    ExaSearchConfig:
+      type: object
+      description: >
+        Configuration for Exa neural/semantic web search.
+
+
+        Exa is optimized for semantic web search, highlights, and retrieved page
+
+        contents for RAG and agent workflows.
+
+
+        **Setup:**
+
+        1. Sign up at https://exa.ai
+
+        2. Get API key from dashboard
+
+
+        **Docs:** https://docs.exa.ai
+      allOf:
+        - $ref: '#/components/schemas/WebSearchConfig'
+        - type: object
+          properties:
+            api_key:
+              type: string
+              description: Exa API key (or set EXA_API_KEY env var)
+            search_type:
+              type: string
+              enum:
+                - auto
+                - neural
+                - keyword
+              default: auto
+              description: Search mode to request from Exa
+            num_results:
+              type: integer
+              minimum: 1
+              maximum: 20
+              description: Provider-specific result count override
+            start_published_date:
+              type: string
+              description: ISO date/time lower bound for published date filtering
+            end_published_date:
+              type: string
+              description: ISO date/time upper bound for published date filtering
+            include_domains:
+              type: array
+              items:
+                type: string
+              description: Only include results from these domains
+            exclude_domains:
+              type: array
+              items:
+                type: string
+              description: Exclude results from these domains
+    WebSearchProviderConfig:
+      description: Provider-specific inline web search configuration.
+      oneOf:
+        - $ref: '#/components/schemas/ExaSearchConfig'
+        - $ref: '#/components/schemas/SerperSearchConfig'
+        - $ref: '#/components/schemas/TavilySearchConfig'
+        - $ref: '#/components/schemas/BraveSearchConfig'
+        - $ref: '#/components/schemas/YouSearchConfig'
+        - $ref: '#/components/schemas/LinkupSearchConfig'
+        - $ref: '#/components/schemas/VertexSearchConfig'
+      discriminator:
+        propertyName: provider
+        mapping:
+          exa: '#/components/schemas/ExaSearchConfig'
+          serper: '#/components/schemas/SerperSearchConfig'
+          tavily: '#/components/schemas/TavilySearchConfig'
+          brave: '#/components/schemas/BraveSearchConfig'
+          you: '#/components/schemas/YouSearchConfig'
+          linkup: '#/components/schemas/LinkupSearchConfig'
+          vertex: '#/components/schemas/VertexSearchConfig'
     Credentials:
       type: object
       properties:
@@ -26701,7 +26721,7 @@ components:
             - semantic_search
             - web_search
         web_search_config:
-          $ref: '#/components/schemas/WebSearchConfig'
+          $ref: '#/components/schemas/WebSearchProviderConfig'
           description: >
             Inline web search provider configuration. Prefer web_search_connection for
 

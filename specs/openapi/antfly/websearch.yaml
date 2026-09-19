@@ -31,6 +31,27 @@ components:
         - **linkup**: Linkup Search API for web search and content retrieval
         - **vertex**: Google Cloud Agent Search / Vertex AI Search
 
+    WebSearchProviderConfig:
+      description: Provider-specific inline web search configuration.
+      oneOf:
+        - $ref: "#/components/schemas/ExaSearchConfig"
+        - $ref: "#/components/schemas/SerperSearchConfig"
+        - $ref: "#/components/schemas/TavilySearchConfig"
+        - $ref: "#/components/schemas/BraveSearchConfig"
+        - $ref: "#/components/schemas/YouSearchConfig"
+        - $ref: "#/components/schemas/LinkupSearchConfig"
+        - $ref: "#/components/schemas/VertexSearchConfig"
+      discriminator:
+        propertyName: provider
+        mapping:
+          exa: "#/components/schemas/ExaSearchConfig"
+          serper: "#/components/schemas/SerperSearchConfig"
+          tavily: "#/components/schemas/TavilySearchConfig"
+          brave: "#/components/schemas/BraveSearchConfig"
+          you: "#/components/schemas/YouSearchConfig"
+          linkup: "#/components/schemas/LinkupSearchConfig"
+          vertex: "#/components/schemas/VertexSearchConfig"
+
     WebSearchConfig:
       description: |
         A unified configuration for web search providers.

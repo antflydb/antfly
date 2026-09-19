@@ -697,6 +697,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .indexes_openapi = indexes_openapi_mod,
         .sort_openapi = sort_openapi_mod,
         .generating_api_openapi = generating_api_openapi_mod,
+        .websearch_openapi = openapi_modules.websearch,
         .eval_openapi = eval_openapi_mod,
         .query_openapi = query_openapi_mod,
         .admin_openapi = admin_openapi_mod,

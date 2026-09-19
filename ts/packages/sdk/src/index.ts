@@ -396,7 +396,9 @@ export type {
   // User and permission types
   User,
   // Web search types
+  ExaSearchConfig,
   WebSearchConfig,
+  WebSearchProviderConfig,
   WebSearchResultItem,
   WriteOptions,
 } from "./types.js";
