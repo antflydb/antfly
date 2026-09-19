@@ -1101,6 +1101,63 @@ on a real corpus"` -- 1 selected, 1 passed, 0 skipped, 0 failed. Log paths
 `http-throughput-err.log`, `make_sections.py`, `bench40.json`,
 `throughput-corpus.json`, `provider-throughput-test.log`.
 
+### 14. Follow-up: the corpus-minimum document, the serial batch contract, and the plan-resolution floor
+
+A full in-process `examples/dogfood` ingest after merging `main` (2026-09-19)
+still failed its drain, and the three causes were all outside the model:
+
+1. **The safetensors checkpoint advertised the generic serial batch
+   contract.** `server.zig`'s `resolvedExecutorKind` only recognized the
+   split encoder+head GGUF bundle as the concrete GLiNER executor; a
+   boundary-architecture manifest (this checkpoint, served from safetensors)
+   fell through to `.compatibility` and the `/ai/v1/models` listing showed
+   `batch: {mode: serial_compatibility, max_items: 128}`. The antfly
+   asset-producer batcher then grouped up to eight sections into one request,
+   which this executor's `request_items = 1` contract rejected with
+   `GlinerBoundaryRequestItemsLimitExceeded` for the whole group -- the
+   "five lost sections" every earlier ingest reported. Both concrete GLiNER
+   executors now share `.native_gliner_extraction`, whose batch contract is
+   `mode = .none, max_items = 1`; the listing test covers the boundary
+   manifest explicitly.
+2. **Tiny sections failed during planning, before any provider ran.**
+   `asset_producer.zig`'s plan-resolution budget was eight times the
+   request's own bytes plus 4 KB, but resolving a plan parses the producer
+   configuration into a JSON value tree whose allocations do not shrink
+   with the source text. Six sections of 150-560 bytes with the dogfood
+   config failed with `InferenceInvocationMemoryExceeded` (terminal). The
+   resolution budget now has a fixed 1 MiB floor (planning only; the
+   invocation itself is still bounded by the resolved plan).
+3. **The corpus-minimum document was below the reviewed floor.**
+   `zig/SCHEMA.md`'s "Related Docs" section is, after docsaf strips the
+   link markup, the 20-byte string `TODO.mdSERVERLESS.md` -- the smallest
+   section the whole ingest corpus produces. Both rows' `document_bytes`
+   floor was 26 (the shortest canonical fixture), so this one section was
+   refused with `GlinerBoundaryDocumentBytesLimitExceeded`, and because the
+   drain reports terminal request failures, the whole ingest exited with
+   `EnrichmentWorkerFailed`. Per section 3's rule the floor was lowered by
+   measurement, not extrapolation: the two geometry tests gained that exact
+   section and a one-character document, measuring (dogfood schema)
+
+   | document | bytes | words | window words | padded tokens |
+   |---|---|---|---|---|
+   | `TODO.mdSERVERLESS.md` | 20 | 5 | 6 | 110 |
+   | `a` | 1 | 1 | 2 | 103 |
+
+   at both window sizes, and the rows now read `document_bytes >= 1`,
+   `document_words >= 1`, `window_words >= 2`, with the long-document row's
+   `padded_sequence_tokens` floor at 103 (the single-window row's stays at
+   14). Two new tests, "gliner boundary long executor provider extractDirect
+   canonical schema_version 2 shape for the corpus-minimum real section
+   native/Metal" in `server/gliner_boundary_service_test.zig`, run both
+   documents through `Node.extractDirect` on each backend and require a
+   canonical, finite response with one window, at most one entity spanning
+   the whole document, and no relations.
+
+Two observability gaps closed on the way: `runUntilIdle` now logs the error
+it fails with, the C ABI logs any error it collapses to `ANTFLY_INTERNAL`
+(the drain's `EnrichmentWorkerFailed` was invisible before), and an isolated
+enrichment failure logs its document key.
+
 ## How to re-qualify a different or wider artifact
 
 1. Pull the artifact and verify its digests against

@@ -267,12 +267,23 @@ const fastino_gliner25_base_v1_features = Features.initMany(&.{
 // longer design-doc sections -- still requires long-document windowing,
 // which remains unqualified (.long_document is not in the feature set
 // above) and correctly fails closed with UnsupportedGlinerBoundaryRuntime.
+//
+// Lower bounds re-measured 2026-09-19 (same geometry test, two added cases):
+// examples/dogfood's smallest real section, zig/SCHEMA.md's "Related Docs"
+// list as docsaf emits it ("TODO.mdSERVERLESS.md": 20 bytes, 5 splitter
+// words, 6 window words, 110 padded tokens with the dogfood schema), and a
+// one-character document ("a": 1 byte, 1 word, 2 window words, 103 padded
+// tokens). Both run end to end on native and Metal through the
+// corpus-minimum provider tests in server/gliner_boundary_service_test.zig.
+// Before this measurement the 26-byte floor (the shortest canonical fixture)
+// made the SCHEMA.md section the one document a full in-process dogfood
+// ingest rejected, and that rejection is terminal for the whole drain.
 const fastino_gliner25_base_v1_lengths = LengthContract{
     .request_items = .{ .min = 1, .max = 1 },
-    .document_bytes = .{ .min = 26, .max = 610 },
-    .document_words = .{ .min = 5, .max = 112 },
+    .document_bytes = .{ .min = 1, .max = 610 },
+    .document_words = .{ .min = 1, .max = 112 },
     .window_count = .{ .min = 1, .max = 1 },
-    .window_words = .{ .min = 5, .max = 112 },
+    .window_words = .{ .min = 2, .max = 112 },
     .padded_sequence_tokens = .{ .min = 14, .max = 218 },
 };
 
@@ -364,13 +375,20 @@ const fastino_gliner25_base_v1_long_document_features = Features.initMany(&.{
 // not been measured and correctly fails closed with the named
 // error.GlinerBoundaryWindowCountLimitExceeded (etc.), not the generic
 // error.UnsupportedGlinerBoundaryRuntime.
+//
+// Lower bounds re-measured 2026-09-19 with the same two tiny documents as
+// the single-window row above (SCHEMA.md "Related Docs": 20 bytes / 5 words
+// / 6 window words / 110 padded tokens; one character: 1 / 1 / 2 / 103),
+// still requested with long_document.mode=window as examples/dogfood does,
+// at both window sizes. Verified end to end on native and Metal by the
+// corpus-minimum provider tests in server/gliner_boundary_service_test.zig.
 const fastino_gliner25_base_v1_long_document_lengths = LengthContract{
     .request_items = .{ .min = 1, .max = 1 },
-    .document_bytes = .{ .min = 26, .max = 182000 },
-    .document_words = .{ .min = 5, .max = 28275 },
+    .document_bytes = .{ .min = 1, .max = 182000 },
+    .document_words = .{ .min = 1, .max = 28275 },
     .window_count = .{ .min = 1, .max = 29 },
-    .window_words = .{ .min = 5, .max = 4096 },
-    .padded_sequence_tokens = .{ .min = 106, .max = 5708 },
+    .window_words = .{ .min = 2, .max = 4096 },
+    .padded_sequence_tokens = .{ .min = 103, .max = 5708 },
 };
 
 const production_entries: []const Entry = &.{
@@ -620,7 +638,7 @@ test "boundary qualification serves the reviewed fastino gliner2.5 base checkpoi
     // Requiring only .long_document is satisfied by the long-document row
     // alone (its feature set is a superset), so this reaches geometry: the
     // single-window row's narrower padded_sequence_tokens minimum (14) falls
-    // under the long-document row's reviewed minimum (106) -- a genuine
+    // under the long-document row's reviewed minimum (103) -- a genuine
     // bounded-length rejection, named accordingly, not a feature mismatch.
     try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(identity, .native, Features.initOne(.long_document), fastino_gliner25_base_v1_lengths));
 

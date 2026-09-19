@@ -966,3 +966,83 @@ test "gliner boundary long executor provider extractDirect canonical schema_vers
     const relations = output.get("relations").?.array.items;
     try std.testing.expect(relations.len > 0);
 }
+
+// Corpus-minimum companion to the corpus-maximum tests above: zig/SCHEMA.md's
+// "Related Docs" section is the smallest section examples/dogfood's real
+// docsaf.MarkdownProcessor splitting produces across the whole ingest corpus
+// (the two link targets with their markup stripped and no whitespace between
+// them -- 20 bytes, one word). The ingest embeds and full-text indexes that
+// section, so the extractor must admit it too: before the qualification rows
+// were measured down to this document, it was the only section a full
+// in-process ingest rejected (GlinerBoundaryDocumentBytesLimitExceeded, a
+// terminal disposition that failed the whole drain). Runs the in-process
+// provider entry (Node.extractDirect, as the embedded worker calls it) on
+// both backends and requires a canonical, finite response that agrees across
+// them: a one-word document has no relations and at most one entity.
+test "gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-minimum real section native" {
+    try corpusMinimumProviderShape(false);
+}
+test "gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-minimum real section Metal" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    try corpusMinimumProviderShape(true);
+}
+fn corpusMinimumProviderShape(metal: bool) !void {
+    const a = std.testing.allocator;
+    const home = platform.env.getenv("HOME") orelse return error.SkipZigTest;
+    const directory = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino", "gliner2.5-base-v1" });
+    defer a.free(directory);
+    std.Io.Dir.cwd().access(std.testing.io, directory, .{}) catch return error.SkipZigTest;
+    const models_dir = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino" });
+    defer a.free(models_dir);
+
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .process_termination_available = true,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    if (!metal) useNativeBackend(&node) else {
+        node.session_manager.preferred_backends = &.{.metal};
+        node.session_manager.required_backend = .metal;
+        node.model_manager.session_manager.preferred_backends = &.{.metal};
+        node.model_manager.session_manager.required_backend = .metal;
+    }
+    try node.attachIo(std.testing.io);
+
+    // Exactly what examples/dogfood sends for doc:zig/SCHEMA.md#schema-related-docs.
+    const documents = [_][]const u8{ "TODO.mdSERVERLESS.md", "a" };
+    for (documents) |document| {
+        const content_json = try std.json.Stringify.valueAlloc(a, document, .{});
+        defer a.free(content_json);
+        const request = extracting_api.Request{
+            .schema_version = 2,
+            .inputs = &.{.{ .id = "1", .content_json = content_json }},
+            .schema_json =
+            \\{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}
+            ,
+            .options_json =
+            \\{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}}
+            ,
+        };
+        var response = try node.extractDirect(a, "gliner2.5-base-v1", request);
+        defer response.deinit();
+        errdefer std.debug.print("corpus-minimum provider response ({s}): {s}\n", .{ document, response.json });
+        var parsed = try std.json.parseFromSlice(Value, a, response.json, .{});
+        defer parsed.deinit();
+        const output = parsed.value.object.get("data").?.array.items[0].object;
+        try std.testing.expectEqual(@as(i64, 1), output.get("long_document").?.object.get("window_count").?.integer);
+        const entities = output.get("entities").?.array.items;
+        try std.testing.expect(entities.len <= 1);
+        for (entities) |raw_entity| {
+            const entity = raw_entity.object;
+            try std.testing.expectEqualStrings(document, entity.get("text").?.string);
+            try std.testing.expectEqual(@as(i64, 0), entity.get("start").?.integer);
+            try std.testing.expectEqual(@as(i64, @intCast(document.len)), entity.get("end").?.integer);
+            const score = entity.get("score").?.float;
+            try std.testing.expect(std.math.isFinite(score) and score >= 0.0 and score <= 1.0);
+        }
+        if (output.get("relations")) |raw_relations| try std.testing.expectEqual(@as(usize, 0), raw_relations.array.items.len);
+    }
+}
