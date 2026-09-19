@@ -376,7 +376,14 @@ const Builder = struct {
         const identity = try self.rowIdentity(table.name, key);
         if (self.by_row.get(identity)) |existing| return existing;
         if (self.work.items.len >= 4096) return error.TransactionTooLarge;
-        var old = try self.lookup(table.name, key, .{});
+        return self.recordWork(table, key, try self.lookup(table.name, key, .{}));
+    }
+
+    fn recordWork(self: *Builder, table: *Loaded, key: []const u8, observation: ?reads.LookupResponse) !*Work {
+        const identity = try self.rowIdentity(table.name, key);
+        if (self.by_row.get(identity)) |existing| return existing;
+        if (self.work.items.len >= 4096) return error.TransactionTooLarge;
+        var old = observation;
         if (old) |row| if (row.expected_content_digest == null)
             return error.MissingPrimaryObservation;
         const observed_version = if (old) |row| row.version else 0;
@@ -392,6 +399,48 @@ const Builder = struct {
         try self.work.append(self.alloc, item);
         try self.by_row.put(self.alloc, identity, item);
         return item;
+    }
+
+    /// Independent primary observations may share a routing view, but never
+    /// the builder's mutable arena. Drain every bounded Io task before copying
+    /// results and publishing predicates on the caller, including on failure.
+    fn preloadWork(self: *Builder, table: *Loaded, keys: []const []const u8) !void {
+        const borrow = self.control.deadline_io orelse return;
+        if (keys.len < 2) return;
+        const Slot = struct {
+            arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+            row: ?reads.LookupResponse = null,
+            failure: ?anyerror = null,
+            fn run(slot: *@This(), source: reads.TableReadSource, name: []const u8, key: []const u8, control: RequestContext) void {
+                slot.row = source.lookup(slot.arena.allocator(), name, key, .{ .include_primary_digest = true, .execution_deadline_ns = control.deadline_ns, .execution_io = control.deadline_io, .cancellation = control.cancellation }, .read_index) catch |err| {
+                    slot.failure = err;
+                    return;
+                };
+            }
+        };
+        var receiver = try borrow.receive();
+        const io = receiver.io();
+        const width = 8;
+        var start: usize = 0;
+        while (start < keys.len) : (start += width) {
+            try self.control.ensureActive();
+            var slots: [width]Slot = @splat(.{});
+            defer for (&slots) |*slot| slot.arena.deinit();
+            const batch = keys[start..@min(start + width, keys.len)];
+            var tasks: std.Io.Group = .init;
+            for (batch, 0..) |key, index| tasks.async(io, Slot.run, .{ &slots[index], self.source, table.name, key, self.control });
+            tasks.await(io) catch return error.Cancelled;
+            try self.control.ensureActive();
+            for (slots[0..batch.len]) |slot| if (slot.failure) |err| return err;
+            for (batch, slots[0..batch.len]) |key, slot| {
+                var owned = slot.row;
+                if (owned) |*row| {
+                    if (row.json.len > 16 * 1024 * 1024 -| self.prepared_bytes) return error.TransactionTooLarge;
+                    row.json = try self.alloc.dupe(u8, row.json);
+                }
+                _ = try self.recordWork(table, key, owned);
+            }
+        }
     }
 
     fn enqueue(self: *Builder, item: *Work) !void {
@@ -860,6 +909,10 @@ fn prepareModeInternal(alloc: Allocator, source: reads.TableReadSource, metadata
         for (request.writes) |write| try writes.put(builder.alloc, write.key, write.value);
         for (request.deletes) |key| try writes.put(builder.alloc, key, null);
         if (writes.count() > 4096) return error.TransactionTooLarge;
+        const keys = try builder.alloc.alloc([]const u8, writes.count());
+        var key_it = writes.keyIterator();
+        for (keys) |*key| key.* = key_it.next().?.*;
+        try builder.preloadWork(table, keys);
         var it = writes.iterator();
         while (it.next()) |entry| {
             const item = try builder.getWork(table, entry.key_ptr.*);
@@ -1378,6 +1431,52 @@ test "distributed txn preparation pins one routing view and releases it" {
         try std.testing.expectEqual(@as(usize, 2), fixture.lookups);
     }
     try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+}
+
+test "distributed txn primary prefetch owns observations and drains failed batches" {
+    const Fixture = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fail: bool,
+        fn lookup(ptr: *anyopaque, alloc: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            try std.testing.expectEqual(.read_index, consistency);
+            try std.testing.expect(opts.include_primary_digest);
+            try std.testing.expect(opts.execution_io != null);
+            if (self.fail and std.mem.eql(u8, key, "b")) return error.InjectedReadFailure;
+            return .{ .json = try alloc.dupe(u8, "{}"), .version = 7, .expected_content_digest = @splat(3) };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    for ([_]bool{ false, true }) |fail| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var fixture: Fixture = .{ .fail = fail };
+        var table: Loaded = undefined;
+        table.name = "rows";
+        var builder: Builder = .{ .alloc = arena.allocator(), .metadata = &.{}, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, .control = .{ .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&io) } };
+        defer builder.deinit();
+        const keys = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i" };
+        if (fail) {
+            try std.testing.expectError(error.InjectedReadFailure, builder.preloadWork(&table, &keys));
+            try std.testing.expectEqual(@as(usize, 8), fixture.calls.load(.monotonic));
+            try std.testing.expectEqual(@as(usize, 0), builder.work.items.len);
+        } else {
+            try builder.preloadWork(&table, &keys);
+            try std.testing.expectEqual(keys.len, fixture.calls.load(.monotonic));
+            for (keys, builder.work.items) |key, work| {
+                try std.testing.expectEqualStrings(key, work.key);
+                try std.testing.expectEqualStrings("{}", work.before.?.json);
+                try std.testing.expectEqual(@as(u64, 7), work.observed_version);
+                try std.testing.expectEqual(@as([32]u8, @splat(3)), work.observed_digest.?);
+                try std.testing.expect(work == try builder.getWork(&table, key));
+            }
+            try std.testing.expectEqual(keys.len, fixture.calls.load(.monotonic));
+        }
+    }
 }
 
 fn testCatalogEnvelope(alloc: Allocator, table_id: u64, json: []const u8) ![]u8 {
