@@ -132,6 +132,9 @@ pub const ReplayWorkingSetOptions = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     tracked_working_set_bytes: ?*u64 = null,
     retained_cap_bytes: usize = default_replay_scratch_retained_cap_bytes,
+    /// Optional caller-owned streaming buffer. Never grown, shrunk or freed;
+    /// it must cover an incomplete record plus the next read chunk.
+    pending_buffer: ?[]u8 = null,
 };
 
 const ReplayWorkingSetTracker = struct {
@@ -578,7 +581,7 @@ pub fn replayIntoMutableWithHooksAndOptions(
     const retained_cap_bytes = normalizedReplayPendingRetainedCap(options.retained_cap_bytes);
     const legacy_path = try legacyPathAlloc(allocator, root_dir);
     defer allocator.free(legacy_path);
-    try replayFileStreaming(storage, allocator, legacy_path, 0, mutable, &stats, hooks, .{}, &working_set, retained_cap_bytes);
+    try replayFileStreaming(storage, allocator, legacy_path, 0, mutable, &stats, hooks, .{}, &working_set, retained_cap_bytes, options.pending_buffer);
 
     const current_segment = (readCurrentSegmentIfPresent(storage, allocator, root_dir) catch |err| switch (err) {
         error.FileNotFound => return stats,
@@ -591,7 +594,7 @@ pub fn replayIntoMutableWithHooksAndOptions(
         errdefer allocator.free(segment_path);
         try replayFileStreaming(storage, allocator, segment_path, segment, mutable, &stats, hooks, .{
             .allow_corrupt_tail = segment == current_segment,
-        }, &working_set, retained_cap_bytes);
+        }, &working_set, retained_cap_bytes, options.pending_buffer);
         allocator.free(segment_path);
     }
 
@@ -1408,6 +1411,7 @@ fn replayFileStreaming(
     options: ReplayFileOptions,
     working_set: *ReplayWorkingSetTracker,
     retained_cap_bytes: usize,
+    fixed_buffer: ?[]u8,
 ) !void {
     const file_size = storage.fileSize(wal_path) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -1417,9 +1421,12 @@ fn replayFileStreaming(
     stats.segments += 1;
     stats.bytes += file_size;
 
-    var pending = std.ArrayListUnmanaged(u8).empty;
-    defer pending.deinit(allocator);
-    try pending.ensureTotalCapacityPrecise(allocator, retained_cap_bytes);
+    var pending: std.ArrayListUnmanaged(u8) = if (fixed_buffer) |buffer|
+        .{ .items = buffer[0..0], .capacity = buffer.len }
+    else
+        .empty;
+    defer if (fixed_buffer == null) pending.deinit(allocator);
+    if (fixed_buffer == null) try pending.ensureTotalCapacityPrecise(allocator, retained_cap_bytes);
     working_set.observePending(&pending);
     defer working_set.observe(0);
 
@@ -1427,7 +1434,9 @@ fn replayFileStreaming(
     while (offset < file_size) {
         const len: usize = @intCast(@min(@as(u64, replay_chunk_bytes), file_size - offset));
         const start = pending.items.len;
-        try pending.ensureUnusedCapacity(allocator, len);
+        if (fixed_buffer != null) {
+            if (len > pending.capacity - pending.items.len) return error.WalRecordTooLarge;
+        } else try pending.ensureUnusedCapacity(allocator, len);
         pending.items.len += len;
         working_set.observePending(&pending);
         errdefer pending.items.len = start;
@@ -1453,13 +1462,13 @@ fn replayFileStreaming(
                 });
                 stats.noteTail(segment, pending.items.len);
                 pending.clearRetainingCapacity();
-                releaseOversizedReplayPendingBuffer(allocator, &pending, retained_cap_bytes);
+                if (fixed_buffer == null) releaseOversizedReplayPendingBuffer(allocator, &pending, retained_cap_bytes);
                 working_set.observePending(&pending);
                 break;
             },
             else => return err,
         };
-        releaseOversizedReplayPendingBuffer(allocator, &pending, retained_cap_bytes);
+        if (fixed_buffer == null) releaseOversizedReplayPendingBuffer(allocator, &pending, retained_cap_bytes);
         working_set.observePending(&pending);
     }
     if (pending.items.len > 0) {

@@ -284,6 +284,21 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             return std.math.add(usize, node_bytes, try std.math.mul(usize, edits, per_edit));
         }
 
+        /// Empty, exclusively owned roots mutate existing paths in place.
+        /// Each insert consumes at most one new leaf; rotations reuse unique
+        /// nodes. Count the maximum spare pool plus a conservative full vector
+        /// and account allocation per edit, including all growth/fragmentation.
+        pub fn uniqueInsertionAllocationBound(edits: usize) !usize {
+            if (edits == 0) return 0;
+            const footprint = @import("completion_allocator.zig").RecyclingScratch.allocationFootprint;
+            const height = 2 * (@as(usize, std.math.log2_int(usize, edits)) + 1);
+            const spares = 3 * height + 4;
+            const nodes = try std.math.add(usize, edits, spares);
+            const node_bytes = try std.math.mul(usize, nodes, try footprint(@sizeOf(Node), @alignOf(Node)));
+            const per_edit = try std.math.add(usize, try footprint(3 * (spares + 8) * @sizeOf(*Node), @alignOf(*Node)), try footprint(@sizeOf(Account), @alignOf(Account)));
+            return std.math.add(usize, node_bytes, try std.math.mul(usize, edits, per_edit));
+        }
+
         pub fn prepareEdits(self: *Self, allocator: std.mem.Allocator, edits: usize) !void {
             if (edits == 0) return;
             if (self.account == null) self.account = try Account.create(allocator);

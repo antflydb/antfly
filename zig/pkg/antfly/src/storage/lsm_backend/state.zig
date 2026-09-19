@@ -734,6 +734,15 @@ pub const ActiveMemTable = struct {
         return std.math.add(usize, records, try OrderedIndex.insertionAllocationBound(max_entries, edits));
     }
 
+    /// Only for replay into an initially empty ordered table, before any
+    /// reader/root snapshot can share nodes. Payload bytes count every version,
+    /// even replacements, and the index bound counts all cumulative allocations.
+    pub fn uniqueReplayAllocationBound(edits: usize, record_bytes: usize) !usize {
+        const footprint = @import("completion_allocator.zig").RecyclingScratch.allocationFootprint;
+        const records = try std.math.add(usize, record_bytes, try std.math.mul(usize, edits, try footprint(@sizeOf(SharedEntry), @alignOf(SharedEntry))));
+        return std.math.add(usize, records, try OrderedIndex.uniqueInsertionAllocationBound(edits));
+    }
+
     /// No allocation, validation, or fallible work may follow the WAL boundary
     /// before this swap. The caller retires the previous root after publication.
     pub fn publishPrepared(self: *ActiveMemTable, candidate: *ActiveMemTable) void {

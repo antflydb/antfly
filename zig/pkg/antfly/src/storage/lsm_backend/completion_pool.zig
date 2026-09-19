@@ -309,6 +309,39 @@ fn entryCapacity(entry: *const entry_codec.OwnedEntry) !capacity.Cost {
     return result;
 }
 
+const replay_max_records = completion.recovery_wal_records + 2 * max_slots;
+const replay_max_entries = completion.foreground_entries + max_slots * 2 * (completion.limits.max_operations + 4);
+const replay_private_key_bytes = blk: {
+    var largest: usize = @max(entry_codec.receiptKey(@splat(0)).len, entry_codec.group_progress_key.len);
+    largest = @max(largest, @import("../internal_keys.zig").raft_document_applied_entry_key.len);
+    for (completion.storage_keys ++ completion.applied_keys) |key| largest = @max(largest, key.len);
+    break :blk largest;
+};
+// Canonical wire covers its public payload plus stored descriptor; descriptor
+// wire covers either outcome's public payload. Add both phases' native-only
+// keys/values, repeated docs namespace, 16-byte entry and 20-byte record framing.
+const replay_phase_overhead = 4 * (replay_private_key_bytes + 112) + (completion.limits.max_operations + 4) * ("docs".len + 16) + 20;
+const replay_max_bytes = completion.recovery_wal_bytes + max_slots * (entry_codec.max_wire_bytes + completion.limits.max_encoded_bytes + 2 * replay_phase_overhead);
+const ReplayWorkspace = struct { tree: usize, pending: usize, paths: usize, total: usize };
+
+/// Replay starts with no readers or shared roots. Payload includes every WAL
+/// version, and the fixed pending span can hold the entire retained WAL, so
+/// arbitrary valid record/chunk boundaries never require buffer growth.
+fn replayWorkspaceRequirement() !ReplayWorkspace {
+    const footprint = domains.RecyclingScratch.allocationFootprint;
+    // The existing applied-entry hook checks after insertion. Include the one
+    // extra decoded entry which a corrupt over-limit input may insert first.
+    const tree = try @import("state.zig").ActiveMemTable.uniqueReplayAllocationBound(replay_max_entries + 1, replay_max_bytes);
+    const pending = try footprint(replay_max_bytes, 1);
+    // Current index+segment, two retention scans (3+segments each), replay
+    // (3+segments), and an optional truncated-tail path.
+    const paths = try std.math.mul(usize, 12 + 3 * (replay_max_records + 1), try footprint(512 + 32, 1));
+    var total = try std.math.add(usize, tree, try std.math.add(usize, pending, paths));
+    total = std.mem.alignForward(usize, total, @alignOf(usize));
+    if (total > completion.scratch_bytes) return error.UnsupportedCompletionProfile;
+    return .{ .tree = tree, .pending = pending, .paths = paths, .total = total };
+}
+
 /// A manifest frame retains both physical key bounds. Reserve the configured
 /// record ceiling for each bound; an accepted small key must not lend future
 /// journal capacity to another member of its already-owned cohort.
@@ -426,6 +459,7 @@ pub fn Pool(comptime Backend: type) type {
         /// Creation is fallible ordinary startup work and grants no Raft proof.
         pub fn create(backend: *Backend, config: Config) !*Self {
             try validateIdentity(config.identity);
+            _ = try replayWorkspaceRequirement();
             const native = backend.storage_owner orelse return error.UnsupportedCompletionBackend;
             const root = backend.root_dir orelse return error.UnsupportedCompletionBackend;
             if (root.len > 512) return error.UnsupportedCompletionProfile;
@@ -1038,17 +1072,17 @@ pub fn Pool(comptime Backend: type) type {
         /// primary WAL. Retained nodes carry allocator provenance past teardown.
         pub fn replayBeforePublication(self: *Self, backend: *Backend) !void {
             if (!self.restored or self.ready or self.failed) return error.RecoveryRequired;
+            if (!backend.mutable.ordered_enabled or backend.mutable.entryCount() != 0 or !self.scratch.isEmpty())
+                return error.CompletionRecoveryCapacityRequired;
+            _ = try replayWorkspaceRequirement();
             const alloc = self.scratch.allocator();
             var lock = try backend.acquireWalOperationLock(.exclusive);
             defer lock.release();
-            const max_records = completion.recovery_wal_records + 2 * max_slots;
-            if (try wal.currentSegment(self.io.storage(), alloc, backend.root_dir.?) > max_records + 1) return error.CompletionRecoveryCapacityRequired;
+            if (try wal.currentSegment(self.io.storage(), alloc, backend.root_dir.?) > replay_max_records + 1) return error.CompletionRecoveryCapacityRequired;
             const retention = try wal.snapshotRetention(self.io.storage(), alloc, backend.root_dir.?);
-            const max_replay_bytes = completion.recovery_wal_bytes + max_slots * (entry_codec.max_wire_bytes + completion.limits.max_encoded_bytes + 8192);
-            if (retention.bytes > max_replay_bytes or retention.segments > max_records + 1) return error.CompletionRecoveryCapacityRequired;
-            const parser_bytes = try alloc.alloc(u8, 4 * 1024 * 1024);
-            defer alloc.free(parser_bytes);
-            var parser = std.heap.FixedBufferAllocator.init(parser_bytes);
+            if (retention.bytes > replay_max_bytes or retention.segments > replay_max_records + 1) return error.CompletionRecoveryCapacityRequired;
+            const pending = try alloc.alloc(u8, replay_max_bytes);
+            defer alloc.free(pending);
             const Hooks = struct {
                 pool: *Self,
                 entries: usize = 0,
@@ -1060,21 +1094,21 @@ pub fn Pool(comptime Backend: type) type {
                 fn onEntry(raw: *anyopaque, _: u64, _: u64) !void {
                     const hooks: *@This() = @ptrCast(@alignCast(raw));
                     hooks.entries += 1;
-                    if (hooks.entries > completion.foreground_entries + max_slots * (2 * 256 + 6)) return error.CompletionRecoveryCapacityRequired;
+                    if (hooks.entries > replay_max_entries) return error.CompletionRecoveryCapacityRequired;
                 }
                 fn onRecord(raw: *anyopaque, _: u64, _: u64) !void {
                     const hooks: *@This() = @ptrCast(@alignCast(raw));
                     hooks.records += 1;
-                    if (hooks.records > max_records) return error.CompletionRecoveryCapacityRequired;
+                    if (hooks.records > replay_max_records) return error.CompletionRecoveryCapacityRequired;
                 }
             };
             var hooks: Hooks = .{ .pool = self };
-            const stats = try wal.replayIntoMutableWithHooks(self.io.storage(), parser.allocator(), backend.root_dir.?, &backend.mutable, .{
+            const stats = try wal.replayIntoMutableWithHooksAndOptions(self.io.storage(), alloc, backend.root_dir.?, &backend.mutable, .{
                 .ctx = &hooks,
                 .entry_allocator = Hooks.entryAllocator,
                 .on_applied_entry = Hooks.onEntry,
                 .on_applied_record = Hooks.onRecord,
-            });
+            }, .{ .pending_buffer = pending });
             if (stats.truncated_tail_bytes != 0) {
                 const segment = stats.truncated_tail_segment orelse return error.InvalidCompletionSlot;
                 if (stats.multiple_truncated_segments or segment != retention.current_segment) return error.InvalidCompletionSlot;
@@ -2188,4 +2222,68 @@ test "workload admission completion operation workspace reserves exact remaining
     try std.testing.expect(!try journalNeedsMaintenance(cap, record_limit, 0));
     try std.testing.expect(try journalNeedsMaintenance(cap, record_limit, max_slots));
     try std.testing.expectError(error.CompletionReservationBusy, journalNeedsMaintenance(cap + 1, record_limit, 0));
+}
+
+test "workload admission completion replay workspace covers unique and replaced versions with fixed pending storage" {
+    const state = @import("state.zig");
+    const alloc = std.testing.allocator;
+    const bound = try replayWorkspaceRequirement();
+    try std.testing.expect(bound.total <= completion.scratch_bytes);
+    for ([_]bool{ false, true }) |replace| {
+        var memory = storage_io.MemoryStorage.init(alloc);
+        defer memory.deinit();
+        const root = "/completion-replay-bound";
+        try memory.storage().createDirPath(root);
+        const distinct = if (replace) replay_max_entries / 2 else replay_max_entries;
+        const value: [1792]u8 = @splat(0xa5);
+        var position: usize = 0;
+        while (position < replay_max_entries) {
+            var incoming: state.ActiveMemTable = .{};
+            defer incoming.deinit(alloc);
+            const end = @min(position + 128, replay_max_entries);
+            while (position < end) : (position += 1) {
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, position % distinct, .big);
+                const tombstone = replace and position >= distinct and position % 17 == 0;
+                const size: usize = if (tombstone) 0 else if (!replace) 900 else if (position < distinct) 64 else value.len;
+                try incoming.upsert(alloc, .{ .name = "docs" }, &key, value[0..size], tombstone);
+            }
+            _ = try wal.appendState(memory.storage(), alloc, root, &incoming, true);
+        }
+        const retained = try wal.snapshotRetention(memory.storage(), alloc, root);
+        try std.testing.expect(retained.bytes <= replay_max_bytes);
+        var failing = std.testing.FailingAllocator.init(alloc, .{});
+        var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = completion.scratch_bytes } });
+        defer manager.deinit(alloc);
+        const domain = try domains.RecyclingScratch.create(failing.allocator(), &manager, bound.total);
+        defer domain.destroy() catch unreachable;
+        failing.fail_index = failing.alloc_index;
+        failing.resize_fail_index = failing.resize_index;
+        const scratch = domain.allocator();
+        {
+            const pending = try scratch.alloc(u8, replay_max_bytes);
+            defer scratch.free(pending);
+            var replayed: state.ActiveMemTable = .{};
+            defer replayed.deinit(scratch);
+            const stats = try wal.replayIntoMutableWithHooksAndOptions(memory.storage(), scratch, root, &replayed, null, .{ .pending_buffer = pending });
+            try std.testing.expectEqual(@as(u64, replay_max_entries), stats.entries);
+            try std.testing.expectEqual(distinct, replayed.entryCount());
+            for (0..distinct) |i| {
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, i, .big);
+                if (replace and (i + distinct) % 17 == 0) {
+                    try std.testing.expectError(error.NotFound, replayed.get(.{ .name = "docs" }, &key));
+                } else {
+                    const found = try replayed.get(.{ .name = "docs" }, &key);
+                    try std.testing.expectEqualSlices(u8, value[0..if (replace) value.len else 900], found);
+                }
+            }
+        }
+        try std.testing.expect(domain.isEmpty());
+        var tiny: [8]u8 = undefined;
+        var rejected: state.ActiveMemTable = .{};
+        defer rejected.deinit(scratch);
+        try std.testing.expectError(error.WalRecordTooLarge, wal.replayIntoMutableWithHooksAndOptions(memory.storage(), scratch, root, &rejected, null, .{ .pending_buffer = &tiny }));
+        try std.testing.expectEqual(@as(usize, 0), rejected.entryCount());
+    }
 }

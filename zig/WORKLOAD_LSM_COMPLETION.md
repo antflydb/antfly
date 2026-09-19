@@ -479,9 +479,28 @@ The following gates remain:
   maximum plans with exactly the computed compiler capacity while nearly all
   independent replay scratch is held, backing/ordinary FD allocation is denied,
   and normal borrowing epochs are exhausted. This closes the pooled healthy
-  operation scratch gap above. Restart replay's tree/parser construction still
-  needs its separate exact allocation bound; the standalone generic writer and
-  standalone journal reservation remain outside this pooled certificate.
+  operation scratch gap above. The standalone generic writer and standalone
+  journal reservation remain outside this pooled certificate.
+- **Pooled restart allocation certificate (implemented).** Installation also
+  checks the complete replay allocation bound against its separately retained
+  32 MiB domain. Startup must begin with an empty ordered mutable and an empty
+  replay domain. Without readers, existing AVL paths are uniquely owned and
+  mutate in place: the typed bound counts inserted leaves, maximum spares,
+  vector/account growth, every payload version, and allocator overhead. A fixed
+  caller-owned pending buffer covers the entire permitted retained WAL and is
+  never grown, shrunk or freed by the parser. Retention measurement and replay
+  cover the same legacy file and checkpoint-to-current segment range under one
+  WAL lock. The bound includes 423 maximum-length path allocations, 4,128
+  legitimate foreground/prepare/outcome entries plus the post-decode rejection
+  entry, and wire/descriptor sizes plus both phases' explicit native-record and
+  WAL framing costs. The owning Debug gate passed 43/43 with zero skips,
+  failures or leaks (`/tmp/workload-native-replay-workspace2.log`). It includes
+  4,128 distinct records and replacement/tombstone versions crossing chunk
+  boundaries on exactly certified backing, denied backing allocation, explicit
+  undersized-buffer rejection, existing crash/reader/pool tests, and ordinary
+  WAL replay regressions. This proves bounded restoration for the current
+  pooled profile; it does not provide the still-separate retained transaction
+  control owner or broaden standalone completion guarantees.
 - **Output-count and future-frontier certificate (implemented).** Qualification
   scans CRC-checked physical records and keeps additive encoded-data, metadata,
   and block costs. Admission adds canonical operations, both possible outcomes,
