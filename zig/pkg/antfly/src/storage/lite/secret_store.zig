@@ -98,15 +98,16 @@ pub const Store = struct {
         defer self.docs.mutex.unlock();
         const revision = try self.head();
         if (revision < options.min_revision) return error.Unavailable;
-        const rows = try self.docs.file.snapshotCatalogRecordsAlloc(alloc);
-        defer native.NativeFile.freeSnapshotCatalogRecords(alloc, rows);
+        var rows = try self.docs.file.metadataCatalogCursor(self.docs.file.activeCheckpoint(), &(self.prefix ++ "entries/".*));
+        defer rows.deinit();
         var entries: std.ArrayList(contract.Metadata) = .empty;
         errdefer {
             for (entries.items) |entry| alloc.free(entry.key);
             entries.deinit(alloc);
         }
-        for (rows) |row| {
-            if (!std.mem.startsWith(u8, row.key, &(self.prefix ++ "entries/".*))) continue;
+        while (try rows.nextRecordAlloc(alloc)) |row| {
+            defer alloc.free(row.key);
+            defer alloc.free(row.value);
             const entry = try decodeEntry(row.value, revision);
             if (!std.mem.eql(u8, row.key, &self.entryKey(entry.key))) return error.CorruptInput;
             const view = try record.decode(entry.envelope);
@@ -261,6 +262,66 @@ fn expectValue(store: *Store, key: []const u8, expected: []const u8, revision: u
     defer value.deinit(std.testing.allocator);
     try std.testing.expectEqual(revision, value.value.?.revision);
     try std.testing.expectEqualSlices(u8, expected, value.value.?.secret.bytes);
+}
+
+test "lite secrets embedding host retains live resolver through rotation snapshot and reopen" {
+    const alloc = std.testing.allocator;
+    const Handle = @import("backend.zig").Handle;
+    const resolver = @import("../../common/secrets.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp);
+    defer alloc.free(path);
+    const snapshot_path = try std.fmt.allocPrint(alloc, "{s}.backup.aflite", .{path});
+    defer alloc.free(snapshot_path);
+    var keys = TestProvider{};
+    var reference = (try resolver.SecretValue.initConfig(alloc, "${secret:provider.api_key}")).?;
+    defer reference.deinit(alloc);
+    {
+        var handle = try Handle.create(alloc, path, true);
+        defer handle.deinit();
+        var native_store = try handle.secretStore(alloc, "host-scope", keys.provider());
+        defer native_store.deinit();
+        var facade = try resolver.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{
+            // Embedding hosts supply the native capability directly.
+            .native = .{ .backend = .distributed, .scope = "host-scope", .keyring_path = "host-provider" },
+            .environment = false,
+        });
+        defer facade.deinit();
+        const native_handle = native_store.nativeStore().?;
+        facade.attachNative(native_handle.source, native_handle.writer);
+        for ([_][]const u8{ "initial-host-credential", "rotated-host-credential" }) |expected| {
+            var metadata = try facade.put(alloc, "provider.api_key", expected);
+            defer metadata.deinit(alloc);
+            const actual = (try reference.resolveOwned(alloc, &facade)).?;
+            defer alloc.free(actual);
+            try std.testing.expectEqualStrings(expected, actual);
+        }
+        keys.unavailable = true;
+        try std.testing.expectError(error.Unavailable, reference.resolveOwned(alloc, &facade));
+        keys.unavailable = false;
+        _ = try handle.copyStableSnapshot(snapshot_path, false);
+    }
+    for ([_][]const u8{ path, snapshot_path }) |reopen_path| {
+        var reopened = try Handle.open(alloc, reopen_path, .{ .read_only = true });
+        defer reopened.deinit();
+        var native_store = try reopened.secretStore(alloc, "host-scope", keys.provider());
+        defer native_store.deinit();
+        try std.testing.expect(native_store.nativeStore() == null);
+        var facade = try resolver.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{
+            .native = .{ .backend = .distributed, .scope = "host-scope", .keyring_path = "host-provider" },
+            .environment = false,
+        });
+        defer facade.deinit();
+        facade.attachNative(native_store.source(), null);
+        const actual = (try reference.resolveOwned(alloc, &facade)).?;
+        defer alloc.free(actual);
+        try std.testing.expectEqualStrings("rotated-host-credential", actual);
+        try std.testing.expectError(error.WriteUnavailable, facade.put(alloc, "provider.api_key", "denied"));
+        const raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, reopen_path, alloc, .limited(16 * 1024 * 1024));
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "rotated-host-credential") == null);
+    }
 }
 
 test "lite secrets persist encrypted scoped values alongside documents through vacuum and reopen" {
@@ -581,4 +642,33 @@ test "lite secrets portable import rejects live secrets and retained scope revis
     try std.testing.expectEqual(@as(u64, 2), (try store.source().refresh("scope")).revision);
     try std.testing.expectEqual(@as(u64, 3), (try store.nativeStore().?.writer.put("scope", "key", "recreated", .absent)).revision);
     try expectValue(&store, "key", "recreated", 3);
+}
+
+test "lite secret metadata listing seeks its scope without loading unrelated catalogs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp);
+    defer alloc.free(path);
+    var docs = try docstore.Store.create(alloc, path, true);
+    defer docs.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const mutations = try arena.allocator().alloc(native.CatalogMutation, 2048);
+    for (mutations, 0..) |*mutation, i| mutation.* = .{
+        .key = try std.fmt.allocPrint(arena.allocator(), "unrelated-{d:0>6}", .{i}),
+        .value = "unrelated-metadata-value",
+    };
+    try docs.file.putCatalogBatch(mutations);
+    var provider = TestProvider{};
+    var store = try Store.init(alloc, &docs, "scope", provider.provider());
+    defer store.deinit();
+    _ = try store.nativeStore().?.writer.put("scope", "token", "secret", .absent);
+    const before = docs.file.test_page_reads.load(.monotonic);
+    try std.testing.expect(try docs.file.hasSecretState());
+    var listing = try store.source().listMetadata(alloc, "scope", .{});
+    defer listing.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), listing.entries.len);
+    try std.testing.expectEqualStrings("token", listing.entries[0].key);
+    try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - before <= 24);
 }

@@ -121,10 +121,7 @@ fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_by
     defer self.docs.generation_lock.unlockShared(io);
     const checkpoint = pinCheckpoint(self.docs);
 
-    const stored = (try self.docs.file.getIndexCatalogRecordAtCheckpointAlloc(allocator, path, checkpoint)) orelse return error.FileNotFound;
-    errdefer allocator.free(stored);
-    if (stored.len > max_bytes) return error.FileTooBig;
-    return stored;
+    return (try self.docs.file.getIndexCatalogRecordLimitedAtCheckpointAlloc(allocator, path, max_bytes, checkpoint)) orelse error.FileNotFound;
 }
 
 fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
@@ -172,20 +169,32 @@ fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !v
     try writeFileReserved(self, path, contents);
 }
 
+const CatalogWrite = struct {
+    kind: enum { put, append, rename, delete, sync },
+    path: []const u8,
+    value: []const u8 = "",
+    fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        switch (self.kind) {
+            .put => try file.putIndexCatalogRecord(self.path, self.value),
+            .append => try file.appendIndexCatalogRecord(self.path, self.value),
+            .rename => try file.renameIndexCatalogRecord(self.path, self.value),
+            .delete => try file.deleteIndexCatalogRecord(self.path),
+            .sync => try file.sync(),
+        }
+    }
+};
+
 fn writeFileReserved(self: *Store, path: []const u8, contents: []const u8) !void {
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
-    try self.docs.file.putIndexCatalogRecord(path, contents);
+    var mutation = CatalogWrite{ .kind = .put, .path = path, .value = contents };
+    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
 }
 
 fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
-    _ = sync;
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
-
-    try self.docs.file.appendIndexCatalogRecord(path, contents);
+    var mutation = CatalogWrite{ .kind = .append, .path = path, .value = contents };
+    try self.docs.submitMutationWithDurability(&mutation, CatalogWrite.apply, sync);
 }
 
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
@@ -199,54 +208,94 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, old_path);
     try validateIndexPath(self, new_path);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
-
-    try self.docs.file.renameIndexCatalogRecord(old_path, new_path);
+    var mutation = CatalogWrite{ .kind = .rename, .path = old_path, .value = new_path };
+    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
 }
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
-    try self.docs.file.deleteIndexCatalogRecord(path);
+    var mutation = CatalogWrite{ .kind = .delete, .path = path };
+    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
 }
 
 fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
+    const Context = struct {
+        store: *Store,
+        path: []const u8,
+        fn apply(context: *anyopaque, _: *native.NativeFile) !void {
+            const request: *@This() = @ptrCast(@alignCast(context));
+            try deleteTreeLocked(request.store, request.path);
+        }
+    };
+    var request = Context{ .store = self, .path = directory };
+    try self.docs.submitMutation(&request, Context.apply);
+}
 
-    var mutations = std.ArrayListUnmanaged(native.CatalogMutation).empty;
-    defer {
-        for (mutations.items) |mutation| self.allocator.free(mutation.key);
-        mutations.deinit(self.allocator);
+// Subtree deletion stays one atomic native transaction. Each private flush
+// releases keys and editor scratch; the cursor retains the original immutable
+// root so subsequent batches cannot skip entries as the active tree shrinks.
+const CatalogDeleteBatch = struct {
+    const max_keys = 64;
+    const max_key_bytes = 16 * 1024;
+    allocator: Allocator,
+    file: *native.NativeFile,
+    mutations: std.ArrayListUnmanaged(native.CatalogMutation) = .empty,
+    key_bytes: usize = 0,
+
+    fn clear(self: *@This()) void {
+        for (self.mutations.items) |mutation| self.allocator.free(mutation.key);
+        self.mutations.clearRetainingCapacity();
+        self.key_bytes = 0;
     }
-    // A subtree includes the exact logical file, but never a neighboring name
-    // such as /a-other. Seek descendants using the slash boundary separately.
-    if (try self.docs.file.getIndexCatalogRecordSize(directory) != null) {
-        const key = try self.allocator.dupe(u8, directory);
-        errdefer self.allocator.free(key);
-        try mutations.append(self.allocator, .{ .key = key, .is_delete = true });
+
+    fn deinit(self: *@This()) void {
+        self.clear();
+        self.mutations.deinit(self.allocator);
     }
+
+    fn add(self: *@This(), key: []const u8) !void {
+        if (self.mutations.items.len != 0 and
+            (self.mutations.items.len >= max_keys or self.key_bytes + key.len > max_key_bytes)) try self.flush();
+        const owned = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned);
+        try self.mutations.append(self.allocator, .{ .key = owned, .is_delete = true });
+        self.key_bytes += owned.len;
+    }
+
+    fn flush(self: *@This()) !void {
+        if (self.mutations.items.len == 0) return;
+        try self.file.putIndexCatalogBatch(self.mutations.items);
+        _ = try self.file.materializeTransactionCheckpoint();
+        self.clear();
+    }
+};
+
+fn deleteTreeLocked(self: *Store, path: []const u8) !void {
+    const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
+    try validateIndexPath(self, directory);
+    const file = &self.docs.file;
+    // Include earlier callbacks in this group before pinning the scan root.
+    const checkpoint = try file.materializeTransactionCheckpoint();
+    var batch = CatalogDeleteBatch{ .allocator = self.allocator, .file = file };
+    defer batch.deinit();
+    // Include the exact file, but never a neighboring name such as /a-other.
+    if (try file.getIndexCatalogRecordSizeAtCheckpoint(directory, checkpoint) != null) try batch.add(directory);
     const prefix = if (std.mem.eql(u8, directory, "/"))
         try self.allocator.dupe(u8, "/")
     else
         try std.fmt.allocPrint(self.allocator, "{s}/", .{directory});
     defer self.allocator.free(prefix);
-    var cursor = try self.docs.file.indexCatalogCursor(self.docs.file.activeCheckpoint(), prefix);
+    var cursor = try file.indexCatalogCursor(checkpoint, prefix);
     defer cursor.deinit();
     while (try cursor.next()) |record| {
-        defer self.docs.file.allocator.free(record.key);
-        if (std.mem.eql(u8, record.key, directory)) continue;
-        const key = try self.allocator.dupe(u8, record.key);
-        errdefer self.allocator.free(key);
-        try mutations.append(self.allocator, .{ .key = key, .is_delete = true });
+        defer file.allocator.free(record.key);
+        if (!std.mem.eql(u8, record.key, directory)) try batch.add(record.key);
     }
-    try self.docs.file.putIndexCatalogBatch(mutations.items);
+    try batch.flush();
 }
 
 fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
@@ -290,9 +339,8 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
 fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
-    try self.docs.file.sync();
+    var mutation = CatalogWrite{ .kind = .sync, .path = path };
+    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
 }
 
 fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -474,12 +522,15 @@ const NativeAtomicWriteSink = struct {
         defer self.deinit();
         if (self.failure) |err| return err;
         if (self.file != null) try self.flush();
-        lockStore(self.storage.docs);
-        defer self.storage.docs.mutex.unlock();
+        try self.storage.docs.submitMutation(self, publish);
+    }
+
+    fn publish(ptr: *anyopaque, destination: *native.NativeFile) !void {
+        const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (self.file) |file| {
-            try self.storage.docs.file.putIndexCatalogRecordFromFile(self.path, file, self.persisted, self.write_options);
+            try destination.putIndexCatalogRecordFromFile(self.path, file, self.persisted, self.write_options);
         } else {
-            try self.storage.docs.file.putIndexCatalogRecordWithOptions(self.path, self.buffer[0..self.buffered], self.write_options);
+            try destination.putIndexCatalogRecordWithOptions(self.path, self.buffer[0..self.buffered], self.write_options);
         }
     }
 
@@ -734,8 +785,8 @@ test "lite native index storage handles large files rename and delete tree" {
 
     const before_rename_page_count = docs.file.activeCheckpoint().page_count;
     try storage.renameAbsolute("/dense/a/blob", "/dense/a/blob2");
-    // Two records, one final tree node, descriptor and free map.
-    try std.testing.expectEqual(before_rename_page_count + 5, docs.file.activeCheckpoint().page_count);
+    // Two packed records share one page, plus tree node, descriptor and free map.
+    try std.testing.expectEqual(before_rename_page_count + 4, docs.file.activeCheckpoint().page_count);
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/blob", 8));
     const after_rename_check = try docs.file.check();
     try std.testing.expect(after_rename_check.valid);
@@ -1145,7 +1196,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
         defer hot_pages.deinit(alloc);
         var cached = docs.file.page_cache.pages.iterator();
         while (cached.next()) |entry| {
-            if (entry.value_ptr.*[4] == @intFromEnum(native.PageKind.value)) try hot_pages.append(alloc, entry.key_ptr.*);
+            if (entry.value_ptr.bytes[4] == @intFromEnum(native.PageKind.value)) try hot_pages.append(alloc, entry.key_ptr.*);
         }
         try std.testing.expect(hot_pages.items.len > 0);
 
@@ -1164,7 +1215,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
             cached = docs.file.page_cache.pages.iterator();
             var payload_pages: usize = 0;
             while (cached.next()) |entry| {
-                if (entry.value_ptr.*[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
+                if (entry.value_ptr.bytes[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
             }
             try std.testing.expectEqual(hot_pages.items.len, payload_pages);
             try std.testing.expect(docs.file.page_cache.pages.contains(docs.file.activeCheckpoint().index_catalog_root_page));
@@ -1182,7 +1233,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
         var payload_pages: usize = 0;
         cached = docs.file.page_cache.pages.iterator();
         while (cached.next()) |entry| {
-            if (entry.value_ptr.*[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
+            if (entry.value_ptr.bytes[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
         }
         try std.testing.expect(payload_pages > hot_pages.items.len);
         for (hot_pages.items) |id| try std.testing.expect(docs.file.page_cache.pages.contains(id));
@@ -1384,4 +1435,145 @@ test "lite native unscoped listings preserve accepted non-normalized keys" {
     defer alloc.free(trailing);
     try std.testing.expectEqualStrings("/a/file/", trailing);
     try std.testing.expect((try reopened.file.check()).valid);
+}
+
+test "lite index read limits reject from pinned metadata before payload allocation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/limited-read.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    docs.file.page_cache_enabled.store(false, .monotonic);
+    const large = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(large);
+    @memset(large, 'v');
+    try docs.file.putIndexCatalogRecord("/scope/large", large);
+    try docs.file.putIndexCatalogRecord("/scope/inline", "small");
+    try docs.file.putIndexCatalogRecord("/scope/empty", "");
+    var store = Store.initWithNamespace(a, &docs, "/scope");
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 0 };
+    const before = docs.file.test_page_reads.load(.monotonic);
+    try std.testing.expectError(error.FileTooBig, store.storage().readFileAlloc(budget.allocator(), "/scope/large", 1024));
+    try std.testing.expectError(error.FileTooBig, store.storage().readFileAlloc(budget.allocator(), "/scope/inline", 4));
+    try std.testing.expectError(error.FileNotFound, store.storage().readFileAlloc(budget.allocator(), "/scope/missing", 0));
+    const empty = try store.storage().readFileAlloc(budget.allocator(), "/scope/empty", 0);
+    budget.allocator().free(empty);
+    try std.testing.expectEqual(@as(usize, 0), budget.peak);
+    try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - before <= 16);
+    const checkpoint = docs.file.activeCheckpoint();
+    try docs.file.putIndexCatalogRecord("/scope/large", "short");
+    try std.testing.expectError(error.FileTooBig, docs.file.getIndexCatalogRecordLimitedAtCheckpointAlloc(budget.allocator(), "/scope/large", 1024, checkpoint));
+    budget.limit = std.math.maxInt(usize);
+    const current = try store.storage().readFileAlloc(budget.allocator(), "/scope/large", 5);
+    defer budget.allocator().free(current);
+    try std.testing.expectEqualStrings("short", current);
+    const exact = (try docs.file.getIndexCatalogRecordLimitedAtCheckpointAlloc(a, "/scope/large", large.len, checkpoint)).?;
+    defer a.free(exact);
+    try std.testing.expectEqualSlices(u8, large, exact);
+}
+
+test "lite subtree deletion bounds heap across private batches and preserves snapshots" {
+    const a = std.testing.allocator;
+    for ([_]struct { count: usize, key_len: usize }{
+        .{ .count = 4096, .key_len = 128 },
+        .{ .count = 16384, .key_len = 128 },
+        .{ .count = 4096, .key_len = 1024 },
+    }) |case| {
+        const count = case.count;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bounded-delete.aflite", .{tmp.sub_path});
+        defer a.free(path);
+        var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        docs.file.page_cache_enabled.store(false, .monotonic);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const mutations = try arena.allocator().alloc(native.CatalogMutation, count);
+        for (mutations, 0..) |*mutation, i| {
+            const key = try arena.allocator().alloc(u8, case.key_len);
+            @memset(key, 'x');
+            _ = try std.fmt.bufPrint(key[0..15], "/scope/{d:0>8}", .{i});
+            mutation.* = .{ .key = key, .value = "" };
+        }
+        try docs.file.putIndexCatalogBatch(mutations);
+        try docs.file.putIndexCatalogRecord("/scope", "exact");
+        try docs.file.putIndexCatalogRecord("/scope-other/keep", "neighbor");
+        const pinned = docs.file.activeCheckpoint();
+        var store = Store.initWithNamespace(budget.allocator(), &docs, "/scope");
+        const baseline = budget.live;
+        budget.peak = baseline;
+        budget.limit = baseline + 512 * 1024;
+        try store.storage().deleteTree("/scope");
+        try std.testing.expect(budget.peak - baseline <= 512 * 1024);
+        budget.limit = std.math.maxInt(usize);
+        try std.testing.expectEqual(pinned.commit_sequence + 1, docs.file.activeCheckpoint().commit_sequence);
+        try std.testing.expect((try docs.file.getIndexCatalogRecordSize("/scope")) == null);
+        var cursor = try docs.file.indexCatalogCursor(docs.file.activeCheckpoint(), "/scope/");
+        defer cursor.deinit();
+        try std.testing.expect((try cursor.next()) == null);
+        const old = (try docs.file.getIndexCatalogRecordAtCheckpointAlloc(a, "/scope", pinned)).?;
+        defer a.free(old);
+        try std.testing.expectEqualStrings("exact", old);
+        try std.testing.expectEqual(@as(?usize, 0), try docs.file.getIndexCatalogRecordSizeAtCheckpoint(mutations[count / 2].key, pinned));
+        const neighbor = (try docs.file.getIndexCatalogRecordAlloc(a, "/scope-other/keep")).?;
+        defer a.free(neighbor);
+        try std.testing.expectEqualStrings("neighbor", neighbor);
+        try std.testing.expect((try docs.file.check()).valid);
+    }
+}
+
+test "lite subtree deletion rolls back earlier private batches on failure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/delete-rollback.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    docs.file.page_cache_enabled.store(false, .monotonic);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const mutations = try arena.allocator().alloc(native.CatalogMutation, 2048);
+    for (mutations, 0..) |*mutation, i| mutation.* = .{
+        .key = try std.fmt.allocPrint(arena.allocator(), "/scope/{d:0>8}", .{i}),
+        .value = "original",
+    };
+    try docs.file.putIndexCatalogBatch(mutations);
+    const pinned = docs.file.activeCheckpoint();
+    const size = (try docs.file.file.stat(std.testing.io)).size;
+    var store = Store.initWithNamespace(a, &docs, "/scope");
+    const before = docs.file.test_page_writes.load(.monotonic);
+    docs.file.test_page_write_fail_after = 30;
+    try std.testing.expectError(error.TestPageWriteFailure, store.storage().deleteTree("/scope"));
+    docs.file.test_page_write_fail_after = null;
+    try std.testing.expect(docs.file.test_page_writes.load(.monotonic) > before);
+    try std.testing.expectEqual(pinned.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
+    try std.testing.expectEqual(size, (try docs.file.file.stat(std.testing.io)).size);
+    try std.testing.expect((try docs.file.check()).valid);
+    const retained = (try docs.file.getIndexCatalogRecordAlloc(a, mutations[0].key)).?;
+    defer a.free(retained);
+    try std.testing.expectEqualStrings("original", retained);
+    // Fail allocations both before scanning and after a private batch spills.
+    for ([_]usize{ 0, 16, 512, 2048 }) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        store.allocator = failing.allocator();
+        docs.file.allocator = failing.allocator();
+        const result = store.storage().deleteTree("/scope");
+        store.allocator = a;
+        docs.file.allocator = a;
+        try std.testing.expectError(error.OutOfMemory, result);
+        try std.testing.expectEqual(pinned.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
+        try std.testing.expectEqual(size, (try docs.file.file.stat(std.testing.io)).size);
+        try std.testing.expect((try docs.file.check()).valid);
+    }
+    try store.storage().deleteTree("/scope");
+    try std.testing.expectEqual(pinned.commit_sequence + 1, docs.file.activeCheckpoint().commit_sequence);
+    var cursor = try docs.file.indexCatalogCursor(docs.file.activeCheckpoint(), "/scope/");
+    defer cursor.deinit();
+    try std.testing.expect((try cursor.next()) == null);
+    try std.testing.expect((try docs.file.check()).valid);
 }

@@ -510,6 +510,8 @@ pub const MetadataProjectionKind = enum(u32) {
     table_restore_admission = 38,
     verify_table_create_projection = 39,
     system_catalog = 41,
+    /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
+    secret_collection = 42,
 };
 
 pub const MetadataProjectionRequest = extern struct {
@@ -1437,6 +1439,10 @@ pub extern fn antfly_storage_context_attach_inference_provider(
     context: ?*anyopaque,
     inference_handle: ?*anyopaque,
 ) callconv(.c) Status;
+
+/// Borrows the runtime secret facade until context destruction. Configure before
+/// opening any table owner; the caller retains ownership and controls its lifetime.
+pub extern fn antfly_storage_context_configure_secrets(context: ?*anyopaque, store: ?*anyopaque) callconv(.c) Status;
 
 /// Replaces the context-owned remote-content security snapshot before any
 /// table owner opens. The payload is a ContentSecurityConfig JSON object.

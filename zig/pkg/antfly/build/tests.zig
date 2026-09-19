@@ -623,7 +623,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "file secret store", "remote content runtime", "secret contract", "secret record" },
+        .filters = &.{ "file secret store", "bearer auth header cache", "remote content runtime", "secret contract", "secret record" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -1562,6 +1562,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const introducer_test_step = b.step("introducer-test", "Run segment introducer unit tests");
     introducer_test_step.dependOn(&run_introducer_tests.step);
 
+    const secret_backend_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/secret_backends_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, secret_backend_test_mod, true, true);
+    secret_backend_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const secret_backend_tests = b.addTest(.{
+        .root_module = secret_backend_test_mod,
+        .filters = &.{"secret backend"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_secret_backend_tests = addFilteredTestRunArtifact(b, secret_backend_tests);
+    b.step("secret-backends-test", "Run distributed and serverless encrypted persistence tests").dependOn(&run_secret_backend_tests.step);
+
     const lite_native_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_native_test.zig"),
         .target = target,
@@ -1580,6 +1595,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lite_native_tests = addFilteredTestRunArtifact(b, lite_native_tests);
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
+    const lite_benchmark = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = &.{"lite throughput benchmark"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_lite_benchmark = b.addRunArtifact(lite_benchmark);
+    run_lite_benchmark.addArgs(&.{ "--test-filter", "lite throughput benchmark" });
+    run_lite_benchmark.setEnvironmentVariable("ANTFLY_LITE_BENCH", "1");
+    b.step("lite-native-benchmark", "Benchmark native Lite transaction, commit, and sorted read scaling").dependOn(&run_lite_benchmark.step);
 
     const cmd_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/cmd_test.zig"),
@@ -1967,6 +1991,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
 
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
+    unit_test_step.dependOn(&run_secret_backend_tests.step);
 
     const serverless_default_filters = [_][]const u8{"serverless"};
     const serverless_tests = b.addTest(.{
@@ -2627,6 +2652,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const vopr_cli = b.addTest(.{
         .name = "vopr",
         .root_module = vopr_cli_mod,
+        // The command runner invokes only this entrypoint. Exclude unrelated
+        // imported unit tests from compilation while retaining test facilities
+        // and every scenario reachable from the command dispatcher.
+        .filters = &.{"VOPR command entrypoint"},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/vopr/cli_runner.zig"),
             .mode = .simple,
@@ -3603,6 +3632,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     config_extension_lifecycle_vopr_test_step.dependOn(&run_config_extension_lifecycle_vopr_tests.step);
 
+    const secret_lifecycle_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"secrets VOPR model exact replays"},
+    });
+    const run_secret_lifecycle_tests = b.addRunArtifact(secret_lifecycle_tests);
+    b.step("secrets-vopr-test", "Replay secret persistence, CAS, rotation, outage and crash histories").dependOn(&run_secret_lifecycle_tests.step);
+    const secrets_test_step = b.step("secrets-test", "Qualify native adapters, Lite persistence, and replayable lifecycle");
+    secrets_test_step.dependOn(&run_secret_backend_tests.step);
+    secrets_test_step.dependOn(&run_lib_common_secrets_tests.step);
+    secrets_test_step.dependOn(&run_secret_lifecycle_tests.step);
+    const lite_secret_tests = b.addTest(.{ .root_module = lite_native_test_mod, .filters = &.{"lite secrets"} });
+    const run_lite_secret_tests = b.addRunArtifact(lite_secret_tests);
+    b.step("lite-secrets-test", "Qualify Lite secret embedding, durability and restore rules").dependOn(&run_lite_secret_tests.step);
+    secrets_test_step.dependOn(&run_lite_secret_tests.step);
+
     const embedded_lite_lifecycle_vopr_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/vopr/embedded_lite_lifecycle.zig"),
         .target = target,
@@ -3866,6 +3910,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     vopr_test_step.dependOn(&run_generation_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_backfill_marker_discovery_vopr_tests.step);
     vopr_test_step.dependOn(&run_config_extension_lifecycle_vopr_tests.step);
+    vopr_test_step.dependOn(&run_secret_lifecycle_tests.step);
     vopr_test_step.dependOn(&run_embedded_lite_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_capi_lite_lifecycle_vopr_tests.step);
     vopr_test_step.dependOn(&run_vopr_determinism_audit_tests.step);
