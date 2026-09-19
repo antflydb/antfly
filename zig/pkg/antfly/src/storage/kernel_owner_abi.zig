@@ -20,6 +20,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Storage layouts evolve independently of the shared failure envelope.
 pub const abi_version: u32 = 69;
 pub const Status = failure_abi.Status;
+pub const completion_pool = @import("completion_pool_abi.zig");
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
 pub const failure_error_name_capacity = failure_abi.failure_error_name_capacity;
