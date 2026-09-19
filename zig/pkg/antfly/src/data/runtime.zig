@@ -393,6 +393,9 @@ const DataRaftBatchRoute = struct {
     /// Original caller clock and cancellation are checked only before Raft
     /// acceptance. Durable completion never borrows this admission deadline.
     pre_decision_context: ?antfly.public_api.distributed_txn.PreDecisionContext = null,
+    /// Local first-decision certainty only; protocol barriers do not set it.
+    /// Borrowed synchronously until the originating proposal call returns.
+    user_proposal_receipt: ?*?u64 = null,
     /// Local structural commands must not be forwarded into a successor term.
     required_local_term: ?u64 = null,
     allow_remote_forward: bool = true,
@@ -8892,6 +8895,7 @@ pub const DataServer = struct {
                 .batch_group_local = localRaftBatchGroupLocal,
                 .batch_group_local_with_cancellation = localRaftBatchGroupLocalWithCancellation,
                 .batch_group_local_with_pre_decision_context = localRaftBatchGroupLocalWithPreDecisionContext,
+                .decide_group_local_with_pre_decision_context = localRaftDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group = localRaftTxnStatusGroup,
                 .txn_status_group_until = localRaftTxnStatusGroupUntil,
                 .txn_status_group_local = localRaftTxnStatusGroupAuthoritativeLocal,
@@ -9468,6 +9472,39 @@ pub const DataServer = struct {
             },
             leader_wait_ns,
         );
+    }
+
+    fn localRaftDecideGroupLocalWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+        context: antfly.public_api.distributed_txn.PreDecisionContext,
+    ) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const mutation = req.transaction orelse return error.PreDecisionNotProposed;
+        if (mutation != .resolve or mutation.resolve.status != .committed) return error.PreDecisionNotProposed;
+        const deadline = self.preDecisionAdmissionDeadline(context) catch return error.PreDecisionNotProposed;
+        const raft = self.data_raft orelse return error.PreDecisionNotProposed;
+        if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.PreDecisionNotProposed;
+        var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
+        var accepted: ?u64 = null;
+        self.proposeRaftBatchGroupWithLeaderWait(alloc, group_id, table_name, req, .{
+            .admission_deadline_ns = deadline,
+            .pre_decision_context = context,
+            .user_proposal_receipt = &accepted,
+            .discovery = .cached,
+            .allow_remote_forward = false,
+            .campaign_allowed = false,
+            .cancellation = if (context.cancellation.ptr != null) &cancellation else null,
+            .visibility_cancellation = context.cancellation,
+        }, if (deadline) |value| value -| self.dataRaftMonotonicNs() else data_raft_batch_leader_wait_ns) catch |err| {
+            // This path cannot forward. Only a local user-entry receipt makes
+            // the result uncertain; a negotiation barrier is not a decision.
+            if (accepted == null) return error.PreDecisionNotProposed;
+            return err;
+        };
     }
 
     fn localRaftTxnStatusGroupAuthoritativeLocal(
@@ -10535,6 +10572,7 @@ pub const DataServer = struct {
                         };
                         target_index = target_index orelse accepted_index orelse
                             return error.RaftBatchWriteOutcomeUnknown;
+                        if (route.user_proposal_receipt) |receipt| receipt.* = target_index;
                         if (proposal_req.sync_level != .propose) {
                             const index = target_index.?;
                             const apply_sm = self.data_raft_apply orelse
@@ -29332,6 +29370,130 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "workload admission first decision preserves local proposal certainty" {
+            if (comptime !linked_storage) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            const VoprIo = @import("vopr").vopr_io.VoprIo;
+            var clock = try VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+            defer clock.deinit();
+            var caller_io = clock.io();
+            const context: antfly.public_api.distributed_txn.PreDecisionContext = .{
+                .deadline_ns = 12 * std.time.ns_per_s,
+                .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&caller_io),
+            };
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            const relative = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+            defer alloc.free(relative);
+            const root = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), relative, alloc);
+            defer alloc.free(root);
+            const catalog_path = try std.fmt.allocPrint(alloc, "{s}/replicas.json", .{root});
+            defer alloc.free(catalog_path);
+            const Fixture = struct {
+                snapshot: antfly.metadata_api.AdminSnapshot,
+                clock: *VoprIo,
+                expire_on_catalog: bool = false,
+                fn execute(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    return .{ .status = 503 };
+                }
+                fn snapshotFn(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.expire_on_catalog) self.clock.monotonic_ns = 12 * std.time.ns_per_s;
+                    return self.snapshot;
+                }
+                fn freeSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn catalog(self: *@This()) antfly.public_api.table_catalog.CatalogSource {
+                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = snapshotFn, .free_admin_snapshot = freeSnapshot } };
+                }
+            };
+            var tables = [_]antfly.metadata.TableRecord{.{ .table_id = 1, .name = "docs", .indexes_json = "{}" }};
+            var ranges = [_]antfly.metadata.RangeRecord{.{ .group_id = 2, .table_id = 1, .range_id = 3, .start_key = "", .doc_identity_shard_id = 2, .doc_identity_range_id = 3 }};
+            var fixture: Fixture = .{ .clock = &clock, .snapshot = .{
+                .status = .{ .metadata_group_id = 9, .metadata_incarnation = "11111111111111111111111111111111".*, .metadata_epoch = 1, .metrics = .{} },
+                .tables = &tables,
+                .ranges = &ranges,
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            } };
+            const executor: antfly.common.http.RequestExecutor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } };
+            var server = try DataServer.initFromMetadataApiUrls(alloc, .{
+                .replica_root_dir = root,
+                .replica_catalog_path = catalog_path,
+                .data_raft_state_backend = .wal,
+                .data_raft_listener_external = true,
+                .data_raft_async_send_worker_count = 0,
+                .data_raft_request_executor = executor,
+                .store_registration = .{ .node_id = 1, .store_id = 1 },
+                .metadata_request_executors = &.{executor},
+            }, &.{"http://metadata.invalid"});
+            defer server.deinit();
+            server.remote_metadata.?.cached_snapshot = try cloneAdminSnapshotOwned(alloc, fixture.snapshot);
+            server.kernel_owner_source.?.catalog = fixture.catalog();
+            server.write_source.catalog = fixture.catalog();
+            server.data_raft_apply.?.write_source.catalog = fixture.catalog();
+            const factory = server.data_raft_factory.?;
+            try factory.peer_sets.put(alloc, 2, try alloc.dupe(u64, &.{1}));
+            try factory.initial_voter_sets.put(alloc, 2, try alloc.dupe(u64, &.{1}));
+            const host = server.data_raft.?.host.http_host.host;
+            _ = try host.ensureReplica(.{ .group_id = 2, .replica_id = 1, .local_node_id = 1 });
+            try host.campaignGroup(2);
+            _ = try host.runRound(0, 16);
+            try std.testing.expect(host.isLocalLeader(2));
+            const participant = try antfly.public_api.distributed_txn.participantIdForGroup(alloc, "docs", 2);
+            defer alloc.free(participant);
+            const txn_id: antfly.db.types.TxnId = @splat(0x71);
+            const source = server.kernel_owner_source.?.writeSource();
+            _ = try source.txnBeginGroupLocal(alloc, 2, "docs", txn_id, 100, 1, true, &.{participant});
+            try std.testing.expectError(error.PreDecisionNotProposed, source.txnDecideGroupLocalWithPreDecisionContext(alloc, 999, "docs", txn_id, .committed, 200, 1, .propose, context));
+
+            // The original clock expires inside real catalog/owner acquisition,
+            // after the public method's initial check. No C decision may run.
+            fixture.expire_on_catalog = true;
+            try std.testing.expectError(error.PreDecisionNotProposed, source.txnDecideGroupLocalWithPreDecisionContext(alloc, 2, "docs", txn_id, .committed, 200, 1, .propose, context));
+            fixture.expire_on_catalog = false;
+            try std.testing.expectEqual(antfly.db.types.TxnStatus.pending, (try source.txnStatusGroupLocal(alloc, 2, "docs", txn_id)).?);
+            clock.monotonic_ns = 10 * std.time.ns_per_s;
+
+            const Hook = struct {
+                clock: *VoprIo,
+                phase: DataRequestLifecyclePhase,
+                fail: bool = false,
+                fn reach(ptr: *anyopaque, event: DataRequestLifecycleEvent) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (event.phase != self.phase) return;
+                    self.clock.monotonic_ns = 12 * std.time.ns_per_s;
+                    if (self.fail) return error.InjectedAfterDecisionAcceptance;
+                }
+            };
+            var hook: Hook = .{ .clock = &clock, .phase = .routing_started };
+            server.data_request_lifecycle_hook = .{ .ptr = &hook, .reach_fn = Hook.reach };
+            defer server.data_request_lifecycle_hook = null;
+            const decision: antfly.db.types.BatchRequest = .{ .sync_level = .propose, .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = .committed, .commit_version = 200 } } };
+            const before = host.raftStatus(2).?.last_index;
+            try std.testing.expectError(error.PreDecisionNotProposed, server.localRaftBatcher().decideGroupLocalWithPreDecisionContext(alloc, 2, "docs", decision, context));
+            try std.testing.expectEqual(before, host.raftStatus(2).?.last_index);
+            clock.monotonic_ns = 10 * std.time.ns_per_s;
+            hook.phase = .proposal_accepted;
+            hook.fail = true;
+            try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, server.localRaftBatcher().decideGroupLocalWithPreDecisionContext(alloc, 2, "docs", decision, context));
+            try std.testing.expect(host.raftStatus(2).?.last_index > before);
+            server.data_request_lifecycle_hook = null;
+            // Acceptance has made the original deadline irrelevant to recovery.
+            _ = try host.runRound(0, 16);
+            try std.testing.expectEqual(antfly.db.types.TxnStatus.committed, (try source.txnStatusGroupLocal(alloc, 2, "docs", txn_id)).?);
+            // A different leader must never trigger forwarding on this proof
+            // path: local nonacceptance says nothing about a remote proposal.
+            const committed = host.raftStatus(2).?;
+            try host.step(2, .{ .msg_type = .heartbeat, .from = 2, .to = 1, .term = committed.hard.current_term + 1, .commit_index = committed.applied_index });
+            clock.monotonic_ns = 10 * std.time.ns_per_s;
+            try std.testing.expectError(error.PreDecisionNotProposed, server.localRaftBatcher().decideGroupLocalWithPreDecisionContext(alloc, 2, "docs", decision, context));
+            try std.testing.expectEqual(committed.last_index, host.raftStatus(2).?.last_index);
+        }
+
         test "workload admission canonical proposal negotiates voters before installation and restores actual WAL ownership" {
             if (comptime !linked_storage) return error.SkipZigTest;
             const alloc = std.testing.allocator;

@@ -441,6 +441,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
+                .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .begin_bulk_ingest_group_local = beginBulkIngestGroupLocal,
@@ -3970,6 +3971,37 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .commit_version = commit_version,
             } },
         });
+        return {};
+    }
+
+    fn txnDecideGroupLocalWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+        status: db_types.TxnStatus,
+        commit_version: u64,
+        _: u64,
+        sync_level: db_types.SyncLevel,
+        context: @import("distributed_txn_contract.zig").PreDecisionContext,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const contract = @import("distributed_txn_contract.zig");
+        if (status != .committed) return error.PreDecisionNotProposed;
+        contract.ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        const request_json = table_writes.encodeStorageKernelBatchRequest(alloc, .{
+            .sync_level = sync_level,
+            .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+        }) catch return error.PreDecisionNotProposed;
+        defer alloc.free(request_json);
+        var lease = self.acquire(group_id, table_name) catch return error.PreDecisionNotProposed;
+        defer lease.deinit();
+        // Owner acquisition may have opened a DB or waited for admission.
+        // Only this final, pre-invocation check proves no decision was sent.
+        contract.ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        var response = try lease.owner().replicatedBatchJson(table_name, request_json);
+        defer response.deinit();
         return {};
     }
 

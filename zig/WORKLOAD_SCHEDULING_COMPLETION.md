@@ -163,3 +163,18 @@ prerequisites are implemented and verified.
   capacity must be reserved with the transaction and retained through its
   final acknowledgement. Adding a free-slot check alone would deadlock this
   lifecycle; the separate control reservation is still outstanding.
+
+- First coordinator decisions now use a dedicated local DATA callback carrying
+  the original deadline. It never forwards or campaigns; only an actual user
+  entry receipt makes the result uncertain, independently of protocol barriers.
+  SourceOwner checks the original context after descriptor/owner acquisition and
+  before invoking C, and preserves all errors after that invocation. The owning
+  DATA gate passed four tests (one implementation, three consumer), with zero
+  skips, failures or leaks. Its real single-voter WAL/C-owner fixture verifies
+  missing-owner and catalog-time expiry rejection, unchanged log on routing
+  expiry, accepted-then-lost-response uncertainty followed by committed apply
+  after expiry, and follower rejection without forwarding. Existing native
+  reservation cancellation/rearm and capsule/WAL restart regressions also pass.
+  Evidence: `/tmp/workload-first-decision-data1.log`, actual exit0. This tests
+  the decision certainty boundary on a legacy table; protected control capacity
+  and replicated quorum-failure qualification remain separate requirements.
