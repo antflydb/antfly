@@ -405,7 +405,7 @@ const Builder = struct {
     /// the builder's mutable arena. Drain every bounded Io task before copying
     /// results and publishing predicates on the caller, including on failure.
     fn preloadWork(self: *Builder, table: *Loaded, keys: []const []const u8) !void {
-        const borrow = self.control.deadline_io orelse return;
+        const borrow = self.control.fanout_io orelse self.control.deadline_io orelse return;
         if (keys.len < 2) return;
         const Slot = struct {
             arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
@@ -1442,7 +1442,7 @@ test "distributed txn primary prefetch owns observations and drains failed batch
             _ = self.calls.fetchAdd(1, .monotonic);
             try std.testing.expectEqual(.read_index, consistency);
             try std.testing.expect(opts.include_primary_digest);
-            try std.testing.expect(opts.execution_io != null);
+            try std.testing.expect(opts.execution_io == null);
             if (self.fail and std.mem.eql(u8, key, "b")) return error.InjectedReadFailure;
             return .{ .json = try alloc.dupe(u8, "{}"), .version = 7, .expected_content_digest = @splat(3) };
         }
@@ -1457,7 +1457,7 @@ test "distributed txn primary prefetch owns observations and drains failed batch
         var fixture: Fixture = .{ .fail = fail };
         var table: Loaded = undefined;
         table.name = "rows";
-        var builder: Builder = .{ .alloc = arena.allocator(), .metadata = &.{}, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, .control = .{ .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&io) } };
+        var builder: Builder = .{ .alloc = arena.allocator(), .metadata = &.{}, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, .control = .{ .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io) } };
         defer builder.deinit();
         const keys = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i" };
         if (fail) {

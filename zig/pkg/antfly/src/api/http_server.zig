@@ -11742,6 +11742,8 @@ pub const ApiHttpServer = struct {
     /// schema/catalog fencing and cascade dependency expansion unchanged.
     pub fn preparePublicCommitWithIntegrity(self: *ApiHttpServer, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, request: api_operation.RequestContext) !@import("relational_integrity_commit.zig").Prepared {
         const integrity = @import("relational_integrity_commit.zig");
+        var preparation_request = request;
+        if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io);
         var snapshot_opt = try self.source.cachedAdminSnapshot();
         if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
         if (snapshot_opt) |value| {
@@ -11749,7 +11751,7 @@ pub const ApiHttpServer = struct {
             defer self.source.freeAdminSnapshot(&snapshot);
             if (try integrity.metadataRequiresCoordination(alloc, snapshot.tables, tables)) {
                 try ensureTableOperationActive(request);
-                var prepared = try integrity.prepareWithCoverageControlled(alloc, self.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, tables, request);
+                var prepared = try integrity.prepareWithCoverageControlled(alloc, self.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, snapshot.ranges, tables, preparation_request);
                 errdefer prepared.deinit();
                 try self.authorizeIntegrityMutations(request, prepared.tables);
                 return prepared;
@@ -11839,10 +11841,12 @@ pub const ApiHttpServer = struct {
             try @import("relational_constraint_recovery.zig").retry(alloc, reader, source, snapshot.tables, snapshot.ranges, tables[0], request);
             return .{ .committed = .{ .participant_count = 0 } };
         }
+        var preparation_request = request;
+        if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io);
         retained_preparation.* = if (request.relational_recovery == .repair)
-            integrity.prepareRepair(alloc, reader, snapshot.tables, snapshot.ranges, tables[0], request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err
+            integrity.prepareRepair(alloc, reader, snapshot.tables, snapshot.ranges, tables[0], preparation_request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err
         else
-            try integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, request);
+            try integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request);
         // CommitOutcome borrows table names and conflict keys from these
         // requests. Keep the preparation alive through outcome handling,
         // including diagnostics, without allocating after a durable decision.
