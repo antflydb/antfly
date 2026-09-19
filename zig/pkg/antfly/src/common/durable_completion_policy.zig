@@ -3,6 +3,11 @@
 
 //! New-work admission is distinct from the trusted runtime's authority to
 //! restore and finish an existing durable obligation.
+/// Implementation readiness only, never admission authority. Keep fresh
+/// replicated activation closed until ordinary/control entry reservations and
+/// maintenance capacity guarantees are complete. Existing obligations restore.
+pub const replicated_activation_supported = false;
+
 pub const Config = struct {
     enabled: bool = false,
 };

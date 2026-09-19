@@ -15,7 +15,7 @@ const backend_runtime = @import("lsm_backend/runtime.zig");
 // Table activation also promises that transaction begin/decision/ack and
 // ordinary writes have pre-consensus capacity. The retained prepare/resolve
 // lane alone is not sufficient evidence for activating that policy.
-const ordinary_mutations_supported = false;
+const ordinary_mutations_supported = @import("../common/durable_completion_policy.zig").replicated_activation_supported;
 
 pub const State = struct {
     proposals: [4]?completion.AcceptedIdentity = @splat(null),
