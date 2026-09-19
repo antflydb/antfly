@@ -333,6 +333,69 @@ test "workload admission attempt client requires authenticated terminal evidence
     }
 }
 
+test "workload admission coordinator late terminal closes debt without publishing expired results" {
+    const alloc = std.testing.allocator;
+    const protocol = @import("workload_attempt_protocol.zig");
+    const coordinator_module = @import("workload_attempt_coordinator.zig");
+    const Fake = struct {
+        cancellation: *http_common.RequestCancellation,
+        coordinator: *coordinator_module.Store,
+        deadline_ns: u64,
+        cancel: bool,
+        signed: bool,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, allocator: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u32, 1), (try self.coordinator.usage()).attempts);
+            const keys: protocol.Keys = .{ .primary = "s" ** 32, .issuer = "cluster" };
+            const authenticated = try protocol.verifyRequest(allocator, keys, request.header(protocol.request_header).?, "node:7", @tagName(request.method), try protocol.requestTarget(request.uri), request.body);
+            if (self.cancel) {
+                self.cancellation.cancel();
+            } else {
+                // Force expiry after actual dispatch, independently of setup or
+                // signature runtime. A transport may return after cancellation.
+                while (platform_time.monotonicNs() < self.deadline_ns)
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            var response: http_common.HttpResponse = .{ .status = 200, .body = try allocator.dupe(u8, "result") };
+            errdefer response.deinit(allocator);
+            if (self.signed) {
+                const evidence = try protocol.signTerminalAfterQuiescence(allocator, keys, authenticated.attempt, 200, response.body);
+                errdefer allocator.free(evidence);
+                const name = try allocator.dupe(u8, protocol.evidence_header);
+                errdefer allocator.free(name);
+                response.headers = try allocator.alloc(http_common.Header, 1);
+                response.headers[0] = .{ .name = name, .value = evidence };
+            }
+            return response;
+        }
+    };
+    inline for (.{ true, false }) |cancel| {
+        inline for (.{ true, false }) |signed| {
+            var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+            defer backend.close();
+            var storage = try backend.runtimeStore(alloc, .{ .name = "system/coordinator-late" });
+            defer storage.deinit();
+            var durable = @import("transactions.zig").DurableSessionStore.initRuntime(alloc, &storage);
+            var coordinator = try coordinator_module.Store.init(alloc, &durable, 7, .{ .max_attempts = 2, .max_bytes = 8192, .max_destination_attempts = 2, .max_destinations = 2 });
+            defer coordinator.deinit();
+            try coordinator.ready(.{ .version = 1, .coordinator = 7, .destination = 8, .worker_namespace = 44, .worker_incarnation = 10, .fenced_through = coordinator.generation - 1, .quiesced_through = coordinator.generation - 1 });
+            var cancellation: http_common.RequestCancellation = .{};
+            const deadline = platform_time.monotonicNs() + 50 * std.time.ns_per_ms;
+            var fake: Fake = .{ .cancellation = &cancellation, .coordinator = &coordinator, .deadline_ns = deadline, .cancel = cancel, .signed = signed };
+            var client = ApiHttpClient.init(alloc, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+            _ = try client.withInternalServiceNodeAuth("s" ** 32, "cluster", 7);
+            const request: http_common.HttpRequest = .{ .method = .POST, .uri = "http://worker/internal/v1/groups/1/tables/docs/_query", .body = "{}", .cancellation = &cancellation };
+            const expected = if (!signed) error.AttemptOutcomeUncertain else if (cancel) error.Canceled else error.DeadlineExceeded;
+            try std.testing.expectError(expected, client.executeCoordinatedRead(&coordinator, 8, "http://worker", request, deadline, null));
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            // Expiry/cancellation alone never proves a remote attempt quiesced.
+            try std.testing.expectEqual(@as(u32, if (signed) 0 else 1), (try coordinator.usage()).attempts);
+        }
+    }
+}
+
 test "workload admission coordinator dispatch durably owns sends and recovers lost terminal responses" {
     const alloc = std.testing.allocator;
     const protocol = @import("workload_attempt_protocol.zig");
@@ -605,6 +668,11 @@ pub const ApiHttpClient = struct {
         const evidence = response.header(protocol.evidence_header) orelse return error.AttemptOutcomeUncertain;
         _ = protocol.verifyTerminal(self.alloc, keys, evidence, id, response.status, response.body) catch return error.AttemptOutcomeUncertain;
         try coordinator.terminal(id);
+        // Valid terminal evidence closes ownership even if the caller has
+        // gone away. It does not authorize publishing a late result to that
+        // caller or restarting its original operation budget.
+        if (request.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Canceled;
+        _ = try attemptRemainingMs(deadline_ns);
         // Only identity-bound terminal evidence permits this overload mapping.
         // An unsigned 429 remains unknown and keeps its durable charge.
         if (response.status == 429) return error.AdmissionFull;

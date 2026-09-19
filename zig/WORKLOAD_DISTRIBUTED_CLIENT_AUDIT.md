@@ -49,3 +49,29 @@ TypeScript late-reply/stalled-clone tests failed before the fix (2 failed,
 11 passed); the composed cleanup test independently reproduced premature permit
 release before the shared-cancellation fix. No new automatic write retry or
 fallback behavior was added.
+
+## Late terminal response boundary
+
+`ApiHttpClient.executeCoordinatedRead` now verifies signed terminal evidence and
+retires its durable attempt before checking caller cancellation and the original
+deadline. A late result is freed and returned as cancellation/deadline failure;
+the terminal proof still closes the remote obligation. An unsigned late response
+remains uncertain and charged. Expiry alone never retires a remote attempt.
+
+The owning `antfly-api-test` gate passed 1/1, no skips/failures/leaks, actual
+exit 0. Its regression covers signed and unsigned responses after both transport-
+triggered cancellation and deadline expiry, with one dispatch in every case.
+Log: `/tmp/workload-coordinator-late-terminal.log`. Reproduce from `zig/`:
+
+```sh
+zig build antfly-api-test -j1 --cache-dir /tmp/zig-local-cache \
+  --global-cache-dir /tmp/zig-global-cache -- \
+  --test-filter 'workload admission coordinator late terminal'
+```
+
+The audit also found that DATA HTTP/coordinator teardown preceded draining native
+DB callback users. This was handed to the runtime owner, who is implementing and
+testing a separate shutdown-order fix. It is not qualified by this API test.
+Existing join fan-out tests cover bounded concurrency, partial worker error,
+complete drain and cancellation before launch; inflight cancellation with mixed
+signed-terminal/unknown results still needs broader qualification.
