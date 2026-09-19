@@ -29,6 +29,9 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .completion_admission_unavailable, .err = error.CompletionAdmissionUnavailable },
+    .{ .status = .completion_admission_policy_changed, .err = error.CompletionAdmissionPolicyChanged },
+    .{ .status = .missing_completion_admission_guard, .err = error.MissingCompletionAdmissionGuard },
     .{ .status = .local_completion_authority_required, .err = error.LocalCompletionAuthorityRequired },
     .{ .status = .unsupported_completion_backend, .err = error.UnsupportedCompletionBackend },
     .{ .status = .unsupported_completion_profile, .err = error.UnsupportedCompletionProfile },
@@ -826,6 +829,19 @@ test "workload admission uncertain completion recovery preserves exact storage f
         const restored = blk: {
             statusToError(failure.status) catch |err| break :blk err;
             return error.ExpectedRecoveryFailure;
+        };
+        try std.testing.expectEqual(expected, restored);
+    }
+}
+
+test "workload admission replicated completion guard failures preserve exact identity" {
+    for ([_]anyerror{ error.CompletionAdmissionUnavailable, error.CompletionAdmissionPolicyChanged, error.MissingCompletionAdmissionGuard }) |expected| {
+        const failure = failureFromError(expected, .storage_owner, abi.abi_version, 1);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expect(failure.status != .internal);
+        const restored = blk: {
+            statusToError(failure.status) catch |err| break :blk err;
+            return error.ExpectedCompletionFailure;
         };
         try std.testing.expectEqual(expected, restored);
     }

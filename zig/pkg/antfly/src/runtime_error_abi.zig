@@ -474,6 +474,9 @@ pub const Detail = enum(c_int) {
     completion_writer_closed,
     completion_writer_live,
     recovery_required,
+    completion_admission_unavailable,
+    completion_admission_policy_changed,
+    missing_completion_admission_guard,
 };
 
 pub const Status = extern struct {
@@ -590,6 +593,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.CompletionWriterClosed => status(.internal, .completion_writer_closed),
         error.CompletionWriterLive => status(.internal, .completion_writer_live),
         error.RecoveryRequired => status(.unavailable, .recovery_required),
+        error.CompletionAdmissionUnavailable => status(.retryable, .completion_admission_unavailable),
+        error.CompletionAdmissionPolicyChanged => status(.unavailable, .completion_admission_policy_changed),
+        error.MissingCompletionAdmissionGuard => status(.internal, .missing_completion_admission_guard),
         error.ExtensionOwnedObject => status(.conflict, .extension_owned_object),
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
@@ -1091,6 +1097,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .completion_writer_closed => "CompletionWriterClosed",
         .completion_writer_live => "CompletionWriterLive",
         .recovery_required => "RecoveryRequired",
+        .completion_admission_unavailable => "CompletionAdmissionUnavailable",
+        .completion_admission_policy_changed => "CompletionAdmissionPolicyChanged",
+        .missing_completion_admission_guard => "MissingCompletionAdmissionGuard",
         .extension_owned_object => "ExtensionOwnedObject",
         .restore_intent_conflict => "RestoreIntentConflict",
         .unauthorized => "Unauthorized",
@@ -1625,4 +1634,14 @@ test "workload admission native completion startup preserves domain failure iden
     try std.testing.expectEqual(@intFromEnum(Code.internal), statusFromError(error.CompletionWriterClosed).code);
     try std.testing.expectEqual(error.CompletionWriterLive, errorFromStatus(statusFromError(error.CompletionWriterLive)));
     try std.testing.expectEqual(@intFromEnum(Code.internal), statusFromError(error.CompletionWriterLive).code);
+}
+
+test "workload admission replicated completion guard classification preserves uncertainty boundaries" {
+    // Error classes do not certify proposal acceptance or safe write retry.
+    try std.testing.expectEqual(error.CompletionAdmissionUnavailable, errorFromStatus(statusFromError(error.CompletionAdmissionUnavailable)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionAdmissionUnavailable).code);
+    try std.testing.expectEqual(error.CompletionAdmissionPolicyChanged, errorFromStatus(statusFromError(error.CompletionAdmissionPolicyChanged)));
+    try std.testing.expectEqual(@intFromEnum(Code.unavailable), statusFromError(error.CompletionAdmissionPolicyChanged).code);
+    try std.testing.expectEqual(error.MissingCompletionAdmissionGuard, errorFromStatus(statusFromError(error.MissingCompletionAdmissionGuard)));
+    try std.testing.expectEqual(@intFromEnum(Code.internal), statusFromError(error.MissingCompletionAdmissionGuard).code);
 }
