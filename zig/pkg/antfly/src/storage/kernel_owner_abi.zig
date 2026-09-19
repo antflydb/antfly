@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 70;
+pub const abi_version: u32 = 71;
 pub const Status = failure_abi.Status;
 pub const completion_pool = @import("completion_pool_abi.zig");
 pub const FailureBoundary = failure_abi.FailureBoundary;
@@ -508,6 +508,9 @@ pub const MetadataApplyPrepareSnapshotRequest = extern struct {
     applied_index: u64 = 0,
 };
 
+pub const completion_projection_max_request_bytes: usize = 64 * 1024;
+pub const completion_projection_max_response_bytes: usize = 8 * 1024 * 1024;
+
 pub const MetadataProjectionKind = enum(u32) {
     latest_checkpoint = 0,
     metadata_incarnation = 1,
@@ -553,6 +556,11 @@ pub const MetadataProjectionKind = enum(u32) {
     table_restore_admission = 38,
     verify_table_create_projection = 39,
     system_catalog = 41,
+    /// Completion projections return bounded raw owned bytes, without an
+    /// additional JSON-string envelope around the already encoded record.
+    capture_completion_activation = 42,
+    completion_activation = 43,
+    completion_installation_response = 44,
 };
 
 pub const MetadataProjectionRequest = extern struct {

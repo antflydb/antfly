@@ -3065,7 +3065,7 @@ pub const MetadataHttpServer = struct {
     fn replaceTableDefinitionOperationWithContext(ptr: *anyopaque, request: operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         if (self.source.vtable.replace_table_definition_with_context) |callback|
-            return callback(self.source.ptr, request, expected, replacement);
+            return try callback(self.source.ptr, request, expected, replacement);
         try request.ensureActive();
         return self.source.replaceTableDefinitionStamped(expected, replacement);
     }

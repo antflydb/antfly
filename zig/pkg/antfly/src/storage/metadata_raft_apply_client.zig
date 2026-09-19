@@ -495,6 +495,36 @@ pub const RaftApplyStore = struct {
         return try self.projection(TableTransitionFence, .{ .kind = .table_transition_fence, .group_id = group_id, .arg0 = table_id });
     }
 
+    pub fn captureCompletionActivation(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64, policy: @import("../common/table_storage.zig").TransactionRecovery) ![]u8 {
+        const request_json = try std.json.Stringify.valueAlloc(alloc, policy, .{});
+        defer alloc.free(request_json);
+        return self.completionProjectionBytes(alloc, .{ .kind = .capture_completion_activation, .group_id = group_id, .arg0 = table_id, .key = .fromSlice(request_json) });
+    }
+
+    pub fn getCompletionActivation(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../metadata/completion_activation.zig").Record) {
+        var response: abi.OwnedBytes = .{};
+        try statusToError(abi.antfly_metadata_apply_store_projection(self.handle, &.{ .kind = .completion_activation, .group_id = group_id, .arg0 = table_id }, &response));
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        if (response.slice().len > abi.completion_projection_max_response_bytes) return error.StorageKernelFailure;
+        if (std.mem.eql(u8, response.slice(), "null")) return null;
+        return try @import("../metadata/completion_activation.zig").decode(alloc, response.slice());
+    }
+
+    pub fn completionInstallationResponse(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, query: @import("../metadata/completion_installation_protocol.zig").Request, keys: @import("../metadata/completion_installation_protocol.zig").Keys) ![]u8 {
+        const request_json = try std.json.Stringify.valueAlloc(alloc, .{ .query = query, .keys = keys }, .{});
+        defer alloc.free(request_json);
+        return self.completionProjectionBytes(alloc, .{ .kind = .completion_installation_response, .group_id = group_id, .key = .fromSlice(request_json) });
+    }
+
+    fn completionProjectionBytes(self: *RaftApplyStore, alloc: std.mem.Allocator, request: abi.MetadataProjectionRequest) ![]u8 {
+        if (request.key.slice().len > abi.completion_projection_max_request_bytes) return error.InvalidArgument;
+        var response: abi.OwnedBytes = .{};
+        try statusToError(abi.antfly_metadata_apply_store_projection(self.handle, &request, &response));
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        if (response.slice().len > abi.completion_projection_max_response_bytes) return error.StorageKernelFailure;
+        return alloc.dupe(u8, response.slice());
+    }
+
     pub fn listSchemaProgress(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SchemaProgressRecord {
         return try self.projectionWithAllocator([]metadata.SchemaProgressRecord, alloc, .{ .kind = .schema_progress, .group_id = group_id });
     }

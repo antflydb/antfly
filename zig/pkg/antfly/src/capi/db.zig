@@ -2967,6 +2967,13 @@ fn metadataProjectionJson(
     return .ok;
 }
 
+fn completionProjectionBytes(alloc: Allocator, out: *kernel_owner_abi.OwnedBytes, bytes: []const u8) kernel_owner_abi.Status {
+    if (bytes.len > kernel_owner_abi.completion_projection_max_response_bytes) return .invalid_argument;
+    const owned = alloc.dupe(u8, bytes) catch return .out_of_memory;
+    out.* = .{ .ptr = if (owned.len == 0) null else owned.ptr, .len = @intCast(owned.len) };
+    return .ok;
+}
+
 fn metadataProjectionStatusFromError(err: anyerror) kernel_owner_abi.Status {
     if (err == error.InvalidDerivedCatalogIndex)
         return storageOwnerStatusFromError(error.InvalidArgument);
@@ -3181,6 +3188,37 @@ pub fn metadataApplyStoreProjection(
     const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
     const alloc = handle.alloc;
     return switch (request.kind) {
+        .capture_completion_activation, .completion_activation, .completion_installation_response => blk: {
+            // These are coherent metadata observations, never backing proof.
+            // Decode and collect in finite owner scratch across the C boundary.
+            if (request.key.slice().len > kernel_owner_abi.completion_projection_max_request_bytes) break :blk .invalid_argument;
+            const scratch = alloc.alloc(u8, 8 * 1024 * 1024) catch break :blk .out_of_memory;
+            defer alloc.free(scratch);
+            var fixed = std.heap.FixedBufferAllocator.init(scratch);
+            const bounded = fixed.allocator();
+            switch (request.kind) {
+                .capture_completion_activation => {
+                    const policy = std.json.parseFromSliceLeaky(@import("../common/table_storage.zig").TransactionRecovery, bounded, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+                    const value = handle.store.captureCompletionActivation(bounded, request.group_id, request.arg0, policy) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk completionProjectionBytes(alloc, out_json, value);
+                },
+                .completion_activation => {
+                    var value = handle.store.getCompletionActivation(bounded, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
+                    defer if (value) |*parsed| parsed.deinit();
+                    const encoded = if (value) |parsed| metadata_raft_apply.completion_activation.encode(bounded, parsed.value) catch |err| break :blk storageOwnerStatusFromError(err) else "null";
+                    break :blk completionProjectionBytes(alloc, out_json, encoded);
+                },
+                .completion_installation_response => {
+                    const protocol = @import("../metadata/completion_installation_protocol.zig");
+                    const Input = struct { query: protocol.Request, keys: protocol.Keys };
+                    const input = std.json.parseFromSliceLeaky(Input, bounded, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+                    input.query.validate() catch |err| break :blk storageOwnerStatusFromError(err);
+                    const value = handle.store.completionInstallationResponse(bounded, request.group_id, input.query, input.keys) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk completionProjectionBytes(alloc, out_json, value);
+                },
+                else => unreachable,
+            }
+        },
         .system_catalog => blk: {
             const contract = metadata_raft_apply.apply_contract;
             var arena = std.heap.ArenaAllocator.init(alloc);

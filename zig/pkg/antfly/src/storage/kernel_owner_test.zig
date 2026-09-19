@@ -1787,6 +1787,95 @@ test "opaque metadata apply owner preserves semantic error identity" {
     );
 }
 
+test "opaque metadata completion installation survives compiled projection boundary and reopen" {
+    const alloc = std.testing.allocator;
+    // Only the command codec is used in this consumer; every mutation and
+    // observation goes through the separately compiled opaque owner.
+    const metadata_codec = @import("../metadata/storage/mod.zig");
+    const entry_codec = @import("../raft/state_machine/mod.zig");
+    const activation = @import("../metadata/completion_activation.zig");
+    const installation = @import("../metadata/completion_installation_protocol.zig");
+    const group_id = @import("../common/group_ids.zig").main_metadata_group_id;
+    const Apply = struct {
+        fn command(store: *metadata_apply_client.RaftApplyStore, index: u64, value: metadata_codec.TransitionCommand) !void {
+            const bytes = try metadata_codec.encodeTransitionCommand(alloc, value);
+            defer alloc.free(bytes);
+            const entries = try entry_codec.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = index, .data = bytes }});
+            defer alloc.free(entries);
+            try store.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = index, .entries_bytes = entries });
+        }
+    };
+    const path = "/tmp/antfly-storage-kernel-metadata-completion";
+    cleanup(path);
+    defer cleanup(path);
+    const policy: @import("../common/table_storage.zig").TransactionRecovery = .{ .protocol_version = 1, .max_count = 4, .max_bytes = 65536, .max_transaction_bytes = 16384, .completion_protocol_version = 1, .profile_version = 1 };
+    const query: installation.Request = .{ .requester = 12, .group_id = 1001, .cluster_incarnation = "11111111111111111111111111111111".*, .nonce = 77 };
+    const keys: installation.Keys = .{ .primary = "compiled-owner-installation-test-key", .issuer = "compiled-metadata-test" };
+    {
+        var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path });
+        defer store.deinit();
+        try Apply.command(&store, 1, .{ .initialize_metadata_incarnation = query.cluster_incarnation });
+        try Apply.command(&store, 2, .{ .apply_table_topology = .{ .create = .{
+            .table = .{ .table_id = 7, .name = "docs", .min_ranges = 1 },
+            .expected_transition_generation = 0,
+            .ranges = &.{.{ .group_id = query.group_id, .range_id = 3, .table_id = 7, .start_key = "" }},
+        } } });
+        try Apply.command(&store, 3, .{ .upsert_node = .{ .node_id = query.requester } });
+        try Apply.command(&store, 4, .{ .upsert_replica_intent = .{
+            .expected_metadata_version = null,
+            .expected_version_fence = 0,
+            .expected_target_drain_requested = false,
+            .replacement = .{ .record = .{ .group_id = query.group_id, .replica_id = 1, .local_node_id = query.requester }, .peer_node_ids = &.{query.requester} },
+        } });
+        const absent = try store.completionInstallationResponse(alloc, group_id, query, keys);
+        defer alloc.free(absent);
+        var absent_verified = try installation.verifyResponse(alloc, keys, absent, query);
+        defer absent_verified.deinit();
+        try std.testing.expect(absent_verified.value.installation == null);
+        const pending_wire = try store.captureCompletionActivation(alloc, group_id, 7, policy);
+        defer alloc.free(pending_wire);
+        try std.testing.expect((try store.getCompletionActivation(alloc, group_id, 7)) == null);
+        try Apply.command(&store, 5, .{ .apply_completion_activation = pending_wire });
+        var pending = (try store.getCompletionActivation(alloc, group_id, 7)).?;
+        defer pending.deinit();
+        try std.testing.expectEqual(activation.Phase.pending, pending.value.phase);
+        const signed = try store.completionInstallationResponse(alloc, group_id, query, keys);
+        defer alloc.free(signed);
+        var verified = try installation.verifyResponse(alloc, keys, signed, query);
+        defer verified.deinit();
+        try std.testing.expect(verified.value.installation.?.sameIntent(pending.value));
+        var wrong = query;
+        wrong.cluster_incarnation = "22222222222222222222222222222222".*;
+        try std.testing.expectError(error.CompletionAdmissionPolicyChanged, store.completionInstallationResponse(alloc, group_id, wrong, keys));
+        var response: abi.OwnedBytes = .{};
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_projection(store.handle, &.{ .version = abi.abi_version - 1, .kind = .completion_activation, .group_id = group_id, .arg0 = 7 }, &response));
+        try std.testing.expectEqual(@as(usize, 0), response.slice().len);
+        var oversized: [abi.completion_projection_max_request_bytes + 1]u8 = undefined;
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_metadata_apply_store_projection(store.handle, &.{ .kind = .completion_installation_response, .group_id = group_id, .key = .fromSlice(&oversized) }, &response));
+        try std.testing.expectEqual(@as(usize, 0), response.slice().len);
+        pending.value.phase = .active;
+        pending.value.evidence_digest = @splat(9);
+        const active_wire = try activation.encode(alloc, pending.value);
+        defer alloc.free(active_wire);
+        try Apply.command(&store, 6, .{ .apply_completion_activation = active_wire });
+    }
+    var reopened = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path });
+    defer reopened.deinit();
+    var active = (try reopened.getCompletionActivation(alloc, group_id, 7)).?;
+    defer active.deinit();
+    try std.testing.expectEqual(activation.Phase.active, active.value.phase);
+    const retry_wire = try reopened.captureCompletionActivation(alloc, group_id, 7, policy);
+    defer alloc.free(retry_wire);
+    var retry = try activation.decode(alloc, retry_wire);
+    defer retry.deinit();
+    try std.testing.expect(retry.value.sameIntent(active.value));
+    const signed = try reopened.completionInstallationResponse(alloc, group_id, query, keys);
+    defer alloc.free(signed);
+    var verified = try installation.verifyResponse(alloc, keys, signed, query);
+    defer verified.deinit();
+    try std.testing.expectEqual(activation.Phase.active, verified.value.installation.?.phase);
+}
+
 test "opaque metadata listener boundary preserves incarnation commit ordering" {
     const path = "/tmp/antfly-storage-kernel-metadata-listener-ordering";
     cleanup(path);
