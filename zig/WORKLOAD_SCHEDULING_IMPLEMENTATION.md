@@ -158,10 +158,11 @@ charged through the final reader. Stale tickets retire historical roots in
 bounded slices outside the writer lock. Debug and ReleaseSafe each passed 27
 focused tests. See [the backend stage contract](WORKLOAD_LSM_COMPLETION.md).
 
-This entry point rejects persistent storage before reserving capacity. WAL,
-manifest and flush capacity still need prepaid ownership, with explicit handling
-of uncertain storage I/O. The internal point-batch path therefore does not yet
-promise mandatory transaction completion or activate a public transaction ticket.
+This memory-only entry point rejects persistent storage before reserving
+capacity. The newer native one-shot helper described below prepays its WAL
+append, but retained transaction tickets still need WAL, manifest and flush
+ownership across prepare, intervening writes and restart. Neither internal path
+promises mandatory transaction completion or activates a public transaction ticket.
 
 A public completion ticket must be stored atomically with intents and the
 prepared vote, bound to transaction revision, schema, backend namespace and a
@@ -565,6 +566,12 @@ signed internal-service credential; ordinary URL matching is insufficient.
 H1 transport rejection has an allocation-free structured 429 response, while
 H2 retains REFUSED_STREAM semantics. Task reservations do not reserve connection
 slots or establish a process-wide execution/progress guarantee.
+
+Frozen Debug `0bdae3dcc4` passed local H1 task saturation: all 32 held reads
+returned exact results while protected probes progressed, excess general work
+received structured 429s, and ownership returned to stable idle within the
+declared recovery bound. The validation record retains failed predecessors and
+the independent receipt audit; this does not qualify optimized performance.
 
 Read-only catalog and local routed lookup calls now wait for nested executor
 capacity within their original deadline and cancellation budget. A failed local

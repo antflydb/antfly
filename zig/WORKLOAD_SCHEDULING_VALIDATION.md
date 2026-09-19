@@ -838,3 +838,81 @@ An absent cache does not mark an unattempted leader unreachable. A known missing
 target still follows the existing placement fallback. The change grants no new
 deadline, forwarding hop or campaign budget, performs no synchronous metadata
 request, and does not retry an ambiguous mutation.
+
+The actual writer wrapper regression passed 1/1, zero failures/leaks, actual
+exit zero (`/tmp/workload-routed-writer-boundary.log`). The routing gate passed
+2/2, zero failures/leaks, actual exit zero
+(`/tmp/workload-cached-routing-readiness-final.log`), including cold/warm/invalidated
+cache transitions, no synchronous executor calls, leader eligibility and existing
+forwarding bounds. The first routing compile failed on a const fixture slice;
+the final gate includes its correction. All 16 stable error-status tests passed
+(`/tmp/workload-routed-write-status-abi.log`). Fresh review found no replay or
+deadline regression in the final routing change.
+
+### Native protected request-task qualification passes
+
+The clean frozen Debug revision
+`0bdae3dcc4887875fa2e8ee69c9952fb45d493e5` built successfully, actual exit zero
+(`/tmp/workload-dispatch-0bdae-production-debug-receipt.json`). Binary SHA-256 is
+`e407c43f406a452d495af3f2d961b696a984295aba716964958c4af50b1b6627`.
+The unchanged acceptance gates passed, actual exit zero:
+`/tmp/workload-dispatch-0bdae3dcc4-receipts`.
+
+An independent audit verified all 26 manifest entries, including the data node's
+log, config and catalog, plus the copied binary hash. All 32 held reads returned
+HTTP 200 with the exact document; their elapsed times were 3.020–3.027 seconds.
+Generator dispatch span was 1.025 ms and latest dispatch was 1.142 ms after
+submission, both within the original 100 ms bound.
+
+Fresh metric gates observed 32 active query and public request tasks, with zero
+queued queries, before and after the protected probes. All 32 clients stayed
+pending throughout the 0.265-second probe interval. Excess general GET and
+unauthenticated recovery POST received exact structured `AdmissionFull` 429
+responses with `Retry-After: 1`. Health/readiness GET returned semantic success;
+HEAD returned 200 with no client-delivered body. Authenticated protocol-3
+discovery passed live signature, nonce and destination checks. The disposable
+key was redacted, so the independent audit checks that live verification record
+rather than repeating HMAC verification offline.
+
+Permit/combined dispatch rejection counters increased by exactly two; executor
+and connection rejection counters stayed zero. All 12 metric samples were fresh
+(maximum source age 0.267 seconds), with no evidence errors. Final idle ownership
+remained stable for 1.028 seconds: query active/queued/outstanding/retained bytes
+and public HTTP active counts were zero. Recovery took 3.791 seconds, within the
+ten-second bound. All three owned processes exited zero without forced cleanup,
+and their PIDs were absent afterward. The proxy closed all 35 accepted
+connections without error.
+
+This qualifies local H1 request-task isolation and recovery for the declared
+fixture. It does not establish connection-exhaustion isolation, process-wide
+progress, mandatory write completion, optimized throughput or Cloud sizing.
+
+### Response loss and restart qualification on the same binary
+
+The same frozen `0bdae3dcc4` Debug artifact passed the unchanged local recovery
+scenario, actual exit zero:
+`/tmp/workload-reconciliation-0bdae3dcc4-capture-receipts`. All 19 requests met
+their assertions, with zero unknown write outcomes, schedule violations or
+cleanup errors. The candidate identity alone changed from the earlier plan;
+fault timing, acceptance limits and bounded response capture stayed fixed.
+
+The independent verifier exited zero and recorded
+`/tmp/workload-reconciliation-0bdae3dcc4-proof-verification.json`. It verified the
+binary hash, all 21 manifest entries and 17 signed exchanges: four discovery,
+four fence and nine terminal proofs. One unsigned capture was excluded. After
+API restart, the same relay finished forwarding the generation-2 fence before
+receiving the generation-3 request. Worker restart preserved its namespace and
+increased its incarnation; API restart preserved the worker identity.
+
+All 35 metric samples were fresh (maximum source age 0.310 seconds). Five owned
+processes started and stopped: two intentionally killed predecessors and three
+final processes exiting zero. Independent process inspection found none alive.
+The generic cluster harness still omits data-node files from its old manifest;
+the external verification report supplements it with hashes for the data config
+and both data server logs, without modifying the retained receipts. All server
+logs were checked for panics and untransportable callback errors; none appeared.
+
+These are signed observed exchanges and relay ordering, backed by sampled
+coordinator accounting. They do not prove application consumption of every
+response, every durable-decision crash boundary, mandatory write-completion
+reservations or release performance.
