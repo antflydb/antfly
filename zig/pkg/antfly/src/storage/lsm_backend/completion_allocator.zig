@@ -111,7 +111,7 @@ pub const Owner = struct {
 /// Only this trusted allocator can exclude bytes from the aggregate observer:
 /// it has already staged those exact bytes on the dedicated credit observer.
 pub fn isPrepaid(allocator: std.mem.Allocator) bool {
-    return allocator.vtable == &Owner.vtable or allocator.vtable == &Arena.vtable or allocator.vtable == &RecyclingScratch.vtable;
+    return allocator.vtable == &Owner.vtable or allocator.vtable == &Arena.vtable or allocator.vtable == &RecyclingScratch.vtable or allocator.vtable == &PublicationReservation.vtable;
 }
 
 /// A physically allocated, heap-stable completion domain. All backing memory
@@ -258,8 +258,9 @@ test "workload admission completion arena refuses recycle while readers retain p
 
 /// Reusable, physically backed scratch for streaming cursors/builders. Unlike
 /// Arena it coalesces freed spans, so reading successive blocks does not consume
-/// capacity proportional to the whole database. Publication must use Arena:
-/// scratch destruction explicitly refuses outstanding borrowed allocations.
+/// capacity proportional to the whole database. Scratch destruction refuses
+/// outstanding allocations; published metadata instead retires the owner and
+/// retains this allocator context until the last allocation is freed.
 pub const RecyclingScratch = struct {
     const none = std.math.maxInt(usize);
     const Block = struct {
@@ -276,6 +277,7 @@ pub const RecyclingScratch = struct {
     storage: []align(@alignOf(Block)) u8,
     free_head: usize = 0,
     live: usize = 0,
+    retired: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
 
     pub fn create(backing: std.mem.Allocator, manager: *resources.ResourceManager, bytes: usize) !*RecyclingScratch {
@@ -303,10 +305,26 @@ pub const RecyclingScratch = struct {
             self.mutex.unlock();
             return error.CompletionReservationBusy;
         }
+        self.mutex.unlock();
+        self.destroyEmpty();
+    }
+
+    /// Relinquish the publication owner without invalidating retained tree nodes
+    /// or readers. The final physical free releases the slab and its resource
+    /// charge. No subsequent allocation is allowed after retirement.
+    pub fn retire(self: *RecyclingScratch) void {
+        self.lock();
+        std.debug.assert(!self.retired);
+        self.retired = true;
+        const empty = self.live == 0;
+        self.mutex.unlock();
+        if (empty) self.destroyEmpty();
+    }
+
+    fn destroyEmpty(self: *RecyclingScratch) void {
         const domain = self.domain;
         const owned = domain.allocator();
         const storage = self.storage;
-        self.mutex.unlock();
         owned.free(storage);
         owned.destroy(self);
         domain.release();
@@ -343,6 +361,7 @@ pub const RecyclingScratch = struct {
         const self: *RecyclingScratch = @ptrCast(@alignCast(raw));
         self.lock();
         defer self.mutex.unlock();
+        if (self.retired) return null;
         var offset = self.free_head;
         const base = @intFromPtr(self.storage.ptr);
         while (offset != none) {
@@ -384,7 +403,11 @@ pub const RecyclingScratch = struct {
     fn free(raw: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
         const self: *RecyclingScratch = @ptrCast(@alignCast(raw));
         self.lock();
-        defer self.mutex.unlock();
+        defer {
+            const destroy_domain = self.retired and self.live == 0;
+            self.mutex.unlock();
+            if (destroy_domain) self.destroyEmpty();
+        }
         std.debug.assert(@intFromPtr(memory.ptr) >= @intFromPtr(self.storage.ptr) + @sizeOf(usize));
         std.debug.assert(@intFromPtr(memory.ptr) + memory.len <= @intFromPtr(self.storage.ptr) + self.storage.len);
         var offset = std.mem.bytesToValue(usize, (memory.ptr - @sizeOf(usize))[0..@sizeOf(usize)]);
@@ -545,4 +568,196 @@ test "workload admission completion compiler borrows retain preowned capacity an
     try second.release();
     try std.testing.expectEqual(charged, manager.snapshot().memory.used_bytes);
     try std.testing.expect(!backing.has_induced_failure);
+}
+
+test "workload admission completion recycling publication retains readers through owner retirement" {
+    const alloc = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var backing = std.testing.FailingAllocator.init(alloc, .{});
+    const before = manager.snapshot().memory.used_bytes;
+    const publication = try RecyclingScratch.create(backing.allocator(), &manager, 64 * 1024);
+    const allocator = publication.allocator();
+    const reader = try allocator.alloc(u8, 8192);
+    @memset(reader, 0x42);
+    const current = try allocator.alloc(u8, 8192);
+    @memset(current, 0x19);
+    const charged = manager.snapshot().memory.used_bytes;
+    backing.fail_index = backing.alloc_index;
+    backing.resize_fail_index = backing.resize_index;
+    manager.memory.budget.hard_limit_bytes = 1;
+    // A live published buffer does not prevent recycling unrelated free spans.
+    for (0..128) |_| {
+        const replacement = try allocator.alloc(u8, 32 * 1024);
+        allocator.free(replacement);
+    }
+    publication.retire();
+    try std.testing.expectError(error.OutOfMemory, allocator.alloc(u8, 1));
+    allocator.free(current);
+    try std.testing.expectEqual(charged, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u8, 0x42), reader[reader.len - 1]);
+    allocator.free(reader);
+    try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+    try std.testing.expect(!backing.has_induced_failure);
+}
+
+/// A concrete contiguous publication allowance carved out before admission.
+/// Allocation partitions this owned span without consulting the free list.
+/// Published children return individual spans, so copied persistent-tree nodes
+/// do not pin an entire admission allowance. Single owner calls finish once.
+/// Already reserved capacity remains usable after domain owner retirement;
+/// retirement prevents creating new reservations, not consuming existing ones.
+pub const PublicationReservation = struct {
+    domain: *RecyclingScratch,
+    remaining: usize,
+    children: usize = 0,
+    finished: bool = false,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    pub fn create(domain: *RecyclingScratch, bytes: usize) !*PublicationReservation {
+        if (bytes == 0) return error.ResourceBudgetExceeded;
+        const domain_alloc = domain.allocator();
+        const self = try domain_alloc.create(PublicationReservation);
+        errdefer domain_alloc.destroy(self);
+        const memory = try domain_alloc.alloc(u8, bytes);
+        const offset = std.mem.bytesToValue(usize, (memory.ptr - @sizeOf(usize))[0..@sizeOf(usize)]);
+        self.* = .{ .domain = domain, .remaining = offset };
+        return self;
+    }
+
+    pub fn allocator(self: *PublicationReservation) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn lock(self: *PublicationReservation) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// Stop allocation and return the unused tail. Children retain this allocator
+    /// context through their physical free, including after domain retirement.
+    pub fn finish(self: *PublicationReservation) void {
+        self.lock();
+        std.debug.assert(!self.finished);
+        self.finished = true;
+        if (self.remaining != RecyclingScratch.none) {
+            // A reserved tail is a normal allocated domain block. Construct its
+            // private free prefix; no caller has ever received these bytes.
+            const offset = self.remaining;
+            self.remaining = RecyclingScratch.none;
+            const ptr = self.domain.storage.ptr + offset + @sizeOf(RecyclingScratch.Block) + @sizeOf(usize);
+            @memcpy((ptr - @sizeOf(usize))[0..@sizeOf(usize)], std.mem.asBytes(&offset));
+            self.domain.allocator().rawFree(ptr[0..1], .@"1", @returnAddress());
+        }
+        const destroy_context = self.children == 0;
+        const domain = self.domain;
+        self.mutex.unlock();
+        if (destroy_context) domain.allocator().destroy(self);
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+        const self: *PublicationReservation = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.finished or self.remaining == RecyclingScratch.none) return null;
+        const domain = self.domain;
+        domain.lock();
+        defer domain.mutex.unlock();
+        const offset = self.remaining;
+        const item = domain.block(offset);
+        std.debug.assert(item.allocated);
+        const base = @intFromPtr(domain.storage.ptr);
+        const unaligned = base + offset + @sizeOf(RecyclingScratch.Block) + @sizeOf(usize);
+        const rounded = std.math.add(usize, unaligned, alignment.toByteUnits() - 1) catch return null;
+        const address = std.mem.alignBackward(usize, rounded, alignment.toByteUnits());
+        const end = std.math.add(usize, address - base, @max(len, 1)) catch return null;
+        const rounded_end = std.math.add(usize, end, RecyclingScratch.block_alignment - 1) catch return null;
+        const needed = std.mem.alignBackward(usize, rounded_end, RecyclingScratch.block_alignment) - offset;
+        if (needed > item.size) return null;
+        const previous_size = item.size;
+        if (previous_size - needed >= RecyclingScratch.minimum_block) {
+            item.size = needed;
+            const next = offset + needed;
+            domain.block(next).* = .{ .size = previous_size - needed, .previous_size = needed, .allocated = true };
+            domain.updateFollowing(next);
+            self.remaining = next;
+            domain.live += 1;
+        } else self.remaining = RecyclingScratch.none;
+        const result: [*]u8 = @ptrFromInt(address);
+        @memcpy((result - @sizeOf(usize))[0..@sizeOf(usize)], std.mem.asBytes(&offset));
+        self.children += 1;
+        return result;
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PublicationReservation = @ptrCast(@alignCast(raw));
+        self.lock();
+        std.debug.assert(self.children != 0);
+        self.children -= 1;
+        const domain = self.domain;
+        domain.allocator().rawFree(memory, alignment, ret_addr);
+        const destroy_context = self.finished and self.children == 0;
+        self.mutex.unlock();
+        if (destroy_context) domain.allocator().destroy(self);
+    }
+};
+
+test "workload admission completion publication reservation isolates capacity and frees individual retained spans" {
+    const alloc = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var backing = std.testing.FailingAllocator.init(alloc, .{});
+    const domain = try RecyclingScratch.create(backing.allocator(), &manager, 256 * 1024);
+    const first = try PublicationReservation.create(domain, 96 * 1024);
+    const second = try PublicationReservation.create(domain, 96 * 1024);
+    try std.testing.expectError(error.OutOfMemory, PublicationReservation.create(domain, 96 * 1024));
+    backing.fail_index = backing.alloc_index;
+    backing.resize_fail_index = backing.resize_index;
+    manager.memory.budget.hard_limit_bytes = 1;
+    const a = first.allocator();
+    const b = second.allocator();
+    const retained = try a.alignedAlloc(u8, .@"64", 32 * 1024);
+    @memset(retained, 0x5a);
+    const transient = try a.alloc(u8, 32 * 1024);
+    a.free(transient);
+    first.finish();
+    // Most of the first reservation is reusable while its reader stays live.
+    const third = try PublicationReservation.create(domain, 48 * 1024);
+    const independent = try b.alloc(u8, 80 * 1024);
+    @memset(independent, 0x19);
+    const another = try third.allocator().alloc(u8, 32 * 1024);
+    third.allocator().free(another);
+    third.finish();
+    second.finish();
+    const charged = manager.snapshot().memory.used_bytes;
+    domain.retire();
+    b.free(independent);
+    try std.testing.expectEqual(charged, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u8, 0x5a), retained[retained.len - 1]);
+    a.free(retained);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expect(!backing.has_induced_failure);
+}
+
+test "workload admission completion preowned publication remains usable after domain owner retirement" {
+    const alloc = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    const domain = try RecyclingScratch.create(alloc, &manager, 64 * 1024);
+    const reserved = try PublicationReservation.create(domain, 48 * 1024);
+    const allocator = reserved.allocator();
+    domain.retire();
+    // Owner close prevents new reservations, not consumption of ownership that
+    // was physically retained before close. The reservation pins its context.
+    const completion = try allocator.alloc(u8, 32 * 1024);
+    @memset(completion, 0x41);
+    reserved.finish();
+    try std.testing.expectEqual(@as(u8, 0x41), completion[completion.len - 1]);
+    allocator.free(completion);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }

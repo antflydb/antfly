@@ -526,3 +526,39 @@ test "writer run store prepaid arena remains singly charged through directory an
     pinned.release(ordinary);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
+
+test "workload admission completion recycling publication survives persistent run tree readers" {
+    const resources = @import("../resource_manager.zig");
+    const ordinary = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = ordinary });
+    defer manager.deinit(ordinary);
+    const publication = try completion_allocation.RecyclingScratch.create(ordinary, &manager, 256 * 1024);
+    const reservation = try completion_allocation.PublicationReservation.create(publication, 128 * 1024);
+    const allocator = reservation.allocator();
+    var live: Store = .{};
+    const run: Run = .{
+        .id = 1,
+        .level = 0,
+        .size_bytes = 1,
+        .path = try allocator.dupe(u8, "recycled.sst"),
+        .smallest_namespace_name = null,
+        .smallest_key = try allocator.dupe(u8, "a"),
+        .largest_namespace_name = null,
+        .largest_key = try allocator.dupe(u8, "z"),
+        .entry_count = 1,
+        .bloom_filter = null,
+        .state = null,
+        .metadata_allocator = allocator,
+    };
+    try live.append(allocator, run);
+    var reader = live.fork();
+    const charged = manager.snapshot().memory.used_bytes;
+    reservation.finish();
+    publication.retire();
+    live.deinit(ordinary);
+    try std.testing.expectEqual(charged, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqualStrings("recycled.sst", reader.at(0).path.?);
+    try std.testing.expectEqualStrings("z", reader.at(0).largest_key);
+    reader.deinit(ordinary);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
