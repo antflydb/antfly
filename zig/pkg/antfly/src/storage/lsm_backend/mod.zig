@@ -55,5 +55,6 @@ test "lsm backend module tests are reachable" {
     std.testing.refAllDecls(wal);
     std.testing.refAllDecls(background);
     std.testing.refAllDecls(compaction_scheduler);
+    std.testing.refAllDecls(@import("completion_entry.zig"));
     std.testing.refAllDecls(@import("../sim_runtime.zig"));
 }

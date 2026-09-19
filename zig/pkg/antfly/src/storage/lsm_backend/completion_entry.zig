@@ -28,6 +28,9 @@ const header_bytes = 256;
 const operation_header_bytes = 12;
 
 pub const Entry = struct {
+    /// Mutation entries apply once; they never create a prepared transaction
+    /// or wait for a subsequent decision. V1 prepares retain their wire form.
+    kind: protocol.Kind = .prepare,
     group_id: u64,
     group_incarnation: [16]u8,
     policy_digest: [32]u8,
@@ -81,6 +84,13 @@ fn validateOperation(op: slot.Operation) !void {
         return error.InvalidCompletionSlot;
 }
 
+fn validateKind(kind: protocol.Kind, descriptor: slot.Descriptor) !void {
+    // A mutation has no future outcome. Encoding templates here would make
+    // its ownership ambiguous and could publish progress before all effects.
+    if (kind == .mutation and (descriptor.commit.len != 0 or descriptor.abort.len != 0))
+        return error.InvalidCompletionSlot;
+}
+
 pub fn encode(allocator: Allocator, entry: Entry) ![]u8 {
     if (entry.group_id == 0 or entry.prepare_operations.len == 0) return error.InvalidCompletionSlot;
     if (entry.descriptor.len > max_descriptor_bytes or entry.prepare_operations.len > max_operations or entry.baseline_keys.len > max_baseline_keys)
@@ -99,11 +109,12 @@ pub fn encode(allocator: Allocator, entry: Entry) ![]u8 {
     var descriptor = try slot.decode(allocator, entry.descriptor, .{ .max_wire_bytes = max_descriptor_bytes });
     defer descriptor.deinit();
     if (!std.mem.eql(u8, &descriptor.descriptor.txn_id, &entry.txn_id)) return error.InvalidCompletionSlot;
+    try validateKind(entry.kind, descriptor.descriptor);
     try validateCoverage(entry.baseline_keys, entry.prepare_operations, descriptor.descriptor);
     const bytes = try allocator.alloc(u8, size);
     @memset(bytes[0..header_bytes], 0);
     @memcpy(bytes[0..8], magic);
-    std.mem.writeInt(u16, bytes[8..10], version, .little);
+    std.mem.writeInt(u16, bytes[8..10], protocol.wireVersion(entry.kind), .little);
     std.mem.writeInt(u16, bytes[10..12], profile, .little);
     std.mem.writeInt(u32, bytes[12..16], @intCast(size), .little);
     std.mem.writeInt(u64, bytes[16..24], entry.group_id, .little);
@@ -137,6 +148,7 @@ pub fn encode(allocator: Allocator, entry: Entry) ![]u8 {
     }
     std.mem.writeInt(u64, bytes[200..208], entry.previous_term, .little);
     std.mem.writeInt(u64, bytes[208..216], entry.previous_index, .little);
+    bytes[216] = @intFromEnum(entry.kind);
     @memcpy(bytes[224..256], &checksum(bytes));
     return bytes;
 }
@@ -242,10 +254,19 @@ pub const BaselineHasher = struct {
 pub fn decode(allocator: Allocator, encoded: []const u8) !OwnedEntry {
     if (encoded.len > max_wire_bytes) return error.CompletionSlotTooLarge;
     if (encoded.len < header_bytes or !std.mem.eql(u8, encoded[0..8], magic)) return error.InvalidCompletionSlot;
-    if (std.mem.readInt(u16, encoded[8..10], .little) != version or
+    const wire_version = std.mem.readInt(u16, encoded[8..10], .little);
+    if ((wire_version != version and wire_version != protocol.mutation_version) or
         std.mem.readInt(u16, encoded[10..12], .little) != profile) return error.UnsupportedCompletionSlotVersion;
+    const kind: protocol.Kind = switch (encoded[216]) {
+        0 => .prepare,
+        1 => .mutation,
+        else => return error.InvalidCompletionSlot,
+    };
+    // Each operation kind has exactly one encoding. In particular, relabeling
+    // a mutation as v1 cannot bypass rolling-version admission.
+    if (wire_version != protocol.wireVersion(kind)) return error.UnsupportedCompletionSlotVersion;
     if (std.mem.readInt(u32, encoded[12..16], .little) != encoded.len or
-        !std.mem.allEqual(u8, encoded[196..200], 0) or !std.mem.allEqual(u8, encoded[216..224], 0)) return error.InvalidCompletionSlot;
+        !std.mem.allEqual(u8, encoded[196..200], 0) or !std.mem.allEqual(u8, encoded[217..224], 0)) return error.InvalidCompletionSlot;
     const digest = checksum(encoded);
     if (!std.mem.eql(u8, encoded[224..256], &digest)) return error.CompletionSlotChecksumMismatch;
     const group_id = std.mem.readInt(u64, encoded[16..24], .little);
@@ -260,6 +281,7 @@ pub fn decode(allocator: Allocator, encoded: []const u8) !OwnedEntry {
     var descriptor = try slot.decode(allocator, encoded[header_bytes..][0..descriptor_len], .{ .max_wire_bytes = max_descriptor_bytes });
     errdefer descriptor.deinit();
     if (!std.mem.eql(u8, &descriptor.descriptor.txn_id, encoded[24..40])) return error.InvalidCompletionSlot;
+    try validateKind(kind, descriptor.descriptor);
     const operation_bytes = @as(usize, count) * @sizeOf(slot.Operation);
     const key_bytes = @as(usize, baseline_count) * @sizeOf([]const u8);
     const wire_offset = try sum(operation_bytes, key_bytes);
@@ -273,6 +295,7 @@ pub fn decode(allocator: Allocator, encoded: []const u8) !OwnedEntry {
     try readBaselineKeys(wire, keys_offset, baseline_count, keys);
     try validateCoverage(keys, operations, descriptor.descriptor);
     return .{ .allocator = allocator, .storage = storage, .decoded_descriptor = descriptor, .digest = protocol.payloadDigest(encoded), .entry = .{
+        .kind = kind,
         .group_id = group_id,
         .group_incarnation = wire[176..192].*,
         .baseline_keys = keys,
@@ -337,6 +360,67 @@ test "workload admission completion entry owns canonical ordered prepare and aut
     try std.testing.expectEqual(.delete, decoded.entry.prepare_operations[1].kind);
     try std.testing.expectEqualStrings("last\x00", decoded.entry.prepare_operations[2].value);
     try std.testing.expectEqualStrings("committed", decoded.decoded_descriptor.descriptor.commit[0].value);
+    try std.testing.expectEqual(protocol.Kind.prepare, decoded.entry.kind);
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, reencoded[8..10], .little));
+    try std.testing.expect(std.mem.allEqual(u8, reencoded[216..224], 0));
+}
+
+test "workload admission completion entry distinguishes single-phase mutations from prepared transactions" {
+    const allocator = std.testing.allocator;
+    const descriptor = try slot.encode(allocator, .{
+        .txn_id = @splat(7),
+        .intent_revision = 0,
+        .limits = .{ .memory_bytes = 4096, .wal_bytes = 4096, .flush_bytes = 4096, .fd_count = 2, .max_operations = 4, .max_encoded_bytes = 4096 },
+        .profile_fence = "replicated-mutation",
+        .commit = &.{},
+        .abort = &.{},
+    }, .{});
+    defer allocator.free(descriptor);
+    var input = fixture(descriptor);
+    input.kind = .mutation;
+    const wire = try encode(allocator, input);
+    defer allocator.free(wire);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, wire[8..10], .little));
+    try std.testing.expectEqual(@as(u16, 8), protocol.requiredRaftVersion(input.kind));
+    var decoded = try decode(allocator, wire);
+    defer decoded.deinit();
+    try std.testing.expectEqual(protocol.Kind.mutation, decoded.entry.kind);
+    try std.testing.expectEqual(@as(usize, 0), decoded.decoded_descriptor.descriptor.commit.len);
+    try std.testing.expectEqual(@as(usize, 0), decoded.decoded_descriptor.descriptor.abort.len);
+    try std.testing.expectEqual(@as(usize, 3), decoded.entry.prepare_operations.len);
+    const copied = try encode(allocator, decoded.entry);
+    defer allocator.free(copied);
+    try std.testing.expectEqualSlices(u8, wire, copied);
+
+    // Neither a recomputed checksum nor an older advertised version can turn
+    // a single-phase mutation into a v1 prepare.
+    std.mem.writeInt(u16, wire[8..10], 1, .little);
+    @memcpy(wire[224..256], &checksum(wire));
+    try std.testing.expectError(error.UnsupportedCompletionSlotVersion, decode(std.testing.failing_allocator, wire));
+    std.mem.writeInt(u16, wire[8..10], 2, .little);
+    wire[216] = 0;
+    @memcpy(wire[224..256], &checksum(wire));
+    try std.testing.expectError(error.UnsupportedCompletionSlotVersion, decode(std.testing.failing_allocator, wire));
+    wire[216] = 1;
+    wire[217] = 1;
+    @memcpy(wire[224..256], &checksum(wire));
+    try std.testing.expectError(error.InvalidCompletionSlot, decode(std.testing.failing_allocator, wire));
+}
+
+test "workload admission completion entry forbids future outcomes on single-phase mutations" {
+    const allocator = std.testing.allocator;
+    const descriptor = try fixtureDescriptor(allocator);
+    defer allocator.free(descriptor);
+    var input = fixture(descriptor);
+    input.kind = .mutation;
+    try std.testing.expectError(error.InvalidCompletionSlot, encode(allocator, input));
+    input.kind = .prepare;
+    const wire = try encode(allocator, input);
+    defer allocator.free(wire);
+    std.mem.writeInt(u16, wire[8..10], protocol.mutation_version, .little);
+    wire[216] = @intFromEnum(protocol.Kind.mutation);
+    @memcpy(wire[224..256], &checksum(wire));
+    try std.testing.expectError(error.InvalidCompletionSlot, decode(allocator, wire));
 }
 
 test "workload admission completion entry rejects canonical framing corruption and oversized input before allocation" {

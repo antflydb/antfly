@@ -512,6 +512,9 @@ pub fn Pool(comptime Backend: type) type {
 
         fn validateEntry(self: *Self, entry: *const entry_codec.OwnedEntry) !void {
             const e = entry.entry;
+            // The codec reserves the single-phase format before its native
+            // publisher is integrated. Never apply it as a prepared vote.
+            if (e.kind != .prepare) return error.UnsupportedCompletionProfile;
             const identity = self.config.identity;
             if (e.group_id != identity.group_id or !std.mem.eql(u8, &e.group_incarnation, &identity.incarnation) or
                 !std.mem.eql(u8, &e.policy_digest, &identity.policy_digest) or

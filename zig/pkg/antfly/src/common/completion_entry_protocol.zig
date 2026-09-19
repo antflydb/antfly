@@ -6,9 +6,28 @@
 const std = @import("std");
 pub const magic = "AFCENTRY";
 pub const version: u16 = 1;
+/// Single-phase mutations cannot be interpreted as transaction prepares by
+/// an older replica. The family stays reserved even for an unknown version.
+pub const mutation_version: u16 = 2;
+pub const Kind = enum(u8) { prepare = 0, mutation = 1 };
 pub const profile: u16 = 1;
 pub const max_wire_bytes = 512 * 1024;
 pub const raft_batch_protocol_version: u16 = 7;
+pub const mutation_raft_batch_protocol_version: u16 = 8;
+
+pub fn wireVersion(kind: Kind) u16 {
+    return switch (kind) {
+        .prepare => version,
+        .mutation => mutation_version,
+    };
+}
+
+pub fn requiredRaftVersion(kind: Kind) u16 {
+    return switch (kind) {
+        .prepare => raft_batch_protocol_version,
+        .mutation => mutation_raft_batch_protocol_version,
+    };
+}
 
 /// Durable progress matches the complete original Raft Entry.data bytes.
 /// Envelope checksums are validated separately and are included in this hash.
