@@ -88,9 +88,9 @@ The implementation now consists of:
   remain indexed until vacuum and are skipped during iteration. Write cursors
   merge a sorted, latest-write-wins overlay containing only that transaction's
   pending mutations; this provides read-your-writes without materializing the
-  durable namespace. Pinned reads use concurrent positional I/O. A
-  `std.Io.RwLock` allows normal append-only commits while readers pin roots and
-  blocks vacuum before it can reclaim those roots.
+  durable namespace. Pinned reads use concurrent positional I/O and retain
+  their file generation across vacuum. Short index reads use a generation
+  lock during publication; old document readers continue on their original inode.
 - `storage/lite/index_storage.zig` stores Antfly index logical files in the
   native index catalog inside the same `.aflite` file.
   Each catalog checkpoint owns an immutable descriptor containing its history
@@ -356,12 +356,14 @@ checks the token at safe page and record boundaries, including during shutdown.
 Only one maintenance job runs at a time; a
 conflicting request returns `409`, and an engine that does not support an
 operation returns `422`. Completed jobs are retained in a bounded in-memory
-history. Lite reports `online: false`: check, compaction, and vacuum acquire the
-exclusive maintenance gate. Readiness becomes false and new database requests
-receive `503` while admin status and cancellation remain available. This avoids
-unbounded request queues and does not call a stop-the-world rewrite "online".
+history. Native Lite reports `online: true`: integrity checks pin a header and
+file length, while compaction and vacuum copy a pinned generation and catch up
+foreground mutations before publication. Readiness stays available during these
+jobs. The compatibility bridge still uses the exclusive maintenance gate.
 Native checkpoint publication and generation replacement serialize under the
-Lite store mutex. Document writes and maintenance also use FIFO writer admission.
+Lite store mutex. Document writers use FIFO admission; vacuum reserves the writer
+slot for its short publication window and returns `FileBusy` if bounded catch-up
+cannot finish.
 Private staged index output enters the store mutex only for final publication.
 Vacuum walks the current checkpoint's catalog and document indexes, skips
 tombstones, and streams values into replacement pages without a temporary LSM
@@ -1015,3 +1017,99 @@ The naming recommendation is:
 - Live single-file Lite database: `*.aflite`
 - Portable backup archive: `*.afb`
 - CLI/internal workspace: `~/.antfly/lite/`
+
+
+## Native throughput and online compaction
+
+Native v3 now has two explicit signatures: `AFLITE\x03N` for the original
+unpacked encoding and `AFLITE\x03P` for packed records. New files use the packed
+encoding. Existing unpacked v3 files remain readable and writable without
+conversion; explicit vacuum writes a packed replacement. Revision 2 remains
+unsupported. Older binaries reject the packed signature before checkpoint
+selection, preventing an older reader from silently selecting a pre-packing
+fallback checkpoint. A packed file requires a binary supporting this encoding.
+
+Small records in multi-key transactions share immutable record pages. A tagged
+reference identifies a physical page and a validated record offset; large
+records keep individual pages and external values keep their extent/chain
+representation. Checks validate physical checksums, record boundaries, and
+checkpoint ownership. Vacuum uses the same packing rules as compact-size
+accounting. Record and index writes coalesce in bounded page-write buffers.
+
+Write transactions maintain one ordered pending-key index. Point reads and
+cursors use that index directly, and commit emits only each key's final mutation.
+Earlier value versions remain alive until transaction teardown because `get`
+returns borrowed values. Sorted multi-reads visit each relevant index node once,
+then order record references by physical page so a packed page is read and
+checksummed once for all requested records on it. Result order remains the
+caller's key order; missing keys and duplicate requests retain their semantics.
+
+The page cache uses incremental CLOCK eviction. Incoming payload pages start
+cold; reads promote pages and navigation metadata gets additional chances.
+Capacity pressure evicts only enough pages to admit the next page. Oversized
+pages bypass admission, and reused page IDs invalidate previous contents.
+Resource-manager pressure still controls cache memory.
+
+Document commits and index-file mutations enter a synchronous commit queue.
+Up to 64 queued requests share one native transaction and one durable checkpoint
+publication. The leader hands off after each group, so an unending producer
+cannot prevent a completed caller from returning. A failed group fails all its
+members; publication failures fence subsequent coordinated writes until reopen.
+
+An index append with `sync=false` advances this handle's visible roots while
+retaining the last durable on-disk checkpoint slots. A subsequent durable
+mutation or explicit sync publishes those accumulated changes with the normal
+sync barriers. A separate open observes the last published checkpoint until
+that barrier. `no_sync` remains the explicit handle-level durability opt-out.
+Callers requiring durable completion must request a barrier and handle its
+errors; completion of an asynchronous append is not a durability promise.
+
+Store-level vacuum prepares its replacement from a pinned snapshot while
+foreground reads and mutations continue. It captures changed keys across the
+document, index, and private metadata catalogs and streams their final values
+into the replacement. Catch-up holds at most 65,536 keys / 4 MiB of key bytes
+and makes at most eight rounds. If it cannot catch up, it returns `FileBusy`,
+discards the unpublished replacement, and leaves foreground commits intact.
+Cancellation is checked during copying and catch-up. The final publication
+reserves the writer slot and briefly fences checkpoint acquisition and logical
+index-file reads while publishing the final header and atomic rename.
+
+Document read transactions own references to their original file generation.
+Vacuum can publish without waiting for those transactions; retired descriptors
+and caches are released after their last reader. Physical reclamation occurs by
+replacing and retiring whole file generations, rather than reusing pages that
+might still belong to a reader. Compaction is explicitly requested through the
+existing maintenance API; this change does not add an automatic vacuum policy.
+
+The server maintenance coordinator advertises native maintenance as online.
+Integrity checks pin both the header and observed file length under the mutation
+mutex, then validate that snapshot outside it. Later appends do not create false
+tail-corruption reports; a tail already present when pinned remains an error.
+Compaction releases the namespace registry lock after its initial sync barrier.
+
+Secret metadata enumeration also uses a scope-bounded catalog cursor. It does
+not materialize unrelated private metadata or encrypted values from other scopes.
+
+Run `zig build lite-native-benchmark -Doptimize=ReleaseSafe` for the reproducible
+transaction-assembly, commit, and sorted-read workloads. Timings are observations;
+structural tests enforce page-read, write-call, memory, and correctness bounds.
+
+### Throughput baseline
+
+Measured against `1debc3d03d` with the same benchmark source, Zig 0.16.0,
+ReleaseSafe, and the C allocator. Values are medians of three alternating runs
+on the same development machine. Each run creates a file, assembles one sorted
+batch with a missing-key read before each insert, commits small document values,
+and reads all keys in order. The build step compiles the benchmark separately.
+
+| Records | Assembly before / after | Commit before / after | Sorted reads before / after | Page accesses before / after | File bytes before / after |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 1.62 / 0.70 ms | 3.94 / 0.29 ms | 3.06 / 0.23 ms | 3,000 / 24 | 4,136,960 / 110,592 |
+| 4,000 | 19.12 / 2.68 ms | 16.29 / 0.91 ms | 13.31 / 0.87 ms | 12,000 / 92 | 16,498,688 / 389,120 |
+| 16,000 | 274.66 / 10.85 ms | 65.52 / 3.60 ms | 67.97 / 3.85 ms | 48,000 / 363 | 65,941,504 / 1,499,136 |
+
+This workload uses `no_sync`, warm filesystem caches, and small values. Page
+accesses include cache lookups; they are not physical disk I/O counts. Other
+builds ran on the host during measurement. Durable fsync throughput, vector
+index construction, and sustained concurrent compaction need separate workload
+qualification. Timing thresholds are intentionally absent from the tests.

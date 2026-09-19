@@ -551,12 +551,7 @@ pub const Handle = struct {
                 if (cancel) |token| try token.check();
                 break :blk toCheckReport(report);
             },
-            .native_single_file => blk: {
-                const store = self.native_docstore.?;
-                platform_sync.lockYielding(&store.mutex);
-                defer store.mutex.unlock();
-                break :blk try store.file.checkWithCancel(cancel);
-            },
+            .native_single_file => try self.native_docstore.?.checkWithCancel(cancel),
         };
     }
 
@@ -573,10 +568,9 @@ pub const Handle = struct {
             .engine = "lite",
             .format = status.format,
             .fsync = status.fsync,
-            // Native maintenance takes the file's exclusive maintenance gate.
-            // It is callable through the asynchronous admin surface, but is
-            // deliberately not advertised as availability-preserving.
-            .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = false },
+            // Native checks pin a snapshot; compaction copies outside the
+            // foreground gate and reserves writers only for publication.
+            .maintenance = .{ .check = true, .compact = true, .vacuum = true, .online = self.engine == .native_single_file },
         };
     }
 
@@ -597,12 +591,14 @@ pub const Handle = struct {
                 };
             },
             .compact => blk: {
-                platform_sync.lockYielding(&self.namespace_mutex);
-                defer self.namespace_mutex.unlock();
-                var runtimes = self.namespace_runtimes.valueIterator();
-                while (runtimes.next()) |runtime| {
-                    try cancel.check();
-                    try runtime.runtime_store.sync(true);
+                {
+                    platform_sync.lockYielding(&self.namespace_mutex);
+                    defer self.namespace_mutex.unlock();
+                    var runtimes = self.namespace_runtimes.valueIterator();
+                    while (runtimes.next()) |runtime| {
+                        try cancel.check();
+                        try runtime.runtime_store.sync(true);
+                    }
                 }
                 const report = try self.vacuumWithCancel(cancel);
                 break :blk vacuumMaintenanceResult(report);
@@ -1063,6 +1059,9 @@ test "lite backend native engine creates and checks aflite file" {
     defer handle.deinit();
 
     try handle.native_docstore.?.file.putDocument("doc:1", "value");
+    try std.testing.expect(handle.maintenanceSource().status().maintenance.online);
+    var cancel = maintenance.CancelToken{};
+    try std.testing.expect((try handle.maintenanceSource().run(.check, &cancel)).valid.?);
 
     const report = try handle.check();
     try std.testing.expect(report.valid);
