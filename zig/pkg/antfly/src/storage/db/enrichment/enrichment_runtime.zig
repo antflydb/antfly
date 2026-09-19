@@ -26149,14 +26149,32 @@ fn denseArtifactTargetsForArtifact(
     out: *std.ArrayListUnmanaged(usize),
 ) !void {
     for (runtime.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
-        const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+        // Keep this artifact-backed test and name match in lockstep with
+        // `DB.DenseArtifactCounterCatalog.init`/`denseIndexIsArtifactBacked`
+        // (storage/db/db.zig): both must recognize the same set of durable
+        // dense-artifact-counter targets. A multi-source/artifact-consuming
+        // index (`sources: [{artifact: ...}]`, e.g. chunk-then-embed pipelines)
+        // records its consumed artifact names in `embedding_names`, not the
+        // singular legacy `embedding_name`. Omitting it here silently drops
+        // every guarded-embedding-write counter update for that index: the
+        // durable target counter then never advances even though embedding
+        // artifacts are actually produced and applied, and derived replay
+        // permanently defers to artifact-maintenance debt that nothing drains.
+        const artifact_backed = entry.external or entry.chunk_name != null or
+            entry.embedding_name != null or entry.embedding_names.len > 0;
         if (!artifact_backed) continue;
         if (entry.dims != dims) continue;
-        if (std.mem.eql(u8, entry.config.name, artifact_name) or
-            (entry.embedding_name != null and std.mem.eql(u8, entry.embedding_name.?, artifact_name)))
-        {
-            try out.append(runtime.alloc, dense_index_idx);
+        var matches = std.mem.eql(u8, entry.config.name, artifact_name) or
+            (entry.embedding_name != null and std.mem.eql(u8, entry.embedding_name.?, artifact_name));
+        if (!matches) {
+            for (entry.embedding_names) |embedding_name| {
+                if (std.mem.eql(u8, embedding_name, artifact_name)) {
+                    matches = true;
+                    break;
+                }
+            }
         }
+        if (matches) try out.append(runtime.alloc, dense_index_idx);
     }
 }
 

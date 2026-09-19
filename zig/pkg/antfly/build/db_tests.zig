@@ -352,6 +352,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "each execution lane persists and clears its own replay cursor scope",
         "asset producer runtime accepts an unrequested boundary-model schema_version upgrade",
         "asset producer runtime batch path accepts an unrequested boundary-model schema_version upgrade",
+        "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter",
+        "runUntilIdle no-progress guard fails fast with a named stuck-index diagnostic",
+        "target advance stuck tracking records first-seen time and clears on success",
     };
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = antfly_test_mod,

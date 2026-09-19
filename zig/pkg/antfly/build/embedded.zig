@@ -429,6 +429,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite defaults embedded generation budgets when no override is given",
         "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
         "capi get edges json does not double free a non-empty edge slice",
+        "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_mod,

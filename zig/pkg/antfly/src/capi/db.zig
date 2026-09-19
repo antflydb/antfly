@@ -1270,6 +1270,7 @@ const ReadableLeaseHook = struct {
             .busy => return error.WouldBlock,
             .outcome_unknown => return error.DurabilityOutcomeUnknown,
             .unsupported => return error.UnsupportedOperation,
+            .stalled => return error.Stalled,
             .internal => return error.Internal,
         }
     }
@@ -7915,7 +7916,10 @@ pub export fn antfly_lite_run_until_idle_json(handle_ptr: ?*anyopaque, out_buf: 
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
-    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    handle.db.runUntilIdle() catch |err| {
+        writeRunUntilIdleNoProgressDiagnosticIfAny(&handle.db, out, err);
+        return capi.mapError(err);
+    };
     out.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
     return .ok;
 }
@@ -9130,9 +9134,28 @@ pub export fn antfly_db_run_until_idle_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    handle.db.runUntilIdle() catch |err| {
+        writeRunUntilIdleNoProgressDiagnosticIfAny(&handle.db, out_buf, err);
+        return capi.mapError(err);
+    };
     out_buf.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
     return .ok;
+}
+
+/// On `error.RunUntilIdleNoProgress` (mapped to `capi.ErrorCode.stalled`),
+/// best-effort populate `out_buf` with the exact stuck index name and its
+/// indexed/expected counters (see `DB.NoProgressDiagnostic`) instead of
+/// leaving callers with only the non-descriptive status code. Any other
+/// error leaves `out_buf` untouched, matching every other failure path here.
+fn writeRunUntilIdleNoProgressDiagnosticIfAny(db: anytype, out_buf: *capi.Buffer, err: anyerror) void {
+    if (err != error.RunUntilIdleNoProgress) return;
+    const diagnostic = db.lastRunUntilIdleNoProgressDiagnostic() orelse return;
+    out_buf.* = stringifyJson(.{
+        .index_name = diagnostic.index_name,
+        .indexed = diagnostic.indexed,
+        .expected = diagnostic.expected,
+        .stuck_ms = diagnostic.stuck_ns / std.time.ns_per_ms,
+    }) catch return;
 }
 
 pub export fn antfly_db_pending_work_stats_json(

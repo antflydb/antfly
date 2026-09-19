@@ -2221,3 +2221,156 @@ func assertHierarchyParentDocKey(t *testing.T, result []byte, wantParentKey stri
 	}
 	t.Fatalf("no hit with hierarchy.parent_doc_key=%q in result: %s", wantParentKey, result)
 }
+
+// TestLiteNativeDogfoodShapedChunkVectorsAndKnowledgeGraphConverge is a
+// regression test for the dogfood in-process ingest livelock: a dense_vector
+// index that consumes a two-stage chunk-then-embed pipeline entirely through
+// its own nested `enrichments` (a `chunk` producer plus an `embedding`
+// producer referenced by the dense index's plural `sources` config, exactly
+// examples/dogfood/index_config.go's `chunk_vectors` shape) alongside a
+// `knowledge` graph index fed by an extractor asset producer never converged:
+// `RunUntilIdleStatus` spun forever because the durable dense-artifact target
+// counter never advanced (see storage/db/enrichment/enrichment_runtime.zig's
+// denseArtifactTargetsForArtifact, which matched only the singular
+// `embedding_name` and not the plural `embedding_names` populated by
+// `sources`). This exercises that exact combination end to end through fake
+// `/ai/v1/embed` and `/ai/v1/extract` servers (no real model) across enough
+// documents (50) to make a livelock-vs-slow-drain distinction meaningful, and
+// asserts both a semantic hit and graph edges are actually present once
+// RunUntilIdleStatus returns.
+func TestLiteNativeDogfoodShapedChunkVectorsAndKnowledgeGraphConverge(t *testing.T) {
+	const dims = 4
+	const docCount = 50
+
+	embedServer, embedCalls := newFakeAntflyEmbedServer(t, dims)
+	extractServer := newFakeAntflyExtractServer(t)
+
+	path := filepath.Join(t.TempDir(), "dogfood-shaped-chunk-vectors-and-knowledge.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:                     OpenModeWriter,
+		Profile:                  ProfileNative,
+		RemoteProviderConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("create native remote-provider Lite database: %v", err)
+	}
+	defer db.Close()
+
+	// dogfood's `chunk_vectors`: one dense_vector index nesting both the
+	// `chunk` producer ("doc_chunks_v1") and the `embedding` producer
+	// ("doc_chunk_dense_v1") in its own config, consuming the embedding
+	// artifact through the plural `sources` array -- the exact shape that
+	// hit the missing-match bug (a singular `embedding_name` config never
+	// did).
+	chunkVectorsIndex, err := json.Marshal(map[string]any{
+		"name": "chunk_vectors",
+		"kind": "dense_vector",
+		"config_json": mustMarshalJSONString(t, map[string]any{
+			"type":            "embeddings",
+			"sources":         []map[string]any{{"artifact": "doc_chunk_dense_v1"}},
+			"dimension":       dims,
+			"distance_metric": "cosine",
+			"embedder": map[string]any{
+				"provider": "antfly",
+				"model":    "fake-embedder",
+				"api_url":  embedServer.URL,
+			},
+			"enrichments": []map[string]any{
+				{
+					"name":       "doc_chunks_v1",
+					"kind":       "chunk",
+					"field":      "body",
+					"chunk_size": 256,
+				},
+				{
+					"name":                 "doc_chunk_dense_v1",
+					"kind":                 "embedding",
+					"field":                "body",
+					"source_artifact_name": "doc_chunks_v1",
+					"expected_dims":        dims,
+				},
+			},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("marshal chunk_vectors index envelope: %v", err)
+	}
+	if err := db.AddIndexJSON(chunkVectorsIndex); err != nil {
+		t.Fatalf("add chunk_vectors dense_vector index: %v", err)
+	}
+
+	// dogfood's `knowledge`: a graph index fed by a `relations_v1` extractor
+	// asset producer.
+	const graphIndexName = "knowledge"
+	const graphArtifactName = "relations_v1"
+	knowledgeIndex, err := knowledgeGraphIndexJSONForTest(graphIndexName, graphArtifactName, extractServer.URL)
+	if err != nil {
+		t.Fatalf("build knowledge graph index config: %v", err)
+	}
+	if err := db.AddIndexJSON(knowledgeIndex); err != nil {
+		t.Fatalf("add knowledge graph index: %v", err)
+	}
+
+	const targetBody = "the antfly VOPR harness fences strong reads during a leadership transition"
+	writes := make([]WriteIntent, docCount)
+	targetKey := fmt.Sprintf("doc:%03d", docCount/2)
+	for i := 0; i < docCount; i++ {
+		key := fmt.Sprintf("doc:%03d", i)
+		body := targetBody
+		if key != targetKey {
+			body = fmt.Sprintf("unrelated filler document number %d about databases and storage engines", i)
+		}
+		writes[i] = WriteIntent{
+			Key:   key,
+			Value: []byte(fmt.Sprintf(`{"title":"doc %d","body":%q}`, i, body)),
+		}
+	}
+	if err := db.Batch(writes, 2 /* sync_level: full_index */); err != nil {
+		t.Fatalf("batch write %d documents: %v", docCount, err)
+	}
+
+	pending, err := db.RunUntilIdleStatus()
+	if err != nil {
+		t.Fatalf("run until idle: %v", err)
+	}
+	var enrichment enrichmentPendingWorkStatus
+	if err := json.Unmarshal(pending.Enrichment, &enrichment); err != nil {
+		t.Fatalf("decode enrichment pending work: %v; raw=%s", err, pending.Enrichment)
+	}
+	if enrichment.ErrorCount != 0 || enrichment.FatalErrorCount != 0 || enrichment.Stalled ||
+		enrichment.TargetSequence != enrichment.AppliedSequence {
+		t.Fatalf("chunk_vectors + knowledge did not drain cleanly: %#v", enrichment)
+	}
+	if atomic.LoadInt32(embedCalls) == 0 {
+		t.Fatalf("fake inference server received no /ai/v1/embed requests; the embedding artifact enrichment never ran")
+	}
+
+	// A semantic hit against chunk_vectors resolves to the target document,
+	// proving the two-stage chunk-then-embed pipeline actually published a
+	// searchable vector (a silently-empty index returns zero hits here, not
+	// a wrong one).
+	semanticQuery, err := json.Marshal(map[string]any{
+		"semantic_search": targetBody,
+		"indexes":         []string{"chunk_vectors"},
+		"hierarchy":       map[string]any{"return_level": "chunk"},
+		"limit":           5,
+	})
+	if err != nil {
+		t.Fatalf("marshal semantic query: %v", err)
+	}
+	semanticResult, err := db.SearchJSON(semanticQuery)
+	if err != nil {
+		t.Fatalf("semantic query: %v result=%s", err, semanticResult)
+	}
+	assertHierarchyParentDocKey(t, semanticResult, targetKey)
+
+	// The knowledge graph index produced edges from every document's
+	// extracted relation.
+	edges, err := db.EdgesJSON(graphIndexName, targetKey, "", 2 /* both */)
+	if err != nil {
+		t.Fatalf("edges json: %v", err)
+	}
+	if !bytes.Contains(edges, []byte("depends_on")) {
+		t.Fatalf("edges JSON %q did not contain the extracted depends_on edge for %s", edges, targetKey)
+	}
+}

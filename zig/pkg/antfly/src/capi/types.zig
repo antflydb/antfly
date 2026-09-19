@@ -220,6 +220,14 @@ pub const ErrorCode = enum(c_int) {
     busy = 6,
     outcome_unknown = 7,
     unsupported = 8,
+    /// A bounded background/foreground drain (e.g. `antfly_db_run_until_idle`)
+    /// detected that a managed index made no forward progress for its
+    /// configured stall window and gave up instead of spinning forever. Not a
+    /// malformed request or a generic server fault: retrying after operator
+    /// intervention (or waiting for a slow-but-legitimate backlog) may
+    /// succeed. See `antfly_lite_run_until_idle_json`/`antfly_db_run_until_idle_json`
+    /// for the stuck index name and indexed/expected counters.
+    stalled = 9,
     internal = 255,
 };
 
@@ -234,6 +242,7 @@ pub fn errorCodeName(code: c_int) [*:0]const u8 {
         @intFromEnum(ErrorCode.busy) => "ANTFLY_BUSY",
         @intFromEnum(ErrorCode.outcome_unknown) => "ANTFLY_OUTCOME_UNKNOWN",
         @intFromEnum(ErrorCode.unsupported) => "ANTFLY_UNSUPPORTED",
+        @intFromEnum(ErrorCode.stalled) => "ANTFLY_STALLED",
         @intFromEnum(ErrorCode.internal) => "ANTFLY_INTERNAL",
         else => "ANTFLY_UNKNOWN_ERROR",
     };
@@ -250,6 +259,7 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
         @intFromEnum(ErrorCode.busy) => "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
         @intFromEnum(ErrorCode.outcome_unknown) => "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
         @intFromEnum(ErrorCode.unsupported) => "the operation requires a capability that is not supported by this platform or filesystem",
+        @intFromEnum(ErrorCode.stalled) => "a bounded drain made no forward progress for its configured stall window and gave up",
         @intFromEnum(ErrorCode.internal) => "an internal error occurred",
         else => "unknown Antfly error code",
     };
@@ -353,6 +363,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         => .busy,
         error.FileLocksUnsupported => .unsupported,
         error.DurabilityOutcomeUnknown => .outcome_unknown,
+        error.RunUntilIdleNoProgress => .stalled,
         // A dimension probe against a live embedder hit an operational
         // (network/transport) failure rather than a malformed request --
         // matches `managed_embedder.isOperationalEmbeddingProbeError`'s
@@ -360,4 +371,16 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.EmbeddingProbeUnavailable => .busy,
         else => .internal,
     };
+}
+
+test "run until idle no-progress error maps to a dedicated stalled ABI code, not internal" {
+    // Regression guard for the dogfood ingest livelock follow-up: a bounded
+    // stall must be distinguishable at the C ABI from an opaque server fault.
+    try std.testing.expectEqual(ErrorCode.stalled, mapError(error.RunUntilIdleNoProgress));
+    try std.testing.expect(ErrorCode.stalled != ErrorCode.internal);
+    try std.testing.expectEqualStrings("ANTFLY_STALLED", std.mem.span(errorCodeName(@intFromEnum(ErrorCode.stalled))));
+    try std.testing.expectEqualStrings(
+        "ANTFLY_INTERNAL",
+        std.mem.span(errorCodeName(@intFromEnum(ErrorCode.internal))),
+    );
 }
