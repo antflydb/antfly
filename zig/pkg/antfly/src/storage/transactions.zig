@@ -136,6 +136,77 @@ const resolved_participants_prefix = "\x00\x00__txn_resolved_participants__:";
 const ha_batch_outbox_prefix = "\x00\x00__txn_ha_batch_outbox__:";
 const ha_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
 
+/// Physical metadata traffic for one begin, one decision, and every unique
+/// participant acknowledgement. Intent application and native ownership rows
+/// are additional costs. This is a sizing input, not a native resource lease.
+/// Duplicate commands assigned fresh consensus indices need separate admission;
+/// they cannot spend the finite budget for unique lifecycle transitions.
+pub const CompletionControlBudget = struct {
+    participant_list_bytes: u64,
+    acknowledgement_list_bytes: u64,
+    mutations: u64,
+    operations: u64,
+    payload_bytes: u64,
+    max_mutation_payload_bytes: u64,
+    wal_bytes: u64,
+
+    fn add(a: u64, b: u64) !u64 {
+        return std.math.add(u64, a, b) catch error.TransactionTooLarge;
+    }
+
+    fn mul(a: u64, b: u64) !u64 {
+        return std.math.mul(u64, a, b) catch error.TransactionTooLarge;
+    }
+
+    pub fn measure(participants: []const []const u8) !CompletionControlBudget {
+        if (participants.len > std.math.maxInt(u32)) return error.TransactionTooLarge;
+        var list_bytes: u64 = @sizeOf(u32);
+        for (participants) |participant| {
+            if (participant.len > std.math.maxInt(u32)) return error.TransactionTooLarge;
+            list_bytes = try add(list_bytes, try add(@sizeOf(u32), participant.len));
+        }
+        return fromEncodedList(participants.len, list_bytes);
+    }
+
+    fn fromEncodedList(count: u64, list_bytes: u64) !CompletionControlBudget {
+        if (count > std.math.maxInt(u32) or list_bytes > std.math.maxInt(u32)) return error.TransactionTooLarge;
+        const record = records_prefix.len + @sizeOf(TxnId) + txn_record_v6_size;
+        const participants_key = participants_prefix.len + @sizeOf(TxnId);
+        const resolved_key = resolved_participants_prefix.len + @sizeOf(TxnId);
+        const credit_key = completion_prefix.len + @sizeOf(TxnId);
+        const summary = completion_summary_key.len + 16;
+        // Begin always has five rows, including the resolved-set tombstone.
+        // An empty participant set deletes its sidecar instead of storing a list.
+        const begin = try add(record + participants_key + resolved_key + credit_key + 16 + summary, if (count == 0) 0 else list_bytes);
+        // Metadata-only resolve writes the record and retires three intent/schema
+        // sidecars. Charging ledger retirement here AND each ACK is conservative
+        // across follower, coordinator, and empty-participant lifecycles.
+        const decision = record + intent_admission_prefix.len + @sizeOf(TxnId) +
+            intent_keys_prefix.len + @sizeOf(TxnId) + schema_leases_prefix.len + @sizeOf(TxnId) + credit_key + summary;
+        const ack_fixed = resolved_key + credit_key + summary;
+        // ACK order is unconstrained. Every prefix is at most the complete
+        // encoded list, so N*L bounds all N rewrites in linear sizing time.
+        // A fixed multiplier of participant-name bytes does not bound this.
+        const acknowledgement_lists = try mul(count, list_bytes);
+        const acknowledgements = try add(try mul(count, ack_fixed), acknowledgement_lists);
+        const payload = try add(try add(begin, decision), acknowledgements);
+        const mutations = try add(2, count);
+        const operations = try add(5 + 6, try mul(count, 3));
+        // Native WAL v1: 16-byte record header, four-byte row count, and
+        // 16-byte row headers. Include the longest supported namespace, docs.
+        const wal_bytes = try add(payload, try add(try mul(mutations, 20), try mul(operations, 16 + "docs".len)));
+        return .{
+            .participant_list_bytes = list_bytes,
+            .acknowledgement_list_bytes = acknowledgement_lists,
+            .mutations = mutations,
+            .operations = operations,
+            .payload_bytes = payload,
+            .max_mutation_payload_bytes = @max(begin, @max(decision, if (count == 0) 0 else try add(ack_fixed, list_bytes))),
+            .wal_bytes = wal_bytes,
+        };
+    }
+};
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -490,12 +561,16 @@ pub const TxnManager = struct {
     }
 
     fn completionMetadataBytes(participants: []const []const u8) !u64 {
+        const control = try CompletionControlBudget.measure(participants);
+        // Preserve the existing small-transaction working-state allowance;
+        // additionally cover the full sequence of participant-list rewrites.
+        // The ledger is admission accounting, not proof of physical backing.
         var bytes: u64 = 4096;
         for (participants) |participant| {
             const payload = std.math.mul(u64, participant.len, 64) catch return error.TransactionTooLarge;
             bytes = std.math.add(u64, bytes, std.math.add(u64, payload, 128) catch return error.TransactionTooLarge) catch return error.TransactionTooLarge;
         }
-        return bytes;
+        return @max(bytes, control.wal_bytes);
     }
 
     fn completionRecord(self: *TxnManager, txn_id: TxnId) !?CompletionRecord {
@@ -3171,6 +3246,137 @@ fn rebindCompiledTemplateForTest(template: *completion_compiler.Template, timest
         });
         std.mem.writeInt(u64, target[binding.offset..][0..8], value, if (binding.byte_order == .little) .little else .big);
     };
+}
+
+test "workload admission completion compiler lifetime control budget covers real WAL rewrites and admission" {
+    const alloc = std.testing.allocator;
+    const codec = @import("lsm_backend/completion_entry.zig");
+    const wal = @import("lsm_backend/wal.zig");
+    const authority: @import("completion_candidate.zig").Authority = .{
+        .group_id = 9,
+        .incarnation = @splat(3),
+        .policy_digest = @splat(4),
+        .schema_catalog_digest = @splat(5),
+        .previous_term = 2,
+        .previous_index = 17,
+    };
+    const Totals = struct {
+        mutations: u64 = 0,
+        operations: u64 = 0,
+        payload: u64 = 0,
+        largest: u64 = 0,
+        wal_bytes: u64 = 0,
+
+        const Rows = struct {
+            operations: []const completion_compiler.slot.Operation,
+            pub fn entryCount(self: @This()) usize {
+                return self.operations.len;
+            }
+            pub fn entryAt(self: @This(), index: usize) struct { namespace_name: ?[]const u8, key: []const u8, value: []const u8, tombstone: bool } {
+                const op = self.operations[index];
+                return .{ .namespace_name = "docs", .key = op.key, .value = op.value, .tombstone = op.kind == .delete };
+            }
+        };
+
+        fn include(self: *@This(), wire: []const u8) !void {
+            var entry = try codec.decode(alloc, wire);
+            defer entry.deinit();
+            const operations = entry.entry.prepare_operations;
+            var payload: u64 = 0;
+            for (operations) |op| payload += op.key.len + op.value.len;
+            self.mutations += 1;
+            self.operations += operations.len;
+            self.payload += payload;
+            self.largest = @max(self.largest, payload);
+            // Use the production WAL encoder, including namespace and record
+            // framing. Preparing bytes performs no filesystem operations.
+            var append = try wal.PreparedAppend.init(alloc, "/control-budget-test", Rows{ .operations = operations }, true, .{});
+            defer append.deinit();
+            self.wal_bytes += append.record.len;
+        }
+
+        fn control(self: *@This(), manager: *TxnManager, input: TxnManager.ControlInput) !void {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            const wire = try manager.compileControlMutation(alloc, &read, input, authority, @splat(6), "control-budget-test", &.{});
+            defer alloc.free(wire);
+            try self.include(wire);
+        }
+    };
+    // Enough distinct participants to exceed the old fixed 64x name-byte
+    // allowance, with unequal binary name lengths and adversarial ACK order.
+    var names: [192][96]u8 = undefined;
+    var participants: [names.len][]const u8 = undefined;
+    for (&names, &participants, 0..) |*name, *participant, i| {
+        @memset(name, @intCast(i));
+        participant.* = name[0 .. 64 + i % 33];
+    }
+    const budget = try CompletionControlBudget.measure(&participants);
+    const charge = try TxnManager.completionMetadataBytes(&participants);
+    var old_charge: u64 = 4096;
+    for (participants) |participant| old_charge += 128 + 64 * participant.len;
+    try std.testing.expect(charge > old_charge);
+    for ([_]TxnStatus{ .committed, .aborted }) |status| {
+        var backend = lsm_backend.Backend.init(alloc, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        const id: TxnId = @splat(202);
+        manager.completion_limits = .{ .max_count = 1, .max_bytes = old_charge };
+        // Admission rejects before creating the transaction or participant set.
+        try std.testing.expectError(error.TransactionRecoveryCapacityExhausted, manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 90, &participants, true, false));
+        try std.testing.expectError(error.TxnNotFound, manager.loadTransactionRecord(id));
+        try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+        manager.completion_limits.max_bytes = charge;
+        var totals: Totals = .{};
+        {
+            var read = try manager.store.beginRead();
+            defer read.abort();
+            const wire = try manager.compileBeginMutation(alloc, &read, .{
+                .txn_id = id,
+                .timestamp = 100,
+                .created_at = 90,
+                .topology_epoch = 0,
+                .participants = &participants,
+                .coordinator = true,
+                .retain_terminal = false,
+            }, authority, @splat(6), "control-budget-test", &.{});
+            defer alloc.free(wire);
+            try totals.include(wire);
+        }
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 90, &participants, true, false);
+        try std.testing.expectEqual(charge, (try manager.completionUsage()).?.bytes);
+        // Lowering admission after begin must not prevent the promised cleanup.
+        manager.completion_limits.max_bytes = 1;
+        try totals.control(&manager, .{ .txn_id = id, .action = .{ .resolve_metadata = .{ .status = status, .timestamp = 200 } } });
+        try manager.resolveIntents(id, status, 200);
+        for (0..participants.len) |ordinal| {
+            const index = if (status == .committed) ordinal else participants.len - ordinal - 1;
+            const participant = participants[index];
+            try totals.control(&manager, .{ .txn_id = id, .action = .{ .acknowledge = participant } });
+            try manager.markParticipantResolved(id, participant);
+            // Duplicate acknowledgements do not retire credit twice. Their
+            // fresh Raft-index costs are deliberately outside this certificate.
+            try manager.markParticipantResolved(id, participant);
+            const usage = (try manager.completionUsage()).?;
+            try std.testing.expectEqual(if (ordinal + 1 == participants.len) @as(u64, 0) else charge, usage.bytes);
+        }
+        try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+        try std.testing.expectEqual(budget.mutations, totals.mutations);
+        try std.testing.expect(totals.operations <= budget.operations);
+        try std.testing.expect(totals.payload <= budget.payload_bytes);
+        try std.testing.expect(totals.largest <= budget.max_mutation_payload_bytes);
+        try std.testing.expect(totals.wal_bytes <= budget.wal_bytes);
+        // Demonstrate the previous charge actually undercounted encoded writes,
+        // rather than merely comparing two versions of the sizing formula.
+        try std.testing.expect(totals.wal_bytes > old_charge);
+    }
+    // No allocation or arithmetic wrap is possible for unencodable declarations.
+    try std.testing.expectError(error.TransactionTooLarge, CompletionControlBudget.fromEncodedList(std.math.maxInt(u64), 4));
+    try std.testing.expectError(error.TransactionTooLarge, CompletionControlBudget.fromEncodedList(1, std.math.maxInt(u64)));
+    try std.testing.expectError(error.TransactionTooLarge, CompletionControlBudget.fromEncodedList(std.math.maxInt(u32), std.math.maxInt(u32)));
 }
 
 test "workload admission completion compiler metadata controls match actual decision acknowledgements and cleanup" {

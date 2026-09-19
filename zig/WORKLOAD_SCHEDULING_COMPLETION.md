@@ -97,6 +97,23 @@ prerequisites are implemented and verified.
   or unlisted participants. This is physical-plan compilation, not completed
   control reservation: DATA routing and replay-free publication must wait for
   independent control ownership retained from begin through the final ACK.
+- Transaction admission now includes a checked lifetime control-write bound.
+  Each unique ACK rewrites the accumulated participant list; the previous fixed
+  64x name-byte allowance did not bound that cumulative traffic. New begins and
+  legacy-ledger initialization charge at least the complete metadata WAL bound,
+  while preserving the existing small-transaction allowance. The ReleaseSafe
+  durable-completion gate passed 32/32 tests, including actual canonical begin,
+  commit/abort and 192 unequal binary participant ACKs measured with the native
+  WAL encoder. Both orders exceed the old charge and fit the new certificate;
+  admission rejects insufficient capacity before creating a transaction, and
+  lowering the ceiling after begin does not block final-ACK retirement. This
+  certificate excludes intent application, native ownership rows and arbitrary
+  duplicate commands at new Raft indices. It is ledger admission accounting,
+  not the outstanding physical control reservation or a retroactive upgrade of
+  already-existing ledger entries. Evidence: `/tmp/workload-control-budget1.log`,
+  actual exit0. Command from `zig/`: `zig build antfly-durable-completion-test
+  -Doptimize=ReleaseSafe -j1 --cache-dir /tmp/zig-workload-scheduling-cache
+  --global-cache-dir /tmp/zig-global-cache`.
 - The owning durable-completion gate subsequently passed 29 tests, including
   six actual child-process kills: document and named-begin mutations stopped
   after acceptance, primary WAL append, and manifest publication. The parent
