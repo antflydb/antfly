@@ -823,7 +823,7 @@ test "gliner boundary qualification measures pinned base checkpoint production g
     // reference by the native and Metal parity tests above. Sweep their exact
     // documents through the same real tokenizer to bound the schema-inflated
     // encoded sequence length actually produced for this feature set.
-    const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const fixture_bytes = try fixtures.fixtureBytes(a, "pipeline_cases_base.json");
     defer a.free(fixture_bytes);
     const parsed = try std.json.parseFromSlice(pipeline.ReferenceFixture, a, fixture_bytes, .{});

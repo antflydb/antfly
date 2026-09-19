@@ -96,6 +96,9 @@ scripts/__pycache__/
 /.benchmark-results/
 /zig/group-*/
 
+# GLiNER2.5 benchmark evidence (large generated reports and fixtures)
+/zig/pkg/inference/scripts/gliner25/evidence/
+
 # TLA+ model checker state directories
 specs/tla/states/
 

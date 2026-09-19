@@ -4112,6 +4112,16 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             return RuntimeError.EnrichmentWorkerFailed;
     }
 
+    /// Explicit drains have no visibility deadline, but must still report
+    /// terminal request failures rather than treating parked repair debt as success.
+    pub fn catchUpUntilForDrain(self: *@This(), sequence: u64) !void {
+        if (sequence == 0) return;
+        const after = self.applied_sequence;
+        try self.catchUpUntil(sequence);
+        if (terminalFailurePendingInRange(self, terminalFailureEnvelopeSnapshot(self), after, sequence))
+            return RuntimeError.EnrichmentWorkerFailed;
+    }
+
     pub fn catchUpUntil(self: *@This(), sequence: u64) !void {
         try self.catchUpUntilGuarded(sequence, .{});
     }
@@ -4795,6 +4805,22 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 );
             }
         }
+    }
+
+    /// Run without a visibility deadline while preserving the wait API's
+    /// durable terminal-failure check, including already-applied prefixes.
+    pub fn catchUpUntilForDrain(self: *EnrichmentRuntime, sequence: u64) !void {
+        if (sequence == 0) return;
+        const io = (self.io_impl orelse return error.MissingBackendRuntimeIo).io();
+        self.mutex.lockUncancelable(io);
+        const after = self.applied_sequence;
+        self.mutex.unlock(io);
+        try self.catchUpUntil(sequence);
+        self.mutex.lockUncancelable(io);
+        const envelope = terminalFailureEnvelopeSnapshot(self);
+        self.mutex.unlock(io);
+        if (terminalFailurePendingInRange(self, envelope, after, sequence))
+            return RuntimeError.EnrichmentWorkerFailed;
     }
 
     pub fn catchUpUntil(self: *EnrichmentRuntime, sequence: u64) !void {
@@ -16118,7 +16144,9 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             .config_json = config_json,
             .source_text = if (has_rendered_media) "" else source_url,
             .source_parts_json = parts_json,
-            .content_type = "text/plain",
+            // A transcript comes back as the full STT response so its
+            // timestamped segments survive into the unit; OCR stays text.
+            .content_type = if (kind == .transcript) "application/json" else "text/plain",
             .inline_media_trusted = has_rendered_media,
             .source_fingerprint = source_fingerprint,
             .item_id = unit.unit_id,
@@ -16836,7 +16864,14 @@ fn applyRuntimeGeneratedUnitTextInPlace(
         .transcript => {
             unit.transcript_used = true;
             unit.transcript_confidence = parsed.confidence;
+            if (unit.transcript_spans.len > 0) alloc.free(unit.transcript_spans);
+            unit.transcript_spans = parsed.spans;
+            parsed.spans = &.{};
         },
+    }
+    if (parsed.spans.len > 0) {
+        alloc.free(parsed.spans);
+        parsed.spans = &.{};
     }
     unit.extraction_warning = final_warning;
     const start = unit.char_start orelse 0;
@@ -16962,13 +16997,61 @@ const RuntimeParsedGeneratedUnitText = struct {
     confidence: ?f64 = null,
     bbox: ?[4]f64 = null,
     warning: ?[]u8 = null,
+    /// Phrase timing when the producer returned transcript segments.
+    spans: []document_extraction_mod.TranscriptSpan = &.{},
 
     fn deinit(self: *RuntimeParsedGeneratedUnitText, alloc: Allocator) void {
         if (self.text.len > 0) alloc.free(self.text);
         if (self.warning) |value| alloc.free(value);
+        if (self.spans.len > 0) alloc.free(self.spans);
         self.* = undefined;
     }
 };
+
+/// Transcript segments from a producer's JSON output (`segments[].text`,
+/// `start_ms`, `end_ms`) resolved to byte spans of `text`.
+fn runtimeGeneratedTextSpansAlloc(alloc: Allocator, object: std.json.ObjectMap, text: []const u8) ![]document_extraction_mod.TranscriptSpan {
+    const value = object.get("segments") orelse return &.{};
+    if (value != .array or value.array.items.len == 0) return &.{};
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const inputs = try scratch.alloc(document_extraction_mod.TranscriptSegmentInput, value.array.items.len);
+    var count: usize = 0;
+    for (value.array.items) |item| {
+        if (item != .object) continue;
+        const segment_text = runtimeGeneratedTextJsonStringField(item.object, "text") orelse continue;
+        const start_ms = runtimeGeneratedTextJsonFloatField(item.object, "start_ms") orelse continue;
+        const end_ms = runtimeGeneratedTextJsonFloatField(item.object, "end_ms") orelse continue;
+        if (start_ms < 0 or end_ms < 0) continue;
+        var words: []document_extraction_mod.TranscriptWordInput = &.{};
+        if (item.object.get("words")) |words_value| {
+            if (words_value == .array and words_value.array.items.len > 0) {
+                words = try scratch.alloc(document_extraction_mod.TranscriptWordInput, words_value.array.items.len);
+                var word_count: usize = 0;
+                for (words_value.array.items) |word_item| {
+                    if (word_item != .object) continue;
+                    const word_text = runtimeGeneratedTextJsonStringField(word_item.object, "word") orelse continue;
+                    const word_start = runtimeGeneratedTextJsonFloatField(word_item.object, "start_ms") orelse continue;
+                    const word_end = runtimeGeneratedTextJsonFloatField(word_item.object, "end_ms") orelse continue;
+                    if (word_start < 0 or word_end < 0) continue;
+                    words[word_count] = .{ .text = word_text, .start_ms = @intFromFloat(word_start), .end_ms = @intFromFloat(word_end) };
+                    word_count += 1;
+                }
+                words = words[0..word_count];
+            }
+        }
+        inputs[count] = .{
+            .text = segment_text,
+            .start_ms = @intFromFloat(start_ms),
+            .end_ms = @intFromFloat(end_ms),
+            .words = words,
+            .speaker = runtimeGeneratedTextJsonStringField(item.object, "speaker"),
+        };
+        count += 1;
+    }
+    return try document_extraction_mod.transcriptSpansFromSegmentsAlloc(alloc, text, inputs[0..count]);
+}
 
 fn parseRuntimeGeneratedUnitTextOutputAlloc(alloc: Allocator, produced: []const u8) !RuntimeParsedGeneratedUnitText {
     const trimmed = std.mem.trimStart(u8, produced, &std.ascii.whitespace);
@@ -16989,6 +17072,7 @@ fn parseRuntimeGeneratedUnitTextOutputAlloc(alloc: Allocator, produced: []const 
     if (runtimeGeneratedTextJsonStringField(parsed.value.object, "warning") orelse runtimeGeneratedTextJsonStringField(parsed.value.object, "extraction_warning")) |warning| {
         out.warning = try alloc.dupe(u8, warning);
     }
+    out.spans = try runtimeGeneratedTextSpansAlloc(alloc, parsed.value.object, out.text);
     return out;
 }
 
@@ -17292,6 +17376,8 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
     errdefer if (page_label) |value| alloc.free(value);
     var text_regions: []document_extraction_mod.TextRegion = if (unit.text_regions.len > 0) try alloc.dupe(document_extraction_mod.TextRegion, unit.text_regions) else &.{};
     errdefer if (text_regions.len > 0) alloc.free(text_regions);
+    var transcript_spans: []document_extraction_mod.TranscriptSpan = if (unit.transcript_spans.len > 0) try alloc.dupe(document_extraction_mod.TranscriptSpan, unit.transcript_spans) else &.{};
+    errdefer if (transcript_spans.len > 0) alloc.free(transcript_spans);
 
     const cloned = document_extraction_mod.Unit{
         .unit_id = unit_id.?,
@@ -17324,6 +17410,7 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
         .page_bbox = unit.page_bbox,
         .page_rotation = unit.page_rotation,
         .text_regions = text_regions,
+        .transcript_spans = transcript_spans,
         .char_start = unit.char_start,
         .char_end = unit.char_end,
     };
@@ -17341,6 +17428,7 @@ fn cloneDocumentExtractionUnit(alloc: Allocator, unit: document_extraction_mod.U
     ocr_failure_stage = null;
     page_label = null;
     text_regions = &.{};
+    transcript_spans = &.{};
     return cloned;
 }
 
@@ -19451,6 +19539,7 @@ fn appendRuntimeDocumentUnitChunkWrites(
             try chunker_mod.chunkText(working_alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
         defer chunker_mod.freeChunks(working_alloc, chunks);
         if (chunks.len == 0) continue;
+        document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
         const include_default_full_text = entry.full_text_index or
             try chunking_types_mod.parseHasFullTextIndexFromSlice(working_alloc, entry.chunker_json);
@@ -25073,6 +25162,7 @@ fn documentUnitPayloadAlloc(
             .ocr_bbox = unit.ocr_bbox,
             .transcript_used = unit.transcript_used,
             .transcript_confidence = unit.transcript_confidence,
+            .transcript_spans = if (unit.transcript_spans.len > 0) unit.transcript_spans else null,
             .extraction_warning = unit.extraction_warning,
             .page_number = unit.page_number,
             .page_label = unit.page_label,
@@ -29765,4 +29855,36 @@ test "extractSourceText with template and scrubHtml helper" {
     const result = try extractSourceText(alloc, .{}, doc, request) orelse return error.TestUnexpectedResult;
     defer alloc.free(result);
     try std.testing.expectEqualStrings("HelloWorld", result);
+}
+
+test "enrichment terminal failure envelope is preserved by unbounded drains" {
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = .{ .borrowed = io_impl.io() },
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+        .applied_sequence = 10,
+        .target_sequence = 10,
+        .terminal_failure_min_sequence = 10,
+        .terminal_failure_max_sequence = 10,
+    };
+    // Terminal request failures do not fail the worker; applied alone cannot
+    // distinguish successfully generated output from durable repair debt.
+    try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.waitForApplied(10));
+    try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.catchUpUntilForDrain(10));
+    try runtime.catchUpUntilForDrain(9);
+    runtime.terminal_failure_min_sequence = 0;
+    runtime.terminal_failure_max_sequence = 0;
+    try runtime.catchUpUntilForDrain(10);
 }

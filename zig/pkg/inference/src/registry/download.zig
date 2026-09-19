@@ -1916,8 +1916,19 @@ pub fn downloadModel(
     const want_hybrid = std.mem.eql(u8, payload_variant, "hybrid") or
         std.mem.eql(u8, payload_variant, "onnx+native") or
         std.mem.eql(u8, payload_variant, "native+onnx");
+    // An explicit `.onnx` file name (e.g. one export out of a repository
+    // that ships several speaker models) is fetched verbatim.
+    const want_named_onnx = std.mem.endsWith(u8, payload_variant, ".onnx") and
+        std.mem.indexOfScalar(u8, payload_variant, '/') == null;
     // Auto-detect: no specific format requested — grab everything available.
-    const auto_detect = !want_gguf and !want_onnx and !want_safetensors and !want_hybrid and !want_mmproj;
+    const auto_detect = !want_gguf and !want_onnx and !want_safetensors and !want_hybrid and !want_mmproj and !want_named_onnx;
+
+    if (want_named_onnx) {
+        if (try appendMatchingFile(allocator, &to_download, files, payload_variant)) {
+            try appendSidecarIfPresent(allocator, &to_download, files, payload_variant);
+            found_model_payload = true;
+        }
+    }
 
     // GGUF
     if (want_gguf or auto_detect) {

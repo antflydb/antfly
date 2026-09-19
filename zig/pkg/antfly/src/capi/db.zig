@@ -4850,6 +4850,32 @@ pub fn storageOwnerOpen(
         null;
     const owner_context = asStorageOwnerContext(request.context);
     const alloc = if (owner_context) |context| context.alloc else std.heap.c_allocator;
+    // A metadata restore intent can become visible before Raft bootstrap has
+    // imported this replica. Do not create an empty DB and retain its reader
+    // lease: that would prevent bootstrap from ever publishing the import.
+    // Pin the validated generation until DB.open acquires its own read lease.
+    var restore_io_impl: std.Io.Threaded = undefined;
+    var owns_restore_io = false;
+    defer if (owns_restore_io) restore_io_impl.deinit();
+    var restore_lease: ?db_mod.generation_lifecycle.ReadLease = null;
+    defer if (restore_lease) |*lease| lease.deinit();
+    if (request.restore.required != 0) {
+        const io = if (owner_context) |context|
+            context.backend_runtime.ptr().filesystemIo() orelse return storageOwnerStatusFromError(error.BackendRuntimeIoUnavailable)
+        else io: {
+            restore_io_impl = std.Io.Threaded.init(alloc, .{});
+            owns_restore_io = true;
+            break :io restore_io_impl.io();
+        };
+        restore_lease = antfly.restore_admission.acquire(alloc, io, path, request.group_id, .{
+            .backup_id = request.restore.backup_id.slice(),
+            .location = request.restore.location.slice(),
+            .snapshot_path = request.restore.snapshot_path.slice(),
+            .artifact_sha256 = request.restore.artifact_sha256.slice(),
+            .native_manifest_size_bytes = request.restore.native_manifest_size_bytes,
+            .native_manifest_sha256 = request.restore.native_manifest_sha256.slice(),
+        }) catch |err| return storageOwnerStatusFromError(err);
+    }
     if ((request.target_observer.ctx == null) != (request.target_observer.notify == null))
         return .invalid_argument;
     const recovery_config = request.transaction_recovery;
@@ -12212,6 +12238,8 @@ test "capi get edges json does not double free a non-empty edge slice" {
     // production builds, manifesting later as an unrelated SIGABRT with no
     // panic message. An empty-result query (before any edges exist) freed a
     // zero-length slice, which many allocators no-op, so it never caught this.
+    // Exercise the edge cleanup helper with the testing allocator as well as
+    // the public C ABI, which uses the C allocator for its handle and results.
     var test_tmp = try TestDirectory.init("capi");
     defer test_tmp.cleanup();
     const alloc = std.testing.allocator;
@@ -12252,6 +12280,13 @@ test "capi get edges json does not double free a non-empty edge slice" {
 
     // Now getEdges returns one real edge. Freeing that non-empty slice twice
     // is a real heap corruption that std.testing.allocator catches.
+    {
+        const edges = try asHandle(handle_ptr).?.db.getEdges(alloc, "gr_edges_v1", "doc:edge-source", "", .both);
+        defer graphFreeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+    }
+
+    // Read the same non-empty result through the public C ABI.
     var out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_edges_json(handle_ptr, .{
         .ptr = "gr_edges_v1",

@@ -25,6 +25,7 @@ fn isTestControl(arg: []const u8) bool {
         std.mem.startsWith(u8, arg, "--skip-test-filter=") or
         std.mem.startsWith(u8, arg, "--seed=") or
         std.mem.startsWith(u8, arg, "--cache-dir=") or
+        std.mem.eql(u8, arg, "--reverse-test-order") or
         std.mem.eql(u8, arg, "--listen=-");
 }
 
@@ -68,6 +69,7 @@ pub fn select(
                 @panic("missing value after --skip-test-filter=");
         } else if (std.mem.startsWith(u8, arg, "--seed=") or
             std.mem.startsWith(u8, arg, "--cache-dir=") or
+            std.mem.eql(u8, arg, "--reverse-test-order") or
             std.mem.eql(u8, arg, "--listen=-"))
         {
             // Runtime-only controls do not participate in compile reachability.
@@ -123,6 +125,7 @@ pub fn addRuntimeControls(
             run.addArg(arg);
         } else if (std.mem.startsWith(u8, arg, "--seed=") or
             std.mem.startsWith(u8, arg, "--cache-dir=") or
+            std.mem.eql(u8, arg, "--reverse-test-order") or
             std.mem.eql(u8, arg, "--listen=-"))
         {
             run.addArg(arg);
@@ -143,6 +146,7 @@ test "select accepts repeated filters and ignores runtime controls" {
             "--skip-test-filter",
             "metrics render",
             "--seed=0x1234",
+            "--reverse-test-order",
         },
         &.{"default"},
     );

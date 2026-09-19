@@ -466,6 +466,8 @@ fn metalConvGeneralHasResidentShape(query: CapabilityQuery) bool {
     const input_shape = nodeInputShape(query, 0) orelse return false;
     const weight_shape = nodeInputShape(query, 1) orelse return false;
     if (input_shape.dtype != .f32 or weight_shape.dtype != .f32 or query.graph.node(query.node_id).output_shape.dtype != .f32) return false;
+    // Dilated kernels are expanded by the host interpreter only.
+    if (attrs.hasDilation()) return false;
     if (attrs.num_spatial == 1 and attrs.groups == 1 and input_shape.rank() == 3 and weight_shape.rank() == 3 and attrs.padding[0][0] == attrs.padding[0][1]) {
         if ((positiveShapeDim(input_shape, 1) orelse return false) != (positiveShapeDim(weight_shape, 1) orelse return false)) return false;
         return conv1dOutputMatches(query.graph.node(query.node_id).output_shape, input_shape, weight_shape, attrs.strides[0], attrs.padding[0][0], null);

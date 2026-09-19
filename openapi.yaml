@@ -13713,6 +13713,12 @@ components:
           description: Secret name (e.g., openai.api_key)
         status:
           $ref: '#/components/schemas/SecretStatus'
+        source:
+          type: string
+          description: Name of the winning source, or environment.
+        managed:
+          type: boolean
+          description: Whether this key has an Antfly-managed override that can be deleted.
         env_var:
           type: string
           description: Corresponding environment variable name (e.g., OPENAI_API_KEY)
@@ -13727,6 +13733,9 @@ components:
       required:
         - secrets
       properties:
+        writable:
+          type: boolean
+          description: Whether this server has a native store for secret API writes.
         secrets:
           type: array
           items:
@@ -16822,13 +16831,18 @@ components:
 
             field when they want an executable Antfly query object.
         retrieval_query_request:
-          $ref: '#/components/schemas/RetrievalQueryRequest'
+          $ref: '#/components/schemas/QueryRequest'
           description: >
             Antfly retrieval query assembled by the coordinator when the requested artifact
 
-            needs retrieval-only features such as tree_search. This is additive to
+            is intended for retrieval. Apply retrieval_navigation to steps.retrieval.navigation. This
+            is additive to
 
             query_request for clients that execute through the retrieval agent pipeline.
+        retrieval_navigation:
+          $ref: '#/components/schemas/RetrievalNavigationConfig'
+          description: Optional retrieval-step navigation policy for the returned query at query_index
+            zero.
         specialist:
           type: string
           description: Specialist or strategy used to build the query, such as `full_text`, `filter`,
@@ -16904,63 +16918,109 @@ components:
         - graph: Relationship-based traversal
 
         - hybrid: Combine multiple strategies with RRF or rerank
-    TreeSearchConfig:
+    RetrievalNavigationStrategy:
+      type: string
+      enum:
+        - tree
+        - graph
+    RetrievalNavigationSelection:
+      type: string
+      enum:
+        - agentic
+        - ranked
+    RetrievalNavigationConfig:
       type: object
-      description: >
-        Configuration for tree search strategy. Tree search navigates hierarchical
-
-        document structures by evaluating summaries at each level.
+      additionalProperties: false
       required:
+        - query_index
+        - strategy
+        - selection
         - index
+      description: >
+        Retrieval-step navigation targeting one ordinary query. Graph navigation
+
+        follows one path; tree navigation explores a retained branch frontier.
+
+        Agentic selection uses the enclosing model and budgets. Ranked selection
+
+        is supported for trees and uses the existing deterministic tree traversal.
+
+        Agentic selection requires agentic mode and a retrieval generator. Search
+
+        starts exploration; navigation selects only an offered, unvisited node.
+
+        All reads enforce mandatory predicates and authenticated row filters.
       properties:
-        index:
-          type: string
-          description: Name of the graph index to use for tree navigation
-          example: doc_hierarchy
-        start_nodes:
-          type: string
-          description: >
-            Starting nodes for tree search:
-
-            - "$roots" - Query for root nodes (nodes with no parents)
-
-            - Comma-separated explicit node IDs
-
-            When omitted and combined with a QueryRequest in a RetrievalQueryRequest,
-
-            the query results are used as start nodes.
-          example: $roots
+        query_index:
+          type: integer
+          minimum: 0
+          description: Zero-based index into the enclosing request queries.
+        strategy:
+          $ref: '#/components/schemas/RetrievalNavigationStrategy'
+        selection:
+          $ref: '#/components/schemas/RetrievalNavigationSelection'
+          description: Ranked selection is supported only with strategy tree.
         max_depth:
           type: integer
           minimum: 1
           maximum: 20
-          default: 5
-          description: Maximum depth to traverse in the tree
+          description: Tree-only maximum depth from the start node (depth zero); defaults to 5.
         beam_width:
           type: integer
           minimum: 1
           maximum: 20
-          default: 3
-          description: Number of branches to explore at each level
-    RetrievalQueryRequest:
-      description: >
-        A canonical query in the retrieval pipeline with an optional tree search
+          description: Tree-only maximum children offered per expansion; defaults to 3.
+        index:
+          type: string
+          minLength: 1
+          pattern: .*\S.*
+          description: Graph index used for every neighbor read.
+        start_nodes:
+          type: string
+          minLength: 1
+          description: Ranked-tree-only seed selector (comma-separated keys, $roots, or a prior-result
+            selector). Mutually exclusive with start_key.
+        start_key:
+          type: string
+          minLength: 1
+          description: Literal start document key. Agentic selection defaults to the first query hit;
+            ranked selection defaults to seed results or prior query hits.
+        direction:
+          $ref: '#/components/schemas/EdgeDirection'
+          description: Direction for every hop; defaults to out.
+        edge_types:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/GraphEdgeType'
+        max_steps:
+          type: integer
+          minimum: 1
+          maximum: 20
+          description: Graph-only maximum moves after the start node (default 8). The enclosing agent's
+            iteration and tool limits also apply.
+        neighbor_limit:
+          type: integer
+          minimum: 1
+          maximum: 256
+          description: Graph-only maximum candidate neighbors per node (default 8), further limited by
+            the context budget.
+        instruction:
+          type: string
+          minLength: 1
+          description: Optional caller-supplied workflow instruction retained in agent history.
+        instruction_field:
+          type: string
+          minLength: 1
+          description: >
+            Explicitly opt in to following instructions from this top-level string
 
-        configuration. Each query specifies its own table. Deprecated stateful
+            field of each visited document. Instructions accumulate in agent history.
 
-        graph_searches compatibility is intentionally unavailable here.
+            Other document fields and unvisited neighbors remain untrusted evidence.
 
-
-        When both search fields (semantic_search, full_text_search) and tree_search
-
-        are provided, the search results are used as start nodes for tree navigation.
-      allOf:
-        - $ref: '#/components/schemas/QueryRequest'
-        - type: object
-          properties:
-            tree_search:
-              $ref: '#/components/schemas/TreeSearchConfig'
-              description: Optional tree search configuration
+            The field must be included if the query uses a fields projection.
     AgentQuestionKind:
       type: string
       enum:
@@ -17215,6 +17275,9 @@ components:
 
         the top-level request tools policy when both are present.
       properties:
+        navigation:
+          $ref: '#/components/schemas/RetrievalNavigationConfig'
+          description: Navigation policy for one query; incompatible with graph_queries on that query.
         tools:
           $ref: '#/components/schemas/ChatToolsConfig'
           description: >
@@ -17275,7 +17338,9 @@ components:
       description: >
         Request for the retrieval agent. Queries define which tables and indexes
 
-        to search, each as a QueryRequest with optional tree search configuration.
+        to search, each as an ordinary QueryRequest. Optional tree or graph exploration
+
+        is configured by steps.retrieval.navigation, targeting one query by index.
 
 
         **Pipeline mode** (default, max_internal_iterations=0): Queries are executed
@@ -17310,7 +17375,7 @@ components:
         queries:
           type: array
           items:
-            $ref: '#/components/schemas/RetrievalQueryRequest'
+            $ref: '#/components/schemas/QueryRequest'
           description: >
             Queries to execute. Each query carries its own table via the
 
@@ -21809,6 +21874,100 @@ components:
           minimum: 1
           format: uint32
           description: Maximum PDF pages admitted for one request-atomic document operation.
+    STTProvider:
+      type: string
+      enum:
+        - openai
+        - vertex
+        - antfly
+      description: The STT provider to use.
+    TranscriberEnrichmentConfig:
+      description: >-
+        Speech-to-text provider for the `transcriber` enrichment shorthand.
+
+
+        Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus
+        the transcription options below. The fields are declared inline rather than composed from `STTConfig`
+        so that a generated client can leave an option out: a composed schema makes a typed client serialize
+        every field, and a `max_download_bytes` of zero would reject every recording.
+
+
+        **Example:**
+
+        ```yaml
+
+        name: call_transcripts
+
+        kind: asset
+
+        field: recording_url
+
+        transcriber:
+          provider: antfly
+          model: openai/whisper-base
+          language_code: en
+          timestamps: true
+        ```
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          $ref: '#/components/schemas/STTProvider'
+        model:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1'
+            for openai).
+        api_url:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: uri
+          description: Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+        base_url:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: uri
+          description: OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+        api_key:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Provider API key. Falls back to the provider's environment variable.
+        project_id:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT.
+        location:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Google Cloud location for the vertex provider.
+        credentials_path:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Path to an ADC credential JSON file for the vertex provider. Falls back to the
+            default ADC chain.
+        language_code:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where
+            the provider supports it.
+        timestamps:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          default: true
+          description: Request timestamped transcript segments so chunks carry recording offsets. Providers
+            without segment timing return plain text.
+        diarization:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: Request speaker labels on transcript segments where the provider supports them.
+        max_download_bytes:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          description: Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers
+            a one hour voice memo or podcast.
     EnrichmentConfig:
       type: object
       description: Inline managed enrichment definition. Enrichments materialize generated artifacts before
@@ -21883,6 +22042,15 @@ components:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Non-semantic execution policy for this enrichment producer. This does not participate
             in generated artifact identity.
+        transcriber:
+          $ref: '#/components/schemas/TranscriberEnrichmentConfig'
+          description: 'Typed shorthand for a transcription asset enrichment. Only valid with kind=asset
+            and without producer_json; Antfly expands it into a document_extraction producer whose audio
+            route transcribes each recording with this speech-to-text provider. The produced units carry
+            the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments
+            that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true
+            the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker.
+            content_type defaults to application/json.'
     FullTextArtifactIndexSource:
       type: object
       additionalProperties: false
@@ -22612,6 +22780,17 @@ components:
       required:
         - provider
         - model
+    OpenAIReasoningEffort:
+      type: string
+      enum:
+        - none
+        - minimal
+        - low
+        - medium
+        - high
+        - xhigh
+        - max
+      description: OpenAI reasoning effort; model support varies. Omit to use the model default.
     OpenAIGeneratorConfig:
       type: object
       description: >
@@ -22643,6 +22822,16 @@ components:
         max_tokens:
           type: integer
           description: Maximum number of tokens to generate.
+        max_completion_tokens:
+          type: integer
+          minimum: 1
+          description: >
+            OpenAI completion budget, including visible output and reasoning tokens.
+
+            Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+        reasoning_effort:
+          $ref: '#/components/schemas/OpenAIReasoningEffort'
+          description: Optional reasoning effort. Supported values depend on the selected OpenAI model.
         top_p:
           type: number
           format: float
@@ -30751,12 +30940,18 @@ components:
         audio:
           type: string
           format: byte
-          description: Base64-encoded audio data (WAV, MP3, FLAC, etc.). Clips longer than 30 s are transcribed
-            in windows cut at pauses; silent clips return an empty transcript.
+          description: Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska,
+            FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips
+            return an empty transcript.
         language:
           type: string
           description: Force specific language for transcription (optional, model-dependent)
           example: en
+        diarization:
+          type: boolean
+          description: Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`)
+            and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first
+            appearance.
     InferenceTranscribeResponse:
       type: object
       required:
@@ -30802,6 +30997,22 @@ components:
           type: string
           description: Detected or forced language
           example: en
+        duration_ms:
+          type: integer
+          description: Decoded clip duration in milliseconds.
+        segments:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceDictationSegment'
+          description: Timestamped phrases in clip order, so a transcript can be indexed and linked back
+            to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets
+            are relative to the whole clip.
+        speakers:
+          type: array
+          items:
+            type: string
+          description: Speaker labels found by diarization, in order of first appearance. Present only
+            when `diarization` was requested.
     InferenceDictationStyle:
       type: string
       description: >
@@ -30911,6 +31122,10 @@ components:
           items:
             $ref: '#/components/schemas/InferenceDictationWord'
           description: Word spans estimated inside the phrase by distributing its duration over word lengths.
+        speaker:
+          type: string
+          description: Speaker label from diarization (`SPEAKER_00`, ...). Absent without diarization
+            or when the phrase had no usable audio.
     InferenceDictationTranscript:
       type: object
       required:

@@ -689,6 +689,11 @@ pub const Config = struct {
             else => return error.InvalidConfig,
         };
 
+        if (raw_root.get("secrets")) |value| {
+            var secret_config = try secrets.parseConfig(alloc, value);
+            secret_config.deinit();
+        }
+
         var parsed_tree = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{
             .allocate = .alloc_always,
         });
@@ -3645,4 +3650,36 @@ test "common config applies standalone shard defaults when standalone mode is se
     try std.testing.expectEqual(@as(u64, default_max_shard_size_bytes), cfg.shard_allocation.max_shard_size_bytes);
     try std.testing.expectEqual(@as(u32, default_max_shards_per_table), cfg.shard_allocation.max_shards_per_table);
     try std.testing.expect(cfg.shard_allocation.disable_shard_alloc);
+}
+
+test "common config bootstraps named secret sources before resolving credentials" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(dir);
+    const secret_path = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{dir});
+    defer alloc.free(secret_path);
+    const config_path = try std.fmt.allocPrint(alloc, "{s}/config.json", .{dir});
+    defer alloc.free(config_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "secrets.json", .data = "{\"secrets\":[{\"key\":\"test.key\",\"value\":\"credential\"}]}" });
+    const raw = try std.fmt.allocPrint(alloc,
+        \\{{"secrets":{{"sources":[{{"name":"platform","type":"file","path":"{s}"}}],"environment":false}},
+        \\"connections":{{"test":{{"kind":"inference","capabilities":["models.generate"],"inference":{{"provider":"openai","api_key":"${{secret:test.key}}"}}}}}}}}
+    , .{secret_path});
+    defer alloc.free(raw);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = raw });
+    var store = (try secrets.initFromConfigPathWithIo(alloc, io, config_path, &.{})).?;
+    defer store.deinit();
+    var cfg = try loadFromPathWithSecretsForDeploymentWithIo(alloc, io, config_path, &store, .standalone);
+    defer cfg.deinit();
+    try std.testing.expect(!store.writable);
+    try std.testing.expect(!store.environment_enabled);
+    const resolved = (try store.getOwned(alloc, "test.key")).?;
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("credential", resolved);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, "{\"secrets\":{\"environment\":\"false\"}}"));
 }

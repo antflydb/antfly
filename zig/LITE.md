@@ -56,7 +56,7 @@ The implementation now consists of:
   `runUntilIdle`.
 - `storage/db/db.zig` already supports open modes such as writer,
   query-readonly, and status-only.
-- `storage/lite/native.zig` owns the native revision-2 header, alternating checkpoint roots,
+- `storage/lite/native.zig` owns the native revision-3 header, alternating checkpoint roots,
   page allocation, free map, crash recovery, integrity checks, stable snapshots,
   and atomic vacuum replacement. Document commits publish a namespace-head
   directory and per-namespace page links in the same checkpoint, so a cold
@@ -70,7 +70,10 @@ The implementation now consists of:
   reclaims superseded pages without putting a reachability walk on the write
   path. Each checkpoint also pins a copy-on-write ordered B+ tree mapping every
   logical document key to its newest document page. Initial loads and vacuum
-  build packed trees as bounded streaming operations. Integrity checks validate
+  build packed trees with one unfinished node per level. The builder retains
+  encoded record references for long keys and materializes only the last input
+  key for order validation. Counting compact pages uses the same builder.
+  Integrity checks validate
   every tree page, separator range, and checkpoint/free-map reachability, then
   prove that the index contains exactly the newest document page for every key
   in history. Missing, stale, duplicate, or cross-key document pointers and
@@ -90,6 +93,68 @@ The implementation now consists of:
   blocks vacuum before it can reclaim those roots.
 - `storage/lite/index_storage.zig` stores Antfly index logical files in the
   native index catalog inside the same `.aflite` file.
+  Each catalog checkpoint owns an immutable descriptor containing its history
+  root and a copy-on-write B+ tree mapping keys to their latest record pages.
+  Point reads and misses use bounded tree searches, including after reopening
+  and at older pinned checkpoints. Empty keys are indexed, and keys longer
+  than 512 bytes use references to their immutable record pages in both leaves
+  and separators. This bounds encoded key slots so mixed-size keys always
+  admit a split, including maximum-length catalog keys. Vacuum rebuilds those
+  references against the new generation; integrity checks prove that the
+  referenced records remain reachable in the checkpoint. Updates retain encoded
+  key references and resolve only comparison keys, including during splits.
+  A transaction-local tree editor decodes each visited node once and writes
+  each surviving changed node once at commit, avoiding intermediate tree
+  versions during catalog and document batches.
+  Deleting a catalog key removes it from the current tree using copy-on-write
+  merging and redistribution. Historical records and older checkpoint roots
+  remain intact, but retired filenames no longer accumulate directory-scan
+  work. Directory listing and subtree deletion seek the live catalog tree at a
+  path prefix instead of replaying mutation history. Listing pins a checkpoint
+  and holds the generation read lock, allowing ordinary commits to continue.
+  In validated namespaces, immediate-file listings seek past each nested
+  directory's exclusive prefix bound before reading descendant catalog records.
+  Listing work depends on direct files and directory prefixes encountered, not
+  nested file count. The unscoped adapter retains its accepted repeated/trailing
+  separators and uses a general prefix scan with dirname filtering, so existing
+  logical keys keep their listing behavior without normalization or migration.
+  External catalog values use a 64-way immutable extent tree with byte lengths
+  on each child. Appends retain one unfinished node per height, fill the partial
+  tail leaf, and seal suffix subtrees once. Existing full subtrees remain
+  shared, so large appends no longer rewrite the ancestor path per leaf and
+  temporary memory depends on tree height rather than suffix length.
+  Range reads seek directly to the requested extents. Vacuum builds packed
+  catalog indexes and extent trees; integrity checks validate both structures.
+  Atomic index writes use a fixed 64 KiB buffer and a private staging file.
+  Header patches and range checksums operate on the buffered tail and positional
+  file I/O. Staging uses a short random sibling basename independent of the
+  database name, including when the database basename approaches filesystem
+  limits. POSIX staging files are unlinked while open so abort and process
+  death reclaim them. Staging holds neither a document writer slot nor a
+  generation pin; unrelated commits and vacuum can proceed. Finish streams the
+  staged bytes into native extents and publishes one checkpoint under the store
+  mutex. This adds a staging I/O pass in exchange for bounded payload heap use;
+  it does not eliminate the final copy or its publication lock. I/O failures
+  poison the sink, and finish consumes it on success or error.
+  Atomic writers carry cache intent through both buffered publication and
+  staged imports. Cold sequential writes bypass admission for external payload
+  pages, preserving hot reads; catalog records and tree navigation pages remain
+  cacheable. Reused page IDs invalidate cached bytes and links even when the
+  replacement bypasses admission. The policy belongs to each writer and does
+  not disable caching for concurrent readers; subsequent reads can cache the
+  cold-written data normally.
+  Native external-value writes encode directly into an operation-owned 64 KiB
+  page buffer. Staged imports, buffered external values, appends, document chains,
+  and vacuum copies coalesce consecutive page IDs into positional writes;
+  fragmented free-page runs flush separately. Value-chain writers retain only
+  one next-page ID. A completed tree is flushed before its root can be read or
+  published. A failed flush admits no pages and poisons its batch; abort drops
+  pending bytes without an implicit retry. Cache policy is applied per page
+  after a successful write.
+  Positional page writes extend the file directly, without per-page stat or
+  resize calls; data, checkpoint-slot, and active-slot sync barriers remain.
+  Revision 2 and other unsupported headers are rejected without mutation;
+  there is no automatic upgrade or compatibility reader.
 - `storage/lite/backend.zig` caches one runtime per logical table/group and
   injects those runtimes through the standalone backend-runtime DB-open hook.
 - Standalone metadata is stored in a reserved system namespace in the same
@@ -157,7 +222,7 @@ into another.
 file format, the selected engine, the primary, replay, and index layouts, the
 native format revision, page size, and active checkpoint sequence. That makes the
 public native `.aflite` path observable and keeps internal bridge profiles from
-being mistaken for the format revision 2 contract.
+being mistaken for the format revision 3 contract.
 
 For native `.aflite`, the public status contract should report
 `primary_layout: native_document_pages`,
@@ -302,18 +367,17 @@ history. Lite reports `online: false`: check, compaction, and vacuum acquire the
 exclusive maintenance gate. Readiness becomes false and new database requests
 receive `503` while admin status and cancellation remain available. This avoids
 unbounded request queues and does not call a stop-the-world rewrite "online".
-Checkpoint inspection, index writes, document commits, compaction, and vacuum
-share the Lite store mutex and FIFO writer admission gate, so blocked writers
-sleep without polling and resume in arrival order. Maintenance cannot
-race checkpoint publication or file replacement. Vacuum builds a temporary,
-disk-backed LSM live-key index for one logical record class at a time. The
-newest record wins, tombstones suppress older values, and a bounded mutable
-batch is flushed to sorted runs. It then streams the ordered live references,
-values, and replacement pages, so heap use does not scale with the number of
-distinct keys. Temporary index directories are removed on success and error.
-This also avoids a
-second whole-database value snapshot and a whole-file output image in memory;
-the replacement is fsynced, atomically renamed, and adopted through its
+Native checkpoint publication and generation replacement serialize under the
+Lite store mutex. Document writes and maintenance also use FIFO writer admission.
+Private staged index output enters the store mutex only for final publication.
+Vacuum walks the current checkpoint's catalog and document indexes, skips
+tombstones, and streams values into replacement pages without a temporary LSM
+index or history deduplication. Its key-tree builder and extent builder each
+retain one unfinished node per level; payload buffers do not grow with logical
+file size. Namespace metadata still scales with namespace count. Integrity
+checking continues to validate reachable pages, while compact-layout statistics
+use record lengths and ordered keys instead of loading payloads again.
+The replacement is fsynced, atomically renamed, and adopted through its
 already-open read/write handle before the parent directory is fsynced. A
 post-rename sync error therefore cannot leave the process writing an unlinked
 old inode.
@@ -418,11 +482,11 @@ same way. Neither should be the public Lite v1 contract.
 
 ### Compatibility Policy
 
-Because this is new, unreleased code, native revision 2 does not carry a legacy fallback,
+Because this is new, unreleased code, native revision 3 does not carry a legacy fallback,
 pre-release importer, v0 directory reader, silent LSM-container upgrade path, or
 prototype-to-v1 auto-migrator. Prototype files can be recreated from tests or
 explicit exports while the format is still pre-release. `.aflite` readers should
-accept the documented revision-2 format and reject unknown versions loudly. Recovery
+accept the documented revision-3 format and reject unknown versions loudly. Recovery
 from an older complete checkpoint root inside the same file is crash
 recovery, not legacy compatibility; a file with no complete checkpoint should
 fail with an explicit integrity error. Compatibility branches should only be

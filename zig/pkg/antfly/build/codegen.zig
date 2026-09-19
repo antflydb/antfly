@@ -182,6 +182,7 @@ pub fn addOpenApiSourceSteps(
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/generated/graph_identifier.yaml"), "antfly_graph_identifier_openapi", antfly_generated_root ++ "/antfly_graph_identifier_openapi", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/sort.yaml"), "antfly_sort_openapi", antfly_generated_root ++ "/antfly_sort_openapi", "types", &.{}),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/antfly/indexes.yaml"), "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi", "types", &.{
+            .{ "audio.yaml", "antfly_audio_openapi" },
             .{ "sort.yaml", "antfly_sort_openapi" },
             .{ "embeddings.yaml", "antfly_embeddings_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
@@ -253,7 +254,7 @@ pub fn addOpenApiSourceSteps(
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
             .{ "websearch.yaml", "antfly_websearch_openapi" },
         }),
-        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", inference_generated_root ++ "/inference_api", "types,server", &.{
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", inference_generated_root ++ "/inference_api", "types,server,client", &.{
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
             .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
             .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
@@ -367,6 +368,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     const generating_api_openapi_mod = committedModule(b, options, "antfly_generating_api_openapi", false);
     const extraction_openapi_mod = committedModule(b, options, "antfly_extraction_openapi", false);
     extraction_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    indexes_openapi_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     indexes_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
     indexes_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     indexes_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);

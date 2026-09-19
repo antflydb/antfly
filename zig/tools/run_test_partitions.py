@@ -115,6 +115,20 @@ def run_partitions(
     return 0
 
 
+def list_partitions(commands: Sequence[Sequence[str]]) -> int:
+    """Keep inventory records intact; execution output may stream partial lines."""
+    for command in commands:
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+        sys.stderr.write(result.stdout.decode())
+        if result.returncode != 0:
+            return (
+                result.returncode if result.returncode > 0 else 128 - result.returncode
+            )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--executable", type=Path, required=True)
@@ -132,6 +146,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.common_skip_filter,
         runtime_args,
     )
+    if "--list-tests" in runtime_args:
+        return list_partitions((partition, complement))
     return run_partitions(
         (
             ("db-core-category", partition),

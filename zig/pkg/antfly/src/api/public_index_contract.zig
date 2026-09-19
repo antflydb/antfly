@@ -410,7 +410,7 @@ fn enrichmentFieldValueMatches(field: []const u8, value: std.json.Value) bool {
         std.mem.eql(u8, field, "chunk_size") or
         std.mem.eql(u8, field, "chunk_overlap")) return isInteger(value);
     if (std.mem.eql(u8, field, "full_text_index")) return isBool(value);
-    if (std.mem.eql(u8, field, "execution")) return value == .object;
+    if (std.mem.eql(u8, field, "execution") or std.mem.eql(u8, field, "transcriber")) return value == .object;
     if (std.mem.eql(u8, field, "vector_space")) return isNonEmptyString(value);
     return isString(value);
 }
@@ -629,8 +629,13 @@ pub fn isAllowedCreatedEnrichmentField(field: []const u8) bool {
         std.mem.eql(u8, field, "execution");
 }
 
+/// Request-only enrichment fields: `producer_json` is write-only, and the
+/// `transcriber` shorthand is expanded into it at admission, so neither
+/// appears on a created enrichment.
 pub fn isAllowedEnrichmentRequestField(field: []const u8) bool {
-    return isAllowedCreatedEnrichmentField(field) or std.mem.eql(u8, field, "producer_json");
+    return isAllowedCreatedEnrichmentField(field) or
+        std.mem.eql(u8, field, "producer_json") or
+        std.mem.eql(u8, field, "transcriber");
 }
 
 pub fn isAllowedIndexExecutionField(field: []const u8) bool {

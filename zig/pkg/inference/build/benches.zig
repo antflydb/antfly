@@ -237,6 +237,33 @@ pub fn addGliner25(ctx: Context) *std.Build.Module {
     const gliner25_cpu_bench_step = ctx.step("bench-gliner25-cpu-build", "Build the supervised GLiNER2.5 direct-core CPU benchmark worker (requires ReleaseFast)");
     gliner25_cpu_bench_step.dependOn(&install_gliner25_cpu_bench.step);
 
+    const gliner25_cuda_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-cuda-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner25_cpu.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    gliner25_cuda_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
+    gliner25_cuda_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_cuda_bench_exe.root_module.link_libc = true;
+    const install_gliner25_cuda_bench = b.addInstallArtifact(gliner25_cuda_bench_exe, .{});
+    ctx.step("bench-gliner25-cuda-build", "Build the GLiNER2.5 CUDA direct-core worker (requires CUDA and ReleaseFast)").dependOn(&install_gliner25_cuda_bench.step);
+
+    const training_bench = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-cuda-training-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner25_training.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    training_bench.root_module.addImport("build_options", ctx.graph.build_options_mod);
+    training_bench.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    training_bench.root_module.link_libc = true;
+    ctx.step("bench-gliner25-cuda-training-build", "Build the supervised CUDA training parity/throughput worker").dependOn(&b.addInstallArtifact(training_bench, .{}).step);
+
     const gliner25_metal_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-gliner25-metal-bench",
         .root_module = b.createModule(.{

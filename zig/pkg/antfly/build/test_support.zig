@@ -386,6 +386,12 @@ pub fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
 }
 
 pub const release_scale_test_filters = [_][]const u8{
+    "graph metric sparse vector chunks production scale",
+    "relational columnar bound scan benchmark",
+    "relational columnar decoded reuse production scale benchmark",
+    "hbc binary monotone insertion production scale",
+    "db doc set bitmap promotion production scale",
+    "compaction phase handoff production scale",
     "db dense default dynamic 0.2 percent numeric filter exact scores bounded candidates",
     "one percent native filter routes through integrated dense search exactly",
     "db one real delete keeps filtered full text on complement path across restart",

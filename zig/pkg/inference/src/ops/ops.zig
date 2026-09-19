@@ -37,6 +37,10 @@ const ml = @import("ml");
 pub const CT = backend_contracts.CT;
 pub const gliner_boundary_device = @import("gliner_boundary_device_ops.zig");
 pub const resident_training = @import("resident_training_ops.zig");
+pub const record_loss_math = @import("record_loss_math.zig");
+pub const elementwise_loss_math = @import("elementwise_loss_math.zig");
+pub const consistency_loss_math = @import("consistency_loss_math.zig");
+pub const listwise_loss_math = @import("listwise_loss_math.zig");
 pub const deberta_training_attention = @import("deberta_training_attention.zig");
 
 pub const UnaryConsumeOp = enum {
@@ -178,6 +182,7 @@ pub const TrainingAdamWBatchInput = struct {
     elem_count: usize,
     bias_correction1: f32,
     bias_correction2: f32,
+    adam_step: u32 = 0,
 };
 
 pub const TrainingAdamWBatchOptions = struct {
@@ -187,6 +192,7 @@ pub const TrainingAdamWBatchOptions = struct {
     eps: f32,
     weight_decay: f32,
     grad_scale: f32 = 1.0,
+    pytorch_fused: ?struct { lr: f64, optimizer: @import("ml").graph.optimizers.AdamWConfig64 } = null,
 };
 
 pub const TrainingSumSquaresInput = resident_training.NormInput;
@@ -592,6 +598,25 @@ pub const DecoderRuntimeApplyLinearArgmaxRequest = backend_contracts.DecoderRunt
 pub const DecoderRuntimeApplyLinearPairRequest = backend_contracts.DecoderRuntimeApplyLinearPairRequest;
 pub const DecoderRuntimeApplyLinearQkvRequest = backend_contracts.DecoderRuntimeApplyLinearQkvRequest;
 pub const DecoderRuntimeActivationKind = backend_contracts.DecoderRuntimeActivationKind;
+
+/// Gemma 4 audio conformer local attention. Queries attend inside their
+/// `chunk`-sized block plus `context_left - 1` past keys; every query/key pair
+/// adds a relative position bias row (`rel`, `[context_left, hidden]`), the
+/// query is scaled per head dim (`q_dim_scales`, `[head_dim]`) and keys by
+/// `k_scale`, logits are tanh-capped and masked keys take `invalid_value`.
+/// `valid` is a `[rows]` 0/1 float mask.
+pub const Gemma4AudioLocalAttentionParams = struct {
+    rows: usize,
+    hidden: usize,
+    heads: usize,
+    head_dim: usize,
+    chunk: usize,
+    context_left: usize,
+    context: usize,
+    k_scale: f32,
+    logit_cap: f32,
+    invalid_value: f32,
+};
 pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntimeApplyActivationRequest;
 pub const DecoderRuntimeApplyGeluBackwardRequest = backend_contracts.DecoderRuntimeApplyGeluBackwardRequest;
 pub const DecoderRuntimeFfnGeluBackwardChainRequest = backend_contracts.DecoderRuntimeFfnGeluBackwardChainRequest;
@@ -1607,6 +1632,10 @@ pub const ComputeBackend = struct {
         glinerBoundaryDevice: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.Request) anyerror!CT = null,
         glinerBoundaryScope: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.ScopeRequest) anyerror!gliner_boundary_device.ScopeStats = null,
         glinerBoundaryResidentPreparation: ?*const fn (ctx: *anyopaque, enabled: bool) anyerror!void = null,
+        recordLossGradient: ?*const fn (ctx: *anyopaque, request: *const record_loss_math.Request) anyerror!void = null,
+        listwiseLossGradient: ?*const fn (ctx: *anyopaque, request: *const listwise_loss_math.Request) anyerror!void = null,
+        consistencyLossGradient: ?*const fn (ctx: *anyopaque, request: *const consistency_loss_math.Request) anyerror!void = null,
+        elementwiseLossGradient: ?*const fn (ctx: *anyopaque, request: *const elementwise_loss_math.Request) anyerror!void = null,
         glinerBoundaryDownload: ?*const fn (ctx: *anyopaque, tensor: CT, output: []f32) anyerror!void = null,
 
         debugCudaGraphCaptureBegin: ?*const fn (ctx: *anyopaque, label: []const u8) anyerror!bool = null,
@@ -1723,6 +1752,30 @@ pub const ComputeBackend = struct {
         /// Y = X * scale. Backends may keep scalar multiplies on device;
         /// callers fall back to creating a broadcast scalar tensor.
         multiplyScalar: ?*const fn (ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT = null,
+
+        /// Y = clamp(X, min, max) with scalar bounds; either bound may be
+        /// absent. Callers fall back to a host clamp.
+        clampScalar: ?*const fn (ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT = null,
+
+        /// Gated linear unit over the last dim: X is `[rows, 2 * dim]` and
+        /// Y[r, c] = X[r, c] * sigmoid(X[r, dim + c]).
+        gluRows: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror!?CT = null,
+
+        /// Depthwise causal conv1d over `[rows, dim]` with a `[kernel_size, dim]`
+        /// weight and `kernel_size - 1` implicit left padding.
+        depthwiseCausalConv1d: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
+
+        /// `[channels, time_steps, freq_bins]` -> `[time_steps, freq_bins * channels]`
+        /// (the Gemma 4 audio conv-stack flatten).
+        flattenChannelsTimeFreq: ?*const fn (ctx: *anyopaque, input: CT, time_steps: usize, freq_bins: usize, channels: usize) anyerror!?CT = null,
+
+        /// Layer norm over the channel axis of `[channels, positions]` (biasless,
+        /// per-channel weight) followed by relu.
+        channelLayerNormRelu: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, channels: usize, positions: usize, eps: f32) anyerror!?CT = null,
+
+        /// Gemma 4 audio conformer chunked local attention with relative
+        /// position bias; see `Gemma4AudioLocalAttentionParams`.
+        gemma4AudioLocalAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
 
         /// Y = X + value. Backends may keep scalar adds on device; callers
         /// fall back to host materialization or a broadcast scalar tensor.
@@ -2326,6 +2379,7 @@ pub const ComputeBackend = struct {
         /// sufficient because a later graph operation may donate its input.
         snapshotTensorShape: ?*const fn (ctx: *anyopaque, tensor: CT, shape: []const i32) anyerror!CT = null,
         residentTrainingNorm: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.NormInput, limits: resident_training.NormLimits, control: ?InferenceExecutionControl) anyerror!resident_training.NormSummary = null,
+        residentTrainingValidate: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.ValidationInput, limits: resident_training.ValidationLimits, control: ?InferenceExecutionControl) anyerror!resident_training.ValidationSummary = null,
         residentTrainingInstruction: ?*const fn (ctx: *anyopaque, instruction: *const resident_program.Instruction, inputs: []const CT, limits: resident_program.Limits, control: ?InferenceExecutionControl) anyerror!CT = null,
 
         /// Copy a tensor from another backend instance into this backend
@@ -3586,6 +3640,20 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    /// `ensureDeviceResident` for a tensor this call owns. A successful
+    /// upload releases the host copy and returns the device tensor; a
+    /// backend that keeps host tensors returns the input unchanged; an
+    /// upload error releases the input before propagating. Callers hand
+    /// over ownership at the call and never hold a tensor that may be gone.
+    pub fn ensureDeviceResidentOwned(self: *const ComputeBackend, tensor: CT) !CT {
+        errdefer self.free(tensor);
+        if (try self.ensureDeviceResident(tensor)) |device| {
+            self.free(tensor);
+            return device;
+        }
+        return tensor;
+    }
+
     /// Fused residual add and layer norm returning both the sum (the new
     /// residual stream) and the normalized tensor. Null when the backend has
     /// no fused kernel or an input is not device resident.
@@ -4052,6 +4120,36 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input, scale);
     }
 
+    pub fn clampScalar(self: *const ComputeBackend, input: CT, min_value: ?f32, max_value: ?f32) !?CT {
+        const op = self.vtable.clampScalar orelse return null;
+        return op(self.ptr, input, min_value, max_value);
+    }
+
+    pub fn gluRows(self: *const ComputeBackend, input: CT, rows: usize, dim: usize) !?CT {
+        const op = self.vtable.gluRows orelse return null;
+        return op(self.ptr, input, rows, dim);
+    }
+
+    pub fn depthwiseCausalConv1d(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, dim: usize, kernel_size: usize) !?CT {
+        const op = self.vtable.depthwiseCausalConv1d orelse return null;
+        return op(self.ptr, input, weight, rows, dim, kernel_size);
+    }
+
+    pub fn flattenChannelsTimeFreq(self: *const ComputeBackend, input: CT, time_steps: usize, freq_bins: usize, channels: usize) !?CT {
+        const op = self.vtable.flattenChannelsTimeFreq orelse return null;
+        return op(self.ptr, input, time_steps, freq_bins, channels);
+    }
+
+    pub fn channelLayerNormRelu(self: *const ComputeBackend, input: CT, weight: CT, channels: usize, positions: usize, eps: f32) !?CT {
+        const op = self.vtable.channelLayerNormRelu orelse return null;
+        return op(self.ptr, input, weight, channels, positions, eps);
+    }
+
+    pub fn gemma4AudioLocalAttention(self: *const ComputeBackend, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) !?CT {
+        const op = self.vtable.gemma4AudioLocalAttention orelse return null;
+        return op(self.ptr, q, k, v, rel, q_dim_scales, valid, params);
+    }
+
     pub fn addScalar(self: *const ComputeBackend, input: CT, value: f32) !?CT {
         const op = self.vtable.addScalar orelse return null;
         return op(self.ptr, input, value);
@@ -4199,6 +4297,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn trainingAdamWManyF32(self: *const ComputeBackend, inputs: []const TrainingAdamWBatchInput, opts: TrainingAdamWBatchOptions) !void {
+        if (opts.pytorch_fused != null and self.kind() != .cuda) return error.DeviceTrainingUnavailable;
         const op = self.vtable.trainingAdamWManyF32 orelse return error.DeviceTrainingUnavailable;
         return op(self.ptr, inputs, opts);
     }
@@ -4265,14 +4364,34 @@ pub const ComputeBackend = struct {
         return result;
     }
 
-    /// Reads back only three bounded scalars per tensor. No gradient values
+    /// Reads back bounded norm scalars (one total for pytorch_f32). No gradient values
     /// are copied to the host, and no implicit uploads are permitted.
     pub fn residentTrainingNorm(self: *const ComputeBackend, inputs: []const resident_training.NormInput, limits: resident_training.NormLimits) !resident_training.NormSummary {
         try self.checkExecutionControl();
+        if (limits.profile == .pytorch_f32 and self.kind() != .cuda) return error.UnsupportedResidentTrainingPrimitive;
         const op = self.vtable.residentTrainingNorm orelse return error.UnsupportedResidentTrainingPrimitive;
         const result = try op(self.ptr, inputs, limits, self.execution_control);
         try self.checkExecutionControl();
         return result;
+    }
+
+    /// Retains the scaled-norm validation on backends without a boolean-only
+    /// primitive. This fallback reads only norm scalars, never tensor payloads.
+    pub fn residentTrainingValidate(self: *const ComputeBackend, inputs: []const resident_training.ValidationInput, limits: resident_training.ValidationLimits) !resident_training.ValidationSummary {
+        try self.checkExecutionControl();
+        if (self.vtable.residentTrainingValidate) |op| {
+            const result = try op(self.ptr, inputs, limits, self.execution_control);
+            try self.checkExecutionControl();
+            return result;
+        }
+        const summary = try self.residentTrainingNorm(inputs, .{
+            .primitive = limits.primitive,
+            .max_tensors = limits.max_tensors,
+            .max_total_elements = limits.max_total_elements,
+            .max_partial_bytes = limits.max_partial_bytes,
+        });
+        const finite = summary.finite and std.math.isFinite(summary.sum_squares) and summary.sum_squares >= 0;
+        return .{ .finite = finite, .all_zero = finite and summary.sum_squares == 0, .tensor_count = summary.tensor_count, .partial_bytes = summary.partial_bytes, .download_bytes = summary.download_bytes };
     }
 
     pub fn residentTrainingInstruction(self: *const ComputeBackend, instruction: *const resident_program.Instruction, inputs: []const CT, limits: resident_program.Limits) !CT {

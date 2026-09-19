@@ -33,6 +33,9 @@ const Fake = struct {
         result.vtable.residentTrainingPrimitive = primitive;
         result.vtable.residentTrainingInstruction = instruction;
         result.vtable.residentTrainingNorm = norm;
+        // This fake intentionally exercises the legacy norm fallback. Optional
+        // capabilities consulted by that path must be null, not undefined.
+        result.vtable.residentTrainingValidate = null;
         result.vtable.trainingAdamWManyF32 = adam;
         result.vtable.trainingSynchronize = synchronize;
         return result;
@@ -488,7 +491,7 @@ fn measuredPrepare(a: Allocator, cb: *const ops.ComputeBackend, state: tx.State,
 }
 fn oracle(cb: *const ops.ComputeBackend, fake: ?*Fake) !void {
     const a = std.testing.allocator;
-    const bytes = try @import("../architectures/gliner_boundary_parity_test.zig").fixtureBytes(a, "training_adamw.json");
+    const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(a, "training_adamw.json");
     defer a.free(bytes);
     const parsed = try std.json.parseFromSlice(Oracle, a, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();

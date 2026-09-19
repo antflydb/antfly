@@ -624,6 +624,9 @@ pub const OpenOptions = struct {
     prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
+    /// Borrowed realtime clock for durable repair retry scheduling. Defaults to
+    /// the backend runtime clock; the caller must keep an override alive until close.
+    index_repair_clock: ?platform_clock.Clock = null,
     /// Private proof installed only by a validated `NativeRestoreOpenPlan`.
     /// A path-bound proof prevents a copied option set from silently skipping
     /// configuration for a different DB namespace.
@@ -5124,6 +5127,7 @@ pub const DB = struct {
     root_incarnation: u128 = 0,
     async_context: *AsyncContext,
     backend_runtime: *background_runtime_mod.BackendRuntime,
+    index_repair_clock: ?platform_clock.Clock = null,
     backend_owner_id: u64,
     status_owner_epoch: u64 = 0,
     status_publication_mutex: std.atomic.Mutex = .unlocked,
@@ -5947,6 +5951,7 @@ pub const DB = struct {
                 .ha_recovery_owner_id = ha_recovery_owner_id,
                 .owned_backend_runtime = owned_backend_runtime,
                 .owned_resource_manager = owned_resource_manager,
+                .index_repair_clock = opts.index_repair_clock,
                 .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
                 .executor = executor,
                 .start_index_workers = start_index_workers,
@@ -15346,6 +15351,10 @@ pub const DB = struct {
         publishIndexRepairProgressWaitHint(ctx);
     }
 
+    fn indexRepairNowMs(self: *const DB) u64 {
+        return (self.index_repair_clock orelse self.backend_runtime.clock()).nowRealtimeMs();
+    }
+
     const progressive_index_repair_audit_interval_ms: u64 = 5 * std.time.ms_per_s;
 
     fn deferIndexRepairForProgress(
@@ -15354,7 +15363,7 @@ pub const DB = struct {
         expected_revision: u64,
         wake_at_sequence: u64,
     ) bool {
-        const fallback_at_ms = currentTimeNs() / std.time.ns_per_ms +|
+        const fallback_at_ms = self.indexRepairNowMs() +|
             progressive_index_repair_audit_interval_ms;
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
         defer self.async_context.index_repair_scheduler_mutex.unlock();
@@ -15374,7 +15383,7 @@ pub const DB = struct {
         repair_id: u128,
         expected_revision: u64,
     ) bool {
-        const fallback_at_ms = currentTimeNs() / std.time.ns_per_ms +|
+        const fallback_at_ms = self.indexRepairNowMs() +|
             progressive_index_repair_audit_interval_ms;
         lockAtomic(&self.async_context.index_repair_scheduler_mutex);
         defer self.async_context.index_repair_scheduler_mutex.unlock();
@@ -16080,7 +16089,7 @@ pub const DB = struct {
             if (try self.core.index_manager.isRepairCandidateActive(entry.intent.index_name, candidate)) {
                 const cfg = self.core.index_manager.get(entry.intent.index_name) orelse
                     return error.InvalidIndexRepairState;
-                const now_ms = currentTimeNs() / std.time.ns_per_ms;
+                const now_ms = self.indexRepairNowMs();
                 const target_sequence = self.core.nextDerivedSequence();
                 var replacement_intent = index_repair_state.IndexRepairIntent{
                     .repair_id = try index_repair_state.newRepairId(alloc),
@@ -16256,7 +16265,7 @@ pub const DB = struct {
         errdefer txn.abort();
         const build_floor = try self.core.store.lastReplaySequenceFromTxn(&txn, 0);
         entry.intent.build_floor_sequence = build_floor;
-        entry.intent.updated_at_ms = currentTimeNs() / std.time.ns_per_ms;
+        entry.intent.updated_at_ms = self.indexRepairNowMs();
         entry.pin.?.retain_after_sequence = build_floor;
         const control_revision = try index_repair_state.putEntryAt(alloc, location, state.identity, expected, entry);
         self.core.index_manager.publishRepairAdmission(
@@ -16525,7 +16534,7 @@ pub const DB = struct {
         var replacement_last_error_owned = replacement_last_error != null;
         errdefer if (replacement_last_error_owned) alloc.free(replacement_last_error.?);
 
-        const now_ms = currentTimeNs() / std.time.ns_per_ms;
+        const now_ms = self.indexRepairNowMs();
         if (update.attempt_failure) |failure| {
             entry.intent.attempt_count = @max(entry.intent.attempt_count, 1);
             entry.intent.failure_streak +|= 1;
@@ -16957,7 +16966,7 @@ pub const DB = struct {
         defer state.deinit(alloc);
         if (state.findIndex(cfg.name)) |i| return state.entries.items[i].intent.repair_id;
         const location = try self.indexRepairStateLocation();
-        const now_ms = currentTimeNs() / std.time.ns_per_ms;
+        const now_ms = self.indexRepairNowMs();
         const target_sequence = @max(
             self.core.nextDerivedSequence(),
             minimum_target_sequence orelse 0,
@@ -18342,7 +18351,7 @@ pub const DB = struct {
             }
 
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
-            const now_ms = currentTimeNs() / std.time.ns_per_ms;
+            const now_ms = self.indexRepairNowMs();
             const target_sequence = self.core.nextDerivedSequence();
             const repair_id = try index_repair_state.newRepairId(alloc);
             const index_name = try alloc.dupe(u8, cfg.name);
@@ -18866,7 +18875,7 @@ pub const DB = struct {
             result.deferred = true;
             return result;
         }
-        const now_ms = currentTimeNs() / std.time.ns_per_ms;
+        const now_ms = self.indexRepairNowMs();
         if (entry.intent.next_retry_at_ms > now_ms) {
             result.deferred = true;
             result.next_retry_at_ms = entry.intent.next_retry_at_ms;
@@ -19533,7 +19542,7 @@ pub const DB = struct {
             @intCast(directory.cursor),
         );
         try selection.repairs.ensureTotalCapacity(alloc, inspection.budget);
-        const now_ms = currentTimeNs() / std.time.ns_per_ms;
+        const now_ms = self.indexRepairNowMs();
         while (selection.inspected < inspection.budget) : (selection.inspected += 1) {
             const record_index = (inspection.start + selection.inspected) % directory.records.items.len;
             const record = directory.records.items[record_index];
@@ -27408,9 +27417,19 @@ pub const DB = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) !doc_set.ResolvedDocSet {
+        return self.resolveDocSetForIdsNoLockAtGenerationWithPolicyAlloc(alloc, doc_ids, generation, .{});
+    }
+
+    fn resolveDocSetForIdsNoLockAtGenerationWithPolicyAlloc(
+        self: *DB,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+        policy: doc_set.BitmapPolicy,
+    ) !doc_set.ResolvedDocSet {
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
-        const resolved = try doc_identity.resolvedDocSetForIdsAtGenerationTxn(alloc, &txn, doc_ids, generation);
+        const resolved = try doc_identity.resolvedDocSetForIdsAtGenerationWithPolicyTxn(alloc, &txn, doc_ids, generation, policy);
         self.recordResolvedDocSet(&resolved, doc_ids.len > 0 and switch (resolved) {
             .doc_keys => true,
             else => false,
@@ -28059,7 +28078,7 @@ pub const DB = struct {
         if (sequence == 0) return;
         const runtime = self.enrichment_runtime orelse return;
         runtime.notifySequence(sequence);
-        try runtime.catchUpUntil(sequence);
+        try runtime.catchUpUntilForDrain(sequence);
     }
 
     fn runEnrichmentUntilForDrain(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
@@ -32290,7 +32309,7 @@ pub const DB = struct {
             "paused"
         else if (intent.phase == .terminal)
             "terminal"
-        else if (intent.next_retry_at_ms > currentTimeNs() / std.time.ns_per_ms)
+        else if (intent.next_retry_at_ms > self.indexRepairNowMs())
             "backoff"
         else if (intent.phase == .rolling_back)
             "rollback"
@@ -35866,6 +35885,45 @@ pub const DB = struct {
         return try self.searchWithCapturedRequestAndExecutionContext(alloc, req, .{});
     }
 
+    /// Own one primary read generation across a local query's selection and
+    /// aggregation collection. Acquire only after the Raft read barrier; never
+    /// wait for another apply barrier while this lease excludes writers.
+    pub const QueryReadLease = struct {
+        db: *DB,
+
+        pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+            const db = self.db;
+            const snapshot_req = try db.searchRequestAtCurrentIdentityGeneration(req);
+            if (!types.canonicalHierarchyExecutionWithinBudget(snapshot_req)) return error.InvalidQueryRequest;
+            var identity_prefix = try db.searchRequestWithIdentityPrefixFilterAlloc(snapshot_req);
+            defer identity_prefix.deinit();
+            var profile: db_query_search.DenseSearchProfile = .{};
+            const result = try db.searchLockedWithExecutionContextImpl(alloc, identity_prefix.req, .{}, true, if (req.profile) &profile else null);
+            return .{
+                .request = snapshot_req,
+                .result = result,
+                .dense_profile = if (profile.search_route.len > 0) profile else null,
+            };
+        }
+
+        pub fn release(self: *QueryReadLease) void {
+            const db = self.db;
+            db.core.unlockApplyShared();
+            if (db.async_context.resource_manager) |manager| manager.finishForegroundQuery();
+            self.* = undefined;
+        }
+    };
+
+    pub fn beginQueryReadLease(self: *DB) !QueryReadLease {
+        if (self.async_context.resource_manager) |manager| manager.beginForegroundQuery();
+        errdefer if (self.async_context.resource_manager) |manager| manager.finishForegroundQuery();
+        try self.enforcePortableRuntimeGate();
+        lockApplyShared(self);
+        errdefer self.core.unlockApplyShared();
+        try self.enforcePortableRuntimeGate();
+        return .{ .db = self };
+    }
+
     pub fn searchWithExecutionContext(
         self: *DB,
         alloc: Allocator,
@@ -36783,6 +36841,7 @@ pub const DB = struct {
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
+            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .is_expired_key = isExpiredDocumentKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
@@ -43011,7 +43070,8 @@ fn completeDocumentExtractionGeneratedText(
                 .config_json = config.transcription_config_json,
                 .source_text = source_url,
                 .source_parts_json = parts_json,
-                .content_type = "text/plain",
+                // The full STT response, so timestamped segments reach the unit.
+                .content_type = "application/json",
             });
             errdefer alloc.free(produced);
             try applyGeneratedUnitText(alloc, unit, produced, "transcript_text", "completed", .transcript);
@@ -43167,7 +43227,14 @@ fn applyGeneratedUnitText(
         .transcript => {
             unit.transcript_used = true;
             unit.transcript_confidence = parsed.confidence;
+            if (unit.transcript_spans.len > 0) alloc.free(unit.transcript_spans);
+            unit.transcript_spans = parsed.spans;
+            parsed.spans = &.{};
         },
+    }
+    if (parsed.spans.len > 0) {
+        alloc.free(parsed.spans);
+        parsed.spans = &.{};
     }
     unit.extraction_warning = parsed.warning;
     parsed.warning = null;
@@ -43234,11 +43301,14 @@ const ParsedGeneratedUnitText = struct {
     text: []u8,
     confidence: ?f64 = null,
     bbox: ?[4]f64 = null,
+    /// Phrase timing when the producer returned transcript segments.
+    spans: []document_extraction_mod.TranscriptSpan = &.{},
     warning: ?[]u8 = null,
 
     fn deinit(self: *ParsedGeneratedUnitText, alloc: Allocator) void {
         if (self.text.len > 0) alloc.free(self.text);
         if (self.warning) |value| alloc.free(value);
+        if (self.spans.len > 0) alloc.free(self.spans);
         self.* = undefined;
     }
 };
@@ -43259,7 +43329,47 @@ fn parseGeneratedUnitTextOutputAlloc(alloc: Allocator, produced: []const u8) !Pa
     if (generatedTextJsonStringField(parsed.value.object, "warning") orelse generatedTextJsonStringField(parsed.value.object, "extraction_warning")) |warning| {
         out.warning = try alloc.dupe(u8, warning);
     }
+    out.spans = try generatedTextSpansAlloc(alloc, parsed.value.object, out.text);
     return out;
+}
+
+/// Transcript segments from a producer's JSON output resolved to byte spans
+/// of `text`.
+fn generatedTextSpansAlloc(alloc: Allocator, object: std.json.ObjectMap, text: []const u8) ![]document_extraction_mod.TranscriptSpan {
+    const value = object.get("segments") orelse return &.{};
+    if (value != .array or value.array.items.len == 0) return &.{};
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const inputs = try scratch.alloc(document_extraction_mod.TranscriptSegmentInput, value.array.items.len);
+    var count: usize = 0;
+    for (value.array.items) |item| {
+        if (item != .object) continue;
+        const segment_text = generatedTextJsonStringField(item.object, "text") orelse continue;
+        const start_ms = generatedTextJsonFloatField(item.object, "start_ms") orelse continue;
+        const end_ms = generatedTextJsonFloatField(item.object, "end_ms") orelse continue;
+        if (start_ms < 0 or end_ms < 0) continue;
+        var words: []document_extraction_mod.TranscriptWordInput = &.{};
+        if (item.object.get("words")) |words_value| {
+            if (words_value == .array and words_value.array.items.len > 0) {
+                words = try scratch.alloc(document_extraction_mod.TranscriptWordInput, words_value.array.items.len);
+                var word_count: usize = 0;
+                for (words_value.array.items) |word_item| {
+                    if (word_item != .object) continue;
+                    const word_text = generatedTextJsonStringField(word_item.object, "word") orelse continue;
+                    const word_start = generatedTextJsonFloatField(word_item.object, "start_ms") orelse continue;
+                    const word_end = generatedTextJsonFloatField(word_item.object, "end_ms") orelse continue;
+                    if (word_start < 0 or word_end < 0) continue;
+                    words[word_count] = .{ .text = word_text, .start_ms = @intFromFloat(word_start), .end_ms = @intFromFloat(word_end) };
+                    word_count += 1;
+                }
+                words = words[0..word_count];
+            }
+        }
+        inputs[count] = .{ .text = segment_text, .start_ms = @intFromFloat(start_ms), .end_ms = @intFromFloat(end_ms), .words = words };
+        count += 1;
+    }
+    return try document_extraction_mod.transcriptSpansFromSegmentsAlloc(alloc, text, inputs[0..count]);
 }
 
 fn generatedTextJsonStringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
@@ -43641,6 +43751,7 @@ fn appendDocumentUnitStoredChunkFullTextDocuments(
         else
             try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
         defer chunker_mod.freeChunks(alloc, chunks);
+        document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
         for (chunks) |chunk| {
             if (!chunk.isText()) continue;
@@ -43681,6 +43792,7 @@ fn documentUnitCanSkipLocalWrites(
         else
             try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
         defer chunker_mod.freeChunks(alloc, chunks);
+        document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
         for (chunks) |chunk| {
             if (!chunk.isText()) continue;
@@ -43752,6 +43864,7 @@ fn appendDocumentUnitChunkWrites(
             try chunker_mod.chunkText(alloc, unit.text, entry.chunk_size, entry.chunk_overlap);
         defer chunker_mod.freeChunks(alloc, chunks);
         if (chunks.len == 0) continue;
+        document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
         const include_default_full_text = entry.full_text_index or
             try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
@@ -44381,6 +44494,7 @@ fn documentUnitPayloadAlloc(
             .ocr_bbox = unit.ocr_bbox,
             .transcript_used = unit.transcript_used,
             .transcript_confidence = unit.transcript_confidence,
+            .transcript_spans = if (unit.transcript_spans.len > 0) unit.transcript_spans else null,
             .extraction_warning = unit.extraction_warning,
             .page_number = unit.page_number,
             .page_label = unit.page_label,
@@ -69064,6 +69178,10 @@ test "relational columnar dirty scans intersect query and shard bounds before de
 }
 
 test "relational columnar existence and null projection do not fetch payload records" {
+    // Assert payload/admission semantics independently of the real-time build
+    // quantum. Bounded/resumable maintenance is tested separately.
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -69740,7 +69858,10 @@ test "relational columnar bootstrap yields across artifact-only owners" {
 }
 
 test "relational columnar scheduler batches deferred discovery before ready work and persists timers" {
-    const alloc = std.testing.allocator;
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -69979,6 +70100,10 @@ test "relational columnar byte costing retains wide clean rows and switches for 
 }
 
 test "relational columnar adaptive admission preserves age across hot updates and restart" {
+    // Assert payload/admission semantics independently of the real-time build
+    // quantum. Bounded/resumable maintenance is tested separately.
+    relational_columns.test_disable_deadline = true;
+    defer relational_columns.test_disable_deadline = false;
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -70181,6 +70306,11 @@ test "relational columnar decoded cache preserves snapshots and releases visitor
 }
 
 fn seedColumnScanPlanTest(db: *DB, alloc: Allocator) !void {
+    return seedColumnScanPlanRows(db, alloc, 768);
+}
+
+fn seedColumnScanPlanRows(db: *DB, alloc: Allocator, row_count: usize) !void {
+    std.debug.assert(row_count >= 8 and row_count <= 768);
     try db.setSchemaJson(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"user-name":{"type":"string"},"payload":{"type":"json"},"embedding":{"type":"embedding"},"wide":{"type":"string"}},"additionalProperties":false}}}}
     );
@@ -70189,8 +70319,8 @@ fn seedColumnScanPlanTest(db: *DB, alloc: Allocator) !void {
     const scratch = arena.allocator();
     const wide = try scratch.alloc(u8, 8192);
     @memset(wide, 'x');
-    const writes = try scratch.alloc(types.BatchWrite, 768);
-    for (writes, 0..) |*write, i| write.* = .{
+    const writes = try scratch.alloc(types.BatchWrite, row_count);
+    for (writes, 768 - row_count..) |*write, i| write.* = .{
         .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}),
         .value = try std.fmt.allocPrint(scratch, "{{\"n\":{d},\"user-name\":\"Ada\",\"payload\":{{\"items\":[{{\"id\":{d}}},{{\"id\":2}}],\"nil\":null}},\"embedding\":[1,2,3],\"wide\":\"{s}\"}}", .{ i, i, wide }),
     };
@@ -70236,17 +70366,35 @@ test "relational columnar JSON numeric predicates preserve document semantics" {
 }
 
 test "relational columnar bound selection and late projection match primary semantics" {
-    const alloc = std.testing.allocator;
+    try testColumnarSelection(true);
+}
+
+test "relational columnar projection matrix matches primary semantics on small fixtures" {
+    try testColumnarSelection(false);
+}
+
+fn testColumnarSelection(comptime physical_plan: bool) !void {
+    const row_count = if (physical_plan) 768 else 32;
+    var profile = @import("../test_work_profile.zig").Profile(enum { setup, columnar, primary, assertions, dense }).init();
+    defer profile.report("relational-selection");
+    // Keep 768 rows for physical plans: 512 changes block layout and selects
+    // sequential reads instead of late materialization. The semantic matrix
+    // retains boundary keys on a smaller fixture without asserting that plan.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_tmp = try TestDirectory.init("db");
+        var path_tmp = try TestDirectory.initFast("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
-        try seedColumnScanPlanTest(&db, alloc);
+        try seedColumnScanPlanRows(&db, alloc, row_count);
+        if (physical_plan) try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) >= 2);
+        profile.mark(.setup);
         const selections = [_][]const []const u8{
             &.{},                     &.{"user-name"}, &.{ "payload.items.id", "payload.nil", "missing.name" },
             &.{"payload.items.1.id"}, &.{"-wide"},     &.{"user-*"},
@@ -70264,22 +70412,26 @@ test "relational columnar bound selection and late projection match primary sema
                 .{ .key = "k0761", .value = "{\"n\":761,\"user-name\":\"Grace\",\"payload\":{\"items\":[{\"id\":761}],\"nil\":null},\"embedding\":[1,2,3]}" },
                 .{ .key = "k0761a", .value = "{\"n\":761,\"payload\":{\"items\":[{\"id\":761}]}}" },
             }, .deletes = &.{"k0762"} });
-            for (selections) |fields| for (filters) |filter| for ([_]u32{ 0, 2 }) |limit| {
+            for (if (physical_plan) selections[0..1] else &selections) |fields| for (if (physical_plan) filters[0..1] else &filters) |filter| for ([_]u32{ 0, 2 }) |limit| {
                 var stats: types.ColumnarScanStats = .{};
                 var opts = types.ScanOptions{ .include_documents = true, .fields = fields, .filter_query_json = filter, .limit = limit, .columnar_stats = &stats, .include_content_hashes = true };
                 var actual = try db.scan(alloc, "k0000", "k0767", opts);
                 defer actual.deinit(alloc);
+                profile.mark(.columnar);
                 try std.testing.expect(stats.used);
                 try std.testing.expectEqual(@as(u64, 1), stats.scan_plans_built);
-                try std.testing.expect(stats.scan_plan_hits > 0);
+                if (physical_plan) try std.testing.expect(stats.scan_plan_hits > 0);
                 if (dirty == 0 and RelationalProjectionPlan.supports(fields, true)) try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
-                if (dirty == 0 and fields.len == 0) try std.testing.expectEqual(@as(u64, actual.documents.len), stats.late_materialized_rows);
+                if (physical_plan and dirty == 0 and fields.len == 0) try std.testing.expectEqual(@as(u64, actual.documents.len), stats.late_materialized_rows);
                 opts.disable_columnar_scan = true;
                 opts.columnar_stats = null;
+                profile.mark(.assertions);
                 var expected = try db.scan(alloc, "k0000", "k0767", opts);
                 defer expected.deinit(alloc);
+                profile.mark(.primary);
                 try std.testing.expectEqualDeep(expected.documents, actual.documents);
                 try std.testing.expectEqualDeep(expected.hashes, actual.hashes);
+                profile.mark(.assertions);
             };
         }
         // Dense full output must choose sequential primary access, not turn
@@ -70287,9 +70439,10 @@ test "relational columnar bound selection and late projection match primary sema
         var stats: types.ColumnarScanStats = .{};
         var dense = try db.scan(alloc, "", "", .{ .include_documents = true, .columnar_stats = &stats });
         defer dense.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 768), dense.documents.len);
-        try std.testing.expect(stats.dense_delta_scans > 0);
+        try std.testing.expectEqual(@as(usize, row_count), dense.documents.len);
+        if (physical_plan) try std.testing.expect(stats.dense_delta_scans > 0);
         try std.testing.expectEqual(@as(u64, 0), stats.late_materialized_rows);
+        profile.mark(.dense);
     }
 }
 
@@ -70347,7 +70500,10 @@ test "relational columnar late materialization pins snapshots and releases visit
 }
 
 test "relational columnar sequential selection preserves dirty owners bounds and limits" {
-    const alloc = std.testing.allocator;
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
@@ -70451,8 +70607,19 @@ test "relational columnar sequential selection pins snapshots and releases failu
     }
 }
 
+test "relational columnar bound scan has bounded plans and primary reads" {
+    try testRelationalBoundScan(false);
+}
+
 test "relational columnar bound scan benchmark" {
-    const alloc = std.testing.allocator;
+    try testRelationalBoundScan(true);
+}
+
+fn testRelationalBoundScan(benchmark: bool) !void {
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const row_count: usize = if (benchmark) 768 else 2 * @import("column_read_cache.zig").max_rows;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
@@ -70462,17 +70629,17 @@ test "relational columnar bound scan benchmark" {
         defer cleanupTempDir(path);
         var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false, .primary_backend = backend });
         defer db.close();
-        try seedColumnScanPlanTest(&db, alloc);
+        try seedColumnScanPlanRows(&db, alloc, row_count);
         const Scenario = struct { fields: []const []const u8, filter: []const u8 = "{\"numeric_range\":{\"field\":\"n\",\"min\":760}}", rows: usize = 8 };
         for ([_]Scenario{
-            .{ .fields = &.{} },                            .{ .fields = &.{"payload.items.0.id"} },                            .{ .fields = &.{"user-name"} },
-            .{ .fields = &.{}, .filter = "", .rows = 768 }, .{ .fields = &.{"payload.items.0.id"}, .filter = "", .rows = 768 },
+            .{ .fields = &.{} },                                  .{ .fields = &.{"payload.items.0.id"} },                                  .{ .fields = &.{"user-name"} },
+            .{ .fields = &.{}, .filter = "", .rows = row_count }, .{ .fields = &.{"payload.items.0.id"}, .filter = "", .rows = row_count },
         }) |scenario| {
             const fields = scenario.fields;
             var elapsed: [2][7]u64 = undefined;
             var allocated: [2]usize = @splat(0);
             var counters: types.ColumnarScanStats = .{};
-            for (0..8) |round| for (0..2) |step| {
+            for (0..@as(usize, if (benchmark) 8 else 1)) |round| for (0..2) |step| {
                 const mode = (round + step) % 2;
                 var measured = std.testing.FailingAllocator.init(alloc, .{});
                 var stats: types.ColumnarScanStats = .{};
@@ -70496,6 +70663,7 @@ test "relational columnar bound scan benchmark" {
                     try std.testing.expectEqual(@as(u64, if (fields.len == 0) scenario.rows else 0), stats.primary_rows_read);
                 }
             };
+            if (!benchmark) continue;
             for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
             std.debug.print("\nbound scan: backend={s}, projection={s}, rows={d}, primary/column median ns={d}/{d}, allocated bytes={d}/{d}, plans={d}, hits={d}, primary rows={d}, payload bytes={d}\n", .{
                 @tagName(backend), if (fields.len == 0) "full" else fields[0], scenario.rows, elapsed[0][3], elapsed[1][3], allocated[0], allocated[1], counters.scan_plans_built, counters.scan_plan_hits, counters.primary_rows_read, counters.payload_bytes_read,
@@ -70614,7 +70782,10 @@ test "relational columnar production LSM physical churn benchmark" {
 }
 
 fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
-    const alloc = std.testing.allocator;
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     var path_tmp = try TestDirectory.init("db");
@@ -70878,13 +71049,23 @@ test "relational columnar dense nested predicate benchmark" {
     }
 }
 
-test "relational columnar decoded reuse benchmark" {
-    const alloc = std.testing.allocator;
+test "relational columnar decoded reuse bounds decoding and allocations" {
+    try testRelationalDecodedReuse(false);
+}
+
+test "relational columnar decoded reuse production scale benchmark" {
+    try testRelationalDecodedReuse(true);
+}
+
+fn testRelationalDecodedReuse(comptime benchmark: bool) !void {
+    var allocator_state: @import("../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
         for ([_]bool{ true, false }) |shared| {
-            var path_tmp = try TestDirectory.init("db");
+            var path_tmp = try TestDirectory.initFast("db");
             defer path_tmp.cleanup();
             const path = path_tmp.path().ptr;
             defer cleanupTempDir(path);
@@ -70909,7 +71090,7 @@ test "relational columnar decoded reuse benchmark" {
             var allocated: [2]usize = @splat(0);
             var counters: [2]types.ColumnarScanStats = @splat(.{});
             // Alternate cache-off/on order; warm both paths before timing.
-            for (0..10) |round| for (0..2) |step| {
+            for (0..if (benchmark) @as(usize, 10) else 1) |round| for (0..2) |step| {
                 const mode = (round + step) % 2;
                 var measured = std.testing.FailingAllocator.init(alloc, .{});
                 var stats: types.ColumnarScanStats = .{};
@@ -70938,10 +71119,12 @@ test "relational columnar decoded reuse benchmark" {
                 allocated[mode] = measured.allocated_bytes;
                 counters[mode] = stats;
             };
-            for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
-            std.debug.print("\ncolumnar decoded reuse: backend={s}, shared={}, median ns off/on={d}/{d}, allocated bytes={d}/{d}, decodes={d}/{d}, hits={d}, peak={d}\n", .{
-                @tagName(backend), shared, elapsed[0][4], elapsed[1][4], allocated[0], allocated[1], counters[0].payload_pages_read, counters[1].payload_pages_read, counters[1].decoded_cache_hits, counters[1].decoded_cache_peak_bytes,
-            });
+            if (benchmark) {
+                for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+                std.debug.print("\ncolumnar decoded reuse: backend={s}, shared={}, median ns off/on={d}/{d}, allocated bytes={d}/{d}, decodes={d}/{d}, hits={d}, peak={d}\n", .{
+                    @tagName(backend), shared, elapsed[0][4], elapsed[1][4], allocated[0], allocated[1], counters[0].payload_pages_read, counters[1].payload_pages_read, counters[1].decoded_cache_hits, counters[1].decoded_cache_peak_bytes,
+                });
+            }
         }
     }
 }
@@ -71190,9 +71373,12 @@ test "relational columnar delete waves coalesce adjacent underfilled ranges" {
 }
 
 test "relational columnar clean coalescing preserves typed cells without primary reads" {
-    const alloc = std.testing.allocator;
+    // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     for ([_]PrimaryBackend{ .lmdb, .{ .lsm = .{ .flush_threshold = 1 } } }) |backend| {
-        var path_tmp = try TestDirectory.init("db");
+        var path_tmp = try TestDirectory.initFast("db");
         defer path_tmp.cleanup();
         const path = path_tmp.path().ptr;
         defer cleanupTempDir(path);
@@ -71772,7 +71958,10 @@ test "relational columnar typed masks avoid vector expansion and eliminated colu
 }
 
 test "relational columnar bounded compaction splits empty ranges and resumes canceled staging" {
-    const alloc = std.testing.allocator;
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     // The explicit block limit below, not elapsed wall time, defines quanta.
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
@@ -74939,6 +75128,14 @@ test "db explicit doc-id filter resolution honors identity generation" {
 }
 
 test "db doc set planning stats record ordinal bitmap promotion" {
+    try testDocSetBitmapPromotion(.{ .min_cardinality = 16 });
+}
+
+test "db doc set bitmap promotion production scale" {
+    try testDocSetBitmapPromotion(.{});
+}
+
+fn testDocSetBitmapPromotion(policy: doc_set.BitmapPolicy) !void {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -74961,7 +75158,7 @@ test "db doc set planning stats record ordinal bitmap promotion" {
         owned_doc_ids.deinit(alloc);
     }
 
-    for (0..doc_set.bitmap_min_cardinality) |i| {
+    for (0..policy.min_cardinality) |i| {
         const doc_id = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
         errdefer alloc.free(doc_id);
         try owned_doc_ids.append(alloc, doc_id);
@@ -74971,18 +75168,31 @@ test "db doc set planning stats record ordinal bitmap promotion" {
 
     try db.batch(.{ .writes = writes.items });
 
-    var resolved = try db.resolveDocSetForIdsAlloc(alloc, doc_ids.items);
+    // Below the threshold must retain ordinal representation; crossing it
+    // must promote and increment the same production planning counters.
+    var below = blk: {
+        lockApplyShared(&db);
+        defer db.core.unlockApplyShared();
+        break :blk try db.resolveDocSetForIdsNoLockAtGenerationWithPolicyAlloc(alloc, doc_ids.items[0 .. doc_ids.items.len - 1], null, policy);
+    };
+    defer below.deinit(alloc);
+    try std.testing.expect(below == .ordinals);
+    var resolved = blk: {
+        lockApplyShared(&db);
+        defer db.core.unlockApplyShared();
+        break :blk try db.resolveDocSetForIdsNoLockAtGenerationWithPolicyAlloc(alloc, doc_ids.items, null, policy);
+    };
     defer resolved.deinit(alloc);
     switch (resolved) {
-        .ordinal_bitmap => |*bitmap| try std.testing.expectEqual(@as(usize, doc_set.bitmap_min_cardinality), bitmap.cardinality()),
+        .ordinal_bitmap => |*bitmap| try std.testing.expectEqual(@as(usize, policy.min_cardinality), bitmap.cardinality()),
         else => return error.ExpectedOrdinalBitmapDocSet,
     }
 
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
-    try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.resolved_set_count);
+    try std.testing.expectEqual(@as(u64, 2), stats.doc_set_planning.resolved_set_count);
     try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.ordinal_bitmap_count);
-    try std.testing.expectEqual(@as(u64, doc_set.bitmap_min_cardinality), stats.doc_set_planning.ordinal_bitmap_docs);
+    try std.testing.expectEqual(@as(u64, policy.min_cardinality), stats.doc_set_planning.ordinal_bitmap_docs);
     try std.testing.expectEqual(@as(u64, 1), stats.doc_set_planning.bitmap_promotion_count);
 }
 
@@ -76536,7 +76746,10 @@ test "db dense and sparse vector searches apply stored symbolic filters before f
 }
 
 test "db dense stored symbolic filter candidate window covers offset pagination" {
-    const alloc = std.testing.allocator;
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -83960,6 +84173,190 @@ test "db document extraction completes audio transcription with transcriber prod
     const provenance = parsed.value.object.get("provenance").?.object;
     try std.testing.expectApproxEqAbs(@as(f64, 0.81), provenance.get("confidence").?.float, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.81), provenance.get("transcript_confidence").?.float, 0.0001);
+}
+
+test "db document extraction transcript segments time chunk artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{
+        .transcriber_output = "{\"text\":\"first phrase here. second phrase there.\",\"confidence\":0.9,\"duration_ms\":2500,\"segments\":[{\"text\":\"first phrase here.\",\"start_ms\":0,\"end_ms\":1200},{\"text\":\"second phrase there.\",\"start_ms\":1300,\"end_ms\":2500}]}",
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"mock-transcriber\"}}}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 20,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:timed-audio",
+            .value = "{\"filename\":\"audio.mp3\",\"mime_type\":\"audio/mpeg\",\"url\":\"data:audio/mpeg;base64,SUQzYXVkaW8gYnl0ZXM=\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(usize, 1), fake.transcriber_calls);
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:timed-audio", "document_units_v1", "audio:000001");
+    defer alloc.free(unit_key);
+    const unit_payload = try db.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    var parsed_unit = try std.json.parseFromSlice(std.json.Value, alloc, unit_payload, .{});
+    defer parsed_unit.deinit();
+    try std.testing.expectEqualStrings("first phrase here. second phrase there.", parsed_unit.value.object.get("text").?.string);
+    const spans = parsed_unit.value.object.get("provenance").?.object.get("transcript_spans").?.array;
+    try std.testing.expectEqual(@as(usize, 2), spans.items.len);
+    try std.testing.expectEqual(@as(i64, 0), spans.items[0].object.get("char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 18), spans.items[0].object.get("char_end").?.integer);
+    try std.testing.expectEqual(@as(i64, 1200), spans.items[0].object.get("end_ms").?.integer);
+    try std.testing.expectEqual(@as(i64, 19), spans.items[1].object.get("char_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 1300), spans.items[1].object.get("start_ms").?.integer);
+    try std.testing.expectEqual(@as(i64, 2500), spans.items[1].object.get("end_ms").?.integer);
+
+    // Every chunk cut from the transcript carries the offsets of the phrases
+    // it overlaps, and the first chunk starts where the recording does.
+    var chunk_index: u32 = 0;
+    var timed_chunks: usize = 0;
+    var last_end_ms: f64 = 0;
+    while (true) : (chunk_index += 1) {
+        const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:timed-audio", "document_chunks_v1", "audio:000001", chunk_index);
+        defer alloc.free(chunk_key);
+        const chunk_payload = db.core.store.get(alloc, chunk_key) catch |err| switch (err) {
+            error.NotFound => break,
+            else => return err,
+        };
+        defer alloc.free(chunk_payload);
+        var parsed_chunk = try std.json.parseFromSlice(std.json.Value, alloc, chunk_payload, .{});
+        defer parsed_chunk.deinit();
+        const start_ms = jsonTestNumber(parsed_chunk.value.object.get("_start_time_ms").?);
+        const end_ms = jsonTestNumber(parsed_chunk.value.object.get("_end_time_ms").?);
+        if (chunk_index == 0) try std.testing.expectEqual(@as(f64, 0), start_ms);
+        try std.testing.expect(end_ms >= start_ms);
+        try std.testing.expect(start_ms >= last_end_ms or start_ms == 0 or start_ms == 1300);
+        last_end_ms = end_ms;
+        timed_chunks += 1;
+    }
+    try std.testing.expect(timed_chunks >= 2);
+    try std.testing.expectEqual(@as(f64, 2500), last_end_ms);
+}
+
+test "db document extraction keeps diarized speakers through reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var fake = TestAssetProducer{
+        .transcriber_output = "{\"text\":\"alpha alpha alpha alpha alpha. beta beta beta beta beta.\",\"confidence\":0.9,\"duration_ms\":6000,\"speakers\":[\"SPEAKER_00\",\"SPEAKER_01\"],\"segments\":[{\"text\":\"alpha alpha alpha alpha alpha.\",\"start_ms\":0,\"end_ms\":3000,\"speaker\":\"SPEAKER_00\"},{\"text\":\"beta beta beta beta beta.\",\"start_ms\":3100,\"end_ms\":6000,\"speaker\":\"SPEAKER_01\"}]}",
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .ttl_cleanup = .{ .enabled = false },
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .asset_producer = fake.producer(),
+            },
+        });
+        defer db.close();
+
+        try db.addEnrichment(.{
+            .name = "document_units_v1",
+            .kind = .asset,
+            .field = "url",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"mock-transcriber\",\"diarization\":true}}}}",
+        });
+        try db.addEnrichment(.{
+            .name = "document_chunks_v1",
+            .kind = .chunk,
+            .field = "text",
+            .source_artifact_name = "document_units_v1",
+            .chunk_size = 20,
+        });
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:diarized-audio",
+                .value = "{\"filename\":\"call.webm\",\"mime_type\":\"video/webm\",\"url\":\"data:video/webm;base64,SUQzYXVkaW8gYnl0ZXM=\"}",
+            }},
+            .sync_level = .full_index,
+        });
+        try std.testing.expectEqual(@as(usize, 1), fake.transcriber_calls);
+    }
+
+    // Reopen: the speaker attribution has to survive as durable artifact
+    // state, not just as something the enrichment pass held in memory.
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{ .enabled = false },
+        .start_index_workers = false,
+    });
+    defer reopened.close();
+
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:diarized-audio", "document_units_v1", "audio:000001");
+    defer alloc.free(unit_key);
+    const unit_payload = try reopened.core.store.get(alloc, unit_key);
+    defer alloc.free(unit_payload);
+    var parsed_unit = try std.json.parseFromSlice(std.json.Value, alloc, unit_payload, .{});
+    defer parsed_unit.deinit();
+
+    // Every phrase kept the speaker who said it, numbered in the order they
+    // first spoke.
+    const spans = parsed_unit.value.object.get("provenance").?.object.get("transcript_spans").?.array;
+    try std.testing.expect(spans.items.len >= 2);
+    try std.testing.expectEqual(@as(i64, 0), spans.items[0].object.get("speaker_index").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), spans.items[spans.items.len - 1].object.get("speaker_index").?.integer);
+
+    // Chunks cut from the transcript carry the speaker's label, and a chunk
+    // that straddles the turn carries none.
+    var chunk_index: u32 = 0;
+    var first_speaker_chunks: usize = 0;
+    var second_speaker_chunks: usize = 0;
+    while (true) : (chunk_index += 1) {
+        const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:diarized-audio", "document_chunks_v1", "audio:000001", chunk_index);
+        defer alloc.free(chunk_key);
+        const chunk_payload = reopened.core.store.get(alloc, chunk_key) catch |err| switch (err) {
+            error.NotFound => break,
+            else => return err,
+        };
+        defer alloc.free(chunk_payload);
+        var parsed_chunk = try std.json.parseFromSlice(std.json.Value, alloc, chunk_payload, .{});
+        defer parsed_chunk.deinit();
+        const speaker = parsed_chunk.value.object.get("_speaker") orelse continue;
+        if (std.mem.eql(u8, speaker.string, "SPEAKER_00")) {
+            first_speaker_chunks += 1;
+        } else if (std.mem.eql(u8, speaker.string, "SPEAKER_01")) {
+            second_speaker_chunks += 1;
+        } else {
+            return error.UnexpectedSpeakerLabel;
+        }
+    }
+    try std.testing.expect(first_speaker_chunks >= 1);
+    try std.testing.expect(second_speaker_chunks >= 1);
 }
 
 test "db document extraction stores rfc822 email units" {
@@ -93329,6 +93726,8 @@ test "db foreign inference provider failure releases enrichment waiter as termin
         error.EnrichmentWorkerFailed,
         db.enrichment_runtime.?.waitForApplied(sequence),
     );
+
+    try std.testing.expectError(error.EnrichmentWorkerFailed, db.runUntilIdle());
 
     const stats = db.enrichment_runtime.?.stats();
     try std.testing.expectEqual(sequence, stats.applied_sequence);
@@ -128640,7 +129039,7 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
     // diagnostics only poison and guard allocations that cross this boundary.
     const alloc = platform.allocator.processAllocator(std.testing.allocator);
 
-    var src_tmp = try TestDirectory.init("db");
+    var src_tmp = try TestDirectory.initFast("db");
     defer src_tmp.cleanup();
     const src_path = src_tmp.path().ptr;
     defer cleanupTempDir(src_path);
@@ -128685,7 +129084,7 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
     }
 
     for (0..32) |i| {
-        var restore_tmp = try TestDirectory.init("db");
+        var restore_tmp = try TestDirectory.initFast("db");
         defer restore_tmp.cleanup();
         const restore_path = restore_tmp.path().ptr;
         defer cleanupTempDir(restore_path);
@@ -130020,7 +130419,10 @@ test "db graph ownership restore cursor resumes one artifact index exactly" {
 }
 
 test "db graph ownership restore materializes large artifacts in published segments" {
-    const alloc = std.testing.allocator;
+    // Keep leak checks and failure injection; allocation backtraces are opt-in.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;

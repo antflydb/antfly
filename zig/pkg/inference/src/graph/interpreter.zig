@@ -1563,6 +1563,15 @@ fn buildGroupedFromRouting(
 }
 
 /// Fill a caller-owned buffer with shape dimensions from a graph node.
+fn safeNumel(dims: []const i64) ?usize {
+    var n: usize = 1;
+    for (dims) |d| {
+        if (d <= 0) return null;
+        n = std.math.mul(usize, n, @intCast(d)) catch return null;
+    }
+    return n;
+}
+
 fn fillShapeDims(graph: *const Graph, node_id: NodeId, buf: *[8]i64) []const i64 {
     const shape = graph.node(node_id).output_shape;
     const rank = shape.rank();
@@ -1593,10 +1602,7 @@ fn executeScatterAdd(
     axis: u8,
 ) !CT {
     if (axis != 0) return error.UnsupportedPrimitiveOp;
-    const index_dtype = cb.tensorDType(indices) catch |err| switch (err) {
-        error.UnsupportedTensorType => .f32,
-        else => return err,
-    };
+    const index_dtype = try cb.tensorDType(indices);
     if (index_dtype == .i32 or index_dtype == .i64) {
         // The compatibility host path below represents legacy indices as f32.
         // Typed training indices must reach the backend without that cast.
@@ -2584,6 +2590,7 @@ pub fn executeNode(
             return cb.relu(V.get(ins[0]));
         },
 
+        .fused_silu_backward, .fused_sigmoid_backward, .fused_prefix_scan_v1, .frozen_span_features_v1 => return error.UnsupportedPrimitiveOp,
         .fused_silu => {
             if (state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
                 if (try cb.unaryConsume(.silu, V.get(ins[0]))) |consumed| return consumed;
@@ -3104,6 +3111,11 @@ pub fn executeNode(
             try cb.evalTensor(V.get(ins[0]));
             return V.get(ins[0]);
         },
+
+        // This opt-in backward profile requires the resident executor's
+        // admitted FP32 reduction kernel. CPU/Metal default VJPs remain
+        // decomposed; do not silently replace requested fused arithmetic.
+        .fused_softmax_backward, .fused_boundary_training_attention_v1, .fused_boundary_training_attention_backward_v1 => return error.UnsupportedResidentProgramInstruction,
 
         .fused_softmax => |attrs| {
             const input_ct = V.get(ins[0]);
@@ -3644,6 +3656,30 @@ pub fn executeNode(
                     }
                 }
             }
+            // The importer sizes this broadcast from static shapes. When an
+            // upstream axis was only known at run time (a Slice bounded by a
+            // Shape subgraph, say), the declared input shape may carry a 1
+            // where the tensor really has the target extent; broadcasting
+            // from the declared shape would then replicate one column. When
+            // the tensor already holds as many elements as the target, it
+            // is the broadcast result and only needs the target shape.
+            {
+                var target_numel: usize = 1;
+                var target_known = true;
+                for (target_dims[0..rank]) |d| {
+                    if (d <= 0) target_known = false else target_numel *= @intCast(d);
+                }
+                const declared_numel = safeNumel(in_shape);
+                if (target_known and declared_numel != null and declared_numel.? != target_numel) {
+                    const data = try cb.toFloat32(V.get(ins[0]), std.heap.page_allocator);
+                    defer std.heap.page_allocator.free(data);
+                    if (data.len == target_numel) {
+                        var target_i32: [8]i32 = undefined;
+                        for (target_dims[0..rank], 0..) |d, i| target_i32[i] = @intCast(d);
+                        return cb.fromFloat32Shape(data, target_i32[0..rank]);
+                    }
+                }
+            }
             const reshaped = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
             defer if (reshaped) |r| cb.free(r);
             const result = try cb.primBroadcastInDim(
@@ -3764,6 +3800,7 @@ pub fn executeNode(
             return result;
         },
         .scatter_add => |attrs| {
+            if (attrs.padding_index != null or attrs.reduction == .pytorch_embedding_v1) return error.UnsupportedOperation;
             var dest_buf: [8]i64 = undefined;
             var values_buf: [8]i64 = undefined;
             var indices_buf: [8]i64 = undefined;
@@ -4054,6 +4091,7 @@ pub fn executeNode(
                 const kernel_size = try positiveShapeDim(weight_shape, 2);
                 const stride = std.math.cast(usize, attrs.strides[0]) orelse return error.UnsupportedShape;
                 const padding = std.math.cast(usize, attrs.padding[0][0]) orelse return error.UnsupportedShape;
+                const dilation = std.math.cast(usize, attrs.dilations[0]) orelse return error.UnsupportedShape;
 
                 const tmp_alloc = std.heap.page_allocator;
                 const bias_data = try tmp_alloc.alloc(f32, out_channels);
@@ -4062,15 +4100,36 @@ pub fn executeNode(
                 const bias = try cb.fromFloat32(bias_data);
                 defer cb.free(bias);
 
+                // A dilated kernel is the dense kernel of size d*(k-1)+1
+                // with zeros between the taps; the dense conv1d then
+                // produces exactly the dilated result.
+                const effective_kernel = if (dilation > 1) dilation * (kernel_size - 1) + 1 else kernel_size;
+                var dilated_weight: ?CT = null;
+                defer if (dilated_weight) |w| cb.free(w);
+                if (dilation > 1) {
+                    const dense = try cb.toFloat32(V.get(ins[1]), tmp_alloc);
+                    defer tmp_alloc.free(dense);
+                    if (dense.len != out_channels * in_channels * kernel_size) return error.InvalidInputShape;
+                    const expanded = try tmp_alloc.alloc(f32, out_channels * in_channels * effective_kernel);
+                    defer tmp_alloc.free(expanded);
+                    @memset(expanded, 0);
+                    for (0..out_channels * in_channels) |oc_ic| {
+                        for (0..kernel_size) |tap| {
+                            expanded[oc_ic * effective_kernel + tap * dilation] = dense[oc_ic * kernel_size + tap];
+                        }
+                    }
+                    dilated_weight = try cb.fromFloat32Shape(expanded, &[_]i32{ @intCast(out_channels), @intCast(in_channels), @intCast(effective_kernel) });
+                }
+
                 return cb.conv1d(
                     V.get(ins[0]),
-                    V.get(ins[1]),
+                    dilated_weight orelse V.get(ins[1]),
                     bias,
                     batch,
                     in_channels,
                     out_channels,
                     time_steps,
-                    kernel_size,
+                    effective_kernel,
                     stride,
                     padding,
                 ) catch |err| {
@@ -4105,6 +4164,10 @@ pub fn executeNode(
                 const padding_h = std.math.cast(usize, attrs.padding[0][0]) orelse return error.UnsupportedShape;
                 const padding_w = std.math.cast(usize, attrs.padding[1][0]) orelse return error.UnsupportedShape;
                 const groups = std.math.cast(usize, attrs.groups) orelse return error.UnsupportedShape;
+                if (attrs.hasDilation()) {
+                    std.log.warn("conv_general 2d with dilation is not supported node_id={d} dilations={any}", .{ node_id, attrs.dilations });
+                    return error.UnsupportedShape;
+                }
 
                 const tmp_alloc = std.heap.page_allocator;
                 const bias_data = try tmp_alloc.alloc(f32, out_channels);
@@ -4430,6 +4493,10 @@ const TestCompute = struct {
     fn backendKind(_: *anyopaque) contracts.BackendKind {
         return .native;
     }
+    // TestBuf stores only f32 values, including the legacy index fixtures.
+    fn tensorDType(_: *anyopaque, _: CT) anyerror!@import("../backends/tensor.zig").DType {
+        return .f32;
+    }
     fn deinitBackend(_: *anyopaque) void {}
     fn prefetchHint(_: *anyopaque, _: []const u8, _: u32) void {}
     fn drainPrefetch(_: *anyopaque, _: usize) void {}
@@ -4749,6 +4816,7 @@ const TestCompute = struct {
     }
 
     const test_vtable = ComputeBackend.VTable{
+        .tensorDType = &tensorDType,
         .backendKind = &backendKind,
         .deinitBackend = &deinitBackend,
         .freeTensor = &freeTensor,

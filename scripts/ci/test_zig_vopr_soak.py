@@ -30,6 +30,9 @@ class SoakTests(unittest.TestCase):
             "Build production executable and qualify owner publication",
             "Soak public overwrite restore with concurrent readers and status",
             "Soak cross-shard Autograph resolution, promotion, and hydration",
+            "Soak three by three cluster backup delete and restore",
+            "Soak large catalog control and diagnostic isolation",
+            "Soak concurrent aggregations and transaction session recovery",
         ):
             with (
                 self.subTest(step=step_name),
@@ -38,10 +41,20 @@ class SoakTests(unittest.TestCase):
                 root = Path(directory)
                 (root / "production-e2e-soak").mkdir()
                 (root / "scripts/ci").mkdir(parents=True)
+                (root / "tools").mkdir()
+                (root / "tools/run_bounded_zig_build.py").write_text(
+                    "import os, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "assert '--max-rss-cap' in args and '-j1' not in args\n"
+                    "os.execvp('zig', ['zig', *args[args.index('--') + 1:]])\n"
+                )
                 for filename in (
                     "zig",
                     "scripts/ci/zig-e2e-regression-loop.sh",
                     "scripts/ci/zig-e2e-autograph-soak.sh",
+                    "scripts/ci/zig-e2e-cluster-restore-soak.sh",
+                    "scripts/ci/zig-e2e-catalog-soak.sh",
+                    "scripts/ci/zig-e2e-query-transaction-soak.sh",
                 ):
                     stub = root / filename
                     stub.write_text(
@@ -67,6 +80,70 @@ class SoakTests(unittest.TestCase):
                 logs = list((root / "production-e2e-soak").glob("*.log"))
                 self.assertEqual(len(logs), 1)
                 self.assertIn("injected-soak-failure", logs[0].read_text())
+
+    def test_qualification_and_runner_build_use_bounded_parallelism(self):
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/zig-vopr-soak.yml"
+        ).read_text()
+        for step_name, targets in (
+            (
+                "Test production transport, runtime scheduling, and determinism boundaries",
+                [
+                    "antfly-raft-transport-test",
+                    "standby-vopr-test",
+                    "vopr-runtime-test",
+                    "restore-admission-vopr-test",
+                    "vopr-determinism-audit",
+                ],
+            ),
+            ("Build campaign runner", ["vopr-build"]),
+        ):
+            with (
+                self.subTest(step=step_name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                (root / "tools").mkdir()
+                (root / "tools/run_bounded_zig_build.py").write_text(
+                    "import json, sys\n"
+                    "from pathlib import Path\n"
+                    "Path('invocation.json').write_text(json.dumps(sys.argv[1:]))\n"
+                    "sys.exit(37)\n"
+                )
+                step = workflow.split(f"      - name: {step_name}\n", 1)[1]
+                step = step.split("      - name:", 1)[0]
+                command = textwrap.dedent(step.split("        run: |\n", 1)[1])
+                result = subprocess.run(
+                    ["bash", "-e", "-o", "pipefail", "-c", command],
+                    cwd=root,
+                    env={
+                        **os.environ,
+                        "VOPR_LOCAL_CACHE_DIR": "local-cache",
+                        "VOPR_GLOBAL_CACHE_DIR": "global-cache",
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
+                args = json.loads((root / "invocation.json").read_text())
+                self.assertEqual(
+                    args[:4], ["--max-rss-cap", "23622320128", "--", "build"]
+                )
+                self.assertEqual(args[4 : 4 + len(targets)], targets)
+                self.assertFalse(
+                    any(re.fullmatch(r"-j(?:[0-9]+)?", arg) for arg in args)
+                )
+                self.assertIn("-Doptimize=ReleaseSafe", args)
+                self.assertEqual(
+                    args[-4:],
+                    [
+                        "--cache-dir",
+                        "local-cache",
+                        "--global-cache-dir",
+                        "global-cache",
+                    ],
+                )
 
     def test_timeout_kills_and_reaps_a_child_that_ignores_termination(self):
         with tempfile.TemporaryDirectory() as root:

@@ -293,6 +293,7 @@ pub const Config = struct {
     graph_execution: ?GraphExecutionConfig = null,
     mcp: ?McpConfig = null,
     backup: ?BackupConfig = null,
+    secrets: ?SecretsConfig = null,
     storage: ?StorageConfig = null,
     transaction_sessions: ?TransactionSessionConfig = null,
     /// DEPRECATED: use hot_standby
@@ -352,6 +353,7 @@ pub const Config = struct {
         .{ "graph_execution", "graph_execution", true },
         .{ "mcp", "mcp", true },
         .{ "backup", "backup", true },
+        .{ "secrets", "secrets", true },
         .{ "storage", "storage", true },
         .{ "transaction_sessions", "transaction_sessions", true },
         .{ "ha", "ha", true },
@@ -425,6 +427,10 @@ pub const Config = struct {
         }
         if (self.backup) |value| {
             try jw.objectField("backup");
+            try jw.write(value);
+        }
+        if (self.secrets) |value| {
+            try jw.objectField("secrets");
             try jw.write(value);
         }
         if (self.storage) |value| {
@@ -1747,6 +1753,39 @@ pub const NamedChainLink = struct {
     }
 };
 
+/// Antfly-managed override store. Currently file-backed and node-local; this setting does not replicate secrets between nodes. Without native, secret API writes are disabled.
+pub const NativeSecretStoreConfig = struct {
+    /// Unique source name; environment is reserved.
+    name: ?[]const u8 = null,
+    /// Literal file path, relative to the process working directory if not absolute.
+    path: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", true },
+        .{ "path", "path", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        try jw.objectField("path");
+        try jw.write(self.path);
+        try jw.endObject();
+    }
+};
+
 pub const ObjectStorageConfig = struct {
     /// ID of a connections entry with kind external_io, protocol s3, and the storage.primary capability. Storage credentials are resolved from that connection independently of remote-content credentials.
     connection: []const u8,
@@ -1970,6 +2009,55 @@ pub const S3ExternalIoConfig = struct {
         }
         if (self.use_ssl) |value| {
             try jw.objectField("use_ssl");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SecretSourceConfig = struct {
+    /// Unique source name; environment is reserved.
+    name: []const u8,
+    type: []const u8,
+    /// Literal path to an externally managed secret file. Never written by the API.
+    path: []const u8,
+};
+
+/// Startup-only secret resolver configuration. Native overrides win, followed by sources in array order, then environment variables. Omitting this section preserves legacy secret-store flags and deployment defaults. Do not combine this section with legacy secret-store flags.
+pub const SecretsConfig = struct {
+    native: ?NativeSecretStoreConfig = null,
+    /// Read-only sources, highest priority first.
+    sources: ?[]const SecretSourceConfig = null,
+    /// Enable environment fallback for secret references and discovery.
+    environment: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "native", "native", true },
+        .{ "sources", "sources", true },
+        .{ "environment", "environment", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.native) |value| {
+            try jw.objectField("native");
+            try jw.write(value);
+        }
+        if (self.sources) |value| {
+            try jw.objectField("sources");
+            try jw.write(value);
+        }
+        if (self.environment) |value| {
+            try jw.objectField("environment");
             try jw.write(value);
         }
         try jw.endObject();

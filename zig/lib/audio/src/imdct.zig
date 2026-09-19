@@ -19,9 +19,16 @@ pub const Complex = struct {
     im: f32,
 };
 
+/// Inverse MDCT of size `n` (n outputs from n/2 coefficients):
+///
+///     x[i] = (2/n) * sum_{k < n/2} X[k] * cos(2*pi/n * (i + 1/2 + n/4) * (k + 1/2))
+///
+/// which is the AAC (ISO 14496-3) and Vorbis kernel. Power-of-two sizes run
+/// the classic n/4-point complex FFT with pre- and post-rotation; other sizes
+/// (the AAC 960-sample frame) go through a Bluestein chirp-z convolution.
 pub const Plan = struct {
     const Mode = enum {
-        residue_fft,
+        pow2_fft,
         bluestein,
     };
 
@@ -36,52 +43,33 @@ pub const Plan = struct {
     pub fn init(allocator: std.mem.Allocator, n: usize) !Plan {
         if (n == 0 or n % 4 != 0) return error.UnsupportedAudioFormat;
 
-        if (ceilPowerOfTwo(2 * n) == 2 * n) {
-            return initResidueFft(allocator, n);
+        if (n >= 8 and std.math.isPowerOfTwo(n)) {
+            return initPow2Fft(allocator, n);
         }
         return initBluestein(allocator, n);
     }
 
-    fn initResidueFft(allocator: std.mem.Allocator, n: usize) !Plan {
+    fn initPow2Fft(allocator: std.mem.Allocator, n: usize) !Plan {
         const quarter_n = n / 4;
-        const pre_twiddle = try allocator.alloc(Complex, 8 * quarter_n);
-        errdefer allocator.free(pre_twiddle);
-        const post_twiddle = try allocator.alloc(Complex, 2 * quarter_n);
-        errdefer allocator.free(post_twiddle);
-
+        // One rotation table serves both the pre- and the post-rotation:
+        // twiddle[i] = -exp(i * 2*pi*(i + 1/8)/n).
+        const twiddle = try allocator.alloc(Complex, quarter_n);
+        errdefer allocator.free(twiddle);
         const n_f = @as(f64, @floatFromInt(n));
-        const output_shift = n_f / 4.0 + 0.5;
-
-        for (0..4) |residue| {
-            for (0..2) |parity| {
-                const table_base = residueParityBase(residue, parity, quarter_n);
-                for (0..quarter_n) |r| {
-                    const k = 2 * r + parity;
-                    const angle = std.math.pi *
-                        (@as(f64, @floatFromInt(residue)) + output_shift) *
-                        (@as(f64, @floatFromInt(k)) + 0.5) / n_f;
-                    pre_twiddle[table_base + r] = complexFromAngle(angle);
-                }
-            }
-        }
-
-        for (0..2) |parity| {
-            const frequency = @as(f64, @floatFromInt(parity)) + 0.5;
-            const table_base = parity * quarter_n;
-            for (0..quarter_n) |q| {
-                const angle = 4.0 * std.math.pi *
-                    @as(f64, @floatFromInt(q)) *
-                    frequency / n_f;
-                post_twiddle[table_base + q] = complexFromAngle(angle);
-            }
+        for (twiddle, 0..) |*value, i| {
+            const angle = 2.0 * std.math.pi * (@as(f64, @floatFromInt(i)) + 0.125) / n_f;
+            value.* = .{
+                .re = @floatCast(-@cos(angle)),
+                .im = @floatCast(-@sin(angle)),
+            };
         }
 
         return .{
             .n = n,
-            .mode = .residue_fft,
+            .mode = .pow2_fft,
             .fft_len = quarter_n,
-            .pre_twiddle = pre_twiddle,
-            .post_twiddle = post_twiddle,
+            .pre_twiddle = twiddle,
+            .post_twiddle = &.{},
             .kernel_fft = &.{},
             .allocator = allocator,
         };
@@ -98,8 +86,11 @@ pub const Plan = struct {
         errdefer allocator.free(kernel_fft);
         @memset(kernel_fft, .{ .re = 0, .im = 0 });
 
+        // cos(theta*a*b) = Re(exp(i*theta*(a+b)^2/2) * exp(-i*theta*a^2/2) * exp(-i*theta*b^2/2)),
+        // so the sum over k is a linear convolution of the chirped
+        // coefficients with the chirp kernel, evaluated at t = i + k.
         const n_f = @as(f64, @floatFromInt(n));
-        const angle_scale = std.math.pi / n_f;
+        const angle_scale = 2.0 * std.math.pi / n_f;
         const n_shift = n_f / 4.0 + 0.5;
         const k_shift = 0.5;
 
@@ -136,7 +127,7 @@ pub const Plan = struct {
 
     pub fn deinit(self: *Plan) void {
         self.allocator.free(self.pre_twiddle);
-        self.allocator.free(self.post_twiddle);
+        if (self.post_twiddle.len > 0) self.allocator.free(self.post_twiddle);
         if (self.kernel_fft.len > 0) self.allocator.free(self.kernel_fft);
         self.* = undefined;
     }
@@ -147,37 +138,60 @@ pub fn imdctInto(out: []f32, coefficients: []const f32, plan: *const Plan, work:
     if (work.len < plan.fft_len) return error.UnsupportedAudioFormat;
 
     switch (plan.mode) {
-        .residue_fft => return imdctIntoResidueFft(out, coefficients, plan, work[0..plan.fft_len]),
+        .pow2_fft => return imdctIntoPow2Fft(out, coefficients, plan, work[0..plan.fft_len]),
         .bluestein => return imdctIntoBluestein(out, coefficients, plan, work[0..plan.fft_len]),
     }
 }
 
-fn imdctIntoResidueFft(out: []f32, coefficients: []const f32, plan: *const Plan, fft_work: []Complex) !void {
-    const quarter_n = plan.n / 4;
-    if (fft_work.len != quarter_n) return error.UnsupportedAudioFormat;
-    @memset(out, 0);
+/// The n/4-point FFT formulation: odd/even coefficient pairs are rotated
+/// into n/4 complex values, transformed, rotated back, and the n/2 real
+/// values that fall out are the middle half of the output, whose two outer
+/// quarters follow from the IMDCT's odd and even symmetries.
+fn imdctIntoPow2Fft(out: []f32, coefficients: []const f32, plan: *const Plan, z: []Complex) !void {
+    const n = plan.n;
+    const n2 = n / 2;
+    const n4 = n / 4;
+    const n8 = n / 8;
+    if (z.len != n4) return error.UnsupportedAudioFormat;
+    const twiddle = plan.pre_twiddle;
 
-    const scale = (2.0 / @as(f32, @floatFromInt(plan.n))) * @as(f32, @floatFromInt(quarter_n));
-    for (0..4) |residue| {
-        for (0..2) |parity| {
-            const pre_base = residueParityBase(residue, parity, quarter_n);
-            for (0..quarter_n) |r| {
-                const coefficient = coefficients[2 * r + parity];
-                const twiddle = plan.pre_twiddle[pre_base + r];
-                fft_work[r] = .{
-                    .re = coefficient * twiddle.re,
-                    .im = coefficient * twiddle.im,
-                };
-            }
+    for (0..n4) |k| {
+        const a = coefficients[n2 - 1 - 2 * k];
+        const b = coefficients[2 * k];
+        z[k] = .{
+            .re = a * twiddle[k].re - b * twiddle[k].im,
+            .im = a * twiddle[k].im + b * twiddle[k].re,
+        };
+    }
 
-            try fftComplex(fft_work, true);
+    // The rotation tables assume an inverse (positive-exponent) transform;
+    // `fftComplex` normalizes its inverse by 1/n4, which the scale undoes.
+    try fftComplex(z, true);
 
-            const post_base = parity * quarter_n;
-            for (0..quarter_n) |q| {
-                const rotated = complexMul(fft_work[q], plan.post_twiddle[post_base + q]);
-                out[4 * q + residue] += rotated.re * scale;
-            }
-        }
+    for (0..n8) |k| {
+        const lo = z[n8 - k - 1];
+        const hi = z[n8 + k];
+        const t_lo = twiddle[n8 - k - 1];
+        const t_hi = twiddle[n8 + k];
+        const re_lo = lo.im * t_lo.im - lo.re * t_lo.re;
+        const im_hi = lo.im * t_lo.re + lo.re * t_lo.im;
+        const re_hi = hi.im * t_hi.im - hi.re * t_hi.re;
+        const im_lo = hi.im * t_hi.re + hi.re * t_hi.im;
+        z[n8 - k - 1] = .{ .re = re_lo, .im = im_lo };
+        z[n8 + k] = .{ .re = re_hi, .im = im_hi };
+    }
+
+    // z now holds the middle half of the output as n/4 (re, im) pairs. The
+    // rotation convention above yields the negated kernel, so the sign is
+    // folded into the 2/n normalization along with the FFT's 1/n4.
+    const scale = -(2.0 / @as(f32, @floatFromInt(n))) * @as(f32, @floatFromInt(n4));
+    for (0..n4) |q| {
+        out[n4 + 2 * q] = z[q].re * scale;
+        out[n4 + 2 * q + 1] = z[q].im * scale;
+    }
+    for (0..n4) |k| {
+        out[k] = -out[n2 - k - 1];
+        out[n - k - 1] = out[n2 + k];
     }
 }
 
@@ -205,10 +219,6 @@ fn imdctIntoBluestein(out: []f32, coefficients: []const f32, plan: *const Plan, 
         const rotated = complexMul(convolved, plan.post_twiddle[out_index]);
         sample.* = rotated.re * scale;
     }
-}
-
-fn residueParityBase(residue: usize, parity: usize, quarter_n: usize) usize {
-    return (residue * 2 + parity) * quarter_n;
 }
 
 fn ceilPowerOfTwo(value: usize) ?usize {
@@ -287,7 +297,7 @@ fn complexMul(a: Complex, b: Complex) Complex {
 }
 
 test "fft imdct matches naive kernel" {
-    const sizes = [_]usize{ 8, 12, 16, 32, 64 };
+    const sizes = [_]usize{ 8, 12, 16, 32, 64, 128, 256, 512, 1920, 2048 };
     for (sizes) |n| {
         const coefficients = try std.testing.allocator.alloc(f32, n / 2);
         defer std.testing.allocator.free(coefficients);
@@ -310,7 +320,7 @@ test "fft imdct matches naive kernel" {
         try imdctInto(actual, coefficients, &plan, work);
 
         for (expected, actual) |want, got| {
-            try std.testing.expectApproxEqAbs(want, got, 1e-4);
+            try std.testing.expectApproxEqAbs(want, got, 2e-4);
         }
     }
 }
@@ -319,14 +329,15 @@ fn imdctIntoNaiveForTest(out: []f32, coefficients: []const f32) !void {
     if (out.len != coefficients.len * 2) return error.UnsupportedAudioFormat;
 
     const n = out.len;
-    const scale = 2.0 / @as(f32, @floatFromInt(n));
+    const n_f = @as(f64, @floatFromInt(n));
+    const scale = 2.0 / n_f;
     for (out, 0..) |*sample, n_idx| {
-        const n_term = @as(f32, @floatFromInt(n_idx)) + 0.5 + @as(f32, @floatFromInt(n)) / 4.0;
-        var accum: f32 = 0;
+        const n_term = @as(f64, @floatFromInt(n_idx)) + 0.5 + n_f / 4.0;
+        var accum: f64 = 0;
         for (coefficients, 0..) |coef, k_idx| {
-            const k_term = @as(f32, @floatFromInt(k_idx)) + 0.5;
-            accum += coef * @cos((std.math.pi / @as(f32, @floatFromInt(n))) * n_term * k_term);
+            const k_term = @as(f64, @floatFromInt(k_idx)) + 0.5;
+            accum += @as(f64, coef) * @cos((2.0 * std.math.pi / n_f) * n_term * k_term);
         }
-        sample.* = accum * scale;
+        sample.* = @floatCast(accum * scale);
     }
 }

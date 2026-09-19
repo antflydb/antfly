@@ -5,7 +5,7 @@
 //! ranking and probability-product pair ranking match the pinned Fastino
 //! TypedRelationPairGenerator, with explicit bounds and deterministic ties.
 const std = @import("std");
-const ops = @import("../architectures/gliner_boundary_ops.zig");
+const ops = @import("../architectures/gliner/boundary_ops.zig");
 const decode = @import("gliner_boundary_decode.zig");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 pub const Route = struct {
