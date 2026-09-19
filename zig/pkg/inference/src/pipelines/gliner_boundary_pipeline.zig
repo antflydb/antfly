@@ -1441,12 +1441,12 @@ fn convertedCheckpointParity(comptime variant: []const u8, comptime environment:
         if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     }
     const directory = @import("antfly_platform").env.getenv(environment) orelse return error.SkipZigTest;
-    const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const factory = @import("../architectures/session_factory.zig");
     const manifest_mod = @import("../models/manifest.zig");
     const bundle = @import("../models/gliner_boundary_bundle.zig");
-    const engine = @import("../architectures/gliner_boundary_engine.zig");
-    const request_device = @import("../architectures/gliner_boundary_request_device.zig");
+    const engine = @import("../architectures/gliner/boundary_engine.zig");
+    const request_device = @import("../architectures/gliner/boundary_request_device.zig");
     const Watchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
     const a = std.testing.allocator;
     const bytes = try fixtures.fixtureBytes(a, fixture_name);
