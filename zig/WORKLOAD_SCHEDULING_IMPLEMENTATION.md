@@ -145,10 +145,10 @@ zero-failure/leak result. Production transport fault tests, backend completion
 credits, sustained-load progress, and release performance qualification remain
 separate work.
 
-### Backend completion boundary still to implement
+### Native completion boundary and remaining integration
 
 The protected row/metadata lanes above reserve preparation and recovery-record
-work. They do not reserve the full physical persistent LSM write.
+work. Their admission alone does not reserve a physical persistent LSM write.
 `CompletionCredit` (`f8c71099cd`) is now connected to an internal, memory-only
 sealed point-batch path (`013b533924`). Preparation charges incoming and
 copy-on-write allocations before allocation; publication requires the original
@@ -158,20 +158,30 @@ charged through the final reader. Stale tickets retire historical roots in
 bounded slices outside the writer lock. Debug and ReleaseSafe each passed 27
 focused tests. See [the backend stage contract](WORKLOAD_LSM_COMPLETION.md).
 
-This memory-only entry point rejects persistent storage before reserving
-capacity. The newer native one-shot helper described below prepays its WAL
-append, but retained transaction tickets still need WAL, manifest and flush
-ownership across prepare, intervening writes and restart. Neither internal path
-promises mandatory transaction completion or activates a public transaction ticket.
+That memory-only entry point rejects persistent storage before reserving
+capacity. The subsequent native completion implementation retains WAL, manifest,
+flush, publication and recovery capacity across a bounded cohort of local
+transactions. Normal local transaction APIs compile the expanded physical plan
+before prepare and restore ownership before foreground admission. The
+[validation record](WORKLOAD_SCHEDULING_VALIDATION.md) identifies the tested
+profiles and their limits.
 
-A public completion ticket must be stored atomically with intents and the
-prepared vote, bound to transaction revision, schema, backend namespace and a
-sealed physical write plan. The plan must include identity, timestamp, replay
-and derived-index writes. Startup must reconstruct its reservations before
-foreground admission; replicas must not reject a committed prepare because
-ordinary local capacity is exhausted. Unsupported plans must be rejected before
-the prepared vote. These are implementation requirements, not guarantees of the
-current opt-in recovery policy.
+Replicated policy activation is still unavailable. The retained prepare/resolve
+lane is insufficient by itself: ordinary writes and transaction begin, decision
+and acknowledgement entries also need canonical mutations and capacity before
+consensus acceptance. Fresh production installation must remain disabled until
+those paths are covered, so a pending policy cannot strand legacy recovery.
+Restoration of existing durable obligations remains mandatory. Pool maintenance,
+reservation reuse and end-to-end replicated fault tests are separate gates;
+passing the local transaction suite does not satisfy them.
+
+The DATA integration now retains opaque native leases through Raft admission,
+durable-log reconciliation and ordered apply. Startup reconstructs the signed
+installation before reconciling accepted work; native progress bypasses ordinary
+projection allocation only when an actual native owner is present. Legacy
+groups retain their previous snapshot-watermark behavior. These are implemented
+mechanisms with focused correctness evidence, not permission to activate the
+unfinished replicated policy.
 
 ## Implemented admission contract
 

@@ -7,29 +7,114 @@ macOS host. They cannot establish Cloud package throughput or latency limits.
 
 ## Durable transaction integration checkpoint (2026-09-19)
 
-`zig build antfly-durable-completion-test -j1` exited successfully with 19/19
-Debug tests and no leaks (`/tmp/workload-physical-db8.log`). These cover normal
-transaction prepare/resolve APIs, multi-document insert/update/delete, exact
-retry, admission-disabled restart, four simultaneous native reservations,
-background recovery ownership, relational timestamp/checksum preservation,
-index visibility targets, checked physical binding, compiler allocation failure,
-and canonical candidates that include absent read dependencies.
+`zig build antfly-durable-completion-test -j1` exited successfully with 24/24
+Debug tests and no leaks (`/tmp/workload-physical-db14.log`). These cover normal
+local transaction prepare/resolve APIs, multi-document insert/update/delete,
+exact retry, admission-disabled restart, four simultaneous native reservations,
+relational timestamp/checksum preservation, index visibility targets, checked
+physical bindings and compiler allocation failure. The real native lease test
+also compiles a canonical prepare, commits with ordinary memory admission
+exhausted, repeats the resolution, and reopens an idle installed pool. The
+installed pool retains structural exclusion between transactions.
 
-The native pool gate passed 9/9 with no leaks
-(`/tmp/workload-native-pool-third.log`). Acceptance, canonical apply and completion
-use retained capacity while ordinary heap, memory admission and descriptor
-admission are unavailable. Accepted and prepared obligations restore before
-native admission. The authenticated capacity-attestation gate passed 4/4; the
-compiled owner authority gate passed 1/1.
+The native maintenance subset passed 4/4 with no leaks
+(`/tmp/workload-native-maintenance-final.log`). It covers four checkpoint/rearm
+cycles under failed ordinary allocation, denied descriptor admission and denied
+new global path-registry allocation; two generations held by real readers;
+65-run idle restoration; and simulated process failures around manifest
+publication and WAL reset. These simulated boundaries do not qualify all actual
+I/O failure outcomes or worst-case metadata amplification.
 
-These checks do not qualify replicated deployment. Candidate emission and DB
-publication-owner hooks are integration surfaces; production readiness still
-requires trusted installation, exact durable Raft suffix reconciliation,
-protected DATA progress publication, terminal-resolution routing, idle pool
-maintenance/reuse, and replicated failure tests. External payload ownership,
-remote child-range outboxes, and named-participant acknowledgement mutations
-remain unsupported physical profiles and must reject before prepare. No Cloud
-performance qualification or new default is implied.
+The follow-up native record-shape and generation-guard gate passed 7/7 with no
+leaks (`/tmp/workload-native-record-shape.log`). Admission now checks exact SST
+record framing for canonical operations, both outcomes and native control
+records before reserving an accepted entry. A descriptor that fits its wire
+limit but exceeds the maintenance record limit is rejected before acceptance.
+The remaining quantitative proof gaps are recorded in
+[the native completion contract](WORKLOAD_LSM_COMPLETION.md#current-replicated-pool-release-gates).
+
+The independently compiled storage-owner gate passed 6/6 with no leaks
+(`/tmp/workload-completion-owner-install2.log`). A real native lease survives
+worker quiescence and original owner close; its native callbacks remain valid,
+and final release cleans up ownership. The append-only failure ABI 59 roundtrip
+passed 1/1 (`/tmp/workload-completion-failure59.log`). Earlier authenticated
+capacity-attestation tests passed 4/4. The focused metadata/WAL gate passed
+10/10 with no leaks (`/tmp/workload-completion-installation-metadata-final.log`),
+including the JWT-authenticated installation endpoint, signed absence,
+policy retry, atomic activation and election no-op progress under exhaustion
+and reopen. These are separate gates, not one complete replicated deployment
+test.
+
+The final protected DATA/WAL gate passed 4/4 with no leaks
+(`/tmp/workload-completion-protected-final1.log`). It verifies native progress,
+durable election no-ops, preservation of legacy snapshot watermarks, and native
+owner installation before accepted-entry reconciliation. The source-owner gate
+passed 5/5 (`/tmp/workload-completion-source-install2.log`), covering rejection
+before the fresh-install barrier, retained owner identity and the absence of a
+legacy fallback for installed pools. The read-progress gate passed 11/11
+(`/tmp/workload-completion-read-progress-summary.log`), including publication
+under exhausted ordinary allocation using capacity reserved at host startup.
+The final DATA guard/canonical-proposal artifact also passed 4/4 with no leaks
+(`/tmp/workload-completion-data-final-direct.log`). These checks cover policy
+latching, owned backing, borrowed frame limits and complete durable evidence.
+The generic Raft/WAL integration is committed as `708502f671`.
+The DATA/API/startup integration is committed as `f5f873d994`. The final DATA
+result above is a direct artifact run; the final build wrapper's exit was not
+retained, so it is not a new test-inventory audit result.
+
+The full executable compile exposed a DATA host-pointer mismatch and missing
+metadata methods in the separately compiled storage facade. The pointer and
+facade were corrected; storage ABI 71 adds bounded activation and installation
+projections. The new opaque-owner regression passed 1/1 with no leaks
+(`/tmp/workload-completion-metadata-owner2.log`), including real metadata
+commands, signed absence and installation, active-state reopen, old-ABI
+rejection and oversized-request rejection. A service-unit test alone did not
+cover this compiled boundary.
+
+The follow-up source-owner gate passed 6/6 with no leaks
+(`/tmp/workload-completion-source-hooks.log`). Restored owners now retain stable
+callback handles before DATA/API initialization. A one-time readiness latch
+keeps those handles unavailable until successful initialization, then publishes
+the real targets; replacement targets are rejected. The regression exercises
+the retained handles before and after publication. Remote DATA construction also
+preserves a caller-owned storage context and uses it for early restoration.
+
+The final metadata gate passed 11/11 with no leaks
+(`/tmp/workload-completion-activation-disabled-final2.log`). It adds an otherwise
+eligible table/range to prove that disabled fresh activation leaves the Raft
+log, activation row and transition fence unchanged, through both public begin
+and direct proposal paths. Existing matching durable intents remain available
+for recovery. This guard is committed as `06e8b016e9`; the callback/startup fix
+is `29152be949` and the compiled metadata boundary is `155d29f33e`.
+
+The full executable build of `06e8b016e9` then exited zero with
+`zig build antfly -Doptimize=Debug -j1`. Only the two scheduling documentation
+files were dirty. The binary SHA-256 is
+`daafc51bf0d812dac009bb3f1995b4757072c4ece24aea468e58695e11399b98`.
+The command, source state and hashes are recorded in
+`/tmp/workload-completion-integration-final-debug-receipt.json`; the build log is
+`/tmp/workload-completion-final-debug-build2.log`. This is a compile/link check,
+not a replicated startup test or performance qualification.
+
+Production activation and fresh production installation remain disabled. The
+retained prepare/resolve lane does not yet cover ordinary writes or transaction
+begin/decision/acknowledgement entries. Allowing pending installation now could
+strand legacy recovery, so rejection precedes both a new metadata intent and
+the admission barrier. Existing durable obligations still require restoration.
+External payload ownership,
+remote child-range outboxes and named-participant acknowledgement mutations
+remain unsupported physical profiles and must reject before prepare.
+
+Replicated DATA restoration currently needs authenticated metadata availability
+to reconstruct the binding and authoritative catalogs before native replay.
+The local installation receipt authenticates that reconstruction but does not
+contain a standalone recovery configuration. Missing metadata or service keys
+fails startup closed, including when new completion admission is disabled.
+Standalone local completion uses its separate in-process catalog path.
+
+Worst-case maintenance headroom, ordinary canonical mutation admission,
+autonomous restart reconstruction and end-to-end replicated failure tests remain
+release gates. No Cloud performance qualification or new default is implied.
 
 ## Current committed correctness checks
 
