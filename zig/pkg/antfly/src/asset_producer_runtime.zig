@@ -197,6 +197,10 @@ test "asset producer runtime local invocation ownership fails closed without exe
     );
 }
 
+/// Two in-flight local transcriptions keep the model busy while the other
+/// recording is decoded and windowed; more only adds memory pressure.
+pub const default_local_transcriber_width: usize = 2;
+
 pub const Runtime = struct {
     alloc: Allocator,
     http: *httpx.Client,
@@ -214,6 +218,11 @@ pub const Runtime = struct {
     max_provider_response_bytes: usize = default_asset_provider_response_bytes,
     provider_response_envelope_bytes: usize = default_provider_response_envelope_bytes,
     result_limits: ResultLimits = .{},
+    /// Recordings transcribed concurrently on the in-process (antfly) route.
+    /// Model runs serialise on the session's execution gate, so the width
+    /// only overlaps audio decoding, feature extraction and token decoding
+    /// of one recording with the model time of another.
+    local_transcriber_width: usize = default_local_transcriber_width,
 
     pub const Options = struct {
         limits: *provider_limits.Registry = &provider_limits.process_registry,
@@ -951,8 +960,9 @@ pub const Runtime = struct {
                 break :blk capabilities.batch.mode;
             },
             // Transcription has one input per provider call. The compatibility
-            // batch preserves result order and uses bounded concurrency only
-            // for remote/stateless routes; linked model state stays serial.
+            // batch preserves result order with bounded concurrency: 8 calls
+            // for remote routes, `local_transcriber_width` for the in-process
+            // model, whose runs serialise on its execution gate.
             .transcriber => .serial_compatibility,
             .extractor => blk: {
                 if (!try self.canExtractBatch(alloc, requests)) break :blk .none;
@@ -1489,7 +1499,15 @@ pub const Runtime = struct {
     /// allocator thread-safety out of the executor contract and bounds retained
     /// response memory even when a provider route fans out across nodes.
     fn produceRemoteCompatibilityBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+        return self.produceCompatibilityBatchWithWidth(alloc, requests, 8);
+    }
+
+    /// Runs `requests` one provider call at a time but up to `max_width`
+    /// calls concurrently, preserving result order. Remote routes use 8;
+    /// the in-process transcriber uses `local_transcriber_width`.
+    fn produceCompatibilityBatchWithWidth(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request, max_width: usize) ![][]u8 {
         if (requests.len == 0) return try alloc.alloc([]u8, 0);
+        if (max_width <= 1) return self.produceBatchSequential(alloc, requests);
         const io = self.execution.io orelse return self.produceBatchSequential(alloc, requests);
         const per_item_response_bytes = @max(
             @as(usize, 1),
@@ -1499,7 +1517,7 @@ pub const Runtime = struct {
         const width = @max(
             @as(usize, 1),
             @min(
-                @as(usize, 8),
+                max_width,
                 @min(requests.len, response_budget / @min(per_item_response_bytes, response_budget)),
             ),
         );
@@ -1545,6 +1563,16 @@ pub const Runtime = struct {
             var group: std.Io.Group = .init;
             for (tasks[start..end]) |*task| group.async(io, Task.run, .{task});
             try group.await(io);
+            // A concurrent wave can exceed the inference node's admission
+            // budget; such items are retried one at a time rather than
+            // failing the whole batch.
+            for (tasks[start..end]) |*task| {
+                const failure = task.failure orelse continue;
+                if (failure == error.QueueFull and task.output == null) {
+                    task.failure = null;
+                    try Task.run(task);
+                }
+            }
             for (tasks[start..end]) |task| if (task.failure) |err| return err;
 
             // Transfer and release this wave before admitting the next one.
@@ -2001,6 +2029,12 @@ pub const Runtime = struct {
             return self.produceRemoteCompatibilityBatch(alloc, requests);
         const model = requiredAntflyTranscriberModel(cfg_parsed.value) catch return error.BatchIncompatible;
         const local = self.antfly_provider orelse return error.BatchIncompatible;
+        // Each recording is one provider call; overlap a bounded number of
+        // them so one recording's decode and feature work runs while the
+        // model is busy with another.
+        if (self.local_transcriber_width > 1 and self.execution.io != null and requests.len > 1) {
+            return self.produceCompatibilityBatchWithWidth(alloc, requests, self.local_transcriber_width);
+        }
 
         const out = try alloc.alloc([]u8, requests.len);
         errdefer {
@@ -2014,6 +2048,8 @@ pub const Runtime = struct {
             const transcribe_request = transcribing.Request{
                 .url = request.source_text,
                 .language = cfg_parsed.value.language_code,
+                .timestamps = cfg_parsed.value.timestamps orelse true,
+                .diarization = cfg_parsed.value.diarization orelse false,
             };
             var result = if (local.transcribe_audio_with_context) |transcribe_audio|
                 try managed_embedder.AntflyProviderBoundary.call(
@@ -2033,10 +2069,12 @@ pub const Runtime = struct {
                 return error.BatchIncompatible;
             defer transcribing.deinitResponse(alloc, &result);
 
+            // Diarized transcripts keep their speaker turns in the text
+            // form too (`SPEAKER_00: ...` lines); JSON carries them as fields.
             out[i] = if (isJsonContentType(request.content_type))
                 try std.json.Stringify.valueAlloc(alloc, result, .{})
             else
-                try alloc.dupe(u8, result.text orelse "");
+                try transcribing.speakerAttributedTextAlloc(alloc, &result);
         }
         return out;
     }
@@ -2788,6 +2826,8 @@ pub const Runtime = struct {
             const transcribe_request = transcribing.Request{
                 .url = request.source_text,
                 .language = cfg_parsed.value.language_code,
+                .timestamps = cfg_parsed.value.timestamps orelse true,
+                .diarization = cfg_parsed.value.diarization orelse false,
             };
             var result = if (local.transcribe_audio_with_context) |transcribe_audio|
                 try managed_embedder.AntflyProviderBoundary.call(
@@ -2810,7 +2850,7 @@ pub const Runtime = struct {
             if (isJsonContentType(request.content_type)) {
                 return try std.json.Stringify.valueAlloc(alloc, result, .{});
             }
-            return try alloc.dupe(u8, result.text orelse "");
+            return try transcribing.speakerAttributedTextAlloc(alloc, &result);
         }
 
         var capability_auth_value: ?[]u8 = null;
@@ -2857,7 +2897,11 @@ pub const Runtime = struct {
             alloc,
             self.http,
             cfg_parsed.value,
-            .{ .url = request.source_text },
+            .{
+                .url = request.source_text,
+                .timestamps = cfg_parsed.value.timestamps orelse true,
+                .diarization = cfg_parsed.value.diarization orelse false,
+            },
             .{
                 .source_table = self.execution.routing.source_table,
                 .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
@@ -2883,7 +2927,7 @@ pub const Runtime = struct {
         if (isJsonContentType(request.content_type)) {
             return try std.json.Stringify.valueAlloc(alloc, result, .{});
         }
-        return try alloc.dupe(u8, result.text orelse "");
+        return try transcribing.speakerAttributedTextAlloc(alloc, &result);
     }
 
     fn extract(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {

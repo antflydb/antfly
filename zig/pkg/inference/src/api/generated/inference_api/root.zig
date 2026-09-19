@@ -2,6 +2,9 @@
 // Package: inference_api
 
 pub const types = @import("types.zig");
+pub const client = @import("client.zig");
+pub const Client = client.Client;
+pub const ApiResponse = client.ApiResponse;
 pub const server = @import("server.zig");
 pub const ServerRouter = server.ServerRouter;
 

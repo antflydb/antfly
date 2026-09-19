@@ -2,6 +2,7 @@
 // Package: antfly_indexes_openapi
 
 const std = @import("std");
+const antfly_audio_openapi = @import("antfly_audio_openapi");
 const antfly_chunking_openapi = @import("antfly_chunking_openapi");
 const antfly_embeddings_openapi = @import("antfly_embeddings_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
@@ -3522,6 +3523,8 @@ pub const EnrichmentConfig = struct {
     producer_json: ?[]const u8 = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
+    /// Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json.
+    transcriber: ?TranscriberEnrichmentConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -3539,6 +3542,7 @@ pub const EnrichmentConfig = struct {
         .{ "content_type", "content_type", true },
         .{ "producer_json", "producer_json", true },
         .{ "execution", "execution", true },
+        .{ "transcriber", "transcriber", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -3601,6 +3605,10 @@ pub const EnrichmentConfig = struct {
         }
         if (self.execution) |value| {
             try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.transcriber) |value| {
+            try jw.objectField("transcriber");
             try jw.write(value);
         }
         try jw.endObject();
@@ -9793,6 +9801,108 @@ pub const StatefulGraphResult = union(enum) {
             .graph_paths_result => |v| try jw.write(v.*),
             .legacy_graph_search_result => |v| try jw.write(v.*),
         }
+    }
+};
+
+/// Speech-to-text provider for the `transcriber` enrichment shorthand. Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording. **Example:** ```yaml name: call_transcripts kind: asset field: recording_url transcriber: provider: antfly model: openai/whisper-base language_code: en timestamps: true ```
+pub const TranscriberEnrichmentConfig = struct {
+    provider: antfly_audio_openapi.STTProvider,
+    /// Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1' for openai).
+    model: ?[]const u8 = null,
+    /// Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+    api_url: ?[]const u8 = null,
+    /// OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+    base_url: ?[]const u8 = null,
+    /// Provider API key. Falls back to the provider's environment variable.
+    api_key: ?[]const u8 = null,
+    /// Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for the vertex provider.
+    location: ?[]const u8 = null,
+    /// Path to an ADC credential JSON file for the vertex provider. Falls back to the default ADC chain.
+    credentials_path: ?[]const u8 = null,
+    /// Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it.
+    language_code: ?[]const u8 = null,
+    /// Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text.
+    timestamps: ?bool = null,
+    /// Request speaker labels on transcript segments where the provider supports them.
+    diarization: ?bool = null,
+    /// Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast.
+    max_download_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", true },
+        .{ "api_url", "api_url", true },
+        .{ "base_url", "base_url", true },
+        .{ "api_key", "api_key", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "language_code", "language_code", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "diarization", "diarization", true },
+        .{ "max_download_bytes", "max_download_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.diarization) |value| {
+            try jw.objectField("diarization");
+            try jw.write(value);
+        }
+        if (self.max_download_bytes) |value| {
+            try jw.objectField("max_download_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 

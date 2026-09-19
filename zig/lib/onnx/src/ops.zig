@@ -1508,11 +1508,36 @@ fn convertReduce(builder: *Builder, comptime op: ReduceTag, node: *const NodePro
         }
     }
 
-    return switch (op) {
+    const reduced = try switch (op) {
         .reduce_sum => builder.reduceSum(inputs[0], axes_buf[0..num_axes]),
         .reduce_mean => builder.reduceMean(inputs[0], axes_buf[0..num_axes]),
         .reduce_max => builder.reduceMax(inputs[0], axes_buf[0..num_axes]),
     };
+
+    // The primitive keeps the reduced axes as size 1; ONNX `keepdims=0`
+    // drops them, which is a pure reshape of the same data.
+    const keepdims = getInt(node.attributes, "keepdims", 1) != 0;
+    if (keepdims or num_axes == 0) return reduced;
+    const reduced_shape = builder.graph.node(reduced).output_shape;
+    var out_dims: [8]i64 = .{0} ** 8;
+    var out_rank: u8 = 0;
+    for (0..reduced_shape.rank()) |d| {
+        var dropped = false;
+        for (axes_buf[0..num_axes]) |ax| {
+            if (ax == d) dropped = true;
+        }
+        if (dropped) continue;
+        out_dims[out_rank] = reduced_shape.dim(@intCast(d));
+        out_rank += 1;
+    }
+    if (out_rank == 0) {
+        // A full reduction is a scalar; keep a one-element vector so later
+        // broadcasts see a concrete rank.
+        out_dims[0] = 1;
+        out_rank = 1;
+    }
+    const out_shape = Shape{ .dtype = reduced_shape.dtype, .dims = out_dims, .rank_ = out_rank };
+    return builder.reshape(reduced, out_shape);
 }
 
 fn convertGather(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
@@ -2877,9 +2902,10 @@ fn convertConv(builder: *Builder, node: *const NodeProto, inputs: []const NodeId
     conv_attrs.num_spatial = num_spatial;
     conv_attrs.groups = group;
 
-    // Strides
+    // Strides and dilations
     for (0..num_spatial) |i| {
         conv_attrs.strides[i] = if (i < strides_attr.len) @intCast(strides_attr[i]) else 1;
+        conv_attrs.dilations[i] = if (i < dilations_attr.len and dilations_attr[i] > 0) @intCast(dilations_attr[i]) else 1;
     }
 
     // Padding: ONNX format is [begin_0, begin_1, ..., end_0, end_1, ...]
@@ -3656,6 +3682,27 @@ fn broadcastPerAxis(builder: *Builder, input: NodeId, target_shape: Shape, axis_
 
 // ── Phase 3: Pooling Ops ────────────────────────────────────────────
 
+/// Static slice `[start, end)` along `axis` of a tensor of any rank.
+fn sliceAxisStatic(builder: *Builder, input: NodeId, axis: u8, start: i64, end: i64) ConvertError!NodeId {
+    const in_shape = builder.graph.node(input).output_shape;
+    var attrs = ml.graph.node.SliceAttrs{};
+    attrs.num_axes = in_shape.rank();
+    var out_dims: [8]i64 = .{0} ** 8;
+    for (0..in_shape.rank()) |d| {
+        const dim = in_shape.dim(@intCast(d));
+        attrs.starts[d] = if (d == axis) start else 0;
+        attrs.limits[d] = if (d == axis) end else dim;
+        attrs.strides[d] = 1;
+        out_dims[d] = if (d == axis) end - start else dim;
+    }
+    return builder.graph.addNode(.{
+        .op = .{ .slice = attrs },
+        .output_shape = Shape{ .dtype = in_shape.dtype, .dims = out_dims, .rank_ = in_shape.rank_ },
+        .inputs = .{ input, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+}
+
 fn convertAveragePool(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
     // AveragePool: reduce_mean over spatial window
     // For global average pool variant or simple cases
@@ -3680,8 +3727,54 @@ fn convertAveragePool(builder: *Builder, node: *const NodeProto, inputs: []const
         return convertGlobalAveragePool(builder, inputs);
     }
 
+    // Exact path for the common 1-D "segment pooling" shape: non-overlapping
+    // windows (stride == kernel) over a static last axis. Full windows are a
+    // reshape plus a mean over the window axis; with `ceil_mode` the partial
+    // trailing window is averaged over the elements it actually covers, as
+    // ONNX Runtime does when no explicit padding is declared.
+    const pads = getInts(node.attributes, "pads");
+    var pads_zero = true;
+    for (pads) |p| if (p != 0) {
+        pads_zero = false;
+    };
+    if (num_spatial == 1 and in_shape.rank() == 3 and pads_zero and kernel[0] > 0) {
+        const k: i64 = kernel[0];
+        const stride: i64 = if (strides.len > 0) strides[0] else 1;
+        const length = in_shape.dim(2);
+        if (stride == k and length > 0) {
+            const ceil_mode = getInt(node.attributes, "ceil_mode", 0) != 0;
+            const n_full = @divTrunc(length, k);
+            const remainder = length - n_full * k;
+            const has_tail = ceil_mode and remainder > 0;
+            if (n_full == 0 and !has_tail) return error.InvalidAttribute;
+
+            var full: ?NodeId = null;
+            if (n_full > 0) {
+                const full_slice = try sliceAxisStatic(builder, inputs[0], 2, 0, n_full * k);
+                var windowed_dims: [8]i64 = .{0} ** 8;
+                windowed_dims[0] = in_shape.dim(0);
+                windowed_dims[1] = in_shape.dim(1);
+                windowed_dims[2] = n_full;
+                windowed_dims[3] = k;
+                const windowed = try builder.reshape(full_slice, Shape{ .dtype = in_shape.dtype, .dims = windowed_dims, .rank_ = 4 });
+                const window_mean = try builder.reduceMean(windowed, &[_]u8{3});
+                var pooled_dims: [8]i64 = .{0} ** 8;
+                pooled_dims[0] = in_shape.dim(0);
+                pooled_dims[1] = in_shape.dim(1);
+                pooled_dims[2] = n_full;
+                full = try builder.reshape(window_mean, Shape{ .dtype = in_shape.dtype, .dims = pooled_dims, .rank_ = 3 });
+            }
+            if (!has_tail) return full.?;
+            const tail_slice = try sliceAxisStatic(builder, inputs[0], 2, n_full * k, length);
+            const tail = try builder.reduceMean(tail_slice, &[_]u8{2});
+            if (full) |head| return builder.concat(head, tail, 2);
+            return tail;
+        }
+    }
+
     // Non-global: compute output shape and use reduce_mean windowed
     // This is an approximation — proper sliding window needs conv_general
+    log.warn("AveragePool '{s}' lowered to a whole-axis mean: overlapping or padded windows are not modelled exactly", .{node.name});
     var out_dims: [8]i64 = .{0} ** 8;
     out_dims[0] = in_shape.dim(0); // batch
     out_dims[1] = in_shape.dim(1); // channels

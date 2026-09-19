@@ -217,6 +217,15 @@ pub const ConvAttrs = struct {
     padding: [4][2]i32 = .{.{0} ** 2} ** 4,
     num_spatial: u8 = 0,
     groups: u32 = 1,
+    /// Per-spatial-axis tap spacing (ONNX `dilations`). Executors that
+    /// only implement dense kernels expand the weight with inserted zeros,
+    /// which is exactly equivalent.
+    dilations: [4]u32 = .{1} ** 4,
+
+    pub fn hasDilation(self: ConvAttrs) bool {
+        for (self.dilations[0..self.num_spatial]) |d| if (d > 1) return true;
+        return false;
+    }
 };
 
 pub const ConvertDTypeAttrs = struct {
