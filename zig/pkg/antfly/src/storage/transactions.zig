@@ -47,6 +47,16 @@ const intents_prefix = "\x00\x00__txn_intents__:";
 // same backend batch as the corresponding intent, so the DB apply mutex makes
 // lock acquisition and ordinary batch admission linearizable.
 const intent_locks_prefix = "\x00\x00__txn_intent_locks__:";
+
+/// Physical conflict dependency for a logical document key. Replicated plan
+/// compilation must bind this absence/presence as well as document contents.
+pub fn makeIntentLockKeyAlloc(alloc: Allocator, user_key: []const u8) ![]u8 {
+    const length = try std.math.add(usize, intent_locks_prefix.len, user_key.len);
+    const key = try alloc.alloc(u8, length);
+    @memcpy(key[0..intent_locks_prefix.len], intent_locks_prefix);
+    @memcpy(key[intent_locks_prefix.len..], user_key);
+    return key;
+}
 // Pending transactions retain their exact user keys so collection and
 // resolution use point probes instead of cloning the whole mutable memtable.
 // Resolution deletes this sidecar atomically with the intents; terminal
@@ -2084,10 +2094,7 @@ pub const TxnManager = struct {
     }
 
     fn makeIntentLockKey(self: *TxnManager, user_key: []const u8) ![]u8 {
-        const key = try self.alloc.alloc(u8, intent_locks_prefix.len + user_key.len);
-        @memcpy(key[0..intent_locks_prefix.len], intent_locks_prefix);
-        @memcpy(key[intent_locks_prefix.len..], user_key);
-        return key;
+        return makeIntentLockKeyAlloc(self.alloc, user_key);
     }
 
     fn loadTransactionRecord(self: *TxnManager, txn_id: TxnId) !TxnRecord {

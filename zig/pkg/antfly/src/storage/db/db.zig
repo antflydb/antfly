@@ -2927,6 +2927,7 @@ const ReplicatedCompletionCapture = struct {
     allocator: Allocator,
     authority: @import("../completion_candidate.zig").Authority,
     envelope: ?[]u8 = null,
+    mutation_input_digest: [32]u8 = @splat(0),
 };
 
 const DurableCompletionPublication = struct {
@@ -2960,6 +2961,7 @@ const BatchExecutionOptions = struct {
     extra_store_writes: []const docstore_mod.KVPair = &.{},
     transaction_resolution: ?TransactionResolution = null,
     durable_completion_prepare: ?*const DurablePhysicalPrepare = null,
+    replicated_mutation_capture: ?*ReplicatedCompletionCapture = null,
     durable_rows: ?*const std.StringHashMapUnmanaged([]const u8) = null,
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
@@ -10809,7 +10811,9 @@ pub const DB = struct {
             explicit_graph_artifact_writes.items.len > 0 or
             precomputed_generated.artifact_writes.len > 0)
         {
-            try self.core.appendArtifactPresenceMarker(&store_writes);
+            if (opts.replicated_mutation_capture != null) {
+                try store_writes.append(self.alloc, .{ .key = &internal_keys.artifact_presence_key, .value = "1" });
+            } else try self.core.appendArtifactPresenceMarker(&store_writes);
         }
         try appendAssetArtifactSourceIndexMutations(
             self.alloc,
@@ -10843,6 +10847,7 @@ pub const DB = struct {
             opts.extra_store_writes.len == 0 and
             opts.transaction_resolution == null and
             opts.durable_completion_prepare == null and
+            opts.replicated_mutation_capture == null and
             opts.ha_applied_lsn_marker == null and
             opts.raft_applied_entry_marker == null and
             !thinReplayInputsHaveDerivedWork(
@@ -10853,6 +10858,8 @@ pub const DB = struct {
             );
         const sequence = if (elide_semantic_noop_replay)
             self.core.nextDerivedSequence()
+        else if (opts.durable_completion_prepare != null or opts.replicated_mutation_capture != null)
+            self.core.nextDerivedAppendSequence()
         else
             self.core.reserveDerivedAppendSequence();
         if (profile) |active_profile| active_profile.source_sequence = sequence;
@@ -10865,7 +10872,7 @@ pub const DB = struct {
         if (effective_req.deletes.len != 0) {
             self.clearBulkIngestIdentityAllNewLocked();
         }
-        if (opts.durable_completion_prepare == null and self.bulk_ingest_identity_all_new and
+        if (opts.durable_completion_prepare == null and opts.replicated_mutation_capture == null and self.bulk_ingest_identity_all_new and
             effective_req.deletes.len == 0 and
             identity_upsert_keys.items.len > 0 and
             (assume_all_new_identity_upserts or identityUpsertStoreWritesAreNew(identity_upsert_write_indexes.items, overwritten_flags)))
@@ -10940,7 +10947,7 @@ pub const DB = struct {
             .key = table_catalog_mod.key,
             .value = next_table_catalog.?.encodeForPersistence(&table_catalog_value),
         });
-        if (opts.durable_completion_prepare != null and remote_child_range_dispatches.items.len != 0) return error.UnsupportedCompletionProfile;
+        if ((opts.durable_completion_prepare != null or opts.replicated_mutation_capture != null) and remote_child_range_dispatches.items.len != 0) return error.UnsupportedCompletionProfile;
         try appendDocumentChildRangeOutboxWrites(
             self.alloc,
             sequence,
@@ -11233,6 +11240,11 @@ pub const DB = struct {
             if (schema_namespace != prepare.schema_namespace) return error.PreparedGenerationChanged;
             if (prepare.transform_snapshot) |read_snapshot| try self.validateTransformReadSnapshot(read_snapshot.*);
             try self.sealDurablePhysicalPlanLocked(prepare, store_writes.items, delete_keys.items, replay_append orelse return error.UnsupportedCompletionProfile, batch_timestamp_ns, completion_timestamp_keys.items);
+            unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+            return;
+        }
+        if (opts.replicated_mutation_capture) |capture| {
+            try self.sealSinglePhasePhysicalPlanLocked(capture, effective_req, &transform_snapshot, store_writes.items, delete_keys.items, replay_append);
             unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
             return;
         }
@@ -25202,6 +25214,70 @@ pub const DB = struct {
         try self.writeTransactionInternal(txn_id, req, null);
     }
 
+    fn replicatedCompletionAuthority(self: *DB, expected_previous: RaftAppliedEntryIdentity) !@import("../completion_candidate.zig").Authority {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (!self.requiresDurablePhysicalCompletion() or self.durable_completion_authority != .raft_apply or
+            !self.durable_completion_enabled) return error.CompletionAdmissionUnavailable;
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        const locked = @import("../lsm_backend/runtime.zig").lockBackend(lsm_backend_mod.Backend, backend);
+        defer @import("../lsm_backend/runtime.zig").unlockBackend(lsm_backend_mod.Backend, backend, locked);
+        const pool = backend.completion_pool orelse return error.CompletionAdmissionUnavailable;
+        if (!pool.ready or pool.failed or backend.manifest_recovery_required) return error.CompletionAdmissionUnavailable;
+        return .{
+            .group_id = pool.config.identity.group_id,
+            .incarnation = pool.config.identity.incarnation,
+            .policy_digest = pool.config.identity.policy_digest,
+            .schema_catalog_digest = pool.config.schema_catalog_digest,
+            .previous_term = expected_previous.term,
+            .previous_index = expected_previous.index,
+        };
+    }
+
+    fn validateSinglePhaseCompletionProfile(self: *DB) !void {
+        if (self.core.store.payload_store != null or self.shadow != null or self.core.splitState() != null or
+            self.bulk_ingest_coalescer.active or self.ha_async_batch_mirror != null or self.ha_async_effect_mirror != null or
+            self.ha_async_metadata_mirror != null or self.ha_write_gate != null)
+            return error.UnsupportedCompletionProfile;
+        const manager = self.core.index_manager;
+        manager.catalog_mutex.lockShared();
+        defer manager.catalog_mutex.unlockShared();
+        try manager.validateCompletionBackends();
+        // These producers can change primary artifact/coverage prefixes outside
+        // this Raft frontier. Point baselines cannot certify an empty prefix or
+        // a skipped coverage update. Enable them only with owned range/version
+        // dependencies, including every asynchronous producer.
+        if (manager.hasGeneratedEnrichmentTargets() or manager.graph_indexes.items.len != 0)
+            return error.UnsupportedCompletionProfile;
+    }
+
+    /// Capture ordinary document mutations at the same final planner boundary
+    /// used for publication, including all derived physical metadata. Admission
+    /// and application remain separate native operations on the returned wire.
+    pub fn compileReplicatedMutation(self: *DB, alloc: Allocator, req: types.BatchRequest, expected_previous: RaftAppliedEntryIdentity) ![]u8 {
+        if (req.transaction != null or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
+            req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or
+            req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null or
+            req.merge_artifacts.len != 0) return error.UnsupportedCompletionProfile;
+        try self.validateSinglePhaseCompletionProfile();
+        for (req.writes) |write| if (isMetadataKey(write.key)) return error.UnsupportedCompletionProfile;
+        for (req.deletes) |key| if (isMetadataKey(key)) return error.UnsupportedCompletionProfile;
+        for (req.transforms) |transform| if (isMetadataKey(transform.key)) return error.UnsupportedCompletionProfile;
+        var capture: ReplicatedCompletionCapture = .{
+            .allocator = alloc,
+            .authority = try self.replicatedCompletionAuthority(expected_previous),
+        };
+        const original = try std.json.Stringify.valueAlloc(alloc, req, .{});
+        defer alloc.free(original);
+        std.crypto.hash.sha2.Sha256.hash(original, &capture.mutation_input_digest, .{});
+        errdefer if (capture.envelope) |bytes| alloc.free(bytes);
+        var request = req;
+        request.reject_graph_transform_projections = true;
+        try self.batchInternal(request, null, .{ .replicated_mutation_capture = &capture, .wait_for_sync_level = false });
+        return capture.envelope orelse error.CompletionAdmissionUnavailable;
+    }
+
     /// Builds a proposal candidate against a stable DB snapshot. This does not
     /// prepare the transaction or acquire accepted ownership. DATA must hold
     /// or revalidate its full Raft frontier before submitting the candidate;
@@ -25213,29 +25289,9 @@ pub const DB = struct {
         req: types.TransactionIntentRequest,
         expected_previous: RaftAppliedEntryIdentity,
     ) ![]u8 {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (!self.requiresDurablePhysicalCompletion() or self.durable_completion_authority != .raft_apply or
-            !self.durable_completion_enabled) return error.CompletionAdmissionUnavailable;
-        const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
-        const config = blk: {
-            try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
-            const locked = @import("../lsm_backend/runtime.zig").lockBackend(lsm_backend_mod.Backend, backend);
-            defer @import("../lsm_backend/runtime.zig").unlockBackend(lsm_backend_mod.Backend, backend, locked);
-            const pool = backend.completion_pool orelse return error.CompletionAdmissionUnavailable;
-            if (!pool.ready or pool.failed or backend.manifest_recovery_required) return error.CompletionAdmissionUnavailable;
-            break :blk pool.config;
-        };
         var capture: ReplicatedCompletionCapture = .{
             .allocator = alloc,
-            .authority = .{
-                .group_id = config.identity.group_id,
-                .incarnation = config.identity.incarnation,
-                .policy_digest = config.identity.policy_digest,
-                .schema_catalog_digest = config.schema_catalog_digest,
-                .previous_term = expected_previous.term,
-                .previous_index = expected_previous.index,
-            },
+            .authority = try self.replicatedCompletionAuthority(expected_previous),
         };
         errdefer if (capture.envelope) |bytes| alloc.free(bytes);
         var preparation: RequestPreparationContext = undefined;
@@ -25613,6 +25669,102 @@ pub const DB = struct {
             .durable_rows = &rows,
             .wait_for_sync_level = false,
         });
+    }
+
+    fn appendSinglePhaseLogicalDependency(self: *DB, key: []const u8, dependencies: *std.ArrayListUnmanaged([]const u8), owned: *std.ArrayListUnmanaged([]u8)) !void {
+        for (0..3) |kind| {
+            if (kind == 1 and internal_keys.isInternalUserKey(key)) continue;
+            const physical = switch (kind) {
+                0 => try encodeStoreLookupKeyAlloc(self, self.alloc, key),
+                1 => try makeTimestampKey(self.alloc, key),
+                else => try transactions_mod.makeIntentLockKeyAlloc(self.alloc, key),
+            };
+            const exists = for (dependencies.items) |existing| {
+                if (std.mem.eql(u8, existing, physical)) break true;
+            } else false;
+            if (exists) {
+                self.alloc.free(physical);
+                continue;
+            }
+            owned.append(self.alloc, physical) catch |err| {
+                self.alloc.free(physical);
+                return err;
+            };
+            try dependencies.append(self.alloc, physical);
+        }
+    }
+
+    fn sealSinglePhasePhysicalPlanLocked(
+        self: *DB,
+        capture: *ReplicatedCompletionCapture,
+        request: types.BatchRequest,
+        observed: *const TransformReadSnapshot,
+        writes: []const docstore_mod.KVPair,
+        deletes: []const []const u8,
+        replay: ?docstore_mod.DocStore.ReplayAppend,
+    ) !void {
+        try self.validateSinglePhaseCompletionProfile();
+        const payloads = @import("../artifact_payload.zig");
+        var manager = try transactions_mod.TxnManager.init(self.alloc, self.core.store);
+        defer manager.deinit();
+        var read = try manager.store.beginRead();
+        defer read.abort();
+        for (writes) |write| {
+            if (payloads.isReference(write.value)) return error.UnsupportedCompletionProfile;
+            if (payloads.isEmbeddingKey(write.key)) {
+                const old = read.get(write.key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                if (payloads.isReference(old)) return error.UnsupportedCompletionProfile;
+            }
+        }
+        for (deletes) |key| if (payloads.isEmbeddingKey(key)) {
+            const old = read.get(key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            if (payloads.isReference(old)) return error.UnsupportedCompletionProfile;
+        };
+        var dependencies: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer dependencies.deinit(self.alloc);
+        var owned_keys: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (owned_keys.items) |key| self.alloc.free(key);
+            owned_keys.deinit(self.alloc);
+        }
+        try dependencies.appendSlice(self.alloc, &.{
+            "\x00\x00__metadata__:schema",             "\x00\x00__metadata__:indexes",
+            "\x00\x00__metadata__:enrichments",        "\x00\x00__metadata__:resolvers",
+            &internal_keys.table_storage_settings_key, public_schema_json_key,
+        });
+        if (self.core.schema) |schema| {
+            const key = try public_table_schema.versionedSchemaKeyAlloc(self.alloc, schema.version);
+            owned_keys.append(self.alloc, key) catch |err| {
+                self.alloc.free(key);
+                return err;
+            };
+            try dependencies.append(self.alloc, key);
+        }
+        for (observed.entries) |entry| try self.appendSinglePhaseLogicalDependency(entry.key, &dependencies, &owned_keys);
+        for (request.predicates) |predicate| try self.appendSinglePhaseLogicalDependency(predicate.key, &dependencies, &owned_keys);
+        // Semantic-noop classification can remove a source write from the
+        // delta, but the observed document/version/lock remains a dependency.
+        for (request.writes) |write| try self.appendSinglePhaseLogicalDependency(write.key, &dependencies, &owned_keys);
+        for (request.deletes) |key| try self.appendSinglePhaseLogicalDependency(key, &dependencies, &owned_keys);
+        const fence = replicatedCompletionFence(capture.authority, capture.mutation_input_digest);
+        capture.envelope = try @import("../completion_candidate.zig").encodePhysicalMutation(
+            capture.allocator,
+            capture.authority,
+            capture.mutation_input_digest,
+            &fence,
+            lsm_backend_mod.Backend.durable_completion_limits,
+            &read,
+            writes,
+            deletes,
+            replay,
+            dependencies.items,
+        );
     }
 
     fn sealDurablePhysicalPlanLocked(self: *DB, prepare: *const DurablePhysicalPrepare, writes: []const docstore_mod.KVPair, deletes: []const []const u8, replay: docstore_mod.DocStore.ReplayAppend, timestamp: u64, timestamp_keys: []const []const u8) !void {
@@ -133795,6 +133947,168 @@ test "workload admission physical completion retained native lease prepares and 
     const value = (try db.get(alloc, "doc")).?;
     defer alloc.free(value);
     try std.testing.expectEqualStrings("{\"value\":2}", value);
+}
+
+test "workload admission physical completion single-phase compiler captures actual batch without publication" {
+    const alloc = std.testing.allocator;
+    const abi = @import("kernel_owner_abi").completion_pool;
+    const candidate = @import("../completion_candidate.zig");
+    const entry_codec = @import("../lsm_backend/completion_entry.zig");
+    const Checks = struct {
+        fn projectedStore(before: []const docstore_mod.OwnedKVPair, after: []const docstore_mod.OwnedKVPair, operations: []const @import("../lsm_backend/completion_slot.zig").Operation) !void {
+            var projected = std.StringHashMapUnmanaged([]const u8).empty;
+            defer projected.deinit(std.testing.allocator);
+            for (before) |row| try projected.put(std.testing.allocator, row.key, row.value);
+            for (operations) |op| switch (op.kind) {
+                .put => try projected.put(std.testing.allocator, op.key, op.value),
+                .delete => {
+                    _ = projected.remove(op.key);
+                },
+            };
+            try std.testing.expectEqual(after.len, projected.count());
+            for (after) |row| try std.testing.expectEqualSlices(u8, row.value, projected.get(row.key) orelse return error.TestUnexpectedResult);
+        }
+
+        fn baseline(pool: anytype, backend: *lsm_backend_mod.Backend, entry: *const @import("../lsm_backend/completion_entry.zig").OwnedEntry) !void {
+            const backend_runtime_mod = @import("../lsm_backend/runtime.zig");
+            const locked = backend_runtime_mod.lockBackend(lsm_backend_mod.Backend, backend);
+            defer backend_runtime_mod.unlockBackend(lsm_backend_mod.Backend, backend, locked);
+            try pool.validateBaseline(backend, std.testing.allocator, entry);
+        }
+    };
+    // Exercise document rows and the relational writer's columnar dirty/token
+    // effects with the same independently published reference operation.
+    for ([_]bool{ false, true }) |relational| {
+        var tmp = try TestDirectory.init("completion-single-phase-compiler");
+        defer tmp.cleanup();
+        var expected_tmp = try TestDirectory.init("completion-single-phase-reference");
+        defer expected_tmp.cleanup();
+        var resources = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+        defer resources.deinit(alloc);
+        try resources.configureTransactionCompletion(1024 * 1024);
+        const settings: table_storage_mod.Settings = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 1024 * 1024,
+            .max_transaction_bytes = 64 * 1024,
+            .completion_protocol_version = 1,
+            .profile_version = 1,
+        } };
+        const options: OpenOptions = .{
+            .resource_manager = &resources,
+            .durable_completion_enabled = true,
+            .durable_completion_authority = .standalone_local,
+            .table_storage = settings,
+            .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        };
+        var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), options);
+        defer db.close();
+        var expected = try DB.open(alloc, std.mem.span(expected_tmp.path().ptr), options);
+        defer expected.close();
+        if (relational) {
+            const table_schema: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "value", .path = "value", .column_type = .integer }} };
+            try db.setSchema(table_schema);
+            try expected.setSchema(table_schema);
+        }
+        const initial: types.BatchRequest = .{ .writes = &.{
+            .{ .key = "a", .value = "{\"value\":1}" },
+            .{ .key = "b", .value = "{\"value\":2}" },
+            .{ .key = "d", .value = "{\"value\":5}" },
+        }, .timestamp_ns = 100 };
+        try db.batch(initial);
+        try expected.batch(initial);
+        var binding: abi.InstallBinding = .{ .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(19), .policy_digest = @import("../../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) }, .table_id = 1, .range_id = 3 };
+        binding.schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}");
+        try db.installCompletionBinding(binding, "", "", "{}", settings);
+        const lease = try db.acquireCompletionLease(2, 7);
+        defer lease.vtable.release(lease.context);
+        const proof: abi.DurableLog = .{ .mode = .startup_complete, .last_index = 1, .commit_index = 1 };
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &proof));
+        const request: types.BatchRequest = .{ .writes = &.{
+            .{ .key = "a", .value = "{\"value\":3}" },
+            .{ .key = "c", .value = "{\"value\":4}" },
+        }, .deletes = &.{"b"}, .predicates = &.{.{ .key = "d", .expected_version = 100 }}, .timestamp_ns = 200 };
+        const physical_before = try db.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, physical_before);
+        const reference_before = try expected.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, reference_before);
+        const sequence_before = db.core.nextDerivedAppendSequence();
+        const wire = try db.compileReplicatedMutation(alloc, request, .{ .term = 1, .index = 1 });
+        defer alloc.free(wire);
+        const retry = try db.compileReplicatedMutation(alloc, request, .{ .term = 1, .index = 1 });
+        defer alloc.free(retry);
+        try std.testing.expectEqualSlices(u8, wire, retry);
+        try std.testing.expectEqual(sequence_before, db.core.nextDerivedAppendSequence());
+        const before_a = (try db.get(alloc, "a")).?;
+        defer alloc.free(before_a);
+        const before_b = (try db.get(alloc, "b")).?;
+        defer alloc.free(before_b);
+        try std.testing.expectEqualStrings("{\"value\":1}", before_a);
+        try std.testing.expectEqualStrings("{\"value\":2}", before_b);
+        try std.testing.expect((try db.get(alloc, "c")) == null);
+        const physical_after_capture = try db.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, physical_after_capture);
+        try Checks.projectedStore(physical_before, physical_after_capture, &.{});
+        var decoded = try entry_codec.decode(alloc, wire);
+        defer decoded.deinit();
+        try std.testing.expectEqual(entry_codec.protocol.Kind.mutation, decoded.entry.kind);
+        try std.testing.expectEqual(@as(usize, 0), decoded.decoded_descriptor.descriptor.commit.len);
+        try std.testing.expectEqual(@as(usize, 0), decoded.decoded_descriptor.descriptor.abort.len);
+        try std.testing.expectEqualSlices(u8, &candidate.mutationId(.{
+            .group_id = 2,
+            .incarnation = binding.identity.incarnation,
+            .policy_digest = binding.identity.policy_digest,
+            .schema_catalog_digest = binding.schema_catalog_digest,
+            .previous_term = 1,
+            .previous_index = 1,
+        }, decoded.entry.original_input_digest), &decoded.entry.txn_id);
+        // The independent predicate's primary value is unchanged. Alter only its
+        // timestamp, then only its absent intent lock: each must invalidate the
+        // native baseline even though neither key is a compiled write target.
+        const pool = db.core.primary_store_owner.lsmBackend().?.completion_pool.?;
+        const baseline_backend = db.core.primary_store_owner.lsmBackend().?;
+        try Checks.baseline(pool, baseline_backend, &decoded);
+        const timestamp_key = try makeTimestampKey(alloc, "d");
+        defer alloc.free(timestamp_key);
+        const intent_key = try transactions_mod.makeIntentLockKeyAlloc(alloc, "d");
+        defer alloc.free(intent_key);
+        for ([_][]const u8{ timestamp_key, intent_key }) |dependency| {
+            var found = false;
+            for (decoded.entry.baseline_keys) |key| if (std.mem.eql(u8, key, dependency)) {
+                found = true;
+                break;
+            };
+            try std.testing.expect(found);
+            for (decoded.entry.prepare_operations) |op| try std.testing.expect(!std.mem.eql(u8, op.key, dependency));
+        }
+        var timestamp_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &timestamp_bytes, 101, .little);
+        try db.core.store.put(timestamp_key, &timestamp_bytes);
+        try std.testing.expectError(error.CompletionProfileChanged, Checks.baseline(pool, baseline_backend, &decoded));
+        std.mem.writeInt(u64, &timestamp_bytes, 100, .little);
+        try db.core.store.put(timestamp_key, &timestamp_bytes);
+        try Checks.baseline(pool, baseline_backend, &decoded);
+        const intent_owner: [16]u8 = @splat(211);
+        try db.core.store.put(intent_key, &intent_owner);
+        try std.testing.expectError(error.CompletionProfileChanged, Checks.baseline(pool, baseline_backend, &decoded));
+        try db.core.store.delete(intent_key);
+        try Checks.baseline(pool, baseline_backend, &decoded);
+
+        // Apply the complete ordered candidate to the independent BEFORE image and
+        // compare every surviving/deleted/inserted key against ordinary publication.
+        // Checking only emitted operations would overlook a missing physical effect.
+        try expected.batch(request);
+        const reference_after = try expected.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, reference_after);
+        try std.testing.expect(decoded.entry.prepare_operations.len > request.writes.len + request.deletes.len);
+        try Checks.projectedStore(reference_before, reference_after, decoded.entry.prepare_operations);
+        var cells: abi.DurableCells = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
+        try std.testing.expectEqual(@as(u32, 0), cells.count);
+    }
 }
 
 test "workload admission physical completion normal APIs cover multi-document insert delete retry and disabled restart" {

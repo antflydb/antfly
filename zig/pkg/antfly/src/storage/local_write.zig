@@ -316,12 +316,12 @@ pub fn compileStorageKernelReplicatedCompletion(
     req: db_mod.types.BatchRequest,
     expected_previous: db_mod.RaftAppliedEntryIdentity,
 ) ![]u8 {
-    const mutation = req.transaction orelse return error.InvalidBatchRequest;
+    try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+    const mutation = req.transaction orelse return db.compileReplicatedMutation(alloc, req, expected_previous);
     if (mutation != .prepare or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
         req.reject_graph_transform_projections or req.split_checkpoint != null or req.split_replication != null or
         req.split_transition != null or req.merge_source_transition != null or req.merge_checkpoint != null or
         req.merge_replication != null or req.merge_artifacts.len != 0) return error.InvalidBatchRequest;
-    try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
     return db.compileReplicatedTransaction(alloc, mutation.prepare.txn_id, .{
         .writes = batchWritesAsTransactionWrites(req.writes),
         .deletes = req.deletes,

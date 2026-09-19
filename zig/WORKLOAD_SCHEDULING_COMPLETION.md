@@ -32,3 +32,42 @@ The existing prepare/resolve and local restart tests remain useful component
 evidence. They do not prove the rows above. Production activation must not be
 enabled until its write, capacity, restoration and replicated recovery
 prerequisites are implemented and verified.
+
+## Current integration evidence and boundaries
+
+- Canonical single-phase envelopes use wire version 2 and require Raft batch
+  protocol 8. Version 1 prepares remain byte-compatible. Seven owning codec
+  tests passed; peer capability advertisement and native mutation application
+  are not enabled by the format change.
+- The native capacity certificate stage passed ten owning tests, including
+  actual SST encoding, before-acceptance counter/capacity rejection, accepted
+  restart and retained readers. Separating retained allocations from transient
+  workspace and proving aggregate allocation overhead remain in progress.
+- Python streamed-response deadline and TypeScript cancellation ownership
+  fixes are committed. The coordinator now discards late successful responses
+  after retiring a verified terminal attempt; unsigned outcomes remain charged.
+  Its owning API test passed all four signed/unsigned and cancel/expiry cases.
+- Ordinary-write compilation is being integrated at the real DB planner's
+  final physical batch boundary. Compilation must not publish primary data,
+  consume a replay sequence, or mutate the artifact-presence hint. Baselines
+  include source documents even when semantic-noop elimination removes their
+  writes, timestamp predicates, absent intent locks, and physical-writer reads.
+  The owning durable-completion gate passed 26 tests, including complete
+  physical before/after comparison with an independently published ordinary
+  batch for document and relational rows, nonpublishing repeat compilation,
+  and native rejection when only a predicate timestamp or intent lock changes.
+  Native single-phase acceptance/application and DATA routing remain open;
+  returning a candidate does not establish their completion guarantee.
+- The current single-phase candidate profile rejects external payload stores,
+  generated-enrichment producers, graph-index catalogs, child-range dispatch,
+  HA mirrors, split/shadow/bulk state, and structural commands. In particular,
+  point dependencies do not certify artifact-prefix phantoms or skipped
+  coverage updates by asynchronous producers. Enabling those profiles requires
+  owned range/version dependencies covering every producer, or another fully
+  verified recovery path. These restrictions are checked before candidate
+  publication and again at its serialized capture boundary.
+- A full pool of prepared transactions cannot be allowed to consume the
+  resources needed by its own decision/ack writes. Their control-mutation
+  capacity must be reserved with the transaction and retained through its
+  final acknowledgement. Adding a free-slot check alone would deadlock this
+  lifecycle; the separate control reservation is still outstanding.
