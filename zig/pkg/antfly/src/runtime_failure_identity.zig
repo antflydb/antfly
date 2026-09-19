@@ -29,6 +29,10 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .prepared_completion_active, .err = error.PreparedCompletionActive },
+    .{ .status = .completion_transition_in_progress, .err = error.CompletionTransitionInProgress },
+    .{ .status = .completion_transition_capacity_exceeded, .err = error.CompletionTransitionCapacityExceeded },
+    .{ .status = .completion_fence_identity_mismatch, .err = error.CompletionFenceIdentityMismatch },
     .{ .status = .native_backup_repair_state_not_quiescent, .err = error.NativeBackupRepairStateNotQuiescent },
     .{ .status = .admission_full, .err = error.AdmissionFull },
     .{ .status = .admission_queue_full, .err = error.AdmissionQueueFull },
@@ -760,5 +764,17 @@ test "index readiness survives the local query and storage owner boundary" {
             return error.ExpectedReadinessFailure;
         };
         try std.testing.expectEqual(expected, transported);
+    }
+}
+
+test "workload admission completion eligibility survives compiled storage failure envelopes" {
+    for ([_]anyerror{ error.PreparedCompletionActive, error.CompletionTransitionInProgress, error.CompletionTransitionCapacityExceeded, error.CompletionFenceIdentityMismatch }) |expected| {
+        const failure = failureFromError(expected, .local_query, abi.abi_version, 1);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        const restored = blk: {
+            statusToError(failure.status) catch |err| break :blk err;
+            return error.ExpectedEligibilityFailure;
+        };
+        try std.testing.expectEqual(expected, restored);
     }
 }

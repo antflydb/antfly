@@ -442,6 +442,11 @@ pub const Detail = enum(c_int) {
     // outcome. Preserve these before the API applies its response policy.
     metadata_snapshot_unavailable,
     group_leader_unavailable,
+    // Append-only identities for restricted completion eligibility fences.
+    prepared_completion_active,
+    completion_transition_in_progress,
+    completion_transition_capacity_exceeded,
+    completion_fence_identity_mismatch,
 };
 
 pub const Status = extern struct {
@@ -528,6 +533,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.TransactionCompletionCapacityMismatch => status(.unavailable, .transaction_completion_capacity_mismatch),
         error.TransactionCompletionPolicyRequired => status(.unavailable, .transaction_completion_policy_required),
         error.TransactionCompletionChanged => status(.retryable, .transaction_completion_changed),
+        error.PreparedCompletionActive => status(.conflict, .prepared_completion_active),
+        error.CompletionTransitionInProgress => status(.retryable, .completion_transition_in_progress),
+        error.CompletionTransitionCapacityExceeded => status(.retryable, .completion_transition_capacity_exceeded),
+        error.CompletionFenceIdentityMismatch => status(.conflict, .completion_fence_identity_mismatch),
         error.ExtensionOwnedObject => status(.conflict, .extension_owned_object),
         error.RestoreIntentConflict => status(.conflict, .restore_intent_conflict),
         error.Unauthorized => status(.unauthorized, .unauthorized),
@@ -999,6 +1008,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .transaction_completion_capacity_mismatch => "TransactionCompletionCapacityMismatch",
         .transaction_completion_policy_required => "TransactionCompletionPolicyRequired",
         .transaction_completion_changed => "TransactionCompletionChanged",
+        .prepared_completion_active => "PreparedCompletionActive",
+        .completion_transition_in_progress => "CompletionTransitionInProgress",
+        .completion_transition_capacity_exceeded => "CompletionTransitionCapacityExceeded",
+        .completion_fence_identity_mismatch => "CompletionFenceIdentityMismatch",
         .extension_owned_object => "ExtensionOwnedObject",
         .restore_intent_conflict => "RestoreIntentConflict",
         .unauthorized => "Unauthorized",
@@ -1464,4 +1477,15 @@ test "storage owner contention retains retryability and exact identity" {
     try std.testing.expectEqual(@intFromEnum(Code.retryable), wire.code);
     try std.testing.expect(errorHasStableDetail(error.StorageBusy));
     try std.testing.expectEqual(error.StorageBusy, errorFromStatus(wire));
+}
+
+test "workload admission completion eligibility failures preserve exact boundary identity" {
+    try std.testing.expectEqual(error.PreparedCompletionActive, errorFromStatus(statusFromError(error.PreparedCompletionActive)));
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), statusFromError(error.PreparedCompletionActive).code);
+    try std.testing.expectEqual(error.CompletionTransitionInProgress, errorFromStatus(statusFromError(error.CompletionTransitionInProgress)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionTransitionInProgress).code);
+    try std.testing.expectEqual(error.CompletionTransitionCapacityExceeded, errorFromStatus(statusFromError(error.CompletionTransitionCapacityExceeded)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.CompletionTransitionCapacityExceeded).code);
+    try std.testing.expectEqual(error.CompletionFenceIdentityMismatch, errorFromStatus(statusFromError(error.CompletionFenceIdentityMismatch)));
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), statusFromError(error.CompletionFenceIdentityMismatch).code);
 }
