@@ -100,6 +100,19 @@ prerequisites are implemented and verified.
   Six owning DATA tests passed for local restoration/authorization, native-owner
   shutdown before coordinator destruction, and canonical protocol selection.
   These component results do not replace real replicated process/quorum faults.
+- The subsequent owning DATA gate passed three tests (one implementation,
+  two compiled consumers; zero skips, failures or leaks). A two-voter RawNode
+  fixture rejects a v7 peer before native installation, applies the protocol8
+  barrier through the real local Raft WAL, and rechecks current membership
+  before publishing backing. It then proposes an ordinary write through the
+  C physical compiler/native reservation, restarts the whole DATA server with
+  admission disabled and no service keys, and applies the retained WAL entry
+  after a higher-term leader heartbeat. Document state and the permanent native
+  progress digest match the accepted entry. BEGIN selects protocol8, while
+  prepare retains protocol7. Peer votes/acknowledgements are delivered explicitly
+  in-process; this does not certify a real peer's durable acknowledgement or a
+  multi-process quorum fault. Fresh production activation remains disabled.
+  Evidence: `/tmp/workload-completion-proposal-wal3.log`, actual exit0.
 - The current single-phase candidate profile rejects external payload stores,
   generated-enrichment producers, graph-index catalogs, child-range dispatch,
   HA mirrors, split/shadow/bulk state, and structural commands. In particular,

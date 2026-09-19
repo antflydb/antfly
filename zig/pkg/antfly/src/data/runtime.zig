@@ -1093,7 +1093,7 @@ const DataDescriptorFactory = struct {
         enabled: bool,
         qualified_wal: bool,
 
-        fn install(self: *CompletionInstaller, group_id: u64, live_host: ?*antfly.raft.Host, live_mutex: ?*std.atomic.Mutex) !void {
+        fn install(self: *CompletionInstaller, group_id: u64, live_server: ?*DataServer) !void {
             const alloc = self.metadata.alloc;
             const marker = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db/completion-installation.guard", .{ self.source.replica_root_dir, group_id });
             defer alloc.free(marker);
@@ -1123,13 +1123,17 @@ const DataDescriptorFactory = struct {
                 try restored.finish();
                 // Startup must not consult metadata or keys. The Raft WAL
                 // provider reconciles restored ownership before publication.
-                if (live_host == null) return;
+                if (live_server == null) return;
             } else if (has_receipt) {
                 // An old/incomplete installation is never reinterpreted as
                 // fresh merely because its restart configuration is missing.
                 self.source.fenceCompletionAuthorization(group_id);
                 return error.CompletionAdmissionUnavailable;
             }
+            // A new group must join its legacy Raft log before negotiating
+            // the durable protocol floor. Native backing would reject the
+            // unreserved activation barrier once installed.
+            if (live_server == null) return;
             if (!self.enabled and !has_receipt) return;
             if (!self.qualified_wal) return error.CompletionAdmissionUnavailable;
             const client = @import("../metadata/completion_installation_client.zig");
@@ -1174,15 +1178,18 @@ const DataDescriptorFactory = struct {
                     return error.CompletionProfileChanged;
                 }
             }
+            const protocol_proof = try live_server.?.ensureCompletionInstallationProtocol(group_id, table_name, deadline_ns);
             var prepared = try self.source.prepareCompletionInstallation(alloc, group_id, table_name, binding, response.schema_json, response.read_schema_json, response.indexes_json, settings, response.installation.?.phase == .active, has_receipt);
             defer prepared.deinit();
             prepared.filesystem_io = self.filesystem_io;
-            if (live_host) |host| {
-                const mutex = live_mutex orelse return error.CompletionAdmissionUnavailable;
-                lockAtomic(mutex);
-                defer mutex.unlock();
+            if (live_server) |server| {
+                const host = (server.data_raft orelse return error.CompletionAdmissionUnavailable).host.http_host.host;
+                lockAtomic(&server.data_raft_mutex);
+                defer server.data_raft_mutex.unlock();
                 const status = host.raftStatus(group_id) orelse return error.CompletionAdmissionUnavailable;
-                if (status.applied_index != status.hard.commit_index or status.applied_index != status.last_index)
+                if (status.applied_index != status.hard.commit_index or status.applied_index != status.last_index or
+                    status.hard.current_term != protocol_proof.term or
+                    DataServer.dataRaftConfStateFingerprint(status.conf_state) != protocol_proof.conf_state_fingerprint)
                     return error.CompletionAdmissionUnavailable;
                 try prepared.begin();
             } else try prepared.begin();
@@ -1270,7 +1277,7 @@ const DataDescriptorFactory = struct {
 
     fn buildDescriptor(ptr: *anyopaque, record: antfly.raft.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
         const self: *DataDescriptorFactory = @ptrCast(@alignCast(ptr));
-        if (self.completion_installer) |*installer| try installer.install(record.group_id, null, null);
+        if (self.completion_installer) |*installer| try installer.install(record.group_id, null);
         const peer_source = self.peer_sets.get(record.group_id) orelse &[_]u64{record.local_node_id};
         const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, peer_source);
         errdefer self.alloc.free(peers);
@@ -10102,16 +10109,77 @@ pub const DataServer = struct {
         };
     }
 
+    /// Install only after the ordinary Raft log has durably applied the
+    /// protocol floor. The caller retries this bounded stage on a later round;
+    /// it never blocks the progress driver waiting on its own barrier.
+    const CompletionInstallationProtocolProof = struct {
+        term: u64,
+        conf_state_fingerprint: u64,
+    };
+
+    fn ensureCompletionInstallationProtocol(self: *DataServer, group_id: u64, table_name: []const u8, deadline_ns: u64) !CompletionInstallationProtocolProof {
+        const required = data_raft_batch.mutation_completion_protocol_version;
+        const needs_barrier = try self.durableDataRaftBatchProtocolVersion(group_id) < required;
+        if (needs_barrier) if (self.kernel_owner_source) |source| {
+            if (source.completionInstallationPresent(group_id)) return error.CompletionAdmissionUnavailable;
+        };
+        const raft = self.data_raft orelse return error.CompletionAdmissionUnavailable;
+        const activation = try self.dataRaftProtocolActivationEntry(group_id);
+        defer activation.release(self.alloc);
+        if (!activation.activation_mutex.tryLock()) return error.CompletionAdmissionUnavailable;
+        defer activation.activation_mutex.unlock();
+        var term: u64 = 0;
+        var plan = capture: {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            const host = raft.host.http_host.host;
+            const status = host.raftStatus(group_id) orelse return error.CompletionAdmissionUnavailable;
+            if ((needs_barrier and !host.isLocalLeader(group_id)) or status.applied_index != status.hard.commit_index or
+                status.applied_index != status.last_index) return error.CompletionAdmissionUnavailable;
+            if (needs_barrier and activation.pending_term.load(.acquire) == status.hard.current_term and
+                activation.pending_version.load(.acquire) >= required) return error.CompletionAdmissionUnavailable;
+            term = status.hard.current_term;
+            break :capture try self.dataRaftProtocolProbePlanLocked(self.alloc, raft, group_id, status.conf_state, host.cfg.local_node_id);
+        };
+        defer plan.deinit(self.alloc);
+        const proof = self.dataRaftBatchProtocolPreflight(self.alloc, plan, required, deadline_ns, null);
+        if (proof.activatable_version < required or self.dataRaftMonotonicNs() >= deadline_ns)
+            return error.CompletionAdmissionUnavailable;
+        const barrier = try data_raft_batch.encodeProtocolBarrier(self.alloc, table_name, required);
+        defer self.alloc.free(barrier);
+        lockAtomic(&self.data_raft_mutex);
+        defer self.data_raft_mutex.unlock();
+        const host = raft.host.http_host.host;
+        const status = host.raftStatus(group_id) orelse return error.CompletionAdmissionUnavailable;
+        if ((needs_barrier and !host.isLocalLeader(group_id)) or status.hard.current_term != term or
+            status.applied_index != status.hard.commit_index or status.applied_index != status.last_index or
+            proof.conf_state_fingerprint != dataRaftConfStateFingerprint(status.conf_state))
+            return error.CompletionAdmissionUnavailable;
+        if (!needs_barrier) return .{ .term = term, .conf_state_fingerprint = proof.conf_state_fingerprint };
+        if (self.kernel_owner_source) |source| {
+            if (source.completionInstallationPresent(group_id)) return error.CompletionAdmissionUnavailable;
+        }
+        var accepted: ?u64 = null;
+        raft.host.http_host.proposeWithReceipt(group_id, barrier, &accepted) catch |err| {
+            if (accepted == null) return err;
+        };
+        if (accepted != null) {
+            activation.pending_version.store(required, .release);
+            activation.pending_term.store(term, .release);
+        }
+        return error.CompletionAdmissionUnavailable;
+    }
+
     fn requiresCanonicalCompletion(req: antfly.db.types.BatchRequest, storage: ?antfly.common.table_storage.Settings) bool {
         return canonicalCompletionProtocolVersion(req, storage) != null;
     }
 
     fn canonicalCompletionProtocolVersion(req: antfly.db.types.BatchRequest, storage: ?antfly.common.table_storage.Settings) ?u16 {
-        if (req.transaction) |transaction| if (transaction != .prepare) return null;
+        if (req.transaction) |transaction| if (transaction != .prepare and transaction != .begin) return null;
         const settings = storage orelse return null;
         const policy = settings.transaction_recovery orelse return null;
         if (policy.completion_protocol_version == 0 and policy.profile_version == 0) return null;
-        return if (req.transaction != null) data_raft_batch.completion_protocol_version else data_raft_batch.mutation_completion_protocol_version;
+        return if (req.transaction != null and req.transaction.? == .prepare) data_raft_batch.completion_protocol_version else data_raft_batch.mutation_completion_protocol_version;
     }
 
     fn proposeRaftBatchGroupWithLeaderWait(
@@ -15876,7 +15944,7 @@ pub const DataServer = struct {
                 if (hosted) {
                     // One bounded signed lookup per round; new group attach
                     // always performs its own check before joining.
-                    try installer.install(group, raft.host.http_host.host, &self.data_raft_mutex);
+                    try installer.install(group, self);
                     break;
                 }
             }
@@ -29197,6 +29265,252 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "workload admission canonical proposal negotiates voters before installation and restores actual WAL ownership" {
+            if (comptime !linked_storage) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            const abi = @import("kernel_owner_abi");
+            const capsule_codec = @import("../common/completion_installation_capsule.zig");
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            const io = io_impl.io();
+            const relative = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+            defer alloc.free(relative);
+            const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, alloc);
+            defer alloc.free(root);
+            const catalog_path = try std.fmt.allocPrint(alloc, "{s}/replicas.json", .{root});
+            defer alloc.free(catalog_path);
+            const db_path = try std.fmt.allocPrint(alloc, "{s}/group-2/table-db", .{root});
+            defer alloc.free(db_path);
+            const settings: antfly.common.table_storage.Settings = .{ .transaction_recovery = .{
+                .protocol_version = 1,
+                .max_count = 4,
+                .max_bytes = 1024 * 1024,
+                .max_transaction_bytes = 64 * 1024,
+                .completion_protocol_version = 1,
+                .profile_version = 1,
+            } };
+            const Fixture = struct {
+                version: u16 = 7,
+                probes: usize = 0,
+                snapshot: antfly.metadata_api.AdminSnapshot,
+                fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (std.mem.endsWith(u8, request.uri, "/internal/v1/capabilities")) {
+                        self.probes += 1;
+                        return .{ .status = 200, .body = try std.fmt.allocPrint(a, "{{\"data_raft_batch_protocol_version\":{d}}}", .{self.version}) };
+                    }
+                    // Peer messages are delivered explicitly through Host.step.
+                    if (request.method == .POST) return .{ .status = 200 };
+                    return .{ .status = 503 };
+                }
+                fn snapshotFn(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return @as(*@This(), @ptrCast(@alignCast(ptr))).snapshot;
+                }
+                fn freeSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn catalog(self: *@This()) antfly.public_api.table_catalog.CatalogSource {
+                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = snapshotFn, .free_admin_snapshot = freeSnapshot } };
+                }
+                fn acknowledge(server: *DataServer) !void {
+                    const host = server.data_raft.?.host.http_host.host;
+                    const state = host.raftStatus(2).?;
+                    try host.step(2, .{ .msg_type = .append_entries_response, .from = 2, .to = 1, .term = state.hard.current_term, .log_index = state.last_index });
+                    _ = try host.runRound(0, 16);
+                }
+            };
+            var tables = [_]antfly.metadata.TableRecord{.{ .table_id = 1, .name = "docs", .indexes_json = "{}" }};
+            var ranges = [_]antfly.metadata.RangeRecord{.{ .group_id = 2, .table_id = 1, .range_id = 3, .start_key = "", .doc_identity_shard_id = 2, .doc_identity_range_id = 3 }};
+            var fixture: Fixture = .{ .snapshot = .{
+                .status = .{ .metadata_group_id = 9, .metadata_incarnation = "11111111111111111111111111111111".*, .metadata_epoch = 1, .metrics = .{} },
+                .tables = &tables,
+                .ranges = &ranges,
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            } };
+            const executor: antfly.common.http.RequestExecutor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } };
+            const binding: completion_pool_abi.InstallBinding = .{
+                .identity = .{ .group_id = 2, .node_id = 1, .capacity = 4, .generation = 1, .incarnation = @splat(15), .policy_digest = @import("../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) },
+                .table_id = 1,
+                .range_id = 3,
+                .schema_catalog_digest = try @import("../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}"),
+            };
+            var accepted_index: u64 = 0;
+            var accepted_term: u64 = 0;
+            var accepted_digest: [32]u8 = undefined;
+            {
+                var server = try DataServer.initFromMetadataApiUrls(alloc, .{
+                    .replica_root_dir = root,
+                    .replica_catalog_path = catalog_path,
+                    .data_raft_state_backend = .wal,
+                    .data_raft_listener_external = true,
+                    .data_raft_async_send_worker_count = 0,
+                    .data_raft_request_executor = executor,
+                    .store_registration = .{ .node_id = 1, .store_id = 1 },
+                    .metadata_request_executors = &.{executor},
+                    .api_server_cfg = .{ .transaction_completion_bytes = 1024 * 1024, .durable_transaction_completion = .{ .enabled = true } },
+                }, &.{"http://metadata.invalid"});
+                defer server.deinit();
+                const remote = server.remote_metadata.?;
+                remote.cached_snapshot = try cloneAdminSnapshotOwned(alloc, fixture.snapshot);
+                server.kernel_owner_source.?.catalog = fixture.catalog();
+                server.write_source.catalog = fixture.catalog();
+                server.data_raft_apply.?.write_source.catalog = fixture.catalog();
+                const factory = server.data_raft_factory.?;
+                try factory.peer_sets.put(alloc, 2, try alloc.dupe(u64, &.{ 1, 2 }));
+                try factory.initial_voter_sets.put(alloc, 2, try alloc.dupe(u64, &.{ 1, 2 }));
+                const host = server.data_raft.?.host.http_host.host;
+                var resolver = antfly.raft.MemoryPeerResolver.init(alloc);
+                defer resolver.deinit();
+                try resolver.upsert(2, 2, &.{.{ .protocol = .http, .address = "http://peer-2" }});
+                const previous_peer_resolver = host.deps.peer_resolver;
+                const previous_http_peer_resolver = server.data_raft.?.host.http_host.deps.host.peer_resolver;
+                defer {
+                    host.deps.peer_resolver = previous_peer_resolver;
+                    server.data_raft.?.host.http_host.deps.host.peer_resolver = previous_http_peer_resolver;
+                }
+                server.data_raft.?.host.http_host.deps.host.peer_resolver = resolver.resolver();
+                host.deps.peer_resolver = resolver.resolver();
+                _ = try host.ensureReplica(.{ .group_id = 2, .replica_id = 1, .local_node_id = 1 });
+                try host.campaignGroup(2);
+                for (0..4) |_| {
+                    const state = host.raftStatus(2).?;
+                    switch (state.soft.role) {
+                        .pre_candidate => try host.step(2, .{ .msg_type = .pre_vote_response, .from = 2, .to = 1, .term = state.hard.current_term + 1 }),
+                        .candidate => try host.step(2, .{ .msg_type = .request_vote_response, .from = 2, .to = 1, .term = state.hard.current_term }),
+                        .leader => break,
+                        else => return error.TestUnexpectedResult,
+                    }
+                }
+                try std.testing.expect(host.isLocalLeader(2));
+                _ = try host.runRound(0, 16);
+                try Fixture.acknowledge(&server);
+                const initial = host.raftStatus(2).?;
+                try std.testing.expectEqual(initial.last_index, initial.applied_index);
+                const deadline = server.dataRaftMonotonicNs() + 5 * std.time.ns_per_s;
+                try std.testing.expectError(error.CompletionAdmissionUnavailable, server.ensureCompletionInstallationProtocol(2, "docs", deadline));
+                try std.testing.expectEqual(initial.last_index, host.raftStatus(2).?.last_index);
+                try std.testing.expect(!server.kernel_owner_source.?.completionInstallationPresent(2));
+                try std.testing.expect(fixture.probes > 0);
+                tables[0].storage = settings;
+                const request: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "doc", .value = "{\"value\":2}" }}, .timestamp_ns = 100, .sync_level = .propose };
+                try std.testing.expectError(error.CompletionAdmissionUnavailable, server.proposeRaftBatchGroupWithLeaderWait(alloc, 2, "docs", request, .{ .discovery = .cached, .allow_remote_forward = false, .campaign_allowed = false }, 5 * std.time.ns_per_s));
+                try std.testing.expectEqual(initial.last_index, host.raftStatus(2).?.last_index);
+                _ = server.kernel_owner_source.?.retireAll();
+                fixture.version = 8;
+                // A fresh endpoint forces a new capability observation instead
+                // of reusing the deliberately short-lived v7 negative cache.
+                try resolver.upsert(2, 2, &.{.{ .protocol = .http, .address = "http://peer-2-v8" }});
+                try std.testing.expectError(error.CompletionAdmissionUnavailable, server.ensureCompletionInstallationProtocol(2, "docs", deadline));
+                try std.testing.expect(host.raftStatus(2).?.last_index > initial.last_index);
+                try std.testing.expect(!server.kernel_owner_source.?.completionInstallationPresent(2));
+                _ = try host.runRound(0, 16);
+                try Fixture.acknowledge(&server);
+                _ = try server.ensureCompletionInstallationProtocol(2, "docs", deadline);
+                try std.testing.expectEqual(@as(u16, 8), try server.durableDataRaftBatchProtocolVersion(2));
+                // A durable floor does not certify a later applying member.
+                // Reobserve the current peer before publishing native backing.
+                fixture.version = 7;
+                try resolver.upsert(2, 2, &.{.{ .protocol = .http, .address = "http://peer-2-current-v7" }});
+                try std.testing.expectError(error.CompletionAdmissionUnavailable, server.ensureCompletionInstallationProtocol(2, "docs", deadline));
+                try std.testing.expect(!server.kernel_owner_source.?.completionInstallationPresent(2));
+                fixture.version = 8;
+                try resolver.upsert(2, 2, &.{.{ .protocol = .http, .address = "http://peer-2-current-v8" }});
+                _ = try server.ensureCompletionInstallationProtocol(2, "docs", deadline);
+                const settings_json = try std.json.Stringify.valueAlloc(alloc, settings, .{});
+                defer alloc.free(settings_json);
+                {
+                    var owner = try kernel_owner_client.Owner.open(.{
+                        .context = server.storageKernelContextHandle(),
+                        .path = .fromSlice(db_path),
+                        .table_name = .fromSlice("docs"),
+                        .group_id = 2,
+                        .has_identity_namespace = 1,
+                        .identity_table_id = 1,
+                        .identity_shard_id = 2,
+                        .identity_range_id = 3,
+                        .indexes_json = .fromSlice("{}"),
+                        .completion_installation = &binding,
+                        .completion_settings_json = .fromSlice(settings_json),
+                    });
+                    defer owner.deinit();
+                    var capsule: capsule_codec.Value = .{
+                        .binding = binding,
+                        .table_name = "docs",
+                        .shard_id = 2,
+                        .root_generation = 0,
+                        .settings = settings,
+                        .schema_json = "",
+                        .read_schema_json = "",
+                        .indexes_json = "{}",
+                        .canonical_root_digest = undefined,
+                        .root_identity_digest = undefined,
+                        .receipt_digest = undefined,
+                    };
+                    try capsule_codec.bindRoot(alloc, io, db_path, &capsule);
+                    try capsule_codec.publish(alloc, io, db_path, capsule);
+                }
+                try factory.completion_installer.?.install(2, null);
+                // This is the trusted metadata result at the installer seam;
+                // production activation remains disabled outside this fixture.
+                var authenticated = try server.kernel_owner_source.?.prepareCompletionInstallation(alloc, 2, "docs", binding, "", "", "{}", settings, true, true);
+                defer authenticated.deinit();
+                try authenticated.begin();
+                try authenticated.finish();
+                remote.cached_snapshot.?.tables[0].storage = settings;
+                try server.proposeRaftBatchGroupWithLeaderWait(alloc, 2, "docs", request, .{ .discovery = .cached, .allow_remote_forward = false, .campaign_allowed = false }, 5 * std.time.ns_per_s);
+                const accepted = host.raftStatus(2).?;
+                accepted_index = accepted.last_index;
+                accepted_term = accepted.hard.current_term;
+                try std.testing.expect(accepted_index > accepted.applied_index);
+                // Persist the accepted entry, but do not acknowledge the peer:
+                // neither the transaction nor native progress has applied yet.
+                _ = try host.runRound(0, 16);
+                const provider = server.kernel_owner_source.?.completionProvider();
+                var lease: completion_pool_abi.Lease = undefined;
+                try std.testing.expectEqual(abi.Status.ok, provider.acquire(provider.context, 2, 1, &lease));
+                defer lease.vtable.release(lease.context);
+                var cells: completion_pool_abi.DurableCells = .{};
+                try std.testing.expectEqual(abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
+                try std.testing.expectEqual(@as(u32, 1), cells.count);
+                accepted_digest = cells.cells[0].identity.payload_digest;
+                try std.testing.expectEqual(accepted_index, cells.cells[0].identity.index);
+                const wal = server.data_raft.?.host.owned_wal_replica_provider.?.stateForGroup(2).?;
+                try std.testing.expectEqual(accepted_index, try wal.storage().lastIndex());
+            }
+            {
+                var server = try DataServer.initFromMetadataApiUrls(alloc, .{
+                    .replica_root_dir = root,
+                    .replica_catalog_path = catalog_path,
+                    .data_raft_state_backend = .wal,
+                    .data_raft_listener_external = true,
+                    .data_raft_async_send_worker_count = 0,
+                    .data_raft_request_executor = executor,
+                    .store_registration = .{ .node_id = 1, .store_id = 1 },
+                    .metadata_request_executors = &.{executor},
+                    .api_server_cfg = .{ .transaction_completion_bytes = 1024 * 1024, .durable_transaction_completion = .{ .enabled = false } },
+                }, &.{"http://metadata.invalid"});
+                defer server.deinit();
+                const host = server.data_raft.?.host.http_host.host;
+                const restored = host.raftStatus(2) orelse return error.MissingRestoredReplica;
+                try std.testing.expectEqual(accepted_index, restored.last_index);
+                try std.testing.expect(restored.applied_index < accepted_index);
+                try std.testing.expect(!server.kernel_owner_source.?.completionAdmissionAuthorized(2));
+                try host.step(2, .{ .msg_type = .heartbeat, .from = 2, .to = 1, .term = accepted_term + 1, .commit_index = accepted_index });
+                _ = try host.runRound(0, 16);
+                try std.testing.expectEqual(accepted_index, host.raftStatus(2).?.applied_index);
+                const progress = (try host.completionProgress(2)).?;
+                try std.testing.expectEqual(accepted_index, progress.index);
+                try std.testing.expectEqualSlices(u8, &accepted_digest, &progress.payload_digest);
+                try std.testing.expectEqual(@as(usize, 1), server.kernel_owner_source.?.entries.items.len);
+                var document = try server.kernel_owner_source.?.entries.items[0].owner.lookupJson("docs", "{\"key\":\"doc\",\"include_all_fields\":true}");
+                defer document.deinit();
+                try std.testing.expect(std.mem.indexOf(u8, document.bytes(), "\"value\":2") != null);
+            }
+        }
+
         test "workload admission data completion capsule installer restores without metadata or service keys" {
             if (comptime !linked_storage) return error.SkipZigTest;
             const alloc = std.testing.allocator;
@@ -29283,8 +29597,8 @@ fn consumerTests() type {
                 .enabled = false,
                 .qualified_wal = true,
             };
-            try installer.install(2, null, null);
-            try installer.install(2, null, null);
+            try installer.install(2, null);
+            try installer.install(2, null);
             try std.testing.expectEqual(@as(usize, 0), offline.calls);
             try std.testing.expect(!source.completionAdmissionAuthorized(2));
             const provider = source.completionProvider();
@@ -29307,7 +29621,7 @@ fn consumerTests() type {
             remote.completion_native_provider = .{ .context = null, .acquire = Missing.acquire };
             try std.testing.expectError(error.CompletionAdmissionUnavailable, RemoteMetadataSource.restoredCompletionProgress(&remote, 2, 7));
             installer.node_id = 8;
-            try std.testing.expectError(error.CompletionProfileChanged, installer.install(2, null, null));
+            try std.testing.expectError(error.CompletionProfileChanged, installer.install(2, null));
             try std.testing.expectEqual(@as(usize, 0), offline.calls);
         }
 
@@ -48832,6 +49146,13 @@ fn implementationTests() type {
 
         test "workload admission canonical proposal selection follows authoritative table policy" {
             const prepare: antfly.db.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = @splat(7), .topology_epoch = 1 } } };
+            const begin: antfly.db.types.BatchRequest = .{ .transaction = .{ .begin = .{
+                .txn_id = @splat(7),
+                .begin_timestamp = 1,
+                .created_at_ns = 1,
+                .topology_epoch = 1,
+                .participants = &.{"docs"},
+            } } };
             var settings: antfly.common.table_storage.Settings = .{ .transaction_recovery = .{
                 .protocol_version = 1,
                 .max_count = 4,
@@ -48847,6 +49168,9 @@ fn implementationTests() type {
             const ordinary: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "doc", .value = "{}" }} };
             try std.testing.expectEqual(@as(?u16, 8), DataServer.canonicalCompletionProtocolVersion(ordinary, settings));
             try std.testing.expectEqual(@as(?u16, 7), DataServer.canonicalCompletionProtocolVersion(prepare, settings));
+            try std.testing.expectEqual(@as(?u16, 8), DataServer.canonicalCompletionProtocolVersion(begin, settings));
+            try std.testing.expectEqual(@as(?u16, null), DataServer.canonicalCompletionProtocolVersion(begin, null));
+            try std.testing.expectEqual(@as(?u16, null), DataServer.canonicalCompletionProtocolVersion(.{ .transaction = .{ .resolve = .{ .txn_id = @splat(7), .status = .committed, .commit_version = 2 } } }, settings));
             try std.testing.expectEqual(@as(?u16, null), DataServer.canonicalCompletionProtocolVersion(ordinary, null));
             // Unknown future/malformed policy is never silently downgraded to the
             // legacy logical prepare format; the canonical compiler rejects it.
