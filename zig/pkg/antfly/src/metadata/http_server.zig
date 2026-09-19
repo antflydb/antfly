@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const completion_installation = @import("completion_installation_protocol.zig");
 const store_report_baseline = @import("store_report_baseline.zig");
 const snapshot_transfer = @import("snapshot_transfer.zig");
 const store_report_update = @import("store_report_update.zig");
@@ -113,11 +114,21 @@ fn systemCatalogIdentityCall(comptime Service: type) *const fn (*anyopaque) anye
     }.call;
 }
 
+fn completionInstallationCall(comptime Service: type) *const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, []const u8) anyerror![]u8 {
+    return struct {
+        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, frame: []const u8) ![]u8 {
+            const svc: *Service = @ptrCast(@alignCast(ptr));
+            return svc.completionInstallation(alloc, request, frame);
+        }
+    }.call;
+}
+
 pub const AdminSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        completion_installation: ?*const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, []const u8) anyerror![]u8 = null,
         catalog_identity: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.CatalogIdentity = null,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: system_catalog.Call) anyerror![]u8 = null,
 
@@ -147,6 +158,7 @@ pub const AdminSource = struct {
         create_table_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
         replace_table_definition_stamped: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!metadata_api.CatalogMutationStamp = null,
+        replace_table_definition_with_context: ?*const fn (*anyopaque, operation.RequestContext, metadata_table_manager.TableRecord, metadata_table_manager.TableRecord) anyerror!metadata_api.CatalogMutationStamp = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -536,6 +548,8 @@ pub const AdminSource = struct {
             .ptr = svc,
             .vtable = &.{
                 .system_catalog = comptime systemCatalogServiceCall(service.MetadataService),
+                .completion_installation = comptime completionInstallationCall(service.MetadataService),
+                .replace_table_definition_with_context = comptime replaceDefinitionContextCall(service.MetadataService),
                 .catalog_identity = comptime systemCatalogIdentityCall(service.MetadataService),
                 .head = metadataServiceHead,
                 .linearizable_head = metadataServiceLinearizableHead,
@@ -601,6 +615,8 @@ pub const AdminSource = struct {
             .ptr = svc,
             .vtable = &.{
                 .system_catalog = comptime systemCatalogServiceCall(service.MetadataHttpService),
+                .completion_installation = comptime completionInstallationCall(service.MetadataHttpService),
+                .replace_table_definition_with_context = comptime replaceDefinitionContextCall(service.MetadataHttpService),
                 .catalog_identity = comptime systemCatalogIdentityCall(service.MetadataHttpService),
                 .head = metadataHttpServiceHead,
                 .linearizable_head = metadataHttpServiceLinearizableHead,
@@ -785,6 +801,15 @@ pub const AdminSource = struct {
         _ = svc;
     }
 
+    fn replaceDefinitionContextCall(comptime Service: type) *const fn (*anyopaque, operation.RequestContext, metadata_table_manager.TableRecord, metadata_table_manager.TableRecord) anyerror!metadata_api.CatalogMutationStamp {
+        return struct {
+            fn call(ptr: *anyopaque, request: operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !metadata_api.CatalogMutationStamp {
+                const svc: *Service = @ptrCast(@alignCast(ptr));
+                return replaceTableDefinitionOnServiceStampedWithContext(svc, request, expected, replacement);
+            }
+        }.call;
+    }
+
     fn replaceTableDefinitionOnService(
         svc: anytype,
         expected: metadata_table_manager.TableRecord,
@@ -798,10 +823,16 @@ pub const AdminSource = struct {
         expected: metadata_table_manager.TableRecord,
         replacement: metadata_table_manager.TableRecord,
     ) !metadata_api.CatalogMutationStamp {
+        return replaceTableDefinitionOnServiceStampedWithContext(svc, .{}, expected, replacement);
+    }
+
+    fn replaceTableDefinitionOnServiceStampedWithContext(svc: anytype, request: operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !metadata_api.CatalogMutationStamp {
+        try request.ensureActive();
+        const physical_policy = try service.completionPolicyOnlyUpdate(expected, replacement);
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const current = findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
-        if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+        if ((!metadata_table_manager.tableDefinitionsEqual(current.*, expected) and !(physical_policy != null and metadata_table_manager.tableDefinitionsEqual(current.*, replacement))) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(std.heap.page_allocator, replacement.indexes_json);
         try managed_embedder.validateEmbeddingProducerOwnershipJson(std.heap.page_allocator, replacement.indexes_json);
         if (try extension_table_ownership.definitionMutationTouchesOwnedState(
@@ -810,6 +841,8 @@ pub const AdminSource = struct {
             expected,
             replacement,
         )) return error.ExtensionOwnedObject;
+        if (@hasDecl(@TypeOf(svc.*), "replaceTableDefinitionStampedWithContext"))
+            return svc.replaceTableDefinitionStampedWithContext(request, expected, replacement);
         return try svc.replaceTableDefinitionStamped(expected, replacement);
     }
 
@@ -1768,6 +1801,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_catalog_group_retirement_check, httpx.Handler.bind(self, metadataCatalogGroupRetirementCheck));
         try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
+        try server.postWithBodyLimit(completion_installation.path, completion_installation.max_request_bytes, httpx.Handler.bind(self, metadataCompletionInstallation));
         try server.postWithBodyLimit(routes.Routes.internal_schema_progress_batch, 16384, httpx.Handler.bind(self, metadataUpsertSchemaProgressBatch));
         try server.post(routes.Routes.internal_schema_progress, httpx.Handler.bind(self, metadataUpsertSchemaProgress));
         try server.post(routes.Routes.internal_restore_progress, httpx.Handler.bind(self, metadataUpsertRestoreProgress));
@@ -1812,6 +1846,20 @@ pub const MetadataHttpServer = struct {
         try server.post(table_path ++ routes.Routes.internal_table_replication_sources_infix ++ ":source_ordinal" ++ routes.Routes.internal_table_reseed_exact_cutover_suffix, httpx.Handler.bind(self, metadataReseedReplicationSourceExactCutover));
         try server.post(table_path ++ routes.Routes.internal_split_suffix, httpx.Handler.bind(self, metadataRequestTableSplit));
         try server.post(table_path ++ routes.Routes.internal_merge_suffix, httpx.Handler.bind(self, metadataRequestTableMerge));
+    }
+
+    fn metadataCompletionInstallation(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse return ctx.status(400).text("missing signed installation request");
+        if (body.len > completion_installation.max_request_bytes) return ctx.status(413).text("installation request too large");
+        const callback = self.source.vtable.completion_installation orelse return ctx.status(503).text("installation query unavailable");
+        const response = callback(self.source.ptr, ctx.allocator, requestContext(ctx), body) catch |err| switch (err) {
+            error.InvalidCompletionInstallation, error.InvalidCompletionInstallationSignature => return ctx.status(403).text("invalid signed installation request"),
+            else => return metadataReadError(ctx, err),
+        };
+        defer ctx.allocator.free(response);
+        try ctx.setHeader("content-type", "text/plain");
+        _ = ctx.response.body(response);
+        return ctx.response.build();
     }
 
     fn metadataSystemCatalog(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -2095,6 +2143,10 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataReadError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.CompletionAdmissionUnavailable or err == error.CompletionAdmissionPolicyChanged) {
+            try ctx.setHeader("Retry-After", "1");
+            return ctx.status(503).text("completion installation unavailable");
+        }
         if (metadata_authority.isRetryableError(err)) {
             try ctx.setHeader("Retry-After", "1");
             try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
@@ -2965,6 +3017,7 @@ pub const MetadataHttpServer = struct {
             .create_table = createTableOperation,
             .create_table_with_context = createTableOperationWithContext,
             .replace_definition = replaceTableDefinitionOperation,
+            .replace_definition_with_context = replaceTableDefinitionOperationWithContext,
             .replace_definition_stamped = if (stamped)
                 replaceTableDefinitionOperationStamped
             else
@@ -3007,6 +3060,14 @@ pub const MetadataHttpServer = struct {
     fn createTableOperationWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8, create_request: tables_api.CreateTableRequest) !void {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.createTableWithContext(alloc, request, table_name, create_request);
+    }
+
+    fn replaceTableDefinitionOperationWithContext(ptr: *anyopaque, request: operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        if (self.source.vtable.replace_table_definition_with_context) |callback|
+            return callback(self.source.ptr, request, expected, replacement);
+        try request.ensureActive();
+        return self.source.replaceTableDefinitionStamped(expected, replacement);
     }
 
     fn replaceTableDefinitionOperation(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
@@ -7628,4 +7689,56 @@ test "workload admission metadata completion capacity preserves unknown mutation
     try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
     try std.testing.expectEqualStrings(routes.Routes.raft_mutation_outcome_unknown, response.headers.get(routes.Routes.raft_mutation_outcome_header).?);
     try std.testing.expect(response.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
+}
+
+test "workload admission metadata installation endpoint forwards only signed bounded requests" {
+    const Fake = struct {
+        calls: usize = 0,
+        fail: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, frame: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try request.ensureActive();
+            self.calls += 1;
+            if (self.fail) return error.CompletionAdmissionUnavailable;
+            if (!std.mem.eql(u8, frame, "signed-query")) return error.InvalidCompletionInstallationSignature;
+            return alloc.dupe(u8, "signed-response");
+        }
+    };
+    var fake = Fake{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot, .completion_installation = Fake.query } });
+    var request = try httpx.Request.init(std.testing.allocator, .POST, completion_installation.path);
+    defer request.deinit();
+    request.body = "signed-query";
+    {
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try server.metadataCompletionInstallation(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(response.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
+    }
+    request.body = "forged-query";
+    {
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try server.metadataCompletionInstallation(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+    }
+    fake.fail = true;
+    {
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try server.metadataCompletionInstallation(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+    }
 }

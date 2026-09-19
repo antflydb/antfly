@@ -3366,6 +3366,38 @@ pub const RaftApplyStore = struct {
         return try completion_activation.decode(alloc, bytes);
     }
 
+    /// One coherent point read: a signed installation is only disclosed to an
+    /// actual applying member of the fenced group. No cluster-wide scan occurs.
+    pub fn completionInstallationResponse(self: *RaftApplyStore, alloc: std.mem.Allocator, metadata_group_id: u64, query: @import("../completion_installation_protocol.zig").Request, keys: @import("../completion_installation_protocol.zig").Keys) ![]u8 {
+        const protocol = @import("../completion_installation_protocol.zig");
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [192]u8 = undefined;
+        const cluster = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&key_buf, metadata_group_id)))).incarnation;
+        if (!std.meta.eql(cluster, query.cluster_incarnation)) return error.CompletionAdmissionPolicyChanged;
+        const range_bytes = try txn.get(try rangeKeyForGroup(&key_buf, metadata_group_id, query.group_id));
+        const range = try decodeRangeRecord(alloc, range_bytes);
+        defer metadata_table_manager.freeRange(alloc, range);
+        const placement = try decodePlacementIntent(alloc, try txn.get(try placementKeyForGroup(&key_buf, metadata_group_id, query.group_id, query.requester)));
+        defer freePlacementIntent(alloc, placement);
+        if (placement.record.group_id != query.group_id or placement.record.local_node_id != query.requester) return error.CompletionAdmissionUnavailable;
+        const encoded = txn.get(try completionActivationKeyForGroup(&key_buf, metadata_group_id, range.table_id)) catch |err| switch (err) {
+            error.NotFound => return protocol.signResponse(alloc, keys, .{ .request = query, .installation = null, .schema_json = "", .read_schema_json = "", .indexes_json = "" }),
+            else => return err,
+        };
+        var record = try completion_activation.decode(alloc, encoded);
+        defer record.deinit();
+        const expected = for (record.value.groups) |group| {
+            if (group.group_id == query.group_id) break group;
+        } else return error.CompletionAdmissionPolicyChanged;
+        var range_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(range_bytes, &range_digest, .{});
+        if (!std.meta.eql(range_digest, expected.range_digest) or !std.meta.eql(cluster, record.value.cluster_incarnation)) return error.CompletionAdmissionPolicyChanged;
+        const table = try decodeTableRecord(alloc, try txn.get(try tableKeyForGroup(&key_buf, metadata_group_id, range.table_id)));
+        defer metadata_table_manager.freeTable(alloc, table);
+        return protocol.signResponse(alloc, keys, .{ .request = query, .installation = record.value, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json });
+    }
+
     fn applyCompletionActivationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         var parsed = try completion_activation.decode(self.alloc, bytes);
         defer parsed.deinit();
@@ -20841,6 +20873,26 @@ test "workload admission completion activation is durable atomic and structurall
     defer source.deinit();
     try Apply.command(&source, 1, .{ .initialize_metadata_incarnation = "11111111111111111111111111111111".* });
     try Apply.command(&source, 2, .{ .apply_table_topology = .{ .create = .{ .table = table, .expected_transition_generation = 0, .ranges = &.{.{ .group_id = 1001, .range_id = 3, .table_id = 7, .start_key = "" }} } } });
+    // Seed a real placement before the installation fence is acquired.
+    {
+        var key_buf: [192]u8 = undefined;
+        const placement = try encodePlacementIntent(alloc, .{ .record = .{ .group_id = 1001, .replica_id = 1, .local_node_id = 12, .metadata_version = 1 }, .store_id = 12, .peer_node_ids = &.{12} });
+        defer alloc.free(placement);
+        var txn = try source.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(try placementKeyForGroup(&key_buf, group_id, 1001, 12), placement);
+        try txn.commit();
+    }
+    {
+        const protocol = @import("../completion_installation_protocol.zig");
+        const absent_query: protocol.Request = .{ .requester = 12, .group_id = 1001, .cluster_incarnation = "11111111111111111111111111111111".*, .nonce = 76 };
+        const absent_keys: protocol.Keys = .{ .primary = "completion-installation-test-key", .issuer = "metadata-test" };
+        const absence = try source.completionInstallationResponse(alloc, group_id, absent_query, absent_keys);
+        defer alloc.free(absence);
+        var verified_absence = try protocol.verifyResponse(alloc, absent_keys, absence, absent_query);
+        defer verified_absence.deinit();
+        try std.testing.expect(verified_absence.value.installation == null);
+    }
     const contract: metadata.TransitionTableContract = .{ .table_id = table.table_id, .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json };
     {
         var read = try source.store.beginReadTxn();
@@ -20860,6 +20912,21 @@ test "workload admission completion activation is durable atomic and structurall
         defer read.abort();
         try std.testing.expect(!try source.tableMatchesTransitionContractTxn(&read, group_id, contract));
     }
+    const installation_protocol = @import("../completion_installation_protocol.zig");
+    const keys: installation_protocol.Keys = .{ .primary = "completion-installation-test-key", .issuer = "metadata-test" };
+    const query: installation_protocol.Request = .{ .requester = 12, .group_id = 1001, .cluster_incarnation = "11111111111111111111111111111111".*, .nonce = 77 };
+    const signed = try source.completionInstallationResponse(alloc, group_id, query, keys);
+    defer alloc.free(signed);
+    var verified = try installation_protocol.verifyResponse(alloc, keys, signed, query);
+    defer verified.deinit();
+    try std.testing.expect(verified.value.installation.?.sameIntent(pending.value));
+    try std.testing.expectEqualStrings(table.schema_json, verified.value.schema_json);
+    var wrong_query = query;
+    wrong_query.requester = 13;
+    try std.testing.expectError(error.NotFound, source.completionInstallationResponse(alloc, group_id, wrong_query, keys));
+    wrong_query = query;
+    wrong_query.cluster_incarnation = "22222222222222222222222222222222".*;
+    try std.testing.expectError(error.CompletionAdmissionPolicyChanged, source.completionInstallationResponse(alloc, group_id, wrong_query, keys));
     const snapshot = try source.snapshotBuilder().buildSnapshot(alloc, group_id);
     defer alloc.free(snapshot);
     var target = try RaftApplyStore.init(alloc, .{ .root_dir = target_root });
