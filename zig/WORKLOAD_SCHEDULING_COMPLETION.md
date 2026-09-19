@@ -71,6 +71,24 @@ from `zig/`: `zig build antfly-durable-completion-test -j1 --cache-dir
 .zig-cache/workload-local --global-cache-dir .zig-cache/workload-global`.
 Evidence: `/tmp/workload-control-resources2.log`.
 
+### Deterministic acknowledgement rejection preserves Raft progress
+
+`InvalidParticipant` now crosses the native failure ABI precisely and is an
+expected DATA command rejection. Previously it could become an opaque native
+failure, or escape the apply state machine's deterministic rejection set and
+stop the committed batch behind an invalid named ACK. The real apply fixture now
+applies an unenlisted-participant ACK, a valid ACK, and an ordinary write in one
+Ready batch, verifies the exact rejection plus both later successes and final
+applied index, then verifies duplicate Ready replay does not regress progress.
+Storage corruption and resource failures remain outside this rejection set.
+
+The focused DATA gate passed its one matching compiled consumer test, zero
+skips, failures, or leaks, actual process exit 0; the implementation artifact had
+no matching test. Command from `zig/`: `zig build antfly-data-runtime-test -j1
+--cache-dir .zig-cache/workload-local --global-cache-dir .zig-cache/workload-global
+-- --test-filter 'data raft apply records transaction conflicts without stopping
+replica progress'`. Evidence: `/tmp/workload-invalid-participant-data1.log`.
+
 ## Current integration evidence and boundaries
 
 - Canonical single-phase envelopes use wire version 2 and require Raft batch

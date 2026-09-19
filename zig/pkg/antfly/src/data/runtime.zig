@@ -1362,6 +1362,7 @@ const RaftTableApplyStateMachine = struct {
         transaction_too_large,
         transaction_recovery_capacity_exhausted,
         invalid_batch_request,
+        invalid_participant,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             return switch (err) {
@@ -1375,6 +1376,9 @@ const RaftTableApplyStateMachine = struct {
                 // of the replicated command. Retrying it cannot repair input.
                 // Storage corruption and resource pressure remain retryable.
                 error.InvalidBatchRequest => .invalid_batch_request,
+                // An ACK naming an unenlisted participant is invalid input.
+                // Replaying the same committed command cannot make it valid.
+                error.InvalidParticipant => .invalid_participant,
                 else => null,
             };
         }
@@ -1388,6 +1392,7 @@ const RaftTableApplyStateMachine = struct {
                 .transaction_too_large => error.TransactionTooLarge,
                 .transaction_recovery_capacity_exhausted => error.TransactionRecoveryCapacityExhausted,
                 .invalid_batch_request => error.InvalidBatchRequest,
+                .invalid_participant => error.InvalidParticipant,
             };
         }
     };
@@ -33254,6 +33259,30 @@ fn consumerTests() type {
             try std.testing.expectEqual(error.InvalidBatchRequest, apply_sm.takeApplyOutcome(group_id, 13).?.failed.toError());
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 14).?);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 15).?);
+            // A bad named ACK must return its precise rejection without
+            // blocking the valid ACK and ordinary command behind it. This also
+            // exercises the error identity through the linked native C owner.
+            const bad_ack = try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, "docs", .{
+                .transaction = .{ .acknowledge = .{ .txn_id = txn_version, .participant = "not-enlisted" } },
+            }, if (descriptor) |*value| value.view() else null);
+            defer alloc.free(bad_ack);
+            const valid_ack = try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, "docs", .{
+                .transaction = .{ .acknowledge = .{ .txn_id = txn_version, .participant = participant } },
+            }, if (descriptor) |*value| value.view() else null);
+            defer alloc.free(valid_ack);
+            const after_bad_ack = [_]raft_engine.core.Entry{
+                .{ .term = 2, .index = 16, .entry_type = .normal, .data = bad_ack },
+                .{ .term = 2, .index = 17, .entry_type = .normal, .data = valid_ack },
+                .{ .term = 2, .index = 18, .entry_type = .normal, .data = write_e },
+            };
+            for (16..19) |index| try apply_sm.registerApplyOutcomeWaiter(group_id, index, 2);
+            try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &after_bad_ack, &.{});
+            try std.testing.expectEqual(@as(u64, 18), apply_sm.appliedIndex(group_id));
+            try std.testing.expectEqual(error.InvalidParticipant, apply_sm.takeApplyOutcome(group_id, 16).?.failed.toError());
+            try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 17).?);
+            try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 18).?);
+            try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &after_bad_ack, &.{});
+            try std.testing.expectEqual(@as(u64, 18), apply_sm.appliedIndex(group_id));
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.ResourceBudgetExceeded));
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.InvalidData));
         }
