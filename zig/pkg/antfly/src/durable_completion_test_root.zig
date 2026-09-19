@@ -7,4 +7,5 @@ test {
     _ = @import("storage/db/db.zig");
     _ = @import("storage/transactions.zig");
     _ = @import("storage/completion_physical.zig");
+    _ = @import("storage/completion_process_test.zig");
 }

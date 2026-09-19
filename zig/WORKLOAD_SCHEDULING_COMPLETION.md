@@ -85,6 +85,14 @@ prerequisites are implemented and verified.
   abort-before-prepare, metadata-only coordinator decisions, and named ACKs
   after local resolution still need retained control ownership. Named prepares
   remain restricted and production activation remains disabled.
+- The owning durable-completion gate subsequently passed 29 tests, including
+  six actual child-process kills: document and named-begin mutations stopped
+  after acceptance, primary WAL append, and manifest publication. The parent
+  forcibly terminates the child without DB close or error unwind, reopens with
+  admission disabled, and verifies every final canonical physical operation,
+  exact applied identity and duplicate application. These prove native storage
+  process-death recovery at those boundaries; they do not prove quorum failure,
+  partial-write/fsync faults, or transaction-control completion ownership.
 - Trusted local installation capsules now restore actual accepted ordinary
   debt with empty metadata/catalog access, no service keys, and new admission
   disabled. Five owning SourceOwner tests passed, including immutable identity,
