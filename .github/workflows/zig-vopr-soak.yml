@@ -114,7 +114,7 @@ jobs:
       - name: Test production transport, runtime scheduling, and determinism boundaries
         working-directory: zig
         run: |
-          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test vopr-determinism-audit \
+          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test vopr-determinism-audit secrets-test \
             -Doptimize=ReleaseSafe --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
 
@@ -216,7 +216,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        scenario: [standby, raft, distributed-data, standby-scaling]
+        scenario: [standby, raft, distributed-data, standby-scaling, secrets]
         shard: [0, 1]
         include:
           - scenario: standby
@@ -227,6 +227,8 @@ jobs:
             histories: 12
           - scenario: standby-scaling
             histories: 2
+          - scenario: secrets
+            histories: 1000
           - shard: 0
             policy: bounded-fair
           - shard: 1
@@ -481,7 +483,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        scenario: [standby, raft, distributed-data, standby-scaling]
+        scenario: [standby, raft, distributed-data, standby-scaling, secrets]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

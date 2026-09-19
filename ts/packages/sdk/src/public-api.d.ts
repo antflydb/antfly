@@ -5676,6 +5676,11 @@ export interface components {
             source?: string;
             /** @description Whether this key has an Antfly-managed override that can be deleted. */
             managed?: boolean;
+            /**
+             * Format: uint64
+             * @description Committed native entry revision, when supported by the configured backend.
+             */
+            revision?: number;
             /** @description Corresponding environment variable name (e.g., OPENAI_API_KEY) */
             env_var?: string;
             /** Format: date-time */
