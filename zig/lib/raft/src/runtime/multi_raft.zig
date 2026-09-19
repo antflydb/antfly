@@ -1040,6 +1040,28 @@ pub const MultiRaft = struct {
         return snapshot;
     }
 
+    /// Called by the owning state machine under the existing serialized Raft
+    /// apply. The group reference outlives Ready and pins the native DB owner.
+    pub fn applyCompletionAccepted(self: *MultiRaft, group_id: u64, term: u64, index: u64, canonical: []const u8) !void {
+        const guard = self.completion_guards.get(group_id) orelse return error.MissingCompletionAdmissionGuard;
+        try guard.applyAccepted(term, index, canonical);
+    }
+    pub fn completionProgress(self: *MultiRaft, group_id: u64) !?completion_admission_iface.Progress {
+        const guard = self.completion_guards.get(group_id) orelse return null;
+        return try guard.progress();
+    }
+    pub fn hasCompletionBacking(self: *MultiRaft, group_id: u64) bool {
+        const guard = self.completion_guards.get(group_id) orelse return false;
+        return guard.hasBacking();
+    }
+    pub fn checkCompletionSnapshot(self: *MultiRaft, group_id: u64) !void {
+        try self.checkCompletion(group_id, .snapshot_admission);
+    }
+    pub fn ownsCompletionAccepted(self: *MultiRaft, group_id: u64, term: u64, index: u64, payload: []const u8) !bool {
+        const guard = self.completion_guards.get(group_id) orelse return false;
+        return try guard.ownsAccepted(term, index, payload);
+    }
+
     fn checkCompletion(self: *MultiRaft, group_id: core.types.GroupId, event: completion_admission_iface.Check) !void {
         if (self.completion_guards.get(group_id)) |guard| {
             const grp = self.group(group_id) orelse return error.UnknownGroup;

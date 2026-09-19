@@ -39,6 +39,31 @@ const backup_restore = @import("storage/backup_restore.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const resource_manager = @import("../storage/resource_manager.zig");
 const linked_storage = control_only_storage_sources;
+fn completionOwns(ptr: *anyopaque, group_id: u64, term: u64, index: u64, payload: []const u8) !bool {
+    const owner: *host_mod.Host = @ptrCast(@alignCast(ptr));
+    return try owner.ownsCompletionAccepted(group_id, term, index, payload);
+}
+fn completionProgress(ptr: *anyopaque, group_id: u64) !?raft_engine.runtime.completion_admission_iface.Progress {
+    const owner: *host_mod.Host = @ptrCast(@alignCast(ptr));
+    return try owner.completionProgress(group_id);
+}
+fn completionHasBacking(ptr: *anyopaque, group_id: u64) bool {
+    const owner: *host_mod.Host = @ptrCast(@alignCast(ptr));
+    return owner.hasCompletionBacking(group_id);
+}
+fn completionSnapshotAllowed(ptr: *anyopaque, group_id: u64) !void {
+    const owner: *host_mod.Host = @ptrCast(@alignCast(ptr));
+    try owner.checkCompletionSnapshot(group_id);
+}
+fn bindCompletionSource(sm: ?*state_machine.DataStateMachine, owner: ?*host_mod.Host) void {
+    if (sm) |data_sm| data_sm.completion_source = if (owner) |host| .{
+        .ptr = host,
+        .owns = completionOwns,
+        .progress = completionProgress,
+        .has_backing = completionHasBacking,
+        .snapshot_allowed = completionSnapshotAllowed,
+    } else null;
+}
 pub const DataApplyStore = if (linked_storage) data_apply_client.RaftApplyStore else data_storage.RaftApplyStore;
 
 pub const ManagedHostConfig = struct {
@@ -170,6 +195,9 @@ pub const ManagedHost = struct {
         host_deps.peer_resolver = view.peerResolver();
         host.* = host_mod.Host.init(alloc, cfg.host, host_deps);
         errdefer host.deinit();
+        bindCompletionSource(prepared_deps.owned_data_state_machine, host);
+        errdefer bindCompletionSource(prepared_deps.owned_data_state_machine, null);
+        if (host_deps.ready_observer) |observer| observer.set_host(observer.ptr, host);
         if (host_deps.replica_catalog != null) _ = try host.restoreReplicasFromCatalog(alloc);
 
         const owned_leadership_tracker = if (deps.leader_observer) |observer| blk: {
@@ -205,6 +233,7 @@ pub const ManagedHost = struct {
     }
 
     pub fn deinit(self: *ManagedHost) void {
+        bindCompletionSource(self.owned_data_state_machine, null);
         if (self.owned_leadership_tracker) |tracker| {
             _ = tracker.releaseAll() catch 0;
         }
@@ -497,6 +526,9 @@ pub const ManagedHttpHost = struct {
         http_deps.host.peer_resolver = view.peerResolver();
         http_host.* = try host_mod.HttpHost.init(alloc, cfg.http, http_deps);
         errdefer http_host.deinit();
+        bindCompletionSource(prepared_deps.owned_data_state_machine, http_host.host);
+        errdefer bindCompletionSource(prepared_deps.owned_data_state_machine, null);
+        if (http_deps.host.ready_observer) |observer| observer.set_host(observer.ptr, http_host.host);
         if (http_deps.host.replica_catalog != null) _ = try http_host.host.restoreReplicasFromCatalog(alloc);
 
         const owned_leadership_tracker = if (deps.leader_observer) |observer| blk: {
@@ -532,6 +564,7 @@ pub const ManagedHttpHost = struct {
     }
 
     pub fn deinit(self: *ManagedHttpHost) void {
+        bindCompletionSource(self.owned_data_state_machine, null);
         if (self.owned_leadership_tracker) |tracker| {
             _ = tracker.releaseAll() catch 0;
         }
@@ -1115,6 +1148,7 @@ fn prepareHostDeps(
                     .root_dir = replica_root_dir,
                     .state = wal_replica_state_cfg,
                     .flush_on_deinit = wal_flush_on_deinit,
+                    .completion_provider = prepared.host.runtime_hooks.completion_admission,
                 }, base_factory);
                 prepared.owned_wal_replica_provider = owned_provider;
                 prepared.host.descriptor_factory = owned_provider.descriptorFactory();
