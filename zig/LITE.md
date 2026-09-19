@@ -1093,3 +1093,23 @@ not materialize unrelated private metadata or encrypted values from other scopes
 Run `zig build lite-native-benchmark -Doptimize=ReleaseSafe` for the reproducible
 transaction-assembly, commit, and sorted-read workloads. Timings are observations;
 structural tests enforce page-read, write-call, memory, and correctness bounds.
+
+### Throughput baseline
+
+Measured against `1debc3d03d` with the same benchmark source, Zig 0.16.0,
+ReleaseSafe, and the C allocator. Values are medians of three alternating runs
+on the same development machine. Each run creates a file, assembles one sorted
+batch with a missing-key read before each insert, commits small document values,
+and reads all keys in order. The build step compiles the benchmark separately.
+
+| Records | Assembly before / after | Commit before / after | Sorted reads before / after | Page accesses before / after | File bytes before / after |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 1.62 / 0.70 ms | 3.94 / 0.29 ms | 3.06 / 0.23 ms | 3,000 / 24 | 4,136,960 / 110,592 |
+| 4,000 | 19.12 / 2.68 ms | 16.29 / 0.91 ms | 13.31 / 0.87 ms | 12,000 / 92 | 16,498,688 / 389,120 |
+| 16,000 | 274.66 / 10.85 ms | 65.52 / 3.60 ms | 67.97 / 3.85 ms | 48,000 / 363 | 65,941,504 / 1,499,136 |
+
+This workload uses `no_sync`, warm filesystem caches, and small values. Page
+accesses include cache lookups; they are not physical disk I/O counts. Other
+builds ran on the host during measurement. Durable fsync throughput, vector
+index construction, and sustained concurrent compaction need separate workload
+qualification. Timing thresholds are intentionally absent from the tests.

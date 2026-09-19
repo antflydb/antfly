@@ -1579,7 +1579,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lite_native_tests = addFilteredTestRunArtifact(b, lite_native_tests);
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
-    const run_lite_benchmark = b.addRunArtifact(lite_native_tests);
+    const lite_benchmark = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = &.{"lite throughput benchmark"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_lite_benchmark = b.addRunArtifact(lite_benchmark);
     run_lite_benchmark.addArgs(&.{ "--test-filter", "lite throughput benchmark" });
     run_lite_benchmark.setEnvironmentVariable("ANTFLY_LITE_BENCH", "1");
     b.step("lite-native-benchmark", "Benchmark native Lite transaction, commit, and sorted read scaling").dependOn(&run_lite_benchmark.step);
