@@ -5,7 +5,11 @@
 
 import createClient, { type Client } from "openapi-fetch";
 import { readLimitedResponseBytes, readLimitedResponseText } from "./client.js";
-import { deserializeEmbeddings } from "./inference-codec.js";
+import {
+  decodeNumericDenseFrame,
+  NUMERIC_RESPONSE_ACCEPT,
+  NUMERIC_RESPONSE_MEDIA_TYPE,
+} from "./inference-codec.js";
 import type {
   ChunkConfig,
   ChunkResponse,
@@ -241,8 +245,9 @@ export class InferenceClient {
   /**
    * Generate dense embeddings as a plain array of vectors.
    *
-   * Current servers return the OpenAI-compatible JSON response. Bounded
-   * application/octet-stream responses from legacy servers remain supported.
+   * The request asks for the packed numeric frame, which keeps every float out
+   * of JSON text, and reads the JSON body when the server answers with that
+   * instead -- an older server, or a model whose vectors are sparse.
    *
    * @param model - Name of the embedder model (e.g., "bge-small-en-v1.5")
    * @param input - Text string, array of strings, or array of content parts (for multimodal)
@@ -251,11 +256,11 @@ export class InferenceClient {
    *
    * @example
    * ```typescript
-   * const embeddings = await client.embedBinary("bge-small-en-v1.5", ["hello", "world"]);
+   * const embeddings = await client.embedDense("bge-small-en-v1.5", ["hello", "world"]);
    * console.log(embeddings[0]); // [0.0123, -0.0456, ...]
    * ```
    */
-  async embedBinary(
+  async embedDense(
     model: string,
     input: EmbedInput,
     options?: { truncate?: boolean }
@@ -264,7 +269,7 @@ export class InferenceClient {
       method: "POST",
       headers: {
         ...this.headers,
-        Accept: "application/octet-stream",
+        Accept: NUMERIC_RESPONSE_ACCEPT,
       },
       body: JSON.stringify({
         model,
@@ -276,7 +281,7 @@ export class InferenceClient {
     if (!response.ok) throw await inferenceAPIErrorResponse(response);
 
     const contentType = responseMediaType(response);
-    if (contentType !== "application/json" && contentType !== "application/octet-stream") {
+    if (contentType !== "application/json" && contentType !== NUMERIC_RESPONSE_MEDIA_TYPE) {
       await response.body?.cancel();
       throw new Error(`Unexpected embedding response content type ${JSON.stringify(contentType)}`);
     }
@@ -292,8 +297,8 @@ export class InferenceClient {
     switch (contentType) {
       case "application/json":
         return denseEmbeddingsFromJSON(bytes);
-      case "application/octet-stream":
-        return deserializeEmbeddings(bytes.buffer);
+      case NUMERIC_RESPONSE_MEDIA_TYPE:
+        return decodeNumericDenseFrame(bytes);
     }
   }
 
@@ -728,7 +733,7 @@ async function fetchLimitedInferenceResponse(
 
   const limit = !response.ok
     ? MAX_INFERENCE_ERROR_BYTES
-    : mediaType === "application/octet-stream" || mediaType === "application/x-sparse-vectors"
+    : mediaType === NUMERIC_RESPONSE_MEDIA_TYPE || mediaType === "application/octet-stream"
       ? maxBinaryResponseBytes
       : MAX_INFERENCE_JSON_RESPONSE_BYTES;
   const tooLarge = new Error(`Inference response exceeded ${limit} bytes`);

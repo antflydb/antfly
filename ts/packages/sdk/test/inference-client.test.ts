@@ -4,7 +4,9 @@ import {
   InferenceAPIError,
   InferenceCapacityError,
   InferenceClient,
-  serializeEmbeddings,
+  NUMERIC_RESPONSE_ACCEPT,
+  NUMERIC_RESPONSE_MEDIA_TYPE,
+  serializeNumericDenseFrame,
 } from "../src/index.js";
 
 describe("InferenceClient", () => {
@@ -40,7 +42,7 @@ describe("InferenceClient", () => {
     expect(typeof client.embed).toBe("function");
     expect(typeof client.generate).toBe("function");
     expect(typeof client.generateStream).toBe("function");
-    expect(typeof client.embedBinary).toBe("function");
+    expect(typeof client.embedDense).toBe("function");
     expect(typeof client.chunk).toBe("function");
     expect(typeof client.rerank).toBe("function");
     expect(typeof client.extract).toBe("function");
@@ -509,7 +511,7 @@ describe("InferenceClient with mock fetch", () => {
       expect(cancel).toHaveBeenCalledOnce();
     });
 
-    it("bounds streamed binary bodies across generated-client calls", async () => {
+    it("bounds streamed numeric frames across generated-client calls", async () => {
       const cancel = vi.fn();
       vi.mocked(fetch).mockResolvedValueOnce(
         new Response(
@@ -519,7 +521,7 @@ describe("InferenceClient with mock fetch", () => {
             },
             cancel,
           }),
-          { status: 200, headers: { "Content-Type": "application/octet-stream" } }
+          { status: 200, headers: { "Content-Type": NUMERIC_RESPONSE_MEDIA_TYPE } }
         )
       );
 
@@ -649,7 +651,7 @@ describe("InferenceClient with mock fetch", () => {
     });
   });
 
-  describe("embedBinary (dense-vector compatibility helper)", () => {
+  describe("embedDense (negotiated dense-vector helper)", () => {
     it("extracts dense vectors from the current OpenAI-compatible JSON response", async () => {
       vi.mocked(fetch).mockResolvedValueOnce(
         new Response(
@@ -667,23 +669,23 @@ describe("InferenceClient with mock fetch", () => {
       );
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      await expect(client.embedBinary("bge-small-en-v1.5", ["hello", "world"])).resolves.toEqual([
+      await expect(client.embedDense("bge-small-en-v1.5", ["hello", "world"])).resolves.toEqual([
         [0.1, 0.2],
         [0.3, 0.4],
       ]);
     });
 
-    it("requests and deserializes the legacy binary format", async () => {
+    it("requests and decodes the negotiated numeric frame", async () => {
       const embeddings = [
         [0.1, 0.2, 0.3],
         [0.4, 0.5, 0.6],
       ];
-      const binaryData = serializeEmbeddings(embeddings);
+      const binaryData = serializeNumericDenseFrame(embeddings);
 
       vi.mocked(fetch).mockResolvedValueOnce(
         new Response(binaryData, {
           status: 200,
-          headers: { "Content-Type": "application/octet-stream" },
+          headers: { "Content-Type": NUMERIC_RESPONSE_MEDIA_TYPE },
         })
       );
 
@@ -691,7 +693,7 @@ describe("InferenceClient with mock fetch", () => {
         baseUrl: "http://localhost:8080/api",
       });
 
-      const result = await client.embedBinary("bge-small-en-v1.5", ["hello", "world"]);
+      const result = await client.embedDense("bge-small-en-v1.5", ["hello", "world"]);
 
       expect(result).toHaveLength(2);
       expect(result[0][0]).toBeCloseTo(0.1);
@@ -707,7 +709,7 @@ describe("InferenceClient with mock fetch", () => {
       expect(options?.method).toBe("POST");
       expect(options?.headers).toBeDefined();
       const headers = options?.headers as Record<string, string>;
-      expect(headers.Accept).toBe("application/octet-stream");
+      expect(headers.Accept).toBe(NUMERIC_RESPONSE_ACCEPT);
     });
 
     it.each([
@@ -730,28 +732,31 @@ describe("InferenceClient with mock fetch", () => {
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
       const error = await client
-        .embedBinary("busy-model", ["test"])
+        .embedDense("busy-model", ["test"])
         .catch((caught: unknown) => caught);
 
       expect(error).toBeInstanceOf(InferenceCapacityError);
       expect(error).toMatchObject({ reason, retryAfterMs: 1000 });
     });
 
-    it("should handle empty embeddings in binary response", async () => {
-      const binaryData = serializeEmbeddings([]);
-
+    it("should handle an empty JSON embedding response", async () => {
       vi.mocked(fetch).mockResolvedValueOnce(
-        new Response(binaryData, {
-          status: 200,
-          headers: { "Content-Type": "application/octet-stream" },
-        })
+        new Response(
+          JSON.stringify({
+            object: "list",
+            model: "bge-small-en-v1.5",
+            data: [],
+            usage: { prompt_tokens: 0, total_tokens: 0 },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
       );
 
       const client = new InferenceClient({
         baseUrl: "http://localhost:8080/api",
       });
 
-      const result = await client.embedBinary("bge-small-en-v1.5", []);
+      const result = await client.embedDense("bge-small-en-v1.5", []);
       expect(result).toEqual([]);
     });
 
@@ -767,7 +772,7 @@ describe("InferenceClient with mock fetch", () => {
         baseUrl: "http://localhost:8080/api",
       });
 
-      await expect(client.embedBinary("invalid-model", ["test"])).rejects.toThrow(
+      await expect(client.embedDense("invalid-model", ["test"])).rejects.toThrow(
         "inference request failed (400): Invalid model"
       );
     });
@@ -783,7 +788,7 @@ describe("InferenceClient with mock fetch", () => {
       vi.mocked(fetch).mockResolvedValueOnce(
         new Response(body, {
           status: 200,
-          headers: { "Content-Type": "application/octet-stream" },
+          headers: { "Content-Type": NUMERIC_RESPONSE_MEDIA_TYPE },
         })
       );
       const client = new InferenceClient({
@@ -791,7 +796,7 @@ describe("InferenceClient with mock fetch", () => {
         maxBinaryResponseBytes: 16,
       });
 
-      await expect(client.embedBinary("test-model", ["test"])).rejects.toThrow(
+      await expect(client.embedDense("test-model", ["test"])).rejects.toThrow(
         "Embedding response exceeded 16 bytes"
       );
       expect(cancel).toHaveBeenCalledOnce();
@@ -816,17 +821,17 @@ describe("InferenceClient with mock fetch", () => {
         )
       );
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      await expect(client.embedBinary("sparse-model", ["test"])).rejects.toThrow(
+      await expect(client.embedDense("sparse-model", ["test"])).rejects.toThrow(
         "item 0 is not a dense vector"
       );
 
       vi.mocked(fetch).mockResolvedValueOnce(
-        new Response(serializeEmbeddings([[0.5]]), {
+        new Response(serializeNumericDenseFrame([[0.5]]), {
           status: 200,
           headers: { "Content-Type": "application/octet-streamx" },
         })
       );
-      await expect(client.embedBinary("test-model", ["test"])).rejects.toThrow(
+      await expect(client.embedDense("test-model", ["test"])).rejects.toThrow(
         'Unexpected embedding response content type "application/octet-streamx"'
       );
     });
@@ -842,12 +847,12 @@ describe("InferenceClient with mock fetch", () => {
         }
         embeddings.push(vector);
       }
-      const binaryData = serializeEmbeddings(embeddings);
+      const binaryData = serializeNumericDenseFrame(embeddings);
 
       vi.mocked(fetch).mockResolvedValueOnce(
         new Response(binaryData, {
           status: 200,
-          headers: { "Content-Type": "application/octet-stream" },
+          headers: { "Content-Type": NUMERIC_RESPONSE_MEDIA_TYPE },
         })
       );
 
@@ -855,7 +860,7 @@ describe("InferenceClient with mock fetch", () => {
         baseUrl: "http://localhost:8080/api",
       });
 
-      const result = await client.embedBinary("bge-small-en-v1.5", ["a", "b", "c"]);
+      const result = await client.embedDense("bge-small-en-v1.5", ["a", "b", "c"]);
 
       expect(result).toHaveLength(3);
       expect(result[0]).toHaveLength(384);
@@ -871,12 +876,12 @@ describe("InferenceClient with mock fetch", () => {
     });
 
     it("should pass truncate option in request body", async () => {
-      const binaryData = serializeEmbeddings([[0.1, 0.2]]);
+      const binaryData = serializeNumericDenseFrame([[0.1, 0.2]]);
 
       vi.mocked(fetch).mockResolvedValueOnce(
         new Response(binaryData, {
           status: 200,
-          headers: { "Content-Type": "application/octet-stream" },
+          headers: { "Content-Type": NUMERIC_RESPONSE_MEDIA_TYPE },
         })
       );
 
@@ -884,7 +889,7 @@ describe("InferenceClient with mock fetch", () => {
         baseUrl: "http://localhost:8080/api",
       });
 
-      await client.embedBinary("bge-small-en-v1.5", ["test"], { truncate: true });
+      await client.embedDense("bge-small-en-v1.5", ["test"], { truncate: true });
 
       const [, options] = vi.mocked(fetch).mock.calls[0];
       const body = JSON.parse(options?.body as string);
@@ -1224,7 +1229,7 @@ describe("InferenceClient with mock fetch", () => {
         usage: { prompt_tokens: 2, total_tokens: 2 },
       };
 
-      const binaryData = serializeEmbeddings(embeddings);
+      const binaryData = serializeNumericDenseFrame(embeddings);
 
       // First call returns JSON
       vi.mocked(fetch).mockResolvedValueOnce({
@@ -1239,7 +1244,7 @@ describe("InferenceClient with mock fetch", () => {
       vi.mocked(fetch).mockResolvedValueOnce(
         new Response(binaryData, {
           status: 200,
-          headers: { "Content-Type": "application/octet-stream" },
+          headers: { "Content-Type": NUMERIC_RESPONSE_MEDIA_TYPE },
         })
       );
 
@@ -1248,7 +1253,7 @@ describe("InferenceClient with mock fetch", () => {
       });
 
       const jsonResult = await client.embed("test-model", ["a", "b"]);
-      const binaryResult = await client.embedBinary("test-model", ["a", "b"]);
+      const binaryResult = await client.embedDense("test-model", ["a", "b"]);
 
       // JSON response includes model, binary does not
       expect(jsonResult.model).toBe("test-model");

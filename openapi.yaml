@@ -8370,6 +8370,18 @@ paths:
 
         URL byte potential is reserved before fetch; inline sources use their actual encoded size.
       operationId: generateEmbeddings
+      parameters:
+        - name: Accept
+          in: header
+          required: false
+          schema:
+            type: string
+          description: >-
+            Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+
+            frame instead of JSON, which avoids serializing every float as text. Any
+
+            other value, or none, returns the JSON body.
       requestBody:
         required: true
         content:
@@ -8383,6 +8395,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceEmbedResponse'
+            application/vnd.antfly.numeric.v1:
+              schema:
+                type: string
+                format: binary
+                description: >-
+                  The same vectors as the JSON body, as one little-endian binary frame:
+
+                  a 24-byte header (magic `AFN1`, u32 kind 1, u64 rows, u64 columns)
+
+                  followed by `rows * columns` f32 values, one row per input in request
+
+                  order. Returned only when the request's `Accept` header names this
+
+                  media type and the model's vectors are dense; anything else, a sparse
+
+                  model included, gets the JSON body. Frames are capped at 4 MiB.
         '400':
           description: Invalid request
           content:

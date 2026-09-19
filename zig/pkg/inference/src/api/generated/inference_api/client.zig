@@ -140,13 +140,17 @@ pub const Client = struct {
 
     /// Create embeddings (alias of `/embeddings`)
     /// POST /embed
-    pub fn generateEmbeddings(self: *@This(), body: types.EmbedRequest) !ApiResponse(types.EmbedResponse) {
+    pub fn generateEmbeddings(self: *@This(), body: types.EmbedRequest, accept: ?[]const u8) !ApiResponse(types.EmbedResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/embed", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.EmbedResponse).fromResponse(self.allocator, &resp);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.EmbedResponse).fromNegotiatedResponse(self.allocator, &resp);
     }
 
     /// Create embeddings (OpenAI-compatible)

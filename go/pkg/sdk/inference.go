@@ -17,6 +17,7 @@ limitations under the License.
 package sdk
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -182,9 +183,9 @@ func inferenceErrorDetail(err *oapi.InferenceError) string {
 	return fmt.Sprintf("%s (%s)", err.Message, err.Error)
 }
 
-// Embed generates embeddings for the given text strings. Current servers return
-// JSON; bounded application/octet-stream responses from legacy servers remain
-// supported for compatibility.
+// Embed generates embeddings for the given text strings. The request asks for
+// the packed numeric frame, which keeps every float out of JSON text, and falls
+// back to the JSON body when the server answers with that instead.
 func (c *InferenceClient) Embed(ctx context.Context, model string, input []string) ([][]float32, error) {
 	// Build the input union type
 	var inputUnion oapi.InferenceEmbedRequest_Input
@@ -197,7 +198,7 @@ func (c *InferenceClient) Embed(ctx context.Context, model string, input []strin
 		Input: inputUnion,
 	}
 
-	resp, err := c.client.GenerateEmbeddingsWithResponse(ctx, req)
+	resp, err := c.client.GenerateEmbeddingsWithResponse(ctx, &oapi.GenerateEmbeddingsParams{Accept: numericResponseAccept}, req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
@@ -216,12 +217,8 @@ func (c *InferenceClient) Embed(ctx context.Context, model string, input []strin
 			return denseEmbeddings(resp.JSON200)
 		}
 		return nil, fmt.Errorf("unexpected JSON response: %s", string(resp.Body))
-	case "application/octet-stream":
-		embeddings, err := deserializeFloatArrays(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("deserializing embeddings: %w", err)
-		}
-		return embeddings, nil
+	case numericResponseMediaType:
+		return decodeNumericDenseFrame(resp.Body)
 	default:
 		return nil, fmt.Errorf("unexpected embedding response content type %q", contentType)
 	}
@@ -229,8 +226,8 @@ func (c *InferenceClient) Embed(ctx context.Context, model string, input []strin
 
 // EmbedMultimodal generates embeddings for multimodal content parts (text, images, audio).
 // Each ContentPart can be a TextContentPart or ImageURLContentPart (with URL or data URI).
-// Current servers return JSON; bounded application/octet-stream responses from
-// legacy servers remain supported for compatibility.
+// Like Embed, it takes the packed numeric frame when the server produces one and
+// the JSON body otherwise.
 func (c *InferenceClient) EmbedMultimodal(ctx context.Context, model string, input []oapi.ContentPart) ([][]float32, error) {
 	var inputUnion oapi.InferenceEmbedRequest_Input
 	if err := inputUnion.FromInferenceEmbedRequestInput2(input); err != nil {
@@ -242,7 +239,7 @@ func (c *InferenceClient) EmbedMultimodal(ctx context.Context, model string, inp
 		Input: inputUnion,
 	}
 
-	resp, err := c.client.GenerateEmbeddingsWithResponse(ctx, req)
+	resp, err := c.client.GenerateEmbeddingsWithResponse(ctx, &oapi.GenerateEmbeddingsParams{Accept: numericResponseAccept}, req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
@@ -261,12 +258,8 @@ func (c *InferenceClient) EmbedMultimodal(ctx context.Context, model string, inp
 			return denseEmbeddings(resp.JSON200)
 		}
 		return nil, fmt.Errorf("unexpected JSON response: %s", string(resp.Body))
-	case "application/octet-stream":
-		embeddings, err := deserializeFloatArrays(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("deserializing embeddings: %w", err)
-		}
-		return embeddings, nil
+	case numericResponseMediaType:
+		return decodeNumericDenseFrame(resp.Body)
 	default:
 		return nil, fmt.Errorf("unexpected embedding response content type %q", contentType)
 	}
@@ -284,10 +277,7 @@ func (c *InferenceClient) EmbedJSON(ctx context.Context, model string, input []s
 		Input: inputUnion,
 	}
 
-	resp, err := c.client.GenerateEmbeddingsWithResponse(ctx, req, func(ctx context.Context, req *http.Request) error {
-		req.Header.Set("Accept", "application/json")
-		return nil
-	})
+	resp, err := c.client.GenerateEmbeddingsWithResponse(ctx, &oapi.GenerateEmbeddingsParams{Accept: "application/json"}, req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
@@ -803,7 +793,7 @@ func (c *InferenceClient) SparseEmbed(ctx context.Context, model string, input [
 		Input: inputUnion,
 	}
 
-	resp, err := c.client.GenerateEmbeddingsWithResponse(ctx, req)
+	resp, err := c.client.GenerateEmbeddingsWithResponse(ctx, &oapi.GenerateEmbeddingsParams{Accept: "application/json"}, req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
@@ -815,17 +805,13 @@ func (c *InferenceClient) SparseEmbed(ctx context.Context, model string, input [
 		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode(), string(resp.Body))
 	}
 	contentType := inferenceMediaType(resp.HTTPResponse.Header.Get("Content-Type"))
-	switch contentType {
-	case "application/json":
-		if resp.JSON200 != nil {
-			return sparseEmbeddings(resp.JSON200)
-		}
-		return nil, fmt.Errorf("unexpected JSON response: %s", string(resp.Body))
-	case "application/x-sparse-vectors":
-		return deserializeSparseVectors(resp.Body)
-	default:
+	if contentType != "application/json" {
 		return nil, fmt.Errorf("unexpected sparse embedding response content type %q", contentType)
 	}
+	if resp.JSON200 == nil {
+		return nil, fmt.Errorf("unexpected JSON response: %s", string(resp.Body))
+	}
+	return sparseEmbeddings(resp.JSON200)
 }
 
 // SparseEmbedJSON generates sparse embeddings and returns JSON response.
@@ -840,10 +826,7 @@ func (c *InferenceClient) SparseEmbedJSON(ctx context.Context, model string, inp
 		Input: inputUnion,
 	}
 
-	resp, err := c.client.GenerateEmbeddingsWithResponse(ctx, req, func(ctx context.Context, req *http.Request) error {
-		req.Header.Set("Accept", "application/json")
-		return nil
-	})
+	resp, err := c.client.GenerateEmbeddingsWithResponse(ctx, &oapi.GenerateEmbeddingsParams{Accept: "application/json"}, req)
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
@@ -934,134 +917,70 @@ func binaryCountToInt(value uint64, field string) (int, error) {
 	return int(value), nil
 }
 
-// deserializeSparseVectors reads sparse vectors from binary format.
-// Format: [uint64 num_vectors] per vector: [uint32 nnz] [int32*nnz indices] [float32*nnz values]
-func deserializeSparseVectors(data []byte) ([]SparseVector, error) {
-	if len(data) < 8 {
-		return nil, fmt.Errorf("invalid sparse embedding response: missing vector count")
+// The negotiated numeric frame: the magic "AFN1", a uint32 kind, uint64 rows
+// and uint64 columns, then rows*columns little-endian float32 values.
+const (
+	numericFrameHeaderBytes = 24
+	numericFrameKindDense   = 1
+)
+
+var numericFrameMagic = [4]byte{'A', 'F', 'N', '1'}
+
+// decodeNumericDenseFrame reads the dense vectors out of one numeric frame. The
+// declared shape is checked against the body before anything is allocated, so a
+// forged header cannot make the client reserve memory it never received.
+func decodeNumericDenseFrame(data []byte) ([][]float32, error) {
+	if len(data) < numericFrameHeaderBytes || !bytes.Equal(data[:4], numericFrameMagic[:]) {
+		return nil, fmt.Errorf("invalid numeric embedding response: not a %s frame", numericResponseMediaType)
 	}
-	numVectors := binary.LittleEndian.Uint64(data[:8])
-	if numVectors == 0 {
-		if len(data) != 8 {
-			return nil, fmt.Errorf("invalid sparse embedding response: unexpected data after empty header")
-		}
-		return []SparseVector{}, nil
+	if kind := binary.LittleEndian.Uint32(data[4:8]); kind != numericFrameKindDense {
+		return nil, fmt.Errorf("invalid numeric embedding response: kind %d is not dense embeddings", kind)
+	}
+	rows := binary.LittleEndian.Uint64(data[8:16])
+	columns := binary.LittleEndian.Uint64(data[16:24])
+	if rows > 0 && columns == 0 {
+		return nil, fmt.Errorf("invalid numeric embedding response: non-empty response has zero dimension")
 	}
 
-	numVectorsInt, err := binaryCountToInt(numVectors, "vector count")
-	if err != nil {
-		return nil, err
-	}
-	vectorOverhead, ok := checkedUint64Mul(numVectors, uint64(unsafe.Sizeof(SparseVector{})))
-	if !ok || vectorOverhead > maxInferenceBinaryDecodedBytes {
-		return nil, fmt.Errorf("sparse embedding response exceeds decoded size limit of %d bytes", maxInferenceBinaryDecodedBytes)
-	}
-
-	offset := 8
-	decodedBytes := vectorOverhead
-	for i := 0; i < numVectorsInt; i++ {
-		if len(data)-offset < 4 {
-			return nil, fmt.Errorf("invalid sparse embedding response: missing nnz for vector %d", i)
-		}
-		nnz := binary.LittleEndian.Uint32(data[offset : offset+4])
-		offset += 4
-		entryBytes := uint64(nnz) * 8
-		if entryBytes > uint64(len(data)-offset) {
-			return nil, fmt.Errorf("invalid sparse embedding response: vector %d declares %d values beyond payload", i, nnz)
-		}
-		decodedBytes, ok = checkedUint64Add(decodedBytes, entryBytes)
-		if !ok || decodedBytes > maxInferenceBinaryDecodedBytes {
-			return nil, fmt.Errorf("sparse embedding response exceeds decoded size limit of %d bytes", maxInferenceBinaryDecodedBytes)
-		}
-		offset += int(entryBytes)
-	}
-	if offset != len(data) {
-		return nil, fmt.Errorf("invalid sparse embedding response: unexpected trailing data")
-	}
-
-	result := make([]SparseVector, numVectorsInt)
-	offset = 8
-	for i := range result {
-		nnz := binary.LittleEndian.Uint32(data[offset : offset+4])
-		offset += 4
-		nnzInt := int(nnz)
-		indices := make([]int32, nnzInt)
-		for j := range indices {
-			indices[j] = int32(binary.LittleEndian.Uint32(data[offset : offset+4]))
-			offset += 4
-		}
-		values := make([]float32, nnzInt)
-		for j := range values {
-			values[j] = math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
-			offset += 4
-		}
-		result[i] = SparseVector{
-			Indices: indices,
-			Values:  values,
-		}
-	}
-	return result, nil
-}
-
-// deserializeFloatArrays reconstructs a 2D float32 array from binary format.
-// Format: uint64(numVectors) + uint64(dimension) + float32 values in little endian
-func deserializeFloatArrays(data []byte) ([][]float32, error) {
-	if len(data) < 8 {
-		return nil, fmt.Errorf("invalid binary embedding response: missing vector count")
-	}
-	numVectors := binary.LittleEndian.Uint64(data[:8])
-	if numVectors == 0 {
-		if len(data) != 8 {
-			return nil, fmt.Errorf("invalid binary embedding response: unexpected data after empty header")
-		}
-		return [][]float32{}, nil
-	}
-	if len(data) < 16 {
-		return nil, fmt.Errorf("invalid binary embedding response: missing vector dimension")
-	}
-	dimension := binary.LittleEndian.Uint64(data[8:16])
-	if dimension == 0 {
-		return nil, fmt.Errorf("invalid binary embedding response: non-empty response has zero dimension")
-	}
-
-	elements, ok := checkedUint64Mul(numVectors, dimension)
+	values, ok := checkedUint64Mul(rows, columns)
 	if !ok {
-		return nil, fmt.Errorf("invalid binary embedding response: vector shape overflows")
+		return nil, fmt.Errorf("invalid numeric embedding response: vector shape overflows")
 	}
-	payloadBytes, ok := checkedUint64Mul(elements, 4)
+	payloadBytes, ok := checkedUint64Mul(values, 4)
 	if !ok {
-		return nil, fmt.Errorf("invalid binary embedding response: payload size overflows")
+		return nil, fmt.Errorf("invalid numeric embedding response: payload size overflows")
 	}
-	expectedBytes, ok := checkedUint64Add(16, payloadBytes)
+	expectedBytes, ok := checkedUint64Add(numericFrameHeaderBytes, payloadBytes)
 	if !ok || expectedBytes != uint64(len(data)) {
-		return nil, fmt.Errorf("invalid binary embedding response: header declares %d bytes, received %d", expectedBytes, len(data))
+		return nil, fmt.Errorf("invalid numeric embedding response: header declares %d bytes, received %d", expectedBytes, len(data))
 	}
 
-	numVectorsInt, err := binaryCountToInt(numVectors, "vector count")
+	rowCount, err := binaryCountToInt(rows, "vector count")
 	if err != nil {
 		return nil, err
 	}
-	dimensionInt, err := binaryCountToInt(dimension, "vector dimension")
+	columnCount, err := binaryCountToInt(columns, "vector dimension")
 	if err != nil {
 		return nil, err
 	}
-	vectorOverhead, ok := checkedUint64Mul(numVectors, uint64(unsafe.Sizeof([]float32(nil))))
+	vectorOverhead, ok := checkedUint64Mul(rows, uint64(unsafe.Sizeof([]float32(nil))))
 	if !ok {
-		return nil, fmt.Errorf("invalid binary embedding response: decoded size overflows")
+		return nil, fmt.Errorf("invalid numeric embedding response: decoded size overflows")
 	}
 	decodedBytes, ok := checkedUint64Add(payloadBytes, vectorOverhead)
 	if !ok || decodedBytes > maxInferenceBinaryDecodedBytes {
-		return nil, fmt.Errorf("binary embedding response exceeds decoded size limit of %d bytes", maxInferenceBinaryDecodedBytes)
+		return nil, fmt.Errorf("numeric embedding response exceeds decoded size limit of %d bytes", maxInferenceBinaryDecodedBytes)
 	}
 
-	result := make([][]float32, numVectorsInt)
-	offset := 16
-	for i := range result {
-		result[i] = make([]float32, dimensionInt)
-		for j := range result[i] {
-			result[i][j] = math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
+	embeddings := make([][]float32, rowCount)
+	offset := numericFrameHeaderBytes
+	for i := range embeddings {
+		vector := make([]float32, columnCount)
+		for j := range vector {
+			vector[j] = math.Float32frombits(binary.LittleEndian.Uint32(data[offset : offset+4]))
 			offset += 4
 		}
+		embeddings[i] = vector
 	}
-	return result, nil
+	return embeddings, nil
 }
