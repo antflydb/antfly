@@ -81,6 +81,7 @@ const resource_manager_mod = @import("../storage/resource_manager.zig");
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const kernel_owner_descriptor = @import("../storage/kernel_owner_descriptor.zig");
 const data_apply_client = @import("../storage/data_raft_apply_client.zig");
+const completion_pool_abi = @import("kernel_owner_abi").completion_pool;
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
@@ -5714,6 +5715,46 @@ pub const DataServer = struct {
         };
     }
 
+    fn completionAttestationSnapshot(raw: ?*anyopaque, group_id: u64, out: *completion_pool_abi.Attestation) callconv(.c) @import("kernel_owner_abi").Status {
+        const self: *DataServer = @ptrCast(@alignCast(raw orelse return .completion_admission_unavailable));
+        // Attestation is a bounded observation. Do not queue behind group work
+        // or manufacture a membership snapshot from metadata/configuration.
+        if (!self.data_raft_mutex.tryLock()) return .completion_admission_unavailable;
+        defer self.data_raft_mutex.unlock();
+        const raft = self.data_raft orelse return .completion_admission_unavailable;
+        const observed = raft.host.http_host.host.raftStatus(group_id) orelse return .completion_admission_unavailable;
+        // A previously accepted configuration must not remain behind this
+        // snapshot. The installed native guard must also fence later config
+        // changes; a momentary membership observation alone is insufficient.
+        if (observed.applied_index != observed.last_index or observed.hard.commit_index != observed.last_index)
+            return .completion_admission_unavailable;
+        const metadata = self.remote_metadata orelse return .completion_admission_unavailable;
+        const provider = metadata.completion_native_provider orelse return .completion_admission_unavailable;
+        const attest = provider.attest orelse return .completion_admission_unavailable;
+        var snapshot: completion_pool_abi.Attestation = .{};
+        const result = attest(provider.context, group_id, observed.id, &snapshot.backing);
+        if (result != .ok) return result;
+        if (snapshot.backing.identity.group_id != group_id or snapshot.backing.identity.node_id != observed.id)
+            return .completion_admission_unavailable;
+        snapshot.term = observed.hard.current_term;
+        snapshot.commit_index = observed.hard.commit_index;
+        snapshot.applied_index = observed.applied_index;
+        snapshot.last_index = observed.last_index;
+        snapshot.leader_id = observed.soft.leader_id orelse 0;
+        snapshot.auto_leave = @intFromBool(observed.conf_state.auto_leave);
+        var offset: usize = 0;
+        for ([_][]const u64{ observed.conf_state.voters, observed.conf_state.voters_outgoing, observed.conf_state.learners, observed.conf_state.learners_next }, 0..) |members, i| {
+            if (members.len > snapshot.members.len - offset) return .completion_admission_unavailable;
+            snapshot.member_counts[i] = @intCast(members.len);
+            const copy = snapshot.members[offset..][0..members.len];
+            @memcpy(copy, members);
+            std.mem.sort(u64, copy, {}, std.sort.asc(u64));
+            offset += members.len;
+        }
+        out.* = snapshot;
+        return .ok;
+    }
+
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
         if (comptime !linked_storage) {
@@ -5722,6 +5763,7 @@ pub const DataServer = struct {
             try self.provisioned_storage.resource_manager.configureReadExecution(self.api_server_cfg.read_execution);
         }
         var api_server_cfg = self.api_server_cfg;
+        api_server_cfg.completion_attestation_source = .{ .context = self, .snapshot = completionAttestationSnapshot };
         api_server_cfg.remote_attempt_node_id = if (self.store_registration) |registration| registration.node_id else 0;
         // Attempt journals must survive process restarts on every data/API role.
         // Keep them in a native engine namespace; linked production builds do
@@ -20556,6 +20598,7 @@ const RemoteMetadataSource = struct {
         lifecycle_linearizable_snapshot_calls: std.atomic.Value(u64) = .init(0),
     } else struct {};
 
+    completion_native_provider: ?completion_pool_abi.Provider = null,
     supports_runtime_reference: std.atomic.Value(bool) = .init(false),
     alloc: std.mem.Allocator,
     /// Clock authority must match the executor that performs the requests.
@@ -47922,4 +47965,21 @@ comptime {
         _ = consumer_tests;
         _ = implementation_tests;
     }
+}
+
+test "workload admission completion attestation DATA rejects absent runtime without publishing output" {
+    var output: completion_pool_abi.Attestation = .{};
+    output.term = 99;
+    try std.testing.expectEqual(@import("kernel_owner_abi").Status.completion_admission_unavailable, DataServer.completionAttestationSnapshot(null, 7, &output));
+    try std.testing.expectEqual(@as(u64, 99), output.term);
+    // Only the fields inspected before the absent-group return are initialized.
+    var server: DataServer = undefined;
+    server.data_raft_mutex = .unlocked;
+    server.data_raft = null;
+    try std.testing.expectEqual(@import("kernel_owner_abi").Status.completion_admission_unavailable, DataServer.completionAttestationSnapshot(&server, 7, &output));
+    try std.testing.expect(server.data_raft_mutex.tryLock());
+    defer server.data_raft_mutex.unlock();
+    // The HTTP issuer must not queue behind a group owner or invent evidence.
+    try std.testing.expectEqual(@import("kernel_owner_abi").Status.completion_admission_unavailable, DataServer.completionAttestationSnapshot(&server, 7, &output));
+    try std.testing.expectEqual(@as(u64, 99), output.term);
 }

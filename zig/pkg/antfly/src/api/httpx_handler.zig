@@ -42,6 +42,7 @@ const internal_repair_operations = @import("internal_repair_operations.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const internal_service_auth = @import("internal_service_auth.zig");
 const attempt_protocol = @import("workload_attempt_protocol.zig");
+const completion_attestation = @import("completion_attestation_protocol.zig");
 const service_authentication_key = "antfly.verified-internal-service";
 
 const ServiceAuthentication = struct {
@@ -1382,6 +1383,7 @@ pub const AntflyApiHandler = struct {
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
         try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
+        try server.post(group_prefix ++ routes.completion_attestation_suffix, httpx.Handler.bind(self, internalCompletionAttestation));
         try server.post(routes.workload_attempt_control, httpx.Handler.bind(self, internalWorkloadControl));
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
@@ -3138,6 +3140,70 @@ pub const AntflyApiHandler = struct {
             .deleted = result.deleted,
             .transformed = result.transformed,
         });
+    }
+
+    fn completionAttestationUnavailable(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        return jsonErrorResponse(ctx, 503, "native completion backing attestation unavailable");
+    }
+
+    fn internalCompletionAttestation(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        // This evidence endpoint never inherits the legacy unsigned migration
+        // exception. Only a verified node identity can challenge native backing.
+        const auth = ServiceAuthentication.fromContext(ctx) orelse return unauthorizedResponse(ctx);
+        const requester = attempt_protocol.nodeId(auth.identity.username) catch return unauthorizedResponse(ctx);
+        const raw_group = ctx.param("group_id") orelse return jsonErrorResponse(ctx, 400, "invalid group id");
+        const group_id = std.fmt.parseUnsigned(u64, raw_group, 10) catch return jsonErrorResponse(ctx, 400, "invalid group id");
+        const body = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "missing attestation challenge");
+        if (body.len > completion_attestation.max_request_bytes) return jsonErrorResponse(ctx, 413, "attestation challenge too large");
+        const parsed = std.json.parseFromSlice(completion_attestation.Request, ctx.allocator, body, .{}) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => jsonErrorResponse(ctx, 400, "invalid attestation challenge"),
+        };
+        defer parsed.deinit();
+        const request = parsed.value;
+        completion_attestation.validateRequest(request) catch return jsonErrorResponse(ctx, 400, "invalid attestation challenge");
+        if (request.requester != requester) return unauthorizedResponse(ctx);
+        if (request.group_id != group_id) return jsonErrorResponse(ctx, 400, "attestation group mismatch");
+        const source = self.api_server.cfg.completion_attestation_source orelse return completionAttestationUnavailable(ctx);
+        const pool = @import("kernel_owner_abi").completion_pool;
+        var snapshot: pool.Attestation = .{};
+        if (source.snapshot(source.context, group_id, &snapshot) != .ok) return completionAttestationUnavailable(ctx);
+        const native = snapshot.backing;
+        const identity = native.identity;
+        if (snapshot.version != pool.pool_abi_version or snapshot.auto_leave > 1 or !std.mem.allEqual(u8, &snapshot.reserved, 0) or
+            identity.version != pool.pool_abi_version or identity.protocol != 1 or identity.profile != 1 or
+            identity.group_id != request.group_id or identity.node_id != request.node_id or identity.generation != request.generation or
+            !std.mem.eql(u8, &identity.incarnation, &request.incarnation) or !std.mem.eql(u8, &identity.policy_digest, &request.policy_digest))
+            return completionAttestationUnavailable(ctx);
+        const proof: completion_attestation.Proof = .{
+            .request = request,
+            .capacity = identity.capacity,
+            .accepted = native.accepted_count,
+            .prepared = native.prepared_count,
+            .term = snapshot.term,
+            .commit_index = snapshot.commit_index,
+            .applied_index = snapshot.applied_index,
+            .last_index = snapshot.last_index,
+            .leader_id = snapshot.leader_id,
+            .membership = .{
+                .voters = snapshot.member_counts[0],
+                .outgoing = snapshot.member_counts[1],
+                .learners = snapshot.member_counts[2],
+                .learners_next = snapshot.member_counts[3],
+                .auto_leave = snapshot.auto_leave != 0,
+                .nodes = snapshot.members,
+            },
+        };
+        const frame = completion_attestation.sign(ctx.allocator, .{
+            .primary = self.api_server.cfg.internal_service_secret orelse return completionAttestationUnavailable(ctx),
+            .issuer = self.api_server.cfg.internal_service_issuer orelse return completionAttestationUnavailable(ctx),
+        }, proof) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => completionAttestationUnavailable(ctx),
+        };
+        defer ctx.allocator.free(frame);
+        return ctx.json(.{ .evidence = frame });
     }
 
     fn internalCapabilities(_: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -12300,4 +12366,80 @@ test "workload admission owned scan proves terminal only after bounded iteration
     _ = try attempt_protocol.verifyTerminal(alloc, keys, evidence, attempt.attempt, response.status.code, response.body orelse "");
     try std.testing.expect((try fake.worker.?.closeGeneration(7, 2, fake.worker.?.incarnation)) != null);
     try std.testing.expectEqual(@as(usize, 0), (try fake.worker.?.usage()).attempts);
+}
+
+comptime {
+    if (builtin.is_test) _ = @import("completion_attestation_client.zig");
+}
+
+test "workload admission completion attestation requires verified identity and actual backing snapshot" {
+    const alloc = std.testing.allocator;
+    const pool = @import("kernel_owner_abi").completion_pool;
+    const Fake = struct {
+        mode: enum { ready, unavailable, wrong_identity, malformed_membership, unapplied } = .ready,
+        calls: usize = 0,
+        fn snapshot(raw: ?*anyopaque, group_id: u64, out: *pool.Attestation) callconv(.c) @import("kernel_owner_abi").Status {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.mode == .unavailable) return .completion_admission_unavailable;
+            out.* = .{
+                .backing = .{ .identity = .{ .capacity = 4, .group_id = group_id, .node_id = 5, .incarnation = @splat(13), .policy_digest = @splat(17), .generation = 19 }, .accepted_count = 2, .prepared_count = 1 },
+                .term = 2,
+                .commit_index = 3,
+                .applied_index = 3,
+                .last_index = 3,
+                .leader_id = 5,
+                .member_counts = .{ 2, 0, 0, 0 },
+            };
+            out.members[0] = 5;
+            out.members[1] = 6;
+            if (self.mode == .wrong_identity) out.backing.identity.generation += 1;
+            if (self.mode == .malformed_membership) out.members[1] = 5;
+            if (self.mode == .unapplied) out.last_index += 1;
+            return .ok;
+        }
+    };
+    const challenge: completion_attestation.Request = .{ .requester = 3, .node_id = 5, .group_id = 7, .nonce = 11, .incarnation = @splat(13), .policy_digest = @splat(17), .generation = 19 };
+    const secret = "s" ** 32;
+    const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "cluster", .node_id = 3 }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    var status: AuthStatusSource = .{};
+    var fake: Fake = .{};
+    var server = try ApiHttpServer.initWithConfig(alloc, .{
+        .internal_service_secret = secret,
+        .internal_service_issuer = "cluster",
+        .internal_service_accept_legacy_unauthenticated = true,
+        .completion_attestation_source = .{ .context = &fake, .snapshot = Fake.snapshot },
+    }, status.iface(), null, null);
+    defer server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &server };
+    inline for (.{ "unsigned", "missing", "wrong_principal", "unavailable", "wrong_identity", "malformed_membership", "unapplied", "ready" }) |mode| {
+        fake.mode = if (comptime std.mem.eql(u8, mode, "unavailable")) .unavailable else if (comptime std.mem.eql(u8, mode, "wrong_identity")) .wrong_identity else if (comptime std.mem.eql(u8, mode, "malformed_membership")) .malformed_membership else if (comptime std.mem.eql(u8, mode, "unapplied")) .unapplied else .ready;
+        server.cfg.completion_attestation_source = if (comptime std.mem.eql(u8, mode, "missing")) null else .{ .context = &fake, .snapshot = Fake.snapshot };
+        var request = try httpx.Request.init(alloc, .POST, "/internal/v1/groups/7/completion/attestation");
+        defer request.deinit();
+        var challenged = challenge;
+        if (comptime std.mem.eql(u8, mode, "wrong_principal")) challenged.requester += 1;
+        const test_body = try std.json.Stringify.valueAlloc(alloc, challenged, .{});
+        defer alloc.free(test_body);
+        request.body = test_body;
+        if (comptime !std.mem.eql(u8, mode, "unsigned")) try request.headers.set(internal_service_auth.header_name, token);
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &.{.{ .name = "group_id", .value = "7" }};
+        var response = try handler.dispatchLinkedRoute(&ctx, httpx.Handler.bind(&handler, AntflyApiHandler.internalCompletionAttestation));
+        defer response.deinit();
+        const expected: u16 = if (comptime std.mem.eql(u8, mode, "unsigned") or std.mem.eql(u8, mode, "wrong_principal")) 401 else if (comptime std.mem.eql(u8, mode, "ready")) 200 else 503;
+        try std.testing.expectEqual(expected, response.status.code);
+        if (expected == 503) try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+        if (expected == 200) {
+            const decoded = try std.json.parseFromSlice(struct { evidence: []const u8 }, alloc, response.body.?, .{});
+            defer decoded.deinit();
+            const proof = try completion_attestation.verify(alloc, .{ .primary = secret, .issuer = "cluster" }, decoded.value.evidence, challenge);
+            try std.testing.expectEqual(@as(u32, 4), proof.capacity);
+            try std.testing.expectEqual(@as(u32, 2), proof.membership.voters);
+            try std.testing.expectEqual(@as(u32, 2), proof.accepted);
+        }
+        if (comptime std.mem.eql(u8, mode, "unsigned") or std.mem.eql(u8, mode, "missing") or std.mem.eql(u8, mode, "wrong_principal")) try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    }
 }

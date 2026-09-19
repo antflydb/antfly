@@ -214,6 +214,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-workload-admission-metadata-test", "Run workload policy persistence and metadata capability regressions").dependOn(&run_workload_metadata_tests.step);
     run_workload_admission_tests.step.dependOn(&run_workload_metadata_tests.step);
 
+    const completion_attestation_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/completion_attestation_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, completion_attestation_mod, true, true);
+    completion_attestation_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const completion_attestation_tests = b.addTest(.{
+        .root_module = completion_attestation_mod,
+        .filters = &.{"workload admission completion attestation"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-completion-attestation-test", "Run native backing attestation transport and verification regressions").dependOn(&addFilteredTestRunArtifact(b, completion_attestation_tests).step);
+
     const store_observer_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[2],
         .filters = &.{"store observer "},

@@ -84,6 +84,7 @@ pub const Routes = struct {
     pub const internal_groups_prefix = "/internal/v1/groups/";
     pub const internal_tables_prefix = "/internal/v1/tables/";
     pub const internal_capabilities = "/internal/v1/capabilities";
+    pub const completion_attestation_suffix = "/completion/attestation";
     pub const batch_suffix = "/batch";
     pub const routed_batch_suffix = "/batch-routed-v1";
     pub const merge_suffix = "/merge";

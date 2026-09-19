@@ -1201,6 +1201,9 @@ pub const ApiHttpServerConfig = struct {
     internal_service_verification_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
     internal_service_auth_capability: ?[]const u8 = null,
+    /// DATA-owned membership snapshot composed with an installed native pool.
+    /// No request/config flag may manufacture this process-local capability.
+    completion_attestation_source: ?@import("kernel_owner_abi").completion_pool.AttestationSource = null,
     /// Explicit first-phase rolling-upgrade mode. Upgraded clients always sign;
     /// servers may temporarily accept old unsigned peers until enforcement is
     /// enabled cluster-wide. Defaults to fail closed.
