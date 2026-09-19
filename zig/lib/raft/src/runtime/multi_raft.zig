@@ -1055,8 +1055,19 @@ pub const MultiRaft = struct {
             return .quarantined;
         }
         const grp = self.group(group_id) orelse return error.UnknownGroup;
-        try self.checkCompletion(group_id, .{ .inbound = msg });
-        try grp.step(msg);
+        var admitted = msg;
+        if (self.completion_guards.get(group_id)) |guard| {
+            const count = try guard.admitInbound(grp.status(), msg, true);
+            if (count != msg.entries.len) {
+                // Preserve prev-index/term checking in Raft itself. Never
+                // acknowledge or commit the excluded prepare, including for
+                // an empty prefix used only to advance a predecessor commit.
+                const last = std.math.add(u64, msg.log_index, count) catch return error.CompletionAdmissionUnavailable;
+                admitted.entries = msg.entries[0..count];
+                admitted.commit_index = @min(msg.commit_index, last);
+            }
+        } else if (self.hooks.completion_admission != null) return error.MissingCompletionAdmissionGuard;
+        try grp.step(admitted);
         return .applied;
     }
 
@@ -3711,5 +3722,95 @@ test "workload admission raft completion guard fences election proposal persiste
         try std.testing.expect(accepted == null);
         try std.testing.expect(runtime.removeGroup(12));
         try std.testing.expectEqual(@as(usize, 0), gate.live);
+    }
+}
+
+test "workload admission raft completion prefix applies predecessors without acknowledging deferred prepare" {
+    const Gate = struct {
+        applied: u64 = 0,
+        invalid_prefix: bool = false,
+        fn attach(ptr: *anyopaque, _: u64, _: u64, _: core.Storage) !completion_admission_iface.Guard {
+            return .{ .ptr = ptr, .vtable = &.{ .check = check, .inbound_prefix = prefix, .proposal_result = result, .detach = detach } };
+        }
+        fn check(_: *anyopaque, status: core.Status, event: completion_admission_iface.Check, _: bool) !void {
+            if (event == .ready) for (event.ready.entries) |entry| {
+                if (std.mem.eql(u8, entry.data, "prepare") and status.applied_index < entry.index - 1)
+                    return error.CompletionAdmissionUnavailable;
+            };
+        }
+        fn prefix(ptr: *anyopaque, status: core.Status, msg: core.Message, _: bool) !usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.invalid_prefix) return msg.entries.len + 1;
+            if (msg.msg_type == .append_entries) for (msg.entries, 0..) |entry, i| {
+                if (std.mem.eql(u8, entry.data, "prepare") and status.applied_index < entry.index - 1) return i;
+            };
+            return msg.entries.len;
+        }
+        fn result(_: *anyopaque, _: core.Status, _: completion_admission_iface.ProposalResult) void {}
+        fn detach(_: *anyopaque) void {}
+        fn apply(ptr: *anyopaque, _: u64, _: ?core.types.Snapshot, entries: []const core.Entry, _: []const core.ReadState) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (entries) |entry| {
+                try std.testing.expectEqual(self.applied + 1, entry.index);
+                self.applied = entry.index;
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |async_writes| {
+        var gate = Gate{};
+        var store = core.MemoryStorage.init(std.testing.allocator);
+        defer store.deinit();
+        var disk = @import("memory_batcher.zig").InMemoryDiskBatcher.init(std.testing.allocator);
+        defer disk.deinit();
+        try disk.registerStore(19, &store);
+        var host = MultiRaft.init(std.testing.allocator, .{}, .{
+            .completion_admission = .{ .ptr = &gate, .vtable = &.{ .attach = Gate.attach } },
+            .disk_batcher = disk.batcher(),
+            .state_machine = .{ .ptr = &gate, .vtable = &.{ .apply_ready = Gate.apply } },
+        });
+        defer host.deinit();
+        try host.addGroup(.{
+            .group_id = 19,
+            .local_node_id = 2,
+            .raft_config = .{ .id = 2, .group_id = 19, .peers = &.{ 1, 2 }, .election_tick = 5, .heartbeat_tick = 1, .async_storage_writes = async_writes },
+            .storage = store.storage(),
+        });
+        var predecessor = "ordinary".*;
+        var prepare = "prepare".*;
+        var entries = [_]core.Entry{
+            .{ .term = 1, .index = 1, .data = &predecessor },
+            .{ .term = 1, .index = 2, .data = &prepare },
+        };
+        const append: core.Message = .{ .msg_type = .append_entries, .from = 1, .to = 2, .term = 1, .log_index = 0, .log_term = 0, .commit_index = 2, .entries = &entries };
+        gate.invalid_prefix = true;
+        try std.testing.expectError(error.CompletionAdmissionUnavailable, host.step(19, append));
+        try std.testing.expectEqual(@as(u64, 0), host.group(19).?.status().last_index);
+        gate.invalid_prefix = false;
+        try host.step(19, append);
+        try std.testing.expectEqual(@as(u64, 1), host.group(19).?.status().last_index);
+        try std.testing.expectEqual(@as(u64, 1), host.group(19).?.status().hard.commit_index);
+        // The zero-prefix retry must still acknowledge only the predecessor.
+        var retry = append;
+        retry.log_index = 1;
+        retry.log_term = 1;
+        retry.entries = entries[1..];
+        try host.step(19, retry);
+        for (host.group(19).?.raw_node.raft.messages.items) |message| if (message.msg_type == .append_entries_response) {
+            try std.testing.expectEqual(@as(u64, 1), message.log_index);
+            try std.testing.expect(!message.reject);
+        };
+        // Prefix selection must not bypass the ordinary prev-term fence.
+        var mismatch = retry;
+        mismatch.log_term = 99;
+        try host.step(19, mismatch);
+        const messages = host.group(19).?.raw_node.raft.messages.items;
+        try std.testing.expect(messages[messages.len - 1].reject);
+        _ = try host.runProgressRound(16);
+        try std.testing.expectEqual(@as(u64, 1), gate.applied);
+        try std.testing.expectEqual(@as(u64, 1), try store.storage().lastIndex());
+        try host.step(19, retry);
+        _ = try host.runProgressRound(16);
+        try std.testing.expectEqual(@as(u64, 2), gate.applied);
+        try std.testing.expectEqual(@as(u64, 2), try store.storage().lastIndex());
     }
 }

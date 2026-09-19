@@ -35,6 +35,11 @@ pub const Guard = struct {
         /// full current membership. Denial must happen before persistence,
         /// configuration application or emission of an acknowledgement.
         check: *const fn (*anyopaque, core.Status, Check, bool) anyerror!void,
+        /// Optional nonmutating admission for inbound messages. Only Append
+        /// may return a shorter entry prefix, allowing committed predecessors
+        /// to progress before a dependent prepare can be acknowledged. This
+        /// callback performs the normal inbound check as well.
+        inbound_prefix: ?*const fn (*anyopaque, core.Status, core.Message, bool) anyerror!usize = null,
         // The final flag permits NEW application obligations. False still
         // permits elections, accepted log apply and resolving existing debt;
         // the backing provider must classify payloads against owned identities.
@@ -57,6 +62,17 @@ pub const Guard = struct {
     }
     pub fn proposalResult(self: Guard, status: core.Status, result: ProposalResult) void {
         self.vtable.proposal_result(self.ptr, status, result);
+    }
+    pub fn admitInbound(self: Guard, status: core.Status, message: core.Message, new_work_allowed: bool) !usize {
+        const count = if (self.vtable.inbound_prefix) |callback|
+            try callback(self.ptr, status, message, new_work_allowed)
+        else blk: {
+            try self.checkAdmission(status, .{ .inbound = message }, new_work_allowed);
+            break :blk message.entries.len;
+        };
+        if (count > message.entries.len or (count != message.entries.len and message.msg_type != .append_entries))
+            return error.CompletionAdmissionUnavailable;
+        return count;
     }
     pub fn detach(self: Guard) void {
         self.vtable.detach(self.ptr);
