@@ -341,3 +341,48 @@ zig build antfly-api-test -j1 --cache-dir .zig-cache/workload-local --global-cac
   --test-filter 'workload admission stable transaction commit durably hands off recovery before acknowledgement' \
   --test-filter 'first decision'
 ```
+
+
+## Recovery owner acquisition and API 37
+
+API 37 appends `txn_resolve_group_local_until` with an absolute native monotonic
+deadline and a separate cancellation token, plus `txn_status_group_local_until`
+for a raw bounded local read. DATA retains its Raft barrier and then invokes the
+raw bounded callback; a storage owner does not claim to provide a quorum barrier. Hosted/local participant workers and
+versioned resolve ingress preserve this deadline; status ingress now translates
+its borrowed clock epoch before invoking the native deadline callback. Missing
+bounded capabilities never fall back to the legacy callback.
+
+Provisioned native recovery borrows only an exact resident generation. Cache,
+lifecycle, or activity contention returns a retryable incomplete result. Cold
+owners publish fixed-capacity, inline-name warmup hints without allocating,
+waiting, or opening storage on the request. DATA's existing lifecycle job drains
+one hint per attempt, rotates before I/O, retains failed attempts and newer
+revisions, and stops accepting work at shutdown. Local Hosted transaction begin
+requires a stable recovery source; a request-only native Hosted fallback is
+rejected before creating an obligation. Metadata's normal remote DATA routing
+continues to use its stable DATA owner.
+
+Raft recovery uses the existing context-aware proposal callback and independent
+recovery deadline. Precise pre-admission expiry becomes Timeout; accepted outcome
+uncertainty remains unchanged. Native resolution publishes cache invalidation on
+success and post-invocation errors. InvalidParticipant ACK is preserved across
+the checked boundary and maps to a deterministic HTTP 409 conflict.
+
+The matching compiled SourceOwner acquisition/queue gate passed **4/4, actual
+exit 0, no skips/failures/leaks** (`/tmp/workload-recovery-owner-bounded1.log`).
+The API owning gate then passed **28/28, actual exit 0, no skips/failures/leaks**
+(`/tmp/workload-recovery-bounded-api2.log`). This includes all prior 22 selected
+recovery/deadline/first-decision tests plus six bounded tests: actual native cold
+status/resolve and lifecycle warmup, queue capacity/error retention/shutdown,
+Hosted pre-begin capability refusal, shifted-clock operations/cancellation,
+checked resolve/status boundaries, and InvalidParticipant HTTP 409 mapping.
+Reproduce it with the 22-test command above plus
+`--test-filter 'transaction recovery bounded'`. The first attempt ended at
+compile-time fixture declaration errors (ambiguous function name, missing null
+optional dependencies, and a dispatch pointer signature); no tests ran in that
+attempt. DATA and updated compiled-owner raw-status qualification follow this
+API receipt; this is not a full end-to-end qualification claim. Synchronous native work already
+invoked remains owned by its storage/runtime contract, not interrupted by an
+expired admission timer. Multi-peer loss and shutdown schedules and the full
+eight-item completion qualification remain open.

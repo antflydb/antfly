@@ -1501,6 +1501,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "transaction recovery provisioned adapter never loses budget through legacy Raft callbacks",
         "transaction recovery transport requires bounded versioned peers without fallback",
         "transaction recovery invalid participant preserves checked status identity",
+        "transaction recovery bounded",
         "first decision transport never downgrades endpoint or ambiguous delivery",
         "first decision endpoint emits proof only for precise preaccept rejection",
         "first decision boundary preserves rejection identity and never calls legacy resolve",

@@ -8743,6 +8743,30 @@ test "internal transaction HTTP size rejection is actionable without claiming no
     try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
 }
 
+test "transaction recovery bounded invalid participant ACK returns conflict" {
+    const Fake = struct {
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+        fn ack(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: []const u8, _: u64) anyerror!?void {
+            return error.InvalidParticipant;
+        }
+    };
+    const operations: internal_group_operations.Operations = .{ .reads = null, .shard_db_adapter = null, .writes = .{ .ptr = undefined, .vtable = &.{ .batch = Fake.batch, .txn_acknowledge_group_local_until = Fake.ack } } };
+    const outcome: internal_group_operations.Error = blk: {
+        operations.txnAcknowledge(std.testing.allocator, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s }, 7, "docs", .{ .txn_id = [_]u8{1} ** 16, .participant = "table2:00000004:docs:7" }) catch |err| break :blk err;
+        return error.ExpectedInvalidParticipant;
+    };
+    try std.testing.expectEqual(error.DecisionConflict, outcome);
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn/acknowledge-v2");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try AntflyApiHandler.internalTxnErrorResponse(&ctx, outcome, .acknowledge);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 409), response.status.code);
+}
+
 test "transaction recovery endpoint requires budget and translates the ingress clock" {
     const Fake = struct {
         calls: usize = 0,

@@ -763,8 +763,10 @@ pub const HostedParticipantWorker = struct {
         if (deadline_ns) |deadline| try ensureDecisionRecoveryDeadline(deadline);
         switch (route) {
             .local => {
-                if (deadline_ns != null and self.writes.vtable.txn_resolve_group_local_with_cancellation == null) return error.CommitDecisionUnknown;
-                _ = (try self.writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, operation_cancellation)) orelse return error.UnknownGroup;
+                _ = (if (deadline_ns) |deadline|
+                    try self.writes.txnResolveGroupLocalUntil(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, deadline, cancellation)
+                else
+                    try self.writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, operation_cancellation)) orelse return error.UnknownGroup;
             },
             .remote => |remote| {
                 var client = self.httpClient(alloc);
@@ -1070,9 +1072,7 @@ pub const LocalTableWriteParticipantWorker = struct {
     fn resolveGroupUntilWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest, deadline_ns: u64, cancellation: db_mod.types.CancellationToken) !void {
         try ensureDecisionRecoveryDeadline(deadline_ns);
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        if (self.writes.vtable.txn_resolve_group_local_with_cancellation == null) return error.CommitDecisionUnknown;
-        var deadline_cancellation = DecisionRecoveryCancellation{ .deadline_ns = deadline_ns, .other = cancellation };
-        try resolveGroupWithCancellation(ptr, alloc, group_id, table_name, req, deadline_cancellation.token());
+        _ = (try self.writes.txnResolveGroupLocalUntil(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, deadline_ns, cancellation)) orelse return error.UnknownGroup;
     }
 
     fn statusGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) !db_mod.types.TxnStatus {

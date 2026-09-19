@@ -5821,12 +5821,13 @@ const LegacyTableWriteSource = struct {
 
 const TxnRecoveryDeadlineCancellation = struct {
     deadline_ns: u64,
+    original: db_mod.types.CancellationToken = .none,
     fn token(self: *const @This()) db_mod.types.CancellationToken {
         return .{ .ptr = self, .is_cancelled_fn = isCancelled };
     }
     fn isCancelled(ptr: *const anyopaque) bool {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
-        return platform_time.monotonicNs() >= self.deadline_ns;
+        return platform_time.monotonicNs() >= self.deadline_ns or self.original.isCancelled();
     }
 };
 
@@ -6144,8 +6145,12 @@ pub const BoundTableWriteSource = struct {
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_status_group_local_until = txnStatusGroupLocalUntil,
+                .txn_status_group_linearizable_until = txnStatusGroupLocalUntil,
+                .txn_status_group_authoritative_local_until = txnStatusGroupLocalUntil,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .txn_acknowledge_group_local_until = txnAcknowledgeGroupLocalUntil,
+                .txn_resolve_group_local_until = txnResolveGroupLocalUntil,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
@@ -7187,6 +7192,13 @@ pub const BoundTableWriteSource = struct {
         return try txnResolveGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context.cancellation, context);
     }
 
+    fn txnResolveGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, deadline_ns: u64, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        try cancellation.check();
+        var scope: TxnRecoveryDeadlineCancellation = .{ .deadline_ns = deadline_ns, .original = cancellation };
+        return txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, scope.token());
+    }
+
     fn txnResolveGroupLocalWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?void {
         return try txnResolveGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation, null);
     }
@@ -7216,6 +7228,13 @@ pub const BoundTableWriteSource = struct {
             transactions_mod.TxnError.TxnNotFound => if (status != .aborted) return err,
             else => return err,
         };
+    }
+
+    fn txnStatusGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) anyerror!?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const status = try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        return status;
     }
 
     fn txnStatusGroupLocal(
@@ -7903,6 +7922,103 @@ pub const ProvisionedTableWriteSource = struct {
             .internal => .internal,
         };
     }
+
+    fn requestRecoveryOwnerWarmup(self: *ProvisionedTableWriteSource, group_id: u64, table_name: []const u8) !void {
+        if (self.local_write_owner) |owner| return owner.requestRecoveryOwnerWarmup(group_id, table_name);
+        if (self.lifecycle.load(.acquire) != .open) return error.Canceled;
+        if (table_name.len == 0 or table_name.len > 1024) return error.CommitPropagationIncomplete;
+        if (!self.recovery_warmup_mutex.tryLock()) return error.CommitPropagationIncomplete;
+        defer self.recovery_warmup_mutex.unlock();
+        if (self.lifecycle.load(.acquire) != .open) return error.Canceled;
+        var free_slot: ?*RecoveryOwnerWarmup = null;
+        for (&self.recovery_warmups) |*request| {
+            if (request.table_name_len == 0) {
+                if (free_slot == null) free_slot = request;
+            } else if (request.group_id == group_id and std.mem.eql(u8, request.name(), table_name)) {
+                request.revision = std.math.add(u64, request.revision, 1) catch return error.CommitPropagationIncomplete;
+                return;
+            }
+        }
+        const slot = free_slot orelse return error.CommitPropagationIncomplete;
+        slot.group_id = group_id;
+        slot.table_name_len = table_name.len;
+        @memcpy(slot.table_name[0..table_name.len], table_name);
+        slot.revision = 1;
+        _ = self.recovery_warmup_pending.fetchAdd(1, .release);
+    }
+
+    pub fn hasPendingRecoveryOwnerWarmups(self: *const ProvisionedTableWriteSource) bool {
+        if (self.local_write_owner) |owner| return owner.hasPendingRecoveryOwnerWarmups();
+        return self.lifecycle.load(.acquire) == .open and self.recovery_warmup_pending.load(.acquire) != 0;
+    }
+
+    /// DATA owns and joins this lifecycle job. Requests only publish inline
+    /// hints; they never perform a cold open or retain caller-owned memory.
+    pub fn drainRecoveryOwnerWarmups(self: *ProvisionedTableWriteSource) !void {
+        if (self.local_write_owner) |owner| return owner.drainRecoveryOwnerWarmups();
+        if (!self.hasPendingRecoveryOwnerWarmups()) return;
+        if (self.recovery_warmup_draining.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        defer self.recovery_warmup_draining.store(false, .release);
+        const selected = blk: {
+            if (!self.recovery_warmup_mutex.tryLock()) return;
+            defer self.recovery_warmup_mutex.unlock();
+            if (self.lifecycle.load(.acquire) != .open) return;
+            for (0..self.recovery_warmups.len) |offset| {
+                const index = (self.recovery_warmup_cursor + offset) % self.recovery_warmups.len;
+                const request = self.recovery_warmups[index];
+                if (request.table_name_len == 0) continue;
+                self.recovery_warmup_cursor = (index + 1) % self.recovery_warmups.len;
+                break :blk .{ .index = index, .request = request };
+            }
+            return;
+        };
+        if (comptime control_only_storage_sources) return error.CommitPropagationIncomplete;
+        if (self.write_cache == null and self.startup_write_cache == null) return error.CommitPropagationIncomplete;
+        try prepareResidentDbForReadRetry(self, std.heap.page_allocator, selected.request.name(), selected.request.group_id, self.visibleRootGeneration(selected.request.group_id));
+        lockAtomic(&self.recovery_warmup_mutex);
+        defer self.recovery_warmup_mutex.unlock();
+        const current = &self.recovery_warmups[selected.index];
+        if (current.revision == selected.request.revision) {
+            current.table_name_len = 0;
+            _ = self.recovery_warmup_pending.fetchSub(1, .release);
+        }
+    }
+
+    /// Caller holds group operation admission through mutation and releases
+    /// this exact cache pin afterward. Contention never starts a cold open.
+    fn acquireResidentRecoveryDb(self: *ProvisionedTableWriteSource, group_id: u64, table_name: []const u8) !ProvisionedTableWriteCache.CachedDb {
+        if (!self.local_db_mutex.tryLock()) return error.CommitPropagationIncomplete;
+        defer self.local_db_mutex.unlock();
+        const generation = self.visibleRootGeneration(group_id);
+        for ([_]?*ProvisionedTableWriteCache{ self.write_cache, self.startup_write_cache }) |maybe_cache| {
+            const cache = maybe_cache orelse continue;
+            if (!cache.entry_lifecycle_mutex.tryLock()) return error.CommitPropagationIncomplete;
+            defer cache.entry_lifecycle_mutex.unlock();
+            for (cache.entries.items) |entry| {
+                if (entry.group_id != group_id or entry.lsm_root_generation != generation or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+                if (entry.retired or entry.auto_bulk_ingest_finishing or !cache.entryHAWriteGateCurrent(entry)) continue;
+                entry.active_leases += 1;
+                return .{ .cache = cache, .entry = entry, .db = &entry.db, .schema_json = entry.schema_json };
+            }
+        }
+        try self.requestRecoveryOwnerWarmup(group_id, table_name);
+        return error.CommitPropagationIncomplete;
+    }
+
+    const RecoveryOwnerWarmup = struct {
+        group_id: u64 = 0,
+        table_name: [1024]u8 = undefined,
+        table_name_len: usize = 0,
+        revision: u64 = 0,
+        fn name(self: *const @This()) []const u8 {
+            return self.table_name[0..self.table_name_len];
+        }
+    };
+    recovery_warmup_mutex: std.atomic.Mutex = .unlocked,
+    recovery_warmups: [256]RecoveryOwnerWarmup = @splat(.{}),
+    recovery_warmup_pending: std.atomic.Value(usize) = .init(0),
+    recovery_warmup_draining: std.atomic.Value(bool) = .init(false),
+    recovery_warmup_cursor: usize = 0,
 
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
@@ -20782,12 +20898,14 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_status_group_local_until = txnStatusGroupLocalUntil,
                 .txn_status_group_linearizable = txnStatusGroupLinearizable,
                 .txn_status_group_linearizable_until = txnStatusGroupLinearizableUntil,
                 .txn_status_group_authoritative_local = txnStatusGroupAuthoritativeLocal,
                 .txn_status_group_authoritative_local_until = txnStatusGroupAuthoritativeLocalUntil,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .txn_acknowledge_group_local_until = txnAcknowledgeGroupLocalUntil,
+                .txn_resolve_group_local_until = txnResolveGroupLocalUntil,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .corrupt_embedding_artifact_group_local = corruptEmbeddingArtifactGroupLocal,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
@@ -23941,6 +24059,59 @@ pub const ProvisionedTableWriteSource = struct {
         return try txnResolveGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context.cancellation, context);
     }
 
+    fn recoveryAdmissionError(err: anyerror) anyerror {
+        return switch (err) {
+            error.PreDecisionDeadlineExceeded => error.Timeout,
+            error.PreDecisionNotProposed => error.CommitPropagationIncomplete,
+            else => err,
+        };
+    }
+
+    fn publishRecoveryMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        // Invocation may have made durable progress even when its final
+        // visibility or transport result is uncertain.
+        lockAtomic(&self.local_db_mutex);
+        self.markWriteCacheDirty(table_name);
+        self.invalidateReadCache(table_name);
+        self.local_db_mutex.unlock();
+        self.notifyLocalChange(table_name, .data);
+    }
+
+    fn txnResolveGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, deadline_ns: u64, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        try cancellation.check();
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        const catalog_deadline = self.catalog.budget(null).deadlineFrom(table_catalog.RoutingBudget.init(deadline_ns));
+        if (topology_epoch != 0) try table_catalog.validatePinnedGroupTopologyUntil(alloc, self.catalog, table_name, group_id, topology_epoch, catalog_deadline);
+        if (self.raft_batcher) |batcher| {
+            if (batcher.vtable.batch_group_local_with_pre_decision_context == null) return error.CommitPropagationIncomplete;
+            batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
+                .sync_level = sync_level,
+                .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+            }, .{ .deadline_ns = deadline_ns, .cancellation = cancellation }) catch |err| return recoveryAdmissionError(err);
+            return {};
+        }
+        if (self.groupLocalWriteSource()) |owner| {
+            defer if (status == .committed) self.publishRecoveryMutation(table_name);
+            return owner.txnResolveGroupLocalUntil(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, deadline_ns, cancellation);
+        }
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        if (!self.tryBeginReplicatedApplyOperation(table_name, group_id)) return error.CommitPropagationIncomplete;
+        defer self.endGroupOperation(table_name, group_id);
+        var cached = try self.acquireResidentRecoveryDb(group_id, table_name);
+        defer cached.deinit(alloc);
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        try cancellation.check();
+        var scope: TxnRecoveryDeadlineCancellation = .{ .deadline_ns = deadline_ns, .original = cancellation };
+        defer if (status == .committed) self.publishRecoveryMutation(table_name);
+        try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, .{
+            .sync_level = sync_level,
+            .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+        }, scope.token());
+        return {};
+    }
+
     fn txnResolveGroupLocalWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?void {
         return try txnResolveGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation, null);
     }
@@ -24062,6 +24233,21 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
+    fn txnStatusGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) anyerror!?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.groupLocalWriteSource()) |owner| return owner.txnStatusGroupLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns);
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        if (!self.tryBeginReplicatedApplyOperation(table_name, group_id)) return error.CommitPropagationIncomplete;
+        defer self.endGroupOperation(table_name, group_id);
+        var cached = try self.acquireResidentRecoveryDb(group_id, table_name);
+        defer cached.deinit(alloc);
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const status = try cached.db.getTransactionStatus(txn_id);
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        return status;
+    }
+
     fn txnStatusGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -24116,11 +24302,8 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?db_mod.types.TxnStatus {
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const batcher = self.raft_batcher orelse {
-            const status = try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
-            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
-            return status;
-        };
+        const batcher = self.raft_batcher orelse
+            return txnStatusGroupLocalUntil(ptr, alloc, group_id, table_name, txn_id, deadline_ns);
         return try batcher.txnStatusGroupUntil(alloc, group_id, table_name, txn_id, deadline_ns);
     }
 
@@ -24147,17 +24330,35 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?db_mod.types.TxnStatus {
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const batcher = self.raft_batcher orelse {
-            const status = try txnStatusGroupLocal(ptr, alloc, group_id, table_name, txn_id);
-            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
-            return status;
-        };
+        const batcher = self.raft_batcher orelse
+            return txnStatusGroupLocalUntil(ptr, alloc, group_id, table_name, txn_id, deadline_ns);
         return try batcher.txnStatusGroupLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns);
     }
 
     fn txnAcknowledgeGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8, deadline_ns: u64) anyerror!?void {
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
-        return try txnAcknowledgeGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, participant, deadline_ns);
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        if (self.raft_batcher) |batcher| {
+            if (batcher.vtable.batch_group_local_with_pre_decision_context == null) return error.CommitPropagationIncomplete;
+            batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
+                .sync_level = .write,
+                .transaction = .{ .acknowledge = .{ .txn_id = txn_id, .participant = participant } },
+            }, .{ .deadline_ns = deadline_ns }) catch |err| return recoveryAdmissionError(err);
+            return {};
+        }
+        if (self.groupLocalWriteSource()) |owner| return owner.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, txn_id, participant, deadline_ns);
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        if (!self.tryBeginReplicatedApplyOperation(table_name, group_id)) return error.CommitPropagationIncomplete;
+        defer self.endGroupOperation(table_name, group_id);
+        var cached = try self.acquireResidentRecoveryDb(group_id, table_name);
+        defer cached.deinit(alloc);
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        try cached.db.markTransactionParticipantResolved(txn_id, participant);
+        lockAtomic(&self.local_db_mutex);
+        self.markWriteCacheDirty(table_name);
+        self.local_db_mutex.unlock();
+        return {};
     }
 
     fn txnAcknowledgeGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8) anyerror!?void {
@@ -26039,8 +26240,12 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_status_group_local_until = txnStatusGroupLocalUntil,
+                .txn_status_group_linearizable_until = txnStatusGroupLinearizableUntil,
+                .txn_status_group_authoritative_local_until = txnStatusGroupAuthoritativeLocalUntil,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .txn_acknowledge_group_local_until = txnAcknowledgeGroupLocalUntil,
+                .txn_resolve_group_local_until = txnResolveGroupLocalUntil,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
@@ -27024,6 +27229,14 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
+        // A local hosted route must have a stable recovery owner before it
+        // creates an obligation. Request-scoped adapters cannot own warmups.
+        if (req.transaction) |mutation| if (mutation == .begin) {
+            const owner = self.groupLocalWriteSource() orelse return error.PreDecisionNotProposed;
+            if (owner.vtable.txn_resolve_group_local_until == null or owner.vtable.txn_acknowledge_group_local_until == null or owner.vtable.txn_status_group_authoritative_local_until == null)
+                return error.PreDecisionNotProposed;
+        };
+
         if (comptime control_only_storage_sources) {
             if (topology_epoch != 0)
                 try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
@@ -27159,6 +27372,14 @@ pub const HostedProvisionedTableWriteSource = struct {
         return try txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .none);
     }
 
+    fn txnResolveGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, deadline_ns: u64, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        try cancellation.check();
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.CommitPropagationIncomplete;
+        return owner.txnResolveGroupLocalUntil(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, deadline_ns, cancellation);
+    }
+
     fn txnResolveGroupLocalWithCancellation(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -27179,6 +27400,27 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .commit_version = commit_version,
             } },
         }, topology_epoch, cancellation);
+    }
+
+    fn txnStatusGroupLinearizableUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) anyerror!?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.DeadlineAwareTxnStatusUnsupported;
+        return owner.txnStatusGroupLinearizableUntil(alloc, group_id, table_name, txn_id, deadline_ns);
+    }
+
+    fn txnStatusGroupAuthoritativeLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) anyerror!?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.DeadlineAwareTxnStatusUnsupported;
+        return owner.txnStatusGroupAuthoritativeLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns);
+    }
+
+    fn txnStatusGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) anyerror!?db_mod.types.TxnStatus {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.DeadlineAwareTxnStatusUnsupported;
+        return owner.txnStatusGroupLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns);
     }
 
     fn txnStatusGroupLocal(
@@ -27205,18 +27447,8 @@ pub const HostedProvisionedTableWriteSource = struct {
     fn txnAcknowledgeGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8, deadline_ns: u64) anyerror!?void {
         if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (comptime control_only_storage_sources) {
-            const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
-            return try owner.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, txn_id, participant, deadline_ns);
-        }
-        var cancellation: TxnRecoveryDeadlineCancellation = .{ .deadline_ns = deadline_ns };
-        return batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
-            .sync_level = .write,
-            .transaction = .{ .acknowledge = .{ .txn_id = txn_id, .participant = participant } },
-        }, 0, .{ .deadline_ns = deadline_ns, .cancellation = cancellation.token() }) catch |err| switch (err) {
-            error.PreDecisionDeadlineExceeded => error.Timeout,
-            else => err,
-        };
+        const owner = self.groupLocalWriteSource() orelse return error.CommitPropagationIncomplete;
+        return owner.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, txn_id, participant, deadline_ns);
     }
 
     fn txnAcknowledgeGroupLocal(
@@ -34081,6 +34313,99 @@ fn consumerTests() type {
                 try std.testing.expectEqual(@as(u64, 1), expired.auto_aborted);
                 try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_id));
             }
+        }
+
+        test "transaction recovery bounded cold owner warms outside request then resolves" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bounded-recovery", .{tmp.sub_path});
+            defer alloc.free(root);
+            const Catalog = struct {
+                fn iface() table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                            .table_id = 7,
+                            .name = "docs",
+                            .placement_role = "data",
+                            .indexes_json = "{\"indexes\":[]}",
+                        }})[0..]),
+                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                            .group_id = 7001,
+                            .table_id = 7,
+                            .start_key = "",
+                            .end_key = null,
+                        }})[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+
+            var cache = ProvisionedTableWriteCache.init(alloc);
+            defer cache.deinit();
+            var source = ProvisionedTableWriteSource.init(root, Catalog.iface());
+            defer source.deinit();
+            source.write_cache = &cache;
+            const txn_id = [_]u8{9} ** 16;
+            const deadline = platform_time.monotonicNs() + 30 * std.time.ns_per_s;
+            try std.testing.expectError(error.CommitPropagationIncomplete, source.source().txnResolveGroupLocalUntil(alloc, 7001, "docs", txn_id, .aborted, 0, 0, .write, deadline, .none));
+            try std.testing.expectError(error.CommitPropagationIncomplete, source.source().txnStatusGroupLocalUntil(alloc, 7001, "docs", txn_id, deadline));
+            try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+            try std.testing.expect(source.hasPendingRecoveryOwnerWarmups());
+            try source.drainRecoveryOwnerWarmups();
+            try std.testing.expect(!source.hasPendingRecoveryOwnerWarmups());
+            try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+            const participant = try distributed_txn.participantIdForGroup(alloc, "docs", 7001);
+            defer alloc.free(participant);
+            _ = try cache.entries.items[0].db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(txn_id, 1, nextTxnTimestamp(cache.entries.items[0].db.backend_runtime.io()), &.{participant}, true, true);
+            _ = try source.source().txnResolveGroupLocalUntil(alloc, 7001, "docs", txn_id, .aborted, 0, 0, .write, deadline, .none);
+            try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try cache.entries.items[0].db.getTransactionStatus(txn_id));
+            try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, (try source.source().txnStatusGroupLocalUntil(alloc, 7001, "docs", txn_id, deadline)).?);
+            _ = try source.source().txnAcknowledgeGroupLocalUntil(alloc, 7001, "docs", txn_id, participant, deadline);
+        }
+
+        test "transaction recovery bounded warmup queue retains failures and rejects late admission" {
+            var source = ProvisionedTableWriteSource.init("/unused-recovery-warmup", table_catalog.emptyCatalogSource());
+            defer source.deinit();
+            for (0..256) |index| try source.requestRecoveryOwnerWarmup(index + 1, "docs");
+            try source.requestRecoveryOwnerWarmup(1, "docs");
+            try std.testing.expectEqual(@as(usize, 256), source.recovery_warmup_pending.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 2), source.recovery_warmups[0].revision);
+            try std.testing.expectError(error.CommitPropagationIncomplete, source.requestRecoveryOwnerWarmup(257, "docs"));
+            try std.testing.expectError(error.CommitPropagationIncomplete, source.drainRecoveryOwnerWarmups());
+            try std.testing.expect(source.hasPendingRecoveryOwnerWarmups());
+            try std.testing.expectEqual(@as(usize, 1), source.recovery_warmup_cursor);
+            try std.testing.expect(source.recovery_warmup_mutex.tryLock());
+            try std.testing.expectError(error.CommitPropagationIncomplete, source.requestRecoveryOwnerWarmup(1, "docs"));
+            source.recovery_warmup_mutex.unlock();
+            source.quiesce();
+            try std.testing.expect(!source.hasPendingRecoveryOwnerWarmups());
+            try std.testing.expectError(error.Canceled, source.requestRecoveryOwnerWarmup(1, "docs"));
+            try source.drainRecoveryOwnerWarmups();
+        }
+
+        test "transaction recovery bounded hosted profile refuses begin without stable recovery owner" {
+            var hosted = HostedProvisionedTableWriteSource.init("/must-not-open-recovery-profile", table_catalog.emptyCatalogSource(), undefined, undefined);
+            try std.testing.expectError(error.PreDecisionNotProposed, hosted.source().txnBeginGroupLocal(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, 1, 0, true, &.{}));
         }
 
         test "transaction recovery provisioned adapter never loses budget through legacy Raft callbacks" {

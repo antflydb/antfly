@@ -609,19 +609,14 @@ pub const Operations = struct {
     pub fn txnResolve(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnResolveRequest) Error!void {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        const DeadlineScope = struct {
-            request: operation.RequestContext,
-            fn check(raw: *const anyopaque) !void {
-                const scope: *const @This() = @ptrCast(@alignCast(raw));
-                try scope.request.ensureActive();
-            }
-        };
-        var scope: DeadlineScope = .{ .request = request };
-        if (request.deadline_ns != null and writes.vtable.txn_resolve_group_local_with_cancellation == null) return error.Unavailable;
-        const cancellation: CancellationToken = if (request.deadline_ns != null) .{ .ptr = &scope, .check_fn = DeadlineScope.check } else request.cancellation;
-        _ = (writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level, cancellation) catch |err| switch (err) {
+        const deadline = @import("table_catalog.zig").RoutingBudget.init(null).deadlineFrom(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io });
+        _ = ((if (deadline) |value|
+            writes.txnResolveGroupLocalUntil(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level, value, request.cancellation)
+        else
+            writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level, request.cancellation)) catch |err| switch (err) {
             error.Canceled, error.Cancelled => return error.Canceled,
             error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.CommitPropagationIncomplete => return error.Unavailable,
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -638,7 +633,8 @@ pub const Operations = struct {
     pub fn txnStatus(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId) Error!db_mod.types.TxnStatus {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        const status = if (request.deadline_ns) |deadline_ns|
+        const deadline = @import("table_catalog.zig").RoutingBudget.init(null).deadlineFrom(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io });
+        const status = if (deadline) |deadline_ns|
             writes.txnStatusGroupAuthoritativeLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns)
         else
             writes.txnStatusGroupAuthoritativeLocal(alloc, group_id, table_name, txn_id);
@@ -648,6 +644,7 @@ pub const Operations = struct {
             error.NotLeader,
             error.Timeout,
             error.DeadlineAwareTxnStatusUnsupported,
+            error.CommitPropagationIncomplete,
             => return error.GroupLeaderUnavailable,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
@@ -1250,6 +1247,44 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "transaction recovery bounded operations translate shifted clocks and preserve cancellation" {
+            const Fake = struct {
+                calls: usize = 0,
+                token: db_mod.types.CancellationToken,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+                    return null;
+                }
+                fn observe(raw: *anyopaque, deadline: u64) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const now = platform_time.monotonicNs();
+                    try std.testing.expect(deadline > now and deadline <= now + 2 * std.time.ns_per_s);
+                    self.calls += 1;
+                }
+                fn status(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, deadline: u64) anyerror!?db_mod.types.TxnStatus {
+                    try observe(raw, deadline);
+                    return .committed;
+                }
+                fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel, deadline: u64, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expectEqual(self.token.ptr, cancellation.ptr);
+                    try observe(raw, deadline);
+                    return {};
+                }
+            };
+            var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 10 * std.time.ns_per_s });
+            defer clock.deinit();
+            var stopped = std.atomic.Value(bool).init(false);
+            const cancellation = db_mod.types.CancellationToken.fromAtomic(&stopped);
+            var fake: Fake = .{ .token = cancellation };
+            const operations: Operations = .{ .reads = null, .shard_db_adapter = null, .writes = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .txn_status_group_authoritative_local_until = Fake.status, .txn_resolve_group_local_until = Fake.resolve } } };
+            const request: operation.RequestContext = .{ .deadline_ns = 12 * std.time.ns_per_s, .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&clock.io()), .cancellation = cancellation };
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try operations.txnStatus(std.testing.allocator, request, 7, "docs", [_]u8{1} ** 16));
+            try operations.txnResolve(std.testing.allocator, request, 7, "docs", .{ .txn_id = [_]u8{1} ** 16, .status = .aborted, .commit_version = 0 });
+            stopped.store(true, .release);
+            try std.testing.expectError(error.Canceled, operations.txnResolve(std.testing.allocator, request, 7, "docs", .{ .txn_id = [_]u8{1} ** 16, .status = .aborted, .commit_version = 0 }));
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        }
+
         test "internal transaction operations preserve pre-decision leader unavailability" {
             const Source = struct {
                 fn iface() table_writes.TableWriteSource {
