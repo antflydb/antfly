@@ -3433,7 +3433,14 @@ pub const NativeFile = struct {
     }
 
     pub fn preparePublicationSequence(self: *NativeFile, sequence: u64) !void {
-        self.header.checkpoints[self.header.active_checkpoint].commit_sequence = sequence;
+        var checkpoint = self.activeCheckpoint();
+        checkpoint.commit_sequence = sequence;
+        // Catch-up can replay keys from failed/no-op foreground mutations, so
+        // its private sequence may exceed the live store's publication sequence.
+        // Both recovery slots must identify the final image; a newer private
+        // fallback slot must never win checkpoint selection after reopen.
+        self.header.checkpoints = .{ checkpoint, checkpoint };
+        self.header.active_checkpoint = 0;
         var encoded: [header_size]u8 = undefined;
         encodeHeader(&encoded, self.header);
         try self.file.writePositionalAll(self.runtimeIo(), &encoded, 0);

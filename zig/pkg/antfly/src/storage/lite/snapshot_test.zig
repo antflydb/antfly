@@ -65,3 +65,27 @@ test "lite online checks validate the pinned file length while later commits app
     try std.testing.expect(!invalid.valid);
     try std.testing.expectEqualStrings("tail_bytes", invalid.issue.?);
 }
+
+test "lite vacuum publication resets private fallback sequences to the final image" {
+    const native = @import("native.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vacuum-sequences.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+    var file = try native.NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    try file.putDocument("doc", "before");
+    var image = try file.prepareVacuum(null);
+    defer image.deinit();
+    for (0..4) |_| try image.prepared.putDocument("doc", "intermediate");
+    try image.prepared.putDocument("doc", "final");
+    try image.prepared.preparePublicationSequence(file.activeCheckpoint().commit_sequence + 1);
+    try file.publishVacuum(&image);
+    var reopened = try native.NativeFile.openWithIo(alloc, std.testing.io, path, .{ .read_only = true });
+    defer reopened.close();
+    const value = (try reopened.getDocumentAlloc(alloc, "doc")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("final", value);
+    try std.testing.expect((try reopened.check()).valid);
+}
